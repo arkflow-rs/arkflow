@@ -22,7 +22,7 @@ MQTT 输出(Output)将每条消息(Message)发布到 MQTT 代理(Broker)的主�
 | clean_session | boolean | no | — | 是否使用干净会话。 |
 | keep_alive | integer | no | — | 保活间隔(秒)。 |
 | retain | boolean | no | — | 是否在代理上保留该消息。 |
-| value_field | string | no | — | 用作消息载荷的记录字段。 |
+| value_field | string | no | — | 二进制或字符串列,其逐行值作为该条消息的载荷(null 值或缺失列会报错)。未配置时按 codec 编码整批。 |
 
 ### topic
 
@@ -33,6 +33,8 @@ MQTT 输出(Output)将每条消息(Message)发布到 MQTT 代理(Broker)的主�
 | type | string | yes | `value`(静态)或 `expr`(SQL 表达式)。 |
 | value | string | yes (`value`) | 静态主题名称。 |
 | expr | string | yes (`expr`) | 对每条消息求值的 SQL 表达式。 |
+
+表达式必须对每一行求出非 null 字符串:任意行为 NULL 时整批报错,错误信息指名表达式与行号(可用 `COALESCE(expr, 'fallback')` 规避,或在上游过滤这类行)。
 
 
 ## TLS

@@ -15,6 +15,7 @@ The Protobuf codec converts between binary Protobuf messages and columnar Arrow 
 | message_type | string | yes | — | Fully qualified Protobuf message type name (including package), e.g. `com.example.User` |
 | proto_inputs | array&lt;string&gt; | yes | — | List of `.proto` source file paths |
 | proto_includes | array&lt;string&gt; | no | — | Include search paths used when parsing `.proto` files |
+| on_error | string | no | `fail` | Decode-error policy: `fail` (default) fails the whole batch on the first bad message; `skip` isolates bad messages — each is dropped with a warning and the rest of the batch still decodes |
 
 ## Examples
 

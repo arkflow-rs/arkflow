@@ -539,8 +539,8 @@ impl Input for KafkaInput {
                         topic: kafka_message.topic().to_string(),
                         partition,
                         offset,
-                            transactional_offsets: self.config.transactional_offsets,
-                        };
+                        transactional_offsets: self.config.transactional_offsets,
+                    };
 
                     return Ok((Arc::new(msg_batch), Arc::new(ack)));
                 }
@@ -645,8 +645,8 @@ impl Input for KafkaInput {
             topic,
             partition: position.partition as i32,
             offset,
-                            transactional_offsets: self.config.transactional_offsets,
-                        })))
+            transactional_offsets: self.config.transactional_offsets,
+        })))
     }
 
     async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
@@ -774,7 +774,8 @@ impl Input for KafkaInput {
             return Err(Error::Config(
                 "Kafka transactional_offsets requires subscribe mode (group membership for \
                  send_offsets_to_transaction); a partition-assigned consumer never joins the \
-                 consumer group. Use a single-reader (non-job) input for L3 flows".into(),
+                 consumer group. Use a single-reader (non-job) input for L3 flows"
+                    .into(),
             ));
         }
         let mut assigned = self
@@ -1105,7 +1106,8 @@ pub fn init() -> Result<(), Error> {
     ).with_example(serde_json::json!({
         "brokers": ["localhost:9092"],
         "topics": ["events"],
-        "consumer_group": "arkflow"
+        "consumer_group": "arkflow",
+        "start_from_latest": false
     })))
 }
 
@@ -1170,7 +1172,6 @@ mod tests {
         );
     }
 
-
     /// Regression: `wait_for_assignment` used to run inside the per-input
     /// acknowledgement lock and its consumer read guard, so one partition
     /// waiting out a rebalance blocked every sibling acknowledgement — and the
@@ -1187,9 +1188,7 @@ mod tests {
         // Bound the scanned body at the test module: the assertion literals
         // below would otherwise match their own text embedded by
         // `include_str!`.
-        let tests_start = source
-            .find("#[cfg(test)]")
-            .expect("the test module exists");
+        let tests_start = source.find("#[cfg(test)]").expect("the test module exists");
         let ack_body = &source[ack_start..tests_start];
         // The old held-guard wait is gone from the acknowledgement path.
         assert!(
@@ -1309,8 +1308,8 @@ mod tests {
             topic: "test-topic".to_string(),
             partition: 0,
             offset: 100,
-                            transactional_offsets: false,
-                        };
+            transactional_offsets: false,
+        };
 
         // Acknowledging without a live consumer must fail; treating this as
         // success would advance the in-memory frontier while no broker offset
@@ -1417,8 +1416,8 @@ mod tests {
             topic: "test-topic".to_string(),
             partition: 3,
             offset: 42,
-                            transactional_offsets: false,
-                        };
+            transactional_offsets: false,
+        };
         assert!(ack.ack().await.is_err());
         assert_eq!(input.current_positions().await.unwrap()[0].offset, 42);
     }
@@ -1689,8 +1688,8 @@ mod tests {
             topic: "test-topic".into(),
             partition: 0,
             offset: 1,
-                            transactional_offsets: false,
-                        };
+            transactional_offsets: false,
+        };
         let waiter = tokio::spawn(async move { ack.ack().await });
         tokio::task::yield_now().await;
         input.close().await.unwrap();

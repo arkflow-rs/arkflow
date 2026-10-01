@@ -5,7 +5,7 @@ sidebar_label: Schema Registry
 
 # Schema Registry
 
-`schema_registry` 编解码器(Codec)在运行时通过 Confluent Schema Registry 解析内嵌的 schema id,从而解码 Confluent 线路格式(wire format)的消息。每个 schema 版本(id)至多获取一次,并按编解码器实例缓存,因此同一条流内支持多版本 schema 演进。**Protobuf** 与 **Avro** 两种 subject 均受支持,依据注册表返回的 `schemaType` 进行分发。可选的 subject 兼容性门控会在某个 subject 的注册兼容级别低于配置的最低要求时让流快速失败。
+`schema_registry` 编解码器(Codec)在运行时通过 Confluent Schema Registry 解析内嵌的 schema id,从而解码 Confluent 线路格式(wire format)的消息。每个 schema 版本(id)至多获取一次,并按编解码器实例缓存,因此同一条流内支持多版本 schema 演进:混合多个 schema 版本的批次会先归一到字段名并集 schema(某版本缺失的列以 null 填充)再合并;同一列在不同版本中类型不同时会显式报错(错误信息含列名与两个类型),绝不猜测转换。**Protobuf** 与 **Avro** 两种 subject 均受支持,依据注册表返回的 `schemaType` 进行分发。可选的 subject 兼容性门控会在某个 subject 的注册兼容级别低于配置的最低要求时让流快速失败。
 
 ## 配置
 
@@ -71,7 +71,7 @@ codec:
 
 1. 解析 Confluent 线路格式(magic + id + payload)。
 2. 按 id 解析 schema(`GET {registry}/schemas/ids/{id}`),并按 id 缓存。分发目标来自响应中的 `schemaType`:
-   - `PROTOBUF`(字段缺失时也是默认值)→ 构建 `MessageDescriptor`,并通过扁平的 Protobuf→Arrow 映射解码负载。
+   - `PROTOBUF` → 构建 `MessageDescriptor`,并通过扁平的 Protobuf→Arrow 映射解码负载。当 `schemaType` **缺失**(旧版 registry)时按 schema 文本内容判定:JSON 对象按 Avro 解码,其余按 Protobuf;两种解析都失败时错误会列出两次尝试。
    - `AVRO` → 解析 Avro writer schema,并通过扁平的 Avro→Arrow 映射解码负载。
 3. 将请求中的单行批次合并为一个列式批次。
 
@@ -103,12 +103,12 @@ Schema 解析被抽象在可插拔的 `SchemaResolver` trait 之后(生产环境
 
 ### Subject 兼容性门控
 
-配置了 `subject` 与 `min_compatibility` 后,首条解码消息会触发一次 `GET {registry}/config/{subject}?defaultToGlobal=true` 请求。subject 的注册级别会被排序(`NONE` < `BACKWARD`/`FORWARD` 含其 `_TRANSITIVE` 变体 < `FULL` 含 `FULL_TRANSITIVE`);如果低于配置的最低级别,流会失败并报错,错误信息中会指明 subject、实际级别与要求。判定结果(通过或失败)会在编解码器生命周期内缓存,因此该配置端点至多被访问一次。这样可以在流水线处捕获兼容性策略的退化(例如 subject 被切换为 `NONE`),而不是静默解码不兼容的未来版本。
+配置了 `subject` 与 `min_compatibility` 后,首条解码消息会触发一次 `GET {registry}/config/{subject}?defaultToGlobal=true` 请求。subject 的注册级别会被排序(`NONE` < `BACKWARD`/`FORWARD` 含其 `_TRANSITIVE` 变体 < `FULL` 含 `FULL_TRANSITIVE`);如果低于配置的最低级别,流会失败并报错,错误信息中会指明 subject、实际级别与要求。**通过**的判定结果会在编解码器生命周期内永久缓存(该配置端点至多被访问一次);**失败**的判定则按不小于 30 秒的最小间隔在后续解码中重试——间隔内的解码直接返回上次错误、不发请求——因此 registry 的瞬时故障不会在恢复后让编解码器永久失效。这样可以在流水线处捕获兼容性策略的退化(例如 subject 被切换为 `NONE`),而不是静默解码不兼容的未来版本。
 
 ## 说明 / 非目标
 
 - 仅限解码侧:它按 id 解析 schema;从不注册新 schema,编码则输出按行分隔的 JSON(与注册表无关)。
-- 注册表响应中缺少 `schemaType` 时按 `PROTOBUF` 处理(这是为向后兼容而保留的 ArkFlow 约定;注意这与 Confluent API 默认的 AVRO 不同)。
+- 注册表响应缺少 `schemaType` 时按内容判定:schema 文本为 JSON 对象则按 Avro 解码(旧版 registry 的 Avro 主题常省略该字段),否则按 Protobuf。旧 registry 的 Avro 流与 Protobuf 流都能正常工作。
 - 不执行 Debezium 信封展平——负载按其注册 schema 的声明进行映射;嵌套的信封结构(`source`、`before`)会被扁平映射拒绝。
 - 不支持 Protobuf schema 引用(imports)——仅支持单文件 schema。
 - Avro 解码仅使用 writer schema(不做 reader-schema 解析),与 Protobuf 路径一致。

@@ -12,6 +12,7 @@
  *    limitations under the License.
  */
 
+pub(crate) mod batch_merge;
 pub(crate) mod json;
 pub(crate) mod protobuf;
 pub(crate) mod redis;

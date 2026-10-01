@@ -12,9 +12,9 @@ JSON 编解码器(Codec)在按行分隔的 JSON 字节负载与列式 Arrow `Rec
 | Field | Type | Required | Default | 描述 |
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | 固定值 `"json"` |
-| pretty | boolean | no | `false` | 元数据声明字段;编码器目前始终输出按行分隔的形式——是否生效由运行时行为决定 |
+| on_error | string | no | `fail` | 解码错误策略:`fail`(缺省)首条坏消息即整批失败;`skip` 逐条隔离——坏消息告警后丢弃,同批其余消息正常解码 |
 
-> 该编解码器的 `build` 实现不会解析额外字段,因此可以省略配置对象(即 `codec: { type: json }`)。`pretty` 仅在组件元数据 schema 中声明。
+> 配置对象可以省略(即 `codec: { type: json }`)。
 
 ## 示例
 

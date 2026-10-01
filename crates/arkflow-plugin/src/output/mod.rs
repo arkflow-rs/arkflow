@@ -27,6 +27,7 @@ pub mod milvus;
 pub mod mongodb;
 pub mod mqtt;
 pub mod nats;
+pub mod payload;
 pub mod pgvector;
 pub mod pulsar;
 pub mod qdrant;

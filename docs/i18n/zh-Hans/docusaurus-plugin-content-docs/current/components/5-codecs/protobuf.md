@@ -15,6 +15,7 @@ Protobuf 编解码器(Codec)使用启动时从 `.proto` 文件编译出的描述
 | message_type | string | yes | — | 完全限定的 Protobuf 消息类型名(包含包名),如 `com.example.User` |
 | proto_inputs | array&lt;string&gt; | yes | — | `.proto` 源文件路径列表 |
 | proto_includes | array&lt;string&gt; | no | — | 解析 `.proto` 文件时使用的 include 搜索路径 |
+| on_error | string | no | `fail` | 解码错误策略:`fail`(缺省)首条坏消息即整批失败;`skip` 逐条隔离——坏消息告警后丢弃,同批其余消息正常解码 |
 
 ## 示例
 

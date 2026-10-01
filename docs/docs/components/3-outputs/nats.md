@@ -15,7 +15,7 @@ The NATS output publishes messages to a NATS server, either to a regular subject
 | url | string | yes | — | NATS server URL (e.g. `nats://localhost:4222`). |
 | mode | object | yes | — | Publishing mode (see below). |
 | auth | object | no | — | Authentication configuration (see below). |
-| value_field | string | no | — | Record field used as the message payload. |
+| value_field | string | no | — | Binary or string column whose per-row value becomes that message's payload (a null value or a missing column is an error). When unset, the codec encoding of the batch applies. |
 
 ### mode
 
@@ -33,6 +33,8 @@ The NATS output publishes messages to a NATS server, either to a regular subject
 | type | string | yes | `value` (static) or `expr` (SQL expression). |
 | value | string | yes (`value`) | Static subject name. |
 | expr | string | yes (`expr`) | SQL expression evaluated per message. |
+
+An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
 
 ### auth
 

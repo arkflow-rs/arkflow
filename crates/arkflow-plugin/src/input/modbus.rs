@@ -12,7 +12,6 @@
  *    limitations under the License.
  */
 use crate::time::deserialize_duration;
-use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::{
     input::{Ack, Input, InputBuilder, NoopAck},
@@ -30,6 +29,19 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_modbus::prelude::{tcp, Client, Reader, SlaveContext};
 use tokio_modbus::{Address, Quantity, SlaveId};
+use tracing::warn;
+
+/// Map a transport-level modbus failure to `Error::Disconnection` so the
+/// engine's source loop reconnects; modbus exception codes stay `Process`
+/// (a poisoned request must not loop reconnects). The underlying cause is
+/// logged because the `Disconnection` variant carries no context.
+fn transport_error(what: &'static str, e: impl std::fmt::Display) -> Error {
+    warn!(
+        "modbus input: {} failed: {}; marking connection lost for reconnect",
+        what, e
+    );
+    Error::Disconnection
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModbusInputConfig {
@@ -63,18 +75,15 @@ struct ModbusInput {
     name: Option<String>,
     first_read: AtomicBool,
     client: Arc<Mutex<Option<tokio_modbus::client::Context>>>,
-    #[allow(dead_code)]
-    codec: Option<Arc<dyn Codec>>,
 }
 
 impl ModbusInput {
-    fn new(config: ModbusInputConfig, name: Option<String>, codec: Option<Arc<dyn Codec>>) -> Self {
+    fn new(config: ModbusInputConfig, name: Option<String>) -> Self {
         Self {
             config,
             first_read: AtomicBool::new(false),
             client: Arc::new(Mutex::new(None)),
             name,
-            codec,
         }
     }
 }
@@ -116,7 +125,7 @@ impl Input for ModbusInput {
                     let result = ctx
                         .read_coils(x.address, x.quantity)
                         .await
-                        .map_err(|e| Error::Process(format!("Failed to read coils:{}", e)))?
+                        .map_err(|e| transport_error("read coils", e))?
                         .map_err(|e| Error::Process(format!("Failed to read coils code:{}", e)))?;
 
                     let (field, list_array) = Self::new_bool_list_array(&x.name, result)?;
@@ -127,9 +136,7 @@ impl Input for ModbusInput {
                     let result = ctx
                         .read_discrete_inputs(x.address, x.quantity)
                         .await
-                        .map_err(|e| {
-                            Error::Process(format!("Failed to read discrete inputs:{}", e))
-                        })?
+                        .map_err(|e| transport_error("read discrete inputs", e))?
                         .map_err(|e| {
                             Error::Process(format!("Failed to read discrete inputs code:{}", e))
                         })?;
@@ -141,9 +148,7 @@ impl Input for ModbusInput {
                     let result = ctx
                         .read_holding_registers(x.address, x.quantity)
                         .await
-                        .map_err(|e| {
-                            Error::Process(format!("Failed to read holding registers:{}", e))
-                        })?
+                        .map_err(|e| transport_error("read holding registers", e))?
                         .map_err(|e| {
                             Error::Process(format!("Failed to read holding registers code:{}", e))
                         })?;
@@ -156,9 +161,7 @@ impl Input for ModbusInput {
                     let result = ctx
                         .read_input_registers(x.address, x.quantity)
                         .await
-                        .map_err(|e| {
-                            Error::Process(format!("Failed to read input registers:{}", e))
-                        })?
+                        .map_err(|e| transport_error("read input registers", e))?
                         .map_err(|e| {
                             Error::Process(format!("Failed to read input registers code:{}", e))
                         })?;
@@ -223,15 +226,24 @@ impl InputBuilder for ModbusInputBuilder {
         &self,
         name: Option<&String>,
         config: &Option<Value>,
-        codec: Option<Arc<dyn Codec>>,
+        codec: Option<Arc<dyn arkflow_core::codec::Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
+        // Register reads already produce typed columns; a codec has no
+        // decode integration point here. Reject instead of dropping it
+        // silently.
+        if codec.is_some() {
+            return Err(Error::Config(
+                "modbus input does not support a codec: register reads produce typed columns"
+                    .to_string(),
+            ));
+        }
         let config = config
             .as_ref()
             .ok_or(Error::Process("Modbus input config is missing".to_string()))?;
         let config: ModbusInputConfig = serde_json::from_value(config.clone())
             .map_err(|e| Error::Process(format!("Failed to parse modbus input config:{}", e)))?;
-        Ok(Arc::new(ModbusInput::new(config, name.cloned(), codec)))
+        Ok(Arc::new(ModbusInput::new(config, name.cloned())))
     }
 }
 
@@ -270,4 +282,33 @@ pub fn init() -> Result<(), Error> {
         "interval": "1s",
         "points": [{"type": "holding_registers", "name": "voltage", "address": 0, "quantity": 1}]
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_errors_map_to_disconnection() {
+        assert!(matches!(
+            transport_error("read coils", std::io::Error::other("broken pipe")),
+            Error::Disconnection
+        ));
+    }
+
+    #[test]
+    fn modbus_input_builds_from_config() {
+        let config = serde_json::json!({
+            "addr": "127.0.0.1:502",
+            "slave_id": 1,
+            "interval": "1s",
+            "points": [{"type": "holding_registers", "name": "v", "address": 0, "quantity": 1}]
+        });
+        let resource = Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        };
+        let built = ModbusInputBuilder.build(None, &Some(config), None, &resource);
+        assert!(built.is_ok(), "config must build: {:?}", built.err());
+    }
 }

@@ -12,9 +12,9 @@ The JSON codec converts between line-delimited JSON byte payloads and columnar A
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | Fixed value `"json"` |
-| pretty | boolean | no | `false` | Metadata declaration field; the encoder currently always outputs newline-delimited form — whether this takes effect is governed by runtime behavior |
+| on_error | string | no | `fail` | Decode-error policy: `fail` (default) fails the whole batch on the first bad message; `skip` isolates bad messages — each is dropped with a warning and the rest of the batch still decodes |
 
-> The `build` implementation of this codec does not parse additional fields, so the configuration object can be omitted (i.e. `codec: { type: json }`). `pretty` is only declared in the component metadata schema.
+> The configuration object can be omitted (i.e. `codec: { type: json }`).
 
 ## Examples
 
@@ -40,6 +40,7 @@ output:
 
 ## Notes
 
-- On decode, multiple byte payloads are concatenated with `\n` and handed to the Arrow JSON reader in a single pass for schema inference; field types must be consistent within a batch, otherwise inference errors may occur.
+- In the default `fail` mode, multiple byte payloads are concatenated with `\n` and handed to the Arrow JSON reader in a single pass for schema inference; one malformed message fails the entire batch.
+- In `skip` mode each message decodes individually: bad messages are dropped with a warning (message index and error are logged) and the good messages are merged on the union schema — missing fields become null columns. A batch where every message fails still errors rather than returning an empty batch.
 - Encoded output is newline-delimited JSON (one object per line), convenient for downstream line-by-line parsing.
 - This codec implements both `Encoder` and `Decoder`, so it can be reused on both the input (decode) and output (encode) sides.

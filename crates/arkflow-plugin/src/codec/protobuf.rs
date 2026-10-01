@@ -31,12 +31,22 @@ use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource};
 use async_trait::async_trait;
-use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use prost_reflect::MessageDescriptor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::warn;
+
+/// Per-message decode-error policy: `fail` (default) fails the whole batch,
+/// `skip` isolates bad messages and decodes the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OnError {
+    #[default]
+    Fail,
+    Skip,
+}
 
 /// Protobuf codec configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +57,9 @@ struct ProtobufCodecConfig {
     proto_includes: Option<Vec<String>>,
     /// Protobuf message type name
     message_type: String,
+    /// Decode-error policy (see [`OnError`]).
+    #[serde(default)]
+    on_error: OnError,
 }
 
 impl ProtobufConfig for ProtobufCodecConfig {
@@ -62,6 +75,7 @@ impl ProtobufConfig for ProtobufCodecConfig {
 /// Protobuf Codec
 struct ProtobufCodec {
     descriptor: MessageDescriptor,
+    on_error: OnError,
 }
 
 impl ProtobufCodec {
@@ -85,6 +99,7 @@ impl ProtobufCodec {
 
         Ok(Self {
             descriptor: message_descriptor,
+            on_error: config.on_error,
         })
     }
 }
@@ -100,21 +115,46 @@ impl Encoder for ProtobufCodec {
 impl Decoder for ProtobufCodec {
     async fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
         let mut batches = Vec::with_capacity(b.len());
+        let mut skipped = 0usize;
 
-        for data in b {
-            let record_batch = protobuf_to_arrow(&self.descriptor, &data)?;
-            batches.push(record_batch);
+        for (idx, data) in b.into_iter().enumerate() {
+            match protobuf_to_arrow(&self.descriptor, &data) {
+                Ok(record_batch) => batches.push(record_batch),
+                Err(e) if self.on_error == OnError::Skip => {
+                    warn!(
+                        "protobuf codec: skipping message #{} ({} bytes): {}",
+                        idx,
+                        data.len(),
+                        e
+                    );
+                    skipped += 1;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
+        if skipped > 0 {
+            warn!(
+                "protobuf codec: skipped {} of {} messages in the batch",
+                skipped,
+                batches.len() + skipped
+            );
+        }
         if batches.is_empty() {
+            if skipped > 0 {
+                return Err(Error::Process(format!(
+                    "protobuf codec: all {} messages in the batch failed to decode",
+                    skipped
+                )));
+            }
             return Ok(MessageBatch::new_arrow(RecordBatch::new_empty(Arc::new(
                 Schema::empty(),
             ))));
         }
 
-        let schema = batches[0].schema();
-        let merged_batch = arrow::compute::concat_batches(&schema, &batches)
-            .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?;
+        // Same descriptor for every message keeps schemas identical; the
+        // union-merge is used defensively in case a descriptor evolves.
+        let merged_batch = crate::component::batch_merge::normalize_and_concat(&batches)?;
 
         Ok(MessageBatch::new_arrow(merged_batch))
     }
@@ -151,7 +191,8 @@ pub(crate) fn init() -> Result<(), Error> {
             "properties": {
                 "message_type": {"type": "string", "description": "Fully-qualified Protobuf message type name."},
                 "proto_inputs": {"type": "array", "items": {"type": "string"}, "description": "Paths to .proto files."},
-                "proto_includes": {"type": "array", "items": {"type": "string"}, "description": "Include paths for proto resolution."}
+                "proto_includes": {"type": "array", "items": {"type": "string"}, "description": "Include paths for proto resolution."},
+                "on_error": {"type": "string", "enum": ["fail", "skip"], "default": "fail", "description": "Decode-error policy: `fail` fails the batch (default), `skip` isolates bad messages with a warning and decodes the rest."}
             },
             "required": ["message_type", "proto_inputs"]
         }),
@@ -234,6 +275,7 @@ mod tests {
             proto_inputs: vec!["test.proto".to_string()],
             proto_includes: Some(vec!["/include".to_string()]),
             message_type: "TestMessage".to_string(),
+            on_error: OnError::default(),
         };
 
         assert_eq!(config.proto_inputs(), &vec!["test.proto".to_string()]);
@@ -312,6 +354,76 @@ message TestMessage {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded.column(0).data_type(), &DataType::Int64);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_codec_skip_isolates_bad_messages() -> Result<(), Error> {
+        let (_x, proto_dir) = create_test_proto_file()?;
+        let config = serde_json::json!({
+            "proto_inputs": [proto_dir.to_string_lossy()],
+            "message_type": "test.TestMessage",
+            "on_error": "skip",
+        });
+        let codec = ProtobufCodecBuilder.build(None, &Some(config), &create_test_resource())?;
+
+        let make_row = |t: i64| -> Result<MessageBatch, Error> {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "timestamp",
+                DataType::Int64,
+                false,
+            )]));
+            let rb = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![t]))])
+                .map_err(|e| Error::Process(e.to_string()))?;
+            Ok(MessageBatch::new_arrow(rb))
+        };
+        let good1 = codec
+            .encode(make_row(1)?)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap();
+        let good2 = codec
+            .encode(make_row(2)?)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let decoded = codec
+            .decode(vec![good1, b"garbage".to_vec(), good2])
+            .await?;
+        assert_eq!(decoded.len(), 2, "bad middle message must be skipped");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_codec_skip_all_bad_errors() -> Result<(), Error> {
+        let (_x, proto_dir) = create_test_proto_file()?;
+        let config = serde_json::json!({
+            "proto_inputs": [proto_dir.to_string_lossy()],
+            "message_type": "test.TestMessage",
+            "on_error": "skip",
+        });
+        let codec = ProtobufCodecBuilder.build(None, &Some(config), &create_test_resource())?;
+        let result = codec
+            .decode(vec![b"garbage".to_vec(), b"more garbage".to_vec()])
+            .await;
+        assert!(result.is_err(), "all-bad batch must error");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_codec_fail_mode_keeps_whole_batch_failure() -> Result<(), Error> {
+        let (_x, proto_dir) = create_test_proto_file()?;
+        let config = serde_json::json!({
+            "proto_inputs": [proto_dir.to_string_lossy()],
+            "message_type": "test.TestMessage",
+        });
+        let codec = ProtobufCodecBuilder.build(None, &Some(config), &create_test_resource())?;
+        let result = codec.decode(vec![b"garbage".to_vec()]).await;
+        assert!(result.is_err(), "default policy must fail the batch");
         Ok(())
     }
 }

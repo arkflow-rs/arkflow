@@ -18,7 +18,8 @@ use arkflow_core::{codec::Codec, Error, MessageBatch, MessageBatchRef, Resource}
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array,
+    Array, BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, StringArray,
+    UInt64Array,
 };
 use datafusion::arrow::datatypes::DataType;
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,21 @@ enum DatabaseConnection {
 }
 
 impl DatabaseConnection {
+    /// Closes the underlying connection explicitly (rather than waiting
+    /// for the object to drop). Consumes the connection: sqlx `close` takes
+    /// ownership.
+    async fn close(self) -> Result<(), Error> {
+        match self {
+            DatabaseConnection::Mysql(conn) => conn
+                .close()
+                .await
+                .map_err(|e| Error::Process(format!("Failed to close MySQL connection: {}", e))),
+            DatabaseConnection::Postgres(conn) => conn.close().await.map_err(|e| {
+                Error::Process(format!("Failed to close PostgreSQL connection: {}", e))
+            }),
+        }
+    }
+
     /// Executes an INSERT query with the given columns and rows
     /// Handles type conversion and proper escaping for different database types
     /// Returns a Result indicating success or detailed error information
@@ -111,13 +127,12 @@ async fn execute_insert_transactional(
                     .build()
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|e| {
-                        Error::Process(format!("Failed to execute MySQL query: {}", e))
-                    })?;
+                    .map_err(|e| Error::Process(format!("Failed to execute MySQL query: {}", e)))?;
             }
-            transaction.commit().await.map_err(|e| {
-                Error::Process(format!("Failed to commit MySQL transaction: {}", e))
-            })
+            transaction
+                .commit()
+                .await
+                .map_err(|e| Error::Process(format!("Failed to commit MySQL transaction: {}", e)))
         }
         DatabaseConnection::Postgres(conn) => {
             let mut transaction = conn.begin().await.map_err(|e| {
@@ -241,10 +256,7 @@ fn build_postgres_insert(
 }
 
 /// Checks that every configured upsert key exists in the batch schema.
-fn validate_upsert_keys(
-    output_config: &SqlOutputConfig,
-    columns: &[String],
-) -> Result<(), Error> {
+fn validate_upsert_keys(output_config: &SqlOutputConfig, columns: &[String]) -> Result<(), Error> {
     if !output_config.upsert {
         return Ok(());
     }
@@ -367,18 +379,16 @@ struct SqlOutput {
     sql_config: SqlOutputConfig,
     conn_lock: Arc<Mutex<Option<DatabaseConnection>>>,
     cancellation_token: CancellationToken,
-    codec: Option<Arc<dyn Codec>>,
 }
 
 impl SqlOutput {
-    fn new(sql_config: SqlOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
+    fn new(sql_config: SqlOutputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
 
         Ok(Self {
             sql_config,
             conn_lock: Arc::new(Mutex::new(None)),
             cancellation_token,
-            codec,
         })
     }
 }
@@ -396,18 +406,8 @@ impl Output for SqlOutput {
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         let mut conn_guard = self.conn_lock.lock().await;
         let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
-
-        // Apply codec encoding if configured, otherwise use the message as-is
-        let processed_msg = if let Some(codec) = &self.codec {
-            let encoded = codec.encode((*msg).clone()).await?;
-            // Convert encoded bytes back to MessageBatch for SQL insertion
-            // This is a simplified approach - in practice, you might need more sophisticated handling
-            MessageBatch::new_binary(encoded)?
-        } else {
-            (*msg).clone()
-        };
-
-        self.insert_row(conn, &processed_msg).await?;
+        // SQL writes consume typed columns; a codec is rejected at build time.
+        self.insert_row(conn, &msg).await?;
         Ok(())
     }
 
@@ -419,12 +419,7 @@ impl Output for SqlOutput {
         let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
         let mut batches = Vec::with_capacity(msgs.len());
         for msg in msgs {
-            let processed: MessageBatch = if let Some(codec) = &self.codec {
-                let encoded = codec.encode((**msg).clone()).await?;
-                MessageBatch::new_binary(encoded)?
-            } else {
-                (**msg).clone()
-            };
+            let processed: MessageBatch = (**msg).clone();
             let schema = processed.schema();
             let num_rows = processed.len();
             let num_columns = schema.fields().len();
@@ -434,9 +429,11 @@ impl Output for SqlOutput {
             validate_upsert_keys(&self.sql_config, &columns)?;
             let mut rows = Vec::with_capacity(num_columns * num_rows);
             for row_index in 0..num_rows {
-                for col_index in 0..num_columns {
+                for (col_index, column_name) in columns.iter().enumerate() {
                     let column = processed.column(col_index);
-                    let value = self.matching_data_type(column, row_index).await?;
+                    let value = self
+                        .matching_data_type(column_name, column, row_index)
+                        .await?;
                     rows.push(value);
                 }
             }
@@ -451,6 +448,10 @@ impl Output for SqlOutput {
 
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.cancel();
+        let mut conn_guard = self.conn_lock.lock().await;
+        if let Some(conn) = conn_guard.take() {
+            conn.close().await?;
+        }
         Ok(())
     }
 }
@@ -486,10 +487,12 @@ impl SqlOutput {
 
         let mut rows = Vec::with_capacity(num_columns * num_rows);
         for row_index in 0..num_rows {
-            for col_index in 0..num_columns {
+            for (col_index, column_name) in columns.iter().enumerate() {
                 let column = msg.column(col_index);
 
-                let value = self.matching_data_type(column, row_index).await?;
+                let value = self
+                    .matching_data_type(column_name, column, row_index)
+                    .await?;
                 rows.push(value);
             }
         }
@@ -502,14 +505,28 @@ impl SqlOutput {
         Ok(())
     }
 
-    // Convert Arrow data types to SQL-compatible string representation
+    // Convert one Arrow cell to a SQL parameter value. The column name is
+    // included in type errors so the offending column is identifiable.
     async fn matching_data_type(
         &self,
+        name: &str,
         column: &dyn Array,
         row_index: usize,
     ) -> Result<SqlValue, Error> {
-        // Determine the data type of the column and convert to appropriate SQL format
+        // One cell: null stays SQL NULL; otherwise the call-site closure
+        // converts (and optionally widens) the native value.
+        macro_rules! cell {
+            ($arr:expr, $i:expr, $conv:expr) => {
+                if $arr.is_null($i) {
+                    Ok(SqlValue::Null)
+                } else {
+                    Ok(($conv)($arr.value($i)))
+                }
+            };
+        }
         let column_type = column.data_type();
+        // Narrow integer widths up to i64/u64, Float32 to f64, temporal
+        // values to ISO strings; complex types are rejected with context.
         match column_type {
             DataType::Utf8 => {
                 let utf8_array = column.as_any().downcast_ref::<StringArray>().unwrap();
@@ -519,29 +536,68 @@ impl SqlOutput {
                     Ok(SqlValue::String(utf8_array.value(row_index).to_string()))
                 }
             }
+            // Narrow integer/float widths widen losslessly to i64/u64/f64
+            // parameter values; each width reads its own concrete array.
             DataType::Int64 => {
-                let int_array = column.as_any().downcast_ref::<Int64Array>().unwrap();
-                if int_array.is_null(row_index) {
-                    Ok(SqlValue::Null)
-                } else {
-                    Ok(SqlValue::Int64(int_array.value(row_index)))
-                }
+                let a = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                cell!(a, row_index, SqlValue::Int64)
+            }
+            DataType::Int32 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                    .unwrap();
+                cell!(a, row_index, |v| SqlValue::Int64(v as i64))
+            }
+            DataType::Int16 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int16Array>()
+                    .unwrap();
+                cell!(a, row_index, |v| SqlValue::Int64(v as i64))
+            }
+            DataType::Int8 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int8Array>()
+                    .unwrap();
+                cell!(a, row_index, |v| SqlValue::Int64(v as i64))
             }
             DataType::UInt64 => {
-                let uint_array = column.as_any().downcast_ref::<UInt64Array>().unwrap();
-                if uint_array.is_null(row_index) {
-                    Ok(SqlValue::Null)
-                } else {
-                    Ok(SqlValue::UInt64(uint_array.value(row_index)))
-                }
+                let a = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+                cell!(a, row_index, SqlValue::UInt64)
+            }
+            DataType::UInt32 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                    .unwrap();
+                cell!(a, row_index, |v| SqlValue::UInt64(v as u64))
+            }
+            DataType::UInt16 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::UInt16Array>()
+                    .unwrap();
+                cell!(a, row_index, |v| SqlValue::UInt64(v as u64))
+            }
+            DataType::UInt8 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::UInt8Array>()
+                    .unwrap();
+                cell!(a, row_index, |v| SqlValue::UInt64(v as u64))
             }
             DataType::Float64 => {
-                let float_array = column.as_any().downcast_ref::<Float64Array>().unwrap();
-                if float_array.is_null(row_index) {
-                    Ok(SqlValue::Null)
-                } else {
-                    Ok(SqlValue::Float64(float_array.value(row_index)))
-                }
+                let a = column.as_any().downcast_ref::<Float64Array>().unwrap();
+                cell!(a, row_index, SqlValue::Float64)
+            }
+            DataType::Float32 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Float32Array>()
+                    .unwrap();
+                cell!(a, row_index, |v| SqlValue::Float64(v as f64))
             }
             DataType::Boolean => {
                 let bool_array = column.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -551,10 +607,65 @@ impl SqlOutput {
                     Ok(SqlValue::Boolean(bool_array.value(row_index)))
                 }
             }
+            DataType::Date32 | DataType::Date64 => {
+                // value_as_date reads the raw slot without consulting the
+                // null bitmap: a null slot usually stores 0 and would
+                // insert 1970-01-01 instead of NULL.
+                if column.is_null(row_index) {
+                    return Ok(SqlValue::Null);
+                }
+                let date = if let Some(arr) = column.as_any().downcast_ref::<Date32Array>() {
+                    arr.value_as_date(row_index)
+                } else if let Some(arr) = column.as_any().downcast_ref::<Date64Array>() {
+                    arr.value_as_date(row_index)
+                } else {
+                    None
+                };
+                match date {
+                    Some(d) => Ok(SqlValue::String(d.to_string())),
+                    None => Ok(SqlValue::Null),
+                }
+            }
+            DataType::Timestamp(_, _) => Self::timestamp_value(column, row_index),
             _ => Err(Error::Process(format!(
-                "Unsupported data type: {:?}",
-                column_type
+                "Unsupported data type for column `{}`: {} (supported: Utf8, Boolean, Int8-64, UInt8-64, Float32/64, Date32/64, Timestamp)",
+                name, column_type
             ))),
+        }
+    }
+
+    /// Format a timestamp cell of any unit as an RFC3339 string parameter.
+    fn timestamp_value(column: &dyn Array, row_index: usize) -> Result<SqlValue, Error> {
+        // Same null-bitmap caveat as the Date branch: value_as_datetime
+        // would turn a null slot into 1970-01-01T00:00:00+00:00.
+        if column.is_null(row_index) {
+            return Ok(SqlValue::Null);
+        }
+        use datafusion::arrow::array::{
+            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+            TimestampSecondArray,
+        };
+        let dt = match column.data_type() {
+            DataType::Timestamp(_, _) => {
+                if let Some(a) = column.as_any().downcast_ref::<TimestampSecondArray>() {
+                    a.value_as_datetime(row_index)
+                } else if let Some(a) = column.as_any().downcast_ref::<TimestampMillisecondArray>()
+                {
+                    a.value_as_datetime(row_index)
+                } else if let Some(a) = column.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                {
+                    a.value_as_datetime(row_index)
+                } else if let Some(a) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                    a.value_as_datetime(row_index)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        match dt {
+            Some(dt) => Ok(SqlValue::String(dt.and_utc().to_rfc3339())),
+            None => Ok(SqlValue::Null),
         }
     }
 
@@ -603,8 +714,21 @@ impl OutputBuilder for SqlOutputBuilder {
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         let config: SqlOutputConfig = parse_config(config, "SqlOutput input")?;
+        // SQL writes map typed Arrow columns to bound parameters; encoding
+        // the batch through a codec would produce a Binary payload column
+        // that can never insert. Reject at build time instead of failing
+        // on every write.
+        if codec.is_some() {
+            return Err(Error::Config(
+                "sql output does not support a codec: it writes typed columns directly".to_string(),
+            ));
+        }
         if config.upsert {
-            if config.upsert_keys.as_ref().is_none_or(|keys| keys.is_empty()) {
+            if config
+                .upsert_keys
+                .as_ref()
+                .is_none_or(|keys| keys.is_empty())
+            {
                 return Err(Error::Config(
                     "sql output: upsert = true requires a non-empty upsert_keys list".to_string(),
                 ));
@@ -620,7 +744,7 @@ impl OutputBuilder for SqlOutputBuilder {
                 ));
             }
         }
-        Ok(Arc::new(SqlOutput::new(config, codec)?))
+        Ok(Arc::new(SqlOutput::new(config)?))
     }
 }
 
@@ -676,10 +800,7 @@ mod tests {
     }
 
     fn rows() -> Vec<Vec<SqlValue>> {
-        vec![vec![
-            SqlValue::Int64(1),
-            SqlValue::String("a".to_string()),
-        ]]
+        vec![vec![SqlValue::Int64(1), SqlValue::String("a".to_string())]]
     }
 
     fn resource() -> Resource {
@@ -701,14 +822,11 @@ mod tests {
 
     #[test]
     fn postgres_upsert_uses_on_conflict_do_update() {
-        let sql = build_postgres_insert(
-            &postgres_config(true, Some(vec!["id"])),
-            &columns(),
-            rows(),
-        )
-        .build()
-        .sql()
-        .to_string();
+        let sql =
+            build_postgres_insert(&postgres_config(true, Some(vec!["id"])), &columns(), rows())
+                .build()
+                .sql()
+                .to_string();
         assert!(sql.contains("ON CONFLICT (\"id\") DO UPDATE SET"));
         assert!(sql.contains("\"name\" = EXCLUDED.\"name\""));
         // key columns are not assigned in the update set
@@ -823,5 +941,130 @@ mod tests {
         // keys referencing unknown columns are irrelevant when upsert is off
         let config = postgres_config(false, Some(vec!["missing"]));
         assert!(validate_upsert_keys(&config, &columns()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn matching_data_type_widens_narrow_widths() {
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        use datafusion::arrow::array::{
+            Date32Array, Float32Array, Int32Array, TimestampNanosecondArray,
+        };
+
+        let i32s = Int32Array::from(vec![Some(-7)]);
+        assert!(matches!(
+            output.matching_data_type("narrow", &i32s, 0).await.unwrap(),
+            SqlValue::Int64(-7)
+        ));
+
+        let f32s = Float32Array::from(vec![Some(1.5f32)]);
+        assert!(matches!(
+            output.matching_data_type("f", &f32s, 0).await.unwrap(),
+            SqlValue::Float64(v) if (v - 1.5f64).abs() < f64::EPSILON
+        ));
+
+        let dates = Date32Array::from(vec![Some(0)]);
+        assert!(matches!(
+            output.matching_data_type("d", &dates, 0).await.unwrap(),
+            SqlValue::String(ref s) if s == "1970-01-01"
+        ));
+
+        let ts = TimestampNanosecondArray::from(vec![Some(0)]);
+        assert!(matches!(
+            output.matching_data_type("ts", &ts, 0).await.unwrap(),
+            SqlValue::String(ref s) if s.starts_with("1970-01-01T00:00:00")
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_data_type_null_temporal_cells_stay_null() {
+        // Regression (CR): value_as_date/value_as_datetime ignore the null
+        // bitmap — a null slot stores 0 and used to insert the epoch
+        // (1970-01-01 / 1970-01-01T00:00:00+00:00) instead of NULL.
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        use datafusion::arrow::array::{Date32Array, TimestampNanosecondArray};
+
+        let dates = Date32Array::from(vec![Some(0), None]);
+        assert!(matches!(
+            output.matching_data_type("d", &dates, 1).await.unwrap(),
+            SqlValue::Null
+        ));
+
+        let ts = TimestampNanosecondArray::from(vec![None]);
+        assert!(matches!(
+            output.matching_data_type("ts", &ts, 0).await.unwrap(),
+            SqlValue::Null
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_data_type_rejects_complex_type_with_column_name() {
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        let list_field = datafusion::arrow::datatypes::Field::new(
+            "tags",
+            datafusion::arrow::datatypes::DataType::List(std::sync::Arc::new(
+                datafusion::arrow::datatypes::Field::new("item", DataType::Utf8, true),
+            )),
+            true,
+        );
+        let schema =
+            std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![list_field]));
+        let rb = datafusion::arrow::array::RecordBatch::new_empty(schema);
+        let batch = arkflow_core::MessageBatch::new_arrow(rb);
+        let err = output
+            .matching_data_type("tags", batch.column(0), 0)
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`tags`"),
+            "error must name the column, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_codec() {
+        let config = serde_json::json!({
+            "output_type": {"type": "postgres", "uri": "postgres://user:pass@localhost/db"},
+            "table_name": "events"
+        });
+        struct NoopCodec;
+        #[async_trait]
+        impl arkflow_core::codec::Encoder for NoopCodec {
+            async fn encode(
+                &self,
+                _batch: arkflow_core::MessageBatch,
+            ) -> Result<Vec<arkflow_core::Bytes>, Error> {
+                Ok(Vec::new())
+            }
+        }
+        #[async_trait]
+        impl arkflow_core::codec::Decoder for NoopCodec {
+            async fn decode(
+                &self,
+                _b: Vec<arkflow_core::Bytes>,
+            ) -> Result<arkflow_core::MessageBatch, Error> {
+                Err(Error::Process("noop".to_string()))
+            }
+        }
+        let codec: Option<std::sync::Arc<dyn arkflow_core::codec::Codec>> =
+            Some(std::sync::Arc::new(NoopCodec));
+        let err = match SqlOutputBuilder.build(None, &Some(config.clone()), codec, &resource()) {
+            Err(e) => e,
+            Ok(_) => panic!("codec must be rejected at build time"),
+        };
+        assert!(
+            format!("{err}").contains("codec"),
+            "error must explain the codec rejection: {err}"
+        );
+        // without a codec, build succeeds (parse-only)
+        assert!(SqlOutputBuilder
+            .build(None, &Some(config), None, &resource())
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_on_unconnected_output_is_ok() {
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        assert!(output.close().await.is_ok());
     }
 }

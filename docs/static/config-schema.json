@@ -663,7 +663,8 @@
               "topics": [
                 "events"
               ],
-              "consumer_group": "arkflow"
+              "consumer_group": "arkflow",
+              "start_from_latest": false
             }
           ]
         },
@@ -1166,16 +1167,26 @@
                 {
                   "type": "kafka",
                   "name": "events",
+                  "brokers": [
+                    "localhost:9092"
+                  ],
                   "topics": [
                     "events"
-                  ]
+                  ],
+                  "consumer_group": "arkflow",
+                  "start_from_latest": false
                 },
                 {
                   "type": "kafka",
                   "name": "logs",
+                  "brokers": [
+                    "localhost:9092"
+                  ],
                   "topics": [
                     "logs"
-                  ]
+                  ],
+                  "consumer_group": "arkflow",
+                  "start_from_latest": false
                 }
               ]
             }
@@ -1643,12 +1654,12 @@
         {
           "type": "object",
           "title": "sql",
-          "description": "Polls a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) with a SELECT statement and emits rows as batches.",
+          "description": "Runs a one-shot SELECT against a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) and emits the rows as batches.",
           "properties": {
             "type": {
               "type": "string",
               "const": "sql",
-              "description": "Polls a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) with a SELECT statement and emits rows as batches."
+              "description": "Runs a one-shot SELECT against a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) and emits the rows as batches."
             },
             "name": {
               "type": "string",
@@ -1716,11 +1727,7 @@
             },
             "select_sql": {
               "type": "string",
-              "description": "SELECT statement to execute on every poll."
-            },
-            "poll_interval": {
-              "type": "string",
-              "description": "Optional poll interval (humantime)."
+              "description": "SELECT statement executed once at startup."
             },
             "ballista": {
               "type": "object",
@@ -1737,7 +1744,6 @@
           "examples": [
             {
               "select_sql": "SELECT id, name FROM users",
-              "poll_interval": "10s",
               "input_type": {
                 "type": "sqlite",
                 "name": "users",
@@ -2362,12 +2368,78 @@
               "description": "List of Kafka broker addresses."
             },
             "topic": {
-              "type": "string",
-              "description": "Destination topic (supports {field} placeholders)."
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "const": "value"
+                    },
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "value"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "const": "expr"
+                    },
+                    "expr": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "expr"
+                  ],
+                  "additionalProperties": false
+                }
+              ],
+              "description": "Literal value or a SQL expression evaluated per batch."
             },
             "key": {
-              "type": "string",
-              "description": "Field used as the message key for partitioning."
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "const": "value"
+                    },
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "value"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "const": "expr"
+                    },
+                    "expr": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "expr"
+                  ],
+                  "additionalProperties": false
+                }
+              ],
+              "description": "Literal value or a SQL expression evaluated per batch."
             },
             "client_id": {
               "type": "string",
@@ -2488,7 +2560,10 @@
               "brokers": [
                 "localhost:9092"
               ],
-              "topic": "events"
+              "topic": {
+                "type": "value",
+                "value": "events"
+              }
             }
           ]
         },
@@ -2814,8 +2889,41 @@
               "description": "Optional password."
             },
             "topic": {
-              "type": "string",
-              "description": "Destination topic (supports {field} placeholders)."
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "const": "value"
+                    },
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "value"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "const": "expr"
+                    },
+                    "expr": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "expr"
+                  ],
+                  "additionalProperties": false
+                }
+              ],
+              "description": "Literal value or a SQL expression evaluated per batch."
             },
             "qos": {
               "type": "integer",
@@ -2840,6 +2948,10 @@
               "type": "boolean",
               "default": false,
               "description": "Whether to retain the message on the broker."
+            },
+            "value_field": {
+              "type": "string",
+              "description": "Column whose per-row value becomes the message payload (binary or string column). When unset, the codec encoding of the batch applies."
             },
             "tls": {
               "type": "object",
@@ -2872,7 +2984,10 @@
               "host": "localhost",
               "port": 1883,
               "client_id": "arkflow",
-              "topic": "sensors/data"
+              "topic": {
+                "type": "value",
+                "value": "sensors/data"
+              }
             }
           ]
         },
@@ -2964,7 +3079,40 @@
                       "const": "regular"
                     },
                     "subject": {
-                      "type": "string"
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "value"
+                            },
+                            "value": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "value"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "expr"
+                            },
+                            "expr": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "expr"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
                     }
                   },
                   "required": [
@@ -2981,7 +3129,40 @@
                       "type": "string"
                     },
                     "subject": {
-                      "type": "string"
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "value"
+                            },
+                            "value": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "value"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "expr"
+                            },
+                            "expr": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "expr"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
                     }
                   },
                   "required": [
@@ -3009,7 +3190,10 @@
               "url": "nats://localhost:4222",
               "mode": {
                 "type": "regular",
-                "subject": "events"
+                "subject": {
+                  "type": "value",
+                  "value": "events"
+                }
               }
             }
           ]
@@ -3362,12 +3546,12 @@
         {
           "type": "object",
           "title": "redis",
-          "description": "Writes messages to Redis: streams, lists, or pub/sub channels.",
+          "description": "Writes messages to Redis via publish, list rpush, hashes, or plain strings.",
           "properties": {
             "type": {
               "type": "string",
               "const": "redis",
-              "description": "Writes messages to Redis: streams, lists, or pub/sub channels."
+              "description": "Writes messages to Redis via publish, list rpush, hashes, or plain strings."
             },
             "name": {
               "type": "string",
@@ -3477,15 +3661,48 @@
                 {
                   "properties": {
                     "type": {
-                      "const": "stream"
+                      "const": "publish"
                     },
-                    "stream": {
-                      "type": "string"
+                    "channel": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "value"
+                            },
+                            "value": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "value"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "expr"
+                            },
+                            "expr": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "expr"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
                     }
                   },
                   "required": [
                     "type",
-                    "stream"
+                    "channel"
                   ]
                 },
                 {
@@ -3493,27 +3710,177 @@
                     "type": {
                       "const": "list"
                     },
-                    "list": {
-                      "type": "string"
+                    "key": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "value"
+                            },
+                            "value": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "value"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "expr"
+                            },
+                            "expr": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "expr"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
                     }
                   },
                   "required": [
                     "type",
-                    "list"
+                    "key"
                   ]
                 },
                 {
                   "properties": {
                     "type": {
-                      "const": "channel"
+                      "const": "hashes"
                     },
-                    "channel": {
-                      "type": "string"
+                    "key": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "value"
+                            },
+                            "value": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "value"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "expr"
+                            },
+                            "expr": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "expr"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    },
+                    "field": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "value"
+                            },
+                            "value": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "value"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "expr"
+                            },
+                            "expr": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "expr"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
                     }
                   },
                   "required": [
                     "type",
-                    "channel"
+                    "key",
+                    "field"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "strings"
+                    },
+                    "key": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "value"
+                            },
+                            "value": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "value"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "const": "expr"
+                            },
+                            "expr": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "expr"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "key"
                   ]
                 }
               ]
@@ -3533,8 +3900,11 @@
                 "url": "redis://localhost:6379"
               },
               "redis_type": {
-                "type": "stream",
-                "stream": "events"
+                "type": "publish",
+                "channel": {
+                  "type": "value",
+                  "value": "events"
+                }
               }
             }
           ]
@@ -3745,10 +4115,10 @@
                 }
               ]
             },
-            "pretty": {
+            "append_newline": {
               "type": "boolean",
-              "default": false,
-              "description": "Pretty-print JSON output."
+              "default": true,
+              "description": "Append a newline after each message."
             }
           },
           "required": [
@@ -3756,7 +4126,7 @@
           ],
           "examples": [
             {
-              "pretty": true
+              "append_newline": true
             }
           ]
         }
@@ -3868,10 +4238,16 @@
                 }
               ]
             },
-            "pretty": {
-              "type": "boolean",
-              "default": false,
-              "description": "Pretty-print JSON output."
+            "value_field": {
+              "type": "string",
+              "description": "Binary column carrying one JSON payload per row (defaults to the standard binary value column)."
+            },
+            "fields_to_include": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Only emit these top-level fields."
             }
           },
           "required": [
@@ -3985,12 +4361,12 @@
         {
           "type": "object",
           "title": "batch",
-          "description": "Batches messages by count, size, or time interval before forwarding.",
+          "description": "Batches messages by count with an idle timeout before forwarding.",
           "properties": {
             "type": {
               "type": "string",
               "const": "batch",
-              "description": "Batches messages by count, size, or time interval before forwarding."
+              "description": "Batches messages by count with an idle timeout before forwarding."
             },
             "name": {
               "type": "string",
@@ -4059,16 +4435,12 @@
             "count": {
               "type": "integer",
               "minimum": 1,
-              "description": "Maximum number of messages per batch."
+              "description": "Number of messages per batch."
             },
-            "size": {
+            "timeout_ms": {
               "type": "integer",
               "minimum": 1,
-              "description": "Approximate maximum byte size per batch."
-            },
-            "interval": {
-              "type": "string",
-              "description": "Maximum time to wait before flushing a partial batch (humantime)."
+              "description": "Idle timeout that flushes a partial batch (milliseconds)."
             }
           },
           "required": [
@@ -4077,7 +4449,7 @@
           "examples": [
             {
               "count": 100,
-              "interval": "5s"
+              "timeout_ms": 5000
             }
           ]
         },
@@ -4278,10 +4650,16 @@
                 }
               ]
             },
-            "batch_size": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Rows per output batch."
+            "value_field": {
+              "type": "string",
+              "description": "Binary column carrying one JSON payload per row (defaults to the standard binary value column)."
+            },
+            "fields_to_include": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Only parse these top-level fields into columns."
             }
           },
           "required": [
@@ -4896,18 +5274,30 @@
             },
             "script": {
               "type": "string",
-              "description": "Python source defining the transform function."
+              "description": "Python source defining the transform function (optional when importing an existing module)."
+            },
+            "module": {
+              "type": "string",
+              "default": "__main__",
+              "description": "Python module providing the function."
             },
             "function": {
               "type": "string",
               "description": "Name of the function to invoke for each batch."
             },
-            "extra_packages": {
+            "python_path": {
               "type": "array",
               "items": {
                 "type": "string"
               },
-              "description": "Optional list of pip packages to install before running."
+              "default": [],
+              "description": "Extra sys.path entries, earlier entries take precedence."
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 60000,
+              "description": "Upper bound for one UDF call in milliseconds; longer calls fail the batch."
             }
           },
           "required": [
@@ -5876,10 +6266,14 @@
                 }
               ]
             },
-            "pretty": {
-              "type": "boolean",
-              "default": false,
-              "description": "Pretty-print JSON output."
+            "on_error": {
+              "type": "string",
+              "enum": [
+                "fail",
+                "skip"
+              ],
+              "default": "fail",
+              "description": "Decode-error policy: `fail` fails the batch (default), `skip` isolates bad messages with a warning and decodes the rest."
             }
           },
           "required": [
@@ -5977,6 +6371,15 @@
                 "type": "string"
               },
               "description": "Include paths for proto resolution."
+            },
+            "on_error": {
+              "type": "string",
+              "enum": [
+                "fail",
+                "skip"
+              ],
+              "default": "fail",
+              "description": "Decode-error policy: `fail` fails the batch (default), `skip` isolates bad messages with a warning and decodes the rest."
             }
           },
           "required": [

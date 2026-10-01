@@ -22,7 +22,7 @@ The MQTT output publishes each message to an MQTT broker topic. It supports QoS 
 | clean_session | boolean | no | — | Whether to use a clean session. |
 | keep_alive | integer | no | — | Keep-alive interval in seconds. |
 | retain | boolean | no | — | Whether to retain the message on the broker. |
-| value_field | string | no | — | Record field used as the message payload. |
+| value_field | string | no | — | Binary or string column whose per-row value becomes that message's payload (a null value or a missing column is an error). When unset, the codec encoding of the batch applies. |
 
 ### topic
 
@@ -33,6 +33,8 @@ The MQTT output publishes each message to an MQTT broker topic. It supports QoS 
 | type | string | yes | `value` (static) or `expr` (SQL expression). |
 | value | string | yes (`value`) | Static topic name. |
 | expr | string | yes (`expr`) | SQL expression evaluated per message. |
+
+An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
 
 ## TLS
 

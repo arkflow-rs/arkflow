@@ -175,17 +175,17 @@ pub fn init() -> Result<(), Error> {
     register_processor_builder("batch", Arc::new(BatchProcessorBuilder))?;
     register_processor_metadata(ComponentMetadata::with_schema(
         "batch",
-        "Batches messages by count, size, or time interval before forwarding.",
+        "Batches messages by count with an idle timeout before forwarding.",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "count": {"type": "integer", "minimum": 1, "description": "Maximum number of messages per batch."},
-                "size": {"type": "integer", "minimum": 1, "description": "Approximate maximum byte size per batch."},
-                "interval": {"type": "string", "description": "Maximum time to wait before flushing a partial batch (humantime)."}
-            }
+                "count": {"type": "integer", "minimum": 1, "description": "Number of messages per batch."},
+                "timeout_ms": {"type": "integer", "minimum": 1, "description": "Idle timeout that flushes a partial batch (milliseconds)."}
+            },
+            "required": ["count", "timeout_ms"]
         }),
-    ).with_optional().with_example(serde_json::json!({"count": 100, "interval": "5s"})))
+    ).with_optional().with_example(serde_json::json!({"count": 100, "timeout_ms": 5000})))
 }
 
 #[cfg(test)]
@@ -329,7 +329,10 @@ mod tests {
         // EOS drains the partial batch instead of dropping it in close
         match processor.finish().await.unwrap() {
             ProcessResult::Single(batch) => assert_eq!(batch.len(), 2),
-            other => panic!("expected ProcessResult::Single, got empty: {}", other.is_empty()),
+            other => panic!(
+                "expected ProcessResult::Single, got empty: {}",
+                other.is_empty()
+            ),
         }
 
         // A second finish has nothing left to emit
@@ -359,7 +362,10 @@ mod tests {
         // The idle tick fires the timeout flush without a new arrival
         match processor.on_tick().await.unwrap() {
             ProcessResult::Single(batch) => assert_eq!(batch.len(), 1),
-            other => panic!("expected ProcessResult::Single, got empty: {}", other.is_empty()),
+            other => panic!(
+                "expected ProcessResult::Single, got empty: {}",
+                other.is_empty()
+            ),
         }
     }
 

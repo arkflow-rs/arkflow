@@ -12,7 +12,7 @@
  *    limitations under the License.
  */
 use arkflow_core::Error;
-use datafusion::arrow::array::{RecordBatch, StringArray};
+use datafusion::arrow::array::{Array, RecordBatch, StringArray};
 use datafusion::common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_plan::PhysicalExpr;
@@ -63,10 +63,26 @@ impl Expr<String> {
                     ColumnarValue::Array(v) => {
                         let v_option = v.as_any().downcast_ref::<StringArray>();
                         if let Some(v) = v_option {
-                            let x: Vec<String> = v
-                                .into_iter()
-                                .filter_map(|x| x.map(|s| s.to_string()))
-                                .collect();
+                            // Row alignment invariant: the result must carry
+                            // one cell per batch row, so consumers can index
+                            // by row. A null cell has no destination meaning
+                            // (topic/key/subject) — dropping it would shift
+                            // every later row onto the wrong destination, so
+                            // it is a loud error instead.
+                            let mut x: Vec<String> = Vec::with_capacity(v.len());
+                            for (row, cell) in v.iter().enumerate() {
+                                match cell {
+                                    Some(s) => x.push(s.to_string()),
+                                    None => {
+                                        return Err(Error::Process(format!(
+                                            "Expression `{expr}` evaluated to NULL at row {row}; \
+                                             per-row destinations (topic/key/subject) must be \
+                                             non-null — wrap the expression in COALESCE or \
+                                             filter the rows upstream",
+                                        )))
+                                    }
+                                }
+                            }
                             Ok(EvaluateResult::Vec(x))
                         } else {
                             Err(Error::Process("Failed to evaluate expression".to_string()))
@@ -209,5 +225,52 @@ mod tests {
             expr: "1 + name".to_string(), // Trying to add number to string
         };
         assert!(expr.evaluate_expr(&batch).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_null_cell_errors_with_expression_and_row() {
+        // A null cell must never shrink the result vector: consumers index
+        // destinations (topic/key/subject) by row, so a dropped cell would
+        // shift every later row onto the wrong destination.
+        let batch = RecordBatch::try_from_iter([(
+            "name",
+            Arc::new(StringArray::from(vec![Some("Alice"), None, Some("Charlie")])) as _,
+        )])
+        .unwrap();
+
+        // A bare column reference keeps the null (functions like `concat`
+        // swallow null arguments, so they would not exercise the path).
+        let expr = Expr::Expr {
+            expr: "name".to_string(),
+        };
+        let err = match expr.evaluate_expr(&batch).await {
+            Err(e) => e,
+            Ok(_) => panic!("null cell must fail the evaluation"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`name`") && msg.contains("row 1"),
+            "error must name the expression and the null row, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_null_column_result_is_row_aligned() {
+        let batch = RecordBatch::try_from_iter([(
+            "name",
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])) as _,
+        )])
+        .unwrap();
+
+        let expr = Expr::Expr {
+            expr: "name".to_string(),
+        };
+        match expr.evaluate_expr(&batch).await.unwrap() {
+            EvaluateResult::Vec(v) => {
+                assert_eq!(v.len(), batch.num_rows(), "one cell per row, no gaps");
+                assert_eq!(v, vec!["a", "b", "c"]);
+            }
+            _ => panic!("Expected vector result"),
+        }
     }
 }

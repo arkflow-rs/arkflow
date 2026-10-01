@@ -21,16 +21,16 @@
 
 use crate::codec::avro_arrow::avro_to_arrow;
 use crate::component::protobuf::{parse_proto_source, protobuf_to_arrow};
+use apache_avro::Schema as AvroSchema;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{Bytes, Error, MessageBatch, Resource};
 use async_trait::async_trait;
-use apache_avro::Schema as AvroSchema;
 use dashmap::DashMap;
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use prost_reflect::MessageDescriptor;
 use serde::Deserialize;
 use serde_json::Value;
@@ -63,6 +63,11 @@ const SUBJECT_PATH_SEGMENT: &AsciiSet = &CONTROLS
 #[derive(Debug, Clone)]
 pub enum FetchedSchema {
     Protobuf(String),
+    /// `schemaType` was omitted by the registry and content detection chose
+    /// Protobuf (the text is not a JSON object). Parsing happens lazily like
+    /// [`FetchedSchema::Protobuf`]; the variant only carries how the choice
+    /// was made so a parse failure can name both detection attempts.
+    ProtobufByDetection(String),
     Avro(AvroSchema),
 }
 
@@ -160,9 +165,19 @@ pub struct SchemaRegistryCodec {
     resolver: Arc<dyn SchemaResolver>,
     cache: DashMap<u32, CachedSchema>,
     gate: Option<CompatibilityGate>,
-    /// Gate verdict for the codec lifetime (failures included), so the config
-    /// endpoint is hit at most once.
-    gate_state: tokio::sync::OnceCell<Result<(), String>>,
+    /// Gate state: a pass verdict is cached for the codec lifetime; a failure
+    /// is retried on later decodes no sooner than `gate_retry_interval` so a
+    /// transient registry outage does not brick the codec.
+    gate_state: tokio::sync::RwLock<GateState>,
+    gate_retry_interval: std::time::Duration,
+}
+
+/// How long after a failed gate check before the config endpoint is retried.
+const GATE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct GateState {
+    verdict: Option<Result<(), String>>,
+    last_attempt: Option<std::time::Instant>,
 }
 
 impl SchemaRegistryCodec {
@@ -176,19 +191,47 @@ impl SchemaRegistryCodec {
             resolver,
             cache: DashMap::new(),
             gate,
-            gate_state: tokio::sync::OnceCell::new(),
+            gate_state: tokio::sync::RwLock::new(GateState {
+                verdict: None,
+                last_attempt: None,
+            }),
+            gate_retry_interval: GATE_RETRY_INTERVAL,
         }
+    }
+
+    /// Test-only override of the gate retry interval.
+    #[cfg(test)]
+    pub(crate) fn set_gate_retry_interval(&mut self, interval: std::time::Duration) {
+        self.gate_retry_interval = interval;
     }
 
     async fn ensure_gate(&self) -> Result<(), Error> {
         let Some(gate) = &self.gate else {
             return Ok(());
         };
-        let verdict = self
-            .gate_state
-            .get_or_init(|| async { gate.check(self.resolver.as_ref()).await })
-            .await;
-        verdict.clone().map_err(Error::Process)
+        // Fast path: a pass verdict is permanent.
+        {
+            let state = self.gate_state.read().await;
+            if let Some(Ok(())) = state.verdict {
+                return Ok(());
+            }
+        }
+        let mut state = self.gate_state.write().await;
+        if let Some(Ok(())) = state.verdict {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        // A recent failure is returned as-is without hitting the registry
+        // again; only after the retry interval may the check be re-issued.
+        if let (Some(Err(err)), Some(last)) = (&state.verdict, state.last_attempt) {
+            if now.duration_since(last) < self.gate_retry_interval {
+                return Err(Error::Process(err.clone()));
+            }
+        }
+        let verdict = gate.check(self.resolver.as_ref()).await;
+        state.verdict = Some(verdict.clone());
+        state.last_attempt = Some(now);
+        verdict.map_err(Error::Process)
     }
 
     async fn resolve_cached(&self, id: u32) -> Result<CachedSchema, Error> {
@@ -205,6 +248,20 @@ impl SchemaRegistryCodec {
                     ))
                 })?;
                 CachedSchema::Protobuf(parse_proto_source(&text, message_type)?)
+            }
+            FetchedSchema::ProtobufByDetection(text) => {
+                let message_type = self.message_type.as_deref().ok_or_else(|| {
+                    Error::Process(format!(
+                        "schema id {} resolved to a Protobuf schema but the codec configuration has no `message_type`",
+                        id
+                    ))
+                })?;
+                CachedSchema::Protobuf(parse_proto_source(&text, message_type).map_err(|e| {
+                    Error::Process(format!(
+                        "schema id {}: the registry omitted `schemaType`; content detection chose Protobuf because the text is not a JSON object, but parsing it as Protobuf failed ({e}). Neither Avro nor Protobuf can read this schema",
+                        id
+                    ))
+                })?)
             }
             FetchedSchema::Avro(schema) => CachedSchema::Avro(schema),
         };
@@ -251,9 +308,10 @@ impl Decoder for SchemaRegistryCodec {
                 Schema::empty(),
             ))));
         }
-        let schema = batches[0].schema();
-        let merged = arrow::compute::concat_batches(&schema, &batches)
-            .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?;
+        // Batches decoded under different schema versions may legitimately
+        // carry different schemas (real schema evolution); normalize to the
+        // field union instead of failing the concat.
+        let merged = crate::component::batch_merge::normalize_and_concat(&batches)?;
         Ok(MessageBatch::new_arrow(merged))
     }
 }
@@ -316,30 +374,39 @@ struct SubjectConfigResponse {
     compatibility_level: Option<String>,
 }
 
+fn parse_avro_schema(text: &str, id: u32) -> Result<AvroSchema, Error> {
+    AvroSchema::parse_str(text).map_err(|e| {
+        Error::Process(format!(
+            "Schema Registry returned an invalid Avro schema for id {}: {}",
+            id, e
+        ))
+    })
+}
+
 #[async_trait]
 impl SchemaResolver for RestSchemaResolver {
     async fn fetch_schema(&self, id: u32) -> Result<FetchedSchema, Error> {
         let body: SchemaResponse = self.get_json(&format!("/schemas/ids/{}", id)).await?;
-        let schema_type = body
-            .schema_type
-            .as_deref()
-            .map(str::to_ascii_uppercase)
-            .unwrap_or_else(|| "PROTOBUF".to_string());
-        match schema_type.as_str() {
-            "PROTOBUF" => Ok(FetchedSchema::Protobuf(body.schema)),
-            "AVRO" => {
-                let schema = AvroSchema::parse_str(&body.schema).map_err(|e| {
-                    Error::Process(format!(
-                        "Schema Registry returned an invalid Avro schema for id {}: {}",
-                        id, e
-                    ))
-                })?;
-                Ok(FetchedSchema::Avro(schema))
-            }
-            other => Err(Error::Process(format!(
+        let schema_type = body.schema_type.as_deref().map(str::to_ascii_uppercase);
+        match schema_type.as_deref() {
+            Some("PROTOBUF") => Ok(FetchedSchema::Protobuf(body.schema)),
+            Some("AVRO") => Ok(FetchedSchema::Avro(parse_avro_schema(&body.schema, id)?)),
+            Some(other) => Err(Error::Process(format!(
                 "Unsupported schema type: {} (supported: PROTOBUF, AVRO)",
                 other
             ))),
+            // Older registries omit `schemaType`: Avro was the only original
+            // format, but this codec historically defaulted to Protobuf, so
+            // detect by content instead of guessing. An Avro schema is always
+            // a JSON object; a proto source never is.
+            None => {
+                let trimmed = body.schema.trim();
+                if trimmed.starts_with('{') {
+                    Ok(FetchedSchema::Avro(parse_avro_schema(trimmed, id)?))
+                } else {
+                    Ok(FetchedSchema::ProtobufByDetection(body.schema))
+                }
+            }
         }
     }
 
@@ -516,9 +583,25 @@ mod tests {
 
     const TEST_SCHEMA: &str = "syntax = \"proto3\";\npackage test;\nmessage M { int64 id = 1; }";
 
+    /// Real schema evolution: v2 adds a `name` column (different schema text).
+    const TEST_SCHEMA_V2: &str =
+        "syntax = \"proto3\";\npackage test;\nmessage M { int64 id = 1; string name = 2; }";
+
+    /// Same column name with a different type: normalization must fail loudly.
+    const TEST_SCHEMA_CONFLICT: &str =
+        "syntax = \"proto3\";\npackage test;\nmessage M { string id = 1; }";
+
     const AVRO_SCHEMA: &str = r#"{
         "type": "record", "name": "M", "fields": [
             {"name": "id", "type": "long"}
+        ]
+    }"#;
+
+    /// Avro evolution: v2 adds a `name` field.
+    const AVRO_SCHEMA_V2: &str = r#"{
+        "type": "record", "name": "M", "fields": [
+            {"name": "id", "type": "long"},
+            {"name": "name", "type": "string"}
         ]
     }"#;
 
@@ -543,6 +626,18 @@ mod tests {
             .unwrap()
     }
 
+    fn avro_payload_v2(id: i64, name: &str) -> Vec<u8> {
+        let schema = AvroSchema::parse_str(AVRO_SCHEMA_V2).unwrap();
+        GenericDatumWriter::builder(&schema)
+            .build()
+            .unwrap()
+            .write_value_to_vec(AvroValue::Record(vec![
+                ("id".to_string(), AvroValue::Long(id)),
+                ("name".to_string(), AvroValue::String(name.to_string())),
+            ]))
+            .unwrap()
+    }
+
     fn wire(id: u32, payload: &[u8]) -> Vec<u8> {
         let mut m = vec![0x00];
         m.extend_from_slice(&id.to_be_bytes());
@@ -552,7 +647,7 @@ mod tests {
 
     struct InMemorySchemaResolver {
         schemas: HashMap<u32, FetchedSchema>,
-        subject_levels: HashMap<String, String>,
+        subject_levels: std::sync::Mutex<HashMap<String, String>>,
         fetch_count: AtomicU32,
         config_count: AtomicU32,
     }
@@ -560,7 +655,7 @@ mod tests {
         fn new(map: HashMap<u32, FetchedSchema>) -> Self {
             Self {
                 schemas: map,
-                subject_levels: HashMap::new(),
+                subject_levels: std::sync::Mutex::new(HashMap::new()),
                 fetch_count: AtomicU32::new(0),
                 config_count: AtomicU32::new(0),
             }
@@ -571,10 +666,16 @@ mod tests {
         ) -> Self {
             Self {
                 schemas: map,
-                subject_levels: levels,
+                subject_levels: std::sync::Mutex::new(levels),
                 fetch_count: AtomicU32::new(0),
                 config_count: AtomicU32::new(0),
             }
+        }
+        fn set_subject_level(&self, subject: &str, level: &str) {
+            self.subject_levels
+                .lock()
+                .unwrap()
+                .insert(subject.to_string(), level.to_string());
         }
         fn fetches(&self) -> u32 {
             self.fetch_count.load(Ordering::SeqCst)
@@ -595,9 +696,12 @@ mod tests {
 
         async fn fetch_subject_compatibility(&self, subject: &str) -> Result<String, Error> {
             self.config_count.fetch_add(1, Ordering::SeqCst);
-            self.subject_levels.get(subject).cloned().ok_or_else(|| {
-                Error::Process(format!("subject {} not in test resolver", subject))
-            })
+            self.subject_levels
+                .lock()
+                .unwrap()
+                .get(subject)
+                .cloned()
+                .ok_or_else(|| Error::Process(format!("subject {} not in test resolver", subject)))
         }
     }
 
@@ -727,39 +831,92 @@ mod tests {
 
     #[tokio::test]
     async fn test_multi_version_each_resolves() {
-        // two ids, same (compatible) schema; each resolves its own descriptor.
+        // Real evolution: id 1 is v1 (id only), id 2 is v2 (adds `name`).
+        // Each id resolves its own descriptor; the merged batch carries the
+        // union schema with the v1 row's `name` null-filled.
         let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([
             (1u32, FetchedSchema::Protobuf(TEST_SCHEMA.to_string())),
-            (2u32, FetchedSchema::Protobuf(TEST_SCHEMA.to_string())),
+            (2u32, FetchedSchema::Protobuf(TEST_SCHEMA_V2.to_string())),
         ])));
         let codec = build_codec(resolver.clone());
         let batch = codec
             .decode(vec![
                 wire(1, &protobuf_payload_id_42()),
-                wire(2, &protobuf_payload_id_42()),
+                wire(2, &[0x08, 0x2A, 0x12, 0x02, b'o', b'k']), // id=42, name="ok"
             ])
             .await
             .unwrap();
         assert_eq!(batch.len(), 2);
         assert_eq!(resolver.fetches(), 2); // both ids resolved
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::datatypes::Int64Type;
+        let rb = batch.record_batch();
+        assert_eq!(rb.num_columns(), 2, "union schema: id + name");
+        let id_col = rb.column_by_name("id").expect("id column");
+        assert_eq!(id_col.as_primitive::<Int64Type>().value(1), 42);
+        let name_col = rb.column_by_name("name").expect("name column");
+        let name = name_col.as_string::<i32>();
+        assert_eq!(name.value(1), "ok");
+        assert!(name.is_null(0), "v1 row's `name` must be null-filled");
     }
 
     #[tokio::test]
     async fn test_multi_version_avro() {
+        // Real Avro evolution: v2 adds a `name` field; the union batch
+        // null-fills it for the v1 row.
         let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([
             (1u32, FetchedSchema::Avro(avro_schema())),
-            (2u32, FetchedSchema::Avro(avro_schema())),
+            (
+                2u32,
+                FetchedSchema::Avro(AvroSchema::parse_str(AVRO_SCHEMA_V2).unwrap()),
+            ),
         ])));
         let codec = avro_codec(resolver.clone());
         let batch = codec
             .decode(vec![
                 wire(1, &avro_payload_id_42()),
-                wire(2, &avro_payload_id_42()),
+                wire(2, &avro_payload_v2(7, "seven")),
             ])
             .await
             .unwrap();
         assert_eq!(batch.len(), 2);
         assert_eq!(resolver.fetches(), 2);
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::datatypes::Int64Type;
+        let rb = batch.record_batch();
+        assert_eq!(rb.num_columns(), 2, "union schema: id + name");
+        let id_col = rb.column_by_name("id").expect("id column");
+        assert_eq!(id_col.as_primitive::<Int64Type>().value(1), 7);
+        let name_col = rb.column_by_name("name").expect("name column");
+        let name = name_col.as_string::<i32>();
+        assert_eq!(name.value(1), "seven");
+        assert!(name.is_null(0), "v1 row's `name` must be null-filled");
+    }
+
+    #[tokio::test]
+    async fn test_multi_version_conflicting_column_types_error() {
+        // `id` is int64 in v1 and string in v2: normalization must name the
+        // column and both types instead of guessing a cast.
+        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([
+            (1u32, FetchedSchema::Protobuf(TEST_SCHEMA.to_string())),
+            (
+                2u32,
+                FetchedSchema::Protobuf(TEST_SCHEMA_CONFLICT.to_string()),
+            ),
+        ])));
+        let codec = build_codec(resolver);
+        let err = codec
+            .decode(vec![
+                wire(1, &protobuf_payload_id_42()),
+                wire(2, &[0x0A, 0x01, b'x']), // string id = "x"
+            ])
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`id`") && msg.contains("Int64") && msg.contains("Utf8"),
+            "error must name the column and both types, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -852,7 +1009,8 @@ mod tests {
                 min: MinCompatibility::Backward,
             }),
         );
-        // Every decode fails at the gate, but the config endpoint is hit once.
+        // Every rapid decode fails at the gate; the config endpoint is hit
+        // once because the failures are inside the retry interval.
         for _ in 0..3 {
             assert!(codec
                 .decode(vec![wire(1, &avro_payload_id_42())])
@@ -860,6 +1018,50 @@ mod tests {
                 .is_err());
         }
         assert_eq!(resolver.config_fetches(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_gate_failure_recovers_after_retry_interval() {
+        // A transient registry failure is not cached forever: once the retry
+        // interval elapses and the registry recovers, decode heals.
+        let resolver = Arc::new(InMemorySchemaResolver::with_subject_levels(
+            HashMap::from([(1u32, FetchedSchema::Avro(avro_schema()))]),
+            HashMap::from([("s".to_string(), "NONE".to_string())]),
+        ));
+        let mut codec = SchemaRegistryCodec::new(
+            None,
+            resolver.clone(),
+            Some(CompatibilityGate {
+                subject: "s".to_string(),
+                min: MinCompatibility::Backward,
+            }),
+        );
+        codec.set_gate_retry_interval(std::time::Duration::from_millis(20));
+        // Fails at the gate while the level is below the minimum.
+        assert!(codec
+            .decode(vec![wire(1, &avro_payload_id_42())])
+            .await
+            .is_err());
+        // Registry side recovers (subject level raised).
+        resolver.set_subject_level("s", "BACKWARD");
+        // Inside the retry interval: last error is returned, no new request.
+        assert!(codec
+            .decode(vec![wire(1, &avro_payload_id_42())])
+            .await
+            .is_err());
+        assert_eq!(resolver.config_fetches(), 1);
+        // After the interval the check is re-issued and passes; the pass
+        // verdict is then cached (no further config requests).
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        codec
+            .decode(vec![wire(1, &avro_payload_id_42())])
+            .await
+            .expect("gate must recover after the registry heals");
+        codec
+            .decode(vec![wire(1, &avro_payload_id_42())])
+            .await
+            .expect("pass verdict must be cached");
+        assert_eq!(resolver.config_fetches(), 2);
     }
 
     #[tokio::test]
@@ -920,10 +1122,73 @@ mod tests {
         let resolver =
             RestSchemaResolver::new(server.uri(), Some(Auth::Bearer("tok".into()))).unwrap();
         let schema = resolver.fetch_schema(2).await.unwrap();
+        // No `schemaType` in the response; proto source text is not a JSON
+        // object, so content detection still chooses Protobuf.
         assert!(matches!(
             schema,
-            FetchedSchema::Protobuf(ref s) if s.contains("message M")
+            FetchedSchema::ProtobufByDetection(ref s) if s.contains("message M")
         ));
+    }
+
+    #[tokio::test]
+    async fn test_rest_resolver_schema_type_absent_avro_text_detected() {
+        // Old registries omit `schemaType` for Avro schemas; the JSON-object
+        // text must be detected as Avro instead of failing as Protobuf.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/5"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"schema": AVRO_SCHEMA})),
+            )
+            .mount(&server)
+            .await;
+        let resolver = RestSchemaResolver::new(server.uri(), None).unwrap();
+        let schema = resolver.fetch_schema(5).await.unwrap();
+        assert!(matches!(schema, FetchedSchema::Avro(_)));
+    }
+
+    #[tokio::test]
+    async fn test_rest_resolver_schema_type_absent_neither_parses() {
+        // Text that looks like JSON but is not valid Avro: detection tried
+        // Avro (only applicable choice) and must fail with a clear error.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/6"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"schema": "{\"not\": "})),
+            )
+            .mount(&server)
+            .await;
+        let resolver = RestSchemaResolver::new(server.uri(), None).unwrap();
+        let err = resolver.fetch_schema(6).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("Avro"),
+            "error should name the failed Avro attempt, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detected_protobuf_parse_failure_lists_both_attempts() {
+        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([(
+            1u32,
+            FetchedSchema::ProtobufByDetection("}}not-a-proto{{".to_string()),
+        )])));
+        let codec = build_codec(resolver);
+        let err = codec
+            .decode(vec![wire(1, &protobuf_payload_id_42())])
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("neither") || (msg.contains("Avro") && msg.contains("Protobuf")),
+            "error should list both detection attempts, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -933,9 +1198,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/schemas/ids/3"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"schema": AVRO_SCHEMA, "schemaType": "AVRO"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"schema": AVRO_SCHEMA, "schemaType": "AVRO"}),
+                ),
+            )
             .mount(&server)
             .await;
         let resolver = RestSchemaResolver::new(server.uri(), None).unwrap();
@@ -950,9 +1217,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/schemas/ids/4"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"schema": "{}", "schemaType": "JSON"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"schema": "{}", "schemaType": "JSON"})),
+            )
             .mount(&server)
             .await;
         let resolver = RestSchemaResolver::new(server.uri(), None).unwrap();
@@ -1003,12 +1271,16 @@ mod tests {
             .and(path("/config/orders"))
             .and(query_param("defaultToGlobal", "true"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"compatibilityLevel": "FULL_TRANSITIVE"})),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"compatibilityLevel": "FULL_TRANSITIVE"})),
             )
             .mount(&server)
             .await;
         let resolver = RestSchemaResolver::new(server.uri(), None).unwrap();
-        let level = resolver.fetch_subject_compatibility("orders").await.unwrap();
+        let level = resolver
+            .fetch_subject_compatibility("orders")
+            .await
+            .unwrap();
         assert_eq!(level, "FULL_TRANSITIVE");
     }
 
@@ -1022,9 +1294,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/config/orders%2Fv2%20prod%25final"))
             .and(query_param("defaultToGlobal", "true"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"compatibilityLevel": "BACKWARD"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"compatibilityLevel": "BACKWARD"})),
+            )
             .mount(&server)
             .await;
         let resolver = RestSchemaResolver::new(server.uri(), None).unwrap();

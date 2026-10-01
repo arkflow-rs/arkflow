@@ -16,10 +16,10 @@
 //!
 //! Receive data from a NATS subject
 
+use crate::input::codec_helper::Delivery;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
-use crate::input::codec_helper::Delivery;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_nats::jetstream::consumer::PullConsumer;
@@ -204,13 +204,12 @@ impl Input for NatsInput {
                             }
                         }
                         Err(e) => {
+                            // Subscribe failures are transient (connection
+                            // not fully established, server restarting):
+                            // classify as Disconnection so the engine
+                            // reconnects instead of failing the source.
                             error!("Failed to subscribe to NATS subject: {}", e);
-                            let _ = sender
-                                .send_async(Delivery::Err(Error::Process(format!(
-                                    "Failed to subscribe to NATS subject: {}",
-                                    e
-                                ))))
-                                .await;
+                            let _ = sender.send_async(Delivery::Err(Error::Disconnection)).await;
                         }
                     }
                 });
@@ -274,12 +273,8 @@ impl Input for NatsInput {
                                 }
                                 Err(e) => {
                                     error!("Failed to get JetStream message: {}", e);
-                                    if let Err(e) = sender
-                                        .send_async(Delivery::Err(Error::Process(format!(
-                                            "Failed to get message: {}",
-                                            e
-                                        ))))
-                                        .await
+                                    if let Err(e) =
+                                        sender.send_async(Delivery::Err(Error::Disconnection)).await
                                     {
                                         error!("Failed to send error to channel: {}", e);
                                     }
@@ -291,12 +286,7 @@ impl Input for NatsInput {
                     }
                     Err(e) => {
                         error!("Failed to fetch JetStream messages: {}", e);
-                        if let Err(e) = sender
-                            .send_async(Delivery::Err(Error::Process(format!(
-                                "Failed to fetch messages: {}",
-                                e
-                            ))))
-                            .await
+                        if let Err(e) = sender.send_async(Delivery::Err(Error::Disconnection)).await
                         {
                             error!("Failed to send error to channel: {}", e);
                         }

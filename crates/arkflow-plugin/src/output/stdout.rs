@@ -115,10 +115,10 @@ pub fn init() -> Result<(), Error> {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "pretty": {"type": "boolean", "default": false, "description": "Pretty-print JSON output."}
+                "append_newline": {"type": "boolean", "default": true, "description": "Append a newline after each message."}
             }
         }),
-    ).with_optional().with_example(serde_json::json!({"pretty": true})))
+    ).with_optional().with_example(serde_json::json!({"append_newline": true})))
 }
 
 trait StdWriter: Write + Send + Sync {}

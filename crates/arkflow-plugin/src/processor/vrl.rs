@@ -58,7 +58,7 @@ struct VrlProcessor {
 #[async_trait]
 impl Processor for VrlProcessor {
     async fn process(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
-        let result = message_batch_to_vrl_values((*msg_batch).clone());
+        let result = message_batch_to_vrl_values((*msg_batch).clone())?;
 
         let mut state = RuntimeState::default();
         let timezone = self.timezone;
@@ -150,7 +150,18 @@ impl ProcessorBuilder for VrlProcessorBuilder {
     }
 }
 
-fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<VrlValue> {
+fn downcast_failure(
+    name: &str,
+    data_type: &datafusion::arrow::datatypes::DataType,
+    ty: &str,
+) -> Error {
+    Error::Process(format!(
+        "VRL processor: column `{}` declared as {} but failed to downcast to {}",
+        name, data_type, ty
+    ))
+}
+
+fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Result<Vec<VrlValue>, Error> {
     let rows = message_batch.num_rows();
     let num_columns = message_batch.num_columns();
     let schema = message_batch.schema();
@@ -168,139 +179,202 @@ fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<VrlValue> {
         let name = schema.field(i).name();
         match column.data_type() {
             DataType::Utf8 => {
-                if let Some(col) = column.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::from(value.to_owned());
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(StringArray))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::from(value.to_owned());
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Binary => {
-                if let Some(col) = column.as_any().downcast_ref::<BinaryArray>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Bytes(value.to_vec().into());
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(BinaryArray))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Bytes(value.to_vec().into());
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Boolean => {
-                if let Some(col) = column.as_any().downcast_ref::<BooleanArray>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Boolean(value);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(BooleanArray))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Boolean(value);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Float64 => {
-                if let Some(col) = column.as_any().downcast_ref::<Float64Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Float(value.try_into().unwrap_or_default());
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(Float64Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Float(value.try_into().unwrap_or_default());
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Float32 => {
-                if let Some(col) = column.as_any().downcast_ref::<Float32Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value =
-                            VrlValue::Float((value as f64).try_into().unwrap_or_default());
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(Float32Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Float((value as f64).try_into().unwrap_or_default());
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Int64 => {
-                if let Some(col) = column.as_any().downcast_ref::<Int64Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(Int64Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Integer(value);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Int32 => {
-                if let Some(col) = column.as_any().downcast_ref::<Int32Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(Int32Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Integer(value as i64);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Int16 => {
-                if let Some(col) = column.as_any().downcast_ref::<Int16Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(Int16Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Integer(value as i64);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Int8 => {
-                if let Some(col) = column.as_any().downcast_ref::<Int8Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                    downcast_failure(name, column.data_type(), stringify!(Int8Array))
+                })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Integer(value as i64);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::UInt64 => {
-                if let Some(col) = column.as_any().downcast_ref::<UInt64Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(UInt64Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    // VRL integers are i64: values beyond i64::MAX must be a
+                    // loud error, never a silent negative wraparound.
+                    let vrl_value = VrlValue::Integer(i64::try_from(value).map_err(|_| {
+                        Error::Process(format!(
+                            "VRL processor: column `{}` has value {} which exceeds i64::MAX (VRL integers are i64); remove or cast the column first, e.g. with filter_columns or a SQL processor",
+                            name, value
+                        ))
+                    })?);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::UInt32 => {
-                if let Some(col) = column.as_any().downcast_ref::<UInt32Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(UInt32Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Integer(value as i64);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::UInt16 => {
-                if let Some(col) = column.as_any().downcast_ref::<UInt16Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<UInt16Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(UInt16Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Integer(value as i64);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::UInt8 => {
-                if let Some(col) = column.as_any().downcast_ref::<UInt8Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<UInt8Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(UInt8Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Integer(value as i64);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Date32 => {
-                if let Some(col) = column.as_any().downcast_ref::<Date32Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value as i64);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(Date32Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Integer(value as i64);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Date64 => {
-                if let Some(col) = column.as_any().downcast_ref::<Date64Array>() {
-                    for i in 0..rows {
-                        let value = col.value(i);
-                        let vrl_value = VrlValue::Integer(value);
-                        insert(i, &mut vrl_values, name, vrl_value)
-                    }
+                let col = column
+                    .as_any()
+                    .downcast_ref::<Date64Array>()
+                    .ok_or_else(|| {
+                        downcast_failure(name, column.data_type(), stringify!(Date64Array))
+                    })?;
+                for i in 0..rows {
+                    let value = col.value(i);
+                    let vrl_value = VrlValue::Integer(value);
+                    insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
             DataType::Null => {
@@ -342,17 +416,17 @@ fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Vec<VrlValue> {
                 }
             }
 
-            _ => {
-                // Handle unsupported data types
-                for i in 0..rows {
-                    let vrl_value = VrlValue::Null;
-                    insert(i, &mut vrl_values, name, vrl_value)
-                }
-                error!("Unsupported data type: {:?}", column.data_type());
+            other => {
+                // Silently nulling an unsupported column is data loss nobody
+                // sees: fail loudly and tell the user how to project it away.
+                return Err(Error::Process(format!(
+                    "VRL processor: column `{}` has unsupported type {} (supported: booleans, integers, floats, utf8/binary, dates, timestamps, null); remove it first, e.g. with filter_columns or a SQL processor",
+                    name, other
+                )));
             }
         };
     }
-    vrl_values.into_iter().map(|v| v.into()).collect()
+    Ok(vrl_values.into_iter().map(|v| v.into()).collect())
 }
 
 fn vrl_values_to_message_batch(mut vrl_values: Vec<VrlValue>) -> Result<MessageBatch, Error> {
@@ -765,5 +839,74 @@ mod tests {
             result.is_ok(),
             "an invalid timezone should fall back to the default, not fail configuration"
         );
+    }
+
+    #[tokio::test]
+    async fn test_uint64_overflow_errors_loudly() -> Result<(), Error> {
+        let processor = build_processor(".")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("big", DataType::UInt64, true)]));
+        let arr = Arc::new(UInt64Array::from(vec![Some(u64::MAX)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let err = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`big`") && msg.contains("i64::MAX"),
+            "error must name the column and the limit, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_uint64_in_range_processes_normally() -> Result<(), Error> {
+        let processor = build_processor(".")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::UInt64, true)]));
+        let arr = Arc::new(UInt64Array::from(vec![Some(i64::MAX as u64)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let result = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?;
+        match result {
+            ProcessResult::Single(b) => assert_eq!(b.len(), 1),
+            _ => panic!("expected single result"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_list_column_errors_instead_of_null() -> Result<(), Error> {
+        let processor = build_processor(".")?;
+        let list_field = Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![list_field]));
+        let values = StringArray::from(vec![Some("a"), None, Some("b")]);
+        let list_arr = Arc::new(
+            ListArray::try_new(
+                Arc::new(Field::new("item", DataType::Utf8, true)),
+                datafusion::arrow::buffer::OffsetBuffer::from_lengths([1, 1, 1]),
+                Arc::new(values),
+                None,
+            )
+            .map_err(|e| Error::Process(e.to_string()))?,
+        );
+        let rb = RecordBatch::try_new(schema, vec![list_arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let err = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`tags`") && msg.contains("filter_columns"),
+            "error must name the column and the workaround, got: {msg}"
+        );
+        Ok(())
     }
 }

@@ -89,8 +89,17 @@ impl Output for RedisOutput {
     }
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
-        // Apply codec encoding if configured
-        let data = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
+        // Payload selection: an explicit `value_field` takes the named
+        // column's value per row, otherwise the codec encoding applies.
+        let data: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
+            crate::output::payload::field_payloads("redis", &msg, field)?
+        } else {
+            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)
+                .await?
+                .into_iter()
+                .map(|p| p.to_vec())
+                .collect()
+        };
         let client_lock = self.client.lock().await;
         let Some(cli) = client_lock.as_ref() else {
             return Err(Error::Process(
@@ -192,7 +201,7 @@ pub fn init() -> Result<(), Error> {
     arkflow_core::output::register_output_builder("redis", Arc::new(RedisOutputBuilder))?;
     register_output_metadata(ComponentMetadata::with_schema(
         "redis",
-        "Writes messages to Redis: streams, lists, or pub/sub channels.",
+        "Writes messages to Redis via publish, list rpush, hashes, or plain strings.",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -209,9 +218,10 @@ pub fn init() -> Result<(), Error> {
                     "type": "object",
                     "description": "Destination data structure.",
                     "oneOf": [
-                        {"properties": {"type": {"const": "stream"}, "stream": {"type": "string"}}, "required": ["type", "stream"]},
-                        {"properties": {"type": {"const": "list"}, "list": {"type": "string"}}, "required": ["type", "list"]},
-                        {"properties": {"type": {"const": "channel"}, "channel": {"type": "string"}}, "required": ["type", "channel"]}
+                        {"properties": {"type": {"const": "publish"}, "channel": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}}, "required": ["type", "channel"]},
+                        {"properties": {"type": {"const": "list"}, "key": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}}, "required": ["type", "key"]},
+                        {"properties": {"type": {"const": "hashes"}, "key": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}, "field": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}}, "required": ["type", "key", "field"]},
+                        {"properties": {"type": {"const": "strings"}, "key": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}}, "required": ["type", "key"]}
                     ]
                 },
                 "value_field": {"type": "string", "description": "Record field used as the payload."}
@@ -220,6 +230,6 @@ pub fn init() -> Result<(), Error> {
         }),
     ).with_example(serde_json::json!({
         "mode": {"type": "single", "url": "redis://localhost:6379"},
-        "redis_type": {"type": "stream", "stream": "events"}
+        "redis_type": {"type": "publish", "channel": {"type": "value", "value": "events"}}
     })))
 }

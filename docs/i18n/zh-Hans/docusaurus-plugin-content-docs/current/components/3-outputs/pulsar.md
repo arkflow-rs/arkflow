@@ -27,6 +27,8 @@ Pulsar 输出(Output)将消息(Message)发布到 Apache Pulsar 主题(Topic)。�
 | value | string | yes (`value`) | 静态主题名称(例如 `persistent://tenant/namespace/topic`)。 |
 | expr | string | yes (`expr`) | 对每条消息求值的 SQL 表达式。 |
 
+表达式必须对每一行求出非 null 字符串:任意行为 NULL 时整批报错,错误信息指名表达式与行号(可用 `COALESCE(expr, 'fallback')` 规避,或在上游过滤这类行)。
+
 ### auth
 
 `auth` 是一个带标签对象(由其 `type` 字段选择)。支持的变体:`token` 与 `o_auth2`。

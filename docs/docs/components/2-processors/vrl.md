@@ -15,6 +15,8 @@ The VRL processor transforms messages using Vector Remap Language (VRL), a safe 
 | statement | string | yes | — | VRL program used to transform each message. |
 | timezone | string | no | — | Time zone used when parsing/formatming time values in the program (e.g. `UTC`, `Asia/Shanghai`). |
 
+Input columns map to VRL values with explicit errors instead of silent loss: a `UInt64` value exceeding `i64::MAX` fails the batch (VRL integers are i64 — no negative wraparound), and column types outside the supported set (booleans, integers, floats, utf8/binary, dates, timestamps, null — e.g. `List`/`Struct`) fail with the column name and type. Remove such columns first, e.g. with `filter_columns` or a SQL processor.
+
 ## Examples
 
 ```yaml validate=fragment wrap=processors

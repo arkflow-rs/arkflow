@@ -55,20 +55,7 @@
 - storage 层 tracing 为零、maintenance 循环 `let _ =` 吞错（`lib.rs:774-780`）、actor 无队列深度指标。
 - `parse_operator_credential` 解析失败回退 Admin 且整串作密钥（`nodes.rs:126-156`）；OIDC 已知 kid 永久缓存不吊销（`oidc.rs:39-42`）；session token 走 URL query 兼容窗口仍在（`lib.rs:3286-3322`）。
 
-**插件层（P2 批）**
-- schema registry 多版本消息 `concat_batches` 报错（`schema_registry.rs:254-256`）；现有"多版本"测试两个 id 用同一 schema 文本，绕开真实演进场景——测试虚假信心（`:729-745`）。
-- debezium tombstone（空 payload）整批失败（`debezium.rs:62-63`）；envelope 元数据覆盖业务同名字段 op/source/before（`:119-124`）。
-- modbus 错误分类用 Process 而非 Disconnection（`modbus.rs:119-163`，引擎直接判死不走重连）；nats 首次订阅失败同病（`nats.rs:203-207`）。
-- 文档/示例与实现脱节批次：batch 官方示例缺 `timeout_ms` 必 build 失败且文档字段 `size`/`interval` 不存在（`batch.rs:156-157`）；sql input 文档 `poll_interval` 不存在（`sql.rs:344-360`）；redis output 示例用不存在的 `stream` 变体（`redis.rs:208-224`）；五个 output 的 `value_field` 被解析从不读取；websocket `headers` 死配置；file/sql/modbus `codec` 字段 dead_code；json/stdout/python 文档字段不存在。
-- vrl UInt64→i64 静默回绕（`vrl.rs:257`）；不支持类型静默转 Null（`:345-352`）。
-- SQL output 仅支持 5 种 Arrow 类型，其余运行期才报错（`output/sql.rs:513-557`）；build 接受 codec 但 write 必然失败（`:401-405`）。
-- SQL processor 临时表路径 `?` 早退跳过 deregister_table（`sql.rs:229-236`）——下一批可命中陈旧临时表。
-- MQTT output 无重连机制、二次 connect 泄漏旧 eventloop（`output/mqtt.rs:128-139`）；SQL output close 不关连接（`sql.rs:452-455`）。
-- json/protobuf 坏消息整批失败无单条隔离/DLQ（`json.rs:57-58`、`protobuf.rs:134-138`）。
-- python processor `sys.path.insert().unwrap()` 可 panic、路径优先级反转（`python.rs:117-121`）、无超时熔断。
-- 窗口族 Notify 丢唤醒竞态（有 timer 兜底，仅延迟一周期）；跨 input 异构 schema 合并必失败（`buffer/window.rs:150-161`）。
-- schemaType 缺失默认 PROTOBUF——旧版 registry 对 Avro 常省略（`schema_registry.rs:323-327`）；gate 失败结果永久缓存（`:165-192`）。
-
+**插件层（P2 批）** ✅ 2026-09-30 已全部修复（`fix-plugin-p2-batch`——schema registry 多版本归一合并 + 真实演进测试；debezium tombstone 跳过 + 同名冲突业务值保留/元数据改投 `__debezium_*`；modbus/nats 瞬时错误归 Disconnection 走引擎重连；元数据诚实批（幽灵字段/示例全部修正 + value_field 四 output 实装复用 pulsar 先例 + websocket headers 实装 + file/sql/modbus 死 codec 移除 + 注册表全量 example 可构建 CI 门禁，该门禁额外抓出 kafka input/multiple_inputs 示例缺字段与 4 个 output 的 Expr 格式错误）；vrl UInt64 溢出与不支持类型显式报错；SQL output 类型扩至全数值宽度+时间类型、codec 构建期拒绝、close 关连接；SQL processor 临时表 RAII 注销；MQTT output 写路径有界重连无泄漏；json/protobuf `on_error: fail|skip` 单条隔离；python sys.path 无 panic/按序/去重 + `timeout_ms` 超时；窗口族 select 关闭唤醒 + 异构 schema 归一 + 失败保留队列与 ack；schemaType 缺省内容判定 + gate 失败 30s 间隔重试。CR 追加修复：payload 共享模块 LargeBinary/LargeUtf8 null 单元与窄类型一致 fail-closed（原 `.flatten()` 静默丢行会使 payload 与行级 topic/key 错位）；stream 级 `codec:` 在 file/sql/modbus input 构建期显式拒绝。DLQ 与引擎级 output 重连为 Non-goal 另行立项。**CR 二轮另发现 `Expr::evaluate_expr` 数组路径 `filter_map` 丢弃 null → kafka topic `&v[i]` 越界 panic / mqtt/nats/pulsar/redis 行级目的地静默错位（`expr/mod.rs:66-73`），已由 `fix-expr-null-row-alignment` 收口：null 求值单元报错指名表达式与行号、Vec 长度恒等于行数、kafka panic 位改防御性报错；vrl 行级 null→默认值（`processor/vrl.rs` 无 is_null 检查）仍为存量开放项**）
 **console（P2 批）**
 - 全站零 Error Boundary——任一 render 异常即白屏（全 src/ 无 componentDidCatch）。→ 必补。
 - `waitForOperation` 7.5s 硬上限把仍在执行的操作报成失败（`api.ts:542-566`）。

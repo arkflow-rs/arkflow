@@ -110,7 +110,9 @@ Conflict detection relies on the primary key / unique index of the target table 
 
 ## Notes
 
-- Supported column types: Utf8, Int64, UInt64, Float64, Boolean. Other Arrow types are rejected with a process error.
+- Supported column types: Utf8, Boolean; `Int8`/`Int16`/`Int32`/`Int64` (bound as i64); `UInt8`/`UInt16`/`UInt32`/`UInt64` (bound as u64); `Float32`/`Float64` (bound as f64); `Date32`/`Date64` (ISO date strings) and `Timestamp` of any unit (RFC3339 strings). Other Arrow types are rejected with an error naming the column and its type.
+- A `codec` is rejected at build time: SQL writes map typed columns to bound parameters and cannot consume encoded bytes. (PostgreSQL has no unsigned integers; `UInt64` values are passed through the driver's signed path as before.)
+- `close()` explicitly closes the database connection instead of leaving it to object teardown.
 - Identifier quoting follows each dialect: backticks for MySQL, double quotes for PostgreSQL.
 - `upsert: true` requires a non-empty `upsert_keys` list without duplicates; violations are rejected at configuration load, before the stream starts.
 - `upsert_keys` columns must exist in the incoming batch schema; otherwise the write fails with an error.

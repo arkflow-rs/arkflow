@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use datafusion::arrow;
 use serde_json::{Map, Value};
 use std::sync::Arc;
+use tracing::warn;
 
 /// Debezium Envelope JSON codec.
 pub struct DebeziumJsonCodec;
@@ -58,26 +59,73 @@ impl Encoder for DebeziumJsonCodec {
 impl Decoder for DebeziumJsonCodec {
     async fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
         let mut json_data: Vec<u8> = Vec::new();
+        let mut collisions: Vec<String> = Vec::new();
+        let mut rows = 0usize;
         for bytes in &b {
+            // Zero-length payloads are Debezium tombstones (Kafka null-value
+            // messages are usually intercepted by the Kafka input before the
+            // codec; this covers every other transport). Skip instead of
+            // failing the whole batch.
+            if bytes.is_empty() {
+                warn!("debezium_json codec: skipping tombstone (empty payload)");
+                continue;
+            }
             let envelope: Value = serde_json::from_slice(bytes)
                 .map_err(|e| Error::Process(format!("Invalid Debezium envelope JSON: {}", e)))?;
-            let row = flatten_envelope(envelope);
+            let row = flatten_envelope(envelope, &mut collisions);
             let line = serde_json::to_vec(&row)
                 .map_err(|e| Error::Process(format!("Failed to serialize flattened row: {}", e)))?;
             json_data.extend_from_slice(&line);
             json_data.push(b'\n');
+            rows += 1;
+        }
+        if !collisions.is_empty() {
+            warn!(
+                "debezium_json codec: business fields {:?} collided with envelope metadata \
+                 columns; envelope values were moved to `__debezium_<name>` columns",
+                collisions
+            );
+        }
+        if rows == 0 {
+            // Everything was a tombstone: an empty batch is the honest result.
+            return Ok(MessageBatch::new_arrow(
+                datafusion::arrow::array::RecordBatch::new_empty(Arc::new(
+                    datafusion::arrow::datatypes::Schema::empty(),
+                )),
+            ));
         }
         let record_batch = component::json::try_to_arrow(&json_data, None)?;
         Ok(MessageBatch::new_arrow(record_batch))
     }
 }
 
+/// Insert an envelope metadata column. When the business payload already uses
+/// the column name, the business value keeps the column and the envelope value
+/// moves to the reserved `__debezium_<name>` name (recorded in `collisions`).
+fn insert_meta(
+    row: &mut Map<String, Value>,
+    name: &str,
+    value: Value,
+    collisions: &mut Vec<String>,
+) {
+    if row.contains_key(name) {
+        if !collisions.iter().any(|c| c == name) {
+            collisions.push(name.to_string());
+        }
+        row.insert(format!("__debezium_{name}"), value);
+    } else {
+        row.insert(name.to_string(), value);
+    }
+}
+
 /// Flatten a Debezium Envelope into a single row object:
 /// - business fields from `after` (or `before` when `after` is null, e.g. deletes)
 ///   are promoted to the top level;
-/// - `op`, `ts_ms`, `source_db`, `source_table` are added as top-level columns;
+/// - `op`, `ts_ms`, `source_db`, `source_table` are added as top-level columns
+///   (on a name collision with a business field the envelope value moves to
+///   `__debezium_<name>` and the business value keeps the column);
 /// - the full `before` and `source` objects are preserved as JSON text columns.
-fn flatten_envelope(envelope: Value) -> Value {
+fn flatten_envelope(envelope: Value, collisions: &mut Vec<String>) -> Value {
     let op = envelope.get("op").cloned().unwrap_or(Value::Null);
     let ts_ms = envelope.get("ts_ms").cloned().unwrap_or(Value::Null);
     let source = envelope.get("source").cloned().unwrap_or(Value::Null);
@@ -116,12 +164,12 @@ fn flatten_envelope(envelope: Value) -> Value {
     // `source_table`) are already promoted to top-level scalar columns above.
     let before_json = serde_json::to_string(&before).unwrap_or_else(|_| "null".to_string());
     let source_json = serde_json::to_string(&source).unwrap_or_else(|_| "null".to_string());
-    row.insert("op".into(), op);
-    row.insert("ts_ms".into(), ts_ms);
-    row.insert("source_db".into(), source_db);
-    row.insert("source_table".into(), source_table);
-    row.insert("before".into(), Value::String(before_json));
-    row.insert("source".into(), Value::String(source_json));
+    insert_meta(&mut row, "op", op, collisions);
+    insert_meta(&mut row, "ts_ms", ts_ms, collisions);
+    insert_meta(&mut row, "source_db", source_db, collisions);
+    insert_meta(&mut row, "source_table", source_table, collisions);
+    insert_meta(&mut row, "before", Value::String(before_json), collisions);
+    insert_meta(&mut row, "source", Value::String(source_json), collisions);
 
     Value::Object(row)
 }
@@ -240,6 +288,65 @@ mod tests {
         let codec = DebeziumJsonCodec;
         let result = codec.decode(vec![b"not json".to_vec()]).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_in_batch_is_skipped() {
+        // One empty payload (tombstone) plus two valid envelopes: only the
+        // valid rows are produced and the batch must not fail.
+        let codec = DebeziumJsonCodec;
+        let data = vec![
+            Vec::new(),
+            br#"{"before":null,"after":{"id":1,"name":"a"},"op":"c","ts_ms":1,"source":{"db":"s","table":"t"}}"#.to_vec(),
+            br#"{"before":null,"after":{"id":2,"name":"b"},"op":"c","ts_ms":2,"source":{"db":"s","table":"t"}}"#.to_vec(),
+        ];
+        let batch = codec.decode(data).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(str_col(&batch, "op", 0), "c");
+    }
+
+    #[tokio::test]
+    async fn test_all_tombstones_yield_empty_batch() {
+        let codec = DebeziumJsonCodec;
+        let batch = codec.decode(vec![Vec::new(), Vec::new()]).await.unwrap();
+        assert_eq!(batch.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_json_null_literal_is_not_a_tombstone() {
+        // A JSON `null` payload parses to an all-null metadata row (existing
+        // behavior); only a zero-length payload is a tombstone.
+        let codec = DebeziumJsonCodec;
+        let batch = codec.decode(vec![b"null".to_vec()]).await.unwrap();
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_business_field_named_op_wins_column() {
+        // A business column named `op` keeps its value; the envelope operation
+        // moves to the reserved `__debezium_op` column instead of silently
+        // overwriting business data.
+        let batch = decode_one(
+            r#"{"before":null,"after":{"id":1,"op":"custom"},"op":"c","ts_ms":1,"source":{"db":"s","table":"t"}}"#,
+        )
+        .await;
+        assert_eq!(batch.len(), 1);
+        assert_eq!(str_col(&batch, "op", 0), "custom"); // business value survives
+        assert_eq!(str_col(&batch, "__debezium_op", 0), "c"); // envelope value relocated
+    }
+
+    #[tokio::test]
+    async fn test_no_collision_keeps_canonical_names() {
+        // Without a collision the metadata columns keep their canonical names.
+        let batch = decode_one(
+            r#"{"before":null,"after":{"id":1,"name":"a"},"op":"c","ts_ms":1,"source":{"db":"s","table":"t"}}"#,
+        )
+        .await;
+        assert!(batch
+            .record_batch()
+            .column_by_name("__debezium_op")
+            .is_none());
+        assert_eq!(str_col(&batch, "op", 0), "c");
     }
 
     #[tokio::test]

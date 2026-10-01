@@ -160,12 +160,9 @@ impl KafkaOutput {
         if exactly_once {
             client_config.set(
                 "transactional.id",
-                config
-                    .transactional_id
-                    .as_ref()
-                    .expect(
-                        "transactional_id presence is validated by the builder when exactly_once is on",
-                    ),
+                config.transactional_id.as_ref().expect(
+                    "transactional_id presence is validated by the builder when exactly_once is on",
+                ),
             );
             client_config.set("enable.idempotence", "true");
         }
@@ -263,8 +260,17 @@ impl Output for KafkaOutput {
             Error::Connection("The Kafka producer is not initialized".to_string())
         })?;
 
-        // Apply codec encoding if configured
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
+        // Payload selection: an explicit `value_field` takes the named
+        // column's value per row, otherwise the codec encoding applies.
+        let payloads: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
+            crate::output::payload::field_payloads("kafka", &msg, field)?
+        } else {
+            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)
+                .await?
+                .into_iter()
+                .map(|p| p.to_vec())
+                .collect()
+        };
         if payloads.is_empty() {
             return Ok(());
         }
@@ -273,11 +279,24 @@ impl Output for KafkaOutput {
         let key = self.get_key(&msg).await?;
 
         // Prepare all records for sending
+        let payloads_len = payloads.len();
         for (i, x) in payloads.into_iter().enumerate() {
-            // Create record
+            // Create record. The per-row topic must exist for every row:
+            // index panicking here would take the whole stream down, so a
+            // short result (a broken row-alignment invariant) is a named
+            // error instead.
             let mut record = match &topic {
                 EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
-                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => match v.get(i) {
+                    Some(t) => FutureRecord::to(t).payload(x.as_slice()),
+                    None => {
+                        return Err(Error::Process(format!(
+                            "Kafka topic expression produced {} values for {} rows (row {i} has no topic)",
+                            v.len(),
+                            payloads_len,
+                        )))
+                    }
+                },
             };
 
             // Add key if available
@@ -428,13 +447,13 @@ impl KafkaOutput {
                 transactional_offsets_for_batches(msgs, Some(group_topic.as_str()))?;
             if covered {
                 let metadata = crate::kafka_txn::group_metadata(group)
-                .await
-                .ok_or_else(|| {
-                    Error::Config(format!(
+                    .await
+                    .ok_or_else(|| {
+                        Error::Config(format!(
                         "Kafka offset commit group '{group}' has no live input in this process; \
                          the paired Kafka input must declare transactional_offsets"
                     ))
-                })?;
+                    })?;
                 let p = producer.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     p.send_offsets_to_transaction(
@@ -477,17 +496,38 @@ impl KafkaOutput {
         producer: &FutureProducer,
         msg: MessageBatchRef,
     ) -> Result<(), Error> {
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
+        let payloads: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
+            crate::output::payload::field_payloads("kafka", &msg, field)?
+        } else {
+            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)
+                .await?
+                .into_iter()
+                .map(|p| p.to_vec())
+                .collect()
+        };
         if payloads.is_empty() {
             return Ok(());
         }
         let topic = self.get_topic(&msg).await?;
         let key = self.get_key(&msg).await?;
 
+        let payloads_len = payloads.len();
         for (i, x) in payloads.into_iter().enumerate() {
+            // Same row-alignment guard as the non-transactional path: a
+            // short topic result must be a named error, never an index
+            // panic inside a transaction.
             let mut record = match &topic {
                 EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
-                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => match v.get(i) {
+                    Some(t) => FutureRecord::to(t).payload(x.as_slice()),
+                    None => {
+                        return Err(Error::Process(format!(
+                            "Kafka topic expression produced {} values for {} rows (row {i} has no topic)",
+                            v.len(),
+                            payloads_len,
+                        )))
+                    }
+                },
             };
             match &key {
                 Some(EvaluateResult::Scalar(s)) => record = record.key(s),
@@ -590,8 +630,10 @@ pub fn init() -> Result<(), Error> {
             "additionalProperties": false,
             "properties": {
                 "brokers": {"type": "array", "items": {"type": "string"}, "description": "List of Kafka broker addresses."},
-                "topic": {"type": "string", "description": "Destination topic (supports {field} placeholders)."},
-                "key": {"type": "string", "description": "Field used as the message key for partitioning."},
+                "topic": {"oneOf": [ {"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}
+                    ], "description": "Literal value or a SQL expression evaluated per batch."},
+                "key": {"oneOf": [ {"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}
+                    ], "description": "Literal value or a SQL expression evaluated per batch."},
                 "client_id": {"type": "string", "description": "Optional client identifier."},
                 "compression": {"type": "string", "enum": ["none", "gzip", "snappy", "lz4", "zstd"], "description": "Compression algorithm."},
                 "acks": {"type": "string", "enum": ["0", "1", "all"], "description": "Acknowledgment level."},
@@ -605,7 +647,7 @@ pub fn init() -> Result<(), Error> {
         }),
     ).with_example(serde_json::json!({
         "brokers": ["localhost:9092"],
-        "topic": "events"
+        "topic": {"type": "value", "value": "events"}
     })))
 }
 
@@ -733,9 +775,8 @@ fn ext_map_entry(
     let offsets = map.offsets();
     let start = offsets.get(row).copied()? as usize;
     let end = offsets.get(row + 1).copied()? as usize;
-    (start..end).find_map(|index| {
-        (keys.value(index) == key).then(|| values.value(index).to_owned())
-    })
+    (start..end)
+        .find_map(|index| (keys.value(index) == key).then(|| values.value(index).to_owned()))
 }
 
 #[cfg(test)]
@@ -823,19 +864,21 @@ mod tests {
             Err(e) => e,
         };
         let message = err.to_string();
-        assert!(message.contains("clickstream"), "error names the conflict: {message}");
-        assert!(message.contains("orders"), "error names the group topic: {message}");
+        assert!(
+            message.contains("clickstream"),
+            "error names the conflict: {message}"
+        );
+        assert!(
+            message.contains("orders"),
+            "error names the group topic: {message}"
+        );
     }
 
     /// Rows attributed to the group topic fold into the offset list as
     /// before.
     #[test]
     fn l3_accepts_rows_matching_group_topic() {
-        let batch = l3_meta_batch(
-            vec![0, 1],
-            vec![10, 20],
-            Some(vec!["orders", "orders"]),
-        );
+        let batch = l3_meta_batch(vec![0, 1], vec![10, 20], Some(vec!["orders", "orders"]));
         let (offsets, covered) =
             transactional_offsets_for_batches(&[batch], Some("orders")).expect("accepted");
         assert!(covered);
@@ -908,7 +951,10 @@ mod tests {
             "topic": {"type": "value", "value": "t"}
         }));
         let client_config = KafkaOutput::build_client_config(&config).unwrap();
-        assert_eq!(client_config.get("bootstrap.servers"), Some("localhost:9092"));
+        assert_eq!(
+            client_config.get("bootstrap.servers"),
+            Some("localhost:9092")
+        );
         for key in client_config.config_map().keys() {
             assert!(
                 !key.starts_with("security.")
@@ -957,6 +1003,47 @@ mod tests {
         assert!(
             err.to_string().contains("security.sasl.password"),
             "expected the error to name security.sasl.password, got: {err}"
+        );
+    }
+
+    /// Spec: expr-row-routing — a topic expression that evaluates to NULL
+    /// for some row must fail the batch with the expression and row named.
+    /// Before the row-alignment fix the null was silently dropped, the
+    /// result vector ran short, and the per-row topic lookup panicked on
+    /// the index.
+    #[tokio::test]
+    async fn test_topic_expression_null_fails_loudly_not_panic() {
+        let config = output_config(serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topic": {"type": "expr", "expr": "device_topic"}
+        }));
+        let output = KafkaOutput::new(config, None).unwrap();
+
+        use datafusion::arrow::array::{ArrayRef, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let rb = datafusion::arrow::array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "device_topic",
+                datafusion::arrow::datatypes::DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![
+                Some("devices/a"),
+                None,
+                Some("devices/c"),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let msg = MessageBatch::new_arrow(rb);
+
+        let err = match output.get_topic(&msg).await {
+            Ok(_) => panic!("a null topic cell must fail the evaluation"),
+            Err(e) => e,
+        };
+        let text = format!("{err}");
+        assert!(
+            text.contains("device_topic") && text.contains("row 1"),
+            "error must name the expression and the null row, got: {text}"
         );
     }
 }

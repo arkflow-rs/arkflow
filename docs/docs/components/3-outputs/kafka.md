@@ -18,7 +18,7 @@ The Kafka output produces messages to an Apache Kafka topic using librdkafka. It
 | client_id | string | no | — | Client identifier. |
 | compression | string | no | — | One of `none`, `gzip`, `snappy`, `lz4`. |
 | acks | string | no | — | Acknowledgment level: `0`, `1`, or `all`. |
-| value_field | string | no | — | Record field used as the message payload. |
+| value_field | string | no | — | Binary or string column whose per-row value becomes that message's payload (a null value or a missing column is an error). When unset, the codec encoding of the batch applies. |
 | exactly_once | boolean | no | `false` | Enable exactly-once transactional production (L2). |
 | transactional_id | string | no | — | Stable transactional id; required when `exactly_once` is `true`. |
 | offset_commit_group | string | no | — | L3 exactly-once: consumer group of a paired same-process Kafka input (with `transactional_offsets: true`) whose source offsets commit inside this output's producer transactions. Requires `exactly_once`. |
@@ -78,6 +78,8 @@ output:
 | type | string | yes | `value` (static) or `expr` (SQL expression). |
 | value | string | yes (`value`) | Static string value. |
 | expr | string | yes (`expr`) | SQL expression evaluated per message. |
+
+An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
 
 ## Examples
 
