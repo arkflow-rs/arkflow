@@ -99,8 +99,13 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # The cargo-chef dependency layers are multi-GB; stored as gha
+          # cache they blew the 10GB Actions cache quota and kept evicting
+          # the Rust and coverage target caches (cold rebuilds everywhere).
+          # On main/tags the layer cache lives in GHCR instead; PRs keep the
+          # PR-scoped gha backend since fork PRs cannot push to the registry.
+          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache', env.IMAGE_NAME) || 'type=gha' }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache,mode=max', env.IMAGE_NAME) || 'type=gha,mode=max' }}
 
       # Sign the resulting Docker image digest except on PRs.
       # This will only write to the public Rekor transparency log when the Docker
