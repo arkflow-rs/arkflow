@@ -74,6 +74,15 @@ jobs:
       - name: Set PROTOC Environment Variable
         run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
 
+      # Same as rust.yml: the python processor tests round-trip MessageBatch
+      # through the embedded CPython interpreter via arrow-pyarrow, which needs
+      # the `pyarrow` package in the interpreter pyo3 links against (the system
+      # python3). Newer Ubuntu images mark it externally managed (PEP 668),
+      # hence the --break-system-packages fallback.
+      - name: Install pyarrow for python UDF tests
+        run: |
+          python3 -m pip install pyarrow || python3 -m pip install --break-system-packages pyarrow
+
       # --no-clean keeps the restored instrumented artifacts in
       # target/llvm-cov-target (cargo-llvm-cov's dedicated target dir), so the
       # cache above actually speeds up later runs.
@@ -122,12 +131,9 @@ jobs:
             coverage-run.log
           if-no-files-found: warn
 
-      # Tokenless upload works for public repos; set the CODECOV_TOKEN secret
-      # (or remove this step) if that ever changes.
-      - name: Upload to Codecov
-        if: ${{ always() }}
-        uses: codecov/codecov-action@v5
-        with:
-          files: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+      # Codecov upload intentionally omitted: tokenless uploads are rejected
+      # ("Token required - not valid tokenless upload") and the repo has no
+      # CODECOV_TOKEN secret. To re-enable, add the token as a repo secret and
+      # a step like:
+      #   - uses: codecov/codecov-action@v5
+      #     with: { files: lcov.info, token: ${{ secrets.CODECOV_TOKEN }} }
