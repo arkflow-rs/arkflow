@@ -1,0 +1,139 @@
+# Coverage: instrument the workspace with cargo-llvm-cov and emit lcov.info.
+# Mirrors rust.yml (disk cleanup, protoc, cargo registry cache) but keeps a
+# dedicated target/llvm-cov-target cache — instrumented artifacts are not
+# compatible with the plain debug cache used by build-and-test.
+# If PR cost becomes a concern, drop the pull_request trigger and keep main only.
+name: Coverage
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_POLICY_VERSION_MINIMUM: 3.5
+
+jobs:
+  coverage:
+    name: Coverage (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Same disk-pressure mitigation as rust.yml: the instrumented workspace
+      # build plus the restored llvm-cov target cache overflow the runner's
+      # ~20GB of free disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Cache cargo registry & git index
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      # Separate cache key from rust.yml's target cache: these objects are built
+      # with -C instrument-coverage and must never be mixed with plain builds.
+      - name: Cache llvm-cov target dir
+        uses: actions/cache@v4
+        with:
+          path: target/llvm-cov-target
+          key: ${{ runner.os }}-llvm-cov-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-llvm-cov-target-
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Install system dependencies (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+
+      - name: Set PROTOC Environment Variable
+        run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      # Same as rust.yml: the python processor tests round-trip MessageBatch
+      # through the embedded CPython interpreter via arrow-pyarrow, which needs
+      # the `pyarrow` package in the interpreter pyo3 links against (the system
+      # python3). Newer Ubuntu images mark it externally managed (PEP 668),
+      # hence the --break-system-packages fallback.
+      - name: Install pyarrow for python UDF tests
+        run: |
+          python3 -m pip install pyarrow || python3 -m pip install --break-system-packages pyarrow
+
+      # --no-clean keeps the restored instrumented artifacts in
+      # target/llvm-cov-target (cargo-llvm-cov's dedicated target dir), so the
+      # cache above actually speeds up later runs.
+      - name: Generate coverage (lcov)
+        run: |
+          set -o pipefail
+          cargo llvm-cov --workspace --all-targets --no-clean \
+            --lcov --output-path lcov.info | tee coverage-run.log
+
+      - name: Coverage summary
+        if: ${{ always() }}
+        run: |
+          set -o pipefail
+          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+
+      - name: Write job summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "### Coverage"
+            echo '```'
+            grep '^TOTAL' coverage-summary.txt
+            echo '```'
+            echo "<details><summary>Per-file coverage table</summary>"
+            echo ""
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Incremental artifacts only bloat the cache; drop them before the
+      # post-job cache save.
+      - name: Trim incremental artifacts
+        if: ${{ always() }}
+        run: rm -rf target/llvm-cov-target/debug/incremental
+
+      - name: Upload lcov artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: |
+            lcov.info
+            coverage-summary.txt
+            coverage-run.log
+          if-no-files-found: warn
+
+      # Codecov upload intentionally omitted: tokenless uploads are rejected
+      # ("Token required - not valid tokenless upload") and the repo has no
+      # CODECOV_TOKEN secret. To re-enable, add the token as a repo secret and
+      # a step like:
+      #   - uses: codecov/codecov-action@v5
+      #     with: { files: lcov.info, token: ${{ secrets.CODECOV_TOKEN }} }
