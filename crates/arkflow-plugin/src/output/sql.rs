@@ -608,6 +608,12 @@ impl SqlOutput {
                 }
             }
             DataType::Date32 | DataType::Date64 => {
+                // value_as_date reads the raw slot without consulting the
+                // null bitmap: a null slot usually stores 0 and would
+                // insert 1970-01-01 instead of NULL.
+                if column.is_null(row_index) {
+                    return Ok(SqlValue::Null);
+                }
                 let date = if let Some(arr) = column.as_any().downcast_ref::<Date32Array>() {
                     arr.value_as_date(row_index)
                 } else if let Some(arr) = column.as_any().downcast_ref::<Date64Array>() {
@@ -630,6 +636,11 @@ impl SqlOutput {
 
     /// Format a timestamp cell of any unit as an RFC3339 string parameter.
     fn timestamp_value(column: &dyn Array, row_index: usize) -> Result<SqlValue, Error> {
+        // Same null-bitmap caveat as the Date branch: value_as_datetime
+        // would turn a null slot into 1970-01-01T00:00:00+00:00.
+        if column.is_null(row_index) {
+            return Ok(SqlValue::Null);
+        }
         use datafusion::arrow::array::{
             TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
             TimestampSecondArray,
@@ -961,6 +972,27 @@ mod tests {
         assert!(matches!(
             output.matching_data_type("ts", &ts, 0).await.unwrap(),
             SqlValue::String(ref s) if s.starts_with("1970-01-01T00:00:00")
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_data_type_null_temporal_cells_stay_null() {
+        // Regression (CR): value_as_date/value_as_datetime ignore the null
+        // bitmap — a null slot stores 0 and used to insert the epoch
+        // (1970-01-01 / 1970-01-01T00:00:00+00:00) instead of NULL.
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        use datafusion::arrow::array::{Date32Array, TimestampNanosecondArray};
+
+        let dates = Date32Array::from(vec![Some(0), None]);
+        assert!(matches!(
+            output.matching_data_type("d", &dates, 1).await.unwrap(),
+            SqlValue::Null
+        ));
+
+        let ts = TimestampNanosecondArray::from(vec![None]);
+        assert!(matches!(
+            output.matching_data_type("ts", &ts, 0).await.unwrap(),
+            SqlValue::Null
         ));
     }
 

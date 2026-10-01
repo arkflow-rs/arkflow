@@ -16,7 +16,7 @@ Python 处理器通过 PyO3 对每个消息批次执行用户提供的 Python �
 | module | string | no | `__main__` | 从中导入函数的 Python 模块。提供 `script` 时忽略此项。 |
 | function | string | yes | — | 要调用的 Python 函数名。该函数必须接受一个 PyArrow 批次,并返回一个 PyArrow 批次列表。 |
 | python_path | array&lt;string&gt; | no | `[]` | 为模块导入而添加到 `sys.path` 的额外路径;靠前的条目优先级更高,已存在的条目不会重复添加,工作目录 `.` 排在配置路径之后。 |
-| timeout_ms | integer | no | `60000` | 单次函数调用的耗时上界(毫秒)。超时使整批报错而不是无限阻塞流;被放弃的 Python 调用仍会在其线程上运行至自然返回。 |
+| timeout_ms | integer | no | `60000` | 单次函数调用的耗时上界(毫秒)。超时使整批报错而不是无限阻塞流;被放弃的 Python 调用仍会在其线程上运行至自然返回。全进程最多 64 个 UDF 调用在运行(或挂起)——超出者等待,避免卡死的调用耗尽共享阻塞线程池。 |
 
 ## 示例
 

@@ -494,6 +494,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn per_input_failure_restores_previously_merged_inputs() {
+        // Input "a" merges fine and is drained before input "b"'s internal
+        // type conflict fails the round: a's message (merged form) must go
+        // back to its queue alongside b's originals — nothing dropped, no
+        // ack lost. Order-independent: whichever input the DashMap yields
+        // first, both inputs end up fully restorable.
+        use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let config = TumblingWindowConfig {
+            interval: Duration::from_millis(50),
+            join: None,
+        };
+        let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
+
+        let arrow = |name: &str, ty: datafusion::arrow::datatypes::DataType, arr: ArrayRef| {
+            let rb = datafusion::arrow::array::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", ty, true)])),
+                vec![arr],
+            )
+            .unwrap();
+            let mut mb = MessageBatch::new_arrow(rb);
+            mb.set_input_name(Some(name.to_string()));
+            mb
+        };
+
+        buffer
+            .write(
+                Arc::new(arrow(
+                    "a",
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    Arc::new(StringArray::from(vec![Some("1")])) as ArrayRef,
+                )),
+                Arc::new(NoopAck),
+            )
+            .await
+            .unwrap();
+        buffer
+            .write(
+                Arc::new(arrow(
+                    "b",
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    Arc::new(StringArray::from(vec![Some("1")])) as ArrayRef,
+                )),
+                Arc::new(NoopAck),
+            )
+            .await
+            .unwrap();
+        buffer
+            .write(
+                Arc::new(arrow(
+                    "b",
+                    datafusion::arrow::datatypes::DataType::Int64,
+                    Arc::new(Int64Array::from(vec![Some(2)])) as ArrayRef,
+                )),
+                Arc::new(NoopAck),
+            )
+            .await
+            .unwrap();
+
+        assert!(buffer.read().await.is_err(), "b's conflict must error");
+
+        let queue_len = |name: &str| {
+            buffer
+                .base_window
+                .queue
+                .get(name)
+                .map(|q| q.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(queue_len("a"), 1, "input a must not be dropped");
+        assert_eq!(queue_len("b"), 2, "input b's messages stay retryable");
+    }
+
+    #[tokio::test]
     async fn close_with_empty_queue_returns_promptly() {
         // A reader that misses the final notify_waiters must still be woken
         // by the close token: bounded wait, never a permanent park.

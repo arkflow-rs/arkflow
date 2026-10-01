@@ -48,6 +48,17 @@ fn default_timeout_ms() -> u64 {
     60_000
 }
 
+/// Process-wide bound on UDF calls occupying blocking threads. A timed-out
+/// call cannot be cancelled and keeps its thread (and this permit) until
+/// the UDF itself returns; without the bound a hanging UDF leaks one
+/// blocking-pool thread per retry until the pool (default 512 threads) is
+/// exhausted, stalling every other `spawn_blocking` caller — including
+/// the Kafka transactional commit path. All Python processors share one
+/// interpreter, so the bound is global.
+const INFLIGHT_UDF_LIMIT: usize = 64;
+static INFLIGHT_UDFS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(INFLIGHT_UDF_LIMIT)));
+
 struct PythonProcessor {
     func: Py<PyAny>, // Stores the Python function to be called
     timeout_ms: u64,
@@ -87,13 +98,25 @@ impl Processor for PythonProcessor {
         let func_to_call = Python::attach(|py| self.func.clone_ref(py));
 
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
-        let handle = tokio::task::spawn_blocking(move || call_udf(func_to_call, batch));
+        // The permit lives inside the blocking closure: an async timeout
+        // abandons the task but the stuck call keeps holding its permit,
+        // so new calls queue here instead of piling more threads.
+        let permit = INFLIGHT_UDFS
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| Error::Process(format!("python UDF in-flight semaphore closed: {e}")))?;
+        let handle = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            call_udf(func_to_call, batch)
+        });
         let result = tokio::time::timeout(timeout, handle)
             .await
             .map_err(|_| {
                 Error::Process(format!(
-                    "Python function call timed out after {} ms (the UDF may still occupy its blocking thread until it returns)",
-                    self.timeout_ms
+                    "Python function call timed out after {} ms (the UDF may still occupy its blocking thread and one of {} in-flight slots until it returns)",
+                    self.timeout_ms,
+                    INFLIGHT_UDF_LIMIT
                 ))
             })?
             .map_err(|e| Error::Process(format!("Failed to spawn blocking task: {}", e)))??;

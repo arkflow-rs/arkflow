@@ -76,14 +76,18 @@ impl Decoder for JsonCodec {
 }
 
 impl JsonCodec {
-    /// `on_error: skip` path: decode message by message, warn-and-drop the bad
-    /// ones, and merge the good ones on the union schema.
+    /// `on_error: skip` path: decode message by message to find the bad ones
+    /// (warn-and-drop), then decode the surviving messages in ONE pass so
+    /// schema inference is shared with the `fail` path — `{"v":1}` and
+    /// `{"v":1.5}` widen to a common Float64 column exactly like a batch
+    /// without bad messages would, instead of colliding as two separately
+    /// inferred schemas.
     async fn decode_isolating(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
-        let mut batches = Vec::with_capacity(b.len());
+        let mut good: Vec<&[u8]> = Vec::with_capacity(b.len());
         let mut skipped = 0usize;
         for (idx, bytes) in b.iter().enumerate() {
             match component::json::try_to_arrow(bytes, None) {
-                Ok(rb) => batches.push(rb),
+                Ok(_) => good.push(bytes.as_slice()),
                 Err(e) => {
                     warn!(
                         "json codec: skipping message #{} ({} bytes): {}",
@@ -95,7 +99,7 @@ impl JsonCodec {
                 }
             }
         }
-        if batches.is_empty() {
+        if good.is_empty() {
             return Err(Error::Process(format!(
                 "json codec: all {} messages in the batch failed to decode",
                 skipped
@@ -108,7 +112,8 @@ impl JsonCodec {
                 b.len()
             );
         }
-        let merged = crate::component::batch_merge::normalize_and_concat(&batches)?;
+        let joined: Vec<u8> = good.join(b"\n" as &[u8]);
+        let merged = component::json::try_to_arrow(&joined, None)?;
         Ok(MessageBatch::new_arrow(merged))
     }
 }
@@ -358,6 +363,43 @@ mod tests {
         use datafusion::arrow::array::Array;
         let name_col = batch.record_batch().column_by_name("name").unwrap();
         assert!(name_col.is_null(1));
+    }
+
+    #[tokio::test]
+    async fn test_json_codec_skip_widens_types_like_fail_mode() {
+        // Regression (CR): skip mode must share schema inference with the
+        // fail path. Decoding each good message separately infers `{"v":1}`
+        // as Int64 and `{"v":1.5}` as Float64, and merging those schemas
+        // fails with a type conflict — a batch the fail mode would decode.
+        // Skip mode must decode the surviving messages in one pass and
+        // produce exactly what fail mode produces for the same messages.
+        let fail = JsonCodec {
+            on_error: OnError::Fail,
+        };
+        let skip = JsonCodec {
+            on_error: OnError::Skip,
+        };
+        let reference = fail
+            .decode(vec![br#"{"v":1}"#.to_vec(), br#"{"v":1.5}"#.to_vec()])
+            .await
+            .expect("fail mode decodes the good pair");
+
+        let batch = skip
+            .decode(vec![
+                br#"{"v":1}"#.to_vec(),
+                b"{invalid".to_vec(),
+                br#"{"v":1.5}"#.to_vec(),
+            ])
+            .await
+            .expect("skip mode must not fail on a batch fail mode decodes");
+
+        assert_eq!(batch.len(), reference.len());
+        assert_eq!(batch.schema(), reference.schema());
+        assert_eq!(
+            batch.record_batch().column(0),
+            reference.record_batch().column(0),
+            "skip mode must produce the same column as fail mode"
+        );
     }
 
     #[tokio::test]

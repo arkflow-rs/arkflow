@@ -66,6 +66,13 @@ struct MqttOutputConfig {
 /// giving up and surfacing the failure to the output chain.
 const RECONNECT_ATTEMPTS: u32 = 3;
 
+/// Upper bound for the broker handshake (ConnAck) during connect. A fresh
+/// rumqttc client opens no network connection until the eventloop polls,
+/// so "created" must not be reported as "connected": without this gate the
+/// write-path reconnect succeeds instantly against a dead broker and the
+/// 1s/2s/4s backoff can never trigger in production.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// MQTT output component
 struct MqttOutput<T: MqttClient> {
     config: MqttOutputConfig,
@@ -114,6 +121,31 @@ impl<T: MqttClient> MqttOutput<T> {
         }
 
         let (client, mut eventloop) = T::create(mqtt_options, 10).await?;
+
+        // A fresh client is not connected: the broker handshake happens on
+        // the first eventloop poll. Wait for ConnAck (bounded) before the
+        // connection is declared established — an unreachable broker fails
+        // HERE, so `reconnect`'s backoff and exhaustion are real.
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, eventloop.poll()).await {
+            Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_)))) => {}
+            Ok(Ok(other)) => {
+                // rumqttc always yields ConnAck first; any other first
+                // event means the protocol stream is not what we expect.
+                return Err(Error::Connection(format!(
+                    "MQTT broker sent an unexpected first event: {other:?}"
+                )));
+            }
+            Ok(Err(e)) => {
+                return Err(Error::Connection(format!(
+                    "MQTT broker handshake failed: {e}"
+                )));
+            }
+            Err(_) => {
+                return Err(Error::Connection(format!(
+                    "MQTT broker handshake timed out after {HANDSHAKE_TIMEOUT:?}"
+                )));
+            }
+        }
 
         let mut client_guard = self.client.lock().await;
         let mut eventloop_handle_guard = self.eventloop_handle.lock().await;
@@ -423,19 +455,52 @@ mod tests {
     static MOCK_DISCONNECTS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
+    /// Minimal fake broker: accepts TCP connections and immediately replies
+    /// with a CONNACK (session-present=0, code=0), then holds the socket
+    /// open. This makes the mock's eventloop pass the ConnAck gate in
+    /// `establish_connection` like a real broker would.
+    async fn spawn_fake_broker() -> Result<u16, std::io::Error> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let (mut rd, mut wr) = socket.into_split();
+                    let _ = wr.write_all(&[0x20, 0x02, 0x00, 0x00]).await;
+                    // keep the connection open until the client goes away
+                    let mut buf = [0u8; 512];
+                    loop {
+                        match rd.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+        Ok(port)
+    }
+
     // Mock MQTT client for testing
     struct MockMqttClient {
         connected: Arc<AtomicBool>,
         #[allow(clippy::type_complexity)]
         published_messages: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        /// Kept alive so the request channel stays open and the eventloop
+        /// (returned to `establish_connection`) keeps polling happily.
+        #[allow(dead_code)]
+        _real_client: AsyncClient,
     }
 
     impl MockMqttClient {
-        fn new() -> Self {
+        fn new(real_client: AsyncClient) -> Self {
             MOCK_CREATES.fetch_add(1, Ordering::SeqCst);
             Self {
                 connected: Arc::new(AtomicBool::new(true)),
                 published_messages: Arc::new(Mutex::new(Vec::new())),
+                _real_client: real_client,
             }
         }
 
@@ -454,9 +519,13 @@ mod tests {
                 MOCK_CREATE_FAILURES.fetch_sub(1, Ordering::SeqCst);
                 return Err(Error::Connection("injected create failure".to_string()));
             }
-            // Create a new EventLoop directly without using new() method
-            let (_, eventloop) = AsyncClient::new(MqttOptions::new("", "", 0), 10);
-            Ok((Self::new(), eventloop))
+            // A real eventloop against the fake broker: the first poll
+            // yields the broker's CONNACK, so the handshake gate passes.
+            let port = spawn_fake_broker()
+                .await
+                .map_err(|e| Error::Connection(format!("fake broker bind failed: {e}")))?;
+            let (client, eventloop) = AsyncClient::new(MqttOptions::new("mock", "127.0.0.1", port), 10);
+            Ok((Self::new(client), eventloop))
         }
 
         async fn publish<S, V>(
@@ -737,5 +806,34 @@ mod tests {
 
         let msg = Arc::new(MessageBatch::from_string("test message").unwrap());
         assert!(output.write(msg).await.is_err());
+    }
+
+    /// Spec: connector-recovery-contract — a fresh rumqttc client opens no
+    /// connection until the eventloop polls, so connect() must be gated on
+    /// the broker's ConnAck: an unreachable broker fails the handshake
+    /// instead of reporting "connected". This exercises the REAL
+    /// AsyncClient path (port 1 has no listener).
+    #[tokio::test]
+    async fn test_connect_fails_loudly_when_broker_unreachable() {
+        let _guard = TEST_LOCK.lock().await;
+        reset_injections();
+        let mut config = test_config();
+        config.host = "127.0.0.1".to_string();
+        config.port = 1;
+
+        let output = MqttOutput::<AsyncClient>::new(config, None).unwrap();
+        let err = match output.connect().await {
+            Ok(_) => panic!("connect must fail against a closed port"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("handshake"),
+            "error must name the handshake stage, got: {msg}"
+        );
+        assert!(
+            !output.connected.load(Ordering::SeqCst),
+            "connected must stay false after a failed handshake"
+        );
     }
 }

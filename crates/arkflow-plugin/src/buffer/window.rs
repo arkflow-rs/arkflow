@@ -29,7 +29,7 @@ pub(crate) struct BaseWindow {
     /// Using DashMap instead of nested RwLock for better performance
     /// This eliminates the nested lock bottleneck: Arc<RwLock<HashMap<String, Arc<RwLock<VecDeque...>>>>
     #[allow(clippy::type_complexity)]
-    queue: Arc<DashMap<String, VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>,
+    pub(crate) queue: Arc<DashMap<String, VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>,
     /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
     /// Token for cancellation of background tasks
@@ -99,7 +99,7 @@ impl BaseWindow {
     pub(crate) async fn process_window(
         &self,
     ) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
-        let mut all_messages = Vec::new();
+        let mut all_messages: Vec<MessageBatchRef> = Vec::new();
         let mut all_acks: Vec<Arc<dyn Ack>> = Vec::new();
 
         // DashMap provides efficient concurrent iteration
@@ -125,8 +125,12 @@ impl BaseWindow {
 
                 // Per-input merge: batches of one input may legitimately
                 // differ in schema (drift); normalize to the field union
-                // instead of failing the concat. On failure the drained
-                // items go back untouched so a later read retries them.
+                // instead of failing the concat. On failure everything
+                // drained so far goes back — this input's items and the
+                // merged batches of the inputs processed before it — so a
+                // later read retries the whole round and no message or ack
+                // is dropped. `write` pushes to the front, so restored
+                // (older) items are appended to the back.
                 let batches: Vec<RecordBatch> = messages
                     .iter()
                     .map(|batch| (**batch).clone().into())
@@ -136,7 +140,13 @@ impl BaseWindow {
                     Ok(b) => b,
                     Err(e) => {
                         self.queue
-                            .insert(input_name, messages.into_iter().zip(acks).collect());
+                            .entry(input_name)
+                            .or_default()
+                            .extend(messages.into_iter().zip(acks));
+                        for (msg, ack) in all_messages.into_iter().zip(all_acks) {
+                            let name = msg.get_input_name().unwrap_or_default();
+                            self.queue.entry(name).or_default().push_back((msg, ack));
+                        }
                         return Err(e);
                     }
                 };
@@ -180,10 +190,11 @@ impl BaseWindow {
                 // Cross-input failure (type conflict or join error): the
                 // per-input merged batches and their acks go back to their
                 // queues — content-equivalent to the original messages — so
-                // nothing is dropped and a later read can retry.
+                // nothing is dropped and a later read can retry. Appended to
+                // the back: `write` pushes newer items to the front.
                 for (msg, ack) in all_messages.into_iter().zip(all_acks) {
                     let name = msg.get_input_name().unwrap_or_default();
-                    self.queue.entry(name).or_default().push_front((msg, ack));
+                    self.queue.entry(name).or_default().push_back((msg, ack));
                 }
                 Err(e)
             }

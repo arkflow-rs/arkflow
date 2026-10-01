@@ -107,8 +107,12 @@ fn validate(value: &serde_json::Value, schema: &serde_json::Value, path: &str) -
             .map(|v| validate(value, v, path))
             .filter(|errs| errs.is_empty())
             .count();
-        if matched == 0 {
-            errors.push(format!("{path}: matches none of the oneOf variants"));
+        // oneOf requires EXACTLY one matching branch (JSON Schema), not
+        // at least one.
+        if matched != 1 {
+            errors.push(format!(
+                "{path}: matches {matched} oneOf variants; expected exactly one"
+            ));
         }
     }
 

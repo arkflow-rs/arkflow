@@ -19,30 +19,30 @@
 ## 4. json/protobuf 坏消息隔离
 
 - [x] 4.1 两个 codec config 增加 `on_error: fail | skip`（serde 缺省 `fail`）；`fail` 路径字节不变
-- [x] 4.2 `skip` 路径：json 逐条 `try_to_arrow`、protobuf 逐条 `protobuf_to_arrow`（失败 warn 含序号与原因后跳过），好消息经 `normalize_and_concat` 合并；全坏返回错误不产空批次（`codec/json.rs:44-51`、`codec/protobuf.rs:100-121`）；单测：混批隔离、全坏报错、异构好消息归并、缺省仍整批失败
+- [x] 4.2 `skip` 路径：json 逐条 `try_to_arrow`、protobuf 逐条 `protobuf_to_arrow`（失败 warn 含序号与原因后跳过），好消息经 `normalize_and_concat` 合并；全坏返回错误不产空批次（`codec/json.rs:44-51`、`codec/protobuf.rs:100-121`）；单测：混批隔离、全坏报错、异构好消息归并、缺省仍整批失败。CodeRabbit 追加：json 的好消息改为单次联合解码（与 fail 路径同源 schema 推断），不再对分别推断的 schema 做类型冲突合并——`{"v":1}` 与 `{"v":1.5}` 这类 fail 可解的批次 skip 不再整批报错（等价性测试钉住）
 
 ## 5. 连接器错误分类与恢复
 
 - [x] 5.1 modbus 四个读路径错误映射 `Error::Disconnection`（IO/连接/超时类），协议类保持 `Process`（`input/modbus.rs:119-164`）；分类逻辑提为可单测的纯函数并补单测
 - [x] 5.2 nats 首次订阅与 connect 期 fetch 失败改 `Disconnection`（`input/nats.rs:206-215,278-298`，对齐 JetStream 循环 `:337,351` 既有用法）；补错误分类断言测试
-- [x] 5.3 MQTT output：eventloop 退出即置 `connected=false`；publish 失败/连接失效时惰性重连（先 abort 旧任务 + best-effort disconnect 旧 client，再重建，1s/2s/4s 共 3 次），耗尽返回 `Connection` 错误（`output/mqtt.rs:113-143`）；基于 MockMqttClient 补：重连不泄漏旧任务、标志真实、耗尽报错三用例
+- [x] 5.3 MQTT output：eventloop 退出即置 `connected=false`；publish 失败/连接失效时惰性重连（先 abort 旧任务 + best-effort disconnect 旧 client，再重建，1s/2s/4s 共 3 次），耗尽返回 `Connection` 错误（`output/mqtt.rs:113-143`）；基于 MockMqttClient 补：重连不泄漏旧任务、标志真实、耗尽报错三用例。CodeRabbit 追加：establish_connection 以有界超时（10s）等待 broker ConnAck 后才置 connected——rumqttc 客户端构造不建连，否则不可达 broker 下重连/退避/耗尽语义全部失效；测试侧引入回 CONNACK 的假 broker，并补真实 AsyncClient 打向关闭端口的握手失败用例
 
 ## 6. processor 加固（vrl / python / sql）
 
 - [x] 6.1 vrl：UInt64 用 `i64::try_from`，超界报错含列名与原值（`processor/vrl.rs:256`）；不支持类型与 downcast 失败分支改显式报错（含列名、类型、`filter_columns` 规避提示），删除静默 Null 路径（`vrl.rs:171-177,345-352`）；单测：u64::MAX 报错、范围内正常、List 列报错、支持类型回归
 - [x] 6.2 python：`sys.path` 装配去 `unwrap()`（错误返回 `Error::Process`）、配置顺序生效（修反转）、跨实例查重去重（`processor/python.rs:117-121`）；单测覆盖顺序与去重
-- [x] 6.3 python：`timeout_ms: Option<u64>`（缺省 60000），`process()` 的 `spawn_blocking` 包 `tokio::time::timeout`，超时报错含耗时（`python.rs:47-80`）；单测：短 UDF 正常、超时路径返回错误
+- [x] 6.3 python：`timeout_ms: Option<u64>`（缺省 60000），`process()` 的 `spawn_blocking` 包 `tokio::time::timeout`，超时报错含耗时（`python.rs:47-80`）；单测：短 UDF 正常、超时路径返回错误。CodeRabbit 追加：全进程在飞 UDF 信号量（64）——超时被弃的 UDF 仍持有许可与阻塞线程直至返回，后续调用在信号量排队而非堆线程，防止挂死 UDF 耗尽共享阻塞池（Kafka 事务提交同用该池）
 - [x] 6.4 sql processor：临时表注销改 RAII guard（Drop 时 deregister 主表与临时表），`?` 早退不再跳过（`processor/sql.rs:219-241`）；单测：构造 register 后执行失败路径，验证后续批次同池 context 可正常注册
 
 ## 7. sql output
 
-- [x] 7.1 扩展 `matching_data_type`：Int8/16/32→i64、UInt8/16/32→u64、Float32→f64、Date32/Date64→ISO 日期串、Timestamp（任意 unit）→RFC3339 串；Unsupported 报错含列名与类型（`output/sql.rs:505-559`）；单测覆盖新增类型映射与报错文案
+- [x] 7.1 扩展 `matching_data_type`：Int8/16/32→i64、UInt8/16/32→u64、Float32→f64、Date32/Date64→ISO 日期串、Timestamp（任意 unit）→RFC3339 串；Unsupported 报错含列名与类型（`output/sql.rs:505-559`）；单测覆盖新增类型映射与报错文案。CodeRabbit 追加：Date/Timestamp 分支先查 null 位图——`value_as_date`/`value_as_datetime` 不检查位图，null 槽位会以 epoch 值（1970-01-01）入库而非 NULL（补 null 单元测试）
 - [x] 7.2 build 配置了 `codec` 即拒绝（配置错误指明原因）（`output/sql.rs:598-604`）；单测：带 codec 构建 Err、不带构建 Ok
 - [x] 7.3 `close()` 显式 take 并关闭数据库连接（`output/sql.rs:452-455`）；单测或既有 mock 路径验证连接关闭调用
 
 ## 8. window buffer
 
-- [x] 8.1 `process_window` 失败保留：任何失败路径（含归一冲突）把已取出队列原样放回再返回 Err，ack 不 settle 不 abort（`buffer/window.rs:113,148-161`）；单测：合并失败后再次 read 可重试同一批
+- [x] 8.1 `process_window` 失败保留：任何失败路径（含归一冲突）把已取出队列原样放回再返回 Err，ack 不 settle 不 abort（`buffer/window.rs:113,148-161`）；单测：合并失败后再次 read 可重试同一批。CodeRabbit 追加：per-input 合并失败时同步回填此前已 drain 并合并的输入（原实现只回填失败输入，早前输入的消息与 ack 会被丢弃）；两个回填点统一 push_back（write 为 push_front，恢复的旧数据排队尾），补多输入回填测试
 - [x] 8.2 异构 schema 归一：合并改用 `normalize_and_concat`（缺列 null、类型冲突走 8.1 保留路径）；单测：缺列归并、类型冲突报错且队列保留
 - [x] 8.3 读者唤醒：三个窗口 buffer（tumbling/sliding/session）读者循环改 `select!`（`notified()` vs 关闭 token），token 触发按 close 语义排空后结束；单测：close 时空队列读者在有限时间（非 200ms 短超时掩盖）返回
 
@@ -52,7 +52,7 @@
 - [x] 9.2 抽取 pulsar `field_payloads` 为 output 共享模块，pulsar 改用；kafka/mqtt/nats/redis write 路径实装 `value_field`（列缺失/类型不符报错，未配置走 codec 编码不变）；各补单测（列取值、缺失列报错、未配置回归）。CR 追加：LargeBinary/LargeUtf8 的 null 单元与 Binary/Utf8 一致显式报错（原 `.flatten()` 静默丢行会使 payload 与行级 topic/key 错位），payload 模块补四种类型的行对齐与 null 拒绝测试
 - [x] 9.3 websocket input 实装 `headers`：握手请求经 request builder 携带配置头（`input/websocket.rs:98`）；单测或集成验证握手头存在，未配置回归
 - [x] 9.4 移除 file/sql/modbus input 的死 `codec` 字段（struct 字段 + `#[allow(dead_code)]` + 元数据 schema 条目，`input/file.rs:157-158`、`input/sql.rs:132-133`、`input/modbus.rs:66-67`）；确认示例与文档无引用。CR 追加：stream 级 `codec:` 键构建期显式拒绝（三 builder + `dead_codec_config_is_rejected_by_builders` 端到端测试）
-- [x] 9.5 新增注册表诚实门禁测试：遍历全部组件元数据，`config_example` 必须通过声明的 schema 校验且反序列化为真实 config struct（构建期联网的组件仅做反序列化并注明）；确保 batch/redis 旧示例若未修会被拦截
+- [x] 9.5 新增注册表诚实门禁测试：遍历全部组件元数据，`config_example` 必须通过声明的 schema 校验且反序列化为真实 config struct（构建期联网的组件仅做反序列化并注明）；确保 batch/redis 旧示例若未修会被拦截。CodeRabbit 追加：oneOf 校验改为恰好匹配一个分支（JSON Schema 语义，原实现接受多匹配）
 
 ## 10. 文档与生成产物
 
