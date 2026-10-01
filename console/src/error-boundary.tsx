@@ -39,9 +39,7 @@ export class AppErrorBoundary extends Component<Props, State> {
             fontFamily: 'system-ui, sans-serif',
           }}
         >
-          <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>
-            Something went wrong
-          </h1>
+          <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Something went wrong</h1>
           <p
             style={{
               color: '#666',
