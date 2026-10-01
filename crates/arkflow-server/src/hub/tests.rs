@@ -47,7 +47,7 @@ fn recovery_selection_requires_matching_job_and_state_versions() {
 
 #[tokio::test]
 async fn checkpoint_completion_after_hub_restart_preserves_metadata() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("checkpoint_completion_after_hub_restart_preserves_metadata").await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub1 = Hub::with_storage(config(), storage.clone());
     let hub2 = Hub::with_storage(config(), storage);
@@ -165,7 +165,7 @@ async fn session_tokens_are_random_and_unique() {
 /// fresh command reaches the node.
 #[tokio::test]
 async fn terminal_failure_intent_reenqueues_a_fresh_command_on_retry() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("terminal_failure_intent_reenqueues_a_fresh_command_on_retry").await;
     let storage = StorageActor::start(store, 8);
     let hub = Hub::with_storage(config(), storage.clone());
     let session = hub
@@ -259,7 +259,7 @@ async fn terminal_failure_intent_reenqueues_a_fresh_command_on_retry() {
 /// confirmation succeeds, later ticks skip again.
 #[tokio::test]
 async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("restart_restores_persisted_operations_and_skips_satisfied_starts").await;
     let hub1 = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
     let session = hub1
         .register(RegisterRequest {
@@ -383,6 +383,166 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
             .iter()
             .any(|command| command.operation == "job_start"),
         "after the one-shot confirmation the dispatch skip holds again"
+    );
+}
+
+#[tokio::test]
+async fn declared_resources_over_capacity_fail_the_reconcile_loudly() {
+    let hub = Hub::new(config());
+    // One node reporting tiny capacity gauges.
+    let session = hub
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "tiny-node".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+    hub.report(NodeReport {
+        auth: AgentAuth {
+            node_id: "tiny-node".into(),
+            session_token: session.session_token,
+        },
+        version: "test".into(),
+        state: "online".into(),
+        capabilities: vec!["job_runtime".into()],
+        streams: vec![],
+        operations: vec![],
+        events: vec![],
+        metrics: BTreeMap::from([
+            ("node_cpu_cores".to_string(), 0.1),
+            ("node_memory_total_bytes".to_string(), 1_000.0),
+        ]),
+        jobs: BTreeMap::new(),
+        configuration: None,
+        configuration_version: None,
+        boot_id: None,
+        report_seq: 1,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
+    })
+    .await
+    .unwrap();
+
+    // A Job declaring more CPU than the node reports.
+    let mut spec = serde_json::from_str::<serde_json::Value>(&job_spec_json("hungry-job")).unwrap();
+    spec["resources"] = serde_json::json!({"cpu_millicores": 5_000});
+    let error = hub
+        .upsert_job(JobRecord {
+            job_id: "hungry-job".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec!["tiny-node".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("insufficient CPU capacity"),
+        "{error}"
+    );
+
+    // The same node with a memory-bound Job also surfaces loudly.
+    let mut spec = serde_json::from_str::<serde_json::Value>(&job_spec_json("fat-job")).unwrap();
+    spec["resources"] = serde_json::json!({"memory_bytes": 100_000});
+    let error = hub
+        .upsert_job(JobRecord {
+            job_id: "fat-job".into(),
+            version: 1,
+            spec_json: spec.to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec!["tiny-node".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("insufficient memory capacity"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn declared_resources_within_capacity_dispatch_normally() {
+    let hub = Hub::new(config());
+    let session = hub
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "roomy-node".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
+    hub.report(NodeReport {
+        auth: AgentAuth {
+            node_id: "roomy-node".into(),
+            session_token: session.session_token.clone(),
+        },
+        version: "test".into(),
+        state: "online".into(),
+        capabilities: vec!["job_runtime".into(), "state_backend".into()],
+        streams: vec![],
+        operations: vec![],
+        events: vec![],
+        metrics: BTreeMap::from([
+            ("node_cpu_cores".to_string(), 4.0),
+            ("node_memory_total_bytes".to_string(), 8_000_000_000.0),
+        ]),
+        jobs: BTreeMap::new(),
+        configuration: None,
+        configuration_version: None,
+        boot_id: None,
+        report_seq: 1,
+        config_versions: Vec::new(),
+        job_tasks: BTreeMap::new(),
+    })
+    .await
+    .unwrap();
+    let mut spec = serde_json::from_str::<serde_json::Value>(&job_spec_json("fits-job")).unwrap();
+    spec["resources"] = serde_json::json!({"cpu_millicores": 500, "memory_bytes": 1_000});
+    hub.upsert_job(JobRecord {
+        job_id: "fits-job".into(),
+        version: 1,
+        spec_json: spec.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec!["roomy-node".into()],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+    hub.reconcile_jobs().await.unwrap();
+    // Without fresh gauges or with a gauge-less node the gate is fail-open:
+    // a registered node that never reported still dispatches.
+    let auth = AgentAuth {
+        node_id: "roomy-node".into(),
+        session_token: session.session_token,
+    };
+    let commands = hub.commands(auth).await.unwrap();
+    assert!(
+        commands.iter().any(|command| command.operation == "job_start"),
+        "a fitting job must dispatch"
     );
 }
 
@@ -595,7 +755,7 @@ fn durable_job_spec_json(id: &str) -> String {
 /// without bound.
 #[tokio::test]
 async fn a_stopped_job_is_not_recommanded_once_its_stop_succeeds() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("a_stopped_job_is_not_recommanded_once_its_stop_succeeds").await;
     let storage = StorageActor::start(store, 8);
     let hub = Hub::with_storage(config(), storage);
     let session = hub
@@ -768,7 +928,7 @@ async fn one_jobs_dispatch_failure_does_not_stall_the_scan() {
 /// operation rows used to accumulate forever.
 #[tokio::test]
 async fn stale_operation_and_checkpoint_records_are_reclaimed() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("stale_operation_and_checkpoint_records_are_reclaimed").await;
     let storage = StorageActor::start(store, 8);
     let hub = Hub::with_storage(config(), storage);
     hub.upsert_job(JobRecord {
@@ -865,7 +1025,7 @@ async fn stale_operation_and_checkpoint_records_are_reclaimed() {
 /// by a stale report.
 #[tokio::test]
 async fn stale_job_observation_cannot_rollback_generation() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("stale_job_observation_cannot_rollback_generation").await;
     let storage = StorageActor::start(store, 8);
     let spec_json = serde_json::json!({
             "id": "orders",
@@ -1210,7 +1370,7 @@ async fn reported_resource_gauges_surface_in_the_node_metrics_view() {
 
 #[tokio::test]
 async fn resource_gauges_are_ephemeral_across_a_hub_restart() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("resource_gauges_are_ephemeral_across_a_hub_restart").await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub1 = Hub::with_storage(config(), storage.clone());
     register_and_report_resources(&hub1, 1).await;
@@ -2132,7 +2292,7 @@ async fn multiple_agent_rollout_smoke_completes_through_commands_and_reports() {
 
 #[tokio::test]
 async fn dispatched_attempt_waits_for_fresh_report_after_hub_restart() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("dispatched_attempt_waits_for_fresh_report_after_hub_restart").await;
     let storage = StorageActor::start(store, 8);
     let hub1 = Hub::with_storage(config(), storage.clone());
     let session1 = hub1
@@ -2543,7 +2703,7 @@ async fn expired_lease_stops_data_plane_export() {
 
 #[tokio::test]
 async fn unsupported_capability_is_rejected_before_dispatch() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("unsupported_capability_is_rejected_before_dispatch").await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub = Hub::with_storage(config(), storage.clone());
     assert!(matches!(
@@ -2650,7 +2810,7 @@ async fn ignores_replayed_reports_from_the_same_boot() {
 
 #[tokio::test]
 async fn reconciler_dispatches_persisted_intent_with_generation() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("reconciler_dispatches_persisted_intent_with_generation").await;
     let hub = Hub::with_storage(config(), crate::storage::StorageActor::start(store, 8));
     let session = hub
         .register(RegisterRequest {
@@ -3238,7 +3398,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
 /// the healthy peer's observation as failed.
 #[tokio::test]
 async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_peer_degradation() {
-    let storage = StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+    let storage = StorageActor::start(crate::storage::ControlPlaneStore::contract("job_observed_state_waits_for_every_assignment_and_ignores_retryable_peer_degradation").await, 8);
     let hub = Hub::with_storage(config(), storage);
     let node_a = hub
         .register(RegisterRequest {
@@ -3448,7 +3608,7 @@ async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_pee
 /// the Job reports failed even though a peer succeeded.
 #[tokio::test]
 async fn job_observed_state_reports_failed_when_a_peer_permanently_fails() {
-    let storage = StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+    let storage = StorageActor::start(crate::storage::ControlPlaneStore::contract("job_observed_state_reports_failed_when_a_peer_permanently_fails").await, 8);
     let hub = Hub::with_storage(config(), storage);
     let node_a = hub
         .register(RegisterRequest {
@@ -3573,7 +3733,7 @@ async fn job_observed_state_reports_failed_when_a_peer_permanently_fails() {
 
 #[tokio::test]
 async fn periodic_job_reconciliation_retries_a_failed_runtime() {
-    let storage = StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+    let storage = StorageActor::start(crate::storage::ControlPlaneStore::contract("periodic_job_reconciliation_retries_a_failed_runtime").await, 8);
     let hub = Hub::with_storage(config(), storage);
     let registration = hub
         .register(RegisterRequest {
@@ -3666,7 +3826,7 @@ async fn periodic_job_reconciliation_retries_a_failed_runtime() {
 
 #[tokio::test]
 async fn periodic_job_reconciliation_stops_persisted_divergence_after_recovery() {
-    let storage = StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+    let storage = StorageActor::start(crate::storage::ControlPlaneStore::contract("periodic_job_reconciliation_stops_persisted_divergence_after_recovery").await, 8);
     let hub1 = Hub::with_storage(config(), storage.clone());
     hub1.register(RegisterRequest {
         data_address: None,
@@ -3740,7 +3900,7 @@ async fn periodic_job_reconciliation_stops_persisted_divergence_after_recovery()
 /// carries an injected `connection_string` so tests can prove audit
 /// records never echo configuration bodies.
 async fn audited_job_hub(secret_marker: &str) -> (Hub, crate::hub::RegisterResponse) {
-    let storage = StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+    let storage = StorageActor::start(crate::storage::ControlPlaneStore::contract("audited_job_hub").await, 8);
     let hub = Hub::with_storage(config(), storage);
     let session = hub
         .register(RegisterRequest {
@@ -4019,7 +4179,7 @@ async fn periodic_checkpoint_scheduling_writes_no_audit_rows() {
     // The periodic scheduler funnels through the same dispatch path as
     // operator triggers; only the latter is a mutation and may appear in
     // the audit trail.
-    let storage = StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+    let storage = StorageActor::start(crate::storage::ControlPlaneStore::contract("periodic_checkpoint_scheduling_writes_no_audit_rows").await, 8);
     let hub = Hub::with_storage(config(), storage);
     hub.register(RegisterRequest {
         data_address: None,
@@ -4079,7 +4239,7 @@ async fn periodic_checkpoint_scheduling_writes_no_audit_rows() {
 
 #[tokio::test]
 async fn audit_history_prunes_old_records_but_keeps_recent() {
-    let storage = StorageActor::start(crate::storage::ControlPlaneStore::in_memory().unwrap(), 8);
+    let storage = StorageActor::start(crate::storage::ControlPlaneStore::contract("audit_history_prunes_old_records_but_keeps_recent").await, 8);
     let hub = Hub::with_storage(config(), storage);
     let now = now_ms() as i64;
     let day_ms = 24 * 60 * 60 * 1000;
@@ -4153,7 +4313,7 @@ fn ha_job_record(job_id: &str) -> JobRecord {
 
 #[tokio::test]
 async fn standby_gates_routes_and_writes_nothing() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("standby_gates_routes_and_writes_nothing").await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub =
         Hub::with_storage(config(), storage.clone()).with_ha(ha_config("standby-hub", 60_000));
@@ -4288,7 +4448,7 @@ async fn disabled_ha_keeps_the_single_instance_surface() {
 
 #[tokio::test]
 async fn lease_failover_promotes_standby_and_recovers_durable_state() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("lease_failover_promotes_standby_and_recovers_durable_state").await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub_a = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-a", 60_000));
     let hub_b = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-b", 60_000));
@@ -4352,7 +4512,7 @@ async fn lease_failover_promotes_standby_and_recovers_durable_state() {
 
 #[tokio::test]
 async fn expired_lease_is_taken_over_without_release() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("expired_lease_is_taken_over_without_release").await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub_a = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-a", 1_000));
     let hub_b = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-b", 60_000));
@@ -4373,7 +4533,7 @@ async fn expired_lease_is_taken_over_without_release() {
 
 #[tokio::test]
 async fn promotion_replaces_stale_memory_from_the_previous_term() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("promotion_replaces_stale_memory_from_the_previous_term").await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub_a = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-a", 60_000));
     let hub_b = Hub::with_storage(config(), storage.clone()).with_ha(ha_config("hub-b", 60_000));
@@ -4427,7 +4587,7 @@ async fn promotion_replaces_stale_memory_from_the_previous_term() {
 
 #[tokio::test]
 async fn serve_hub_elects_leadership_and_flips_readiness() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("serve_hub_elects_leadership_and_flips_readiness").await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub = Hub::with_storage(config(), storage).with_ha(ha_config("serve-hub", 1_000));
     // Reserve an ephemeral port, then hand it to serve_hub.
@@ -4578,7 +4738,7 @@ async fn succeed_all_starts(hub: &Hub, auth: &AgentAuth) -> usize {
 /// Register one node, create a durable running Job at version 1, and drive
 /// its start to a succeeded, observed-running state.
 async fn atomic_upgrade_fixture(job_id: &str) -> (Hub, AgentAuth) {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("atomic_upgrade_fixture").await;
     let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
     let session = hub
         .register(RegisterRequest {
@@ -4963,7 +5123,7 @@ async fn verification_deadline_rolls_back_and_rollback_failure_is_terminal() {
 
 #[tokio::test]
 async fn orchestration_survives_hub_restart_and_keeps_the_fence() {
-    let store = crate::storage::ControlPlaneStore::in_memory().unwrap();
+    let store = crate::storage::ControlPlaneStore::contract("orchestration_survives_hub_restart_and_keeps_the_fence").await;
     let hub1 = Hub::with_storage(config(), StorageActor::start(store.clone(), 8));
     let session = hub1
         .register(RegisterRequest {

@@ -1141,6 +1141,171 @@ fn header_metadata(headers: &impl KafkaHeaders) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_from_json(value: serde_json::Value) -> KafkaInputConfig {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn base_config() -> serde_json::Value {
+        serde_json::json!({
+            "brokers": ["127.0.0.1:9092"],
+            "topics": ["orders"],
+            "consumer_group": "group-a",
+            "start_from_latest": false,
+        })
+    }
+
+    fn input_with(value: serde_json::Value) -> KafkaInput {
+        KafkaInput::new(None, config_from_json(value), None).unwrap()
+    }
+
+    #[test]
+    fn client_config_carries_every_tuning_knob() {
+        let mut value = base_config();
+        value["client_id"] = serde_json::json!("client-1");
+        value["fetch_min_bytes"] = serde_json::json!(10);
+        value["fetch_max_bytes"] = serde_json::json!(20_000_000);
+        value["fetch_max_partition_bytes"] = serde_json::json!(1_000_000);
+        value["fetch_wait_max_ms"] = serde_json::json!(250);
+        let input = input_with(value);
+        let config = input.build_client_config().unwrap();
+        let get = |key: &str| config.get(key).map(str::to_string);
+        assert_eq!(get("bootstrap.servers").as_deref(), Some("127.0.0.1:9092"));
+        assert_eq!(get("group.id").as_deref(), Some("group-a"));
+        assert_eq!(get("client.id").as_deref(), Some("client-1"));
+        assert_eq!(get("fetch.min.bytes").as_deref(), Some("10"));
+        assert_eq!(get("fetch.max.bytes").as_deref(), Some("20000000"));
+        assert_eq!(get("max.partition.fetch.bytes").as_deref(), Some("1000000"));
+        assert_eq!(get("fetch.wait.max.ms").as_deref(), Some("250"));
+        // Crash-safety invariant: offsets are committed explicitly only.
+        assert_eq!(get("enable.auto.offset.store").as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn client_config_latest_offset_reset_and_defaults() {
+        let mut value = base_config();
+        value["start_from_latest"] = serde_json::json!(true);
+        let input = input_with(value);
+        let config = input.build_client_config().unwrap();
+        assert_eq!(
+            config.get("auto.offset.reset"),
+            Some("latest")
+        );
+
+        let input = input_with(base_config());
+        let config = input.build_client_config().unwrap();
+        assert_eq!(config.get("auto.offset.reset"), Some("earliest"));
+        // Optional knobs stay unset.
+        assert!(config.get("client.id").is_none());
+        assert!(config.get("fetch.min.bytes").is_none());
+    }
+
+    #[test]
+    fn kafka_timestamp_conversion_handles_bounds() {
+        assert!(KafkaInput::convert_kafka_timestamp(-1).is_none());
+        assert_eq!(
+            KafkaInput::convert_kafka_timestamp(0),
+            Some(SystemTime::UNIX_EPOCH)
+        );
+        assert!(KafkaInput::convert_kafka_timestamp(1_700_000_000_000).is_some());
+        // Very large-but-positive values stay representable.
+        assert!(KafkaInput::convert_kafka_timestamp(i64::MAX).is_some());
+    }
+
+    #[test]
+    fn applicable_positions_filter_by_topic_and_assigned_partition() {
+        let input = input_with(serde_json::json!({
+            "brokers": ["b"],
+            "topics": ["orders", "billing"],
+            "consumer_group": "g",
+            "start_from_latest": false,
+        }));
+        let positions = vec![
+            arkflow_core::checkpoint::SourcePosition {
+                topic: Some("orders".into()),
+                partition: 0,
+                offset: 1,
+            },
+            arkflow_core::checkpoint::SourcePosition {
+                topic: Some("orders".into()),
+                partition: 3,
+                offset: 2,
+            },
+            arkflow_core::checkpoint::SourcePosition {
+                topic: Some("other".into()),
+                partition: 0,
+                offset: 3,
+            },
+        ];
+
+        // Subscription mode (no explicit assignment): topic filter only.
+        let applicable = input.applicable_positions(&positions).unwrap();
+        assert_eq!(applicable.len(), 2);
+
+        // Explicit partition mode: only the assigned partition survives.
+        *input
+            .assigned_partition
+            .try_write()
+            .expect("write guard")
+        = Some(3);
+        let applicable = input.applicable_positions(&positions).unwrap();
+        assert_eq!(applicable.len(), 1);
+        assert_eq!(applicable[0].partition, 3);
+    }
+
+    #[test]
+    fn merged_restore_assignment_honors_positions_and_start_policy() {
+        let restored = arkflow_core::checkpoint::SourcePosition {
+            topic: Some("orders".into()),
+            partition: 2,
+            offset: 42,
+        };
+        // A checkpointed topic restores its offset; an uncheckpointed topic
+        // follows the start_from_latest policy.
+        let assignment = KafkaInput::merged_restore_assignment(
+            &["orders".to_string(), "billing".to_string()],
+            2,
+            &[restored],
+            false,
+        );
+        let elements = assignment.elements();
+        assert_eq!(elements.len(), 2);
+        let orders = elements
+            .iter()
+            .find(|e| e.topic() == "orders")
+            .expect("orders assigned");
+        assert_eq!(orders.offset(), rdkafka::Offset::Offset(42));
+        let billing = elements
+            .iter()
+            .find(|e| e.topic() == "billing")
+            .expect("billing assigned");
+        assert_eq!(billing.offset(), rdkafka::Offset::Beginning);
+
+        let assignment = KafkaInput::merged_restore_assignment(
+            &["orders".to_string()],
+            2,
+            &[],
+            true,
+        );
+        let elements = assignment.elements();
+        assert_eq!(elements[0].offset(), rdkafka::Offset::End);
+    }
+
+    #[test]
+    fn transactional_offsets_register_the_consumer_group() {
+        let mut value = base_config();
+        value["transactional_offsets"] = serde_json::json!(true);
+        let input = input_with(value);
+        assert!(
+            input.txn_metadata.is_some(),
+            "transactional offsets must register group metadata"
+        );
+
+        let input = input_with(base_config());
+        assert!(input.txn_metadata.is_none());
+    }
+
+
     /// Header metadata mapping: duplicate keys keep every value (positional
     /// suffix) and binary values are lossy-decoded instead of dropped.
     #[test]
@@ -1897,5 +2062,350 @@ mod tests {
             .read()
             .await
             .expect("unacked message must be re-delivered after restart (no loss)");
+    }
+
+    // ===== Offline coverage: subscription-mode connect, watermark and
+    // ack-for-position guards, restore guards, and error classification. =====
+
+    fn ack_of(input: &KafkaInput, topic: &str, partition: i32, offset: i64) -> KafkaAck {
+        KafkaAck {
+            consumer: input.consumer.clone(),
+            frontier: input.frontier.clone(),
+            ack_lock: input.ack_lock.clone(),
+            ack_notify: input.ack_notify.clone(),
+            close: input.close.clone(),
+            topic: topic.to_string(),
+            partition,
+            offset,
+            transactional_offsets: false,
+        }
+    }
+
+    /// Error classification: cancellation and queue-close variants are
+    /// reconnectable; production errors and unknown shapes are not.
+    #[test]
+    fn retryable_receive_error_classification_is_complete() {
+        // Canceled: reconnectable before the code extraction.
+        assert!(KafkaInput::retryable_receive_error(&KafkaError::Canceled));
+        // ConsumerQueueClose carries a code like the other two variants.
+        assert!(KafkaInput::retryable_receive_error(&KafkaError::ConsumerQueueClose(
+            RDKafkaErrorCode::AllBrokersDown,
+        )));
+        assert!(!KafkaInput::retryable_receive_error(&KafkaError::ConsumerQueueClose(
+            RDKafkaErrorCode::Authentication,
+        )));
+        // An error shape without an embedded code is never retryable.
+        assert!(!KafkaInput::retryable_receive_error(&KafkaError::MessageProduction(
+            RDKafkaErrorCode::QueueFull,
+        )));
+        // Admin-op errors carry no consumer code either.
+        assert!(!KafkaInput::retryable_receive_error(&KafkaError::AdminOp(
+            RDKafkaErrorCode::Authentication,
+        )));
+    }
+
+    /// Subscription-mode connect is broker-less (librdkafka joins the group
+    /// in the background); watermark reads flow through the assignment.
+    #[tokio::test]
+    async fn connect_subscribe_mode_reads_watermarks_and_closes() {
+        let input = input_with(base_config());
+
+        // Before connect: watermark reports the missing consumer.
+        let err = input.watermark_partitions().await.unwrap_err();
+        assert!(
+            err.to_string().contains("not connected"),
+            "got: {err}"
+        );
+
+        input.connect().await.expect("subscribe-mode connect is offline");
+        // The group assignment is still empty (no broker) — the partition
+        // list comes back empty rather than erroring.
+        let partitions = input.watermark_partitions().await.unwrap();
+        assert!(partitions.is_empty());
+
+        // The assignment probe agrees the partition is not ours yet.
+        {
+            let consumer_guard = input.consumer.read().await;
+            let consumer = consumer_guard.as_ref().expect("connected consumer");
+            assert!(!KafkaAck::partition_assigned(consumer, "orders", 0));
+        }
+
+        // close() unassigns the live consumer without an error.
+        input.close().await.unwrap();
+        // A read after close reports the missing consumer again.
+        match input.read().await {
+            Err(e) => assert!(e.to_string().contains("not connected")),
+            Ok(_) => panic!("a closed input cannot read"),
+        }
+    }
+
+    /// Explicit-partition watermarks map every configured topic to the one
+    /// assigned partition, without touching the consumer at all.
+    #[tokio::test]
+    async fn watermark_partitions_with_an_explicit_assignment_maps_topics() {
+        let input = input_with(serde_json::json!({
+            "brokers": ["127.0.0.1:9092"],
+            "topics": ["orders", "billing"],
+            "consumer_group": "g",
+            "start_from_latest": false,
+        }));
+        input.assign_partition(3).unwrap();
+        let partitions = input.watermark_partitions().await.unwrap();
+        let mut named: Vec<(Option<String>, u32)> = partitions
+            .into_iter()
+            .map(|p| (p.topic.clone(), p.partition))
+            .collect();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            named,
+            vec![
+                (Some("billing".to_string()), 3),
+                (Some("orders".to_string()), 3),
+            ]
+        );
+    }
+
+    /// `ack_for_position` guards: zero offsets, foreign topics and foreign
+    /// partitions decline (None); matching positions hand back an ack; a
+    /// missing topic or an out-of-i64 offset is a named error.
+    #[tokio::test]
+    async fn ack_for_position_guards_and_anchors() {
+        let input = input_with(serde_json::json!({
+            "brokers": ["127.0.0.1:9092"],
+            "topics": ["orders"],
+            "consumer_group": "g",
+            "start_from_latest": false,
+        }));
+        // Zero offset: nothing to acknowledge.
+        assert!(
+            input
+                .ack_for_position(&SourcePosition {
+                    topic: Some("orders".into()),
+                    partition: 0,
+                    offset: 0,
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A topic this input is not subscribed to is not ours to ack.
+        assert!(
+            input
+                .ack_for_position(&SourcePosition {
+                    topic: Some("other".into()),
+                    partition: 0,
+                    offset: 7,
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Explicit-partition mode declines other partitions.
+        input.assign_partition(1).unwrap();
+        assert!(
+            input
+                .ack_for_position(&SourcePosition {
+                    topic: Some("orders".into()),
+                    partition: 5,
+                    offset: 7,
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Matching topic+partition: an ack comes back anchored at the
+        // record offset (checkpoint positions are exclusive).
+        assert!(
+            input
+                .ack_for_position(&SourcePosition {
+                    topic: Some("orders".into()),
+                    partition: 1,
+                    offset: 9,
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // A position without a topic is filtered by the configured-topic
+        // guard above (which requires Some(topic)); it declines instead of
+        // reaching the missing-topic error.
+        assert!(
+            input
+                .ack_for_position(&SourcePosition {
+                    topic: None,
+                    partition: 1,
+                    offset: 9,
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // An offset that does not fit i64 cannot become a record offset.
+        let err = match input
+            .ack_for_position(&SourcePosition {
+                topic: Some("orders".into()),
+                partition: 1,
+                offset: u64::MAX,
+            })
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("an out-of-i64 offset cannot yield an ack"),
+        };
+        assert!(
+            err.to_string().contains("exceeds i64"),
+            "got: {err}"
+        );
+    }
+
+    /// restore_positions before connect is a hard error; an empty
+    /// checkpoint is a no-op in both assignment modes.
+    #[tokio::test]
+    async fn restore_positions_requires_connect_and_accepts_empty_checkpoints() {
+        let input = input_with(base_config());
+        let err = input.restore_positions(&[]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("before connect"),
+            "got: {err}"
+        );
+
+        // Subscription mode: empty applicable set → no seeks, frontier seeded.
+        input.connect().await.unwrap();
+        input.restore_positions(&[]).await.unwrap();
+        assert!(input.current_positions().await.unwrap().is_empty());
+        input.close().await.unwrap();
+
+        // Explicit-partition mode: the complete configured assignment is
+        // re-applied even with an empty checkpoint.
+        let input = input_with(base_config());
+        input.assign_partition(0).unwrap();
+        input.connect().await.unwrap();
+        input.restore_positions(&[]).await.unwrap();
+        input.close().await.unwrap();
+    }
+
+    /// A checkpoint whose watermarks cannot be fetched (broker-less connect)
+    /// fails the restore — keeping the previous valid checkpoint selected.
+    #[tokio::test]
+    async fn restore_positions_surfaces_watermark_failures() {
+        let input = input_with(base_config());
+        input.connect().await.unwrap();
+        let err = input
+            .restore_positions(&[SourcePosition {
+                topic: Some("orders".into()),
+                partition: 0,
+                offset: 5,
+            }])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("fetch Kafka watermarks"),
+            "got: {err}"
+        );
+        input.close().await.unwrap();
+    }
+
+    /// Partition assignment is rejected for L3 (transactional offsets)
+    /// inputs; partitioning support is advertised.
+    #[test]
+    fn assign_partition_is_rejected_for_transactional_offsets() {
+        let mut value = base_config();
+        value["transactional_offsets"] = serde_json::json!(true);
+        let input = input_with(value);
+        let err = input.assign_partition(0).unwrap_err();
+        assert!(
+            err.to_string().contains("requires subscribe mode"),
+            "got: {err}"
+        );
+        assert!(input.supports_partitioning());
+
+        let plain = input_with(base_config());
+        plain.assign_partition(7).unwrap();
+        assert!(plain.supports_partitioning());
+    }
+
+    /// Compensation without a live consumer is an explicit retryable error.
+    #[tokio::test]
+    async fn undo_without_a_consumer_is_retryable() {
+        let input = input_with(base_config());
+        let ack = ack_of(&input, "orders", 0, 41);
+        let err = ack.undo().await.unwrap_err();
+        assert!(
+            err.to_string().contains("compensation is retryable"),
+            "got: {err}"
+        );
+    }
+
+    /// The builder rejects malformed configurations up front.
+    #[test]
+    fn builder_rejects_malformed_configs() {
+        let missing = match KafkaInputBuilder.build(
+            None,
+            &None,
+            None,
+            &Resource {
+                temporary: HashMap::new(),
+                input_names: Default::default(),
+            },
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing config must be rejected"),
+        };
+        assert!(
+            missing.to_string().to_lowercase().contains("kafka input"),
+            "got: {missing}"
+        );
+
+        let malformed = match KafkaInputBuilder.build(
+            None,
+            &Some(serde_json::json!({"unexpected": true})),
+            None,
+            &Resource {
+                temporary: HashMap::new(),
+                input_names: Default::default(),
+            },
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a malformed config must be rejected"),
+        };
+        assert!(
+            malformed.to_string().to_lowercase().contains("kafka input"),
+            "got: {malformed}"
+        );
+    }
+
+    /// The builder hands back a working input for a valid configuration.
+    #[test]
+    fn builder_accepts_a_valid_config() {
+        let built = KafkaInputBuilder.build(
+            None,
+            &Some(base_config()),
+            None,
+            &Resource {
+                temporary: HashMap::new(),
+                input_names: Default::default(),
+            },
+        );
+        assert!(built.is_ok(), "a valid config must build");
+    }
+
+    /// A consumer that librdkafka refuses to construct surfaces as a
+    /// connection error at connect time (empty `group.id` is rejected by
+    /// the client, offline).
+    #[tokio::test]
+    async fn connect_maps_consumer_creation_failures() {
+        let input = input_with(serde_json::json!({
+            "brokers": ["127.0.0.1:9092"],
+            "topics": ["orders"],
+            "consumer_group": "",
+            "start_from_latest": false,
+        }));
+        match input.connect().await {
+            Err(e) => assert!(
+                e.to_string().contains("Unable to create a Kafka consumer"),
+                "got: {e}"
+            ),
+            Ok(()) => panic!("an empty group id must fail consumer creation"),
+        }
     }
 }

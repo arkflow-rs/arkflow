@@ -1523,3 +1523,556 @@ mod compatibility_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod artifact_selection_tests {
+    use super::*;
+    use crate::state::StateEntry;
+
+    fn job_id() -> JobId {
+        JobId::new("job-a").unwrap()
+    }
+
+    fn snapshot() -> StateSnapshot {
+        StateSnapshot::new(
+            1,
+            vec![StateEntry {
+                namespace: "job:a:state:default:operator:sum".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                expires_at_ms: None,
+            }],
+        )
+    }
+
+    fn state_ref(uri: &str, checksum: u64) -> StateSnapshotRef {
+        StateSnapshotRef {
+            task_id: "task-1".into(),
+            node_id: None,
+            uri: uri.into(),
+            checksum,
+            bytes: 4,
+        }
+    }
+
+    /// Round a coordinator through start → both acks → complete, returning
+    /// the sealed manifest.
+    fn completed_manifest() -> CheckpointManifest {
+        let mut coordinator =
+            CheckpointCoordinator::new(job_id(), JobVersion(1), 7, 1, ["task-1", "task-2"].map(String::from));
+        let barrier = coordinator.start("ckpt-1").unwrap();
+        assert_eq!(barrier.generation, 7);
+        for (index, task) in ["task-1", "task-2"].into_iter().enumerate() {
+            let completes = coordinator
+                .acknowledge(TaskCheckpointAck {
+                    task_id: task.into(),
+                    attempt_id: format!("{task}-att"),
+                    partition: 0,
+                    checkpoint_id: "ckpt-1".into(),
+                    generation: 7,
+                    state: snapshot(),
+                    source_positions: vec![SourcePosition::for_partition(0, 12)],
+                    watermark_ms: Some(1_000),
+                    watermark_partitions: vec![WatermarkPosition::new(
+                        Some("t".into()),
+                        0,
+                        900,
+                    )],
+                })
+                .unwrap();
+            assert_eq!(
+                completes,
+                index == 1,
+                "only the second acknowledgement completes the set"
+            );
+        }
+        coordinator
+            .complete(
+                ["task-1", "task-2"]
+                    .into_iter()
+                    .map(|t| TaskAttemptSnapshot {
+                        task_id: t.into(),
+                        attempt_id: format!("{t}-att"),
+                        node_id: "node-a".into(),
+                    })
+                    .collect(),
+                vec![
+                    state_ref("checkpoints/ckpt-1/state-a.json", 1),
+                    StateSnapshotRef {
+                        task_id: "task-2".into(),
+                        node_id: None,
+                        uri: "checkpoints/ckpt-1/state-b.json".into(),
+                        checksum: 2,
+                        bytes: 4,
+                    },
+                ],
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn watermark_position_constructor_and_partition_helper() {
+        let position = WatermarkPosition::new(Some("topic".into()), 3, -5);
+        assert_eq!(position.topic.as_deref(), Some("topic"));
+        assert_eq!(position.partition, 3);
+        let source = SourcePosition::for_partition(9, 44);
+        assert_eq!(source.partition, 9);
+    }
+
+    #[test]
+    fn coordinator_rejects_double_start_and_foreign_acks() {
+        let mut coordinator =
+            CheckpointCoordinator::new(job_id(), JobVersion(1), 1, 1, ["task-1"].map(String::from));
+        coordinator.start("ckpt-x").unwrap();
+        assert!(coordinator.start("ckpt-y").is_err(), "double start");
+
+        let ack = TaskCheckpointAck {
+            task_id: "task-ghost".into(),
+            attempt_id: "a".into(),
+            partition: 0,
+            checkpoint_id: "ckpt-x".into(),
+            generation: 1,
+            state: snapshot(),
+            source_positions: vec![],
+            watermark_ms: None,
+            watermark_partitions: vec![],
+        };
+        assert!(coordinator.acknowledge(ack).is_err(), "unknown task");
+
+        let mut ack = TaskCheckpointAck {
+            task_id: "task-1".into(),
+            attempt_id: "a".into(),
+            partition: 0,
+            checkpoint_id: "other".into(),
+            generation: 1,
+            state: snapshot(),
+            source_positions: vec![],
+            watermark_ms: None,
+            watermark_partitions: vec![],
+        };
+        assert!(coordinator.acknowledge(ack.clone()).is_err(), "barrier mismatch");
+
+        ack.checkpoint_id = "ckpt-x".into();
+        ack.generation = 99;
+        assert!(coordinator.acknowledge(ack.clone()).is_err(), "generation mismatch");
+
+        ack.generation = 1;
+        let mut broken_state = snapshot();
+        broken_state.checksum ^= 1;
+        let bad = TaskCheckpointAck {
+            state: broken_state,
+            ..ack
+        };
+        assert!(coordinator.acknowledge(bad).is_err(), "invalid state");
+
+        let fresh = TaskCheckpointAck {
+            task_id: "task-1".into(),
+            attempt_id: "a".into(),
+            partition: 0,
+            checkpoint_id: "ckpt-x".into(),
+            generation: 1,
+            state: snapshot(),
+            source_positions: vec![],
+            watermark_ms: None,
+            watermark_partitions: vec![],
+        };
+        assert!(coordinator.acknowledge(fresh.clone()).unwrap(), "last ack completes");
+        assert!(coordinator.acknowledge(fresh).is_err(), "duplicate ack");
+        assert_eq!(coordinator.status(), CheckpointStatus::InProgress);
+    }
+
+    #[test]
+    fn complete_validates_task_coverage_and_snapshot_set() {
+        let mut coordinator =
+            CheckpointCoordinator::new(job_id(), JobVersion(1), 1, 1, ["task-1", "task-2"].map(String::from));
+        // No acks yet: complete must refuse.
+        assert!(coordinator.complete(vec![], vec![]).is_err());
+
+        let ack = |task: &str| TaskCheckpointAck {
+            task_id: task.into(),
+            attempt_id: format!("{task}-att"),
+            partition: 0,
+            checkpoint_id: "ckpt-c".into(),
+            generation: 1,
+            state: snapshot(),
+            source_positions: vec![],
+            watermark_ms: None,
+            watermark_partitions: vec![],
+        };
+        coordinator.start("ckpt-c").unwrap();
+        coordinator.acknowledge(ack("task-1")).unwrap();
+        coordinator.acknowledge(ack("task-2")).unwrap();
+
+        // Attempt set missing a participant.
+        let attempts = vec![TaskAttemptSnapshot {
+            task_id: "task-1".into(),
+            attempt_id: "a".into(),
+            node_id: "n".into(),
+        }];
+        assert!(coordinator.complete(attempts, vec![]).is_err());
+
+        let attempts = ["task-1", "task-2"]
+            .into_iter()
+            .map(|t| TaskAttemptSnapshot {
+                task_id: t.into(),
+                attempt_id: format!("{t}-att"),
+                node_id: "n".into(),
+            })
+            .collect::<Vec<_>>();
+        // Snapshot set has a duplicate task reference.
+        let duplicate = vec![
+            state_ref("checkpoints/ckpt-c/a.json", 1),
+            state_ref("checkpoints/ckpt-c/a.json", 1),
+        ];
+        assert!(coordinator.complete(attempts.clone(), duplicate).is_err());
+        // Snapshot set missing task-2.
+        let missing = vec![state_ref("checkpoints/ckpt-c/a.json", 1)];
+        assert!(coordinator.complete(attempts.clone(), missing).is_err());
+        // Correct set completes.
+        let snapshots = vec![
+            state_ref("checkpoints/ckpt-c/a.json", 1),
+            StateSnapshotRef {
+                task_id: "task-2".into(),
+                node_id: None,
+                uri: "checkpoints/ckpt-c/b.json".into(),
+                checksum: 2,
+                bytes: 4,
+            },
+        ];
+        let manifest = coordinator.complete(attempts, snapshots).unwrap();
+        assert!(manifest.verify());
+        assert_eq!(coordinator.status(), CheckpointStatus::Completed);
+    }
+
+    #[test]
+    fn start_if_needed_is_idempotent_and_barrier_matches_by_identity() {
+        let mut coordinator =
+            CheckpointCoordinator::new(job_id(), JobVersion(1), 3, 1, ["task-1"].map(String::from));
+        let first = coordinator.start_if_needed("ckpt-i").unwrap();
+        let second = coordinator.start_if_needed("ignored-id").unwrap();
+        assert_eq!(first, second);
+        // Trace context is observability metadata only: equality ignores it.
+        let traced = CheckpointBarrier {
+            trace_context: Some("traceparent-1".into()),
+            ..first
+        };
+        assert_eq!(traced, second);
+        assert!(coordinator.barrier().is_some());
+    }
+
+    #[test]
+    fn file_store_round_trip_and_key_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileCheckpointStore::new(dir.path()).unwrap();
+        store.put("nested/key.json", b"value").unwrap();
+        assert_eq!(store.get("nested/key.json").unwrap().as_deref(), Some(b"value".as_slice()));
+        assert!(store.get("missing.json").unwrap().is_none());
+
+        for bad_key in ["", "../escape", "/absolute"] {
+            assert!(store.put(bad_key, b"x").is_err(), "key {bad_key:?} must be rejected");
+            assert!(store.get(bad_key).is_err(), "key {bad_key:?} must be rejected on read");
+        }
+        store.delete("nested/key.json").unwrap();
+        assert!(store.get("nested/key.json").unwrap().is_none());
+    }
+
+    #[test]
+    fn repository_manifest_and_snapshot_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = CheckpointRepository::new(FileCheckpointStore::new(dir.path()).unwrap());
+
+        let mut manifest = completed_manifest();
+        // write_manifest verifies every referenced snapshot is readable, so
+        // persist real snapshots and point the manifest at them.
+        let first = repository.write_state_snapshot("ckpt-1", &snapshot()).unwrap();
+        let second = repository.write_state_snapshot("ckpt-1", &snapshot()).unwrap();
+        manifest.state_snapshots = vec![
+            StateSnapshotRef {
+                task_id: "task-1".into(),
+                node_id: None,
+                uri: first.uri,
+                checksum: first.checksum,
+                bytes: first.bytes,
+            },
+            StateSnapshotRef {
+                task_id: "task-2".into(),
+                node_id: None,
+                uri: second.uri,
+                checksum: second.checksum,
+                bytes: second.bytes,
+            },
+        ];
+        manifest.seal();
+        let artifact = repository.create_savepoint(&manifest).unwrap();
+        assert_eq!(artifact.kind, RecoveryArtifactKind::Savepoint);
+        assert_eq!(
+            artifact.manifest_key,
+            recovery_manifest_key(RecoveryArtifactKind::Savepoint, "ckpt-1")
+        );
+
+        let loaded = repository.read_manifest(&artifact).unwrap();
+        assert_eq!(loaded, manifest);
+
+        // Corrupting the stored bytes breaks the checksum on read.
+        let key = artifact.manifest_key.clone();
+        repository.store.put(&key, b"{\"checkpoint_id\":\"x\"}").unwrap();
+        assert!(repository.read_manifest(&artifact).is_err());
+    }
+
+    #[test]
+    fn write_manifest_rejects_invalid_or_incomplete_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = CheckpointRepository::new(FileCheckpointStore::new(dir.path()).unwrap());
+
+        let mut manifest = completed_manifest();
+        manifest.checksum ^= 1; // now invalid
+        assert!(repository
+            .write_manifest(&manifest, RecoveryArtifactKind::Checkpoint, "c/k.json".into())
+            .is_err());
+
+        let mut manifest = completed_manifest();
+        manifest.task_attempts.clear(); // incomplete
+        manifest.seal();
+        assert!(repository
+            .write_manifest(&manifest, RecoveryArtifactKind::Checkpoint, "c/k.json".into())
+            .is_err());
+
+        // A snapshot reference pointing at a missing object rejects the seal.
+        let mut manifest = completed_manifest();
+        repository.write_state_snapshot("ckpt-1", &snapshot()).unwrap();
+        manifest.state_snapshots[1].uri = "checkpoints/ckpt-1/missing.json".into();
+        manifest.seal();
+        assert!(repository
+            .write_manifest(&manifest, RecoveryArtifactKind::Checkpoint, "c/k.json".into())
+            .is_err());
+    }
+
+    #[test]
+    fn state_snapshot_write_read_and_checksum_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = CheckpointRepository::new(FileCheckpointStore::new(dir.path()).unwrap());
+        let reference = repository.write_state_snapshot("ckpt-s", &snapshot()).unwrap();
+        assert!(reference.uri.starts_with("checkpoints/ckpt-s/state-"));
+        let loaded = repository.read_state_snapshot(&reference).unwrap();
+        assert_eq!(loaded, snapshot());
+
+        let tampered = StateSnapshotRef {
+            checksum: reference.checksum ^ 1,
+            ..reference.clone()
+        };
+        assert!(repository.read_state_snapshot(&tampered).is_err());
+
+        let mut invalid = snapshot();
+        invalid.checksum ^= 1;
+        assert!(repository.write_state_snapshot("ckpt-s", &invalid).is_err());
+
+        let missing = StateSnapshotRef {
+            uri: "nowhere.json".into(),
+            ..reference
+        };
+        assert!(repository.read_state_snapshot(&missing).is_err());
+    }
+
+    #[test]
+    fn delete_removes_manifest_snapshots_and_intermediate_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileCheckpointStore::new(dir.path()).unwrap();
+        let repository = CheckpointRepository::new(store);
+
+        let written = repository.write_state_snapshot("ckpt-1", &snapshot()).unwrap();
+        let mut manifest = completed_manifest();
+        manifest.state_snapshots = vec![
+            StateSnapshotRef {
+                task_id: "task-1".into(),
+                node_id: None,
+                uri: written.uri.clone(),
+                checksum: written.checksum,
+                bytes: written.bytes,
+            },
+            StateSnapshotRef {
+                task_id: "task-2".into(),
+                node_id: None,
+                uri: written.uri.clone(),
+                checksum: written.checksum,
+                bytes: written.bytes,
+            },
+        ];
+        manifest.seal();
+        let artifact = repository
+            .write_manifest(&manifest, RecoveryArtifactKind::Checkpoint, "c/m.json".into())
+            .unwrap();
+        // Seed the intermediate per-node manifests delete also sweeps; the
+        // key derives from the manifest's checkpoint_id (ckpt-1).
+        repository.store
+            .put("checkpoints/ckpt-1/manifests/node-a.json", b"{}")
+            .unwrap();
+
+        repository.delete(&artifact).unwrap();
+        assert!(repository.store.get("c/m.json").unwrap().is_none());
+        assert!(repository.store.get(&written.uri).unwrap().is_none());
+        assert!(repository
+            .store
+            .get("checkpoints/ckpt-1/manifests/node-a.json")
+            .unwrap()
+            .is_none());
+
+        // Deleting an artifact whose manifest key is absent is a clean no-op
+        // at the store layer.
+        let ghost = RecoveryArtifact {
+            id: "ghost".into(),
+            kind: RecoveryArtifactKind::Checkpoint,
+            manifest_key: "c/gone.json".into(),
+            job_version: JobVersion(1),
+            format_version: 1,
+            created_at_ms: 0,
+            status: CheckpointStatus::Completed,
+        };
+        repository.delete(&ghost).unwrap();
+    }
+
+    #[test]
+    fn catalog_retention_and_latest_valid_selection() {
+        let mut catalog = CheckpointCatalog::default();
+        let mut artifact = RecoveryArtifact {
+            id: "c-1".into(),
+            kind: RecoveryArtifactKind::Checkpoint,
+            manifest_key: "k1".into(),
+            job_version: JobVersion(1),
+            format_version: 1,
+            created_at_ms: 10,
+            status: CheckpointStatus::Completed,
+        };
+        catalog.record(artifact.clone());
+        artifact.created_at_ms = 20;
+        artifact.id = "c-2".into();
+        artifact.manifest_key = "k2".into();
+        catalog.record(artifact.clone());
+        // A savepoint never qualifies as the latest checkpoint.
+        artifact.id = "s-1".into();
+        artifact.kind = RecoveryArtifactKind::Savepoint;
+        artifact.manifest_key = "k3".into();
+        catalog.record(artifact.clone());
+
+        let latest = catalog.latest_valid(JobVersion(2), 1).unwrap();
+        assert_eq!(latest.id, "c-2");
+        assert!(catalog.latest_valid(JobVersion(1), 2).is_none(), "format mismatch");
+        assert!(catalog.latest_valid(JobVersion(1), 1).is_some());
+
+        let removed = catalog.retain_checkpoints(1);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id, "c-1");
+        assert_eq!(catalog.artifacts().len(), 2);
+    }
+
+    #[test]
+    fn recovery_compatibility_matrix() {
+        let manifest = completed_manifest();
+        let tasks: BTreeSet<String> = ["task-1", "task-2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        assert!(evaluate_recovery_compatibility(&manifest, &job_id(), JobVersion(1), 1, &tasks).is_compatible());
+        assert!(evaluate_recovery_compatibility(&manifest, &job_id(), JobVersion(2), 1, &tasks).is_compatible(), "upgrade path");
+
+        let mut broken = manifest.clone();
+        broken.checksum ^= 1;
+        let verdict = evaluate_recovery_compatibility(&broken, &job_id(), JobVersion(1), 1, &tasks);
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("checksum"));
+
+        let verdict = evaluate_recovery_compatibility(
+            &manifest,
+            &JobId::new("job-b").unwrap(),
+            JobVersion(1),
+            1,
+            &tasks,
+        );
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("belongs to job"));
+
+        let verdict = evaluate_recovery_compatibility(&manifest, &job_id(), JobVersion(1), 2, &tasks);
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("no migration path"));
+
+        let verdict = evaluate_recovery_compatibility(&manifest, &job_id(), JobVersion(0), 1, &tasks);
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("downgrade"));
+
+        let mut duplicated = manifest.clone();
+        duplicated.task_attempts.push(duplicated.task_attempts[0].clone());
+        duplicated.seal();
+        let verdict = evaluate_recovery_compatibility(&duplicated, &job_id(), JobVersion(1), 1, &tasks);
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("duplicate"));
+
+        let fewer: BTreeSet<String> = ["task-1"].into_iter().map(String::from).collect();
+        let verdict = evaluate_recovery_compatibility(&manifest, &job_id(), JobVersion(1), 1, &fewer);
+        assert!(!verdict.is_compatible());
+        assert!(verdict.reason.unwrap().contains("task set"));
+
+        // Identity-only evaluation shares the same verdicts.
+        assert!(evaluate_recovery_identity(&manifest, &job_id(), JobVersion(1), 1).is_compatible());
+        assert!(!evaluate_recovery_identity(&manifest, &job_id(), JobVersion(0), 1).is_compatible());
+    }
+
+    #[test]
+    fn snapshot_task_set_and_namespace_validators() {
+        let snapshots = vec![
+            state_ref("a.json", 1),
+            StateSnapshotRef {
+                task_id: "task-2".into(),
+                node_id: None,
+                uri: "b.json".into(),
+                checksum: 2,
+                bytes: 4,
+            },
+        ];
+        let tasks: BTreeSet<String> = ["task-1", "task-2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(validate_state_snapshot_task_set(&snapshots, &tasks).is_ok());
+        assert!(validate_state_snapshot_tasks_unique(&snapshots).is_ok());
+        assert!(validate_state_snapshot_task_set(
+            &snapshots[..1],
+            &tasks
+        )
+        .is_err());
+        assert!(validate_state_snapshot_tasks_unique(&[
+            state_ref("a.json", 1),
+            state_ref("a.json", 1),
+        ])
+        .is_err());
+
+        let good = snapshot();
+        assert!(validate_state_snapshot_namespace(&good, "job:a:state:default:").is_ok());
+        let mut bad_checksum = snapshot();
+        bad_checksum.checksum ^= 1;
+        assert!(validate_state_snapshot_namespace(&bad_checksum, "job:a:state:default:").is_err());
+        let foreign = StateSnapshot::new(
+            1,
+            vec![StateEntry {
+                namespace: "job:b:state:default:operator:x".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        assert!(validate_state_snapshot_namespace(&foreign, "job:a:state:default:").is_err());
+    }
+
+    #[test]
+    fn recovery_plan_round_trip_and_guards() {
+        let manifest = completed_manifest();
+        let plan = RecoveryPlan::from_manifest(&manifest).unwrap();
+        assert_eq!(plan.checkpoint_id, "ckpt-1");
+        assert_eq!(plan.source_positions.len(), 2);
+        assert_eq!(plan.watermarks_ms.get("task-1"), Some(&1_000));
+        assert_eq!(plan.watermark_partitions.len(), 2);
+
+        let mut broken = manifest;
+        broken.checksum ^= 1;
+        assert!(RecoveryPlan::from_manifest(&broken).is_err());
+    }
+}

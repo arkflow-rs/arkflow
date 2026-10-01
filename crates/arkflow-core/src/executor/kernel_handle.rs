@@ -149,14 +149,19 @@ impl KernelJobHandle {
 
     /// The current round deadline as a Duration.
     fn round_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.checkpoint_round_timeout_ms.load(std::sync::atomic::Ordering::Acquire))
+        std::time::Duration::from_millis(
+            self.checkpoint_round_timeout_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Shrink the round deadline. Test-only.
     #[cfg(test)]
     pub(crate) fn override_round_timeout_for_tests(&mut self, timeout: std::time::Duration) {
-        self.checkpoint_round_timeout_ms
-            .store(timeout.as_millis() as u64, std::sync::atomic::Ordering::Release);
+        self.checkpoint_round_timeout_ms.store(
+            timeout.as_millis() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     async fn checkpoint_barrier_inner(
@@ -842,12 +847,1557 @@ impl KernelJobRunner {
             chain_finished,
             _finished_keepalive: chain_finished_tx,
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
-            checkpoint_round_timeout_ms: AtomicU64::new(
-                CHECKPOINT_ROUND_TIMEOUT.as_millis() as u64,
-            ),
+            checkpoint_round_timeout_ms: AtomicU64::new(CHECKPOINT_ROUND_TIMEOUT.as_millis() as u64),
             next_snapshot_id: AtomicU64::new(0),
             metrics: runtime_metrics.kernel.clone(),
             state_format,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::{CheckpointBarrier, SourcePosition, WatermarkPosition};
+    use crate::executor::barrier::ChainSnapshot;
+    use crate::executor::graph::ExecutionGraphBuilder;
+    use crate::input::{Ack, Input};
+    use crate::job::{
+        EdgeSpec, JobComponentAdapter, JobId, JobPlan, JobSpec, JobVersion, OperatorKind,
+        OperatorSpec, SinkSpec, SourceSpec, TimeMode, TimeSpec, WatermarkSpec, WatermarkStrategy,
+    };
+    use crate::output::Output;
+    use crate::processor::Processor;
+    use crate::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
+    use async_trait::async_trait;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    // ---------- synthetic handle construction ----------
+    //
+    // The checkpoint round loop reacts to report/error/finished channel
+    // traffic that real chains produce in specific interleavings. Building
+    // the handle directly lets each interleaving be staged deterministically.
+
+    /// Senders paired with a synthetically constructed handle's receivers.
+    struct SyntheticChannels {
+        report: tokio::sync::mpsc::UnboundedSender<ChainSnapshot>,
+        error: tokio::sync::mpsc::UnboundedSender<Error>,
+        finished: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    fn synthetic_handle(
+        participants: &[&str],
+        cancellation: CancellationToken,
+    ) -> (KernelJobHandle, SyntheticChannels) {
+        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (error_tx, error_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (finished_tx, finished_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = KernelJobHandle {
+            cancellation,
+            inputs: Vec::new(),
+            watermark_gates: BTreeMap::new(),
+            gate_partitions: BTreeMap::new(),
+            barrier_senders: BTreeMap::new(),
+            participants: participants.iter().map(|id| (*id).to_string()).collect(),
+            reports: Arc::new(tokio::sync::Mutex::new(report_rx)),
+            checkpoint_errors: Arc::new(tokio::sync::Mutex::new(error_rx)),
+            chain_finished: Arc::new(tokio::sync::Mutex::new(finished_rx)),
+            _finished_keepalive: finished_tx.clone(),
+            checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
+            checkpoint_round_timeout_ms: AtomicU64::new(10 * 60 * 1000),
+            next_snapshot_id: AtomicU64::new(0),
+            metrics: Arc::new(KernelMetrics::default()),
+            state_format: 1,
+            completion: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        (
+            handle,
+            SyntheticChannels {
+                report: report_tx,
+                error: error_tx,
+                finished: finished_tx,
+            },
+        )
+    }
+
+    /// Like [`synthetic_handle`] but without a keep-alive on the finished
+    /// channel: the finished receiver observes closure, which the round loop
+    /// must treat as full termination.
+    fn synthetic_handle_without_keepalive(
+        participants: &[&str],
+    ) -> (KernelJobHandle, SyntheticChannels) {
+        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (error_tx, error_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (finished_tx, finished_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(finished_tx);
+        let handle = KernelJobHandle {
+            cancellation: CancellationToken::new(),
+            inputs: Vec::new(),
+            watermark_gates: BTreeMap::new(),
+            gate_partitions: BTreeMap::new(),
+            barrier_senders: BTreeMap::new(),
+            participants: participants.iter().map(|id| (*id).to_string()).collect(),
+            reports: Arc::new(tokio::sync::Mutex::new(report_rx)),
+            checkpoint_errors: Arc::new(tokio::sync::Mutex::new(error_rx)),
+            chain_finished: Arc::new(tokio::sync::Mutex::new(finished_rx)),
+            _finished_keepalive: {
+                let (unrelated_tx, _unrelated_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<String>();
+                unrelated_tx
+            },
+            checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
+            checkpoint_round_timeout_ms: AtomicU64::new(10 * 60 * 1000),
+            next_snapshot_id: AtomicU64::new(0),
+            metrics: Arc::new(KernelMetrics::default()),
+            state_format: 1,
+            completion: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        (
+            handle,
+            SyntheticChannels {
+                report: report_tx,
+                error: error_tx,
+                finished: {
+                    let (unrelated_tx, _unrelated_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<String>();
+                    unrelated_tx
+                },
+            },
+        )
+    }
+
+    fn snapshot_report(task: &str, checkpoint: &str, generation: u64) -> ChainSnapshot {
+        ChainSnapshot {
+            task_id: task.to_string(),
+            attempt_id: format!("{task}:test:0"),
+            partition: 0,
+            barrier: CheckpointBarrier {
+                checkpoint_id: checkpoint.to_string(),
+                generation,
+                trace_context: None,
+            },
+            cut_generation: generation,
+            state: crate::state::StateSnapshot::new(1, Vec::new()),
+            source_positions: Vec::new(),
+            watermark_ms: None,
+            watermark_partitions: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fails_without_source_barrier_channels() {
+        let (handle, _channels) = synthetic_handle(&[], CancellationToken::new());
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("a graph with no chains must fail the round");
+        assert!(
+            error.to_string().contains("no source barrier channel"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fails_when_every_chain_already_ended() {
+        let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        // The exit notification is observed before the round starts: the
+        // chain is exempted up front and no report can arrive.
+        channels.finished.send("a".into()).unwrap();
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("an all-ended graph must fail the round");
+        assert!(
+            error.to_string().contains("kernel ended before checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fails_when_the_source_barrier_channel_is_closed() {
+        let (mut handle, _channels) = synthetic_handle(&["a"], CancellationToken::new());
+        // A source chain whose barrier receiver was dropped with its event
+        // loop, but whose exit notification has not been observed yet.
+        let (sender, receiver) = flume::bounded(8);
+        drop(receiver);
+        handle.barrier_senders.insert("a".to_string(), sender);
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("a closed barrier channel must fail the round");
+        assert!(
+            error
+                .to_string()
+                .contains("source barrier channel is closed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_round_times_out_and_records_a_failure_metric() {
+        let (mut handle, _channels) = synthetic_handle(&["a"], CancellationToken::new());
+        handle.override_round_timeout_for_tests(std::time::Duration::from_millis(20));
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("a round with no reports must time out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert_eq!(
+            handle.metrics.snapshot().checkpoint_failures,
+            1,
+            "a failed round must bump the failure counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fails_when_cancelled_during_the_round() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (handle, _channels) = synthetic_handle(&["a"], cancellation);
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("a cancelled kernel must fail the round");
+        assert!(
+            error.to_string().contains("cancelled during checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_surfaces_chain_snapshot_errors() {
+        let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        channels
+            .error
+            .send(Error::Process("injected snapshot failure".into()))
+            .unwrap();
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("a chain snapshot error must fail the round");
+        assert!(
+            error.to_string().contains("injected snapshot failure"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fails_when_the_error_channel_closes() {
+        let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        drop(channels.error);
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("a closed error channel must fail the round");
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint error channel closed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fails_when_a_chain_ends_without_a_report() {
+        let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        let task = tokio::spawn(async move { handle.checkpoint_barrier("cp-1", 0).await });
+        // Let the round start (past its up-front exit drain) before the
+        // notification arrives, so the chain is not simply exempted.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        channels.finished.send("a".into()).unwrap();
+        let error = task
+            .await
+            .unwrap()
+            .expect_err("an ended chain without a report must fail the round");
+        assert!(
+            error
+                .to_string()
+                .contains("ended during the checkpoint round without reporting"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fails_when_the_finished_channel_closes() {
+        let (handle, channels) = synthetic_handle_without_keepalive(&["a"]);
+        // A stale report is consumed first; with the reports and error
+        // channels still alive, the closed finished channel is then the only
+        // termination signal the loop can observe.
+        channels
+            .report
+            .send(snapshot_report("a", "stale", 9))
+            .unwrap();
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("finished-channel closure must fail the round");
+        assert!(
+            error.to_string().contains("kernel ended before checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ignores_stale_reports_from_an_abandoned_round() {
+        let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        // A detached snapshot from a previously failed round sits in the
+        // queue ahead of the current round's reports.
+        channels
+            .report
+            .send(snapshot_report("a", "abandoned-round", 7))
+            .unwrap();
+        let task = tokio::spawn(async move { handle.checkpoint_barrier("cp-2", 0).await });
+        channels
+            .report
+            .send(snapshot_report("a", "cp-2", 0))
+            .unwrap();
+        task.await.unwrap().expect("stale reports must be ignored");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_reports_from_unknown_chains() {
+        let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        channels
+            .report
+            .send(snapshot_report("zzz", "cp-1", 0))
+            .unwrap();
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("a report from a non-participant must fail the round");
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint report from unknown chain"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_duplicate_chain_reports() {
+        let (handle, channels) = synthetic_handle(&["a", "b"], CancellationToken::new());
+        let task = tokio::spawn(async move { handle.checkpoint_barrier("cp-1", 0).await });
+        channels
+            .report
+            .send(snapshot_report("a", "cp-1", 0))
+            .unwrap();
+        channels
+            .report
+            .send(snapshot_report("a", "cp-1", 0))
+            .unwrap();
+        channels
+            .report
+            .send(snapshot_report("b", "cp-1", 0))
+            .unwrap();
+        let error = task
+            .await
+            .unwrap()
+            .expect_err("a duplicate report must fail the round");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate chain checkpoint report"),
+            "{error}"
+        );
+    }
+
+    /// Whether the round's post-collection drain or the in-select error
+    /// branch observes the queued error is up to `tokio::select!`'s random
+    /// branch order; both must surface the error. Repeating the interleaving
+    /// keeps the outcome deterministic while exercising both paths.
+    #[tokio::test]
+    async fn checkpoint_surfaces_errors_queued_alongside_the_reports() {
+        for _ in 0..8 {
+            let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+            channels
+                .error
+                .send(Error::Process("injected post-report failure".into()))
+                .unwrap();
+            channels
+                .report
+                .send(snapshot_report("a", "cp-1", 0))
+                .unwrap();
+            let error = handle
+                .checkpoint_barrier("cp-1", 0)
+                .await
+                .expect_err("an error queued with the reports must fail the round");
+            assert!(
+                error.to_string().contains("injected post-report failure"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_invalid_state_snapshots() {
+        let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        let mut report = snapshot_report("a", "cp-1", 0);
+        // Tamper with the checksum: the snapshot no longer verifies.
+        report.state.checksum = report.state.checksum.wrapping_add(1);
+        channels.report.send(report).unwrap();
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("a corrupted snapshot must fail the round");
+        assert!(
+            error.to_string().contains("invalid state snapshot"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_state_format_mismatches_but_allows_stateless_defaults() {
+        let (mut handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        handle.state_format = 3;
+        let mut mismatched = snapshot_report("a", "cp-1", 0);
+        mismatched.state = crate::state::StateSnapshot::new(
+            2,
+            vec![crate::state::StateEntry {
+                namespace: "job:agg".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        channels.report.send(mismatched).unwrap();
+        let error = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect_err("a foreign state format must fail the round");
+        assert!(
+            error.to_string().contains("reported state format 2"),
+            "{error}"
+        );
+
+        // A stateless chain's default-format snapshot never vetoes the Job's
+        // configured format: the round succeeds and adopts the configured
+        // format for the assembled snapshot.
+        let (mut handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        handle.state_format = 3;
+        channels
+            .report
+            .send(snapshot_report("a", "cp-1", 0))
+            .unwrap();
+        let (snapshot, _, _) = handle
+            .checkpoint_barrier("cp-1", 0)
+            .await
+            .expect("a stateless default snapshot must not veto the round");
+        assert_eq!(snapshot.format_version, 3);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_assembles_positions_and_watermarks_from_reports() {
+        let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        let mut report = snapshot_report("a", "kernel-snapshot-0", 0);
+        report.source_positions = vec![SourcePosition {
+            topic: Some("orders".into()),
+            partition: 2,
+            offset: 11,
+        }];
+        report.watermark_ms = Some(4_200);
+        report.watermark_partitions = vec![WatermarkPosition::new(Some("orders".into()), 2, 4_100)];
+        channels.report.send(report).unwrap();
+        let (snapshot, positions, watermarks) = handle
+            .checkpoint_snapshot()
+            .await
+            .expect("a complete round must succeed");
+        assert_eq!(snapshot.format_version, 1);
+        assert_eq!(
+            positions,
+            vec![SourcePosition {
+                topic: Some("orders".into()),
+                partition: 2,
+                offset: 11,
+            }]
+        );
+        assert_eq!(watermarks.get("a"), Some(&4_200));
+        // The success path also records the checkpoint duration metric.
+        assert_eq!(handle.metrics.snapshot().checkpoint_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_succeeds_through_the_finished_chain_report_drain() {
+        // A chain reports and then exits; whichever order the select observes
+        // them in, the report must be collected and the round sealed.
+        for _ in 0..6 {
+            let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+            let task = tokio::spawn(async move { handle.checkpoint_barrier("cp-1", 0).await });
+            // Let the round start before the report and its exit notification
+            // arrive together.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            channels
+                .report
+                .send(snapshot_report("a", "cp-1", 0))
+                .unwrap();
+            channels.finished.send("a".into()).unwrap();
+            task.await
+                .unwrap()
+                .expect("a report queued with its exit notification must complete the round");
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_resolves_the_completion_slot_in_both_directions() {
+        let (handle, _channels) = synthetic_handle(&[], CancellationToken::new());
+        KernelJobHandle::complete(&handle.completion, Ok(())).await;
+        handle.watcher().await.unwrap().expect("Ok completion");
+
+        let (handle, _channels) = synthetic_handle(&[], CancellationToken::new());
+        KernelJobHandle::complete(
+            &handle.completion,
+            Err(Error::Process("kernel blew up".into())),
+        )
+        .await;
+        let error = handle
+            .watcher()
+            .await
+            .unwrap()
+            .expect_err("Err completion must surface");
+        assert!(error.to_string().contains("kernel blew up"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn accessors_expose_the_shared_token_and_detached_gate() {
+        let (handle, _channels) = synthetic_handle(&["a"], CancellationToken::new());
+        assert!(!handle.cancellation().is_cancelled());
+        handle.stop();
+        assert!(handle.cancellation().is_cancelled());
+        // The legacy gate accessor is deliberately detached: acquiring it
+        // must not block or affect the running graph.
+        let gate = handle.gate();
+        let _guard = gate.read().await;
+        drop(_guard);
+        let _snapshot = handle.metrics().snapshot();
+        assert!(handle.watermark_gates().is_empty());
+    }
+
+    // ---------- real graph spawning ----------
+
+    /// An input that never delivers a batch and never ends: the source chain
+    /// stays alive so barrier rounds flow through a live kernel.
+    struct NeverEndingInput {
+        connects: AtomicUsize,
+        closes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Input for NeverEndingInput {
+        async fn connect(&self) -> Result<(), Error> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            std::future::pending().await
+        }
+        async fn close(&self) -> Result<(), Error> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct OneBatchThenEofInput {
+        sent: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Input for OneBatchThenEofInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let mut sent = self.sent.lock().unwrap();
+            if *sent {
+                return Err(Error::EOF);
+            }
+            *sent = true;
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap();
+            Ok((
+                Arc::new(MessageBatch::new_arrow(batch)),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct FailingConnectInput {
+        closes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Input for FailingConnectInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Err(Error::Connection("injected source connect failure".into()))
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::EOF)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// An input that records restored checkpoint positions.
+    struct RecordingPositionsInput {
+        restored: Mutex<Vec<SourcePosition>>,
+    }
+
+    #[async_trait]
+    impl Input for RecordingPositionsInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            std::future::pending().await
+        }
+        async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
+            self.restored.lock().unwrap().extend_from_slice(positions);
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct DevNullOutput;
+
+    #[async_trait]
+    impl Output for DevNullOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct FailingConnectOutput;
+
+    #[async_trait]
+    impl Output for FailingConnectOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Err(Error::Connection("injected sink connect failure".into()))
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct PassThroughProcessor;
+
+    #[async_trait]
+    impl Processor for PassThroughProcessor {
+        async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Single(batch))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct KernelAdapter {
+        input: Arc<dyn Input>,
+        output: Arc<dyn Output>,
+        processor: Arc<dyn Processor>,
+    }
+
+    impl JobComponentAdapter for KernelAdapter {
+        fn build_input(
+            &self,
+            _source: &SourceSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(self.input.clone())
+        }
+        fn build_output(
+            &self,
+            _sink: &SinkSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(self.output.clone())
+        }
+        fn build_processor(
+            &self,
+            _operator: &OperatorSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Processor>, Error> {
+            Ok(self.processor.clone())
+        }
+    }
+
+    fn adapter_with(input: Arc<dyn Input>) -> KernelAdapter {
+        KernelAdapter {
+            input,
+            output: Arc::new(DevNullOutput),
+            processor: Arc::new(PassThroughProcessor),
+        }
+    }
+
+    fn processing_time() -> TimeSpec {
+        TimeSpec {
+            mode: TimeMode::ProcessingTime,
+            timestamp_field: None,
+            watermark: None,
+            allowed_lateness_ms: 0,
+            late_event_policy: Default::default(),
+            late_event_route: None,
+        }
+    }
+
+    fn kernel_spec(stateful: bool, parallelism: u32) -> JobSpec {
+        let mut operators = vec![OperatorSpec {
+            id: "source".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        }];
+        if stateful {
+            operators.push(OperatorSpec {
+                id: "agg".into(),
+                kind: OperatorKind::Aggregate,
+                stateful: true,
+                key_field: Some("key".into()),
+                config: serde_json::json!({}),
+            });
+        }
+        operators.push(OperatorSpec {
+            id: "sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        let edges = if stateful {
+            vec![
+                EdgeSpec {
+                    id: "source-agg".into(),
+                    from: "source".into(),
+                    to: "agg".into(),
+                    partitioned: false,
+                },
+                EdgeSpec {
+                    id: "agg-sink".into(),
+                    from: "agg".into(),
+                    to: "sink".into(),
+                    partitioned: false,
+                },
+            ]
+        } else {
+            vec![EdgeSpec {
+                id: "source-sink".into(),
+                from: "source".into(),
+                to: "sink".into(),
+                partitioned: false,
+            }]
+        };
+        JobSpec {
+            resources: Default::default(),
+            rescale: false,
+            rebalance: None,
+            id: JobId::new("kernel-handle-job").unwrap(),
+            version: JobVersion(1),
+            max_parallelism: 2,
+            parallelism,
+            operators,
+            edges,
+            sources: vec![SourceSpec {
+                operator_id: "source".into(),
+                input_type: "vec".into(),
+                codec: None,
+                config: serde_json::json!({}),
+                time: processing_time(),
+            }],
+            sinks: vec![SinkSpec {
+                operator_id: "sink".into(),
+                output_type: "collect".into(),
+                codec: None,
+                config: serde_json::json!({}),
+            }],
+            state: stateful.then(|| crate::job::StateSpec {
+                backend: "embedded_kv".into(),
+                durability: crate::job::StateDurability::Ephemeral,
+                root: None,
+                namespace: None,
+                ttl_ms: None,
+                format_version: 1,
+                max_pending_transactions: None,
+                max_bytes: None,
+            }),
+            checkpoint: None,
+            placement: crate::job::PlacementStrategy::Colocated,
+            recovery: Default::default(),
+        }
+    }
+
+    fn resource() -> Resource {
+        Resource {
+            temporary: HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn build_graph(
+        spec: JobSpec,
+        adapter: &KernelAdapter,
+    ) -> (JobPlan, crate::executor::graph::ExecutionGraph) {
+        let plan = JobPlan::compile(spec).unwrap();
+        let graph = ExecutionGraphBuilder::default()
+            .build(&plan, adapter, &resource())
+            .unwrap();
+        (plan, graph)
+    }
+
+    fn eof_adapter() -> KernelAdapter {
+        adapter_with(Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_runs_a_graph_to_completion_and_the_watcher_resolves() {
+        let adapter = eof_adapter();
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let handle =
+            KernelJobRunner::spawn(graph, Vec::new(), BTreeMap::new(), BTreeMap::new(), true)
+                .await
+                .expect("spawn must succeed");
+        handle
+            .watcher()
+            .await
+            .unwrap()
+            .expect("an EOF run must complete successfully");
+        assert_eq!(handle.state_format, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_with_cancellation_honors_the_caller_owned_token() {
+        let adapter = eof_adapter();
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let cancellation = CancellationToken::new();
+        let handle = KernelJobRunner::spawn_with_cancellation(
+            graph,
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            true,
+            cancellation.clone(),
+        )
+        .await
+        .expect("spawn must succeed");
+        assert!(!cancellation.is_cancelled());
+        handle.stop();
+        handle
+            .watcher()
+            .await
+            .unwrap()
+            .expect("a cancelled graceful run must complete successfully");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_prepared_with_cancellation_runs_preconnected_sources() {
+        let input = Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        });
+        let adapter = adapter_with(input.clone());
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        input.connect().await.unwrap();
+        let handle = KernelJobRunner::spawn_prepared_with_cancellation(
+            graph,
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("prepared spawn must succeed");
+        handle
+            .watcher()
+            .await
+            .unwrap()
+            .expect("an EOF run must complete successfully");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_with_cancellation_and_state_format_retains_the_configured_format() {
+        let adapter = eof_adapter();
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let handle = KernelJobRunner::spawn_with_cancellation_and_state_format(
+            graph,
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            true,
+            7,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("spawn must succeed");
+        assert_eq!(handle.state_format, 7);
+        handle.stop();
+        let _ = handle.watcher().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_prepared_with_cancellation_and_state_format_retains_the_format() {
+        let input = Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        });
+        let adapter = adapter_with(input.clone());
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        input.connect().await.unwrap();
+        let handle = KernelJobRunner::spawn_prepared_with_cancellation_and_state_format(
+            graph,
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            5,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("prepared spawn must succeed");
+        assert_eq!(handle.state_format, 5);
+        handle.stop();
+        let _ = handle.watcher().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_closes_every_input_when_one_connection_fails() {
+        let failing = Arc::new(FailingConnectInput {
+            closes: AtomicUsize::new(0),
+        });
+        let healthy = Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        });
+        let adapter = adapter_with(healthy.clone());
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let error = KernelJobRunner::spawn(
+            graph,
+            vec![failing.clone(), healthy.clone()],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            true,
+        )
+        .await
+        .err()
+        .expect("a failing source connection must fail the spawn");
+        assert!(
+            error
+                .to_string()
+                .contains("injected source connect failure"),
+            "{error}"
+        );
+        assert_eq!(failing.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_fails_when_the_graph_startup_fails() {
+        let adapter = KernelAdapter {
+            input: Arc::new(OneBatchThenEofInput {
+                sent: Mutex::new(false),
+            }),
+            output: Arc::new(FailingConnectOutput),
+            processor: Arc::new(PassThroughProcessor),
+        };
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let error =
+            KernelJobRunner::spawn(graph, Vec::new(), BTreeMap::new(), BTreeMap::new(), false)
+                .await
+                .err()
+                .expect("a failing sink connection must fail the spawn");
+        assert!(
+            error.to_string().contains("injected sink connect failure"),
+            "{error}"
+        );
+    }
+
+    /// Gate construction aborts after the inputs were already connected or
+    /// restored: the cleanup path must close every input and state backend
+    /// before surfacing the error. (Plan compilation rejects such a graph, so
+    /// the watermark is stripped on an already-built one.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_closes_connected_inputs_when_gate_construction_fails() {
+        let input = Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        });
+        let adapter = adapter_with(input.clone());
+        let (_plan, mut graph) = build_graph(kernel_spec(false, 1), &adapter);
+        for chain in &mut graph.chains {
+            if let Some(time) = &mut chain.source_time {
+                time.mode = TimeMode::EventTime;
+                time.watermark = None;
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let state: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(directory.path(), 1).unwrap());
+        let error = KernelJobRunner::spawn_with_cancellation(
+            graph,
+            vec![input.clone()],
+            BTreeMap::from([("source-0".to_string(), state)]),
+            BTreeMap::new(),
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("a watermark-less event-time source must fail the spawn");
+        assert!(error.to_string().contains("watermark"), "{error}");
+        assert_eq!(
+            input.closes.load(Ordering::SeqCst),
+            1,
+            "the connected input must be closed during cleanup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn checkpoint_barrier_snapshots_a_live_stateful_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(directory.path(), 1).unwrap());
+        let adapter = adapter_with(Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        }));
+        let (plan, graph) = {
+            let plan = JobPlan::compile(kernel_spec(true, 1)).unwrap();
+            let graph = ExecutionGraphBuilder::default()
+                .with_state(backend.clone())
+                .build(&plan, &adapter, &resource())
+                .unwrap();
+            (plan, graph)
+        };
+        let states = state_map_for_plan(&plan, backend);
+        let handle = KernelJobRunner::spawn_with_cancellation(
+            graph,
+            Vec::new(),
+            states,
+            BTreeMap::new(),
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("spawn must succeed");
+        let (snapshot, _positions, _watermarks) = handle
+            .checkpoint_barrier("live-checkpoint", 4)
+            .await
+            .unwrap_or_else(|error| panic!("a live kernel must complete a barrier round: {error}"));
+        assert_eq!(snapshot.format_version, 1);
+        handle.stop();
+        handle
+            .watcher()
+            .await
+            .unwrap()
+            .expect("a stopped run must complete gracefully");
+    }
+
+    fn state_map_for_plan(
+        plan: &JobPlan,
+        state: Arc<dyn StateBackend>,
+    ) -> BTreeMap<String, Arc<dyn StateBackend>> {
+        plan.tasks
+            .iter()
+            .filter(|task| {
+                plan.spec
+                    .operators
+                    .iter()
+                    .any(|operator| operator.id == task.operator_id && operator.stateful)
+            })
+            .map(|task| (task.id.clone(), state.clone()))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_positions_restores_every_source_input() {
+        let input = Arc::new(RecordingPositionsInput {
+            restored: Mutex::new(Vec::new()),
+        });
+        let adapter = adapter_with(input.clone());
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let handle = KernelJobRunner::spawn_with_cancellation(
+            graph,
+            vec![input.clone()],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("spawn must succeed");
+        let position = SourcePosition {
+            topic: Some("orders".into()),
+            partition: 1,
+            offset: 22,
+        };
+        handle
+            .restore_positions(std::slice::from_ref(&position))
+            .await
+            .unwrap();
+        assert_eq!(*input.restored.lock().unwrap(), vec![position]);
+        handle.stop();
+        let _ = handle.watcher().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_watermarks_installs_physical_and_legacy_progress() {
+        let input = Arc::new(RecordingPositionsInput {
+            restored: Mutex::new(Vec::new()),
+        });
+        let adapter = adapter_with(input.clone());
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let mut gates = BTreeMap::new();
+        for task in ["source-0", "source-1", "source-2"] {
+            let time = crate::job::TimeSpec {
+                mode: TimeMode::EventTime,
+                timestamp_field: Some("ts".into()),
+                watermark: Some(WatermarkSpec {
+                    strategy: WatermarkStrategy::BoundedOutOfOrderness,
+                    out_of_orderness_ms: 0,
+                    idle_timeout_ms: None,
+                }),
+                allowed_lateness_ms: 0,
+                late_event_policy: Default::default(),
+                late_event_route: None,
+            };
+            let gate = super::super::event_time_gate::EventTimeGate::new(
+                &time,
+                Vec::<super::super::event_time_gate::WindowTiming>::new(),
+            )
+            .unwrap();
+            gates.insert(
+                task.to_string(),
+                Arc::new(tokio::sync::Mutex::new(Some(gate))),
+            );
+        }
+        let mut handle = KernelJobRunner::spawn_with_cancellation(
+            graph,
+            vec![input],
+            BTreeMap::new(),
+            gates.clone(),
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("spawn must succeed");
+        // Bind the fallback partition of the third gate before restoring.
+        handle.gate_partitions.insert("source-2".to_string(), 5);
+
+        // Physical per-partition progress restores onto the real partitions.
+        handle
+            .restore_watermarks_with_partitions(
+                &BTreeMap::new(),
+                &BTreeMap::from([(
+                    "source-0".to_string(),
+                    vec![WatermarkPosition::new(Some("orders".into()), 3, 1_000)],
+                )]),
+            )
+            .await
+            .unwrap();
+        let gate = handle.watermark_gates().get("source-0").unwrap().clone();
+        let known = gate.lock().await.as_ref().unwrap().known_partitions();
+        assert!(known.contains(
+            &crate::event_time::EventTimePartition::new(Some("orders".into()), 3)
+                .with_source_identity("source-0")
+        ));
+
+        // Legacy task-level restore fans out to every known partition.
+        handle
+            .restore_watermarks(&BTreeMap::from([("source-0".to_string(), 2_000_i64)]))
+            .await
+            .unwrap();
+
+        // With no known partitions the restore falls back to the chain's
+        // configured physical partition (5), not partition 0.
+        handle
+            .restore_watermarks(&BTreeMap::from([("source-2".to_string(), 7_000_i64)]))
+            .await
+            .unwrap();
+        let gate = handle.watermark_gates().get("source-2").unwrap().clone();
+        let known = gate.lock().await.as_ref().unwrap().known_partitions();
+        assert_eq!(
+            known,
+            vec![crate::event_time::EventTimePartition::for_source(
+                "source-2", 5
+            )]
+        );
+
+        // And without a configured partition the fallback is partition 0.
+        handle
+            .restore_watermarks(&BTreeMap::from([("source-1".to_string(), 9_000_i64)]))
+            .await
+            .unwrap();
+        let gate = handle.watermark_gates().get("source-1").unwrap().clone();
+        let known = gate.lock().await.as_ref().unwrap().known_partitions();
+        assert_eq!(
+            known,
+            vec![crate::event_time::EventTimePartition::for_source(
+                "source-1", 0
+            )]
+        );
+        handle.stop();
+        let _ = handle.watcher().await;
+    }
+
+    /// A task carrying physical watermark progress is skipped by the legacy
+    /// fan-out in the same call, and a taken gate is skipped silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_watermarks_skips_physical_progress_and_taken_gates() {
+        let input = Arc::new(RecordingPositionsInput {
+            restored: Mutex::new(Vec::new()),
+        });
+        let adapter = adapter_with(input.clone());
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let time = crate::job::TimeSpec {
+            mode: TimeMode::EventTime,
+            timestamp_field: Some("ts".into()),
+            watermark: Some(WatermarkSpec {
+                strategy: WatermarkStrategy::BoundedOutOfOrderness,
+                out_of_orderness_ms: 0,
+                idle_timeout_ms: None,
+            }),
+            allowed_lateness_ms: 0,
+            late_event_policy: Default::default(),
+            late_event_route: None,
+        };
+        let gate = super::super::event_time_gate::EventTimeGate::new(
+            &time,
+            Vec::<super::super::event_time_gate::WindowTiming>::new(),
+        )
+        .unwrap();
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "source-0".to_string(),
+            Arc::new(tokio::sync::Mutex::new(Some(gate))),
+        );
+        gates.insert(
+            "taken".to_string(),
+            Arc::new(tokio::sync::Mutex::new(None)),
+        );
+        let handle = KernelJobRunner::spawn_with_cancellation(
+            graph,
+            vec![input],
+            BTreeMap::new(),
+            gates,
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("spawn must succeed");
+
+        // Both maps mention source-0: the legacy value must be skipped.
+        handle
+            .restore_watermarks_with_partitions(
+                &BTreeMap::from([("source-0".to_string(), 3_000_i64)]),
+                &BTreeMap::from([(
+                    "source-0".to_string(),
+                    vec![WatermarkPosition::new(Some("orders".into()), 1, 1_000)],
+                )]),
+            )
+            .await
+            .unwrap();
+        // A taken gate is skipped even when it is targeted directly.
+        handle
+            .restore_watermarks_with_partitions(
+                &BTreeMap::from([("taken".to_string(), 3_000_i64)]),
+                &BTreeMap::from([(
+                    "taken".to_string(),
+                    vec![WatermarkPosition::new(Some("orders".into()), 1, 1_000)],
+                )]),
+            )
+            .await
+            .unwrap();
+        let gate = handle.watermark_gates().get("taken").unwrap().clone();
+        assert!(
+            gate.lock().await.as_ref().is_none(),
+            "a taken gate must stay untouched"
+        );
+        handle.stop();
+        let _ = handle.watcher().await;
+    }
+
+    // ---------- barrier round drain interleavings ----------
+
+    /// A stale report queued ahead of the exiting chain's report is drained
+    /// and ignored inside the finished-branch drain loop. Whichever order
+    /// the select observes the ready branches in, the round must succeed.
+    #[tokio::test]
+    async fn checkpoint_drain_ignores_stale_reports_before_the_exiting_chain() {
+        for _ in 0..16 {
+            let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+            let task = tokio::spawn(async move { handle.checkpoint_barrier("cp-1", 0).await });
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            channels
+                .report
+                .send(snapshot_report("a", "abandoned-round", 7))
+                .unwrap();
+            channels
+                .report
+                .send(snapshot_report("a", "cp-1", 0))
+                .unwrap();
+            channels.finished.send("a".into()).unwrap();
+            task.await
+                .unwrap()
+                .expect("the drained round must still seal with the matching report");
+        }
+    }
+
+    /// The drain loop rejects unknown-chain reports whether they are drained
+    /// behind a finished notification or consumed by the main loop first.
+    #[tokio::test]
+    async fn checkpoint_drain_rejects_reports_from_unknown_chains() {
+        for _ in 0..8 {
+            let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+            let task = tokio::spawn(async move { handle.checkpoint_barrier("cp-1", 0).await });
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            channels
+                .report
+                .send(snapshot_report("zzz", "cp-1", 0))
+                .unwrap();
+            channels.finished.send("a".into()).unwrap();
+            let error = task
+                .await
+                .unwrap()
+                .expect_err("an unknown chain must fail the round");
+            assert!(
+                error.to_string().contains("unknown chain"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A duplicate report fails the round from either the drain loop or the
+    /// main loop. A second participant keeps the round open until both
+    /// copies of the duplicated report have been consumed.
+    #[tokio::test]
+    async fn checkpoint_drain_rejects_duplicate_reports() {
+        for _ in 0..8 {
+            let (handle, channels) = synthetic_handle(&["a", "b"], CancellationToken::new());
+            let task = tokio::spawn(async move { handle.checkpoint_barrier("cp-1", 0).await });
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            channels
+                .report
+                .send(snapshot_report("a", "cp-1", 0))
+                .unwrap();
+            channels
+                .report
+                .send(snapshot_report("a", "cp-1", 0))
+                .unwrap();
+            channels.finished.send("a".into()).unwrap();
+            let error = task
+                .await
+                .unwrap()
+                .expect_err("a duplicate report must fail the round");
+            assert!(
+                error.to_string().contains("duplicate chain checkpoint report"),
+                "{error}"
+            );
+        }
+    }
+
+    /// The drain treats reports-channel closure as termination: whether the
+    /// closure surfaces through the finished branch's `try_recv` or the main
+    /// loop's `recv`, the round fails with an ended-kernel error.
+    #[tokio::test]
+    async fn checkpoint_drain_treats_reports_closure_as_termination() {
+        for _ in 0..8 {
+            let (handle, channels) = synthetic_handle(&["a", "b"], CancellationToken::new());
+            let task = tokio::spawn(async move { handle.checkpoint_barrier("cp-1", 0).await });
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            channels
+                .report
+                .send(snapshot_report("b", "cp-1", 0))
+                .unwrap();
+            drop(channels.report);
+            channels.finished.send("a".into()).unwrap();
+            let error = task
+                .await
+                .unwrap()
+                .expect_err("a closed reports channel must fail the round");
+            assert!(
+                error.to_string().contains("ended"),
+                "{error}"
+            );
+        }
+    }
+
+    /// The reports channel closing with the error and finished channels
+    /// still alive is observed directly by the main loop.
+    #[tokio::test]
+    async fn checkpoint_fails_when_the_reports_channel_closes() {
+        let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
+        drop(channels.report);
+        // Keep the error sender alive so only the reports closure is ready.
+        let error_sender = channels.error;
+        let result = handle.checkpoint_barrier("cp-1", 0).await;
+        drop(error_sender);
+        let error = result.expect_err("a closed reports channel must fail the round");
+        assert!(
+            error.to_string().contains("kernel ended before checkpoint completed"),
+            "{error}"
+        );
+    }
+
+    // ---------- startup panics and stateful flows ----------
+
+    struct PanickingOutput;
+
+    #[async_trait]
+    impl Output for PanickingOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            panic!("injected sink startup panic");
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// A panic inside the graph startup drops the startup oneshot sender:
+    /// spawn fails with the exited-before-readiness error, and the panic is
+    /// captured into the completion slot instead of tearing down the test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_fails_when_the_graph_startup_panics() {
+        let adapter = KernelAdapter {
+            input: Arc::new(OneBatchThenEofInput {
+                sent: Mutex::new(false),
+            }),
+            output: Arc::new(PanickingOutput),
+            processor: Arc::new(PassThroughProcessor),
+        };
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let error =
+            KernelJobRunner::spawn(graph, Vec::new(), BTreeMap::new(), BTreeMap::new(), false)
+                .await
+                .err()
+                .expect("a panicking startup must fail the spawn");
+        assert!(
+            error
+                .to_string()
+                .contains("kernel graph startup task exited before readiness"),
+            "{error}"
+        );
+    }
+
+    /// A batch with the aggregate's key column, so stateful chains accept it.
+    struct KeyedBatchThenEofInput {
+        sent: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Input for KeyedBatchThenEofInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let mut sent = self.sent.lock().unwrap();
+            if *sent {
+                return Err(Error::EOF);
+            }
+            *sent = true;
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(datafusion::arrow::array::StringArray::from(vec!["k1"])),
+                    Arc::new(Int64Array::from(vec![1])),
+                ],
+            )
+            .unwrap();
+            Ok((
+                Arc::new(MessageBatch::new_arrow(batch)),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// A stateful graph delivers its batches through the plan's processors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stateful_graph_flows_batches_through_the_processor() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(directory.path(), 1).unwrap());
+        let input = Arc::new(KeyedBatchThenEofInput {
+            sent: Mutex::new(false),
+        });
+        let adapter = adapter_with(input.clone());
+        let (plan, graph) = {
+            let plan = JobPlan::compile(kernel_spec(true, 1)).unwrap();
+            let graph = ExecutionGraphBuilder::default()
+                .with_state(backend.clone())
+                .build(&plan, &adapter, &resource())
+                .unwrap();
+            (plan, graph)
+        };
+        let handle = KernelJobRunner::spawn_with_cancellation(
+            graph,
+            vec![input],
+            state_map_for_plan(&plan, backend),
+            BTreeMap::new(),
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("spawn must succeed");
+        handle
+            .watcher()
+            .await
+            .unwrap()
+            .expect("an EOF stateful run must complete successfully");
+    }
+
+    /// Preconnected sources that never managed to connect still surface
+    /// end-of-stream through their read path, ending the chain cleanly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preconnected_source_reports_eof_from_read() {
+        let failing = Arc::new(FailingConnectInput {
+            closes: AtomicUsize::new(0),
+        });
+        let adapter = adapter_with(failing.clone());
+        let (_plan, graph) = build_graph(kernel_spec(false, 1), &adapter);
+        let handle = KernelJobRunner::spawn_prepared_with_cancellation(
+            graph,
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("spawn must succeed");
+        handle
+            .watcher()
+            .await
+            .unwrap()
+            .expect("an EOF read must complete the run gracefully");
     }
 }

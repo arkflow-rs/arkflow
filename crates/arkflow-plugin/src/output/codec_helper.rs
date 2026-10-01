@@ -62,4 +62,59 @@ mod tests {
         assert_eq!(bytes.len(), 1);
         assert_eq!(bytes[0], b"test data".to_vec());
     }
+
+    /// A codec that encodes every batch to one fixed payload, mirroring the
+    /// shape of the real JSON codec (one Bytes per row).
+    struct FixedBytesCodec;
+
+    #[async_trait::async_trait]
+    impl arkflow_core::codec::Encoder for FixedBytesCodec {
+        async fn encode(&self, _batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
+            Ok(vec![b"encoded".to_vec()])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl arkflow_core::codec::Decoder for FixedBytesCodec {
+        async fn decode(&self, _b: Vec<Bytes>) -> Result<MessageBatch, Error> {
+            Err(Error::Process("not implemented in test codec".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_codec_encode_with_codec_uses_codec_output() {
+        let batch = MessageBatch::new_binary(vec![b"raw".to_vec()]).unwrap();
+        let msg_ref = std::sync::Arc::new(batch);
+        let codec: Option<Arc<dyn Codec>> = Some(std::sync::Arc::new(FixedBytesCodec));
+
+        let bytes = apply_codec_encode(&msg_ref, &codec).await.unwrap();
+        assert_eq!(bytes, vec![b"encoded".to_vec()]);
+    }
+
+    /// A codec whose encoder always fails, to check error propagation.
+    struct FailingCodec;
+
+    #[async_trait::async_trait]
+    impl arkflow_core::codec::Encoder for FailingCodec {
+        async fn encode(&self, _batch: MessageBatch) -> Result<Vec<Bytes>, Error> {
+            Err(Error::Process("encode boom".to_string()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl arkflow_core::codec::Decoder for FailingCodec {
+        async fn decode(&self, _b: Vec<Bytes>) -> Result<MessageBatch, Error> {
+            Err(Error::Process("decode boom".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_codec_encode_propagates_codec_error() {
+        let batch = MessageBatch::new_binary(vec![b"raw".to_vec()]).unwrap();
+        let msg_ref = std::sync::Arc::new(batch);
+        let codec: Option<Arc<dyn Codec>> = Some(std::sync::Arc::new(FailingCodec));
+
+        let err = apply_codec_encode(&msg_ref, &codec).await.unwrap_err();
+        assert!(format!("{err}").contains("encode boom"), "{err}");
+    }
 }

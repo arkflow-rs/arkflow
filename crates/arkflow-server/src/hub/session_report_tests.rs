@@ -42,7 +42,7 @@ async fn registered_hub() -> (Hub, crate::hub::RegisterResponse) {
     let hub = Hub::with_storage(
         config(),
         crate::storage::StorageActor::start(
-            crate::storage::ControlPlaneStore::in_memory().unwrap(),
+            crate::storage::ControlPlaneStore::contract("registered_hub").await,
             4,
         ),
     );

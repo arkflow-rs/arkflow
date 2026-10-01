@@ -3402,6 +3402,15 @@ mod worker_pool_tests {
             "the fence reports the stalled delivery: {error}"
         );
     }
+
+    /// The stalling double's close path is a plain success.
+    #[tokio::test]
+    async fn a_stalling_processor_closes_cleanly() {
+        let processor = StallingProcessor {
+            started: Arc::new(AtomicUsize::new(0)),
+        };
+        processor.close().await.expect("close must succeed");
+    }
 }
 
 #[cfg(test)]
@@ -3554,4 +3563,2611 @@ mod watermark_idle_tests {
         assert_eq!(clamp_forwarded_watermark(Some(5_000), 5_000), 5_000);
     }
 
+}
+
+/// Unit coverage for the private dispatch/routing helpers of the chain event
+/// loops. These tests construct chains and envelopes directly so the error
+/// and compensation arms are reachable without racing a full graph.
+#[cfg(test)]
+mod task_dispatch_tests {
+    use super::*;
+    use crate::event_time::WindowAction;
+    use crate::input::NoopAck;
+    use crate::processor::Processor;
+    use crate::ProcessResult;
+    use async_trait::async_trait;
+    use datafusion::arrow::array::{
+        ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        Int8Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
+        UInt8Array,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    // ---------- doubles ----------
+
+    /// Acknowledgement recording every settlement kind, with optional
+    /// failure injection per kind.
+    #[derive(Default)]
+    struct ProbeAck {
+        acks: AtomicUsize,
+        aborts: AtomicUsize,
+        fail_ack: std::sync::atomic::AtomicBool,
+        fail_abort: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::input::Ack for ProbeAck {
+        async fn ack(&self) -> Result<(), Error> {
+            if self.fail_ack.load(Ordering::SeqCst) {
+                return Err(Error::Process("ack failed".into()));
+            }
+            self.acks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            if self.fail_abort.load(Ordering::SeqCst) {
+                return Err(Error::Process("abort failed".into()));
+            }
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A processor whose `process` and control hooks pop scripted results.
+    struct ScriptedProcessor {
+        results: Mutex<VecDeque<ProcessResult>>,
+        controls: Mutex<VecDeque<ProcessResult>>,
+        control_error: Option<String>,
+    }
+
+    impl ScriptedProcessor {
+        fn new(results: Vec<ProcessResult>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().collect()),
+                controls: Mutex::new(VecDeque::new()),
+                control_error: None,
+            }
+        }
+
+        fn with_controls(results: Vec<ProcessResult>, controls: Vec<ProcessResult>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().collect()),
+                controls: Mutex::new(controls.into_iter().collect()),
+                control_error: None,
+            }
+        }
+
+        fn failing_control(message: &str) -> Self {
+            Self {
+                results: Mutex::new(VecDeque::new()),
+                controls: Mutex::new(VecDeque::new()),
+                control_error: Some(message.to_string()),
+            }
+        }
+
+        fn control_result(&self) -> Result<ProcessResult, Error> {
+            match &self.control_error {
+                Some(message) => Err(Error::Process(message.clone())),
+                None => Ok(self
+                    .controls
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(ProcessResult::None)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Processor for ScriptedProcessor {
+        async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(self
+                .results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(ProcessResult::None))
+        }
+        async fn finish(&self) -> Result<ProcessResult, Error> {
+            self.control_result()
+        }
+        async fn on_tick(&self) -> Result<ProcessResult, Error> {
+            self.control_result()
+        }
+        async fn on_watermark(&self, _watermark_ms: i64) -> Result<ProcessResult, Error> {
+            self.control_result()
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn empty_batch() -> crate::MessageBatchRef {
+        Arc::new(crate::MessageBatch::new_arrow(RecordBatch::new_empty(
+            Arc::new(Schema::empty()),
+        )))
+    }
+
+    fn utf8_batch(rows: Vec<Option<&str>>) -> crate::MessageBatchRef {
+        Arc::new(crate::MessageBatch::new_arrow(RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(rows)) as ArrayRef],
+        )
+        .unwrap()))
+    }
+
+    fn chain_with_processor(processor: Arc<dyn Processor>) -> Chain {
+        let mut chain = Chain::for_pool_test(1, vec![processor]);
+        chain.task_ids = vec!["m".into()];
+        chain
+    }
+
+    fn hook() -> CheckpointHook {
+        CheckpointHook::default()
+    }
+
+    // ---------- pure helpers ----------
+
+    #[test]
+    fn panic_payload_extracts_known_types() {
+        assert_eq!(panic_payload(&"boom"), "boom");
+        assert_eq!(panic_payload(&String::from("boom")), "boom");
+        assert_eq!(panic_payload(&7u32), "unknown panic");
+    }
+
+    #[test]
+    fn tag_input_index_is_a_no_op_when_already_tagged() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                crate::executor::join::META_INPUT_INDEX,
+                DataType::UInt32,
+                false,
+            )])),
+            vec![Arc::new(UInt32Array::from(vec![1u32]))],
+        )
+        .unwrap();
+        let tagged = tag_input_index(batch, 0).unwrap();
+        assert_eq!(tagged.num_columns(), 1);
+    }
+
+    #[test]
+    fn tag_input_index_appends_the_marker() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2i64]))],
+        )
+        .unwrap();
+        let tagged = tag_input_index(batch, 3).unwrap();
+        let column = tagged
+            .column_by_name(crate::executor::join::META_INPUT_INDEX)
+            .unwrap();
+        let values = column.as_any().downcast_ref::<UInt32Array>().unwrap();
+        assert_eq!(values.values(), &[3u32, 3u32]);
+    }
+
+    #[test]
+    fn mark_event_batch_skips_an_existing_marker() {
+        let batch = utf8_batch(vec![Some("a")]);
+        let marked = mark_event_batch(batch.clone(), "__arkflow_late_event_route").unwrap();
+        assert_eq!(marked.num_columns(), batch.num_columns() + 1);
+        // Marking again is a no-op (the column already exists).
+        let twice = mark_event_batch(marked.clone(), "__arkflow_late_event_route").unwrap();
+        assert_eq!(twice.num_columns(), marked.num_columns());
+    }
+
+    #[tokio::test]
+    async fn a_scripted_processor_closes_cleanly() {
+        let processor = ScriptedProcessor::new(vec![]);
+        processor.close().await.expect("close must succeed");
+    }
+    #[test]
+    fn result_to_batches_maps_every_variant() {
+        let batch = empty_batch();
+        let ack: Arc<dyn Ack> = Arc::new(NoopAck);
+
+        assert_eq!(result_to_batches(ProcessResult::Deferred).len(), 0);
+        assert_eq!(result_to_batches(ProcessResult::None).len(), 0);
+        assert_eq!(
+            result_to_batches(ProcessResult::Single(batch.clone())).len(),
+            1
+        );
+        assert_eq!(
+            result_to_batches(ProcessResult::Multiple(vec![
+                batch.clone(),
+                batch.clone()
+            ]))
+            .len(),
+            2
+        );
+        assert_eq!(
+            result_to_batches(ProcessResult::SingleWithAck(batch.clone(), ack.clone())).len(),
+            1
+        );
+        assert_eq!(
+            result_to_batches(ProcessResult::MultipleWithAck(vec![
+                (batch.clone(), ack.clone()),
+                (batch, ack)
+            ]))
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn hash_column_supports_every_keyed_arrow_type() {
+        let max_parallelism = 16u32;
+        let group = |bytes: &[u8]| {
+            crate::job::key_group_for_key(bytes, max_parallelism).unwrap()
+        };
+        // Integer-like keys hash the big-endian representation of their
+        // native width; nulls hash a typed sentinel instead.
+        let cases: Vec<(&str, ArrayRef, u32)> = vec![
+            ("i8", Arc::new(Int8Array::from(vec![Some(1i8)])), group(&1i8.to_be_bytes())),
+            (
+                "i16",
+                Arc::new(Int16Array::from(vec![Some(1i16)])),
+                group(&1i16.to_be_bytes()),
+            ),
+            (
+                "i32",
+                Arc::new(Int32Array::from(vec![Some(1i32)])),
+                group(&1i32.to_be_bytes()),
+            ),
+            (
+                "i64",
+                Arc::new(Int64Array::from(vec![Some(1i64)])),
+                group(&1i64.to_be_bytes()),
+            ),
+            (
+                "u8",
+                Arc::new(UInt8Array::from(vec![Some(1u8)])),
+                group(&1u8.to_be_bytes()),
+            ),
+            (
+                "u16",
+                Arc::new(UInt16Array::from(vec![Some(1u16)])),
+                group(&1u16.to_be_bytes()),
+            ),
+            (
+                "u32",
+                Arc::new(UInt32Array::from(vec![Some(1u32)])),
+                group(&1u32.to_be_bytes()),
+            ),
+            (
+                "u64",
+                Arc::new(UInt64Array::from(vec![Some(1u64)])),
+                group(&1u64.to_be_bytes()),
+            ),
+            (
+                "date32",
+                Arc::new(Date32Array::from(vec![Some(1i32)])),
+                group(&1i32.to_be_bytes()),
+            ),
+            (
+                "date64",
+                Arc::new(Date64Array::from(vec![Some(1i64)])),
+                group(&1i64.to_be_bytes()),
+            ),
+            (
+                "ts_s",
+                Arc::new(TimestampSecondArray::from(vec![Some(1i64)])),
+                group(&1i64.to_be_bytes()),
+            ),
+            (
+                "ts_ms",
+                Arc::new(TimestampMillisecondArray::from(vec![Some(1i64)])),
+                group(&1i64.to_be_bytes()),
+            ),
+            (
+                "ts_us",
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(1i64)])),
+                group(&1i64.to_be_bytes()),
+            ),
+            (
+                "ts_ns",
+                Arc::new(TimestampNanosecondArray::from(vec![Some(1i64)])),
+                group(&1i64.to_be_bytes()),
+            ),
+            (
+                "decimal128",
+                Arc::new(Decimal128Array::from(vec![Some(1i128)])),
+                group(&1i128.to_be_bytes()),
+            ),
+        ];
+        for (tag, column, expected) in cases {
+            let groups = hash_column(column.as_ref(), max_parallelism)
+                .unwrap_or_else(|error| panic!("{tag}: {error}"));
+            assert_eq!(groups, vec![Some(expected)], "{tag} hashes its raw value");
+        }
+
+        // Boolean and string/binary keys use their own sentinels.
+        let booleans = hash_column(
+            &BooleanArray::from(vec![Some(true), Some(false), None]),
+            max_parallelism,
+        )
+        .unwrap();
+        assert_eq!(booleans[0].unwrap(), group(b"bool:1"));
+        assert_eq!(booleans[1].unwrap(), group(b"bool:0"));
+        assert_eq!(booleans[2].unwrap(), group(b"null:bool"));
+
+        let strings = hash_column(
+            &StringArray::from(vec![Some("a"), None]),
+            max_parallelism,
+        )
+        .unwrap();
+        assert_eq!(strings[0].unwrap(), group(b"a"));
+        assert_eq!(strings[1].unwrap(), group(b"null:utf8"));
+
+        let binaries = hash_column(
+            &datafusion::arrow::array::BinaryArray::from_iter_values([b"b"]),
+            max_parallelism,
+        )
+        .unwrap();
+        assert_eq!(binaries[0].unwrap(), group(b"b"));
+
+        let unsupported = hash_column(&Float64Array::from(vec![1.0f64]), max_parallelism);
+        assert!(unsupported.is_err());
+    }
+
+    #[test]
+    fn partition_batch_by_key_hash_validates_its_inputs() {
+        let batch = utf8_batch(vec![Some("a"), Some("b")]);
+
+        // An empty key field routes everything to the first subtask.
+        let routed = partition_batch_by_key_hash(&batch, "", 2, &[], 16).unwrap();
+        assert!(routed[0].is_some());
+        assert!(routed[1].is_none());
+
+        // Channel/range mismatch fails closed.
+        let error = partition_batch_by_key_hash(
+            &batch,
+            "key",
+            2,
+            &[crate::job::KeyGroupRange { start: 0, end: 7 }],
+            16,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("2 channels but 1 key-group ranges"),
+            "{error}"
+        );
+
+        // A missing key field fails closed.
+        let error = partition_batch_by_key_hash(&batch, "absent", 1, &[crate::job::KeyGroupRange {
+            start: 0,
+            end: 15,
+        }], 16)
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("'absent' is missing from batch"),
+            "{error}"
+        );
+
+        // Ranges that cover no key group produce an empty delivery per
+        // subtask.
+        let empty_ranges = vec![
+            crate::job::KeyGroupRange { start: 1, end: 0 },
+            crate::job::KeyGroupRange { start: 1, end: 0 },
+        ];
+        let routed = partition_batch_by_key_hash(&batch, "key", 2, &empty_ranges, 16).unwrap();
+        assert!(routed.iter().all(Option::is_none));
+    }
+
+    // ---------- gate output dispatch ----------
+
+    fn ready_slice(action: WindowAction) -> (crate::MessageBatchRef, WindowAction) {
+        (empty_batch(), action)
+    }
+
+    #[tokio::test]
+    async fn mismatched_gate_vectors_fail_and_abort_every_acknowledgement() {
+        let chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let probe = Arc::new(ProbeAck::default());
+        let error = dispatch_gate_outputs(
+            &chain,
+            &hook(),
+            vec![ready_slice(WindowAction::Emit)],
+            vec![Arc::new(ProbeAck::default()), Arc::new(ProbeAck::default())],
+            vec![true],
+            vec![probe.clone()],
+            None,
+            0,
+            true,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("mismatched output vectors"),
+            "{error}"
+        );
+        // The dropped acknowledgement is aborted alongside the ready ones.
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn watermark_at_the_ready_slice_fails_the_dispatch() {
+        // The watermark envelope must leave before the current ready slice;
+        // a closed downstream channel fails the whole dispatch and aborts
+        // every acknowledgement it still owns.
+        let mut chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        chain.outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(dead_tx)],
+        );
+        let probe = Arc::new(ProbeAck::default());
+        let error = dispatch_gate_outputs(
+            &chain,
+            &hook(),
+            vec![ready_slice(WindowAction::Emit)],
+            vec![probe.clone()],
+            vec![false],
+            vec![],
+            Some(1_000),
+            0,
+            true,
+            Some(0),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("downstream channel closed"),
+            "{error}"
+        );
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn watermark_after_the_last_slice_is_forwarded() {
+        // A drop-only decision still forwards the watermark after the ready
+        // slices when `current_ready_start` points past them.
+        let mut chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let (tx, rx) = flume::bounded::<Envelope>(4);
+        chain.outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(tx)],
+        );
+        dispatch_gate_outputs(
+            &chain,
+            &hook(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some(2_000),
+            0,
+            true,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Watermark(2_000))));
+
+        // With the channel closed the same tail fails the dispatch.
+        let mut chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        chain.outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(dead_tx)],
+        );
+        let error = dispatch_gate_outputs(
+            &chain,
+            &hook(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some(2_000),
+            0,
+            true,
+            Some(0),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("downstream channel closed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_dropped_acknowledgement_fails_the_dispatch() {
+        let chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_ack.store(true, Ordering::SeqCst);
+        let error = dispatch_gate_outputs(
+            &chain,
+            &hook(),
+            vec![],
+            vec![],
+            vec![],
+            vec![probe.clone()],
+            None,
+            0,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("ack failed"), "{error}");
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_forwarded_tail_watermark_fails_on_a_closed_channel() {
+        let mut chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        chain.outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(dead_tx)],
+        );
+        let error = dispatch_gate_outputs(
+            &chain,
+            &hook(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some(3_000),
+            0,
+            true,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("downstream channel closed"),
+            "{error}"
+        );
+    }
+
+    // ---------- gated (late-event) dispatch ----------
+
+    #[tokio::test]
+    async fn an_invalid_timestamp_routes_marked_to_the_late_edge() {
+        let mut chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let (tx, rx) = flume::bounded::<Envelope>(2);
+        chain.late_event_outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(tx)],
+        );
+        let probe = Arc::new(ProbeAck::default());
+        dispatch_gated(
+            &chain,
+            &hook(),
+            utf8_batch(vec![Some("late")]),
+            WindowAction::Route,
+            probe.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        let Envelope::Data(batch, _) = rx.try_recv().unwrap() else {
+            panic!("the invalid timestamp must reach the late edge");
+        };
+        assert!(batch
+            .record_batch()
+            .column_by_name("__arkflow_invalid_timestamp_route")
+            .is_some());
+        assert!(batch
+            .record_batch()
+            .column_by_name("__arkflow_late_event_route")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_timestamp_without_a_route_target_is_dropped() {
+        let chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let probe = Arc::new(ProbeAck::default());
+        dispatch_gated(
+            &chain,
+            &hook(),
+            utf8_batch(vec![Some("bad")]),
+            WindowAction::Route,
+            probe.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_valid_late_row_without_a_route_target_stays_on_the_main_path() {
+        let chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![
+            ProcessResult::Deferred,
+        ])));
+        let probe = Arc::new(ProbeAck::default());
+        dispatch_gated(
+            &chain,
+            &hook(),
+            utf8_batch(vec![Some("late")]),
+            WindowAction::Route,
+            probe.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        // The main path re-marked the row as a late update and the chain's
+        // processor retained the acknowledgement (Deferred).
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_update_action_marks_the_batch() {
+        let chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let probe = Arc::new(ProbeAck::default());
+        dispatch_gated(
+            &chain,
+            &hook(),
+            utf8_batch(vec![Some("stale")]),
+            WindowAction::Update,
+            probe.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        // The marked update flowed through the chain (no outputs: the data
+        // acknowledgement settles immediately).
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_chain_processor_aborts_the_gated_acknowledgement() {
+        struct FailingProcessor;
+        #[async_trait]
+        impl Processor for FailingProcessor {
+            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+                Err(Error::Process("injected processor failure".into()))
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let chain = chain_with_processor(Arc::new(FailingProcessor));
+        let probe = Arc::new(ProbeAck::default());
+        let error = dispatch_gated(
+            &chain,
+            &hook(),
+            utf8_batch(vec![Some("row")]),
+            WindowAction::Emit,
+            probe.clone(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("injected processor failure"),
+            "{error}"
+        );
+        // The delivery is aborted by the dispatch error path and again by
+        // the gate-output compensation pass.
+        assert!(probe.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    // ---------- output flushing ----------
+
+    #[tokio::test]
+    async fn late_routed_pool_output_leaves_through_the_late_edge() {
+        let mut chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let (tx, rx) = flume::bounded::<Envelope>(2);
+        chain.late_event_outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(tx)],
+        );
+        let batch = mark_event_batch(utf8_batch(vec![Some("late")]), "__arkflow_late_event_route")
+            .unwrap();
+        flush_outputs(
+            &chain,
+            vec![ProcessedBatch {
+                batch,
+                ack: Arc::new(ProbeAck::default()),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Data(_, _))));
+    }
+
+    #[tokio::test]
+    async fn a_failed_late_route_aborts_the_remaining_outputs() {
+        let mut chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        chain.late_event_outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(dead_tx)],
+        );
+        let first = Arc::new(ProbeAck::default());
+        let second = Arc::new(ProbeAck::default());
+        let marked = mark_event_batch(utf8_batch(vec![Some("late")]), "__arkflow_late_event_route")
+            .unwrap();
+        let error = flush_outputs(
+            &chain,
+            vec![
+                ProcessedBatch {
+                    batch: marked,
+                    ack: first.clone(),
+                },
+                ProcessedBatch {
+                    batch: empty_batch(),
+                    ack: second.clone(),
+                },
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("downstream channel closed"),
+            "{error}"
+        );
+        // Both the failed delivery and the un-routed sibling settle. The
+        // failed delivery's acknowledgement is aborted by both the failed
+        // fan-out and the compensation pass, so "at least once" is the
+        // contract that matters here.
+        assert!(first.aborts.load(Ordering::SeqCst) >= 1);
+        assert!(second.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_reports_a_failing_abort() {
+        let mut chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        chain.outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(dead_tx)],
+        );
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_abort.store(true, Ordering::SeqCst);
+        let error = flush_outputs(
+            &chain,
+            vec![ProcessedBatch {
+                batch: empty_batch(),
+                ack: probe.clone(),
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("acknowledgement abort failed"),
+            "{error}"
+        );
+    }
+
+    // ---------- generated-batch processing ----------
+
+    fn processed(ack: Arc<dyn Ack>) -> Vec<ProcessedBatch> {
+        vec![ProcessedBatch {
+            batch: empty_batch(),
+            ack,
+        }]
+    }
+
+    #[tokio::test]
+    async fn generated_multiple_empty_output_settles_the_acknowledgement() {
+        let processor: Arc<dyn Processor> = Arc::new(ScriptedProcessor::new(vec![
+            ProcessResult::Multiple(vec![]),
+        ]));
+        let probe = Arc::new(ProbeAck::default());
+        process_generated_batches(&processor, processed(probe.clone()))
+            .await
+            .unwrap();
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn generated_multiple_empty_output_fails_when_the_ack_fails() {
+        let processor: Arc<dyn Processor> = Arc::new(ScriptedProcessor::new(vec![
+            ProcessResult::Multiple(vec![]),
+        ]));
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_ack.store(true, Ordering::SeqCst);
+        let Err(error) = process_generated_batches(&processor, processed(probe.clone())).await
+        else {
+            panic!("a failing acknowledgement must fail the stage");
+        };
+        assert!(error.to_string().contains("ack failed"), "{error}");
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn generated_multiple_output_fans_out_the_acknowledgement() {
+        let processor: Arc<dyn Processor> = Arc::new(ScriptedProcessor::new(vec![
+            ProcessResult::Multiple(vec![empty_batch(), empty_batch()]),
+        ]));
+        let probe = Arc::new(ProbeAck::default());
+        let outputs = process_generated_batches(&processor, processed(probe.clone()))
+            .await
+            .unwrap();
+        assert_eq!(outputs.len(), 2);
+        // Settling one branch is not enough; both must ack.
+        outputs[0].ack.ack().await.unwrap();
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 0);
+        outputs[1].ack.ack().await.unwrap();
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn generated_with_ack_results_reuse_the_replacement() {
+        let replacement = Arc::new(ProbeAck::default());
+        let processor: Arc<dyn Processor> = Arc::new(ScriptedProcessor::new(vec![
+            ProcessResult::SingleWithAck(empty_batch(), replacement.clone()),
+            ProcessResult::MultipleWithAck(vec![
+                (empty_batch(), Arc::new(ProbeAck::default())),
+                (empty_batch(), Arc::new(ProbeAck::default())),
+            ]),
+        ]));
+        let next = process_generated_batches(&processor, processed(Arc::new(ProbeAck::default())))
+            .await
+            .unwrap();
+        // The first stage's replacement flows into the second stage's input.
+        assert_eq!(next.len(), 1);
+        let next = process_generated_batches(&processor, next).await.unwrap();
+        assert_eq!(next.len(), 2);
+        for output in &next {
+            output.ack.ack().await.unwrap();
+        }
+        replacement.ack().await.unwrap();
+        assert_eq!(replacement.acks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn generated_none_and_deferred_results() {
+        let probe = Arc::new(ProbeAck::default());
+        let processor: Arc<dyn Processor> =
+            Arc::new(ScriptedProcessor::new(vec![ProcessResult::None]));
+        process_generated_batches(&processor, processed(probe.clone()))
+            .await
+            .unwrap();
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 1);
+
+        let probe = Arc::new(ProbeAck::default());
+        let processor: Arc<dyn Processor> =
+            Arc::new(ScriptedProcessor::new(vec![ProcessResult::Deferred]));
+        let retained = process_generated_batches(&processor, processed(probe.clone()))
+            .await
+            .unwrap();
+        assert!(retained.is_empty());
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn generated_none_output_fails_when_the_ack_fails() {
+        let processor: Arc<dyn Processor> =
+            Arc::new(ScriptedProcessor::new(vec![ProcessResult::None]));
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_ack.store(true, Ordering::SeqCst);
+        let Err(error) = process_generated_batches(&processor, processed(probe.clone())).await
+        else {
+            panic!("a failing acknowledgement must fail the stage");
+        };
+        assert!(error.to_string().contains("ack failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn generated_processing_failure_aborts_later_batches() {
+        struct FailAfterFirst;
+        #[async_trait]
+        impl Processor for FailAfterFirst {
+            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+                Err(Error::Process("second stage failed".into()))
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let processor: Arc<dyn Processor> = Arc::new(FailAfterFirst);
+        let probe = Arc::new(ProbeAck::default());
+        let Err(error) = process_generated_batches(&processor, processed(probe.clone())).await
+        else {
+            panic!("a failing stage must fail the batch run");
+        };
+        assert!(error.to_string().contains("second stage failed"), "{error}");
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_abort_during_compensation_is_reported() {
+        struct FailAfterFirst;
+        #[async_trait]
+        impl Processor for FailAfterFirst {
+            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+                Err(Error::Process("stage failed".into()))
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let processor: Arc<dyn Processor> = Arc::new(FailAfterFirst);
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_abort.store(true, Ordering::SeqCst);
+        let Err(error) = process_generated_batches(&processor, processed(probe.clone())).await
+        else {
+            panic!("a failing stage must fail the batch run");
+        };
+        assert!(
+            error.to_string().contains("acknowledgement abort failed"),
+            "{error}"
+        );
+    }
+
+    // ---------- control dispatch ----------
+
+    #[tokio::test]
+    async fn a_failing_control_hook_fails_the_dispatch() {
+        let processor = Arc::new(ScriptedProcessor::failing_control("control failed"));
+        let chain = chain_with_processor(processor);
+        for control in [
+            ProcessorControl::Finish,
+            ProcessorControl::Tick,
+            ProcessorControl::Watermark(500),
+        ] {
+            let error = dispatch_processor_control(&chain, control)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("control failed"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_and_watermark_controls_flush_through_the_chain() {
+        let (tx, rx) = flume::bounded::<Envelope>(4);
+        let mut chain = chain_with_processor(Arc::new(ScriptedProcessor::with_controls(
+            vec![],
+            vec![
+                ProcessResult::Single(empty_batch()),
+                ProcessResult::Single(empty_batch()),
+            ],
+        )));
+        chain
+            .outputs
+            .insert("m".into(), vec![super::super::graph::EdgeTarget::Forward(tx)]);
+        dispatch_processor_control(&chain, ProcessorControl::Tick)
+            .await
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Data(_, _))));
+        dispatch_processor_control(&chain, ProcessorControl::Watermark(500))
+            .await
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Data(_, _))));
+    }
+
+    // ---------- failure routing ----------
+
+    fn processor_failure(ack: Arc<dyn Ack>) -> ProcessorFailure {
+        ProcessorFailure {
+            error: Error::Process("operator failed".into()),
+            batch: empty_batch(),
+            ack,
+            siblings: Vec::new(),
+            failed_task_id: "m".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_error_route_without_abort_failure_reports_both() {
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        let probe = Arc::new(ProbeAck::default());
+        let error = route_processor_failure(
+            &vec![super::super::graph::EdgeTarget::Forward(dead_tx)],
+            processor_failure(probe.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("error output routing failed")
+                && error.to_string().contains("operator failed")
+                && error.to_string().contains("downstream channel closed"),
+            "{error}"
+        );
+        // The failed fan-out aborts the delivery once and the route failure
+        // compensation aborts it again.
+        assert!(probe.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_error_route_with_a_failing_abort_reports_the_triple() {
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_abort.store(true, Ordering::SeqCst);
+        let error = route_processor_failure(
+            &vec![super::super::graph::EdgeTarget::Forward(dead_tx)],
+            processor_failure(probe.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("acknowledgement abort failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pooled_failure_without_error_targets_aborts() {
+        let chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let probe = Arc::new(ProbeAck::default());
+        let error = flush_pool_result(
+            &chain,
+            PoolResult::ProcessorFailure(processor_failure(probe.clone())),
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("operator failed"), "{error}");
+        assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pooled_failure_routes_through_the_error_targets() {
+        let (tx, rx) = flume::bounded::<Envelope>(2);
+        let chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let error_targets = BTreeMap::from([(
+            "m".to_string(),
+            vec![super::super::graph::EdgeTarget::Forward(tx)],
+        )]);
+        let probe = Arc::new(ProbeAck::default());
+        flush_pool_result(
+            &chain,
+            PoolResult::ProcessorFailure(processor_failure(probe.clone())),
+            &error_targets,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Data(_, _))));
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_pooled_error_route_combines_the_errors() {
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        let chain = chain_with_processor(Arc::new(ScriptedProcessor::new(vec![])));
+        let error_targets = BTreeMap::from([(
+            "m".to_string(),
+            vec![super::super::graph::EdgeTarget::Forward(dead_tx)],
+        )]);
+        let error = flush_pool_result(
+            &chain,
+            PoolResult::ProcessorFailure(processor_failure(Arc::new(ProbeAck::default()))),
+            &error_targets,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("error output routing failed"),
+            "{error}"
+        );
+    }
+
+    // ---------- data dispatch with a failing error route ----------
+
+    #[tokio::test]
+    async fn dispatch_data_reports_a_failing_error_route() {
+        struct FailingProcessor;
+        #[async_trait]
+        impl Processor for FailingProcessor {
+            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+                Err(Error::Process("operator failed".into()))
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        let mut chain = chain_with_processor(Arc::new(FailingProcessor));
+        chain.error_outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(dead_tx)],
+        );
+        let error = dispatch_data(
+            &chain,
+            utf8_batch(vec![Some("row")]),
+            Arc::new(ProbeAck::default()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("processor failed and error output routing failed"),
+            "{error}"
+        );
+    }
+
+    // ---------- edge routing ----------
+
+    #[tokio::test]
+    async fn partitioned_data_routing_spreads_rows_across_channels() {
+        let batch = utf8_batch(vec![Some("alpha"), Some("beta"), Some("gamma")]);
+        let (tx0, rx0) = flume::bounded::<Envelope>(4);
+        let (tx1, rx1) = flume::bounded::<Envelope>(4);
+        let probe = Arc::new(ProbeAck::default());
+        send_to_targets(
+            Some(&vec![super::super::graph::EdgeTarget::Partitioned {
+                channels: vec![tx0, tx1],
+                key_field: "key".into(),
+                key_group_ranges: vec![
+                    crate::job::KeyGroupRange { start: 0, end: 7 },
+                    crate::job::KeyGroupRange { start: 8, end: 15 },
+                ],
+                max_parallelism: 16,
+            }]),
+            Envelope::Data(batch, probe.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        let mut received = 0;
+        while let Ok(Envelope::Data(batch, _)) = rx0.try_recv() {
+            received += batch.len();
+        }
+        while let Ok(Envelope::Data(batch, _)) = rx1.try_recv() {
+            received += batch.len();
+        }
+        assert_eq!(received, 3, "every row must arrive on one of the channels");
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unroutable_partitioned_data_settles_its_acknowledgement() {
+        let batch = utf8_batch(vec![Some("alpha")]);
+        let (tx0, _rx0) = flume::bounded::<Envelope>(1);
+        let (tx1, _rx1) = flume::bounded::<Envelope>(1);
+        let probe = Arc::new(ProbeAck::default());
+        send_to_targets(
+            Some(&vec![super::super::graph::EdgeTarget::Partitioned {
+                channels: vec![tx0, tx1],
+                key_field: "key".into(),
+                key_group_ranges: vec![
+                    crate::job::KeyGroupRange { start: 1, end: 0 },
+                    crate::job::KeyGroupRange { start: 1, end: 0 },
+                ],
+                max_parallelism: 16,
+            }]),
+            Envelope::Data(batch, probe.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(probe.acks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_sibling_channel_aborts_the_whole_fanout() {
+        let batch = utf8_batch(vec![Some("alpha")]);
+        let (live_tx, _live_rx) = flume::bounded::<Envelope>(1);
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        let probe = Arc::new(ProbeAck::default());
+        let error = send_to_targets(
+            Some(&vec![super::super::graph::EdgeTarget::Broadcast(vec![
+                live_tx, dead_tx,
+            ])]),
+            Envelope::Data(batch, probe.clone()),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("downstream channel closed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_envelopes_broadcast_to_every_partition_channel() {
+        let (tx0, rx0) = flume::bounded::<Envelope>(1);
+        let (tx1, rx1) = flume::bounded::<Envelope>(1);
+        send_to_targets(
+            Some(&vec![super::super::graph::EdgeTarget::Partitioned {
+                channels: vec![tx0, tx1],
+                key_field: "key".into(),
+                key_group_ranges: vec![
+                    crate::job::KeyGroupRange { start: 0, end: 7 },
+                    crate::job::KeyGroupRange { start: 8, end: 15 },
+                ],
+                max_parallelism: 16,
+            }]),
+            Envelope::Eos,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx0.try_recv(), Ok(Envelope::Eos)));
+        assert!(matches!(rx1.try_recv(), Ok(Envelope::Eos)));
+    }
+
+    #[tokio::test]
+    async fn unrouted_error_data_returns_an_error() {
+        // An error-only edge that routes to zero deliveries must fail rather
+        // than silently dropping the failed delivery.
+        let batch = utf8_batch(vec![Some("alpha")]);
+        let (tx0, _rx0) = flume::bounded::<Envelope>(1);
+        let (tx1, _rx1) = flume::bounded::<Envelope>(1);
+        let error = send_to_targets(
+            Some(&vec![super::super::graph::EdgeTarget::Partitioned {
+                channels: vec![tx0, tx1],
+                key_field: "key".into(),
+                key_group_ranges: vec![
+                    crate::job::KeyGroupRange { start: 1, end: 0 },
+                    crate::job::KeyGroupRange { start: 1, end: 0 },
+                ],
+                max_parallelism: 16,
+            }]),
+            Envelope::Data(batch, Arc::new(NoopAck)),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("error output has no deliveries"),
+            "{error}"
+        );
+    }
+}
+
+/// Coverage for the chain event loops themselves (source and interior):
+/// drain timeouts, reconnect cancellation, event-time gate failures, worker
+/// pool supervision, alignment, and shutdown paths that the dispatch-level
+/// tests above cannot reach. Everything drives the private loop functions
+/// directly over hand-built chains, so no graph construction is needed.
+#[cfg(test)]
+mod task_loop_tests {
+    use super::*;
+    use crate::job::WatermarkStrategy;
+    use crate::executor::event_time_gate::{EventTimeGate, WindowTiming};
+    use crate::event_time::WatermarkTracker;
+    use crate::executor::graph::EdgeTarget;
+    use crate::input::Ack;
+    use crate::job::{LateEventPolicy, TimeMode, TimeSpec, WatermarkSpec};
+    use crate::processor::Processor;
+    use async_trait::async_trait;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, Int8Array, BinaryArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    const BUDGET: Duration = Duration::from_secs(30);
+
+    // ---------- doubles ----------
+
+    /// Acknowledgement recording settlements, with injectable failures.
+    #[derive(Default)]
+    struct ProbeAck {
+        acks: AtomicUsize,
+        aborts: AtomicUsize,
+        fail_ack: AtomicBool,
+        fail_abort: AtomicBool,
+    }
+
+    #[async_trait]
+    impl Ack for ProbeAck {
+        async fn ack(&self) -> Result<(), Error> {
+            if self.fail_ack.load(Ordering::SeqCst) {
+                return Err(Error::Process("ack failed".into()));
+            }
+            self.acks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            if self.fail_abort.load(Ordering::SeqCst) {
+                return Err(Error::Process("abort failed".into()));
+            }
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    enum SourceStep {
+        Batch(crate::MessageBatchRef, Arc<dyn Ack>),
+        Disconnection,
+    }
+
+    /// A source whose `read` sequence and `connect` outcome are scripted.
+    struct ScriptSource {
+        steps: Mutex<VecDeque<SourceStep>>,
+        connect_fails: bool,
+    }
+
+    impl ScriptSource {
+        fn with_steps(steps: Vec<SourceStep>) -> Arc<Self> {
+            Arc::new(Self {
+                steps: Mutex::new(steps.into_iter().collect()),
+                connect_fails: true,
+            })
+        }
+
+        fn idle() -> Arc<Self> {
+            Self::with_steps(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl crate::input::Input for ScriptSource {
+        async fn connect(&self) -> Result<(), Error> {
+            if self.connect_fails {
+                Err(Error::Connection("scripted connect failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn Ack>), Error> {
+            let step = self.steps.lock().unwrap().pop_front();
+            match step {
+                Some(SourceStep::Batch(batch, ack)) => Ok((batch, ack)),
+                Some(SourceStep::Disconnection) => Err(Error::Disconnection),
+                None => std::future::pending().await,
+            }
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Processor returning `Deferred`: the acknowledgement stays unsettled,
+    /// which keeps a barrier's acknowledgement drain permanently blocking.
+    struct RetainAckProcessor {
+        seen: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Processor for RetainAckProcessor {
+        async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            Ok(ProcessResult::Deferred)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Processor returning `None` (a filter), optionally failing `close`.
+    struct NoneProcessor {
+        close_fails: bool,
+    }
+
+    #[async_trait]
+    impl Processor for NoneProcessor {
+        async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::None)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            if self.close_fails {
+                Err(Error::Process("close failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Processor that blocks the delivery whose `ts` column matches
+    /// `gate_ts` on an externally held gate. Results are keyed by the same
+    /// match, so which worker claims which sequence stays irrelevant.
+    struct GatedScriptProcessor {
+        gate: Arc<tokio::sync::Mutex<()>>,
+        gate_ts: i64,
+        gated: Mutex<Option<Result<ProcessResult, Error>>>,
+        other: Mutex<Option<Result<ProcessResult, Error>>>,
+    }
+
+    impl GatedScriptProcessor {
+        fn new(
+            gate: Arc<tokio::sync::Mutex<()>>,
+            gate_ts: i64,
+            gated: Option<Result<ProcessResult, Error>>,
+            other: Option<Result<ProcessResult, Error>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                gate,
+                gate_ts,
+                gated: Mutex::new(gated),
+                other: Mutex::new(other),
+            })
+        }
+
+        /// Every delivery forwards its batch unchanged (the empty slots fall
+        /// back to `Single(batch)`); only `gate_ts` blocks.
+        fn passthrough(gate: Arc<tokio::sync::Mutex<()>>, gate_ts: i64) -> Arc<Self> {
+            Self::new(gate, gate_ts, None, None)
+        }
+
+        fn is_gated(&self, batch: &crate::MessageBatchRef) -> bool {
+            let column = batch
+                .record_batch()
+                .column_by_name("ts")
+                .and_then(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                })
+                .expect("gated batches carry an int64 ts column");
+            column.value(0) == self.gate_ts
+        }
+    }
+
+    #[async_trait]
+    impl Processor for GatedScriptProcessor {
+        async fn process(&self, batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            let gated = self.is_gated(&batch);
+            if gated {
+                let _held = self.gate.lock().await;
+            }
+            let slot = if gated { &self.gated } else { &self.other };
+            match slot.lock().unwrap().take() {
+                Some(result) => result,
+                None => Ok(ProcessResult::Single(batch)),
+            }
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct FailingProcessor;
+
+    #[async_trait]
+    impl Processor for FailingProcessor {
+        async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            Err(Error::Process("injected processor failure".into()))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// A sink that accepts every write.
+    struct NullOutput;
+
+    #[async_trait]
+    impl crate::output::Output for NullOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: crate::MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn ts_batch(value: i64) -> crate::MessageBatchRef {
+        Arc::new(crate::MessageBatch::new_arrow(RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+        )
+        .unwrap()))
+    }
+
+    fn event_time_spec() -> TimeSpec {
+        TimeSpec {
+            mode: TimeMode::EventTime,
+            timestamp_field: Some("ts".into()),
+            watermark: Some(WatermarkSpec {
+                strategy: WatermarkStrategy::BoundedOutOfOrderness,
+                out_of_orderness_ms: 100,
+                idle_timeout_ms: Some(1_000),
+            }),
+            allowed_lateness_ms: 100,
+            late_event_policy: LateEventPolicy::Update,
+            late_event_route: None,
+        }
+    }
+
+    fn barrier(id: &str, generation: u64) -> Envelope {
+        Envelope::Barrier(crate::checkpoint::CheckpointBarrier {
+            checkpoint_id: id.into(),
+            generation,
+            trace_context: None,
+        })
+    }
+
+    /// Build an interior chain with `inputs` inbound channels.
+    fn interior_chain(
+        parallelism: usize,
+        processors: Vec<Arc<dyn Processor>>,
+        inputs: usize,
+    ) -> (Chain, Vec<flume::Sender<Envelope>>) {
+        let mut chain = Chain::for_pool_test(parallelism, processors);
+        chain.task_ids = vec!["m".into()];
+        let mut senders = Vec::with_capacity(inputs);
+        for _ in 0..inputs {
+            let (tx, rx) = flume::bounded::<Envelope>(8192);
+            chain.inputs.push(rx);
+            senders.push(tx);
+        }
+        (chain, senders)
+    }
+
+    async fn settle(task: tokio::task::JoinHandle<Result<(), Error>>) -> Result<(), Error> {
+        tokio::time::timeout(BUDGET, task)
+            .await
+            .expect("chain settles within timeout")
+            .expect("chain task must not panic")
+    }
+
+    // ---------- source loop: barrier drain timeout ----------
+
+    /// A checkpoint barrier whose in-flight (non-held) acknowledgements never
+    /// drain must abort the round through the bounded timeout instead of
+    /// parking the source forever. Paused time walks the real 30-second bound
+    /// instantly.
+    #[tokio::test(start_paused = true)]
+    async fn barrier_drain_timeout_aborts_the_round_and_reports() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let mut chain = Chain::for_pool_test(1, vec![Arc::new(RetainAckProcessor {
+            seen: seen.clone(),
+        })]);
+        chain.task_ids = vec!["src".into()];
+        let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
+        let (fail_tx, mut fail_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = CheckpointHook {
+            failure_reporter: Some(fail_tx),
+            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+            ..Default::default()
+        };
+        let source = ScriptSource::with_steps(vec![SourceStep::Batch(
+            ts_batch(1_000),
+            Arc::new(ProbeAck::default()),
+        )]);
+        chain.source = Some(source);
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_chain(chain, hook, token.clone()));
+        // The delivery must be dispatched (and retained by the Deferred
+        // processor) before the barrier arrives, so the drain is blocking.
+        tokio::time::timeout(BUDGET, async {
+            while seen.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the batch is dispatched before the barrier");
+        barrier_tx
+            .send_async(barrier("c-1", 1))
+            .await
+            .expect("barrier queued");
+        let report = tokio::time::timeout(4 * BUDGET, fail_rx.recv())
+            .await
+            .expect("the drain timeout reports a checkpoint failure")
+            .expect("reporter alive");
+        assert!(
+            report.to_string().contains("drain timed out with 1 acknowledgements"),
+            "{report}"
+        );
+        token.cancel();
+        let result = settle(task).await;
+        assert!(result.is_ok(), "an aborted round must not fail the chain: {result:?}");
+    }
+
+    // ---------- source loop: cancellation during reconnect backoff ----------
+
+    /// Cancelling the chain while a failed reconnect sleeps in its backoff
+    /// must take the clean shutdown path, not wait out the five-second sleep.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_reconnect_backoff_shuts_the_source_down() {
+        let mut chain = Chain::for_pool_test(1, vec![]);
+        chain.task_ids = vec!["src".into()];
+        chain.source = Some(ScriptSource::with_steps(vec![SourceStep::Disconnection]));
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_chain(chain, CheckpointHook::default(), token.clone()));
+        // Let the chain park inside the reconnect backoff sleep, then cancel
+        // well before the (fake) five-second timer can fire.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        token.cancel();
+        let result = settle(task).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    // ---------- source loop: event-time gate failures ----------
+
+    fn poisoned_gate() -> (
+        Arc<std::sync::Mutex<WatermarkTracker>>,
+        EventTimeGate,
+    ) {
+        let tracker = Arc::new(std::sync::Mutex::new(
+            WatermarkTracker::from_time_spec(&event_time_spec()).unwrap(),
+        ));
+        let gate = EventTimeGate::new_with_shared_tracker(
+            &event_time_spec(),
+            vec![WindowTiming::Tumbling { size_ms: 1_000 }],
+            tracker.clone(),
+        )
+        .unwrap();
+        let poison = tracker.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison the shared watermark tracker");
+        }));
+        (tracker, gate)
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_event_time_tracker_fails_the_source_chain_at_the_idle_tick() {
+        let (_tracker, gate) = poisoned_gate();
+        let mut chain = Chain::for_pool_test(1, vec![]);
+        chain.task_ids = vec!["src".into()];
+        chain.source_time = Some(event_time_spec());
+        chain.source = Some(ScriptSource::idle());
+        let hook = CheckpointHook {
+            event_time_gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+            partition: Some(0),
+            ..Default::default()
+        };
+        let error = settle(tokio::spawn(run_chain(chain, hook, CancellationToken::new())))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("tracker lock is poisoned"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_gate_flush_failure_during_cancellation_is_tolerated() {
+        let (_tracker, gate) = poisoned_gate();
+        let mut chain = Chain::for_pool_test(1, vec![]);
+        chain.task_ids = vec!["src".into()];
+        chain.source_time = Some(event_time_spec());
+        chain.source = Some(ScriptSource::idle());
+        let hook = CheckpointHook {
+            event_time_gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = settle(tokio::spawn(run_chain(chain, hook, token))).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// Held gate rows flushed during cancellation whose dispatch fails are
+    /// discarded (debug-logged), never surfaced as a chain failure.
+    #[tokio::test]
+    async fn held_rows_flushed_during_cancellation_ignore_dispatch_failures() {
+        let mut gate =
+            EventTimeGate::new(&event_time_spec(), vec![WindowTiming::Tumbling {
+                size_ms: 60_000,
+            }])
+            .unwrap();
+        let probe = Arc::new(ProbeAck::default());
+        gate.observe_with_ack(0, ts_batch(1_000), probe.clone())
+            .unwrap();
+        assert!(gate.has_held(), "the row must be held by its open window");
+        let mut chain = Chain::for_pool_test(1, vec![Arc::new(FailingProcessor)]);
+        chain.task_ids = vec!["src".into()];
+        chain.source_time = Some(event_time_spec());
+        chain.source = Some(ScriptSource::idle());
+        let hook = CheckpointHook {
+            event_time_gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = settle(tokio::spawn(run_chain(chain, hook, token))).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(probe.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn aborting_held_gate_acknowledgements_reports_the_first_failure() {
+        let mut gate =
+            EventTimeGate::new(&event_time_spec(), vec![WindowTiming::Tumbling {
+                size_ms: 60_000,
+            }])
+            .unwrap();
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_abort.store(true, Ordering::SeqCst);
+        gate.observe_with_ack(0, ts_batch(1_000), probe.clone())
+            .unwrap();
+        let hook = CheckpointHook {
+            event_time_gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+            ..Default::default()
+        };
+        let error = abort_event_time_held(&hook).await.unwrap_err();
+        assert!(error.to_string().contains("abort failed"), "{error}");
+    }
+
+    // ---------- interior loop: worker pool supervision ----------
+
+    /// A fatal worker failure (acknowledgement failure on a consumed batch)
+    /// surfaces through the chain's failure arm, and the pool's cleanup error
+    /// (drain observes the recorded failure flag) is reported through the
+    /// bounded flush fence first.
+    #[tokio::test(start_paused = true)]
+    async fn a_fatal_worker_failure_fails_the_idle_tick_fence_and_the_chain() {
+        let (chain, senders) =
+            interior_chain(2, vec![Arc::new(NoneProcessor { close_fails: false })], 1);
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_ack.store(true, Ordering::SeqCst);
+        senders[0]
+            .send_async(Envelope::Data(ts_batch(1), probe.clone()))
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_chain(chain, CheckpointHook::default(), token));
+        let error = settle(task).await.unwrap_err();
+        assert!(
+            error.to_string().contains("failed before control fence")
+                || error.to_string().contains("ack failed"),
+            "the fatal failure must fail the chain: {error}"
+        );
+        assert!(probe.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// Cancellation while a worker sits on a gated delivery: the shutdown
+    /// path's `cancel_and_join` observes the fatal failure recorded just
+    /// before the worker exits, and the queued-but-unsubmitted delivery's
+    /// failing abort is only debug-logged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_with_a_wedged_pool_tolerates_cleanup_failures() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = gate.clone().lock_owned().await;
+        let processor = GatedScriptProcessor::new(
+            gate,
+            1,
+            Some(Ok(ProcessResult::None)),
+            Some(Ok(ProcessResult::None)),
+        );
+        let (chain, mut senders) = interior_chain(2, vec![processor], 1);
+        let wedged = Arc::new(ProbeAck::default());
+        wedged.fail_ack.store(true, Ordering::SeqCst);
+        senders[0]
+            .send_async(Envelope::Data(ts_batch(1), wedged.clone()))
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_chain(chain, CheckpointHook::default(), token.clone()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Close the inputs first so the shutdown drain of queued envelopes
+        // terminates; the wedged worker is then released into a fatal
+        // acknowledgement failure whose cleanup error must be tolerated.
+        drop(senders.swap_remove(0));
+        token.cancel();
+        drop(held);
+        let result = settle(task).await;
+        assert!(result.is_ok(), "cleanup failures must not fail shutdown: {result:?}");
+    }
+
+    /// Shutdown with envelopes still queued on the inbound channels: each is
+    /// aborted (not acknowledged), and a failing abort is only debug-logged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_envelopes_are_aborted_on_cancellation() {
+        let (chain, mut senders) = interior_chain(1, vec![], 1);
+        let queued = Arc::new(ProbeAck::default());
+        queued.fail_abort.store(true, Ordering::SeqCst);
+        senders[0]
+            .send_async(Envelope::Data(ts_batch(1), queued.clone()))
+            .await
+            .unwrap();
+        drop(senders.swap_remove(0));
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = settle(tokio::spawn(run_chain(
+            chain,
+            CheckpointHook::default(),
+            token,
+        )))
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// End of stream on a pooled chain drains the worker pool in order: the
+    /// collector sees its result channel disconnect and flushes whatever is
+    /// left before the terminal EOS flows downstream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_close_eos_drains_the_pool_in_order_and_finishes() {
+        let (tx, rx) = flume::bounded::<Envelope>(64);
+        let (mut chain, mut senders) = interior_chain(
+            2,
+            vec![GatedScriptProcessor::passthrough(
+                Arc::new(tokio::sync::Mutex::new(())),
+                1,
+            )],
+            1,
+        );
+        chain
+            .outputs
+            .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
+        let first = Arc::new(ProbeAck::default());
+        let second = Arc::new(ProbeAck::default());
+        senders[0]
+            .send_async(Envelope::Data(ts_batch(1), first.clone()))
+            .await
+            .unwrap();
+        senders[0]
+            .send_async(Envelope::Data(ts_batch(2), second.clone()))
+            .await
+            .unwrap();
+        drop(senders.swap_remove(0));
+        let result = settle(tokio::spawn(run_chain(
+            chain,
+            CheckpointHook::default(),
+            CancellationToken::new(),
+        )))
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Data(_, _))));
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Data(_, _))));
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Eos)));
+        // The source acknowledgements settle only when the downstream
+        // consumer acknowledges its fan-out branches, which this test does
+        // not model.
+        drop((first, second));
+    }
+
+    /// The collector's shutdown join is bounded: a collector stuck flushing
+    /// into a full, unwatched edge must fail the chain after the bound
+    /// instead of parking the EOS path forever. Paused time exercises the
+    /// real 30-second bound instantly.
+    #[tokio::test(start_paused = true)]
+    async fn a_collector_stuck_on_a_full_edge_fails_the_drain_within_its_bound() {
+        let (tx, _undrained_rx) = flume::bounded::<Envelope>(1);
+        let (mut chain, mut senders) = interior_chain(
+            2,
+            vec![GatedScriptProcessor::passthrough(
+                Arc::new(tokio::sync::Mutex::new(())),
+                1,
+            )],
+            1,
+        );
+        chain
+            .outputs
+            .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
+        for value in 1..=3 {
+            senders[0]
+                .send_async(Envelope::Data(
+                    ts_batch(value),
+                    Arc::new(ProbeAck::default()),
+                ))
+                .await
+                .unwrap();
+        }
+        drop(senders.swap_remove(0));
+        let error = tokio::time::timeout(
+            4 * BUDGET,
+            run_chain(chain, CheckpointHook::default(), CancellationToken::new()),
+        )
+        .await
+        .expect("the bounded drain fails the chain")
+        .unwrap_err();
+        // Either bound proves the contract: the collector's join times out
+        // when the EOS drain reached it first, or the control fence times
+        // out when the idle tick fenced the stuck pool first.
+        assert!(
+            error.to_string().contains("did not finish draining within 30s")
+                || error.to_string().contains("did not publish delivery"),
+            "{error}"
+        );
+    }
+
+    /// Workers publishing into a collector that already exited (cancellation)
+    /// settle their results through the abort path; a processor failure is
+    /// aborted exactly like ordinary output.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_collector_aborts_a_pending_processor_failure() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = gate.clone().lock_owned().await;
+        let failure = || Error::Process("pooled operator failure".into());
+        let processor = GatedScriptProcessor::new(
+            gate.clone(),
+            1,
+            Some(Err(failure())),
+            Some(Err(failure())),
+        );
+        let (chain, _senders) = interior_chain(2, vec![processor], 1);
+        let token = CancellationToken::new();
+        let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
+            .expect("pooled chain");
+        let first = Arc::new(ProbeAck::default());
+        let second = Arc::new(ProbeAck::default());
+        pool.submit((ts_batch(1), first.clone())).await.unwrap();
+        pool.submit((ts_batch(2), second.clone())).await.unwrap();
+        // Sequence 1 fails fast and parks in the collector's reorder buffer
+        // (sequence 0 is still gated); cancellation then aborts it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        token.cancel();
+        // Let the collector observe cancellation (aborting the buffered
+        // sequence) before the gated sequence publishes into the void.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held);
+        pool.cancel_and_join()
+            .await
+            .expect("cancellation drains the pool");
+        assert!(first.aborts.load(Ordering::SeqCst) >= 1);
+        assert!(second.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_collector_aborts_pending_outputs() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = gate.clone().lock_owned().await;
+        let processor = GatedScriptProcessor::passthrough(gate, 1);
+        let (chain, _senders) = interior_chain(2, vec![processor], 1);
+        let token = CancellationToken::new();
+        let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
+            .expect("pooled chain");
+        let first = Arc::new(ProbeAck::default());
+        let second = Arc::new(ProbeAck::default());
+        pool.submit((ts_batch(1), first.clone())).await.unwrap();
+        pool.submit((ts_batch(2), second.clone())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        token.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held);
+        pool.cancel_and_join()
+            .await
+            .expect("cancellation drains the pool");
+        assert!(first.aborts.load(Ordering::SeqCst) >= 1);
+        assert!(second.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// A fatal worker failure surfaces through the chain loop's failure arm:
+    /// the loop consumes the failure report, and the cleanup drain then sees
+    /// only the recorded failure flag (the message itself is spent).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fatal_worker_failure_surfaces_through_the_failure_arm() {
+        let (chain, mut senders) =
+            interior_chain(2, vec![Arc::new(NoneProcessor { close_fails: false })], 1);
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_ack.store(true, Ordering::SeqCst);
+        senders[0]
+            .send_async(Envelope::Data(ts_batch(1), probe.clone()))
+            .await
+            .unwrap();
+        drop(senders.swap_remove(0));
+        let error = settle(tokio::spawn(run_chain(
+            chain,
+            CheckpointHook::default(),
+            CancellationToken::new(),
+        )))
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("ack failed"),
+            "the fatal failure must propagate through the failure arm: {error}"
+        );
+        assert!(probe.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// Deliveries still queued when the pool is cancelled are aborted by the
+    /// drain instead of leaking their acknowledgements.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_pool_deliveries_are_aborted_by_the_drain() {
+        let processor = GatedScriptProcessor::passthrough(
+            Arc::new(tokio::sync::Mutex::new(())),
+            1,
+        );
+        let (chain, _senders) = interior_chain(2, vec![processor], 1);
+        let token = CancellationToken::new();
+        let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
+            .expect("pooled chain");
+        // Cancel first: the workers exit without claiming, so the submitted
+        // delivery stays in the work queue for the drain to abort.
+        token.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let queued = Arc::new(ProbeAck::default());
+        pool.submit((ts_batch(1), queued.clone())).await.unwrap();
+        pool.cancel_and_join()
+            .await
+            .expect("the drained pool reports no failure");
+        assert!(queued.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// The control fence reports a pool that already recorded a fatal failure
+    /// instead of waiting for its publication deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_control_fence_reports_an_already_failed_pool() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = gate.clone().lock_owned().await;
+        let processor = GatedScriptProcessor::new(
+            gate,
+            1,
+            Some(Ok(ProcessResult::None)),
+            Some(Ok(ProcessResult::None)),
+        );
+        let (chain, _senders) = interior_chain(2, vec![processor], 1);
+        let token = CancellationToken::new();
+        let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
+            .expect("pooled chain");
+        let probe = Arc::new(ProbeAck::default());
+        probe.fail_ack.store(true, Ordering::SeqCst);
+        pool.submit((ts_batch(1), probe.clone())).await.unwrap();
+        drop(held);
+        tokio::time::timeout(BUDGET, async {
+            while !pool.failed.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pool records the fatal failure");
+        let error = pool.flush().await.unwrap_err();
+        assert!(
+            error.to_string().contains("failed before control fence"),
+            "{error}"
+        );
+        token.cancel();
+        let _ = pool.cancel_and_join().await;
+    }
+
+    // ---------- interior loop: watermark late-row surfacing ----------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn window_late_row_counters_surface_into_the_kernel_metrics() {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (mut chain, mut senders) = interior_chain(1, vec![], 1);
+        chain.window_late_event_rows = Some(counter.clone());
+        let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+        let hook = CheckpointHook {
+            metrics: Some(metrics.clone()),
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_chain(chain, hook, token));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        counter.store(7, Ordering::SeqCst);
+        tokio::time::timeout(BUDGET, async {
+            while metrics.kernel.late_events.load(Ordering::SeqCst) < 7 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the delta surfaces through the idle tick");
+        drop(senders.swap_remove(0));
+        let result = settle(task).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    // ---------- interior loop: alignment ----------
+
+    /// A channel that closes while another input still aligns a barrier lets
+    /// the EOS complete the alignment; a released buffer that ends every
+    /// input finishes the chain through the ordered EOS path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_inputs_complete_alignment_and_finish_the_chain() {
+        let (tx, rx) = flume::bounded::<Envelope>(64);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (mut chain, mut senders) = interior_chain(
+            2,
+            vec![Arc::new(RetainAckProcessor {
+                seen: seen.clone(),
+            })],
+            2,
+        );
+        chain
+            .outputs
+            .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_chain(chain, CheckpointHook::default(), token));
+        // Input 0: one data envelope, then the barrier, then the producer
+        // drops; input 1 closes without a barrier. The data envelope's
+        // processing is the deterministic ordering signal.
+        senders[0]
+            .send_async(Envelope::Data(ts_batch(1), probe()))
+            .await
+            .unwrap();
+        tokio::time::timeout(BUDGET, async {
+            while seen.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pre-barrier data is processed first");
+        senders[0].send_async(barrier("c-2", 2)).await.unwrap();
+        drop(senders.swap_remove(0));
+        // Input 0's channel-close surfaces as an EOS buffered behind the
+        // in-flight barrier; input 1's close then completes the alignment and
+        // the released EOS pair ends the chain.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(senders.pop().unwrap());
+        let result = settle(task).await;
+        assert!(result.is_ok(), "{result:?}");
+        let mut saw_barrier = false;
+        while let Ok(envelope) = rx.try_recv() {
+            if matches!(envelope, Envelope::Barrier(_)) {
+                saw_barrier = true;
+            }
+        }
+        assert!(saw_barrier, "the aligned barrier must be forwarded");
+    }
+
+    /// Exceeding the alignment bound fails the round through the failure
+    /// reporter, flushes the pool, and releases the buffered envelopes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alignment_overflow_fails_the_round_and_releases_the_buffer() {
+        let (tx, rx) = flume::bounded::<Envelope>(8192);
+        let (mut chain, mut senders) = interior_chain(
+            2,
+            vec![GatedScriptProcessor::passthrough(
+                Arc::new(tokio::sync::Mutex::new(())),
+                1,
+            )],
+            2,
+        );
+        chain
+            .outputs
+            .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
+        let (fail_tx, mut fail_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = CheckpointHook {
+            failure_reporter: Some(fail_tx),
+            ..Default::default()
+        };
+        // Input 1 aligns a barrier; input 0 floods enough data to exceed the
+        // 1024-envelope bound regardless of the reader interleaving.
+        senders[1].send_async(barrier("c-3", 3)).await.unwrap();
+        for value in 0..1_100 {
+            senders[0]
+                .send_async(Envelope::Data(
+                    ts_batch(value),
+                    Arc::new(ProbeAck::default()),
+                ))
+                .await
+                .unwrap();
+        }
+        let task = tokio::spawn(run_chain(chain, hook, CancellationToken::new()));
+        let report = tokio::time::timeout(BUDGET, fail_rx.recv())
+            .await
+            .expect("the overflow reports a checkpoint failure")
+            .expect("reporter alive");
+        assert!(
+            report.to_string().contains("exceeded the"),
+            "{report}"
+        );
+        drop(senders.swap_remove(0));
+        drop(senders.pop().unwrap());
+        let result = settle(task).await;
+        assert!(result.is_ok(), "{result:?}");
+        let mut datas = 0;
+        while let Ok(envelope) = rx.try_recv() {
+            if matches!(envelope, Envelope::Data(_, _)) {
+                datas += 1;
+            }
+        }
+        assert!(datas >= 1_000, "released envelopes must flow: {datas}");
+    }
+
+    // ---------- dispatch helpers ----------
+
+    fn probe() -> Arc<ProbeAck> {
+        Arc::new(ProbeAck::default())
+    }
+
+    fn ready_slice(action: crate::event_time::WindowAction) -> (crate::MessageBatchRef, crate::event_time::WindowAction) {
+        (ts_batch(1), action)
+    }
+
+    fn session_chain(processor: Arc<dyn Processor>) -> Chain {
+        let mut chain = Chain::for_pool_test(1, vec![processor]);
+        chain.task_ids = vec!["m".into()];
+        chain.window_timings = vec![WindowTiming::Session { gap_ms: 100 }];
+        chain
+    }
+
+    #[tokio::test]
+    async fn dynamic_sessions_forward_the_watermark_before_the_current_slice() {
+        let (tx, rx) = flume::bounded::<Envelope>(8);
+        let mut chain = session_chain(Arc::new(NoneProcessor { close_fails: false }));
+        chain
+            .outputs
+            .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
+        dispatch_gate_outputs(
+            &chain,
+            &CheckpointHook::default(),
+            vec![ready_slice(crate::event_time::WindowAction::Emit)],
+            vec![probe()],
+            vec![false],
+            vec![],
+            Some(1_000),
+            0,
+            true,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Watermark(1_000))));
+
+        // The same insertion on a closed edge fails the whole dispatch and
+        // aborts every acknowledgement it still owns.
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        let mut chain = session_chain(Arc::new(FailingProcessor));
+        chain
+            .outputs
+            .insert("m".into(), vec![EdgeTarget::Forward(dead_tx)]);
+        let ack = probe();
+        let error = dispatch_gate_outputs(
+            &chain,
+            &CheckpointHook::default(),
+            vec![ready_slice(crate::event_time::WindowAction::Emit)],
+            vec![ack.clone()],
+            vec![false],
+            vec![],
+            Some(1_000),
+            0,
+            true,
+            Some(0),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("downstream channel closed"),
+            "{error}"
+        );
+        assert!(ack.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn dynamic_sessions_append_the_tail_watermark_past_the_last_slice() {
+        let (tx, rx) = flume::bounded::<Envelope>(8);
+        let mut chain = session_chain(Arc::new(NoneProcessor { close_fails: false }));
+        chain
+            .outputs
+            .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
+        dispatch_gate_outputs(
+            &chain,
+            &CheckpointHook::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some(2_000),
+            0,
+            true,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Watermark(2_000))));
+
+        let (dead_tx, dead_rx) = flume::bounded::<Envelope>(1);
+        drop(dead_rx);
+        let mut chain = session_chain(Arc::new(FailingProcessor));
+        chain
+            .outputs
+            .insert("m".into(), vec![EdgeTarget::Forward(dead_tx)]);
+        let error = dispatch_gate_outputs(
+            &chain,
+            &CheckpointHook::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some(2_000),
+            0,
+            true,
+            Some(0),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("downstream channel closed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_gated_slice_compensates_published_and_dropped_acknowledgements() {
+        let chain = session_chain(Arc::new(FailingProcessor));
+        let ready = probe();
+        let dropped = probe();
+        let error = dispatch_gate_outputs(
+            &chain,
+            &CheckpointHook::default(),
+            vec![ready_slice(crate::event_time::WindowAction::Emit)],
+            vec![ready.clone()],
+            vec![false],
+            vec![dropped.clone()],
+            None,
+            0,
+            true,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("injected processor failure"),
+            "{error}"
+        );
+        assert!(ready.aborts.load(Ordering::SeqCst) >= 1);
+        assert!(dropped.aborts.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn barrier_spans_parent_onto_a_remote_trace_context() {
+        let chain = interior_chain(1, vec![], 0).0;
+        let mut with_context = crate::checkpoint::CheckpointBarrier {
+            checkpoint_id: "c-9".into(),
+            generation: 9,
+            trace_context: Some(
+                "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".into(),
+            ),
+        };
+        let _span = barrier_span(&chain, &with_context);
+        with_context.trace_context = Some("garbage".into());
+        let _span = barrier_span(&chain, &with_context);
+        with_context.trace_context = None;
+        let _span = barrier_span(&chain, &with_context);
+    }
+
+    // ---------- process_chain / process_generated_batches arms ----------
+
+    fn simple_chain(processor: Arc<dyn Processor>) -> Chain {
+        let mut chain = Chain::for_pool_test(1, vec![processor]);
+        chain.task_ids = vec!["m".into()];
+        chain
+    }
+
+    #[tokio::test]
+    async fn an_empty_multiple_result_with_a_failing_ack_is_fatal() {
+        struct EmptyMultiple;
+        #[async_trait]
+        impl Processor for EmptyMultiple {
+            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+                Ok(ProcessResult::Multiple(Vec::new()))
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let chain = simple_chain(Arc::new(EmptyMultiple));
+        let ack = probe();
+        ack.fail_ack.store(true, Ordering::SeqCst);
+        let error = dispatch_data(&chain, ts_batch(1), ack.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ack failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_none_result_with_a_failing_ack_is_fatal() {
+        let chain = simple_chain(Arc::new(NoneProcessor { close_fails: false }));
+        let ack = probe();
+        ack.fail_ack.store(true, Ordering::SeqCst);
+        let error = dispatch_data(&chain, ts_batch(1), ack.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ack failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn multiple_with_ack_results_reuse_their_replacement_acknowledgements() {
+        struct Replacing;
+        #[async_trait]
+        impl Processor for Replacing {
+            async fn process(&self, batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+                let replacement = probe();
+                Ok(ProcessResult::MultipleWithAck(vec![(batch, replacement)]))
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let chain = simple_chain(Arc::new(Replacing));
+        dispatch_data(&chain, ts_batch(1), probe(), None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn processor_errors_bump_the_runtime_and_chain_metrics() {
+        let chain = simple_chain(Arc::new(FailingProcessor));
+        let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+        let error = dispatch_data(
+            &chain,
+            ts_batch(1),
+            probe(),
+            Some(&metrics),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("injected processor failure"),
+            "{error}"
+        );
+        assert_eq!(metrics.processing_errors.load(Ordering::SeqCst), 1);
+        let chain_metrics = metrics.kernel.chain("m");
+        assert_eq!(chain_metrics.errors.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_sink_acknowledgement_failure_after_a_successful_write_is_fatal() {
+        let mut chain = Chain::for_pool_test(1, vec![]);
+        chain.task_ids = vec!["m".into()];
+        chain.sink = Some(Arc::new(NullOutput));
+        let ack = probe();
+        ack.fail_ack.store(true, Ordering::SeqCst);
+        let error = dispatch_data(&chain, ts_batch(1), ack.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ack failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn generated_single_results_carry_their_acknowledgement_forward() {
+        struct SingleOnce {
+            used: AtomicBool,
+        }
+        #[async_trait]
+        impl Processor for SingleOnce {
+            async fn process(&self, batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+                assert!(!self.used.swap(true, Ordering::SeqCst));
+                Ok(ProcessResult::Single(batch))
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let processor: Arc<dyn Processor> = Arc::new(SingleOnce {
+            used: AtomicBool::new(false),
+        });
+        let ack = probe();
+        let outputs = process_generated_batches(&processor, vec![ProcessedBatch {
+            batch: ts_batch(1),
+            ack: ack.clone(),
+        }])
+        .await
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        outputs[0].ack.ack().await.unwrap();
+        assert_eq!(ack.acks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn process_chain_errors_convert_into_fatal_failures() {
+        let error = ProcessChainError::from(Error::Process("conversion".into()));
+        match error {
+            ProcessChainError::Fatal(failure) => {
+                assert!(failure.error.to_string().contains("conversion"));
+                assert!(failure.acknowledgements.is_empty());
+            }
+            ProcessChainError::Processor(_) => panic!("plain errors are fatal, not routed"),
+        }
+    }
+
+    // ---------- failure routing / compensation ----------
+
+    fn processor_failure_with(ack: Arc<dyn Ack>) -> ProcessorFailure {
+        ProcessorFailure {
+            error: Error::Process("operator failed".into()),
+            batch: ts_batch(1),
+            ack,
+            siblings: Vec::new(),
+            failed_task_id: "m".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_a_pooled_failure_with_a_failing_abort_reports_both() {
+        let chain = simple_chain(Arc::new(NoneProcessor { close_fails: false }));
+        let ack = probe();
+        ack.fail_abort.store(true, Ordering::SeqCst);
+        let error = flush_pool_result(
+            &chain,
+            PoolResult::ProcessorFailure(processor_failure_with(ack)),
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("operator failed")
+                && error.to_string().contains("acknowledgement abort failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_a_fatal_failure_with_a_failing_abort_reports_both() {
+        let ack = probe();
+        ack.fail_abort.store(true, Ordering::SeqCst);
+        let error = abort_fatal_failure(FatalFailure {
+            error: Error::Process("fatal".into()),
+            acknowledgements: vec![ack],
+        })
+        .await;
+        assert!(
+            error.to_string().contains("fatal")
+                && error.to_string().contains("acknowledgement abort failed"),
+            "{error}"
+        );
+    }
+
+    // ---------- edge routing ----------
+
+    #[tokio::test]
+    async fn partition_mismatch_errors_propagate_from_data_routing() {
+        let (tx0, _rx0) = flume::bounded::<Envelope>(1);
+        let (tx1, _rx1) = flume::bounded::<Envelope>(1);
+        let error = send_to_targets(
+            Some(&vec![EdgeTarget::Partitioned {
+                channels: vec![tx0, tx1],
+                key_field: "ts".into(),
+                key_group_ranges: vec![crate::job::KeyGroupRange { start: 0, end: 15 }],
+                max_parallelism: 16,
+            }]),
+            Envelope::Data(ts_batch(1), probe()),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("2 channels but 1 key-group ranges"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_channel_partitioned_edge_routes_without_hashing() {
+        let (tx, rx) = flume::bounded::<Envelope>(4);
+        let probe = Arc::new(ProbeAck::default());
+        send_to_targets(
+            Some(&vec![EdgeTarget::Partitioned {
+                channels: vec![tx],
+                key_field: "absent".into(),
+                key_group_ranges: vec![crate::job::KeyGroupRange { start: 0, end: 15 }],
+                max_parallelism: 16,
+            }]),
+            Envelope::Data(ts_batch(1), probe.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Envelope::Data(_, _))));
+    }
+
+    #[test]
+    fn routing_skips_subtasks_whose_key_group_range_is_empty() {
+        let batch = crate::MessageBatch::new_arrow(RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)])),
+            vec![Arc::new(datafusion::arrow::array::StringArray::from(
+                vec!["alpha"],
+            ))],
+        )
+        .unwrap());
+        // The second range covers no key group: its subtask is skipped.
+        let routed = partition_batch_by_key_hash(
+            &batch,
+            "key",
+            2,
+            &[
+                crate::job::KeyGroupRange { start: 0, end: 15 },
+                crate::job::KeyGroupRange { start: 1, end: 0 },
+            ],
+            16,
+        )
+        .unwrap();
+        assert!(routed[0].is_some());
+        assert!(routed[1].is_none());
+    }
+
+    #[test]
+    fn hash_column_covers_the_remaining_null_sentinels() {
+        let max_parallelism = 16u32;
+        let group = |bytes: &[u8]| crate::job::key_group_for_key(bytes, max_parallelism).unwrap();
+        let small_ints = hash_column(&Int8Array::from(vec![Some(1i8), None]), max_parallelism)
+            .unwrap();
+        assert_eq!(small_ints[0].unwrap(), group(&1i8.to_be_bytes()));
+        assert_eq!(small_ints[1].unwrap(), group(b"null:i8"));
+
+        let binaries = hash_column(
+            &BinaryArray::from_opt_vec(vec![Some(&b"b"[..]), None]),
+            max_parallelism,
+        )
+        .unwrap();
+        assert_eq!(binaries[0].unwrap(), group(b"b"));
+        assert_eq!(binaries[1].unwrap(), group(b"null:binary"));
+    }
 }

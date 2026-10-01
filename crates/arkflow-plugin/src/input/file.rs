@@ -506,3 +506,349 @@ fn default_disallow_http() -> bool {
 fn default_table() -> String {
     "flow".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::codec::{Decoder, Encoder};
+    use arkflow_core::input::Input;
+    use std::cell::RefCell;
+
+    fn resource() -> Resource {
+        Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Minimal codec to exercise the builder's codec-rejection branch.
+    struct NoopCodec;
+    #[async_trait::async_trait]
+    impl Encoder for NoopCodec {
+        async fn encode(&self, _: arkflow_core::MessageBatch) -> Result<Vec<arkflow_core::Bytes>, Error> {
+            Ok(Vec::new())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Decoder for NoopCodec {
+        async fn decode(&self, _: Vec<arkflow_core::Bytes>) -> Result<arkflow_core::MessageBatch, Error> {
+            unimplemented!("not needed for the rejection test")
+        }
+    }
+
+    fn build(input_type: Value) -> Result<Arc<dyn Input>, Error> {
+        let config = Some(serde_json::json!({ "input_type": input_type }));
+        FileBuilder.build(None, &config, None, &resource())
+    }
+
+    fn build_with_query(
+        input_type: Value,
+        query: Value,
+    ) -> Result<Arc<dyn Input>, Error> {
+        let config = Some(serde_json::json!({
+            "input_type": input_type,
+            "query": query,
+        }));
+        FileBuilder.build(None, &config, None, &resource())
+    }
+
+    #[tokio::test]
+    async fn csv_round_trip_reads_rows_until_eof() -> Result<(), Error> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.csv");
+        std::fs::write(&path, "id,name\n1,alpha\n2,beta\n").unwrap();
+        let input = build(serde_json::json!({
+            "type": "csv",
+            "path": path.to_str().unwrap(),
+        }))?;
+        input.connect().await?;
+        let mut rows = 0usize;
+        loop {
+            match input.read().await {
+                Ok((batch, _)) => rows += batch.num_rows(),
+                Err(Error::EOF) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        assert_eq!(rows, 2);
+        input.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn json_round_trip_with_sql_query() -> Result<(), Error> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.json");
+        std::fs::write(&path, "{\"v\": 10}\n{\"v\": 20}\n{\"v\": 30}\n").unwrap();
+        let input = build_with_query(
+            serde_json::json!({"type": "json", "path": path.to_str().unwrap()}),
+            serde_json::json!({
+                "query": "SELECT COUNT(*) AS c FROM flow WHERE v > 5",
+                "table": "flow",
+            }),
+        )?;
+        input.connect().await?;
+        let (batch, _) = input.read().await?;
+        assert_eq!(batch.num_rows(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parquet_round_trip_reads_written_file() -> Result<(), Error> {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::parquet::arrow::ArrowWriter as ParquetWriter;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+            .map_err(|e| Error::Process(e.to_string()))?;
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = ParquetWriter::try_new(file, batch.schema(), None)
+                .map_err(|e| Error::Process(e.to_string()))?;
+            writer.write(&batch).map_err(|e| Error::Process(e.to_string()))?;
+            writer.close().map_err(|e| Error::Process(e.to_string()))?;
+        }
+
+        let input = build(serde_json::json!({
+            "type": "parquet",
+            "path": path.to_str().unwrap(),
+        }))?;
+        input.connect().await?;
+        let (batch, _) = input.read().await?;
+        assert_eq!(batch.num_rows(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn arrow_round_trip_reads_ipc_file() -> Result<(), Error> {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::ipc::writer::FileWriter as IpcWriter;
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.arrow");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![9]))])
+            .map_err(|e| Error::Process(e.to_string()))?;
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = IpcWriter::try_new(file, schema.as_ref())
+                .map_err(|e| Error::Process(e.to_string()))?;
+            writer.write(&batch).map_err(|e| Error::Process(e.to_string()))?;
+            writer.finish().map_err(|e| Error::Process(e.to_string()))?;
+        }
+
+        let input = build(serde_json::json!({
+            "type": "arrow",
+            "path": path.to_str().unwrap(),
+        }))?;
+        input.connect().await?;
+        let (batch, _) = input.read().await?;
+        assert_eq!(batch.num_rows(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parquet_round_trip_with_sql_query() -> Result<(), Error> {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter as ParquetWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
+        )
+        .map_err(|e| Error::Process(e.to_string()))?;
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = ParquetWriter::try_new(file, batch.schema(), None)
+                .map_err(|e| Error::Process(e.to_string()))?;
+            writer.write(&batch).map_err(|e| Error::Process(e.to_string()))?;
+            writer.close().map_err(|e| Error::Process(e.to_string()))?;
+        }
+
+        let input = build_with_query(
+            serde_json::json!({"type": "parquet", "path": path.to_str().unwrap()}),
+            serde_json::json!({
+                "query": "SELECT SUM(v) AS total FROM flow WHERE v > 1",
+                "table": "flow",
+            }),
+        )?;
+        input.connect().await?;
+        let (batch, _) = input.read().await?;
+        assert_eq!(batch.num_rows(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn arrow_round_trip_with_sql_query() -> Result<(), Error> {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::ipc::writer::FileWriter as IpcWriter;
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.arrow");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![5, 6]))],
+        )
+        .map_err(|e| Error::Process(e.to_string()))?;
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = IpcWriter::try_new(file, schema.as_ref())
+                .map_err(|e| Error::Process(e.to_string()))?;
+            writer.write(&batch).map_err(|e| Error::Process(e.to_string()))?;
+            writer.finish().map_err(|e| Error::Process(e.to_string()))?;
+        }
+
+        let input = build_with_query(
+            serde_json::json!({"type": "arrow", "path": path.to_str().unwrap()}),
+            serde_json::json!({
+                "query": "SELECT COUNT(*) AS c FROM flow",
+                "table": "flow",
+            }),
+        )?;
+        input.connect().await?;
+        let (batch, _) = input.read().await?;
+        assert_eq!(batch.num_rows(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_file_fails_connect_with_process_error() {
+        let input = build(serde_json::json!({
+            "type": "csv",
+            "path": "/nonexistent/arkflow/missing.csv",
+        }))
+        .unwrap();
+        match input.connect().await {
+            Err(err) => assert!(err.to_string().contains("Read input failed"), "{err}"),
+            Ok(()) => panic!("reading a missing file must fail"),
+        }
+    }
+
+    #[tokio::test]
+    async fn avro_branch_reports_read_failure_for_missing_file() {
+        let input = build(serde_json::json!({
+            "type": "avro",
+            "path": "/nonexistent/arkflow/missing.avro",
+        }))
+        .unwrap();
+        match input.connect().await {
+            Err(err) => assert!(err.to_string().contains("Read input failed"), "{err}"),
+            Ok(()) => panic!("reading a missing file must fail"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_before_connect_and_close_then_eof() -> Result<(), Error> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.csv");
+        std::fs::write(&path, "id\n1\n").unwrap();
+        let input = build(serde_json::json!({
+            "type": "csv",
+            "path": path.to_str().unwrap(),
+        }))?;
+
+        match input.read().await {
+            Err(err) => assert!(err.to_string().contains("Stream is None"), "{err}"),
+            Ok(_) => panic!("read before connect must fail"),
+        }
+
+        input.connect().await?;
+        input.read().await?;
+        input.close().await?;
+        assert!(matches!(input.read().await, Err(Error::EOF)));
+        Ok(())
+    }
+
+    #[test]
+    fn builder_rejects_codec_and_bad_config() -> Result<(), Error> {
+        let Err(codec_rejected) = FileBuilder.build(
+            None,
+            &Some(serde_json::json!({"input_type": {"type": "csv", "path": "/tmp/x"}})),
+            Some(Arc::new(NoopCodec)),
+            &resource(),
+        ) else {
+            panic!("a codec must be rejected");
+        };
+        assert!(codec_rejected.to_string().contains("does not support a codec"), "{codec_rejected}");
+
+        let Err(bad_config) = FileBuilder.build(
+            None,
+            &Some(serde_json::json!({"unexpected": 1})),
+            None,
+            &resource(),
+        ) else {
+            panic!("a malformed config must be rejected");
+        };
+        assert!(!bad_config.to_string().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn object_store_registration_branches() -> Result<(), Error> {
+        let input = FileInput::new(
+            None,
+            serde_json::from_value(serde_json::json!({
+                "input_type": {"type": "csv", "path": "s3://does-not-matter/x.csv"}
+            }))?,
+        )?;
+        let ctx = datafusion::prelude::SessionContext::new();
+
+        // HTTP store registration is offline: only the URL shape is parsed.
+        let http = Store::Http(HttpConfig {
+            url: "https://example.invalid".into(),
+        });
+        input.object_store(&ctx, &http).unwrap();
+
+        // S3 with a missing region still builds a client (credentials are
+        // resolved lazily); a broken URL is rejected earlier by the builder.
+        let s3 = Store::S3(AwsS3Config {
+            endpoint: Some("http://127.0.0.1:1".into()),
+            region: Some("us-east-1".into()),
+            bucket_name: "bucket".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            allow_http: true,
+        });
+        input.object_store(&ctx, &s3).unwrap();
+
+        // GCS without credentials or an emulator env var refuses to build.
+        let gcs = Store::Gs(GoogleCloudStorageConfig {
+            bucket_name: "bucket".into(),
+            url: Some("http://127.0.0.1:1".into()),
+            service_account_path: None,
+            service_account_key: None,
+        });
+        match input.object_store(&ctx, &gcs) {
+            Err(err) => assert!(err.to_string().contains("GCS"), "{err}"),
+            Ok(()) => panic!("credential-less GCS must be rejected"),
+        }
+
+        // Azure with an explicit non-HTTPS endpoint is rejected by the builder.
+        let az = Store::Az(MicrosoftAzureConfig {
+            url: Some("http://127.0.0.1:1".into()),
+            endpoint: None,
+            account: "account".into(),
+            access_key: Some("key".into()),
+            container_name: "container".into(),
+        });
+        match input.object_store(&ctx, &az) {
+            Err(err) => assert!(err.to_string().to_lowercase().contains("azure"), "{err}"),
+            Ok(()) => panic!("azure with an http endpoint must be rejected"),
+        }
+        Ok(())
+    }
+}

@@ -581,4 +581,189 @@ mod tests {
         assert_eq!(metrics.watermark_lag_ms.load(Ordering::Relaxed), 25);
         assert_eq!(metrics.late_events_total(), 2);
     }
+
+    #[test]
+    fn records_update_metrics_and_ignores_on_time_actions() {
+        let metrics = EventTimeMetrics::default();
+        metrics.record_action(WindowAction::Update);
+        metrics.record_action(WindowAction::Hold);
+        metrics.record_action(WindowAction::Emit);
+        assert_eq!(metrics.late_events_total(), 1);
+        assert_eq!(metrics.late_events_updated.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.late_events_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.late_events_routed.load(Ordering::Relaxed), 0);
+        // A negative lag is clamped to zero instead of reporting progress.
+        metrics.record_watermark_lag(-7);
+        assert_eq!(metrics.watermark_lag_ms.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn with_source_identity_preserves_topics_and_namespaces_numeric_partitions() {
+        let connector = EventTimePartition::new(Some("orders".into()), 3);
+        let namespaced = connector.with_source_identity("edge-1");
+        assert_eq!(namespaced.topic.as_deref(), Some("orders"));
+        assert_eq!(namespaced.partition, 3);
+
+        let neutral = EventTimePartition::numeric(3).with_source_identity("edge-1");
+        assert_eq!(
+            neutral.topic.as_deref(),
+            Some("__arkflow_source__:edge-1"),
+            "connector-neutral partitions gain a stable source namespace"
+        );
+        assert_eq!(neutral.partition, 3);
+        // Two distinct sources never collide on the same numeric partition.
+        let other = EventTimePartition::numeric(3).with_source_identity("edge-2");
+        assert_ne!(neutral, other);
+    }
+
+    #[test]
+    fn tracker_requires_a_watermark_specification() {
+        let mut time = spec();
+        time.watermark = None;
+        let error = WatermarkTracker::from_time_spec(&time).unwrap_err();
+        assert!(error.to_string().contains("watermark"), "{error}");
+    }
+
+    #[test]
+    fn physical_partition_progress_is_queryable_per_key() {
+        let mut tracker = WatermarkTracker::from_time_spec(&spec()).unwrap();
+        let kafka = EventTimePartition::new(Some("topic-a".into()), 0);
+        tracker.observe_partition(&kafka, 5_000, 0);
+        let progress = tracker
+            .partition_progress_for(&kafka)
+            .expect("observed partition has progress");
+        assert_eq!(progress.watermark_ms, 4_900);
+        assert!(!progress.idle);
+        assert!(
+            tracker
+                .partition_progress_for(&EventTimePartition::new(Some("topic-b".into()), 0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn seeded_partitions_hold_the_watermark_at_minimum() {
+        let mut tracker = WatermarkTracker::from_time_spec(&spec()).unwrap();
+        tracker.seed_partitions(&[
+            EventTimePartition::numeric(0),
+            EventTimePartition::new(Some("topic".into()), 1),
+        ]);
+        // A silent seeded partition is active at MIN so a fast sibling cannot
+        // close a window before its first event arrives.
+        let topic_partition = EventTimePartition::new(Some("topic".into()), 1);
+        assert_eq!(
+            tracker.observe_partition(&topic_partition, 9_000, 0),
+            i64::MIN
+        );
+        assert!(tracker.partition_progress().contains_key(&0));
+        assert_eq!(
+            tracker
+                .partition_progress_for(&EventTimePartition::new(Some("topic".into()), 1))
+                .map(|progress| progress.watermark_ms),
+            Some(8_900)
+        );
+    }
+
+    #[test]
+    fn restored_partitions_reseed_the_compatibility_view() {
+        let mut tracker = WatermarkTracker::from_time_spec(&spec()).unwrap();
+        tracker.restore_partition(2, 5_000);
+        assert_eq!(
+            tracker
+                .partition_progress()
+                .get(&2)
+                .map(|progress| progress.watermark_ms),
+            Some(5_000)
+        );
+        tracker.restore_partition_key(&EventTimePartition::numeric(3), 7_000);
+        assert_eq!(
+            tracker
+                .partition_progress()
+                .get(&3)
+                .map(|progress| progress.watermark_ms),
+            Some(7_000)
+        );
+        // The global watermark is the minimum of the restored partitions.
+        assert_eq!(tracker.watermark(), Some(5_000));
+        // Marking a restored partition idle unblocks the frontier.
+        assert_eq!(tracker.mark_idle(2), Some(7_000));
+    }
+
+    #[test]
+    fn window_action_holds_without_watermark_and_for_future_rows() {
+        // No watermark yet: everything is held.
+        assert_eq!(
+            window_action(1_000, 900, None, 100, LateEventPolicy::Drop),
+            WindowAction::Hold
+        );
+        // The row belongs to a later window than the one being asked about:
+        // holding keeps it for that window instead of classifying it late.
+        assert_eq!(
+            window_action(1_000, 1_500, Some(500), 100, LateEventPolicy::Drop),
+            WindowAction::Hold
+        );
+    }
+
+    #[test]
+    fn window_action_applies_drop_policy_within_the_deadline() {
+        // Watermark 1_050 passed the window end but is still within the
+        // allowed lateness: the Drop policy discards the row immediately.
+        assert_eq!(
+            window_action(1_000, 900, Some(1_050), 100, LateEventPolicy::Drop),
+            WindowAction::Drop
+        );
+        assert_eq!(
+            window_action(1_000, 900, Some(1_050), 100, LateEventPolicy::Route),
+            WindowAction::Route
+        );
+    }
+
+    #[test]
+    fn field_extractor_returns_the_first_row_timestamp_or_actionable_errors() {
+        use datafusion::arrow::array::{Int64Array as PlainInt64, TimestampMillisecondArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use std::sync::Arc as StdArc;
+
+        fn batch_of(
+            name: &str,
+            data_type: DataType,
+            column: StdArc<dyn datafusion::arrow::array::Array>,
+        ) -> MessageBatch {
+            MessageBatch::new_arrow(
+                RecordBatch::try_new(
+                    StdArc::new(Schema::new(vec![Field::new(name, data_type, true)])),
+                    vec![column],
+                )
+                .unwrap(),
+            )
+        }
+
+        let extractor = FieldTimestampExtractor { field: "ts".into() };
+        let millis = batch_of(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            StdArc::new(TimestampMillisecondArray::from(vec![Some(1_234), Some(9)])),
+        );
+        // The trait method surfaces the FIRST row's timestamp.
+        assert_eq!(extractor.extract_timestamp_ms(&millis).unwrap(), 1_234);
+
+        // A null first row has no timestamp to offer.
+        let null_first = batch_of(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            StdArc::new(TimestampMillisecondArray::from(vec![Option::<i64>::None, Some(9)])),
+        );
+        let error = extractor.extract_timestamp_ms(&null_first).unwrap_err();
+        assert!(error.to_string().contains("no value"), "{error}");
+
+        // A missing field is a configuration error naming the field.
+        let missing = batch_of(
+            "other",
+            DataType::Int64,
+            StdArc::new(PlainInt64::from(vec![1])),
+        );
+        let error = extractor.extract_timestamp_ms(&missing).unwrap_err();
+        assert!(error.to_string().contains("'ts'"), "{error}");
+    }
 }

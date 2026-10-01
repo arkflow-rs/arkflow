@@ -1067,4 +1067,379 @@ mod tests {
         let output = SqlOutput::new(postgres_config(false, None)).unwrap();
         assert!(output.close().await.is_ok());
     }
+
+    // ---- SSL option parsing (no network needed) ----
+
+    fn ssl_config(mode: &str) -> SslConfig {
+        SslConfig {
+            ssl_mode: mode.to_string(),
+            root_cert: None,
+            client_cert: None,
+            client_key: None,
+        }
+    }
+
+    fn mysql_config(uri: &str) -> MysqlConfig {
+        MysqlConfig {
+            uri: uri.to_string(),
+            ssl: None,
+        }
+    }
+
+    fn pg_config(uri: &str) -> PostgresConfig {
+        PostgresConfig {
+            uri: uri.to_string(),
+            ssl: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mysql_ssl_modes_parse_case_insensitively() {
+        let config = mysql_config("mysql://root@127.0.0.1:3306/db");
+        for mode in [
+            "disable",
+            "prefer",
+            "require",
+            "verify_ca",
+            "verify_full",
+            "DISABLE",
+            "Prefer",
+            "VERIFY_CA",
+        ] {
+            let result = ssl_config(mode).generate_mysql_ssl_opts(&config).await;
+            assert!(result.is_ok(), "mysql ssl_mode '{mode}' must parse: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mysql_ssl_opts_reject_unknown_mode_and_bad_uri() {
+        let config = mysql_config("mysql://root@127.0.0.1:3306/db");
+        let err = ssl_config("bogus")
+            .generate_mysql_ssl_opts(&config)
+            .await
+            .expect_err("unknown ssl mode must be rejected");
+        assert!(format!("{err}").contains("Invalid SSL mode"), "{err}");
+
+        let bad_uri = mysql_config("not a mysql uri");
+        let err = ssl_config("disable")
+            .generate_mysql_ssl_opts(&bad_uri)
+            .await
+            .expect_err("malformed mysql uri must be rejected");
+        assert!(format!("{err}").contains("Invalid MySQL URI"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn postgres_ssl_modes_parse_case_insensitively() {
+        let config = pg_config("postgres://user:pass@127.0.0.1:5432/db");
+        for mode in [
+            "disable",
+            "prefer",
+            "require",
+            "verify_ca",
+            "verify_full",
+            "DISABLE",
+            "Prefer",
+            "VERIFY_CA",
+        ] {
+            let result = ssl_config(mode).generate_postgres_ssl_opts(&config).await;
+            assert!(
+                result.is_ok(),
+                "postgres ssl_mode '{mode}' must parse: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_ssl_opts_reject_unknown_mode_and_bad_uri() {
+        let config = pg_config("postgres://user:pass@127.0.0.1:5432/db");
+        let err = ssl_config("bogus")
+            .generate_postgres_ssl_opts(&config)
+            .await
+            .expect_err("unknown ssl mode must be rejected");
+        assert!(format!("{err}").contains("Invalid SSL mode"), "{err}");
+
+        let bad_uri = pg_config("not a pg uri");
+        let err = ssl_config("disable")
+            .generate_postgres_ssl_opts(&bad_uri)
+            .await
+            .expect_err("malformed postgres uri must be rejected");
+        assert!(format!("{err}").contains("Invalid PostgreSQL URI"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ssl_opts_accept_certificates_and_warn_on_half_configured_identity() {
+        // A full client identity, a lone root cert, and the two half-configured
+        // identities (cert without key / key without cert) all produce options;
+        // the halves only warn.
+        let mysql = mysql_config("mysql://root@127.0.0.1:3306/db");
+        let mut full = ssl_config("require");
+        full.root_cert = Some("/nonexistent/root.pem".to_string());
+        full.client_cert = Some("/nonexistent/client.pem".to_string());
+        full.client_key = Some("/nonexistent/client.key".to_string());
+        assert!(full.generate_mysql_ssl_opts(&mysql).await.is_ok());
+
+        let mut cert_only = ssl_config("require");
+        cert_only.client_cert = Some("/nonexistent/client.pem".to_string());
+        assert!(cert_only.generate_mysql_ssl_opts(&mysql).await.is_ok());
+
+        let mut key_only = ssl_config("require");
+        key_only.client_key = Some("/nonexistent/client.key".to_string());
+        assert!(key_only.generate_mysql_ssl_opts(&mysql).await.is_ok());
+
+        let postgres = pg_config("postgres://user:pass@127.0.0.1:5432/db");
+        let mut pg_full = ssl_config("require");
+        pg_full.root_cert = Some("/nonexistent/root.pem".to_string());
+        pg_full.client_cert = Some("/nonexistent/client.pem".to_string());
+        pg_full.client_key = Some("/nonexistent/client.key".to_string());
+        assert!(pg_full.generate_postgres_ssl_opts(&postgres).await.is_ok());
+
+        let mut pg_cert_only = ssl_config("require");
+        pg_cert_only.client_cert = Some("/nonexistent/client.pem".to_string());
+        assert!(pg_cert_only.generate_postgres_ssl_opts(&postgres).await.is_ok());
+
+        let mut pg_key_only = ssl_config("require");
+        pg_key_only.client_key = Some("/nonexistent/client.key".to_string());
+        assert!(pg_key_only.generate_postgres_ssl_opts(&postgres).await.is_ok());
+    }
+
+    // ---- connection failures against a guaranteed-closed local port ----
+
+    fn closed_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        port
+    }
+
+    #[tokio::test]
+    async fn mysql_connect_failure_surfaces_config_error() {
+        let config = SqlOutputConfig {
+            output_type: DatabaseType::Mysql(mysql_config(&format!(
+                "mysql://root@127.0.0.1:{}/db",
+                closed_port()
+            ))),
+            table_name: "events".to_string(),
+            upsert: false,
+            upsert_keys: None,
+        };
+        let output = SqlOutput::new(config).unwrap();
+        let err = output.connect().await.unwrap_err();
+        assert!(format!("{err}").contains("Failed to connect to MySQL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mysql_connect_failure_with_ssl_surfaces_ssl_error() {
+        let config = SqlOutputConfig {
+            output_type: DatabaseType::Mysql(MysqlConfig {
+                uri: format!("mysql://root@127.0.0.1:{}/db", closed_port()),
+                ssl: Some(ssl_config("disable")),
+            }),
+            table_name: "events".to_string(),
+            upsert: false,
+            upsert_keys: None,
+        };
+        let output = SqlOutput::new(config).unwrap();
+        let err = output.connect().await.unwrap_err();
+        assert!(
+            format!("{err}").contains("Failed to connect to MySQL with SSL"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_connect_failure_surfaces_config_error() {
+        let config = SqlOutputConfig {
+            output_type: DatabaseType::Postgres(pg_config(&format!(
+                "postgres://user:pass@127.0.0.1:{}/db",
+                closed_port()
+            ))),
+            table_name: "events".to_string(),
+            upsert: false,
+            upsert_keys: None,
+        };
+        let output = SqlOutput::new(config).unwrap();
+        let err = output.connect().await.unwrap_err();
+        assert!(
+            format!("{err}").contains("Failed to connect to PostgreSQL"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_connect_failure_with_ssl_surfaces_ssl_error() {
+        let config = SqlOutputConfig {
+            output_type: DatabaseType::Postgres(PostgresConfig {
+                uri: format!("postgres://user:pass@127.0.0.1:{}/db", closed_port()),
+                ssl: Some(ssl_config("disable")),
+            }),
+            table_name: "events".to_string(),
+            upsert: false,
+            upsert_keys: None,
+        };
+        let output = SqlOutput::new(config).unwrap();
+        let err = output.connect().await.unwrap_err();
+        assert!(
+            format!("{err}")
+                .contains("Failed to connect to PostgreSQL with SSL"),
+            "{err}"
+        );
+    }
+
+    // ---- write paths before connect ----
+
+    fn typed_batch() -> MessageBatchRef {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = datafusion::arrow::array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some("a")])),
+            ],
+        )
+        .unwrap();
+        Arc::new(MessageBatch::new_arrow(batch))
+    }
+
+    #[tokio::test]
+    async fn write_and_write_batch_before_connect_report_disconnection() {
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        let err = output.write(typed_batch()).await.unwrap_err();
+        assert!(matches!(err, Error::Disconnection), "{err:?}");
+        let err = output
+            .write_batch(&[typed_batch()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Disconnection), "{err:?}");
+        // close stays a no-op success whether or not a connection existed
+        assert!(output.close().await.is_ok());
+    }
+
+    // ---- remaining matching_data_type conversions ----
+
+    #[tokio::test]
+    async fn matching_data_type_widens_unsigned_and_signed_widths() {
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        use datafusion::arrow::array::{
+            Int16Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        };
+
+        let u8s = UInt8Array::from(vec![Some(250u8)]);
+        assert!(matches!(
+            output.matching_data_type("u8", &u8s, 0).await.unwrap(),
+            SqlValue::UInt64(250)
+        ));
+        let u16s = UInt16Array::from(vec![Some(65_535u16)]);
+        assert!(matches!(
+            output.matching_data_type("u16", &u16s, 0).await.unwrap(),
+            SqlValue::UInt64(65_535)
+        ));
+        let u32s = UInt32Array::from(vec![Some(4_000_000_000u32)]);
+        assert!(matches!(
+            output.matching_data_type("u32", &u32s, 0).await.unwrap(),
+            SqlValue::UInt64(4_000_000_000)
+        ));
+        let u64s = UInt64Array::from(vec![Some(u64::MAX)]);
+        assert!(matches!(
+            output.matching_data_type("u64", &u64s, 0).await.unwrap(),
+            SqlValue::UInt64(u64::MAX)
+        ));
+        let i8s = Int8Array::from(vec![Some(-128i8)]);
+        assert!(matches!(
+            output.matching_data_type("i8", &i8s, 0).await.unwrap(),
+            SqlValue::Int64(-128)
+        ));
+        let i16s = Int16Array::from(vec![Some(-32_768i16)]);
+        assert!(matches!(
+            output.matching_data_type("i16", &i16s, 0).await.unwrap(),
+            SqlValue::Int64(-32_768)
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_data_type_handles_bool_float64_and_nulls() {
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        use datafusion::arrow::array::{
+            BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array,
+        };
+
+        let bools = BooleanArray::from(vec![Some(true)]);
+        assert!(matches!(
+            output.matching_data_type("b", &bools, 0).await.unwrap(),
+            SqlValue::Boolean(true)
+        ));
+        let null_bools = BooleanArray::from(vec![None::<bool>]);
+        assert!(matches!(
+            output.matching_data_type("b", &null_bools, 0).await.unwrap(),
+            SqlValue::Null
+        ));
+
+        let floats = Float64Array::from(vec![Some(2.25)]);
+        assert!(matches!(
+            output.matching_data_type("f", &floats, 0).await.unwrap(),
+            SqlValue::Float64(v) if (v - 2.25).abs() < f64::EPSILON
+        ));
+        let null_floats = Float64Array::from(vec![None::<f64>]);
+        assert!(matches!(
+            output.matching_data_type("f", &null_floats, 0).await.unwrap(),
+            SqlValue::Null
+        ));
+
+        let null_ints = Int64Array::from(vec![None::<i64>]);
+        assert!(matches!(
+            output.matching_data_type("i", &null_ints, 0).await.unwrap(),
+            SqlValue::Null
+        ));
+        let null_uints = UInt64Array::from(vec![None::<u64>]);
+        assert!(matches!(
+            output.matching_data_type("u", &null_uints, 0).await.unwrap(),
+            SqlValue::Null
+        ));
+        let null_strings = StringArray::from(vec![None::<&str>]);
+        assert!(matches!(
+            output.matching_data_type("s", &null_strings, 0).await.unwrap(),
+            SqlValue::Null
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_data_type_formats_date64_and_all_timestamp_units() {
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        use datafusion::arrow::array::{
+            Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+            TimestampSecondArray,
+        };
+
+        let dates = Date64Array::from(vec![Some(86_400_000i64)]);
+        assert!(matches!(
+            output.matching_data_type("d", &dates, 0).await.unwrap(),
+            SqlValue::String(ref s) if s == "1970-01-02"
+        ));
+        let null_dates = Date64Array::from(vec![None::<i64>]);
+        assert!(matches!(
+            output.matching_data_type("d", &null_dates, 0).await.unwrap(),
+            SqlValue::Null
+        ));
+
+        let seconds = TimestampSecondArray::from(vec![Some(1i64)]);
+        assert!(matches!(
+            output.matching_data_type("ts", &seconds, 0).await.unwrap(),
+            SqlValue::String(ref s) if s.starts_with("1970-01-01T00:00:01")
+        ));
+        let millis = TimestampMillisecondArray::from(vec![Some(1_500i64)]);
+        assert!(matches!(
+            output.matching_data_type("ts", &millis, 0).await.unwrap(),
+            SqlValue::String(ref s) if s.starts_with("1970-01-01T00:00:01.500")
+        ));
+        let micros = TimestampMicrosecondArray::from(vec![Some(1_000i64)]);
+        assert!(matches!(
+            output.matching_data_type("ts", &micros, 0).await.unwrap(),
+            SqlValue::String(ref s) if s.starts_with("1970-01-01T00:00:00.001")
+        ));
+    }
 }

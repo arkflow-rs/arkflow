@@ -485,6 +485,7 @@ pub fn init() -> Result<(), Error> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::time::Duration;
 
     fn create_test_resource() -> Resource {
         Resource {
@@ -611,5 +612,94 @@ mod tests {
         assert!(serialized.contains("regular"));
         assert!(serialized.contains("test"));
         assert!(serialized.contains("queue"));
+    }
+
+    #[test]
+    fn test_nats_mode_without_type_tag_rejected() {
+        let config_json = serde_json::json!({
+            "url": "nats://localhost:4222",
+            "mode": {
+                "subject": "test.subject"
+            }
+        });
+        let error = serde_json::from_value::<NatsInputConfig>(config_json).unwrap_err();
+        assert!(error.to_string().contains("type"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn read_before_connect_reports_connection_error() {
+        let input = NatsInput::new(
+            None,
+            serde_json::from_value(serde_json::json!({
+                "url": "nats://localhost:4222",
+                "mode": {"type": "regular", "subject": "test.subject"}
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let error = match input.read().await {
+            Err(error) => error,
+            Ok(_) => panic!("read before connect must fail"),
+        };
+        assert!(
+            error.to_string().contains("not connected"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_before_connect_is_ok() {
+        let input = NatsInput::new(
+            None,
+            serde_json::from_value(serde_json::json!({
+                "url": "nats://localhost:4222",
+                "mode": {
+                    "type": "jet_stream",
+                    "stream": "s",
+                    "consumer_name": "c"
+                }
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        input.close().await.expect("close before connect");
+    }
+
+    #[tokio::test]
+    async fn connect_to_unreachable_server_fails_fast() {
+        let input = NatsInput::new(
+            None,
+            serde_json::from_value(serde_json::json!({
+                "url": "nats://127.0.0.1:1",
+                "mode": {"type": "regular", "subject": "test.subject"}
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), input.connect()).await;
+        let error = match result {
+            Err(_) => panic!("connect to a dead server must fail, not hang"),
+            Ok(Err(error)) => error,
+            Ok(Ok(())) => panic!("connect to a dead server must fail"),
+        };
+        assert!(
+            matches!(error, Error::Connection(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_invalid_config() {
+        let bad = Some(serde_json::json!({
+            "url": "nats://localhost:4222",
+            "mode": {"type": "unknown-kind", "subject": "s"}
+        }));
+        assert!(matches!(
+            NatsInputBuilder.build(None, &bad, None, &create_test_resource()),
+            Err(Error::Config(_))
+        ));
     }
 }

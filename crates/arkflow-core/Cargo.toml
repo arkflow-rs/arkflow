@@ -47,6 +47,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 rcgen = "0.13"
+serial_test = "4.0.1"
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Only `#[tokio::test(start_paused = true)]` needs the paused clock; keeping the
 # feature out of the workspace dependency keeps it out of production builds.

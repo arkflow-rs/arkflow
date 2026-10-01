@@ -3674,3 +3674,81 @@ mod metadata_tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+mod process_result_tests {
+    use super::*;
+
+    fn batch() -> MessageBatch {
+        MessageBatch::new_binary(vec![b"payload".to_vec()]).unwrap()
+    }
+
+    fn shared() -> MessageBatchRef {
+        Arc::new(batch())
+    }
+
+    #[test]
+    fn debug_renders_every_variant_without_payload_bloat() {
+        let single = ProcessResult::Single(shared());
+        assert!(format!("{single:?}").contains("Single"));
+        let multiple = ProcessResult::Multiple(vec![shared(), shared()]);
+        assert!(format!("{multiple:?}").contains("len: 2"));
+        let with_ack = ProcessResult::SingleWithAck(shared(), Arc::new(input::NoopAck));
+        assert!(format!("{with_ack:?}").contains("SingleWithAck"));
+        let many_ack = ProcessResult::MultipleWithAck(vec![(shared(), Arc::new(input::NoopAck))]);
+        assert!(format!("{many_ack:?}").contains("MultipleWithAck"));
+        assert!(format!("{:?}", ProcessResult::Deferred).contains("Deferred"));
+        assert!(format!("{:?}", ProcessResult::None).contains("None"));
+    }
+
+    #[test]
+    fn into_vec_unwraps_or_clones_shared_batches() {
+        // Arc shared with another holder: into_vec clones.
+        let shared_holder = shared();
+        let result = ProcessResult::Single(shared_holder.clone());
+        assert_eq!(result.into_vec().len(), 1);
+
+        // Arc with a single owner: into_vec unwraps in place.
+        let result = ProcessResult::Single(Arc::new(batch()));
+        assert_eq!(result.into_vec().len(), 1);
+
+        let result = ProcessResult::Multiple(vec![Arc::new(batch()), Arc::new(batch())]);
+        assert_eq!(result.into_vec().len(), 2);
+
+        let result =
+            ProcessResult::SingleWithAck(Arc::new(batch()), Arc::new(input::NoopAck));
+        assert_eq!(result.into_vec().len(), 1);
+
+        let result =
+            ProcessResult::MultipleWithAck(vec![(Arc::new(batch()), Arc::new(input::NoopAck))]);
+        assert_eq!(result.into_vec().len(), 1);
+
+        assert!(ProcessResult::Deferred.into_vec().is_empty());
+        assert!(ProcessResult::None.into_vec().is_empty());
+    }
+
+    #[test]
+    fn from_vec_maps_lengths_to_variants() {
+        assert!(matches!(ProcessResult::from_vec(vec![]), ProcessResult::None));
+        let single = ProcessResult::from_vec(vec![batch()]);
+        assert!(matches!(single, ProcessResult::Single(_)));
+        let multiple = ProcessResult::from_vec(vec![batch(), batch()]);
+        assert!(matches!(multiple, ProcessResult::Multiple(v) if v.len() == 2));
+    }
+
+    #[test]
+    fn empty_and_len_accessors_cover_every_variant() {
+        assert!(ProcessResult::None.is_empty());
+        assert!(ProcessResult::Deferred.is_empty());
+        assert!(!ProcessResult::Single(shared()).is_empty());
+        assert_eq!(ProcessResult::Single(shared()).len(), 1);
+        assert_eq!(ProcessResult::Multiple(vec![shared(), shared()]).len(), 2);
+        assert_eq!(ProcessResult::SingleWithAck(shared(), Arc::new(input::NoopAck)).len(), 1);
+        assert_eq!(
+            ProcessResult::MultipleWithAck(vec![(shared(), Arc::new(input::NoopAck))]).len(),
+            1
+        );
+        assert_eq!(ProcessResult::Deferred.len(), 0);
+        assert_eq!(ProcessResult::None.len(), 0);
+    }
+}

@@ -25,3 +25,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Local control-plane config versions written by hub tests at the
+# process cwd (see apply_configuration).
+.arkflow/

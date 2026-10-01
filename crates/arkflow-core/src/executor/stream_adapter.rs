@@ -552,6 +552,506 @@ mod tests {
         ))
     }
 
+    /// A batch whose source metadata uses the nullable Int32/Int64 column
+    /// forms some connectors produce instead of the canonical UInt32/UInt64.
+    fn signed_metadata_batch(partitions: Vec<i32>, offsets: Vec<i64>) -> crate::MessageBatchRef {
+        let rows = partitions.len();
+        let value = Field::new("value", DataType::Int64, false);
+        let partition = Field::new(crate::meta_columns::PARTITION, DataType::Int32, true);
+        let offset = Field::new(crate::meta_columns::OFFSET, DataType::Int64, true);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![value, partition, offset])),
+            vec![
+                Arc::new(Int64Array::from(vec![1; rows])),
+                Arc::new(datafusion::arrow::array::Int32Array::from(partitions)),
+                Arc::new(datafusion::arrow::array::Int64Array::from(offsets)),
+            ],
+        )
+        .unwrap();
+        Arc::new(crate::MessageBatch::new_arrow(batch))
+    }
+
+    /// A two-row batch spanning two partitions (two distinct positions).
+    fn two_partition_batch() -> crate::MessageBatchRef {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 1]))],
+        )
+        .unwrap();
+        let batch = crate::metadata::with_partition(batch, 0).unwrap();
+        let batch = crate::metadata::with_offset(batch, 0).unwrap();
+        let partition = batch
+            .schema()
+            .index_of(crate::meta_columns::PARTITION)
+            .unwrap();
+        let offset = batch
+            .schema()
+            .index_of(crate::meta_columns::OFFSET)
+            .unwrap();
+        let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = batch.columns().to_vec();
+        columns[partition] = Arc::new(datafusion::arrow::array::UInt32Array::from(vec![1, 2]));
+        columns[offset] = Arc::new(datafusion::arrow::array::UInt64Array::from(vec![10, 20]));
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(batch.schema(), columns).unwrap(),
+        ))
+    }
+
+    fn trivial_public_batch() -> crate::MessageBatchRef {
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// A batch carrying a partition column of an unusable type: the coverage
+    /// comparison must fall back to the WAL-sequence position instead of
+    /// panicking on the unexpected array type.
+    fn string_partition_batch() -> crate::MessageBatchRef {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let mut fields: Vec<Arc<Field>> = batch.schema().fields().to_vec();
+        let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = batch.columns().to_vec();
+        fields.insert(
+            0,
+            Arc::new(Field::new(
+                crate::meta_columns::PARTITION,
+                DataType::Utf8,
+                false,
+            )),
+        );
+        columns.insert(
+            0,
+            Arc::new(datafusion::arrow::array::StringArray::from(vec!["zero"])),
+        );
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
+        ))
+    }
+
+    fn empty_batch() -> crate::MessageBatchRef {
+        let batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])));
+        Arc::new(crate::MessageBatch::new_arrow(batch))
+    }
+
+    /// Inner connector double with configurable native positions and
+    /// per-position acknowledgements, recording every delegation it sees.
+    struct RecordingInnerInput {
+        positions: Vec<SourcePosition>,
+        restored: std::sync::Mutex<Vec<SourcePosition>>,
+        acked_positions: std::sync::Mutex<Vec<SourcePosition>>,
+        acknowledgements: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        assigned: std::sync::Mutex<Vec<u32>>,
+        partitioning: bool,
+        fail_close: bool,
+    }
+
+    impl RecordingInnerInput {
+        fn new(positions: Vec<SourcePosition>) -> Self {
+            Self {
+                positions,
+                restored: std::sync::Mutex::new(Vec::new()),
+                acked_positions: std::sync::Mutex::new(Vec::new()),
+                acknowledgements: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                assigned: std::sync::Mutex::new(Vec::new()),
+                partitioning: true,
+                fail_close: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Input for RecordingInnerInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::EOF)
+        }
+
+        async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
+            self.restored.lock().unwrap().extend_from_slice(positions);
+            Ok(())
+        }
+
+        async fn current_positions(&self) -> Result<Vec<SourcePosition>, Error> {
+            Ok(self.positions.clone())
+        }
+
+        async fn ack_for_position(
+            &self,
+            position: &SourcePosition,
+        ) -> Result<Option<Arc<dyn Ack>>, Error> {
+            self.acked_positions.lock().unwrap().push(position.clone());
+            let counter = self.acknowledgements.clone();
+            Ok(Some(Arc::new(CountingSourceAck(counter))))
+        }
+
+        fn supports_partitioning(&self) -> bool {
+            self.partitioning
+        }
+
+        fn assign_partition(&self, partition: u32) -> Result<(), Error> {
+            self.assigned.lock().unwrap().push(partition);
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            if self.fail_close {
+                return Err(Error::Process("injected inner close failure".into()));
+            }
+            Ok(())
+        }
+    }
+
+    struct CountingSourceAck(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Ack for CountingSourceAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_accessor_exposes_the_opened_wal_and_is_none_without_durability() {
+        let directory = tempfile::tempdir().unwrap();
+        let enabled = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let durable = StreamJobAdapter::new(Some(&enabled)).unwrap();
+        assert!(durable.wal().is_some());
+        durable.close().await.unwrap();
+
+        let disabled = WalConfig::local(
+            false,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let ephemeral = StreamJobAdapter::new(Some(&disabled)).unwrap();
+        assert!(ephemeral.wal().is_none());
+        ephemeral.close().await.unwrap();
+        StreamJobAdapter::new(None).unwrap().close().await.unwrap();
+    }
+
+    #[test]
+    fn invalid_compiled_codec_payload_fails_the_component_build() {
+        let adapter = StreamJobAdapter::new(None).unwrap();
+        let source = SourceSpec {
+            codec: None,
+            operator_id: "source".into(),
+            input_type: "memory".into(),
+            config: serde_json::json!({CODEC_PAYLOAD_KEY: "not-an-object"}),
+            time: crate::job::TimeSpec {
+                mode: crate::job::TimeMode::ProcessingTime,
+                timestamp_field: None,
+                watermark: None,
+                allowed_lateness_ms: 0,
+                late_event_policy: Default::default(),
+                late_event_route: None,
+            },
+        };
+        let resource = adapter.build_resource().unwrap();
+        let error = adapter
+            .build_input(&source, &resource)
+            .err()
+            .expect("invalid codec payload must fail the build");
+        assert!(
+            error
+                .to_string()
+                .contains("compiled stream codec payload is invalid"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn build_processor_requires_an_explicit_type() {
+        let adapter = StreamJobAdapter::new(None).unwrap();
+        let operator = crate::job::OperatorSpec {
+            id: "op".into(),
+            kind: crate::job::OperatorKind::Map,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({"name": "no-type-here"}),
+        };
+        let resource = adapter.build_resource().unwrap();
+        let error = adapter
+            .build_processor(&operator, &resource)
+            .err()
+            .expect("missing config.type must fail the build");
+        assert!(
+            error.to_string().contains("requires config.type"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_coverage_rejects_empty_positions_and_empty_batches() {
+        let position = SourcePosition::for_partition(0, 3);
+        assert!(!WalInput::batch_is_covered_by_checkpoint(
+            1,
+            &metadata_batch(0, 1, "orders"),
+            &[]
+        ));
+        assert!(!WalInput::batch_is_covered_by_checkpoint(
+            1,
+            &empty_batch(),
+            std::slice::from_ref(&position)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_coverage_reads_signed_partition_and_offset_metadata() {
+        let position = SourcePosition {
+            topic: None,
+            partition: 2,
+            offset: 11,
+        };
+        // Int32 partition + Int64 offset columns compare like the unsigned
+        // forms: (partition 2, offset 10) is covered by next-offset 11.
+        assert!(WalInput::batch_is_covered_by_checkpoint(
+            1,
+            &signed_metadata_batch(vec![2], vec![10]),
+            std::slice::from_ref(&position)
+        ));
+        assert!(!WalInput::batch_is_covered_by_checkpoint(
+            1,
+            &signed_metadata_batch(vec![2], vec![11]),
+            std::slice::from_ref(&position)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_coverage_falls_back_to_the_wal_sequence_on_unusable_metadata() {
+        let position = SourcePosition::for_partition(0, 3);
+        // A partition column of an unexpected type must not panic; the
+        // topicless WAL-sequence fallback decides coverage instead.
+        assert!(WalInput::batch_is_covered_by_checkpoint(
+            2,
+            &string_partition_batch(),
+            std::slice::from_ref(&position)
+        ));
+        assert!(!WalInput::batch_is_covered_by_checkpoint(
+            3,
+            &string_partition_batch(),
+            &[position]
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_input_current_positions_falls_back_to_the_wal_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        wal.append(&metadata_batch(0, 1, "orders")).await.unwrap();
+        wal.append(&metadata_batch(0, 2, "orders")).await.unwrap();
+        let input = WalInput::new(Arc::new(EmptyInput), wal.clone());
+        // The WAL cursor only advances on acknowledgement: two unacked
+        // appends leave the next durable position at sequence 1.
+        let positions = input.current_positions().await.unwrap();
+        assert_eq!(positions, vec![SourcePosition::for_partition(0, 1)]);
+        input.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_input_current_positions_prefers_native_connector_positions() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        let native = vec![SourcePosition {
+            topic: Some("orders".into()),
+            partition: 4,
+            offset: 100,
+        }];
+        let input = WalInput::new(
+            Arc::new(RecordingInnerInput::new(native.clone())),
+            wal.clone(),
+        );
+        let positions = input.current_positions().await.unwrap();
+        assert_eq!(positions, native);
+        input.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_input_delegates_positioning_and_position_acks_to_the_connector() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        let inner = Arc::new(RecordingInnerInput::new(Vec::new()));
+        let input = WalInput::new(inner.clone(), wal.clone());
+
+        assert!(input.supports_partitioning());
+        input.assign_partition(7).unwrap();
+        assert_eq!(*inner.assigned.lock().unwrap(), vec![7]);
+
+        let position = SourcePosition {
+            topic: Some("orders".into()),
+            partition: 1,
+            offset: 9,
+        };
+        input
+            .restore_positions(std::slice::from_ref(&position))
+            .await
+            .unwrap();
+        assert_eq!(*inner.restored.lock().unwrap(), vec![position.clone()]);
+
+        assert!(input.ack_for_position(&position).await.unwrap().is_some());
+        assert_eq!(*inner.acked_positions.lock().unwrap(), vec![position]);
+        input.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_input_close_surfaces_the_inner_connector_close_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        let mut inner = RecordingInnerInput::new(Vec::new());
+        inner.fail_close = true;
+        let input = WalInput::new(Arc::new(inner), wal.clone());
+        let error = input
+            .close()
+            .await
+            .expect_err("inner close failure must surface");
+        assert!(
+            error.to_string().contains("injected inner close failure"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_without_source_metadata_acks_with_noop() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        wal.append(&trivial_public_batch()).await.unwrap();
+        let input = WalInput::new(Arc::new(EmptyInput), wal.clone());
+        let (batch, ack) = input.read().await.unwrap();
+        assert_eq!(batch.len(), 1);
+        ack.ack().await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        input.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_builds_one_source_ack_per_distinct_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        let inner = Arc::new(RecordingInnerInput::new(Vec::new()));
+        let acknowledgements = inner.acknowledgements.clone();
+        // One row: a single distinct position acks through its own ack.
+        wal.append(&metadata_batch(1, 5, "orders")).await.unwrap();
+        // Two rows on different partitions: both distinct positions must be
+        // acknowledged concurrently by one WalAck.
+        wal.append(&two_partition_batch()).await.unwrap();
+        let input = WalInput::new(inner.clone(), wal.clone());
+
+        let (_, single) = input.read().await.unwrap();
+        single.ack().await.unwrap();
+        assert_eq!(
+            acknowledgements.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let (_, concurrent) = input.read().await.unwrap();
+        concurrent.ack().await.unwrap();
+        assert_eq!(
+            acknowledgements.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        // The replayed metadata covers exactly the distinct source positions.
+        assert_eq!(inner.acked_positions.lock().unwrap().len(), 3);
+        input.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_reads_signed_partition_and_offset_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        let inner = Arc::new(RecordingInnerInput::new(Vec::new()));
+        wal.append(&signed_metadata_batch(vec![3], vec![42]))
+            .await
+            .unwrap();
+        let input = WalInput::new(inner.clone(), wal.clone());
+        let (batch, ack) = input.read().await.unwrap();
+        assert_eq!(batch.len(), 1);
+        ack.ack().await.unwrap();
+        let positions = inner.acked_positions.lock().unwrap().clone();
+        assert_eq!(
+            positions,
+            vec![SourcePosition {
+                topic: None,
+                partition: 3,
+                offset: 43,
+            }]
+        );
+        input.close().await.unwrap();
+    }
+
+    /// The `EmptyInput` double's own trait methods stay exercised so the
+    /// double itself is fully covered.
+    #[tokio::test]
+    async fn empty_input_double_trait_methods_are_callable() {
+        let input = EmptyInput;
+        input.connect().await.unwrap();
+        assert!(input.read().await.is_err());
+        input.close().await.unwrap();
+    }
+
     #[test]
     fn checkpoint_coverage_requires_matching_topic_partition_and_next_offset() {
         let position = SourcePosition {
@@ -645,6 +1145,174 @@ mod tests {
         assert_eq!(wal.cursor().await.unwrap(), 3);
 
         wal.close().await.unwrap();
+    }
+
+    #[test]
+    fn build_resource_rejects_unknown_temporary_types() {
+        let adapter = StreamJobAdapter::with_temporary(
+            None,
+            Some(vec![crate::temporary::TemporaryConfig {
+                temporary_type: "no-such-temporary".into(),
+                name: "missing".into(),
+                config: None,
+            }]),
+        )
+        .unwrap();
+        let error = adapter
+            .build_resource()
+            .err()
+            .expect("unknown temporary type must fail the dry run");
+        assert!(error.to_string().contains("Unknown temporary type"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_resource_builds_registered_temporaries_into_the_resource() {
+        struct StubTemporary;
+        #[async_trait::async_trait]
+        impl crate::temporary::Temporary for StubTemporary {
+            async fn connect(&self) -> Result<(), Error> {
+                Ok(())
+            }
+            async fn get(
+                &self,
+                _keys: &[datafusion::logical_expr::ColumnarValue],
+            ) -> Result<Option<crate::MessageBatch>, Error> {
+                Ok(None)
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        struct StubTemporaryBuilder;
+        impl crate::temporary::TemporaryBuilder for StubTemporaryBuilder {
+            fn build(
+                &self,
+                _config: &Option<serde_json::Value>,
+                _resource: &Resource,
+            ) -> Result<Arc<dyn crate::temporary::Temporary>, Error> {
+                Ok(Arc::new(StubTemporary))
+            }
+        }
+        crate::temporary::register_temporary_builder(
+            "coverage-stub-temporary",
+            Arc::new(StubTemporaryBuilder),
+        )
+        .unwrap();
+        let adapter = StreamJobAdapter::with_temporary(
+            None,
+            Some(vec![crate::temporary::TemporaryConfig {
+                temporary_type: "coverage-stub-temporary".into(),
+                name: "stub".into(),
+                config: None,
+            }]),
+        )
+        .unwrap();
+        let resource = adapter.build_resource().unwrap();
+        let temporary = resource
+            .temporary
+            .get("stub")
+            .cloned()
+            .expect("the registered temporary was built");
+        // The built double's trait methods stay exercised.
+        temporary.connect().await.unwrap();
+        assert!(temporary.get(&[]).await.unwrap().is_none());
+        temporary.close().await.unwrap();
+    }
+
+    #[test]
+    fn checkpoint_coverage_ignores_an_offset_column_of_an_unusable_type() {
+        // A usable partition column beside an unusable offset column must
+        // fall back to the WAL-sequence position instead of panicking.
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(crate::meta_columns::PARTITION, DataType::UInt32, false),
+                Field::new(crate::meta_columns::OFFSET, DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![0u32])),
+                Arc::new(datafusion::arrow::array::StringArray::from(vec!["zero"])),
+            ],
+        )
+        .unwrap();
+        let batch = Arc::new(crate::MessageBatch::new_arrow(batch));
+        let position = SourcePosition::for_partition(0, 3);
+        assert!(WalInput::batch_is_covered_by_checkpoint(
+            2,
+            &batch,
+            std::slice::from_ref(&position)
+        ));
+        assert!(!WalInput::batch_is_covered_by_checkpoint(
+            3,
+            &batch,
+            &[position]
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_input_delegates_watermark_partitions_and_the_double_stays_exercised() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        let inner = Arc::new(RecordingInnerInput::new(Vec::new()));
+        let input = WalInput::new(inner.clone(), wal.clone());
+        assert!(input.watermark_partitions().await.unwrap().is_empty());
+        // The recording double's own trait methods stay exercised.
+        inner.connect().await.unwrap();
+        assert!(inner.read().await.is_err());
+        input.close().await.unwrap();
+    }
+
+    #[test]
+    fn build_processor_strips_compiler_keys_and_null_configs_become_empty_objects() {
+        let adapter = StreamJobAdapter::new(None).unwrap();
+        let resource = adapter.build_resource().unwrap();
+
+        // The compiler metadata keys ("type"/"name") are stripped before the
+        // processor config reaches the plugin registry.
+        let operator = crate::job::OperatorSpec {
+            id: "op".into(),
+            kind: crate::job::OperatorKind::Map,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({
+                "type": "no-such-processor",
+                "name": "worker",
+                "field": 1
+            }),
+        };
+        let error = adapter
+            .build_processor(&operator, &resource)
+            .err()
+            .expect("unknown processor type must fail the build");
+        assert!(error.to_string().contains("Unknown processor type"), "{error}");
+
+        // A payload stripped down to JSON null hands plugins `{}` rather than
+        // a null config object.
+        let source = SourceSpec {
+            codec: None,
+            operator_id: "source".into(),
+            input_type: "no-such-input".into(),
+            config: serde_json::Value::Null,
+            time: crate::job::TimeSpec {
+                mode: crate::job::TimeMode::ProcessingTime,
+                timestamp_field: None,
+                watermark: None,
+                allowed_lateness_ms: 0,
+                late_event_policy: Default::default(),
+                late_event_route: None,
+            },
+        };
+        let error = adapter
+            .build_input(&source, &resource)
+            .err()
+            .expect("unknown input type must fail the build");
+        assert!(error.to_string().contains("Unknown input type"), "{error}");
     }
 }
 
@@ -832,8 +1500,7 @@ mod wal_lifecycle_tests {
                 self.entered.notify_waiters();
                 // Hold in-flight until the test releases (after close).
                 self.release.notified().await;
-                self.acked
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.acked.store(true, std::sync::atomic::Ordering::SeqCst);
                 self.gate.notify_waiters();
                 Ok(())
             }
@@ -907,9 +1574,7 @@ mod wal_lifecycle_tests {
         .expect("both acknowledgements settle within the drain window");
 
         assert!(
-            seq1_ack
-                .acked
-                .load(std::sync::atomic::Ordering::SeqCst),
+            seq1_ack.acked.load(std::sync::atomic::Ordering::SeqCst),
             "sequence 1 source commit completed"
         );
         assert_eq!(
@@ -918,6 +1583,10 @@ mod wal_lifecycle_tests {
             "both sequences committed through the drain"
         );
         let _ = close_task.await;
+        // The gated double's remaining trait methods stay exercised.
+        seq1_ack.mark_held();
+        seq1_ack.release_held();
+        seq1_ack.undo().await.unwrap();
     }
 
     /// The drain window is bounded: when the earlier in-flight delivery
@@ -1012,5 +1681,18 @@ mod wal_lifecycle_tests {
             .expect("sequence 1 settles after release")
             .unwrap();
         let _ = close_task.await;
+        // The gated double's remaining trait methods stay exercised.
+        seq1_ack.mark_held();
+        seq1_ack.release_held();
+        seq1_ack.undo().await.unwrap();
+    }
+
+    /// The lifecycle module's `EmptyInput` double stays fully exercised.
+    #[tokio::test]
+    async fn lifecycle_empty_input_double_trait_methods_are_callable() {
+        let input = EmptyInput;
+        input.connect().await.unwrap();
+        assert!(input.read().await.is_err());
+        input.close().await.unwrap();
     }
 }

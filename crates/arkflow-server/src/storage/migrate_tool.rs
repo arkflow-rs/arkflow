@@ -140,6 +140,7 @@ async fn pg_insert_chunk(
         for value in values {
             query = match value {
                 PgVal::Null => query.bind(Option::<String>::None),
+                PgVal::NullInt => query.bind(Option::<i64>::None),
                 PgVal::Text(v) => query.bind(v.clone()),
                 PgVal::Int(v) => query.bind(*v),
                 PgVal::Real(v) => query.bind(*v),
@@ -326,13 +327,11 @@ mod tests {
     /// the contract, migrates, and verifies the report and round-trip counts.
     #[tokio::test]
     async fn migrates_sqlite_data_into_postgres() {
-        let url = match std::env::var("ARKFLOW_TEST_POSTGRES_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping: ARKFLOW_TEST_POSTGRES_URL not set");
-                return;
-            }
-        };
+        if std::env::var("ARKFLOW_TEST_POSTGRES_URL").is_err() {
+            eprintln!("skipping: ARKFLOW_TEST_POSTGRES_URL not set");
+            return;
+        }
+        let url = super::super::contract_database_url("pg_migrate_tool").await;
         use super::super::{ControlPlaneStore, StorageBackend};
         let path = std::env::temp_dir().join(format!(
             "arkflow-migrate-{}-{}.sqlite",
@@ -363,7 +362,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ = std::fs::remove_file(&path);
+        // Close the source connection so the WAL is checkpointed into the main
+        // database file before the migration tool reopens it by path, and keep
+        // the file until the migration has read it.
+        drop(sqlite);
 
         let report = super::migrate_sqlite_to_postgres(&path, &url).await.unwrap();
         assert!(report.total_rows() >= 1);
@@ -380,5 +382,103 @@ mod tests {
             .unwrap()
             .expect("migrated job present");
         assert_eq!(job.generation, 3);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every SQLite value kind maps onto the typed bind the PostgreSQL side
+    /// expects; a mismatch here surfaces only mid-migration as an opaque
+    /// SQLSTATE error, so the mapping is pinned by unit test instead.
+    #[test]
+    fn value_to_pg_maps_every_sqlite_value_kind() {
+        assert!(matches!(value_to_pg(ValueRef::Null), PgVal::Null));
+        assert!(matches!(
+            value_to_pg(ValueRef::Integer(-7)),
+            PgVal::Int(-7)
+        ));
+        assert!(matches!(
+            value_to_pg(ValueRef::Real(2.5)),
+            PgVal::Real(v) if v == 2.5
+        ));
+        assert!(matches!(
+            value_to_pg(ValueRef::Text(b"txt")),
+            PgVal::Text(v) if v == "txt"
+        ));
+        assert!(matches!(
+            value_to_pg(ValueRef::Blob(b"bytes")),
+            PgVal::Bytes(v) if v == b"bytes"
+        ));
+    }
+
+    #[test]
+    fn migration_report_sums_per_table_rows() {
+        let report = MigrationReport {
+            rows_per_table: vec![
+                ("cp_nodes".into(), 2),
+                ("cp_jobs".into(), 3),
+                ("cp_outbox".into(), 0),
+            ],
+        };
+        assert_eq!(report.total_rows(), 5);
+        assert_eq!(
+            MigrationReport {
+                rows_per_table: Vec::new(),
+            }
+            .total_rows(),
+            0
+        );
+    }
+
+    /// Without the columns the ordering needs, rows pass through in scan
+    /// order instead of panicking or dropping data.
+    #[test]
+    fn parents_first_ordering_degrades_to_scan_order_without_its_columns() {
+        let rows = vec![vec![PgVal::Int(1), PgVal::Int(2)]];
+        // Neither a key column nor the parent column exists.
+        let ordered = order_parents_first(&["other".to_string()], rows.clone(), "parent");
+        assert_eq!(ordered.len(), 1);
+        // Key column present but the parent column is absent.
+        let ordered = order_parents_first(
+            &["intent_id".to_string()],
+            rows,
+            "superseded_by_intent_id",
+        );
+        assert_eq!(ordered.len(), 1);
+    }
+
+    /// SQLite is dynamically typed: a non-TEXT key or parent reference is
+    /// treated as absent (root row) rather than blocking emission.
+    #[test]
+    fn non_text_keys_and_parents_never_block_emission() {
+        let columns = vec![
+            "intent_id".to_string(),
+            "superseded_by_intent_id".to_string(),
+        ];
+        let rows = vec![
+            vec![PgVal::Int(1), PgVal::Null],
+            vec![PgVal::Null, PgVal::Text("dangling".into())],
+            vec![PgVal::Text("i1".into()), PgVal::Int(2)],
+        ];
+        let ordered = order_parents_first(&columns, rows, "superseded_by_intent_id");
+        assert_eq!(ordered.len(), 3, "every row emits as a root");
+        assert!(matches!(ordered[2].first(), Some(PgVal::Text(key)) if key == "i1"));
+    }
+
+    /// A dependency cycle can make no progress in any pass: those rows keep
+    /// their scan order at the tail so the copy surfaces the violation.
+    #[test]
+    fn cyclic_parent_chains_keep_their_order_at_the_tail() {
+        let columns = vec![
+            "intent_id".to_string(),
+            "superseded_by_intent_id".to_string(),
+        ];
+        let rows = vec![
+            vec![PgVal::Text("a".into()), PgVal::Text("b".into())],
+            vec![PgVal::Text("b".into()), PgVal::Text("a".into())],
+        ];
+        let ordered = order_parents_first(&columns, rows, "superseded_by_intent_id");
+        assert_eq!(ordered.len(), 2);
+        assert!(matches!(ordered[0].first(), Some(PgVal::Text(key)) if key == "a"));
+        assert!(matches!(ordered[1].first(), Some(PgVal::Text(key)) if key == "b"));
     }
 }
