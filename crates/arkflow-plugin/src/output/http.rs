@@ -257,3 +257,233 @@ pub fn init() -> Result<(), Error> {
         "retry_count": 3
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::MessageBatch;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn resource() -> Resource {
+        Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn build(config: serde_json::Value) -> Result<Arc<dyn Output>, Error> {
+        HttpOutputBuilder.build(None, &Some(config), None, &resource())
+    }
+
+    fn base_config(url: String) -> serde_json::Value {
+        serde_json::json!({
+            "url": url,
+            "method": "POST",
+            "timeout_ms": 2_000,
+            "retry_count": 0,
+        })
+    }
+
+    fn batch() -> MessageBatchRef {
+        Arc::new(MessageBatch::new_binary(vec![b"{\"k\":1}".to_vec()]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn post_delivers_the_batch() -> Result<(), Error> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ingest"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = build(base_config(format!("{}/ingest", server.uri())))?;
+        output.connect().await?;
+        output.write(batch()).await?;
+        output.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn each_supported_method_reaches_the_endpoint() -> Result<(), Error> {
+        for verb in ["GET", "PUT", "PATCH", "DELETE"] {
+            let server = MockServer::start().await;
+            Mock::given(method(verb))
+                .and(path("/sink"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let config = serde_json::json!({
+                "url": format!("{}/sink", server.uri()),
+                "method": verb,
+                "timeout_ms": 2_000,
+                "retry_count": 0,
+            });
+            let output = build(config)?;
+            output.connect().await?;
+            output.write(batch()).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn basic_and_bearer_auth_headers_are_sent() -> Result<(), Error> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Basic dXNlcjpwYXNz",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = base_config(format!("{}/auth", server.uri()));
+        config["auth"] =
+            serde_json::json!({"Basic": {"username": "user", "password": "pass"}});
+        let output = build(config)?;
+        output.connect().await?;
+        output.write(batch()).await?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer token-1",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = base_config(format!("{}/auth", server.uri()));
+        config["auth"] = serde_json::json!({"Bearer": {"token": "token-1"}});
+        let output = build(config)?;
+        output.connect().await?;
+        output.write(batch()).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn custom_header_and_default_content_type() -> Result<(), Error> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hdr"))
+            .and(wiremock::matchers::header("X-Custom", "1"))
+            .and(wiremock::matchers::header("Content-Type", "application/json"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = base_config(format!("{}/hdr", server.uri()));
+        config["headers"] = serde_json::json!({"X-Custom": "1"});
+        let output = build(config)?;
+        output.connect().await?;
+        output.write(batch()).await?;
+
+        // An explicit Content-Type is preserved, not overwritten.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hdr"))
+            .and(wiremock::matchers::header("Content-Type", "text/plain"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = base_config(format!("{}/hdr", server.uri()));
+        config["headers"] = serde_json::json!({"Content-Type": "text/plain"});
+        let output = build(config)?;
+        output.connect().await?;
+        output.write(batch()).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_error_is_retried_then_reported() -> Result<(), Error> {
+        let server = MockServer::start().await;
+        // One failure then one success with retry_count=1.
+        Mock::given(method("POST"))
+            .and(path("/flaky"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/flaky"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = base_config(format!("{}/flaky", server.uri()));
+        config["retry_count"] = serde_json::json!(1);
+        let output = build(config)?;
+        output.connect().await?;
+        output.write(batch()).await?;
+
+        // Exhausted retries surface the failure.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/down"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let output = build(base_config(format!("{}/down", server.uri())))?;
+        output.connect().await?;
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            output.write(batch()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(err.to_string().contains("503"), "{err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreachable_endpoint_reports_a_connection_error() -> Result<(), Error> {
+        // Port 1 refuses connections immediately.
+        let output = build(base_config("http://127.0.0.1:1/sink".into()))?;
+        output.connect().await?;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            output.write(batch()),
+        )
+        .await;
+        match result {
+            Err(_elapsed) => panic!("write must not hang on a refused connection"),
+            Ok(Err(err)) => assert!(matches!(err, Error::Connection(_)), "{err}"),
+            Ok(Ok(())) => panic!("a refused connection must not report success"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_without_connect_and_after_close_is_rejected() -> Result<(), Error> {
+        let output = build(base_config("http://127.0.0.1:1/sink".into()))?;
+        let err = output.write(batch()).await.unwrap_err();
+        assert!(matches!(err, Error::Connection(_)), "{err}");
+
+        let server = MockServer::start().await;
+        let output = build(base_config(format!("{}/x", server.uri())))?;
+        output.connect().await?;
+        output.close().await?;
+        let err = output.write(batch()).await.unwrap_err();
+        assert!(matches!(err, Error::Connection(_)), "{err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_method_is_rejected_at_send_time() -> Result<(), Error> {
+        let mut config = base_config("http://127.0.0.1:1/sink".into());
+        config["method"] = serde_json::json!("TRACE");
+        let output = build(config)?;
+        output.connect().await?;
+        let err = output.write(batch()).await.unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{err}");
+        Ok(())
+    }
+}

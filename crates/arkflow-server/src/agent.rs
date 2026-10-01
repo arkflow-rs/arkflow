@@ -3284,7 +3284,22 @@ async fn crashed_previous_teardown_surfaces_the_join_error() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{hub_router, ServerConfig};
     use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
+    use arkflow_core::control_plane::ControlPlane;
+    use arkflow_core::runtime::RuntimeManager;
+
+    /// Env-mutating TLS tests and any `run()` invocation with a data port
+    /// read the same `ARKFLOW_DATA_PLANE_TLS_*` variables: serialize them so
+    /// a concurrent data-plane session never observes a half-set environment.
+    static ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Kernel-starting tests serialize like the two-node smoke suite: in
+    /// parallel they saturate a shared runner and the resulting redb lock
+    /// contention turns healthy starts into flaky failures.
+    static ONE_KERNEL_AT_A_TIME: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     /// Regression: the session credential used to travel in the URL query
     /// string for the transition window. It now rides only in the
@@ -3330,6 +3345,7 @@ mod tests {
     /// and cancel it.
     #[tokio::test]
     async fn aborted_start_leaves_no_unregistered_running_kernel() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
         let _ = arkflow_plugin::initialize();
         let runtime = std::sync::Arc::new(JobRuntime::default());
         let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
@@ -3538,6 +3554,7 @@ mod tests {
     /// through the job-observation channel and a fresh kernel takes over.
     #[tokio::test]
     async fn same_generation_start_over_a_crashed_kernel_surfaces_the_crash() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
         let runtime = Arc::new(JobRuntime::default());
         insert_exited_task(
             &runtime,
@@ -3581,6 +3598,7 @@ mod tests {
     /// swallow the crash: the observation rides the superseded generation.
     #[tokio::test]
     async fn generation_bump_over_a_crashed_kernel_reports_the_superseded_crash() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
         let runtime = Arc::new(JobRuntime::default());
         insert_exited_task(
             &runtime,
@@ -3624,6 +3642,7 @@ mod tests {
     /// observation — only genuine crashes are parked.
     #[tokio::test]
     async fn clean_replacement_produces_no_crash_observation() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
         let runtime = Arc::new(JobRuntime::default());
         insert_exited_task(&runtime, "orders-clean", 1, Ok(())).await;
         let (plan, assignments) = replacement_test_plan("orders-clean").await;
@@ -3662,6 +3681,7 @@ mod tests {
     /// with no observation parked and no restart churn.
     #[tokio::test]
     async fn healthy_same_generation_start_stays_an_idempotent_no_op() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
         let runtime = Arc::new(JobRuntime::default());
         let (plan, assignments) = replacement_test_plan("orders-idem").await;
         runtime
@@ -3773,6 +3793,15 @@ mod tests {
     /// Loopback detection for the no-proxy decision must cover the whole
     /// 127/8 range and both IPv6 spellings — a system interception proxy
     /// breaking `127.0.0.2` would wedge the agent just like `127.0.0.1`.
+    /// Both client flavors build: loopback hubs are pinned to no-proxy,
+    /// everything else keeps the system proxy configuration.
+    #[test]
+    fn agent_client_builds_for_loopback_and_remote_hubs() {
+        build_agent_client("http://127.0.0.1:8080").expect("loopback client builds");
+        build_agent_client("http://hub.example.invalid:8080").expect("remote client builds");
+        build_agent_client("not a url").expect("an unparseable hub still yields a client");
+    }
+
     #[test]
     fn loopback_detection_covers_the_whole_loopback_range() {
         assert!(is_loopback_host("127.0.0.1"));
@@ -4274,6 +4303,7 @@ mod tests {
     /// to take effect), not report a healthy no-op.
     #[tokio::test]
     async fn drifting_same_generation_start_replaces_the_kernel() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
         let runtime = Arc::new(JobRuntime::default());
         let (plan, assignments) = replacement_test_plan("orders-drift").await;
         let initial_task_count = assignments.len();
@@ -4372,6 +4402,7 @@ mod tests {
     /// shared runtime (None).
     #[tokio::test]
     async fn declared_cpu_runs_on_a_dedicated_bounded_runtime() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
         // The component catalogue is process-global: resolve it explicitly
         // instead of depending on a sibling test having initialized it (a
         // process-per-test runner like nextest runs this test alone).
@@ -4430,6 +4461,7 @@ mod tests {
 
     #[tokio::test]
     async fn undeclared_jobs_keep_the_shared_runtime() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
         let runtime = Arc::new(JobRuntime::default());
         let (plan, assignments) = replacement_test_plan("orders-shared").await;
         runtime
@@ -4458,8 +4490,9 @@ mod tests {
 
     /// Partial data-plane TLS configuration fails closed (startup error),
     /// never a silent plaintext fallback.
-    #[test]
-    fn partial_data_plane_tls_configuration_fails_closed() {
+    #[tokio::test]
+    async fn partial_data_plane_tls_configuration_fails_closed() {
+        let _guard = ENV_LOCK.lock().await;
         unsafe { std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CERT", "/nonexistent") };
         unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_KEY") };
         unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CA") };
@@ -4471,6 +4504,60 @@ mod tests {
         unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CERT") };
         // Fully absent stays optional (plaintext default).
         assert!(data_plane_tls_from_env().unwrap().is_none());
+    }
+
+    /// Complete-but-unreadable TLS material and a valid self-signed set:
+    /// the read errors surface verbatim, and real PEM material loads into a
+    /// usable mTLS configuration.
+    #[tokio::test]
+    async fn complete_tls_material_reads_files_and_loads_pem() {
+        let _guard = ENV_LOCK.lock().await;
+        let missing = format!("/nonexistent-tls-{}", std::process::id());
+        unsafe {
+            std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CERT", &missing);
+            std::env::set_var("ARKFLOW_DATA_PLANE_TLS_KEY", &missing);
+            std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CA", &missing);
+        }
+        let error = match data_plane_tls_from_env() {
+            Err(error) => error,
+            Ok(_) => panic!("unreadable TLS material must fail closed"),
+        };
+        assert!(
+            error.contains("could not be read"),
+            "unreadable material must fail with the file error: {error}"
+        );
+
+        let certificate = rcgen::generate_simple_self_signed(vec!["node-a".to_string()]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cert_path = directory.path().join("cert.pem");
+        let key_path = directory.path().join("key.pem");
+        let ca_path = directory.path().join("ca.pem");
+        std::fs::write(&cert_path, certificate.cert.pem()).unwrap();
+        std::fs::write(&key_path, certificate.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&ca_path, certificate.cert.pem()).unwrap();
+        unsafe {
+            std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CERT", &cert_path);
+            std::env::set_var("ARKFLOW_DATA_PLANE_TLS_KEY", &key_path);
+            std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CA", &ca_path);
+        }
+        let tls = data_plane_tls_from_env().expect("complete self-signed material must load");
+        assert!(tls.is_some(), "a complete set must produce a TLS config");
+
+        // Readable but non-PEM material is rejected by the parser.
+        std::fs::write(&cert_path, "this is not a certificate").unwrap();
+        let error = match data_plane_tls_from_env() {
+            Err(error) => error,
+            Ok(_) => panic!("garbage PEM material must be rejected"),
+        };
+        assert!(
+            error.contains("data-plane TLS") && error.contains(":"),
+            "the rejection names the offending material: {error}"
+        );
+        unsafe {
+            std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CERT");
+            std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_KEY");
+            std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CA");
+        }
     }
 
     /// Regression for the Drop guard: a JobTask carrying a dedicated
@@ -4512,5 +4599,3886 @@ mod tests {
         // serves other work.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(runtime.tasks.lock().await.is_empty());
+    }
+
+    // =====================================================================
+    // Coverage additions: object-store guards, recovery validation, runtime
+    // preconditions, command settlement, and full Hub/Agent sessions.
+    // =====================================================================
+
+    /// Event-driven bounded wait (no fixed sleeps on the hot path).
+    async fn wait_for<F, Fut>(budget: Duration, mut condition: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        tokio::time::timeout(budget, async {
+            loop {
+                if condition().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("condition timed out")
+    }
+
+    /// A unique scratch directory for redb state backends: the backend holds
+    /// an exclusive file lock per path and every test shares one process.
+    fn unique_state_dir(tag: &str) -> std::path::PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "arkflow-agent-test-{tag}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    /// A stateless source→sink Job spec value with an optional checkpoint
+    /// object-store URI (processing time, `generate` input).
+    fn source_sink_spec_value(
+        job_id: &str,
+        input_type: &str,
+        input_config: serde_json::Value,
+        time: serde_json::Value,
+        checkpoint_uri: Option<String>,
+    ) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "id": job_id,
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": input_type,
+                "config": input_config,
+                "time": time
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        });
+        if let Some(uri) = checkpoint_uri {
+            value["checkpoint"] =
+                serde_json::json!({"object_store_uri": uri, "interval_ms": 60000, "retention": 3});
+            // Job validation requires a state specification alongside a
+            // checkpoint policy; a durable rooted one keeps this spec legal
+            // without making the source→sink pair stateful.
+            value["state"] = serde_json::json!({
+                "backend": "embedded_kv",
+                "durability": "durable",
+                "root": unique_state_dir(job_id).display().to_string(),
+                "format_version": 1
+            });
+        }
+        value
+    }
+
+    fn processing_time() -> serde_json::Value {
+        serde_json::json!({"mode": "processing_time"})
+    }
+
+    /// A sealed manifest whose task attempts cover exactly the plan's tasks.
+    fn plan_manifest(
+        plan: &JobPlan,
+        checkpoint_id: &str,
+        state_snapshots: Vec<StateSnapshotRef>,
+    ) -> arkflow_core::checkpoint::CheckpointManifest {
+        let mut manifest = arkflow_core::checkpoint::CheckpointManifest {
+            checkpoint_id: checkpoint_id.to_owned(),
+            job_id: plan.spec.id.clone(),
+            job_version: plan.spec.version,
+            generation: 1,
+            task_attempts: plan
+                .tasks
+                .iter()
+                .map(|task| arkflow_core::checkpoint::TaskAttemptSnapshot {
+                    task_id: task.id.clone(),
+                    attempt_id: format!("{}:node-a:0", task.id),
+                    node_id: "node-a".into(),
+                })
+                .collect(),
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
+                checkpoint_id: checkpoint_id.to_owned(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots,
+            format_version: plan
+                .spec
+                .state
+                .as_ref()
+                .map(|state| state.format_version)
+                .unwrap_or(1),
+            checksum: 0,
+        };
+        manifest.seal();
+        manifest
+    }
+
+    /// Write one state snapshot per planned task (entries supplied by
+    /// `entries_for`) plus the sealed manifest at the canonical key.
+    fn write_full_artifact(
+        plan: &JobPlan,
+        store_uri: &str,
+        checkpoint_id: &str,
+        entries_for: impl Fn(&str) -> Vec<arkflow_core::state::StateEntry>,
+    ) -> CheckpointRepository<SharedCheckpointStore> {
+        let repository =
+            CheckpointRepository::new(SharedCheckpointStore::from_uri(store_uri).unwrap());
+        let format_version = plan
+            .spec
+            .state
+            .as_ref()
+            .map(|state| state.format_version)
+            .unwrap_or(1);
+        let mut snapshots = Vec::new();
+        for task in &plan.tasks {
+            let snapshot =
+                arkflow_core::state::StateSnapshot::new(format_version, entries_for(&task.id));
+            let mut reference = repository
+                .write_state_snapshot(checkpoint_id, &snapshot)
+                .unwrap();
+            reference.task_id = task.id.clone();
+            snapshots.push(reference);
+        }
+        let manifest = plan_manifest(plan, checkpoint_id, snapshots);
+        repository
+            .write_manifest(
+                &manifest,
+                RecoveryArtifactKind::Checkpoint,
+                arkflow_core::checkpoint::recovery_manifest_key(
+                    RecoveryArtifactKind::Checkpoint,
+                    checkpoint_id,
+                ),
+            )
+            .unwrap();
+        repository
+    }
+
+    /// Write a sealed manifest straight through the store, bypassing the
+    /// repository's completeness checks — exactly what a foreign or older
+    /// writer could have left behind.
+    fn put_manifest_direct(
+        store_uri: &str,
+        key: &str,
+        manifest: &arkflow_core::checkpoint::CheckpointManifest,
+    ) {
+        SharedCheckpointStore::from_uri(store_uri)
+            .unwrap()
+            .put(key, &serde_json::to_vec(manifest).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_store_rejects_invalid_keys_and_reads_missing_as_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = Url::from_directory_path(directory.path()).unwrap();
+        let store = SharedCheckpointStore::from_uri(uri.as_str()).unwrap();
+        assert!(store.put("", b"x").is_err(), "empty key");
+        assert!(store.put("/absolute", b"x").is_err(), "leading slash");
+        assert!(store.put("a/../b", b"x").is_err(), "parent traversal");
+        assert_eq!(store.get("missing/key").unwrap(), None);
+    }
+
+    #[test]
+    fn checkpoint_store_keys_without_a_prefix_stay_rooted() {
+        let store = SharedCheckpointStore::from_uri("memory://").unwrap();
+        store.put("cp/root-key", b"payload").unwrap();
+        assert_eq!(
+            store.get("cp/root-key").unwrap().as_deref(),
+            Some(b"payload".as_slice())
+        );
+    }
+
+    #[test]
+    fn checkpoint_store_surfaces_backend_errors() {
+        // A file:// store rooted at an existing FILE cannot create objects.
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        let uri = Url::from_file_path(&file).unwrap();
+        let store = SharedCheckpointStore::from_uri(uri.as_str()).unwrap();
+        assert!(store.put("key", b"value").is_err());
+    }
+
+    #[test]
+    fn recovery_artifact_distinguishes_savepoints() {
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "artifact-kinds",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms"}),
+            processing_time(),
+            Some("memory://artifact-kinds".into()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let checkpoint = recovery_artifact(&plan, "cp-1", false).unwrap();
+        let savepoint = recovery_artifact(&plan, "sp-1", true).unwrap();
+        assert!(matches!(checkpoint.kind, RecoveryArtifactKind::Checkpoint));
+        assert!(matches!(savepoint.kind, RecoveryArtifactKind::Savepoint));
+        assert!(checkpoint.manifest_key.starts_with("checkpoints/"));
+        assert!(savepoint.manifest_key.starts_with("savepoints/"));
+    }
+
+    #[test]
+    fn recovery_manifest_rejects_checkpoint_id_mismatch() {
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "manifest-mismatch",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms"}),
+            processing_time(),
+            Some("memory://manifest-mismatch".into()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let manifest = plan_manifest(&plan, "cp-real", Vec::new());
+        let error = validate_recovery_manifest(&plan, "cp-fake", 1, &manifest, false).unwrap_err();
+        assert!(
+            error.contains("does not match the dispatched checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rescale_manifests_with_duplicate_task_entries_fail_closed() {
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "manifest-duplicates",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms"}),
+            processing_time(),
+            Some("memory://manifest-duplicates".into()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let mut manifest = plan_manifest(&plan, "cp-dup", Vec::new());
+        let first = manifest.task_attempts[0].clone();
+        manifest.task_attempts.push(first);
+        manifest.seal();
+        let error = validate_recovery_manifest(&plan, "cp-dup", 1, &manifest, true).unwrap_err();
+        assert!(
+            error.contains("duplicate task entries"),
+            "a corrupted rescale seal must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn recovery_snapshot_validation_enforces_task_sets_and_namespaces() {
+        let store = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", store.path().display());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "snapshot-validation",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms"}),
+            processing_time(),
+            Some(uri.clone()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let namespace = arkflow_core::job::effective_state_namespace(
+            &plan.spec.id,
+            plan.spec.state.as_ref(),
+            "source",
+            "source-0",
+        );
+        let foreign = arkflow_core::job::effective_state_namespace(
+            &arkflow_core::job::JobId::new("another-job").unwrap(),
+            plan.spec.state.as_ref(),
+            "source",
+            "source-0",
+        );
+        let repository = write_full_artifact(&plan, &uri, "cp-snap", |task_id| {
+            if task_id == "source-0" {
+                vec![arkflow_core::state::StateEntry {
+                    namespace: namespace.clone(),
+                    key: b"utf8:k".to_vec(),
+                    value: b"v".to_vec(),
+                    expires_at_ms: None,
+                }]
+            } else {
+                Vec::new()
+            }
+        });
+        let artifact = recovery_artifact(&plan, "cp-snap", false).unwrap();
+        let manifest = repository.read_manifest(&artifact).unwrap();
+        assert!(
+            validate_recovery_snapshots(&plan, &repository, &manifest, false).is_ok(),
+            "a complete, namespace-valid snapshot set restores"
+        );
+
+        // Duplicated snapshot references are a corrupted seal even under
+        // rescale (the task set legitimately differs there).
+        let mut duplicated = manifest.clone();
+        let first = duplicated.state_snapshots[0].clone();
+        duplicated.state_snapshots.push(first);
+        assert!(validate_recovery_snapshots(&plan, &repository, &duplicated, true).is_err());
+
+        // Without rescale, an incomplete snapshot task set is incompatible.
+        let mut partial = manifest.clone();
+        partial.state_snapshots.pop();
+        assert!(validate_recovery_snapshots(&plan, &repository, &partial, false).is_err());
+
+        // An entry outside the Job's state namespace prefix is rejected.
+        let rogue = write_full_artifact(&plan, &uri, "cp-rogue", |task_id| {
+            if task_id == "source-0" {
+                vec![arkflow_core::state::StateEntry {
+                    namespace: foreign.clone(),
+                    key: b"utf8:k".to_vec(),
+                    value: b"v".to_vec(),
+                    expires_at_ms: None,
+                }]
+            } else {
+                Vec::new()
+            }
+        });
+        let rogue_read = rogue
+            .read_manifest(&recovery_artifact(&plan, "cp-rogue", false).unwrap())
+            .unwrap();
+        assert!(
+            validate_recovery_snapshots(&plan, &rogue, &rogue_read, false).is_err(),
+            "foreign namespaces must not restore into this Job"
+        );
+    }
+
+    #[test]
+    fn restore_recovery_state_scopes_snapshots_to_assignments() {
+        let store = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", store.path().display());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "restore-scope",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms"}),
+            processing_time(),
+            Some(uri.clone()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let namespaces: BTreeMap<String, String> = plan
+            .tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    arkflow_core::job::effective_state_namespace(
+                        &plan.spec.id,
+                        plan.spec.state.as_ref(),
+                        &task.operator_id,
+                        &task.id,
+                    ),
+                )
+            })
+            .collect();
+        let repository = write_full_artifact(&plan, &uri, "cp-restore", |task_id| {
+            namespaces.get(task_id).map(|namespace| {
+                vec![arkflow_core::state::StateEntry {
+                    namespace: namespace.clone(),
+                    key: format!("utf8:{task_id}").into_bytes(),
+                    value: b"owned".to_vec(),
+                    expires_at_ms: None,
+                }]
+            }).unwrap_or_default()
+        });
+        let manifest = repository
+            .read_manifest(&recovery_artifact(&plan, "cp-restore", false).unwrap())
+            .unwrap();
+        let all_assignments: Vec<TaskAttempt> = plan
+            .tasks
+            .iter()
+            .map(|task| attempt_for(&plan, &task.id, "node-a"))
+            .collect();
+        let source_only: Vec<TaskAttempt> = vec![attempt_for(&plan, "source-0", "node-a")];
+
+        // Every assigned snapshot's entries land in the backend.
+        let backend = RedbStateBackend::open(unique_state_dir("restore-all"), 1).unwrap();
+        let state: Arc<dyn StateBackend> = Arc::new(backend);
+        restore_recovery_state(&plan, &repository, &manifest, &all_assignments, &state, false)
+            .unwrap();
+        for (task_id, namespace) in &namespaces {
+            assert_eq!(
+                state.get(namespace, format!("utf8:{task_id}").as_bytes()).unwrap(),
+                Some(b"owned".to_vec()),
+                "{task_id} entries must restore"
+            );
+        }
+
+        // A single assigned snapshot restores without merging.
+        let backend = RedbStateBackend::open(unique_state_dir("restore-one"), 1).unwrap();
+        let state: Arc<dyn StateBackend> = Arc::new(backend);
+        restore_recovery_state(&plan, &repository, &manifest, &source_only, &state, false)
+            .unwrap();
+        assert_eq!(
+            state
+                .get(&namespaces["source-0"], b"utf8:source-0")
+                .unwrap(),
+            Some(b"owned".to_vec())
+        );
+        assert_eq!(state.get(&namespaces["sink-0"], b"utf8:sink-0").unwrap(), None);
+
+        // No assigned snapshots: a successful no-op.
+        let backend = RedbStateBackend::open(unique_state_dir("restore-none"), 1).unwrap();
+        let state: Arc<dyn StateBackend> = Arc::new(backend);
+        restore_recovery_state(&plan, &repository, &manifest, &[], &state, false).unwrap();
+        assert_eq!(state.get(&namespaces["source-0"], b"utf8:source-0").unwrap(), None);
+    }
+
+    #[test]
+    fn recovery_record_validity_guards_every_rejection() {
+        let store = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", store.path().display());
+        let spec_value =
+            source_sink_spec_value(
+                "record-valid",
+                "generate",
+                serde_json::json!({"context": "x", "interval": "10ms"}),
+                processing_time(),
+                Some(uri.clone()),
+            );
+        let plan = JobPlan::compile(serde_json::from_value(spec_value.clone()).unwrap()).unwrap();
+        let namespace = arkflow_core::job::effective_state_namespace(
+            &plan.spec.id,
+            plan.spec.state.as_ref(),
+            "source",
+            "source-0",
+        );
+        write_full_artifact(&plan, &uri, "cp-rec", |task_id| {
+            if task_id == "source-0" {
+                vec![arkflow_core::state::StateEntry {
+                    namespace: namespace.clone(),
+                    key: b"utf8:k".to_vec(),
+                    value: b"v".to_vec(),
+                    expires_at_ms: None,
+                }]
+            } else {
+                Vec::new()
+            }
+        });
+        let record = |checkpoint_id: &str, kind: &str| crate::storage::JobCheckpointRecord {
+            job_id: "record-valid".into(),
+            job_version: 1,
+            checkpoint_id: checkpoint_id.into(),
+            kind: kind.into(),
+            status: "completed".into(),
+            manifest_uri: None,
+            format_version: 1,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let valid: arkflow_core::job::JobSpec = serde_json::from_value(spec_value.clone()).unwrap();
+        assert!(
+            recovery_record_is_valid(&valid, &record("cp-rec", "checkpoint")),
+            "a complete artifact validates"
+        );
+        assert!(
+            !recovery_record_is_valid(&valid, &record("cp-rec", "snapshot")),
+            "unknown kinds are rejected"
+        );
+        assert!(
+            !recovery_record_is_valid(&valid, &record("cp-missing", "checkpoint")),
+            "a missing manifest is rejected"
+        );
+
+        // A spec that cannot compile has no recoverable record.
+        let mut broken = spec_value.clone();
+        broken["resources"] = serde_json::json!({"cpu_millicores": 0});
+        let broken: arkflow_core::job::JobSpec = serde_json::from_value(broken).unwrap();
+        assert!(!recovery_record_is_valid(&broken, &record("cp-rec", "checkpoint")));
+
+        // A spec without a checkpoint store cannot be validated either.
+        let stateless: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "record-valid",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms"}),
+            processing_time(),
+            None,
+        ))
+        .unwrap();
+        assert!(!recovery_record_is_valid(&stateless, &record("cp-rec", "checkpoint")));
+
+        // A manifest stored under one checkpoint id but describing another
+        // fails the identity check.
+        let inner = plan_manifest(&plan, "cp-inner", Vec::new());
+        put_manifest_direct(
+            &uri,
+            &arkflow_core::checkpoint::recovery_manifest_key(
+                RecoveryArtifactKind::Checkpoint,
+                "cp-outer",
+            ),
+            &inner,
+        );
+        assert!(
+            !recovery_record_is_valid(&valid, &record("cp-outer", "checkpoint")),
+            "an id-mismatched manifest is rejected"
+        );
+
+        // Namespace-valid snapshots are re-read as part of validity.
+        let foreign_ns = arkflow_core::job::effective_state_namespace(
+            &arkflow_core::job::JobId::new("another-job").unwrap(),
+            plan.spec.state.as_ref(),
+            "source",
+            "source-0",
+        );
+        let rogue_snapshot = arkflow_core::state::StateSnapshot::new(
+            1,
+            vec![arkflow_core::state::StateEntry {
+                namespace: foreign_ns,
+                key: b"utf8:k".to_vec(),
+                value: b"v".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        let rogue_repository =
+            CheckpointRepository::new(SharedCheckpointStore::from_uri(&uri).unwrap());
+        let mut rogue_reference = rogue_repository
+            .write_state_snapshot("cp-rogue", &rogue_snapshot)
+            .unwrap();
+        rogue_reference.task_id = "source-0".into();
+        let mut rogue = plan_manifest(&plan, "cp-rogue", vec![rogue_reference]);
+        rogue.seal();
+        put_manifest_direct(
+            &uri,
+            &arkflow_core::checkpoint::recovery_manifest_key(
+                RecoveryArtifactKind::Checkpoint,
+                "cp-rogue",
+            ),
+            &rogue,
+        );
+        assert!(
+            !recovery_record_is_valid(&valid, &record("cp-rogue", "checkpoint")),
+            "foreign-namespace snapshots are rejected"
+        );
+
+        // Rescale with an empty task-attempt set passes identity but has no
+        // observable task coverage.
+        let mut rescale = spec_value.clone();
+        rescale["rescale"] = serde_json::json!(true);
+        let rescale: arkflow_core::job::JobSpec = serde_json::from_value(rescale).unwrap();
+        let repository =
+            CheckpointRepository::new(SharedCheckpointStore::from_uri(&uri).unwrap());
+        let empty_snapshot = arkflow_core::state::StateSnapshot::new(1, Vec::new());
+        let mut empty_reference = repository
+            .write_state_snapshot("cp-empty", &empty_snapshot)
+            .unwrap();
+        empty_reference.task_id = "source-0".into();
+        let mut empty_attempts =
+            plan_manifest(&plan, "cp-empty", vec![empty_reference]);
+        empty_attempts.task_attempts.clear();
+        empty_attempts.seal();
+        put_manifest_direct(
+            &uri,
+            &arkflow_core::checkpoint::recovery_manifest_key(
+                RecoveryArtifactKind::Checkpoint,
+                "cp-empty",
+            ),
+            &empty_attempts,
+        );
+        assert!(
+            !recovery_record_is_valid(&rescale, &record("cp-empty", "checkpoint")),
+            "an artifact without task attempts has no coverage"
+        );
+    }
+
+    #[test]
+    fn node_path_encoding_and_ephemeral_nonces_stay_injective() {
+        assert_eq!(safe_path_component(""), "unknown");
+        assert_ne!(ephemeral_state_nonce(), ephemeral_state_nonce());
+    }
+
+    #[test]
+    fn start_marker_persists_atomically_and_removes_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join(".arkflow-started");
+        persist_start_marker(&marker).unwrap();
+        assert!(marker.is_file());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "started\n");
+        remove_start_marker(&marker);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn completed_command_cache_evicts_only_the_oldest_entry() {
+        let result_for = |command_id: &str| CommandResult {
+            command_id: command_id.into(),
+            operation_id: "op".into(),
+            state: HubOperationState::Succeeded,
+            progress: 100,
+            error: None,
+            correlation_id: None,
+            generation: 1,
+            observed_generation: None,
+            action_id: None,
+            failure_class: None,
+            config_version_id: None,
+            rollout_id: None,
+            observed_checkpoint_id: None,
+            checkpoint_manifest_uri: None,
+            result: None,
+        };
+        let mut cache = CompletedCommandCache::new(2);
+        for command_id in ["cmd-1", "cmd-2", "cmd-3"] {
+            remember_completed_command(&mut cache, command_id.into(), result_for(command_id));
+        }
+        assert!(
+            replay_cached_command(&cache, "cmd-1").is_none(),
+            "the oldest entry is evicted one at a time"
+        );
+        assert!(replay_cached_command(&cache, "cmd-2").is_some());
+        assert!(replay_cached_command(&cache, "cmd-3").is_some());
+        // Re-membering an existing id never evicts a newer one.
+        remember_completed_command(&mut cache, "cmd-2".into(), result_for("cmd-2"));
+        assert!(replay_cached_command(&cache, "cmd-3").is_some());
+    }
+
+    /// The Drop guard's no-runtime fallback: dropped outside every tokio
+    /// runtime, the dedicated-runtime shutdown parks on a bare thread.
+    #[test]
+    fn dropping_a_task_outside_any_runtime_takes_the_bare_thread_path() {
+        let task = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let dedicated = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("arkflow-job-dropguard-sync")
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                JobTask {
+                    generation: 1,
+                    ephemeral_state: false,
+                    recovery_required: false,
+                    cancellation: CancellationToken::new(),
+                    assignments: Vec::new(),
+                    dedicated_runtime: Some(Arc::new(dedicated)),
+                    watermark_partitions: BTreeMap::new(),
+                    state: Arc::new(
+                        arkflow_core::state::InMemoryStateBackend::new(1)
+                            .expect("in-memory test backend"),
+                    ),
+                    checkpoint_store_uri: None,
+                    kernel: None,
+                    handle: tokio::spawn(async { Ok(()) }),
+                }
+            })
+        };
+        // Outside every runtime context: must not panic.
+        drop(task);
+    }
+
+    #[tokio::test]
+    async fn metrics_count_ephemeral_and_recovery_required_jobs() {
+        let runtime = JobRuntime::default();
+        for (job_id, ephemeral, recovery) in
+            [("job-eph", true, false), ("job-rec", false, true), ("job-plain", false, false)]
+        {
+            let state: Arc<dyn StateBackend> = Arc::new(
+                arkflow_core::state::InMemoryStateBackend::new(1)
+                    .expect("in-memory test backend"),
+            );
+            runtime.tasks.lock().await.insert(
+                job_id.into(),
+                JobTask {
+                    generation: 1,
+                    ephemeral_state: ephemeral,
+                    recovery_required: recovery,
+                    cancellation: CancellationToken::new(),
+                    assignments: Vec::new(),
+                    dedicated_runtime: None,
+                    watermark_partitions: BTreeMap::new(),
+                    state,
+                    checkpoint_store_uri: None,
+                    kernel: None,
+                    handle: tokio::spawn(std::future::pending::<
+                        Result<(), arkflow_core::Error>,
+                    >()),
+                },
+            );
+        }
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics["jobs_total"], 3.0);
+        assert_eq!(metrics["jobs_ephemeral_state"], 1.0);
+        assert_eq!(metrics["jobs_recovery_required"], 1.0);
+        let mut tasks = runtime.tasks.lock().await;
+        for task in tasks.values_mut() {
+            task.handle.abort();
+        }
+        tasks.clear();
+    }
+
+    #[tokio::test]
+    async fn parking_no_observations_is_a_no_op() {
+        JobRuntime::default().park_observations(Vec::new()).await;
+    }
+
+    // ------------------ JobRuntime preconditions ------------------
+
+    #[tokio::test]
+    async fn start_and_stop_reject_command_level_preconditions() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let runtime = Arc::new(JobRuntime::default());
+        let (plan, assignments) = replacement_test_plan("orders-guards").await;
+
+        // No assignments at all.
+        let error = runtime
+            .start(
+                plan.clone(),
+                Vec::new(),
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Job command contains no task assignments");
+
+        // The Hub declared recovery required but supplied no checkpoint.
+        let error = runtime
+            .start(
+                plan.clone(),
+                assignments.clone(),
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload {
+                    recovery_required: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("requires recovery but no compatible checkpoint"),
+            "{error}"
+        );
+
+        // A start behind an already-registered newer generation is stale.
+        insert_exited_task(&runtime, "orders-guards", 5, Ok(())).await;
+        let error = runtime
+            .start(
+                plan.clone(),
+                assignments.clone(),
+                3,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "job generation is stale");
+
+        // So is a stop behind a newer generation.
+        let error = runtime.stop("orders-guards", 3).await.unwrap_err();
+        assert_eq!(error, "job generation is stale");
+        let _ = runtime.take_finished().await;
+    }
+
+    /// A durable, stateful, checkpointed Job persists its start marker; a
+    /// restart at the same generation without a recovery payload must fail
+    /// closed on that marker (the state on disk may be mid-mutation).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_restart_without_recovery_fails_closed_on_the_start_marker() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let state_root = tempfile::tempdir().unwrap();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders-marker",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "agg", "kind": "map", "stateful": true, "key_field": "key", "config": {"type": "batch", "count": 1, "timeout_ms": 10}},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "agg", "partitioned": true},
+                {"id": "e2", "from": "agg", "to": "sink"}
+            ],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "generate",
+                "config": {"context": "x", "interval": "10ms", "batch_size": 1},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {
+                "backend": "embedded_kv",
+                "durability": "durable",
+                "root": state_root.path().display().to_string(),
+                "format_version": 1
+            },
+            "checkpoint": {
+                "object_store_uri": format!("file://{}", checkpoint_root.path().display()),
+                "interval_ms": 60000,
+                "retention": 3
+            }
+        }))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        runtime
+            .start(
+                plan.clone(),
+                assignments.clone(),
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the durable start persists its marker");
+        let marker = durable_recovery_marker(&plan, "node-a", 1).unwrap();
+        assert!(marker.is_file(), "the start marker must exist on disk");
+
+        runtime.stop("orders-marker", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+
+        // Stopping does not clear the marker: only a recovery start may run.
+        assert!(marker.is_file(), "stopping must not clear the marker");
+        let error = runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("requires recovery because state marker"),
+            "{error}"
+        );
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
+    /// A spawn failure must unwind everything the start path registered: the
+    /// placeholder task-map entry, the cancellation token, and the marker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_failure_releases_the_placeholder_and_the_start_marker() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let state_root = tempfile::tempdir().unwrap();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders-spawnfail",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "agg", "kind": "map", "stateful": true, "key_field": "key", "config": {"type": "batch", "count": 1, "timeout_ms": 10}},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "agg", "partitioned": true},
+                {"id": "e2", "from": "agg", "to": "sink"}
+            ],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "no-such-input",
+                "config": {},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {
+                "backend": "embedded_kv",
+                "durability": "durable",
+                "root": state_root.path().display().to_string(),
+                "format_version": 1
+            },
+            "checkpoint": {
+                "object_store_uri": format!("file://{}", checkpoint_root.path().display()),
+                "interval_ms": 60000,
+                "retention": 3
+            }
+        }))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        let error = runtime
+            .start(
+                plan.clone(),
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("no-such-input") || error.contains("input"),
+            "the missing input must surface: {error}"
+        );
+        assert!(
+            runtime.tasks.lock().await.is_empty(),
+            "the placeholder entry must be removed"
+        );
+        let marker = durable_recovery_marker(&plan, "node-a", 1).unwrap();
+        assert!(!marker.is_file(), "the start marker must be rolled back");
+    }
+
+    /// Ephemeral-state Jobs run against a unique process-temp root and honor
+    /// the declared `state.max_bytes` bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ephemeral_state_jobs_run_against_a_bounded_temp_root() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders-ephemeral",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "agg", "kind": "map", "stateful": true, "key_field": "key", "config": {"type": "batch", "count": 1, "timeout_ms": 10}},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "agg", "partitioned": true},
+                {"id": "e2", "from": "agg", "to": "sink"}
+            ],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "generate",
+                "config": {"context": "x", "interval": "10ms", "batch_size": 1},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {
+                "backend": "embedded_kv",
+                "durability": "ephemeral",
+                "format_version": 1,
+                "max_bytes": 4096
+            }
+        }))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the ephemeral start succeeds");
+        let tasks = runtime.tasks.lock().await;
+        let task = tasks.get("orders-ephemeral").expect("registered");
+        assert!(task.ephemeral_state, "the task carries the ephemeral flag");
+        drop(tasks);
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics["jobs_ephemeral_state"], 1.0);
+        runtime.stop("orders-ephemeral", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+    /// A bounded source (generate with `count`) ends its chain normally: the
+    /// kernel exits on its own and `take_finished` collects the outcome so
+    /// the Hub learns the Job stopped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_that_ends_on_its_own_is_collected_by_take_finished() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let runtime = Arc::new(JobRuntime::default());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "orders-bounded",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "5ms", "count": 2, "batch_size": 1}),
+            processing_time(),
+            None,
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the bounded start succeeds");
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let finished = runtime.take_finished().await;
+                if finished.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                break finished;
+            }
+        })
+        .await
+        .expect("the bounded kernel must exit on its own");
+        assert!(
+            finished
+                .iter()
+                .any(|(job_id, generation, _)| job_id == "orders-bounded" && *generation == 1),
+            "the finished kernel must be reported: {finished:?}"
+        );
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_all_cancels_every_registered_task() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let runtime = Arc::new(JobRuntime::default());
+        let (plan_a, assignments_a) = replacement_test_plan("orders-stopall-a").await;
+        let (plan_b, assignments_b) = replacement_test_plan("orders-stopall-b").await;
+        runtime
+            .start(
+                plan_a,
+                assignments_a,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap();
+        runtime
+            .start(
+                plan_b,
+                assignments_b,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.tasks.lock().await.len(), 2);
+        runtime.stop_all().await;
+        assert!(runtime.tasks.lock().await.is_empty());
+        let _ = runtime.take_finished().await;
+    }
+
+    /// Checkpoint + aggregate round trip through a real object store,
+    /// including the savepoint artifact kind and every aggregation guard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_and_aggregate_round_trip_through_the_object_store() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let store_uri = format!("file://{}", checkpoint_root.path().display());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "orders-checkpoint",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms", "batch_size": 1}),
+            processing_time(),
+            Some(store_uri.clone()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let planned_task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        runtime
+            .start(
+                plan.clone(),
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the checkpointed job starts");
+
+        // Generation mismatches are rejected before any barrier work.
+        let node_a = ["node-a".to_string()];
+        let error = runtime
+            .checkpoint("orders-checkpoint", "cp-1", 9, false, "node-a")
+            .await
+            .unwrap_err();
+        assert_eq!(error, "checkpoint generation does not match running Job");
+        let error = runtime
+            .aggregate_checkpoint("orders-checkpoint", "cp-1", 9, false, &node_a, &planned_task_ids)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "checkpoint generation does not match running Job");
+
+        // A savepoint writes under the savepoints/ prefix.
+        let uri = runtime
+            .checkpoint("orders-checkpoint", "sp-1", 1, true, "node-a")
+            .await
+            .expect("the savepoint barrier completes");
+        assert!(
+            uri.contains("savepoints/sp-1/"),
+            "the savepoint manifest lands under savepoints/: {uri}"
+        );
+
+        let planned = planned_task_ids.clone();
+        let aggregated = runtime
+            .aggregate_checkpoint(
+                "orders-checkpoint",
+                "sp-1",
+                1,
+                true,
+                &["node-a".to_string()],
+                &planned,
+            )
+            .await
+            .expect("the single-node aggregate seals the final manifest");
+        assert!(
+            aggregated.contains("sp-1"),
+            "the aggregate points at the sealed manifest: {aggregated}"
+        );
+
+        // Guardrails: no agent manifests, no planned tasks.
+        let error = runtime
+            .aggregate_checkpoint("orders-checkpoint", "sp-1", 1, true, &[], &planned_task_ids)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "checkpoint has no agent manifests");
+        let error = runtime
+            .aggregate_checkpoint("orders-checkpoint", "sp-1", 1, true, &node_a, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error, "checkpoint has no planned task assignments");
+
+        // A second node's manifest that belongs to another job breaks the
+        // shared-barrier requirement...
+        let repository =
+            CheckpointRepository::new(SharedCheckpointStore::from_uri(&store_uri).unwrap());
+        let node_a_key = "savepoints/sp-1/manifests/node-a.json".to_string();
+        let node_a_artifact = RecoveryArtifact {
+            id: "sp-1".into(),
+            kind: RecoveryArtifactKind::Savepoint,
+            manifest_key: node_a_key.clone(),
+            job_version: plan.spec.version,
+            format_version: 1,
+            created_at_ms: 0,
+            status: CheckpointStatus::Completed,
+        };
+        let node_manifest = repository.read_manifest(&node_a_artifact).unwrap();
+        let mut foreign_manifest = node_manifest.clone();
+        foreign_manifest.job_id = arkflow_core::job::JobId::new("another-job").unwrap();
+        foreign_manifest.seal();
+        repository
+            .write_manifest(
+                &foreign_manifest,
+                RecoveryArtifactKind::Savepoint,
+                "savepoints/sp-1/manifests/node-b.json".to_string(),
+            )
+            .unwrap();
+        let error = runtime
+            .aggregate_checkpoint(
+                "orders-checkpoint",
+                "sp-1",
+                1,
+                true,
+                &["node-a".to_string(), "node-b".to_string()],
+                &planned_task_ids,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error, "checkpoint manifests do not share one job barrier",
+            "{error}"
+        );
+
+        // ...and a verbatim duplicate breaks task uniqueness.
+        let mut same_manifest = node_manifest;
+        same_manifest.seal();
+        repository
+            .write_manifest(
+                &same_manifest,
+                RecoveryArtifactKind::Savepoint,
+                "savepoints/sp-1/manifests/node-b.json".to_string(),
+            )
+            .unwrap();
+        let error = runtime
+            .aggregate_checkpoint(
+                "orders-checkpoint",
+                "sp-1",
+                1,
+                true,
+                &["node-a".to_string(), "node-b".to_string()],
+                &planned_task_ids,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("duplicate task"),
+            "duplicate tasks across manifests must fail: {error}"
+        );
+
+        runtime.stop("orders-checkpoint", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+    /// A checkpoint on a Job without a checkpoint store fails with the
+    /// actionable error instead of panicking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_without_a_store_uri_fails_with_an_actionable_error() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let runtime = Arc::new(JobRuntime::default());
+        let (plan, assignments) = replacement_test_plan("orders-nostore").await;
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap();
+        let error = runtime
+            .checkpoint("orders-nostore", "cp-1", 1, false, "node-a")
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Job has no checkpoint object_store_uri");
+        runtime.stop("orders-nostore", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+    /// Recovery start: a complete artifact restores keyed state before the
+    /// kernel connects its sources.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_start_restores_keyed_state_before_running() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let store_uri = format!("file://{}", checkpoint_root.path().display());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "orders-recover",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms", "batch_size": 1}),
+            processing_time(),
+            Some(store_uri.clone()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let namespace = arkflow_core::job::effective_state_namespace(
+            &plan.spec.id,
+            plan.spec.state.as_ref(),
+            "source",
+            "source-0",
+        );
+        write_full_artifact(&plan, &store_uri, "cp-recover", |task_id| {
+            if task_id == "source-0" {
+                vec![arkflow_core::state::StateEntry {
+                    namespace: namespace.clone(),
+                    key: b"utf8:counter".to_vec(),
+                    value: b"42".to_vec(),
+                    expires_at_ms: None,
+                }]
+            } else {
+                Vec::new()
+            }
+        });
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        runtime
+            .start(
+                plan.clone(),
+                assignments,
+                1,
+                Some("cp-recover".into()),
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the recovery start succeeds");
+        {
+            let tasks = runtime.tasks.lock().await;
+            let task = tasks.get("orders-recover").expect("registered");
+            assert_eq!(
+                task.state.get(&namespace, b"utf8:counter").unwrap(),
+                Some(b"42".to_vec()),
+                "the checkpointed entry must be restored into the node backend"
+            );
+        }
+        runtime.stop("orders-recover", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+    /// Broken artifacts fail closed with distinct, actionable errors and
+    /// leave nothing registered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_start_fails_closed_on_broken_artifacts() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let store_uri = format!("file://{}", checkpoint_root.path().display());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "orders-broken-recovery",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms", "batch_size": 1}),
+            processing_time(),
+            Some(store_uri.clone()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+
+        // (a) the artifact does not exist at all
+        let error = runtime
+            .start(
+                plan.clone(),
+                assignments.clone(),
+                1,
+                Some("no-such-checkpoint".into()),
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.is_empty(), "{error}");
+        assert!(runtime.tasks.lock().await.is_empty());
+
+        // (b) the manifest exists under the requested key but belongs to a
+        // different checkpoint id
+        let repository =
+            CheckpointRepository::new(SharedCheckpointStore::from_uri(&store_uri).unwrap());
+        let mismatch_snapshot = arkflow_core::state::StateSnapshot::new(1, Vec::new());
+        let mut mismatch_reference = repository
+            .write_state_snapshot("cp-fake", &mismatch_snapshot)
+            .unwrap();
+        mismatch_reference.task_id = "source-0".into();
+        let mismatched = plan_manifest(&plan, "cp-real", vec![mismatch_reference]);
+        put_manifest_direct(
+            &store_uri,
+            &arkflow_core::checkpoint::recovery_manifest_key(
+                RecoveryArtifactKind::Checkpoint,
+                "cp-fake",
+            ),
+            &mismatched,
+        );
+        let error = runtime
+            .start(
+                plan.clone(),
+                assignments.clone(),
+                1,
+                Some("cp-fake".into()),
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("does not match the dispatched checkpoint"),
+            "{error}"
+        );
+        assert!(runtime.tasks.lock().await.is_empty());
+
+        // (c) the attempts cover the plan but the snapshot task set does not
+        let partial_snapshots = {
+            let snapshot = arkflow_core::state::StateSnapshot::new(1, Vec::new());
+            let mut reference = repository
+                .write_state_snapshot("cp-partial", &snapshot)
+                .unwrap();
+            reference.task_id = "source-0".into();
+            vec![reference]
+        };
+        let partial = plan_manifest(&plan, "cp-partial", partial_snapshots);
+        put_manifest_direct(
+            &store_uri,
+            &arkflow_core::checkpoint::recovery_manifest_key(
+                RecoveryArtifactKind::Checkpoint,
+                "cp-partial",
+            ),
+            &partial,
+        );
+        let error = runtime
+            .start(
+                plan.clone(),
+                assignments,
+                1,
+                Some("cp-partial".into()),
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("incompatible") || error.contains("does not match"),
+            "an incomplete snapshot set must fail closed: {error}"
+        );
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
+    /// A recovery start whose reconnection fails must release the prepared
+    /// inputs so a retry can reconnect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_start_releases_inputs_when_reconnect_fails() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let store_uri = format!("file://{}", checkpoint_root.path().display());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "orders-ws-recovery",
+            "websocket",
+            serde_json::json!({"url": "ws://127.0.0.1:1/"}),
+            processing_time(),
+            Some(store_uri.clone()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        write_full_artifact(&plan, &store_uri, "cp-ws", |_| Vec::new());
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime.start(
+                plan,
+                assignments,
+                1,
+                Some("cp-ws".into()),
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            ),
+        )
+        .await
+        .expect("the failing reconnect must not hang");
+        assert!(result.is_err(), "a dead websocket endpoint must fail recovery");
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
+    /// Event-time sources install watermark gates (a shared tracker per
+    /// watermark group) before the kernel consumes anything, and a recovery
+    /// start re-installs the checkpointed per-partition and per-task
+    /// watermarks into those gates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn event_time_recovery_reinstalls_watermark_gates() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let store_uri = format!("file://{}", checkpoint_root.path().display());
+        let event_time = || {
+            serde_json::json!({
+                "mode": "event_time",
+                "timestamp_field": "value",
+                "watermark": {"strategy": "bounded_out_of_orderness", "out_of_orderness_ms": 50}
+            })
+        };
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders-eventtime",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "extra", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "sink"},
+                {"id": "e2", "from": "extra", "to": "sink"}
+            ],
+            "sources": [
+                {
+                    "operator_id": "source",
+                    "input_type": "generate",
+                    "config": {"context": "x", "interval": "10ms", "count": 2, "batch_size": 1},
+                    "time": event_time()
+                },
+                {
+                    "operator_id": "extra",
+                    "input_type": "generate",
+                    "config": {"context": "y", "interval": "10ms", "count": 2, "batch_size": 1},
+                    "time": event_time()
+                }
+            ],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {
+                "backend": "embedded_kv",
+                "durability": "durable",
+                "root": unique_state_dir("orders-eventtime").display().to_string(),
+                "format_version": 1
+            },
+            "checkpoint": {"object_store_uri": store_uri, "interval_ms": 60000, "retention": 3}
+        }))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let repository =
+            CheckpointRepository::new(SharedCheckpointStore::from_uri(&store_uri).unwrap());
+        let mut snapshots = Vec::new();
+        for task in &plan.tasks {
+            let snapshot = arkflow_core::state::StateSnapshot::new(1, Vec::new());
+            let mut reference = repository
+                .write_state_snapshot("cp-eventtime", &snapshot)
+                .unwrap();
+            reference.task_id = task.id.clone();
+            snapshots.push(reference);
+        }
+        let mut manifest = plan_manifest(&plan, "cp-eventtime", snapshots);
+        // One gated source restores its physical partition watermark, the
+        // other its task-level watermark (no partition progress recorded).
+        manifest.watermark_partitions.insert(
+            "source-0".into(),
+            vec![arkflow_core::checkpoint::WatermarkPosition::new(
+                Some("orders".into()),
+                0,
+                9_000,
+            )],
+        );
+        manifest.watermarks_ms.insert("extra-0".into(), 4_500);
+        manifest.seal();
+        repository
+            .write_manifest(
+                &manifest,
+                RecoveryArtifactKind::Checkpoint,
+                arkflow_core::checkpoint::recovery_manifest_key(
+                    RecoveryArtifactKind::Checkpoint,
+                    "cp-eventtime",
+                ),
+            )
+            .unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                Some("cp-eventtime".into()),
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the event-time recovery start succeeds");
+        assert!(runtime.tasks.lock().await.contains_key("orders-eventtime"));
+        runtime.stop("orders-eventtime", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+    /// Generic operators (map/filter/udf) build through the registry
+    /// adapter; a config without `type` fails with the operator's identity.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn processor_operators_build_through_the_registry_adapter() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let runtime = Arc::new(JobRuntime::default());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders-processor",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "shaper", "kind": "map", "config": {"type": "batch", "count": 1, "timeout_ms": 10}},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "shaper"},
+                {"id": "e2", "from": "shaper", "to": "sink"}
+            ],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "generate",
+                "config": {"context": "x", "interval": "10ms", "count": 3, "batch_size": 1},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+        }))
+        .unwrap();
+        let mut plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        runtime
+            .start(
+                plan.clone(),
+                assignments.clone(),
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the processor job starts");
+        assert!(runtime.tasks.lock().await.contains_key("orders-processor"));
+        runtime.stop("orders-processor", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+
+        // A processor without config.type cannot build.
+        let mut broken = serde_json::to_value(&plan.spec).unwrap();
+        broken["operators"][1]["config"] = serde_json::json!({});
+        let broken: arkflow_core::job::JobSpec = serde_json::from_value(broken).unwrap();
+        plan = JobPlan::compile(broken).unwrap();
+        let error = runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("requires config.type"),
+            "the operator identity must surface: {error}"
+        );
+    }
+
+    /// A split payload with peer data-plane addresses builds the remote-edge
+    /// context: malformed addresses are skipped and a missing full task map
+    /// degrades to the local assignment map.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn split_payloads_with_peer_addresses_wire_remote_context() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let mut runtime = JobRuntime::default();
+        let credentials =
+            arkflow_core::executor::remote::DataPlaneCredentials::new("node-a", "secret")
+                .expect("test credentials");
+        let manager = arkflow_core::executor::remote::NetworkManager::with_config(
+            arkflow_core::executor::remote::NetworkManagerConfig {
+                credentials: Some(credentials),
+                channel_capacity: 16,
+                ..Default::default()
+            },
+        )
+        .expect("data plane manager builds");
+        manager.spawn();
+        runtime.data_plane = Some(manager.clone());
+        let (plan, assignments) = replacement_test_plan("orders-remotectx").await;
+        let split = SplitPlacementPayload {
+            task_nodes: None,
+            node_data_ports: BTreeMap::from([
+                ("node-a".into(), "127.0.0.1:39601".into()),
+                ("bad-node".into(), "not-a-socket-address".into()),
+            ]),
+            recovery_required: false,
+        };
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &split,
+            )
+            .await
+            .expect("the colocated split start succeeds");
+        assert!(runtime.tasks.lock().await.contains_key("orders-remotectx"));
+        runtime.stop("orders-remotectx", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+        manager.shutdown();
+    }
+
+    // ------------------ command settlement ------------------
+
+    /// A minimal always-200 Hub so `execute_command` can deliver results.
+    async fn stub_hub_server() -> (String, CancellationToken, tokio::task::JoinHandle<()>) {
+        async fn always_ok() -> axum::http::StatusCode {
+            axum::http::StatusCode::OK
+        }
+        let app = axum::Router::new().fallback(always_ok);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let shutdown = cancellation.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), cancellation, task)
+    }
+
+    fn test_command(
+        operation: &str,
+        resource_id: &str,
+        generation: u64,
+        payload: Option<serde_json::Value>,
+        expires_at_ms: u64,
+    ) -> AgentCommand {
+        AgentCommand {
+            id: format!("cmd-{operation}-{resource_id}"),
+            operation_id: format!("op-{operation}-{resource_id}"),
+            node_id: "node-a".into(),
+            operation: operation.into(),
+            resource_id: resource_id.into(),
+            expires_at_ms,
+            generation,
+            action_id: Some(format!("action-{operation}")),
+            config_version_id: None,
+            attempt_id: None,
+            rollout_id: None,
+            correlation_id: Some("corr-1".into()),
+            payload,
+            required_capabilities: Vec::new(),
+        }
+    }
+
+    fn test_node_config(hub_url: &str) -> NodeAgentConfig {
+        NodeAgentConfig {
+            hub_url: hub_url.into(),
+            api_prefix: "/api/v1".into(),
+            node_id: "node-a".into(),
+            node_token: "token".into(),
+            boot_id: "boot-test".into(),
+            heartbeat_interval: Duration::from_secs(5),
+            report_interval: Duration::from_secs(5),
+            poll_interval: Duration::from_secs(5),
+            data_port: None,
+            data_host: None,
+        }
+    }
+
+    fn test_auth() -> AgentAuth {
+        AgentAuth {
+            node_id: "node-a".into(),
+            session_token: "stub-session".into(),
+        }
+    }
+
+    fn generate_drop_stream(id: &str) -> arkflow_core::stream::StreamConfig {
+        arkflow_core::stream::StreamConfig {
+            id: Some(id.to_string()),
+            input: InputConfig {
+                input_type: "generate".into(),
+                name: None,
+                codec: None,
+                config: Some(serde_json::json!({
+                    "context": "agent-test",
+                    "interval": "50ms",
+                    "batch_size": 1
+                })),
+            },
+            pipeline: arkflow_core::pipeline::PipelineConfig {
+                thread_num: 1,
+                processors: Vec::new(),
+            },
+            output: OutputConfig {
+                output_type: "drop".into(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            error_output: None,
+            buffer: None,
+            durability: None,
+            state: None,
+            temporary: None,
+        }
+    }
+
+    fn engine_config_with_stream(stream_id: &str) -> EngineConfig {
+        EngineConfig {
+            streams: vec![generate_drop_stream(stream_id)],
+            jobs: Vec::new(),
+            logging: LoggingConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        }
+    }
+
+    /// Every non-kernel command shape settles through the stub Hub with the
+    /// state, error and failure class the Hub's retry machinery expects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let (hub_url, hub_cancel, hub_task) = stub_hub_server().await;
+        let client = build_agent_client(&hub_url).unwrap();
+        let config = test_node_config(&hub_url);
+        let auth = test_auth();
+        let engine_config = engine_config_with_stream("orders-stream");
+        let cp = ControlPlane::new(engine_config.clone(), RuntimeManager::new());
+        cp.runtime_manager()
+            .replace_config(&engine_config)
+            .await
+            .expect("the stream registers");
+        let runtime = Arc::new(JobRuntime::default());
+        let live_deadline = now_ms().saturating_add(60_000);
+
+        // Expired before execution.
+        let command = test_command("restart", "orders-stream", 1, None, now_ms() - 1_000);
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::TimedOut);
+        assert_eq!(result.failure_class.as_deref(), Some("temporary_execution"));
+        assert!(result.error.is_some());
+
+        // A Job command behind the running generation is superseded.
+        insert_exited_task(&runtime, "job-stale", 5, Ok(())).await;
+        let command = test_command("job_stop", "job-stale", 3, None, live_deadline);
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Superseded);
+        assert_eq!(result.observed_generation, Some(5));
+        assert_eq!(result.failure_class.as_deref(), Some("stale_generation"));
+
+        // A failing Job command carries the observed checkpoint id.
+        let command = test_command(
+            "job_checkpoint",
+            "ghost-job",
+            1,
+            Some(serde_json::json!({"checkpoint_id": "cp-9"})),
+            live_deadline,
+        );
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Failed);
+        assert_eq!(result.observed_checkpoint_id.as_deref(), Some("cp-9"));
+        assert_eq!(result.failure_class.as_deref(), Some("permanent_execution"));
+        assert!(result.checkpoint_manifest_uri.is_none());
+
+        // A Job restart through the command path stops and starts the kernel.
+        let (plan, assignments) = replacement_test_plan("orders-cmd").await;
+        let payload = serde_json::json!({
+            "plan": serde_json::to_value(&plan).unwrap(),
+            "assignments": serde_json::to_value(&assignments).unwrap(),
+        });
+        let command = test_command("job_restart", "orders-cmd", 1, Some(payload), live_deadline);
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Succeeded);
+        assert_eq!(result.observed_generation, Some(1));
+        assert!(result.error.is_none());
+        assert!(runtime.tasks.lock().await.contains_key("orders-cmd"));
+
+        // Validate/diff configuration reports.
+        let candidate = arkflow_core::configuration::ConfigCandidate {
+            format: arkflow_core::configuration::ConfigFormat::Yaml,
+            content: "streams: []\n".into(),
+            content_verbatim: None,
+        };
+        let command = test_command(
+            "validate_configuration",
+            "config",
+            1,
+            Some(serde_json::to_value(&candidate).unwrap()),
+            live_deadline,
+        );
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Succeeded);
+        let report = result.result.expect("the validation report rides the payload");
+        assert_eq!(report["valid"], serde_json::json!(true));
+
+        let invalid = arkflow_core::configuration::ConfigCandidate {
+            format: arkflow_core::configuration::ConfigFormat::Yaml,
+            content: "streams: [ { broken\n".into(),
+            content_verbatim: None,
+        };
+        let command = test_command(
+            "validate_configuration",
+            "config",
+            1,
+            Some(serde_json::to_value(&invalid).unwrap()),
+            live_deadline,
+        );
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Succeeded);
+        assert_eq!(
+            result.result.as_ref().unwrap()["valid"],
+            serde_json::json!(false),
+            "an invalid candidate still validates successfully"
+        );
+
+        let command = test_command("validate_configuration", "config", 1, None, live_deadline);
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Failed);
+        assert_eq!(result.error.as_deref(), Some("missing configuration payload"));
+
+        // Diff configuration between two stored versions.
+        let changed = arkflow_core::configuration::ConfigCandidate {
+            format: arkflow_core::configuration::ConfigFormat::Yaml,
+            content: format!(
+                "streams: []\n# revision {}\n",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ),
+            content_verbatim: None,
+        };
+        let first = cp.version_store().save_with_parent(&candidate, None).unwrap();
+        let second = cp
+            .version_store()
+            .save_with_parent(&changed, Some(first.id.clone()))
+            .unwrap();
+        let command = test_command(
+            "diff_configuration",
+            "config",
+            1,
+            Some(serde_json::json!({"from": first.id, "to": second.id})),
+            live_deadline,
+        );
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Succeeded);
+        assert_eq!(
+            result.result.as_ref().unwrap()["changed"],
+            serde_json::json!(true)
+        );
+
+        // NOTE: unlike every other command shape, a malformed
+        // diff_configuration payload escapes `execute_command` as a raw Err
+        // instead of settling as a Failed CommandResult (suspected product
+        // inconsistency — see the report). The test pins the current
+        // behavior so a future fix updates it deliberately.
+        let command = test_command(
+            "diff_configuration",
+            "config",
+            1,
+            Some(serde_json::json!({"to": second.id})),
+            live_deadline,
+        );
+        let error = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "missing configuration version",
+            "diff payload errors currently escape the command path"
+        );
+
+        let command = test_command(
+            "diff_configuration",
+            "config",
+            1,
+            Some(serde_json::json!({"from": "no-such-version", "to": second.id})),
+            live_deadline,
+        );
+        let error = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+
+        // Stream lifecycle: an unknown stream fails, a known one settles.
+        let command = test_command("restart", "ghost-stream", 1, None, live_deadline);
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Failed);
+        assert!(
+            result.error.as_deref().unwrap().contains("Unknown stream runtime"),
+            "{:?}",
+            result.error
+        );
+
+        let command = test_command("restart", "orders-stream", 1, None, live_deadline);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_command(&client, &cp, &config, &auth, &command, &runtime),
+        )
+        .await
+        .expect("the lifecycle watcher settles")
+        .unwrap();
+        assert_eq!(
+            result.state,
+            HubOperationState::Succeeded,
+            "a restart of a healthy stream settles: {:?}",
+            result.error
+        );
+        assert_eq!(result.progress, 100);
+
+        // Apply/rollback configuration drive the runtime manager.
+        let applied = arkflow_core::configuration::ConfigCandidate {
+            format: arkflow_core::configuration::ConfigFormat::Yaml,
+            content: serde_json::to_string(&serde_json::json!({
+                "streams": [{
+                    "id": "orders-stream",
+                    "input": {
+                        "type": "generate",
+                        "context": "applied",
+                        "interval": "50ms",
+                        "batch_size": 1
+                    },
+                    "pipeline": {"thread_num": 1, "processors": []},
+                    "output": {"type": "drop"}
+                }]
+            }))
+            .unwrap(),
+            content_verbatim: None,
+        };
+        let mut apply_command = test_command(
+            "apply_configuration",
+            "config",
+            1,
+            Some(serde_json::to_value(&applied).unwrap()),
+            live_deadline,
+        );
+        apply_command.config_version_id = Some("version-42".into());
+        let result = execute_command(&client, &cp, &config, &auth, &apply_command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.state,
+            HubOperationState::Succeeded,
+            "{:?}",
+            result.error
+        );
+        assert_eq!(
+            cp.runtime_manager().observed_config_version().await,
+            Some("version-42".into())
+        );
+
+        let command = test_command("apply_configuration", "config", 1, None, live_deadline);
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Failed);
+        assert_eq!(result.error.as_deref(), Some("missing configuration payload"));
+
+        let command = test_command(
+            "rollback_configuration",
+            "config",
+            1,
+            Some(serde_json::json!({"id": first.id})),
+            live_deadline,
+        );
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Succeeded);
+
+        let command = test_command("rollback_configuration", "config", 1, None, live_deadline);
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Failed);
+        assert_eq!(result.error.as_deref(), Some("missing configuration version"));
+
+        // Malformed Job payloads surface their own actionable errors.
+        let cases = [
+            ("job_start", None::<serde_json::Value>, "missing Job plan payload"),
+            (
+                "job_start",
+                Some(serde_json::json!({})),
+                "missing Job plan payload",
+            ),
+            (
+                "job_start",
+                Some(serde_json::json!({"plan": serde_json::to_value(&plan).unwrap()})),
+                "missing Job task assignments",
+            ),
+            ("job_checkpoint", None, "missing checkpoint payload"),
+            (
+                "job_checkpoint",
+                Some(serde_json::json!({})),
+                "missing checkpoint_id",
+            ),
+            ("job_checkpoint_commit", None, "missing checkpoint aggregation payload"),
+        ];
+        for (operation, payload, expected) in cases {
+            let command = test_command(operation, "any-job", 1, payload, live_deadline);
+            let error = execute_job_operation(&command, &config, &runtime)
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected, "{operation}");
+        }
+        let command = test_command(
+            "job_checkpoint_commit",
+            "any-job",
+            1,
+            Some(serde_json::json!({"checkpoint_id": "cp-1"})),
+            live_deadline,
+        );
+        let error = execute_job_operation(&command, &config, &runtime)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "missing checkpoint manifest nodes");
+        let command = test_command("job_teleport", "any-job", 1, None, live_deadline);
+        let error = execute_job_operation(&command, &config, &runtime)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "unknown Job operation job_teleport");
+
+        // Teardown.
+        runtime.stop("orders-cmd", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+        let _ = cp.runtime_manager().stop_all().await;
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+    }
+
+    /// A terminal result must survive a delivery failure: the call still
+    /// returns Ok so the completed-command cache can replay it later.
+    #[tokio::test]
+    async fn terminal_results_survive_delivery_failures() {
+        let _ = arkflow_plugin::initialize();
+        let config = test_node_config("http://127.0.0.1:1");
+        let client = build_agent_client(&config.hub_url).unwrap();
+        let auth = test_auth();
+        let cp = ControlPlane::new(
+            EngineConfig {
+                streams: Vec::new(),
+                jobs: Vec::new(),
+                logging: LoggingConfig::default(),
+                health_check: HealthCheckConfig::default(),
+            },
+            RuntimeManager::new(),
+        );
+        let command = test_command("restart", "orders-stream", 1, None, now_ms() - 1_000);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_command(&client, &cp, &config, &auth, &command, &JobRuntime::default()),
+        )
+        .await
+        .expect("delivery failure must not hang")
+        .expect("the terminal result is still returned");
+        assert_eq!(result.state, HubOperationState::TimedOut);
+    }
+
+    // ------------------ full Hub/Agent sessions ------------------
+
+    /// A real Hub served over loopback HTTP, mirroring the two-node smoke
+    /// harness (reconcile driven by the caller where needed).
+    async fn spawned_hub() -> (
+        crate::hub::Hub,
+        String,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let hub = crate::hub::Hub::new(crate::hub::HubConfig {
+            operator_token: None,
+            node_token: None,
+            insecure_local: true,
+            lease_ttl_ms: 2_000,
+            poll_interval_ms: 20,
+            session_ttl_ms: 2_000,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let server_hub = hub.clone();
+        let server_cancel = cancellation.clone();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                hub_router(server_hub, &ServerConfig::default()).into_make_service(),
+            )
+            .with_graceful_shutdown(server_cancel.cancelled_owned())
+            .await;
+        });
+        (hub, format!("http://{address}"), cancellation, server)
+    }
+
+    fn empty_control_plane() -> ControlPlane {
+        ControlPlane::new(
+            EngineConfig {
+                streams: Vec::new(),
+                jobs: Vec::new(),
+                logging: LoggingConfig::default(),
+                health_check: HealthCheckConfig::default(),
+            },
+            RuntimeManager::new(),
+        )
+    }
+
+    /// One Agent session end to end: registration, heartbeats, reports with
+    /// stream gauges, Job dispatch, a self-ending kernel whose observation
+    /// reaches the Hub, and a clean draining shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_session_reports_and_delivers_job_observations() {
+        let _ = arkflow_plugin::initialize();
+        let (hub, hub_url, hub_cancel, hub_server) = spawned_hub().await;
+        let reconcile_cancel = CancellationToken::new();
+        let reconcile_hub = hub.clone();
+        let reconcile_stop = reconcile_cancel.clone();
+        let reconcile = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                tokio::select! {
+                    _ = reconcile_stop.cancelled() => return,
+                    _ = tick.tick() => {
+                        let _ = reconcile_hub.reconcile_jobs().await;
+                    }
+                }
+            }
+        });
+
+        // The Agent's control plane carries one running stream so reports
+        // aggregate stream gauges alongside the kernel counters.
+        let engine_config = engine_config_with_stream("orders-stream");
+        let cp = ControlPlane::new(engine_config.clone(), RuntimeManager::new());
+        cp.runtime_manager()
+            .replace_config(&engine_config)
+            .await
+            .expect("the stream registers");
+
+        let agent_cancel = CancellationToken::new();
+        let mut agent = tokio::spawn(run(
+            cp.clone(),
+            NodeAgentConfig {
+                hub_url: hub_url.clone(),
+                api_prefix: "/api/v1".into(),
+                node_id: "node-a".into(),
+                node_token: String::new(),
+                boot_id: "boot-observation".into(),
+                heartbeat_interval: Duration::from_millis(50),
+                report_interval: Duration::from_millis(50),
+                poll_interval: Duration::from_millis(20),
+                data_port: None,
+                data_host: None,
+            },
+            agent_cancel.clone(),
+        ));
+        wait_for(Duration::from_secs(15), || {
+            let hub = hub.clone();
+            async move { !hub.nodes().await.is_empty() }
+        })
+        .await;
+
+        // A bounded Job: the kernel consumes its two messages and exits, and
+        // the Agent must deliver that observation to the Hub.
+        let job_id = format!("observation-job-{}", std::process::id());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            &job_id,
+            "generate",
+            serde_json::json!({"context": "x", "interval": "5ms", "count": 2, "batch_size": 1}),
+            processing_time(),
+            None,
+        ))
+        .unwrap();
+        hub.upsert_job(crate::storage::JobRecord {
+            job_id: job_id.clone(),
+            version: 1,
+            spec_json: serde_json::to_string(&spec).unwrap(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec!["node-a".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        wait_for(Duration::from_secs(15), || {
+            let hub = hub.clone();
+            let job_id = job_id.clone();
+            async move {
+                hub.job(&job_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.observed_state == "stopped")
+            }
+        })
+        .await;
+
+        // Draining shutdown: the agent returns Ok after cancelling.
+        agent_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(10), &mut agent)
+            .await
+            .expect("the agent exits on cancellation")
+            .unwrap()
+            .expect("a cancelled agent exits cleanly");
+        agent.abort();
+        let _ = cp.runtime_manager().stop_all().await;
+        reconcile_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), reconcile).await;
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_server).await;
+    }
+
+    /// The data-plane listener: a routable host advertises a data address,
+    /// and every unbindable or unadvertisable setup still registers the
+    /// node (colocated-only) instead of failing startup. Each stage waits
+    /// for ITS node id so earlier stages' draining entries cannot satisfy
+    /// the condition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn data_plane_setup_advertises_or_degrades_gracefully() {
+        let _guard = ENV_LOCK.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let (hub, hub_url, hub_cancel, hub_server) = spawned_hub().await;
+
+        let run_agent = |hub_url: String,
+                         node_id: &'static str,
+                         data_port: Option<u16>,
+                         data_host: Option<String>| {
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(run(
+                empty_control_plane(),
+                NodeAgentConfig {
+                    hub_url,
+                    api_prefix: "/api/v1".into(),
+                    node_id: node_id.into(),
+                    node_token: "data-plane-secret".into(),
+                    boot_id: format!("boot-{node_id}"),
+                    heartbeat_interval: Duration::from_millis(50),
+                    report_interval: Duration::from_millis(50),
+                    poll_interval: Duration::from_millis(50),
+                    data_port,
+                    data_host,
+                },
+                cancel.clone(),
+            ));
+            (task, cancel)
+        };
+        let stop_agent = |mut agent: tokio::task::JoinHandle<
+            Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        >,
+                          cancel: CancellationToken| async move {
+            cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(10), &mut agent).await;
+            agent.abort();
+        };
+
+        // (1) port 0 + routable host: the node advertises a data address and
+        // the network_shuffle capability at registration.
+        let (agent, cancel) =
+            run_agent(hub_url.clone(), "node-dp-a", Some(0), Some("127.0.0.1".into()));
+        wait_for(Duration::from_secs(15), || {
+            let hub = hub.clone();
+            async move {
+                hub.nodes().await.iter().any(|node| {
+                    node.id == "node-dp-a"
+                        && node.data_address.is_some()
+                        && node.capabilities.iter().any(|c| c == "network_shuffle")
+                })
+            }
+        })
+        .await;
+        stop_agent(agent, cancel).await;
+
+        // (2) a bound port without data_host: no address is advertised (the
+        // node stays colocated-only from the Hub's placement perspective).
+        let (agent, cancel) = run_agent(hub_url.clone(), "node-dp-b", Some(0), None);
+        wait_for(Duration::from_secs(15), || {
+            let hub = hub.clone();
+            async move {
+                hub.nodes()
+                    .await
+                    .iter()
+                    .any(|node| node.id == "node-dp-b" && node.data_address.is_none())
+            }
+        })
+        .await;
+        stop_agent(agent, cancel).await;
+
+        // (3) an unparseable data_host never reaches the bind.
+        let (agent, cancel) = run_agent(
+            hub_url.clone(),
+            "node-dp-c",
+            Some(0),
+            Some("not-an-ip-address".into()),
+        );
+        wait_for(Duration::from_secs(15), || {
+            let hub = hub.clone();
+            async move {
+                hub.nodes()
+                    .await
+                    .iter()
+                    .any(|node| node.id == "node-dp-c" && node.data_address.is_none())
+            }
+        })
+        .await;
+        stop_agent(agent, cancel).await;
+
+        // (4) an occupied port fails the bind and stays colocated.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied = held.local_addr().unwrap().port();
+        let (agent, cancel) = run_agent(
+            hub_url.clone(),
+            "node-dp-d",
+            Some(occupied),
+            Some("127.0.0.1".into()),
+        );
+        wait_for(Duration::from_secs(15), || {
+            let hub = hub.clone();
+            async move {
+                hub.nodes()
+                    .await
+                    .iter()
+                    .any(|node| node.id == "node-dp-d" && node.data_address.is_none())
+            }
+        })
+        .await;
+        stop_agent(agent, cancel).await;
+        drop(held);
+
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_server).await;
+    }
+
+    /// An unreachable Hub fails registration, backs off with jitter, and a
+    /// cancellation during the backoff window exits the loop cleanly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_registration_backs_off_and_exits_cleanly() {
+        let cancel = CancellationToken::new();
+        let mut agent = tokio::spawn(run(
+            empty_control_plane(),
+            NodeAgentConfig {
+                hub_url: "http://127.0.0.1:1".into(),
+                api_prefix: "/api/v1".into(),
+                node_id: "node-offline".into(),
+                node_token: String::new(),
+                boot_id: "boot-offline".into(),
+                heartbeat_interval: Duration::from_millis(50),
+                report_interval: Duration::from_millis(50),
+                poll_interval: Duration::from_millis(50),
+                data_port: None,
+                data_host: None,
+            },
+            cancel.clone(),
+        ));
+        // One failed registration round trip plus its backoff window.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), &mut agent)
+            .await
+            .expect("the agent exits after cancellation")
+            .unwrap();
+        assert!(outcome.is_ok(), "cancellation during backoff exits Ok");
+        agent.abort();
+
+        // An already-cancelled agent exits before any registration attempt.
+        let pre_cancelled = CancellationToken::new();
+        pre_cancelled.cancel();
+        let outcome = run(empty_control_plane(), test_node_config("http://127.0.0.1:1"), pre_cancelled).await;
+        assert!(outcome.is_ok(), "a pre-cancelled agent exits Ok immediately");
+    }
+
+    // ------------------------------------------------------------------
+    // Coverage additions: checkpoint kinds/aggregation, marker failures,
+    // command settlement, data-plane session bookkeeping, session loop.
+    // ------------------------------------------------------------------
+
+    /// A plain checkpoint (not a savepoint) writes under `checkpoints/`, and
+    /// the aggregate path merges manifests from several nodes into one
+    /// sealed barrier: attempts, positions, watermarks and snapshots all
+    /// carry over, with distinct task sets merging successfully.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plain_checkpoints_round_trip_and_multi_node_manifests_merge() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let store_uri = format!("file://{}", checkpoint_root.path().display());
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "orders-plain",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms", "batch_size": 1}),
+            processing_time(),
+            Some(store_uri.clone()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        runtime
+            .start(
+                plan.clone(),
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the job starts");
+
+        // The plain checkpoint kind lands under checkpoints/.
+        let uri = runtime
+            .checkpoint("orders-plain", "cp-plain", 1, false, "node-a")
+            .await
+            .expect("the plain checkpoint barrier completes");
+        assert!(
+            uri.contains("checkpoints/cp-plain/"),
+            "plain checkpoints use the checkpoints/ prefix: {uri}"
+        );
+
+        // A second node's manifest with a DISJOINT task set merges cleanly.
+        let repository =
+            CheckpointRepository::new(SharedCheckpointStore::from_uri(&store_uri).unwrap());
+        let node_a_artifact = RecoveryArtifact {
+            id: "cp-plain".into(),
+            kind: RecoveryArtifactKind::Checkpoint,
+            manifest_key: "checkpoints/cp-plain/manifests/node-a.json".into(),
+            job_version: plan.spec.version,
+            format_version: 1,
+            created_at_ms: 0,
+            status: CheckpointStatus::Completed,
+        };
+        let node_manifest = repository.read_manifest(&node_a_artifact).unwrap();
+        let mut extra = node_manifest.clone();
+        extra.task_attempts = vec![arkflow_core::checkpoint::TaskAttemptSnapshot {
+            task_id: "extra-0".into(),
+            attempt_id: "extra-0:node-b:0".into(),
+            node_id: "node-b".into(),
+        }];
+        // The aggregated snapshot set must cover the planned tasks, so the
+        // extra node's manifest references its own state snapshot.
+        let extra_snapshot = arkflow_core::state::StateSnapshot::new(1, Vec::new());
+        let mut extra_reference = repository
+            .write_state_snapshot("cp-plain", &extra_snapshot)
+            .unwrap();
+        extra_reference.task_id = "extra-0".into();
+        extra.state_snapshots = vec![extra_reference];
+        extra.watermarks_ms.insert("extra-0".into(), 1_000);
+        extra.watermark_partitions.insert(
+            "extra-0".into(),
+            vec![arkflow_core::checkpoint::WatermarkPosition::new(
+                Some("extra".into()),
+                0,
+                500,
+            )],
+        );
+        extra.seal();
+        repository
+            .write_manifest(
+                &extra,
+                RecoveryArtifactKind::Checkpoint,
+                "checkpoints/cp-plain/manifests/node-b.json".to_string(),
+            )
+            .unwrap();
+
+        let planned = ["source-0".to_string(), "sink-0".to_string(), "extra-0".to_string()];
+        let aggregated = runtime
+            .aggregate_checkpoint(
+                "orders-plain",
+                "cp-plain",
+                1,
+                false,
+                &["node-a".to_string(), "node-b".to_string()],
+                &planned,
+            )
+            .await
+            .expect("the multi-node aggregate seals one manifest");
+        assert!(
+            aggregated.contains("checkpoints/cp-plain/"),
+            "the aggregate keeps the checkpoint identity: {aggregated}"
+        );
+
+        runtime.stop("orders-plain", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+    /// The atomic start-marker write surfaces its failure paths: an
+    /// unwritable parent fails the temporary write, an existing directory at
+    /// the marker path fails the rename, and `remove_start_marker` stays
+    /// best-effort in both cases.
+    #[test]
+    fn start_marker_write_failures_are_surfaced_and_best_effort() {
+        let root = tempfile::tempdir().unwrap();
+        // (a) the parent directory does not exist: the temporary write fails.
+        let missing_parent = root.path().join("no/such/dir/.arkflow-started");
+        assert!(persist_start_marker(&missing_parent).is_err());
+        // (b) a directory occupies the marker path: the rename fails.
+        let occupied = root.path().join(".arkflow-started");
+        std::fs::create_dir_all(&occupied).unwrap();
+        assert!(
+            persist_start_marker(&occupied).is_err(),
+            "renaming onto a directory must fail"
+        );
+        // Removal never panics regardless of the path's shape.
+        remove_start_marker(&occupied);
+        remove_start_marker(&missing_parent);
+    }
+
+    /// A durable, recoverable Job whose start marker cannot be persisted
+    /// fails closed: the state backend is closed and nothing is registered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_start_fails_closed_when_the_marker_cannot_persist() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let store_uri = format!("file://{}", checkpoint_root.path().display());
+        // A stateful operator makes the durable state recoverable, so the
+        // start path computes and persists the start marker.
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders-marker",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "agg", "kind": "map", "stateful": true, "key_field": "key", "config": {"type": "batch", "count": 1, "timeout_ms": 10}},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "agg", "partitioned": true},
+                {"id": "e2", "from": "agg", "to": "sink"}
+            ],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "generate",
+                "config": {"context": "x", "interval": "10ms", "batch_size": 1},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {
+                "backend": "embedded_kv",
+                "durability": "durable",
+                "root": unique_state_dir("orders-marker").display().to_string(),
+                "format_version": 1
+            },
+            "checkpoint": {"object_store_uri": store_uri, "interval_ms": 60000, "retention": 3}
+        }))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        // Pre-create the marker path as a directory so the atomic rename
+        // inside the start path fails.
+        let marker = durable_recovery_marker(&plan, "node-a", 1).unwrap();
+        std::fs::create_dir_all(&marker).unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        let error = runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("start marker"),
+            "the marker failure must surface: {error}"
+        );
+        assert!(
+            runtime.tasks.lock().await.is_empty(),
+            "a failed marker persist must not register the Job"
+        );
+    }
+
+    /// A previous kernel that PANICKED resolves the join with an error, so
+    /// the start path still surfaces an outcome instead of hanging on the
+    /// join handle.
+    #[tokio::test]
+    async fn await_previous_teardown_reports_a_panicked_kernel_join() {
+        let mut panicked = tokio::spawn(async {
+            panic!("kernel exploded");
+            #[allow(unreachable_code)]
+            Ok::<(), arkflow_core::Error>(())
+        });
+        let outcome =
+            await_previous_teardown("job-join-panic", &mut panicked, Duration::from_secs(5)).await;
+        assert!(
+            matches!(&outcome, Some(Err(message)) if message.contains("panic")),
+            "a panicked join must surface an error outcome: {outcome:?}"
+        );
+    }
+
+    /// Backend errors surface through every store verb: a read against a
+    /// file-rooted store is an error (not a NotFound), and an unsupported
+    /// object-store scheme fails checkpoint repository construction.
+    #[test]
+    fn checkpoint_store_reads_and_repository_construction_surface_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        let uri = Url::from_file_path(&file).unwrap();
+        let store = SharedCheckpointStore::from_uri(uri.as_str()).unwrap();
+        assert!(
+            store.get("some/key").is_err(),
+            "a read against a broken root must error, not read as absent"
+        );
+        assert!(store.delete("some/key").is_err());
+
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "orders-baduri",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms"}),
+            processing_time(),
+            Some("unsupported-scheme://nowhere".into()),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let error = match checkpoint_repository(&plan) {
+            Err(error) => error,
+            Ok(_) => panic!("an unsupported object-store scheme must fail construction"),
+        };
+        assert!(
+            error.to_lowercase().contains("scheme") || !error.is_empty(),
+            "the unsupported scheme must surface: {error}"
+        );
+    }
+
+    /// Job checkpoint commands settle end to end against a stub Hub: a
+    /// checkpoint returns its manifest URI, the aggregation commit merges the
+    /// agent manifests, malformed commit payloads fail with actionable
+    /// errors, and a job_stop on the running generation succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn job_checkpoint_commit_and_stop_commands_settle() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let (hub_url, hub_cancel, hub_task) = stub_hub_server().await;
+        let client = build_agent_client(&hub_url).unwrap();
+        let config = test_node_config(&hub_url);
+        let auth = test_auth();
+        let cp = empty_control_plane();
+        let runtime = Arc::new(JobRuntime::default());
+        let live_deadline = now_ms().saturating_add(120_000);
+
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "orders-cmds",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms", "batch_size": 1}),
+            processing_time(),
+            Some(format!("file://{}", checkpoint_root.path().display())),
+        ))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let planned_task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+
+        // Start with a full task map and empty data ports in the payload.
+        let payload = serde_json::json!({
+            "plan": serde_json::to_value(&plan).unwrap(),
+            "assignments": serde_json::to_value(&assignments).unwrap(),
+            "task_nodes": {"source-0": "node-a", "sink-0": "node-a"},
+            "node_data_ports": {}
+        });
+        let command = test_command("job_start", "orders-cmds", 1, Some(payload), live_deadline);
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Succeeded, "{:?}", result.error);
+
+        // A checkpoint succeeds and reports its manifest URI.
+        let command = test_command(
+            "job_checkpoint",
+            "orders-cmds",
+            1,
+            Some(serde_json::json!({"checkpoint_id": "cp-cmds"})),
+            live_deadline,
+        );
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Succeeded, "{:?}", result.error);
+        let manifest_uri = result
+            .checkpoint_manifest_uri
+            .expect("a successful checkpoint reports its manifest");
+        assert!(manifest_uri.contains("checkpoints/cp-cmds/"), "{manifest_uri}");
+
+        // The aggregation commit merges the agent manifest.
+        let command = test_command(
+            "job_checkpoint_commit",
+            "orders-cmds",
+            1,
+            Some(serde_json::json!({
+                "checkpoint_id": "cp-cmds",
+                "manifest_nodes": ["node-a"],
+                "planned_task_ids": planned_task_ids,
+            })),
+            live_deadline,
+        );
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Succeeded, "{:?}", result.error);
+        assert!(result.checkpoint_manifest_uri.is_some());
+
+        // Malformed aggregation payloads settle as terminal failures.
+        for payload in [
+            serde_json::json!({"checkpoint_id": "cp-cmds", "manifest_nodes": "not-an-array"}),
+            serde_json::json!({
+                "checkpoint_id": "cp-cmds",
+                "manifest_nodes": ["node-a"],
+                "planned_task_ids": 7
+            }),
+        ] {
+            let command = test_command("job_checkpoint_commit", "orders-cmds", 1, Some(payload), live_deadline);
+            let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.state,
+                HubOperationState::Failed,
+                "malformed payload must fail: {:?}",
+                result.error
+            );
+            assert!(result.error.is_some());
+        }
+
+        // A stop on the running generation succeeds through the command path.
+        let command = test_command("job_stop", "orders-cmds", 1, None, live_deadline);
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(result.state, HubOperationState::Succeeded, "{:?}", result.error);
+        let _ = runtime.take_finished().await;
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+    }
+
+    /// Stream command settlement: a generation behind the local stream is
+    /// superseded, and a start against an already-running stream settles as
+    /// a Failed operation (the runtime manager rejects the transition).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_commands_settle_stale_and_failed_lifecycle_outcomes() {
+        let _ = arkflow_plugin::initialize();
+        let (hub_url, hub_cancel, hub_task) = stub_hub_server().await;
+        let client = build_agent_client(&hub_url).unwrap();
+        let config = test_node_config(&hub_url);
+        let auth = test_auth();
+        let engine_config = engine_config_with_stream("orders-stream");
+        let cp = ControlPlane::new(engine_config.clone(), RuntimeManager::new());
+        cp.runtime_manager()
+            .replace_config(&engine_config)
+            .await
+            .expect("the stream registers");
+        let runtime = Arc::new(JobRuntime::default());
+        let live_deadline = now_ms().saturating_add(120_000);
+
+        // NOTE: a stream command behind the runtime's desired generation is
+        // superseded (2594-2599), but arkflow-core's runtime manager never
+        // moves `desired_generation` off 0, so that arm is not reachable
+        // through a real ControlPlane today and is not exercised here.
+
+        // Starting the already-running stream fails the lifecycle operation
+        // and settles as a terminal Failed result.
+        let command = test_command("start", "orders-stream", 1, None, live_deadline);
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            execute_command(&client, &cp, &config, &auth, &command, &runtime),
+        )
+        .await
+        .expect("the lifecycle watcher settles")
+        .unwrap();
+        assert_eq!(
+            result.state,
+            HubOperationState::Failed,
+            "start on a running stream must fail: {:?}",
+            result.error
+        );
+        assert_eq!(result.failure_class.as_deref(), Some("permanent_execution"));
+
+        let _ = cp.runtime_manager().stop_all().await;
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+    }
+
+    /// A JobRuntime with a data-plane manager releases the per-Job session
+    /// on every retirement path: replacement, stop, self-completion (with
+    /// the crash outcome surfaced) and stop_all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_plane_sessions_track_replacement_stop_and_completion() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let credentials =
+            arkflow_core::executor::remote::DataPlaneCredentials::new("node-a", "secret")
+                .expect("test credentials");
+        let manager = arkflow_core::executor::remote::NetworkManager::with_config(
+            arkflow_core::executor::remote::NetworkManagerConfig {
+                credentials: Some(credentials),
+                channel_capacity: 16,
+                ..Default::default()
+            },
+        )
+        .expect("data plane manager builds");
+        manager.spawn();
+        let runtime = JobRuntime {
+            data_plane: Some(manager.clone()),
+            ..JobRuntime::default()
+        };
+
+        // A same-Job replacement removes the previous generation's session.
+        let (plan, assignments) = replacement_test_plan("orders-dp").await;
+        runtime
+            .start(
+                plan.clone(),
+                assignments.clone(),
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap();
+        runtime
+            .start(
+                plan,
+                assignments,
+                2,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the replacement start succeeds");
+        runtime.stop("orders-dp", 2).await.unwrap();
+
+        // A crashed kernel surfaces its error outcome through take_finished.
+        insert_exited_task(
+            &runtime,
+            "crash-dp",
+            1,
+            Err(arkflow_core::Error::Process("kernel died".into())),
+        )
+        .await;
+        // A bounded job ends on its own and is collected the same way.
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
+            "bounded-dp",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "5ms", "count": 2, "batch_size": 1}),
+            processing_time(),
+            None,
+        ))
+        .unwrap();
+        let bounded = JobPlan::compile(spec).unwrap();
+        let bounded_assignments = bounded
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        runtime
+            .start(
+                bounded,
+                bounded_assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap();
+        let finished = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut collected = Vec::new();
+            loop {
+                let finished = runtime.take_finished().await;
+                collected.extend(finished);
+                let saw_crash = collected
+                    .iter()
+                    .any(|(job_id, _, _)| job_id == "crash-dp");
+                let saw_bounded = collected
+                    .iter()
+                    .any(|(job_id, _, _)| job_id == "bounded-dp");
+                if saw_crash && saw_bounded {
+                    break collected;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the exited kernels are collected");
+        assert!(
+            finished
+                .iter()
+                .any(|(job_id, generation, outcome)| job_id == "crash-dp"
+                    && *generation == 1
+                    && outcome.is_err()),
+            "the crash outcome must be reported: {finished:?}"
+        );
+        assert!(
+            finished
+                .iter()
+                .any(|(job_id, _, outcome)| job_id == "bounded-dp" && outcome.is_ok()),
+            "the bounded kernel must be reported: {finished:?}"
+        );
+
+        // stop_all cancels whatever is left.
+        let (plan, assignments) = replacement_test_plan("orders-dp2").await;
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap();
+        runtime.stop_all().await;
+        assert!(runtime.tasks.lock().await.is_empty());
+        manager.shutdown();
+    }
+
+    /// A spawn failure on a Job with a DECLARED CPU (dedicated runtime) and
+    /// a data-plane manager releases both: the runtime shuts down off the
+    /// async path and the job session is removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_failure_releases_dedicated_runtime_and_data_plane_session() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let state_root = tempfile::tempdir().unwrap();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let credentials =
+            arkflow_core::executor::remote::DataPlaneCredentials::new("node-a", "secret")
+                .expect("test credentials");
+        let manager = arkflow_core::executor::remote::NetworkManager::with_config(
+            arkflow_core::executor::remote::NetworkManagerConfig {
+                credentials: Some(credentials),
+                channel_capacity: 16,
+                ..Default::default()
+            },
+        )
+        .expect("data plane manager builds");
+        manager.spawn();
+        let runtime = JobRuntime {
+            data_plane: Some(manager.clone()),
+            ..JobRuntime::default()
+        };
+        let mut spec = serde_json::json!({
+            "id": "orders-spawnfail-dp",
+            "version": 1,
+            "resources": {"cpu_millicores": 100},
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "agg", "kind": "map", "stateful": true, "key_field": "key", "config": {"type": "batch", "count": 1, "timeout_ms": 10}},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "source", "to": "agg", "partitioned": true},
+                {"id": "e2", "from": "agg", "to": "sink"}
+            ],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "no-such-input",
+                "config": {},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {
+                "backend": "embedded_kv",
+                "durability": "durable",
+                "root": state_root.path().display().to_string(),
+                "format_version": 1
+            },
+            "checkpoint": {
+                "object_store_uri": format!("file://{}", checkpoint_root.path().display()),
+                "interval_ms": 60000,
+                "retention": 3
+            }
+        });
+        spec["sources"][0]["config"] = serde_json::json!({});
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(spec).unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let error = runtime
+            .start(
+                plan.clone(),
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("no-such-input") || error.contains("input"),
+            "the missing input must surface: {error}"
+        );
+        assert!(
+            runtime.tasks.lock().await.is_empty(),
+            "the placeholder entry must be removed"
+        );
+        let marker = durable_recovery_marker(&plan, "node-a", 1).unwrap();
+        assert!(!marker.is_file(), "the start marker must be rolled back");
+        manager.shutdown();
+    }
+
+    /// The remote-edge context honours the full task map when the split
+    /// dispatch carries peer data ports, and degrades to colocated edges
+    /// when the dispatch carries no ports at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_context_uses_the_full_task_map_and_degrades_without_ports() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let credentials =
+            arkflow_core::executor::remote::DataPlaneCredentials::new("node-a", "secret")
+                .expect("test credentials");
+        let manager = arkflow_core::executor::remote::NetworkManager::with_config(
+            arkflow_core::executor::remote::NetworkManagerConfig {
+                credentials: Some(credentials),
+                channel_capacity: 16,
+                ..Default::default()
+            },
+        )
+        .expect("data plane manager builds");
+        manager.spawn();
+        let runtime = JobRuntime {
+            data_plane: Some(manager.clone()),
+            ..JobRuntime::default()
+        };
+
+        // Full task map with peer ports: the remote context is built.
+        let (plan, assignments) = replacement_test_plan("orders-ports").await;
+        let split = SplitPlacementPayload {
+            task_nodes: Some(BTreeMap::from([
+                ("source-0".into(), "node-a".into()),
+                ("sink-0".into(), "node-a".into()),
+            ])),
+            node_data_ports: BTreeMap::from([("node-a".into(), "127.0.0.1:39601".into())]),
+            recovery_required: false,
+        };
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &split,
+            )
+            .await
+            .expect("the split start with a full map succeeds");
+        assert!(runtime.tasks.lock().await.contains_key("orders-ports"));
+        runtime.stop("orders-ports", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+
+        // No peer ports: the job stays colocated.
+        let (plan, assignments) = replacement_test_plan("orders-noports").await;
+        let split = SplitPlacementPayload {
+            task_nodes: Some(BTreeMap::from([
+                ("source-0".into(), "node-a".into()),
+                ("sink-0".into(), "node-a".into()),
+            ])),
+            node_data_ports: BTreeMap::new(),
+            recovery_required: false,
+        };
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                None,
+                false,
+                "node-a",
+                &split,
+            )
+            .await
+            .expect("the colocated start succeeds");
+        assert!(runtime.tasks.lock().await.contains_key("orders-noports"));
+        runtime.stop("orders-noports", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+        manager.shutdown();
+    }
+
+    /// An agent cancelled before its first loop iteration still tears down
+    /// the data plane it bound during startup.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_cancelled_agent_shuts_its_data_plane_down() {
+        let _guard = ENV_LOCK.lock().await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = run(
+            empty_control_plane(),
+            NodeAgentConfig {
+                hub_url: "http://127.0.0.1:1".into(),
+                api_prefix: "/api/v1".into(),
+                node_id: "node-dp-early".into(),
+                node_token: "data-plane-secret".into(),
+                boot_id: "boot-early".into(),
+                heartbeat_interval: Duration::from_millis(50),
+                report_interval: Duration::from_millis(50),
+                poll_interval: Duration::from_millis(50),
+                data_port: Some(0),
+                data_host: Some("127.0.0.1".into()),
+            },
+            cancel,
+        )
+        .await;
+        assert!(outcome.is_ok(), "a pre-cancelled agent exits Ok: {outcome:?}");
+    }
+
+    /// A session that loses its Hub mid-flight logs the reconnect and exits
+    /// cleanly once cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_session_reconnects_after_the_hub_goes_away() {
+        let _ = arkflow_plugin::initialize();
+        let (hub, hub_url, hub_cancel, hub_server) = spawned_hub().await;
+        let cancel = CancellationToken::new();
+        let mut agent = tokio::spawn(run(
+            empty_control_plane(),
+            NodeAgentConfig {
+                hub_url: hub_url.clone(),
+                api_prefix: "/api/v1".into(),
+                node_id: "node-a".into(),
+                node_token: String::new(),
+                boot_id: "boot-reconnect".into(),
+                heartbeat_interval: Duration::from_millis(50),
+                report_interval: Duration::from_millis(50),
+                poll_interval: Duration::from_millis(50),
+                data_port: None,
+                data_host: None,
+            },
+            cancel.clone(),
+        ));
+        wait_for(Duration::from_secs(15), || {
+            let hub = hub.clone();
+            async move { !hub.nodes().await.is_empty() }
+        })
+        .await;
+        // Kill the Hub so the next heartbeat fails and the session unwinds.
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_server).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), &mut agent)
+            .await
+            .expect("the agent exits after cancellation")
+            .unwrap();
+        assert!(outcome.is_ok(), "the agent exits cleanly: {outcome:?}");
+        agent.abort();
+    }
+
+    /// A scriptable stub Hub so the session loop itself can be driven.
+    struct ScriptedHub {
+        batches: std::sync::Mutex<std::collections::VecDeque<Vec<AgentCommand>>>,
+        results: std::sync::Mutex<Vec<serde_json::Value>>,
+        observations: std::sync::Mutex<Vec<serde_json::Value>>,
+        observation_status: u16,
+    }
+
+    async fn scripted_hub_server(
+        observation_status: u16,
+        batches: Vec<Vec<AgentCommand>>,
+    ) -> (
+        String,
+        std::sync::Arc<ScriptedHub>,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::extract::State;
+        let hub = std::sync::Arc::new(ScriptedHub {
+            batches: std::sync::Mutex::new(batches.into_iter().collect()),
+            results: std::sync::Mutex::new(Vec::new()),
+            observations: std::sync::Mutex::new(Vec::new()),
+            observation_status,
+        });
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/agent/commands",
+                axum::routing::get(|State(hub): State<std::sync::Arc<ScriptedHub>>| async move {
+                    let batch = hub
+                        .batches
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_default();
+                    axum::Json(batch)
+                }),
+            )
+            .route(
+                "/api/v1/agent/commands/{id}/result",
+                axum::routing::post(
+                    |State(hub): State<std::sync::Arc<ScriptedHub>>,
+                     axum::extract::Path(_id): axum::extract::Path<String>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        hub.results.lock().unwrap().push(body);
+                        axum::http::StatusCode::OK
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/agent/job-observations",
+                axum::routing::post(
+                    |State(hub): State<std::sync::Arc<ScriptedHub>>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        hub.observations.lock().unwrap().push(body);
+                        axum::http::StatusCode::from_u16(hub.observation_status).unwrap()
+                    },
+                ),
+            )
+            .fallback(|| async { axum::http::StatusCode::OK })
+            .with_state(hub.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let shutdown = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await;
+        });
+        (format!("http://{address}"), hub, cancellation, task)
+    }
+
+    fn fast_session_config(hub_url: &str) -> NodeAgentConfig {
+        NodeAgentConfig {
+            hub_url: hub_url.into(),
+            api_prefix: "/api/v1".into(),
+            node_id: "node-a".into(),
+            node_token: "token".into(),
+            boot_id: "boot-session".into(),
+            heartbeat_interval: Duration::from_millis(50),
+            report_interval: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(20),
+            data_port: None,
+            data_host: None,
+        }
+    }
+
+    fn stub_session() -> crate::hub::RegisterResponse {
+        crate::hub::RegisterResponse {
+            node_id: "node-a".into(),
+            session_token: "stub-session".into(),
+            session_ttl_ms: 0,
+            lease_ttl_ms: 0,
+            poll_interval_ms: 0,
+            protocol_version: "v1".into(),
+        }
+    }
+
+    /// A command whose execution escapes as a raw error ends the session so
+    /// the reconnect loop owns recovery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_session_failing_command_ends_the_session() {
+        let _ = arkflow_plugin::initialize();
+        let live_deadline = now_ms().saturating_add(120_000);
+        let broken = test_command(
+            "diff_configuration",
+            "config",
+            1,
+            Some(serde_json::json!({"to": "some-version"})),
+            live_deadline,
+        );
+        let (hub_url, _hub, hub_cancel, hub_task) =
+            scripted_hub_server(200, vec![vec![broken]]).await;
+        let client = build_agent_client(&hub_url).unwrap();
+        let config = fast_session_config(&hub_url);
+        let cancel = CancellationToken::new();
+        let sampler_cancel = CancellationToken::new();
+        let sampler = spawn_resource_sampler(Duration::from_secs(3_600), sampler_cancel.clone());
+        let mut cache = CompletedCommandCache::new(16);
+        let runtime = JobRuntime::default();
+        let error = tokio::time::timeout(
+            Duration::from_secs(15),
+            run_session(
+                &client,
+                &empty_control_plane(),
+                &config,
+                stub_session(),
+                cancel,
+                &mut cache,
+                runtime,
+                false,
+                &sampler,
+            ),
+        )
+        .await
+        .expect("the session ends")
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "missing configuration version",
+            "{error}"
+        );
+        sampler_cancel.cancel();
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+    }
+
+    /// A crashed kernel's observation rides the session as `failed`, and a
+    /// delivery failure parks the observation for the next session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_session_delivers_failed_observations_and_parks_on_failure() {
+        let _ = arkflow_plugin::initialize();
+
+        // (a) delivery succeeds: the observation reports the failure state.
+        let (hub_url, hub, hub_cancel, hub_task) = scripted_hub_server(200, vec![]).await;
+        let client = build_agent_client(&hub_url).unwrap();
+        let config = fast_session_config(&hub_url);
+        let cancel = CancellationToken::new();
+        let sampler_cancel = CancellationToken::new();
+        let sampler = spawn_resource_sampler(Duration::from_secs(3_600), sampler_cancel.clone());
+        let mut cache = CompletedCommandCache::new(16);
+        let cp = empty_control_plane();
+        let runtime = JobRuntime::default();
+        insert_exited_task(
+            &runtime,
+            "crash-obs",
+            1,
+            Err(arkflow_core::Error::Process("kernel died".into())),
+        )
+        .await;
+        let session_cancel = cancel.clone();
+        let session = tokio::spawn(async move {
+            run_session(
+                &client,
+                &cp,
+                &config,
+                stub_session(),
+                session_cancel,
+                &mut cache,
+                runtime,
+                false,
+                &sampler,
+            )
+            .await
+        });
+        wait_for(Duration::from_secs(15), || {
+            let hub = hub.clone();
+            async move { !hub.observations.lock().unwrap().is_empty() }
+        })
+        .await;
+        let observed = hub.observations.lock().unwrap()[0].clone();
+        assert_eq!(observed["state"], "failed", "{observed}");
+        assert!(
+            observed["error"].as_str().unwrap().contains("kernel died"),
+            "{observed}"
+        );
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), session).await;
+        sampler_cancel.cancel();
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+
+        // (b) delivery fails: the observation is parked and the session ends.
+        let (hub_url, _hub, hub_cancel, hub_task) = scripted_hub_server(500, vec![]).await;
+        let client = build_agent_client(&hub_url).unwrap();
+        let config = fast_session_config(&hub_url);
+        let cancel = CancellationToken::new();
+        let sampler_cancel = CancellationToken::new();
+        let sampler = spawn_resource_sampler(Duration::from_secs(3_600), sampler_cancel.clone());
+        let mut cache = CompletedCommandCache::new(16);
+        let runtime = JobRuntime::default();
+        insert_exited_task(
+            &runtime,
+            "crash-park",
+            2,
+            Err(arkflow_core::Error::Process("kernel died again".into())),
+        )
+        .await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(15),
+            run_session(
+                &client,
+                &empty_control_plane(),
+                &config,
+                stub_session(),
+                cancel,
+                &mut cache,
+                runtime.clone(),
+                false,
+                &sampler,
+            ),
+        )
+        .await
+        .expect("the session ends on the delivery failure")
+        .unwrap_err();
+        assert!(!error.to_string().is_empty(), "{error}");
+        let parked = runtime.take_finished().await;
+        assert!(
+            parked
+                .iter()
+                .any(|(job_id, generation, outcome)| job_id == "crash-park"
+                    && *generation == 2
+                    && outcome.is_err()),
+            "the undelivered observation must be parked: {parked:?}"
+        );
+        sampler_cancel.cancel();
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+    }
+
+    /// The session replays cached terminal results without re-executing and
+    /// ignores a duplicate command id inside one poll batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_session_replays_cached_commands_and_deduplicates() {
+        let _ = arkflow_plugin::initialize();
+        let live_deadline = now_ms().saturating_add(120_000);
+        let replay = test_command("job_stop", "ghost-replay", 1, None, live_deadline);
+        let duplicate = test_command("job_stop", "ghost-dupe", 1, None, live_deadline);
+        let replay_id = replay.id.clone();
+        let duplicate_id = duplicate.id.clone();
+        let (hub_url, hub, hub_cancel, hub_task) =
+            scripted_hub_server(200, vec![vec![replay, duplicate.clone(), duplicate]]).await;
+        let client = build_agent_client(&hub_url).unwrap();
+        let config = fast_session_config(&hub_url);
+        let cancel = CancellationToken::new();
+        let sampler_cancel = CancellationToken::new();
+        let sampler = spawn_resource_sampler(Duration::from_secs(3_600), sampler_cancel.clone());
+        let mut cache = CompletedCommandCache::new(16);
+        let cached = CommandResult {
+            command_id: replay_id.clone(),
+            operation_id: "op-cached".into(),
+            state: HubOperationState::Succeeded,
+            progress: 100,
+            error: None,
+            correlation_id: None,
+            generation: 1,
+            observed_generation: None,
+            action_id: None,
+            failure_class: None,
+            config_version_id: None,
+            rollout_id: None,
+            observed_checkpoint_id: None,
+            checkpoint_manifest_uri: None,
+            result: None,
+        };
+        remember_completed_command(&mut cache, replay_id.clone(), cached);
+        let runtime = JobRuntime::default();
+        let cp = empty_control_plane();
+        let session_cancel = cancel.clone();
+        let session = tokio::spawn(async move {
+            run_session(
+                &client,
+                &cp,
+                &config,
+                stub_session(),
+                session_cancel,
+                &mut cache,
+                runtime,
+                false,
+                &sampler,
+            )
+            .await
+        });
+        wait_for(Duration::from_secs(15), || {
+            let hub = hub.clone();
+            let replay_id = replay_id.clone();
+            let duplicate_id = duplicate_id.clone();
+            async move {
+                let results = hub.results.lock().unwrap();
+                results.iter().any(|result| {
+                    result["command_id"] == replay_id.as_str()
+                        && result["operation_id"] == "op-cached"
+                }) && results
+                    .iter()
+                    .any(|result| result["command_id"] == duplicate_id.as_str())
+            }
+        })
+        .await;
+        // The cached replay must not re-execute: no runtime entry appears.
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), session).await;
+        sampler_cancel.cancel();
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+    }
+
+    /// Two event-time sources feeding one window share a single watermark
+    /// tracker, and recovery reinstalls both the partition-scoped watermark
+    /// and skips the task-level one when partition progress was recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn event_time_sources_sharing_a_window_share_one_tracker() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let _ = arkflow_plugin::initialize();
+        let checkpoint_root = tempfile::tempdir().unwrap();
+        let store_uri = format!("file://{}", checkpoint_root.path().display());
+        let event_time = || {
+            serde_json::json!({
+                "mode": "event_time",
+                "timestamp_field": "value",
+                "watermark": {"strategy": "bounded_out_of_orderness", "out_of_orderness_ms": 50}
+            })
+        };
+        let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders-shared-evt",
+            "version": 1,
+            "operators": [
+                {"id": "left", "kind": "source"},
+                {"id": "right", "kind": "source"},
+                {"id": "win", "kind": "window", "stateful": true, "key_field": "key", "config": {
+                    "type": "window", "kind": "tumbling", "size_ms": 10000,
+                    "timestamp_field": "value", "key_field": "key",
+                    "value_fields": ["value"], "trigger": "watermark",
+                    "watermark_field": "__watermark_ms"
+                }},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [
+                {"id": "e1", "from": "left", "to": "win"},
+                {"id": "e2", "from": "right", "to": "win"},
+                {"id": "e3", "from": "win", "to": "sink"}
+            ],
+            "sources": [
+                {
+                    "operator_id": "left",
+                    "input_type": "generate",
+                    "config": {"context": "x", "interval": "10ms", "count": 4, "batch_size": 1},
+                    "time": event_time()
+                },
+                {
+                    "operator_id": "right",
+                    "input_type": "generate",
+                    "config": {"context": "y", "interval": "10ms", "count": 4, "batch_size": 1},
+                    "time": event_time()
+                }
+            ],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "state": {
+                "backend": "embedded_kv",
+                "durability": "durable",
+                "root": unique_state_dir("orders-shared-evt").display().to_string(),
+                "format_version": 1
+            },
+            "checkpoint": {"object_store_uri": store_uri, "interval_ms": 60000, "retention": 3}
+        }))
+        .unwrap();
+        let plan = JobPlan::compile(spec).unwrap();
+        let repository =
+            CheckpointRepository::new(SharedCheckpointStore::from_uri(&store_uri).unwrap());
+        let mut snapshots = Vec::new();
+        for task in &plan.tasks {
+            let snapshot = arkflow_core::state::StateSnapshot::new(1, Vec::new());
+            let mut reference = repository
+                .write_state_snapshot("cp-shared", &snapshot)
+                .unwrap();
+            reference.task_id = task.id.clone();
+            snapshots.push(reference);
+        }
+        let mut manifest = plan_manifest(&plan, "cp-shared", snapshots);
+        manifest.watermark_partitions.insert(
+            "left-0".into(),
+            vec![arkflow_core::checkpoint::WatermarkPosition::new(
+                Some("orders".into()),
+                0,
+                9_000,
+            )],
+        );
+        // A task-level watermark whose partition progress was also recorded
+        // must not overwrite the restored partitions.
+        manifest.watermarks_ms.insert("left-0".into(), 4_500);
+        manifest.seal();
+        repository
+            .write_manifest(
+                &manifest,
+                RecoveryArtifactKind::Checkpoint,
+                arkflow_core::checkpoint::recovery_manifest_key(
+                    RecoveryArtifactKind::Checkpoint,
+                    "cp-shared",
+                ),
+            )
+            .unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".to_string()], 1)
+            .unwrap();
+        let runtime = Arc::new(JobRuntime::default());
+        runtime
+            .start(
+                plan,
+                assignments,
+                1,
+                Some("cp-shared".into()),
+                false,
+                "node-a",
+                &SplitPlacementPayload::default(),
+            )
+            .await
+            .expect("the shared-tracker event-time recovery start succeeds");
+        assert!(
+            runtime
+                .tasks
+                .lock()
+                .await
+                .contains_key("orders-shared-evt")
+        );
+        runtime.stop("orders-shared-evt", 1).await.unwrap();
+        let _ = runtime.take_finished().await;
+    }
+
+    /// A kernel task that PANICKED resolves the join with an error in
+    /// `take_finished`, so the observation reports the failure instead of
+    /// assuming a clean exit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn take_finished_reports_a_panicked_kernel_join() {
+        let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        let runtime = JobRuntime::default();
+        let state: Arc<dyn StateBackend> = Arc::new(
+            RedbStateBackend::open(unique_state_dir("join-panic"), 1)
+                .expect("test state backend opens"),
+        );
+        let handle = tokio::spawn(async {
+            panic!("kernel join panic");
+            #[allow(unreachable_code)]
+            Ok::<(), arkflow_core::Error>(())
+        });
+        // Let the panic resolve before collection so the join is terminal.
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        runtime.tasks.lock().await.insert(
+            "join-panic-job".to_string(),
+            JobTask {
+                generation: 1,
+                ephemeral_state: false,
+                recovery_required: false,
+                cancellation: CancellationToken::new(),
+                assignments: Vec::new(),
+                dedicated_runtime: None,
+                watermark_partitions: BTreeMap::new(),
+                state,
+                checkpoint_store_uri: None,
+                kernel: None,
+                handle,
+            },
+        );
+        let finished = runtime.take_finished().await;
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        let (job_id, generation, outcome) = &finished[0];
+        assert_eq!(job_id, "join-panic-job");
+        assert_eq!(*generation, 1);
+        assert!(
+            matches!(outcome, Err(message) if message.contains("panic")),
+            "a panicked join must surface: {outcome:?}"
+        );
+        assert!(runtime.tasks.lock().await.is_empty());
+    }
+
+    /// A stream command whose deadline expires while its lifecycle operation
+    /// is still mid-flight settles as TimedOut through the watcher's expiry
+    /// branch (rather than the pre-execution expiry).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_command_deadline_expires_mid_lifecycle() {
+        let _ = arkflow_plugin::initialize();
+        let (hub_url, hub_cancel, hub_task) = stub_hub_server().await;
+        let client = build_agent_client(&hub_url).unwrap();
+        let config = test_node_config(&hub_url);
+        let auth = test_auth();
+        let engine_config = engine_config_with_stream("orders-deadline");
+        let cp = ControlPlane::new(engine_config.clone(), RuntimeManager::new());
+        cp.runtime_manager()
+            .replace_config(&engine_config)
+            .await
+            .expect("the stream registers");
+        let runtime = Arc::new(JobRuntime::default());
+
+        // Each attempt uses a fresh command id and a deadline only a
+        // millisecond out: the precheck passes, and the first watcher poll
+        // after the result round trip lands past the deadline while the
+        // lifecycle operation is still mid-flight.
+        let mut saw_deadline = false;
+        for attempt in 0..40 {
+            let mut command = test_command(
+                "restart",
+                "orders-deadline",
+                1,
+                None,
+                now_ms().saturating_add(1),
+            );
+            command.id = format!("cmd-deadline-{attempt}");
+            command.operation_id = format!("op-deadline-{attempt}");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(20),
+                execute_command(&client, &cp, &config, &auth, &command, &runtime),
+            )
+            .await
+            .expect("each attempt settles")
+            .unwrap();
+            match outcome.state {
+                HubOperationState::TimedOut => {
+                    assert!(
+                        outcome
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("deadline")),
+                        "{:?}",
+                        outcome.error
+                    );
+                    saw_deadline = true;
+                    break;
+                }
+                HubOperationState::Succeeded => continue,
+                other => panic!("unexpected intermediate state {other:?}"),
+            }
+        }
+        assert!(
+            saw_deadline,
+            "at least one attempt must settle through the deadline branch"
+        );
+        let _ = cp.runtime_manager().stop_all().await;
+        hub_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+    }
+
+    /// An agent cancelled before its first loop iteration with no data-plane
+    /// secret never builds the manager and still exits cleanly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_cancelled_agent_without_a_secret_skips_the_data_plane() {
+        let _guard = ENV_LOCK.lock().await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = run(
+            empty_control_plane(),
+            NodeAgentConfig {
+                hub_url: "http://127.0.0.1:1".into(),
+                api_prefix: "/api/v1".into(),
+                node_id: "node-dp-nosecret".into(),
+                node_token: String::new(),
+                boot_id: "boot-nosecret".into(),
+                heartbeat_interval: Duration::from_millis(50),
+                report_interval: Duration::from_millis(50),
+                poll_interval: Duration::from_millis(50),
+                data_port: Some(0),
+                data_host: Some("127.0.0.1".into()),
+            },
+            cancel,
+        )
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
     }
 }

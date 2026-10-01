@@ -358,3 +358,95 @@ pub fn init() -> Result<(), Error> {
         "input_type": {"type": "sqlite", "name": "users", "path": "./data.db"}
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resource() -> Resource {
+        Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn build_sqlite(path: &str, select_sql: &str) -> Result<Arc<dyn Input>, Error> {
+        let config = Some(serde_json::json!({
+            "select_sql": select_sql,
+            "input_type": {"type": "sqlite", "path": path}
+        }));
+        SqlInputBuilder.build(None, &config, None, &resource())
+    }
+
+    fn seeded_sqlite_file() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.db");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let sql = format!(
+            "INSTALL sqlite; LOAD sqlite; ATTACH '{}' AS flow_db (TYPE sqlite);
+             CREATE TABLE flow_db.events (id INTEGER PRIMARY KEY, kind TEXT);
+             INSERT INTO flow_db.events (id, kind) VALUES (1, 'a'), (2, 'b'), (3, 'c');
+             DETACH flow_db;",
+            path.to_str().unwrap()
+        );
+        conn.execute_batch(&sql).unwrap();
+        drop(conn);
+        (dir, path.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn sqlite_input_reads_all_rows_until_eof() -> Result<(), Error> {
+        let (_dir, path) = seeded_sqlite_file();
+        let input = build_sqlite(&path, "SELECT id, kind FROM flow.main.events")?;
+        input.connect().await?;
+        let mut rows = 0usize;
+        loop {
+            match input.read().await {
+                Ok((batch, _)) => rows += batch.num_rows(),
+                Err(Error::EOF) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        assert_eq!(rows, 3);
+        input.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_before_connect_reports_missing_stream() -> Result<(), Error> {
+        let (_dir, path) = seeded_sqlite_file();
+        let input = build_sqlite(&path, "SELECT 1")?;
+        match input.read().await {
+            Err(err) => assert!(err.to_string().contains("Stream is None"), "{err}"),
+            Ok(_) => panic!("read before connect must fail"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_database_file_fails_at_connect() {
+        let result = build_sqlite("/nonexistent/arkflow/missing.db", "SELECT 1");
+        if let Ok(input) = result {
+            match input.connect().await {
+                Err(err) => assert!(
+                    err.to_string().to_lowercase().contains("sqlite"),
+                    "{err}"
+                ),
+                Ok(()) => panic!("a missing sqlite file must fail connect"),
+            }
+        }
+    }
+
+    #[test]
+    fn builder_rejects_malformed_config() {
+        let Err(err) = SqlInputBuilder.build(
+            None,
+            &Some(serde_json::json!({"unexpected": 1})),
+            None,
+            &resource(),
+        ) else {
+            panic!("malformed config must be rejected");
+        };
+        assert!(err.to_string().contains("Sql input"), "{err}");
+    }
+}

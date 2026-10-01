@@ -380,5 +380,366 @@ mod tls_url_tests {
     fn empty_url_rejected() {
         assert!(PulsarConfigValidator::validate_service_url("").is_err());
     }
+
+    #[test]
+    fn plain_prefix_without_host_rejected() {
+        assert!(PulsarConfigValidator::validate_service_url("pulsar://").is_err());
+    }
+}
+
+#[cfg(test)]
+mod topic_tests {
+    use super::PulsarConfigValidator;
+
+    #[test]
+    fn valid_topics_pass() {
+        for topic in [
+            "my-topic",
+            "persistent://tenant/namespace/topic",
+            "non-persistent://tenant/namespace/topic",
+            "tenant/namespace/my-topic-v2",
+        ] {
+            assert!(
+                PulsarConfigValidator::validate_topic(topic).is_ok(),
+                "'{topic}' should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_topic_rejected() {
+        assert!(PulsarConfigValidator::validate_topic("").is_err());
+    }
+
+    #[test]
+    fn dotdot_and_slash_topics_rejected() {
+        for topic in [
+            "a/../b",
+            "a//b",
+            "/leading",
+            "trailing/",
+        ] {
+            assert!(
+                PulsarConfigValidator::validate_topic(topic).is_err(),
+                "'{topic}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn fully_qualified_topic_may_contain_double_slash() {
+        assert!(
+            PulsarConfigValidator::validate_topic("persistent://tenant/ns/topic").is_ok()
+        );
+    }
+
+    #[test]
+    fn overlong_topic_rejected() {
+        let topic = "t".repeat(256);
+        assert!(PulsarConfigValidator::validate_topic(&topic).is_err());
+        let topic = "t".repeat(255);
+        assert!(PulsarConfigValidator::validate_topic(&topic).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::PulsarConfigValidator;
+
+    #[test]
+    fn valid_subscription_names_pass() {
+        for name in ["sub-1", "my_sub", "group.name", "Sub42"] {
+            assert!(PulsarConfigValidator::validate_subscription_name(name).is_ok());
+        }
+    }
+
+    #[test]
+    fn empty_subscription_name_rejected() {
+        assert!(PulsarConfigValidator::validate_subscription_name("").is_err());
+    }
+
+    #[test]
+    fn invalid_characters_rejected() {
+        for name in ["sub name", "sub/name", "sub:name", "sub#1"] {
+            assert!(
+                PulsarConfigValidator::validate_subscription_name(name).is_err(),
+                "'{name}' should be rejected"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_config_tests {
+    use super::{PulsarConfigValidator, RetryConfig};
+
+    fn config() -> RetryConfig {
+        RetryConfig {
+            max_attempts: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+        }
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        assert!(PulsarConfigValidator::validate_retry_config(&RetryConfig::default()).is_ok());
+        // The documented defaults.
+        assert_eq!(RetryConfig::default().max_attempts, 3);
+        assert_eq!(RetryConfig::default().initial_delay_ms, 100);
+        assert_eq!(RetryConfig::default().max_delay_ms, 5000);
+        assert_eq!(RetryConfig::default().backoff_multiplier, 2.0);
+    }
+
+    #[test]
+    fn zero_attempts_rejected() {
+        let mut config = config();
+        config.max_attempts = 0;
+        assert!(PulsarConfigValidator::validate_retry_config(&config).is_err());
+    }
+
+    #[test]
+    fn zero_initial_delay_rejected() {
+        let mut config = config();
+        config.initial_delay_ms = 0;
+        assert!(PulsarConfigValidator::validate_retry_config(&config).is_err());
+    }
+
+    #[test]
+    fn max_delay_below_initial_rejected() {
+        let mut config = config();
+        config.max_delay_ms = 50;
+        assert!(PulsarConfigValidator::validate_retry_config(&config).is_err());
+    }
+
+    #[test]
+    fn backoff_multiplier_at_or_below_one_rejected() {
+        for multiplier in [1.0, 0.5] {
+            let mut config = config();
+            config.backoff_multiplier = multiplier;
+            assert!(PulsarConfigValidator::validate_retry_config(&config).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod auth_config_tests {
+    use super::{PulsarAuth, PulsarConfigValidator};
+
+    #[test]
+    fn valid_token_passes() {
+        assert!(
+            PulsarConfigValidator::validate_auth_config(&PulsarAuth::Token {
+                token: "secret".to_string()
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_token_rejected() {
+        assert!(
+            PulsarConfigValidator::validate_auth_config(&PulsarAuth::Token { token: String::new() })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn overlong_token_rejected() {
+        let token = "t".repeat(4097);
+        assert!(
+            PulsarConfigValidator::validate_auth_config(&PulsarAuth::Token { token }).is_err()
+        );
+    }
+
+    fn oauth2(issuer_url: &str, credentials_url: &str, audience: &str) -> PulsarAuth {
+        PulsarAuth::OAuth2 {
+            issuer_url: issuer_url.to_string(),
+            credentials_url: credentials_url.to_string(),
+            audience: audience.to_string(),
+        }
+    }
+
+    #[test]
+    fn valid_oauth2_passes() {
+        assert!(
+            PulsarConfigValidator::validate_auth_config(&oauth2(
+                "https://issuer.example.com",
+                "https://issuer.example.com/credentials",
+                "urn:audience"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_oauth2_fields_rejected() {
+        for auth in [
+            oauth2("", "https://issuer.example.com/creds", "aud"),
+            oauth2("https://issuer.example.com", "", "aud"),
+            oauth2("https://issuer.example.com", "https://issuer.example.com/creds", ""),
+        ] {
+            assert!(PulsarConfigValidator::validate_auth_config(&auth).is_err());
+        }
+    }
+
+    #[test]
+    fn non_http_oauth2_urls_rejected() {
+        for auth in [
+            oauth2("issuer.example.com", "https://issuer.example.com/creds", "aud"),
+            oauth2("https://issuer.example.com", "file:///tmp/creds", "aud"),
+        ] {
+            assert!(PulsarConfigValidator::validate_auth_config(&auth).is_err());
+        }
+    }
+
+    #[test]
+    fn auth_deserializes_from_snake_case_tags() {
+        let token: PulsarAuth =
+            serde_json::from_value(serde_json::json!({"type": "token", "token": "t"})).unwrap();
+        assert!(matches!(token, PulsarAuth::Token { .. }));
+
+        let oauth2: PulsarAuth = serde_json::from_value(serde_json::json!({
+            "type": "o_auth2",
+            "issuer_url": "https://issuer",
+            "credentials_url": "https://issuer/creds",
+            "audience": "aud"
+        }))
+        .unwrap();
+        assert!(matches!(oauth2, PulsarAuth::OAuth2 { .. }));
+    }
+}
+
+#[cfg(test)]
+mod client_builder_tests {
+    use super::{PulsarAuth, PulsarClientUtils};
+
+    #[test]
+    fn builder_without_auth() {
+        assert!(
+            PulsarClientUtils::create_client_builder("pulsar://127.0.0.1:6650", &None).is_ok()
+        );
+    }
+
+    #[test]
+    fn builder_with_token_auth() {
+        let auth = Some(PulsarAuth::Token { token: "t".to_string() });
+        assert!(
+            PulsarClientUtils::create_client_builder("pulsar://127.0.0.1:6650", &auth).is_ok()
+        );
+    }
+
+    #[test]
+    fn builder_with_oauth2_auth() {
+        let auth = Some(PulsarAuth::OAuth2 {
+            issuer_url: "https://issuer".to_string(),
+            credentials_url: "https://issuer/creds".to_string(),
+            audience: "aud".to_string(),
+        });
+        assert!(
+            PulsarClientUtils::create_client_builder("pulsar+ssl://127.0.0.1:6651", &auth).is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_backoff_tests {
+    use super::{RetryConfig, RetryUtils};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn fast_config(max_attempts: u32) -> RetryConfig {
+        RetryConfig {
+            max_attempts,
+            initial_delay_ms: 1,
+            max_delay_ms: 2,
+            backoff_multiplier: 2.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn succeeds_on_first_attempt_without_sleeping() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let start = std::time::Instant::now();
+        let result: Result<u32, String> = RetryUtils::retry_with_backoff(
+            || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready::<Result<u32, String>>(Ok(7))
+            },
+            &fast_config(3),
+            "first-try",
+        )
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn retries_until_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let result: Result<u32, String> = RetryUtils::retry_with_backoff(
+            || {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(if n < 2 {
+                    Err("transient".to_string())
+                } else {
+                    Ok(42)
+                })
+            },
+            &fast_config(5),
+            "flaky",
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn returns_last_error_after_exhausting_attempts() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let result: Result<(), String> = RetryUtils::retry_with_backoff(
+            || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready::<Result<(), String>>(Err("always fails".to_string()))
+            },
+            &fast_config(3),
+            "doomed",
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "always fails");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[cfg(test)]
+mod tls_config_tests {
+    use super::PulsarTlsConfig;
+
+    #[test]
+    fn defaults_apply_when_fields_omitted() {
+        let config: PulsarTlsConfig =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.ca_file.is_none());
+        assert!(config.certificate_chain_file.is_none());
+        assert_eq!(config.hostname_verification, Some(true));
+    }
+
+    #[test]
+    fn explicit_fields_are_parsed() {
+        let config: PulsarTlsConfig = serde_json::from_value(serde_json::json!({
+            "ca_file": "/etc/ca.pem",
+            "certificate_chain_file": "/etc/cert.pem",
+            "hostname_verification": false
+        }))
+        .unwrap();
+        assert_eq!(config.ca_file.as_deref(), Some("/etc/ca.pem"));
+        assert_eq!(config.certificate_chain_file.as_deref(), Some("/etc/cert.pem"));
+        assert_eq!(config.hostname_verification, Some(false));
+    }
 }
 

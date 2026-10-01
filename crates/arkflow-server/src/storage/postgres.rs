@@ -37,7 +37,13 @@ pub(crate) fn q(sql: &str) -> String {
 /// (PostgreSQL has no unsigned integers); reads cast back.
 #[derive(Clone)]
 pub(crate) enum PgVal {
+    /// Typed NULL: bound as text. Every NULL produced from an `Option`
+    /// numeric field must use `NullInt` instead — a text-typed parameter
+    /// sent to a bigint column fails PostgreSQL's strict prepared-statement
+    /// type check (SQLSTATE 42804).
     Null,
+    /// Typed NULL bound as bigint, for `Option<i64/u64/u32>` fields.
+    NullInt,
     Text(String),
     Int(i64),
     Real(f64),
@@ -82,17 +88,17 @@ impl From<&Option<&str>> for PgVal {
 }
 impl From<&Option<u64>> for PgVal {
     fn from(value: &Option<u64>) -> Self {
-        value.map(|v| PgVal::Int(v as i64)).unwrap_or(PgVal::Null)
+        value.map(|v| PgVal::Int(v as i64)).unwrap_or(PgVal::NullInt)
     }
 }
 impl From<&Option<i64>> for PgVal {
     fn from(value: &Option<i64>) -> Self {
-        value.map(PgVal::Int).unwrap_or(PgVal::Null)
+        value.map(PgVal::Int).unwrap_or(PgVal::NullInt)
     }
 }
 impl From<&Option<u32>> for PgVal {
     fn from(value: &Option<u32>) -> Self {
-        value.map(|v| PgVal::Int(v as i64)).unwrap_or(PgVal::Null)
+        value.map(|v| PgVal::Int(v as i64)).unwrap_or(PgVal::NullInt)
     }
 }
 impl From<&u64> for PgVal {
@@ -210,6 +216,7 @@ fn push_arguments(vals: &[PgVal]) -> PgArguments {
     for val in vals {
         let _ = match val {
             PgVal::Null => args.add(Option::<String>::None),
+            PgVal::NullInt => args.add(Option::<i64>::None),
             PgVal::Text(s) => args.add(s.clone()),
             PgVal::Int(v) => args.add(*v),
             PgVal::Real(v) => args.add(*v),
@@ -768,6 +775,158 @@ mod tests {
         assert_eq!(q("SELECT 'a?b'"), "SELECT 'a?b'");
     }
 
+    /// The bind surface pins its typed-NULL contracts: every Option numeric
+    /// must bind as a bigint-typed NULL (NullInt), never a text-typed one —
+    /// PostgreSQL's prepared-statement type check rejects a text-typed
+    /// parameter against a BIGINT column (SQLSTATE 42804).
+    #[test]
+    fn pg_val_from_impls_pin_the_typed_null_contracts() {
+        let text = String::from("text");
+        let optional_text = Some(String::from("opt"));
+        // Text shapes, owned and borrowed.
+        assert!(matches!(PgVal::from(&text), PgVal::Text(_)));
+        assert!(matches!(PgVal::from(text.clone()), PgVal::Text(_)));
+        assert!(matches!(PgVal::from(&text[..]), PgVal::Text(_)));
+        assert!(matches!(PgVal::from(&optional_text), PgVal::Text(_)));
+        assert!(matches!(PgVal::from(optional_text.clone()), PgVal::Text(_)));
+        let text_reference = &text;
+        assert!(matches!(PgVal::from(&text_reference), PgVal::Text(_)));
+        let slice_reference = &text[..];
+        assert!(matches!(PgVal::from(&slice_reference), PgVal::Text(_)));
+        let optional_reference = &optional_text;
+        assert!(matches!(PgVal::from(&optional_reference), PgVal::Text(_)));
+        // Untyped NULLs for text columns.
+        assert!(matches!(PgVal::from(None::<String>), PgVal::Null));
+        assert!(matches!(PgVal::from(None::<&str>), PgVal::Null));
+        assert!(matches!(PgVal::from(&None::<String>), PgVal::Null));
+        assert!(matches!(PgVal::from(&None::<&str>), PgVal::Null));
+        let nested = Some(Some(String::from("nested")));
+        let inner_none = Some(None);
+        let outer_none: Option<Option<String>> = None;
+        assert!(matches!(PgVal::from(&nested), PgVal::Text(_)));
+        assert!(matches!(PgVal::from(&inner_none), PgVal::Null));
+        assert!(matches!(PgVal::from(&outer_none), PgVal::Null));
+        // Typed NULLs for numeric columns.
+        let none_u64: Option<u64> = None;
+        let none_i64: Option<i64> = None;
+        let none_u32: Option<u32> = None;
+        assert!(matches!(PgVal::from(&none_u64), PgVal::NullInt));
+        assert!(matches!(PgVal::from(&none_i64), PgVal::NullInt));
+        assert!(matches!(PgVal::from(&none_u32), PgVal::NullInt));
+        // Integer shapes (u64 values travel as BIGINT via i64 casts).
+        assert!(matches!(PgVal::from(&7u64), PgVal::Int(7)));
+        assert!(matches!(PgVal::from(&7i64), PgVal::Int(7)));
+        assert!(matches!(PgVal::from(&7u32), PgVal::Int(7)));
+        assert!(matches!(PgVal::from(&7i32), PgVal::Int(7)));
+        assert!(matches!(PgVal::from(&7usize), PgVal::Int(7)));
+        assert!(matches!(PgVal::from(7u64), PgVal::Int(7)));
+        assert!(matches!(PgVal::from(7i64), PgVal::Int(7)));
+        assert!(matches!(PgVal::from(7u32), PgVal::Int(7)));
+        assert!(matches!(PgVal::from(7i32), PgVal::Int(7)));
+        assert!(matches!(PgVal::from(7usize), PgVal::Int(7)));
+        // Real, boolean and byte shapes.
+        assert!(matches!(PgVal::from(&1.5f64), PgVal::Real(value) if value == 1.5));
+        assert!(matches!(PgVal::from(1.5f64), PgVal::Real(value) if value == 1.5));
+        assert!(matches!(PgVal::from(&true), PgVal::Bool(true)));
+        assert!(matches!(PgVal::from(false), PgVal::Bool(false)));
+        let bytes = vec![1u8, 2];
+        assert!(matches!(PgVal::from(&bytes), PgVal::Bytes(_)));
+        assert!(matches!(PgVal::from(bytes.clone()), PgVal::Bytes(_)));
+    }
+
+    /// `RowResult::required` distinguishes a missing row (a contract
+    /// violation worth surfacing) from a propagated storage failure, while
+    /// `optional` passes both apart.
+    #[test]
+    fn row_result_required_distinguishes_missing_from_failure() {
+        let missing: RowResult<i64> = RowResult(Ok(None));
+        assert!(matches!(
+            missing.required(),
+            Err(StorageError::Unsupported(_))
+        ));
+        let absent: RowResult<i64> = RowResult(Ok(None));
+        assert_eq!(absent.optional().unwrap(), None);
+        let present: RowResult<i64> = RowResult(Ok(Some(3)));
+        assert_eq!(present.required().unwrap(), 3);
+        let failed: RowResult<i64> = RowResult(Err(StorageError::Unsupported("probe")));
+        assert!(failed.required().is_err());
+        let failed: RowResult<i64> = RowResult(Err(StorageError::Unsupported("probe")));
+        assert!(failed.optional().is_err());
+    }
+
+    /// Decode battery: exercise every column shape the row accessors support
+    /// (text, bigint, double, boolean, bytea, narrowed u32/u64 reads, and
+    /// typed NULLs) through a real PostgreSQL round trip.
+    #[tokio::test]
+    async fn pg_row_decode_covers_the_column_type_surface() {
+        if std::env::var("ARKFLOW_TEST_POSTGRES_URL").is_err() {
+            eprintln!("skipping: ARKFLOW_TEST_POSTGRES_URL not set");
+            return;
+        }
+        let url = super::contract_database_url("pg_row_decode_types").await;
+        let backend = PostgresBackend::open(&url).await.unwrap();
+        let mut connection = backend.lease().await.unwrap();
+        let (text, bigint, real, flag, bytes): (String, i64, f64, bool, Vec<u8>) = connection
+            .query_row(
+                "SELECT ?1::text, ?2::bigint, ?3::double precision, ?4::boolean, ?5::bytea",
+                &[
+                    PgVal::from("txt"),
+                    PgVal::from(42i64),
+                    PgVal::from(1.5f64),
+                    PgVal::from(true),
+                    PgVal::from(vec![1u8, 2, 3]),
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .await
+            .required()
+            .unwrap();
+        assert_eq!(
+            (text.as_str(), bigint, flag, bytes.as_slice()),
+            ("txt", 42, true, &[1u8, 2, 3][..])
+        );
+        assert!((real - 1.5).abs() < f64::EPSILON);
+        let (narrow, wide, opt_text, opt_bigint, opt_wide): (
+            u32,
+            u64,
+            Option<String>,
+            Option<i64>,
+            Option<u64>,
+        ) = connection
+            .query_row(
+                "SELECT ?1::bigint, ?2::bigint, ?3::text, ?4::bigint, ?5::bigint",
+                &[
+                    PgVal::from(7i32),
+                    PgVal::from(9u64),
+                    PgVal::Null,
+                    PgVal::NullInt,
+                    PgVal::NullInt,
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .await
+            .required()
+            .unwrap();
+        assert_eq!((narrow, wide), (7, 9));
+        assert_eq!((opt_text, opt_bigint, opt_wide), (None, None, None));
+    }
+
     /// The contract battery every backend must satisfy. The SQLite suite in
     /// `mod.rs` runs the full 29-test surface offline; this battery covers the
     /// cross-backend invariants called out by the hub-ha spec (idempotency-key
@@ -775,13 +934,11 @@ mod tests {
     /// PostgreSQL instance passing it demonstrates contract parity.
     #[tokio::test]
     async fn postgres_contract_suite() {
-        let url = match std::env::var("ARKFLOW_TEST_POSTGRES_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping: ARKFLOW_TEST_POSTGRES_URL not set");
-                return;
-            }
-        };
+        if std::env::var("ARKFLOW_TEST_POSTGRES_URL").is_err() {
+            eprintln!("skipping: ARKFLOW_TEST_POSTGRES_URL not set");
+            return;
+        }
+        let url = super::contract_database_url("pg_contract_suite").await;
         let store = ControlPlaneStore::open(&url).await.unwrap();
         let storage = super::super::StorageActor::start(store, 8);
 

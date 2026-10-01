@@ -2288,3 +2288,761 @@ mod placement_tests {
         assert!(zero.validate().is_err());
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::tests::base_job;
+    use super::*;
+
+    /// A minimal stateless job (source -> sink) with no state and no
+    /// checkpoint, so state/checkpoint validation branches can be exercised
+    /// without the base job's stateful aggregate.
+    fn stateless_job() -> JobSpec {
+        let mut job = base_job();
+        job.operators
+            .retain(|operator| operator.id != "aggregate");
+        job.edges.clear();
+        job.edges.push(EdgeSpec {
+            id: "source-sink".into(),
+            from: "source".into(),
+            to: "sink".into(),
+            partitioned: false,
+        });
+        job.state = None;
+        job.checkpoint = None;
+        job
+    }
+
+    #[test]
+    fn checkpoint_spec_defaults_apply_when_fields_are_omitted() {
+        let spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "id": "orders",
+            "version": 1,
+            "operators": [
+                {"id": "source", "kind": "source"},
+                {"id": "sink", "kind": "sink"}
+            ],
+            "edges": [{"id": "e", "from": "source", "to": "sink"}],
+            "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+            "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+            "checkpoint": {"object_store_uri": "s3://bucket"}
+        }))
+        .unwrap();
+        let checkpoint = spec.checkpoint.expect("checkpoint present");
+        assert_eq!(checkpoint.interval_ms, 30_000);
+        assert_eq!(checkpoint.retention, 3);
+    }
+
+    #[test]
+    fn side_edges_report_dynamic_session_window_routes() {
+        let mut job = base_job();
+        // A reachable Window operator with an event-time Session trigger
+        // owns a dynamic late-event deadline: its route must be accounted.
+        let window = job
+            .operators
+            .iter_mut()
+            .find(|operator| operator.id == "aggregate")
+            .expect("aggregate operator");
+        window.kind = OperatorKind::Window;
+        window.stateful = true;
+        window.key_field = Some("customer_id".into());
+        window.config = serde_json::json!({
+            "kind": "session",
+            "gap_ms": 1_000,
+            "timestamp_field": "timestamp",
+            "key_field": "customer_id",
+            "value_fields": ["amount"],
+            "trigger": "watermark",
+            "watermark_field": "timestamp"
+        });
+        // A reachable tumbling window with a watermark trigger parses but is
+        // not Session: no dynamic route is added.
+        job.operators.push(OperatorSpec {
+            id: "tumbling".into(),
+            kind: OperatorKind::Window,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({
+                "kind": "tumbling",
+                "size_ms": 1_000,
+                "timestamp_field": "timestamp",
+                "key_field": "customer_id",
+                "value_fields": ["amount"],
+                "trigger": "watermark",
+                "watermark_field": "timestamp"
+            }),
+        });
+        job.edges.push(EdgeSpec {
+            id: "aggregate-tumbling".into(),
+            from: "aggregate".into(),
+            to: "tumbling".into(),
+            partitioned: false,
+        });
+        // A Window operator whose config cannot parse (gap_ms has the wrong
+        // type) is skipped by the guard instead of failing placement.
+        job.operators.push(OperatorSpec {
+            id: "broken-window".into(),
+            kind: OperatorKind::Window,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({
+                "kind": "session",
+                "gap_ms": "soon",
+                "timestamp_field": "timestamp",
+                "key_field": "customer_id",
+                "value_fields": ["amount"],
+                "trigger": "watermark",
+                "watermark_field": "timestamp"
+            }),
+        });
+        job.edges.push(EdgeSpec {
+            id: "tumbling-broken".into(),
+            from: "tumbling".into(),
+            to: "broken-window".into(),
+            partitioned: false,
+        });
+        // A cycle downstream exercises the reachability visited guard, and
+        // an unreachable Session window is never considered.
+        job.operators.push(OperatorSpec {
+            id: "hop-a".into(),
+            kind: OperatorKind::Map,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.operators.push(OperatorSpec {
+            id: "hop-b".into(),
+            kind: OperatorKind::Map,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.operators.push(OperatorSpec {
+            id: "far-window".into(),
+            kind: OperatorKind::Window,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({
+                "kind": "session",
+                "gap_ms": 1_000,
+                "timestamp_field": "timestamp",
+                "key_field": "customer_id",
+                "value_fields": ["amount"],
+                "trigger": "watermark",
+                "watermark_field": "timestamp"
+            }),
+        });
+        job.edges.push(EdgeSpec {
+            id: "broken-hop-a".into(),
+            from: "broken-window".into(),
+            to: "hop-a".into(),
+            partitioned: false,
+        });
+        job.edges.push(EdgeSpec {
+            id: "hop-a-b".into(),
+            from: "hop-a".into(),
+            to: "hop-b".into(),
+            partitioned: false,
+        });
+        job.edges.push(EdgeSpec {
+            id: "hop-b-a".into(),
+            from: "hop-b".into(),
+            to: "hop-a".into(),
+            partitioned: false,
+        });
+        job.operators.push(OperatorSpec {
+            id: "mapper".into(),
+            kind: OperatorKind::Map,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.operators.push(OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.sources[0].time.late_event_route = Some("late_sink".into());
+
+        let side_edges = job.side_edges();
+        assert!(
+            side_edges.contains(&SideEdgeSpec {
+                from: "source".into(),
+                to: "late_sink".into(),
+                kind: SideEdgeKind::LateEvent,
+            }),
+            "the source route is always a side edge: {side_edges:?}"
+        );
+        assert!(
+            side_edges.contains(&SideEdgeSpec {
+                from: "aggregate".into(),
+                to: "late_sink".into(),
+                kind: SideEdgeKind::LateEvent,
+            }),
+            "a watermark Session window adds its own dynamic route: {side_edges:?}"
+        );
+        assert_eq!(
+            side_edges.len(),
+            2,
+            "tumbling, unparsable and unreachable windows add no edges: {side_edges:?}"
+        );
+    }
+
+    #[test]
+    fn every_job_command_exposes_its_generation() {
+        let commands = [
+            (JobCommand::Start { generation: 1 }, 1),
+            (JobCommand::Stop { generation: 2 }, 2),
+            (
+                JobCommand::Restart {
+                    generation: 3,
+                    action_id: "act".into(),
+                },
+                3,
+            ),
+            (JobCommand::Cancel { generation: 4 }, 4),
+            (
+                JobCommand::Restore {
+                    generation: 5,
+                    checkpoint_id: "cp".into(),
+                },
+                5,
+            ),
+        ];
+        for (command, expected) in commands {
+            assert_eq!(command.generation(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_zero_memory_request() {
+        let mut job = base_job();
+        job.resources.memory_bytes = Some(0);
+        let error = job.validate().unwrap_err().to_string();
+        assert!(error.contains("memory_bytes"), "{error}");
+        job.resources.memory_bytes = Some(1);
+        job.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_jobs_without_executable_sources_or_sinks() {
+        let mut job = base_job();
+        job.sources.clear();
+        let error = job.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("at least one executable source"),
+            "{error}"
+        );
+
+        let mut job = base_job();
+        job.sinks.clear();
+        let error = job.validate().unwrap_err().to_string();
+        assert!(error.contains("at least one executable sink"), "{error}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_parallelism() {
+        let mut job = base_job();
+        job.parallelism = 0;
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("parallelism must be between"));
+
+        let mut job = base_job();
+        job.max_parallelism = 1;
+        job.parallelism = 2;
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("parallelism must be between"));
+    }
+
+    #[test]
+    fn rejects_checkpoint_without_a_state_specification() {
+        let mut job = stateless_job();
+        job.checkpoint = Some(CheckpointSpec {
+            interval_ms: 1_000,
+            retention: 1,
+            object_store_uri: "s3://bucket".into(),
+        });
+        let error = job.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("checkpointing a Job requires a state specification"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_unparsable_operator_configs() {
+        let mut job = base_job();
+        job.operators.push(OperatorSpec {
+            id: "join".into(),
+            kind: OperatorKind::Join,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({"left_key": "customer_id"}),
+        });
+        let error = job.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("join operator 'join' has invalid config"),
+            "{error}"
+        );
+
+        let mut job = base_job();
+        let window = job
+            .operators
+            .iter_mut()
+            .find(|operator| operator.id == "aggregate")
+            .unwrap();
+        window.kind = OperatorKind::Window;
+        window.stateful = false;
+        window.key_field = None;
+        window.config = serde_json::json!({"definitely-not-a-window": true});
+        let error = job.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("window operator 'aggregate' has invalid config"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_edge_id_endpoint_and_duplicate_pathologies() {
+        let mut job = base_job();
+        job.edges.push(EdgeSpec {
+            id: String::new(),
+            from: "source".into(),
+            to: "aggregate".into(),
+            partitioned: false,
+        });
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate or empty edge id"));
+
+        let mut job = base_job();
+        job.edges.push(EdgeSpec {
+            id: "self-loop".into(),
+            from: "aggregate".into(),
+            to: "aggregate".into(),
+            partitioned: false,
+        });
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("self-loop"));
+
+        let mut job = base_job();
+        job.edges.push(EdgeSpec {
+            id: "ghost-edge".into(),
+            from: "source".into(),
+            to: "ghost".into(),
+            partitioned: false,
+        });
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("references an unknown operator"));
+
+        let mut job = base_job();
+        job.edges.push(EdgeSpec {
+            id: "source-aggregate-again".into(),
+            from: "source".into(),
+            to: "aggregate".into(),
+            partitioned: true,
+        });
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate edges from 'source' to 'aggregate'"));
+    }
+
+    #[test]
+    fn rejects_late_event_route_pathologies() {
+        // Unknown route target.
+        let mut job = base_job();
+        job.sources[0].time.late_event_route = Some("ghost".into());
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("late-event route target 'ghost'"));
+
+        // Route target is the source itself.
+        let mut job = base_job();
+        job.sources[0].time.late_event_route = Some("source".into());
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must not be a Source or itself"));
+
+        // Route target duplicated as a normal dataflow edge.
+        let mut job = base_job();
+        job.operators.push(OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.edges.push(EdgeSpec {
+            id: "source-late".into(),
+            from: "source".into(),
+            to: "late_sink".into(),
+            partitioned: false,
+        });
+        job.sources[0].time.late_event_route = Some("late_sink".into());
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be a side target, not a normal edge"));
+    }
+
+    #[test]
+    fn rejects_source_and_sink_binding_mismatches() {
+        let mut job = base_job();
+        job.sources[0].operator_id = "ghost".into();
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("source references unknown operator 'ghost'"));
+
+        let mut job = base_job();
+        job.sources[0].operator_id = "aggregate".into();
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("source 'aggregate' must reference a Source operator"));
+
+        let mut job = base_job();
+        job.sinks[0].operator_id = "ghost".into();
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sink references unknown operator 'ghost'"));
+
+        let mut job = base_job();
+        job.sinks[0].operator_id = "aggregate".into();
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sink 'aggregate' must reference a Sink operator"));
+    }
+
+    #[test]
+    fn rejects_invalid_checkpoint_and_state_fields() {
+        let mut job = base_job();
+        job.checkpoint.as_mut().unwrap().interval_ms = 0;
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("interval and retention must be positive"));
+
+        let mut job = base_job();
+        job.checkpoint.as_mut().unwrap().retention = 0;
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("interval and retention must be positive"));
+
+        let mut job = base_job();
+        job.checkpoint.as_mut().unwrap().object_store_uri = "   ".into();
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("object_store_uri is required"));
+
+        let mut job = base_job();
+        job.state.as_mut().unwrap().root = Some("  ".into());
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("state root must not be empty"));
+    }
+
+    #[test]
+    fn rejects_invalid_time_specs() {
+        // Processing-time sources cannot declare a watermark.
+        let mut job = base_job();
+        job.sources[0].time.mode = TimeMode::ProcessingTime;
+        job.sources[0].time.watermark = Some(WatermarkSpec {
+            strategy: WatermarkStrategy::BoundedOutOfOrderness,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        });
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot define a watermark"));
+
+        // Event-time sources need a non-empty timestamp field.
+        let mut job = base_job();
+        job.sources[0].time.timestamp_field = None;
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires timestamp_field"));
+
+        let mut job = base_job();
+        job.sources[0].time.timestamp_field = Some(String::new());
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires timestamp_field"));
+    }
+
+    #[test]
+    fn assignments_for_node_report_queued_attempts() {
+        let plan = JobPlan::compile(base_job()).unwrap();
+        let attempts = plan.assignments_for_node("node-a");
+        assert_eq!(attempts.len(), plan.tasks.len());
+        assert_eq!(attempts[0].id, format!("source-0:node-a:0"));
+        assert_eq!(attempts[0].task_id, "source-0");
+        assert_eq!(attempts[0].job_id, JobId::new("orders").unwrap());
+        assert_eq!(attempts[0].job_version, JobVersion(1));
+        assert_eq!(attempts[0].generation, 0);
+        assert!(attempts
+            .iter()
+            .all(|attempt| attempt.state == TaskAttemptState::Queued));
+    }
+
+    #[test]
+    fn assignments_without_nodes_are_empty() {
+        let plan = JobPlan::compile(base_job()).unwrap();
+        assert!(plan.assignments_for_nodes(&[], 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn side_edge_assignment_validation_rejects_duplicates() {
+        let mut job = base_job();
+        job.placement = PlacementStrategy::Split;
+        job.parallelism = 1;
+        job.operators.push(OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.sources[0].time.late_event_route = Some("late_sink".into());
+        let plan = JobPlan::compile(job).unwrap();
+        let mut assignments = plan.assignments_for_nodes(&["a".into()], 1).unwrap();
+        assignments.push(assignments[0].clone());
+        let error = plan
+            .validate_side_edge_assignments(&assignments)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("duplicate task assignment"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn side_edge_node_validation_requires_every_participating_task() {
+        let mut job = base_job();
+        job.placement = PlacementStrategy::Split;
+        job.parallelism = 1;
+        job.operators.push(OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.sources[0].time.late_event_route = Some("late_sink".into());
+        let plan = JobPlan::compile(job).unwrap();
+        let assignments = plan.assignments_for_nodes(&["a".into()], 1).unwrap();
+        let complete: BTreeMap<String, String> = assignments
+            .iter()
+            .map(|attempt| (attempt.task_id.clone(), attempt.node_id.clone()))
+            .collect();
+        plan.validate_side_edge_nodes(&complete).unwrap();
+
+        let mut missing_target = complete.clone();
+        missing_target.remove("late_sink-0");
+        let error = plan
+            .validate_side_edge_nodes(&missing_target)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("missing assignment for task 'late_sink-0'"),
+            "{error}"
+        );
+
+        let mut missing_source = complete;
+        missing_source.remove("source-0");
+        let error = plan
+            .validate_side_edge_nodes(&missing_source)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("missing assignment for task 'source-0'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn colocated_placement_spreads_disconnected_components() {
+        let mut job = base_job();
+        // A side edge keeps the late sink inside the main component, and a
+        // second source/sink pair forms a disconnected component.
+        job.operators.push(OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.operators.push(OperatorSpec {
+            id: "aux-source".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.operators.push(OperatorSpec {
+            id: "aux-sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.edges.push(EdgeSpec {
+            id: "aux-flow".into(),
+            from: "aux-source".into(),
+            to: "aux-sink".into(),
+            partitioned: false,
+        });
+        job.sources[0].time.late_event_route = Some("late_sink".into());
+        job.sources.push(SourceSpec {
+            codec: None,
+            operator_id: "aux-source".into(),
+            input_type: "memory".into(),
+            config: serde_json::json!({}),
+            time: TimeSpec {
+                mode: TimeMode::ProcessingTime,
+                timestamp_field: None,
+                watermark: None,
+                allowed_lateness_ms: 0,
+                late_event_policy: LateEventPolicy::Drop,
+                late_event_route: None,
+            },
+        });
+        job.sinks.push(SinkSpec {
+            codec: None,
+            operator_id: "late_sink".into(),
+            output_type: "drop".into(),
+            config: serde_json::json!({}),
+        });
+        job.sinks.push(SinkSpec {
+            codec: None,
+            operator_id: "aux-sink".into(),
+            output_type: "drop".into(),
+            config: serde_json::json!({}),
+        });
+        let plan = JobPlan::compile(job).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["node-a".into(), "node-b".into()], 1)
+            .unwrap();
+        let node_of = |task_id: &str| {
+            assignments
+                .iter()
+                .find(|attempt| attempt.task_id == task_id)
+                .unwrap()
+                .node_id
+                .clone()
+        };
+        // The connected main component (source, aggregate, sink and the
+        // side-routed late sink) shares one node.
+        for task in ["source-0", "aggregate-0", "sink-0", "late_sink-0"] {
+            assert_eq!(node_of(task), "node-a", "main component stays together");
+        }
+        // The disconnected auxiliary component lands on the other node.
+        assert_eq!(node_of("aux-source-0"), "node-b");
+        assert_eq!(node_of("aux-sink-0"), "node-b");
+    }
+
+    #[test]
+    fn key_group_helpers_reject_invalid_input() {
+        assert!(key_group_for_key(b"customer-1", 0).is_err());
+        let plan = JobPlan::compile(base_job()).unwrap();
+        assert!(key_group_for_key(b"customer-1", plan.spec.max_parallelism).is_ok());
+        let error = task_for_key(&plan, "ghost-operator", b"customer-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no task owns key group"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn task_attempt_controller_covers_start_stop_and_supersede() {
+        let attempt = TaskAttempt {
+            id: "aggregate-0:node-a:0".into(),
+            job_id: JobId::new("orders").unwrap(),
+            job_version: JobVersion(1),
+            task_id: "aggregate-0".into(),
+            generation: 2,
+            node_id: "node-a".into(),
+            state: TaskAttemptState::Queued,
+        };
+        let mut controller = TaskAttemptController::new(attempt);
+        assert!(controller.is_stale(1));
+        assert!(controller.start(1).is_err(), "a stale generation is refused");
+        controller.start(2).unwrap();
+        assert_eq!(controller.attempt().state, TaskAttemptState::Running);
+        assert!(
+            !controller.cancellation_token().is_cancelled(),
+            "start does not cancel"
+        );
+        assert!(controller.stop(1).is_err(), "stale stop is refused");
+        controller.stop(2).unwrap();
+        assert_eq!(controller.attempt().state, TaskAttemptState::Stopping);
+        assert!(
+            controller.cancellation_token().is_cancelled(),
+            "stop cancels the token"
+        );
+        controller.supersede();
+        assert_eq!(controller.attempt().state, TaskAttemptState::Superseded);
+        assert!(controller.stop(3).is_err(), "a superseded attempt is stale");
+    }
+
+    #[test]
+    fn bounded_job_channel_transmits_values() {
+        let (sender, receiver) = bounded_job_channel::<u8>(2).unwrap();
+        sender.send(9).unwrap();
+        assert_eq!(receiver.recv().unwrap(), 9);
+    }
+
+    #[test]
+    fn key_group_range_bounds_are_inclusive() {
+        let range = KeyGroupRange { start: 2, end: 5 };
+        assert!(!range.contains(1));
+        assert!(range.contains(2));
+        assert!(range.contains(5));
+        assert!(!range.contains(6));
+    }
+}

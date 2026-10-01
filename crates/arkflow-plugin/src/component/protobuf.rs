@@ -497,3 +497,220 @@ fn typed_column<'a, T: Array + 'static>(
         ))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkflow_core::MessageBatch;
+
+    const SCHEMA: &str = r#"
+syntax = "proto3";
+package arkflow.test;
+enum Level {
+  LOW = 0;
+  HIGH = 1;
+}
+message Sample {
+  string name = 1;
+  int64 count = 2;
+  bool active = 3;
+  double score = 4;
+  bytes payload = 5;
+  Level level = 6;
+}
+"#;
+
+    #[derive(Clone)]
+    struct TestConfig {
+        inputs: Vec<String>,
+        includes: Option<Vec<String>>,
+    }
+    impl ProtobufConfig for TestConfig {
+        fn proto_inputs(&self) -> &Vec<String> {
+            &self.inputs
+        }
+        fn proto_includes(&self) -> &Option<Vec<String>> {
+            &self.includes
+        }
+    }
+
+    fn write_schema(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("sample.proto");
+        std::fs::write(&path, SCHEMA).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn list_files_in_dir_covers_files_dirs_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = write_schema(&dir);
+        // A directory expands to its entries (recursing into subdirectories).
+        let listed = list_files_in_dir(dir.path()).unwrap();
+        assert!(listed.iter().any(|p| p.ends_with("sample.proto")));
+        // A direct file path is returned as-is.
+        let listed = list_files_in_dir(&file_path).unwrap();
+        assert_eq!(listed, vec![std::path::PathBuf::from(&file_path)]);
+        // A missing path is passed through unchanged (validated later by
+        // the proto parser, which owns the real error message).
+        let listed = list_files_in_dir("/nonexistent/arkflow").unwrap();
+        assert_eq!(
+            listed,
+            vec![std::path::PathBuf::from("/nonexistent/arkflow")]
+        );
+    }
+
+    #[test]
+    fn parse_proto_file_round_trips_a_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_schema(&dir);
+        let set = parse_proto_file(&TestConfig {
+            inputs: vec![path.clone()],
+            includes: None,
+        })
+        .unwrap();
+        assert!(!set.file.is_empty());
+
+        // Empty inputs and proto-less directories are config errors.
+        let err = parse_proto_file(&TestConfig {
+            inputs: vec![],
+            includes: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("No proto files found"), "{err}");
+
+        let empty_dir = tempfile::tempdir().unwrap();
+        let err = parse_proto_file(&TestConfig {
+            inputs: vec![empty_dir.path().to_str().unwrap().to_string()],
+            includes: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("No proto files found"), "{err}");
+
+        let err = parse_proto_file(&TestConfig {
+            inputs: vec!["/nonexistent/arkflow".into()],
+            includes: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("No proto files found"), "{err}");
+
+        // A syntactically invalid schema fails the typecheck.
+        let bad_dir = tempfile::tempdir().unwrap();
+        let bad = bad_dir.path().join("bad.proto");
+        std::fs::write(&bad, "this is not proto").unwrap();
+        let err = parse_proto_file(&TestConfig {
+            inputs: vec![bad.to_str().unwrap().to_string()],
+            includes: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("Failed to parse the proto file"), "{err}");
+    }
+
+    #[test]
+    fn parse_proto_source_resolves_and_rejects_message_types() {
+        let descriptor = parse_proto_source(SCHEMA, "arkflow.test.Sample").unwrap();
+        assert!(descriptor.get_field_by_name("name").is_some());
+
+        let err = parse_proto_source(SCHEMA, "arkflow.test.Missing").unwrap_err();
+        assert!(err.to_string().contains("Message type not found"), "{err}");
+
+        let err = parse_proto_source("garbage {", "x.Y").unwrap_err();
+        assert!(err.to_string().contains("Failed to parse proto source"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn enum_and_bytes_fields_round_trip() {
+        let descriptor = parse_proto_source(SCHEMA, "arkflow.test.Sample").unwrap();
+        let mut message = prost_reflect::DynamicMessage::new(descriptor.clone());
+        message.set_field_by_name("level", Value::EnumNumber(1));
+        message.set_field_by_name("payload", Value::Bytes(vec![0x01, 0x02].into()));
+        let encoded = message.encode_to_vec();
+
+        let batch = protobuf_to_arrow(&descriptor, &encoded).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        // level arrives as a plain Int32 column.
+        use datafusion::arrow::array::Int32Array;
+        let level = batch
+            .column_by_name("level")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("enum as int32");
+        assert_eq!(level.value(0), 1);
+
+        let message_batch = MessageBatch::new_arrow(batch);
+        let re_encoded = arrow_to_protobuf(&descriptor, &message_batch).unwrap();
+        let decoded = protobuf_to_arrow(&descriptor, &re_encoded[0]).unwrap();
+        let level = decoded
+            .column_by_name("level")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(level.value(0), 1);
+    }
+
+    #[tokio::test]
+    async fn arrow_column_type_mismatch_names_the_field() {
+        let descriptor = parse_proto_source(SCHEMA, "arkflow.test.Sample").unwrap();
+        // count is int64 in the schema; hand it a Utf8 column instead.
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::Schema;
+        let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::Utf8, true)]));
+        let arr = Arc::new(StringArray::from(vec![Some("x")]));
+        let rb = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let err = arrow_to_protobuf(&descriptor, &MessageBatch::new_arrow(rb)).unwrap_err();
+        assert!(
+            err.to_string().contains("expects proto Int64"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_proto_kind_is_rejected() {
+        let schema = r#"
+syntax = "proto3";
+package arkflow.test;
+message WithNested {
+  Sample inner = 1;
+}
+message Sample {
+  string name = 1;
+}
+"#;
+        let descriptor = parse_proto_source(schema, "arkflow.test.WithNested").unwrap();
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::Schema;
+        let schema = Arc::new(Schema::new(vec![Field::new("inner", DataType::Utf8, true)]));
+        let arr = Arc::new(StringArray::from(vec![Some("x")]));
+        let rb = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let err = arrow_to_protobuf(&descriptor, &MessageBatch::new_arrow(rb)).unwrap_err();
+        assert!(err.to_string().contains("Unsupported Protobuf type"), "{err}");
+    }
+
+    #[test]
+    fn protobuf_arrow_round_trip_preserves_values() {
+        let descriptor = parse_proto_source(SCHEMA, "arkflow.test.Sample").unwrap();
+
+        // Encode a dynamic message.
+        use prost_reflect::Value;
+        let mut message = prost_reflect::DynamicMessage::new(descriptor.clone());
+        message.set_field_by_name("name", Value::String("alice".to_string()));
+        message.set_field_by_name("count", Value::I64(7));
+        message.set_field_by_name("active", Value::Bool(true));
+        message.set_field_by_name("score", Value::F64(1.5));
+        let encoded = message.encode_to_vec();
+
+        let batch = protobuf_to_arrow(&descriptor, &encoded).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let message_batch = MessageBatch::new_arrow(batch);
+        let re_encoded = arrow_to_protobuf(&descriptor, &message_batch).unwrap();
+        assert_eq!(re_encoded.len(), 1);
+        let decoded = protobuf_to_arrow(&descriptor, &re_encoded[0]).unwrap();
+        assert_eq!(decoded.num_rows(), 1);
+
+        // A truncated buffer fails decode loudly.
+        let err = protobuf_to_arrow(&descriptor, &encoded[..encoded.len() / 2]).unwrap_err();
+        assert!(err.to_string().contains("Protobuf message parsing failed"), "{err}");
+    }
+}

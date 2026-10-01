@@ -608,7 +608,7 @@ pub fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
+    use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
 
@@ -814,5 +814,436 @@ mod tests {
         output.connect().await.unwrap();
         assert!(output.write(Arc::new(typed_batch())).await.is_err());
         assert_eq!(output.batch_buffer.lock().await.len(), 1);
+    }
+
+    /// A no-op codec used to exercise the codec-rejection branches.
+    struct NoopCodec;
+
+    #[async_trait]
+    impl arkflow_core::codec::Encoder for NoopCodec {
+        async fn encode(&self, _b: MessageBatch) -> Result<Vec<arkflow_core::Bytes>, Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl arkflow_core::codec::Decoder for NoopCodec {
+        async fn decode(&self, b: Vec<arkflow_core::Bytes>) -> Result<MessageBatch, Error> {
+            MessageBatch::new_binary(b)
+        }
+    }
+
+    fn flexible_config(
+        fields: Vec<FieldMapping>,
+        tags: Option<Vec<TagMapping>>,
+        timestamp_field: Option<String>,
+    ) -> InfluxDBOutputConfig {
+        InfluxDBOutputConfig {
+            url: "http://127.0.0.1:1".into(),
+            org: "org".into(),
+            bucket: "bucket".into(),
+            token: "token".into(),
+            measurement: "m".into(),
+            tags,
+            fields,
+            timestamp_field,
+            batch_size: Some(1000),
+            flush_interval: None,
+            retry_count: Some(1),
+            timeout_ms: Some(1000),
+        }
+    }
+
+    #[test]
+    fn test_zero_batch_size_rejected() {
+        let error = match InfluxDBOutput::new(typed_config("http://127.0.0.1:1".into(), 0)) {
+            Ok(_) => panic!("zero batch_size must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("batch_size"), "{error}");
+    }
+
+    #[test]
+    fn test_builder_rejects_codec() {
+        let resource = Resource {
+            temporary: Default::default(),
+            input_names: std::cell::RefCell::new(Default::default()),
+        };
+        let config = Some(serde_json::json!({
+            "url": "http://localhost:8086",
+            "org": "org",
+            "bucket": "bucket",
+            "token": "token",
+            "measurement": "m",
+            "fields": [{"field": "value", "field_name": "value"}]
+        }));
+        let error = match InfluxDBOutputBuilder.build(None, &config, Some(Arc::new(NoopCodec)), &resource) {
+            Ok(_) => panic!("codec must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("codec"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_write_before_connect_fails() {
+        let output = InfluxDBOutput::new(typed_config("http://127.0.0.1:1".into(), 10)).unwrap();
+        let error = output.write(Arc::new(typed_batch())).await.unwrap_err();
+        assert!(error.to_string().contains("not connected"), "{error}");
+        let error = output
+            .write_batch(&[Arc::new(typed_batch())])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not connected"), "{error}");
+    }
+
+    fn column_batch(columns: Vec<(&str, ArrayRef)>) -> MessageBatch {
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(name, column)| Field::new(*name, column.data_type().clone(), true))
+            .collect();
+        MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                columns.into_iter().map(|(_, c)| c).collect(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_integer_fields_render_i_suffix() {
+        let msg = column_batch(vec![
+            ("count", Arc::new(Int64Array::from(vec![Some(7)]))),
+            ("ts", Arc::new(Int64Array::from(vec![Some(99)]))),
+        ]);
+        let output = InfluxDBOutput::new(flexible_config(
+            vec![FieldMapping {
+                field: "count".into(),
+                field_name: "count".into(),
+                field_type: Some(FieldType::Integer),
+            }],
+            None,
+            Some("ts".into()),
+        ))
+        .unwrap();
+        assert_eq!(output.convert_to_line_protocol(&msg).unwrap(), vec!["m count=7i 99"]);
+    }
+
+    #[test]
+    fn test_boolean_fields_render_bare_values() {
+        let msg = column_batch(vec![("ok", Arc::new(BooleanArray::from(vec![Some(true)])))]);
+        let output = InfluxDBOutput::new(flexible_config(
+            vec![FieldMapping {
+                field: "ok".into(),
+                field_name: "ok".into(),
+                field_type: Some(FieldType::Boolean),
+            }],
+            None,
+            Some("ts".into()), // missing column -> now() fallback
+        ))
+        .unwrap();
+        let lines = output.convert_to_line_protocol(&msg).unwrap();
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert!(line.starts_with("m ok=true "), "{line}");
+        let timestamp = line.rsplit(' ').next().unwrap();
+        assert!(
+            timestamp.parse::<u128>().is_ok_and(|v| v > 1_600_000_000_000_000_000),
+            "fallback timestamp must be current nanos: {timestamp}"
+        );
+    }
+
+    #[test]
+    fn test_string_fields_default_to_quoted_strings() {
+        let msg = column_batch(vec![(
+            "note",
+            Arc::new(StringArray::from(vec![Some("a\"b")])),
+        )]);
+        let output = InfluxDBOutput::new(flexible_config(
+            vec![FieldMapping {
+                field: "note".into(),
+                field_name: "note".into(),
+                field_type: None,
+            }],
+            None,
+            None,
+        ))
+        .unwrap();
+        let lines = output.convert_to_line_protocol(&msg).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("m note=\"a\\\"b\" "),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn test_null_tag_and_field_values_are_skipped() {
+        let msg = column_batch(vec![
+            ("region", Arc::new(StringArray::from(vec![None::<&str>]))),
+            ("host", Arc::new(StringArray::from(vec![Some("h1")]))),
+            ("value", Arc::new(Float64Array::from(vec![None::<f64>]))),
+        ]);
+        let output = InfluxDBOutput::new(flexible_config(
+            vec![FieldMapping {
+                field: "value".into(),
+                field_name: "value".into(),
+                field_type: Some(FieldType::Float),
+            }],
+            Some(vec![
+                TagMapping { field: "region".into(), tag_name: "region".into() },
+                TagMapping { field: "host".into(), tag_name: "host".into() },
+            ]),
+            None,
+        ))
+        .unwrap();
+        // Null tag dropped, null field dropped -> row has no fields -> skipped.
+        assert!(output.convert_to_line_protocol(&msg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_missing_tag_column_is_ignored() {
+        let msg = column_batch(vec![(
+            "value",
+            Arc::new(Float64Array::from(vec![1.5])),
+        )]);
+        let output = InfluxDBOutput::new(flexible_config(
+            vec![FieldMapping {
+                field: "value".into(),
+                field_name: "value".into(),
+                field_type: Some(FieldType::Float),
+            }],
+            Some(vec![TagMapping { field: "nope".into(), tag_name: "nope".into() }]),
+            Some("also-nope".into()),
+        ))
+        .unwrap();
+        let lines = output.convert_to_line_protocol(&msg).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("m value=1.5 "),
+            "missing tag/timestamp columns must not add sections: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn test_null_timestamp_falls_back_to_now() {
+        let msg = column_batch(vec![
+            ("value", Arc::new(Float64Array::from(vec![2.0]))),
+            ("ts", Arc::new(Int64Array::from(vec![None::<i64>]))),
+        ]);
+        let output = InfluxDBOutput::new(flexible_config(
+            vec![FieldMapping {
+                field: "value".into(),
+                field_name: "value".into(),
+                field_type: Some(FieldType::Float),
+            }],
+            None,
+            Some("ts".into()),
+        ))
+        .unwrap();
+        let lines = output.convert_to_line_protocol(&msg).unwrap();
+        let timestamp = lines[0].rsplit(' ').next().unwrap();
+        assert!(
+            timestamp.parse::<u128>().is_ok_and(|v| v > 1_600_000_000_000_000_000),
+            "null timestamp must fall back to now: {timestamp}"
+        );
+    }
+
+    #[test]
+    fn test_multiple_rows_each_become_a_line() {
+        let msg = column_batch(vec![
+            ("host", Arc::new(StringArray::from(vec![Some("a"), Some("b")]))),
+            ("value", Arc::new(Float64Array::from(vec![1.0, 2.0]))),
+            ("ts", Arc::new(Int64Array::from(vec![10, 20]))),
+        ]);
+        let output = InfluxDBOutput::new(flexible_config(
+            vec![FieldMapping {
+                field: "value".into(),
+                field_name: "value".into(),
+                field_type: Some(FieldType::Float),
+            }],
+            Some(vec![TagMapping { field: "host".into(), tag_name: "host".into() }]),
+            Some("ts".into()),
+        ))
+        .unwrap();
+        assert_eq!(
+            output.convert_to_line_protocol(&msg).unwrap(),
+            vec!["m,host=a value=1 10", "m,host=b value=2 20"]
+        );
+    }
+
+    #[test]
+    fn test_get_string_value_covers_arrow_variants() {
+        let large = datafusion::arrow::array::LargeStringArray::from(vec![Some("big")]);
+        assert_eq!(
+            InfluxDBOutput::get_string_value(&large, 0),
+            Some("big".to_string())
+        );
+        assert_eq!(
+            InfluxDBOutput::get_string_value(&Int32Array::from(vec![42]), 0),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            InfluxDBOutput::get_string_value(&Float64Array::from(vec![1.5]), 0),
+            Some("1.5".to_string())
+        );
+        assert_eq!(
+            InfluxDBOutput::get_string_value(&BooleanArray::from(vec![true]), 0),
+            Some("true".to_string())
+        );
+        let unsupported = datafusion::arrow::array::BinaryArray::from(vec![b"x" as &[u8]]);
+        assert_eq!(InfluxDBOutput::get_string_value(&unsupported, 0), None);
+        let null_utf8 = StringArray::from(vec![None::<&str>]);
+        assert_eq!(InfluxDBOutput::get_string_value(&null_utf8, 0), None);
+    }
+
+    #[tokio::test]
+    async fn test_should_flush_respects_size_and_interval() {
+        let mut config = flexible_config(Vec::new(), None, None);
+        config.batch_size = Some(10);
+        let output = InfluxDBOutput::new(config).unwrap();
+        // Empty buffer, no interval configured.
+        assert!(!output.should_flush().await);
+        output.batch_buffer.lock().await.push("line".into());
+        assert!(!output.should_flush().await, "1 < 10 must not flush");
+
+        // Interval of zero seconds is always elapsed.
+        output.batch_buffer.lock().await.clear();
+        let mut config = flexible_config(Vec::new(), None, None);
+        config.flush_interval = Some(0);
+        let output = InfluxDBOutput::new(config).unwrap();
+        assert!(output.should_flush().await);
+
+        // Buffer reaching the batch size flushes regardless of interval.
+        let output = InfluxDBOutput::new(typed_config("http://127.0.0.1:1".into(), 1)).unwrap();
+        output.batch_buffer.lock().await.push("line".into());
+        assert!(output.should_flush().await);
+    }
+
+    #[tokio::test]
+    async fn test_flush_without_client_fails() {
+        let output = InfluxDBOutput::new(typed_config("http://127.0.0.1:1".into(), 1000)).unwrap();
+        output.batch_buffer.lock().await.push("m v=1".into());
+        let error = output.flush().await.unwrap_err();
+        assert!(error.to_string().contains("not initialized"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_flush_succeeds_clears_buffer_and_sends_encoded_request() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let output =
+            InfluxDBOutput::new(typed_config(server.uri(), 1)).unwrap();
+        output.connect().await.unwrap();
+        output.write(Arc::new(typed_batch())).await.unwrap();
+        assert!(
+            output.batch_buffer.lock().await.is_empty(),
+            "successful flush must clear the buffer"
+        );
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        let url = request.url.to_string();
+        assert!(url.contains("/api/v2/write"), "{url}");
+        assert!(url.contains("bucket=metrics"), "{url}");
+        assert!(url.contains("precision=ns"), "{url}");
+        let authorization = request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(authorization, "Token token");
+        let body = String::from_utf8(request.body.clone()).unwrap();
+        assert_eq!(body, "sensor\\ data,device=lab\\ 1 reading=42.5 1700000000000000000");
+    }
+
+    #[tokio::test]
+    async fn test_flush_server_error_retains_buffered_lines() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let output = InfluxDBOutput::new(typed_config(server.uri(), 1)).unwrap();
+        output.connect().await.unwrap();
+        let error = output.write(Arc::new(typed_batch())).await.unwrap_err();
+        assert!(error.to_string().contains("500"), "{error}");
+        assert!(error.to_string().contains("boom"), "{error}");
+        assert_eq!(output.batch_buffer.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_retries_then_succeeds() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let mut config = typed_config(server.uri(), 1);
+        config.retry_count = Some(3);
+        let output = InfluxDBOutput::new(config).unwrap();
+        output.connect().await.unwrap();
+        output.write(Arc::new(typed_batch())).await.unwrap();
+        assert!(output.batch_buffer.lock().await.is_empty());
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            2,
+            "1 fail + 1 success"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_close_flushes_remaining_buffer() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        // Batch size larger than one write so nothing flushes during write.
+        let output = InfluxDBOutput::new(typed_config(server.uri(), 1000)).unwrap();
+        output.connect().await.unwrap();
+        output.write(Arc::new(typed_batch())).await.unwrap();
+        assert_eq!(output.batch_buffer.lock().await.len(), 1);
+
+        output.close().await.unwrap();
+        assert!(
+            output.batch_buffer.lock().await.is_empty(),
+            "close must flush pending lines"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1
+        );
+
+        // After close the output is disconnected again.
+        let error = output.write(Arc::new(typed_batch())).await.unwrap_err();
+        assert!(error.to_string().contains("not connected"), "{error}");
     }
 }

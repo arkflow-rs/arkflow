@@ -314,3 +314,111 @@ pub fn init() -> Result<(), Error> {
         "topics": ["sensors/#"]
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    fn test_resource() -> Resource {
+        Resource {
+            temporary: Default::default(),
+            input_names: RefCell::new(Default::default()),
+        }
+    }
+
+    fn config(qos: Option<u8>) -> MqttInputConfig {
+        serde_json::from_value(serde_json::json!({
+            "host": "127.0.0.1",
+            "port": 1883,
+            "client_id": "test-client",
+            "topics": ["sensors/#"],
+            "qos": qos,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn builder_rejects_missing_required_fields() {
+        let bad = Some(serde_json::json!({
+            "host": "localhost",
+            "port": 1883,
+            "client_id": "c"
+            // topics missing
+        }));
+        assert!(matches!(
+            MqttInputBuilder.build(None, &bad, None, &test_resource()),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn builder_accepts_full_config() {
+        let config = Some(serde_json::json!({
+            "host": "localhost",
+            "port": 1883,
+            "client_id": "c",
+            "topics": ["a", "b/#"],
+            "qos": 2,
+            "username": "u",
+            "password": "p",
+            "clean_session": false,
+            "keep_alive": 30
+        }));
+        assert!(
+            MqttInputBuilder
+                .build(None, &config, None, &test_resource())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn qos_variants_deserialize() {
+        assert_eq!(config(Some(0)).qos, Some(0));
+        assert_eq!(config(Some(2)).qos, Some(2));
+        assert!(config(Some(9)).qos.is_some(), "out-of-range qos still parses");
+        assert!(config(None).qos.is_none());
+        assert!(config(None).tls.is_none(), "tls defaults to none");
+    }
+
+    #[tokio::test]
+    async fn read_before_connect_reports_disconnection() {
+        let input = MqttInput::new(None, config(None), None).unwrap();
+        assert!(matches!(input.read().await, Err(Error::Disconnection)));
+    }
+
+    #[tokio::test]
+    async fn close_before_connect_is_ok() {
+        let input = MqttInput::new(None, config(None), None).unwrap();
+        input.close().await.expect("close before connect");
+    }
+
+    #[tokio::test]
+    async fn dead_broker_surfaces_disconnection_on_read() {
+        // rumqttc queues the subscribe without awaiting the broker, so
+        // connect returns Ok; the eventloop error must then surface as a
+        // Disconnection from read(), not hang.
+        let input = MqttInput::new(
+            None,
+            MqttInputConfig {
+                port: 1,
+                ..config(Some(2))
+            },
+            None,
+        )
+        .unwrap();
+        input.connect().await.expect("connect queues subscriptions");
+        let outcome = tokio::time::timeout(Duration::from_secs(15), input.read())
+            .await
+            .expect("read must resolve, not hang");
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("read on a dead broker must fail, not deliver"),
+        };
+        assert!(
+            matches!(error, Error::Disconnection),
+            "unexpected error: {error}"
+        );
+    }
+}

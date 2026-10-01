@@ -571,3 +571,238 @@ pub fn init() -> Result<(), Error> {
         "redis_type": {"type": "list", "list": ["events"]}
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_error_classification() {
+        // Permanent: auth/permission/unknown-command/invalid text.
+        for text in [
+            "NOAUTH Authentication required",
+            "WRONGPASS invalid username-password pair",
+            "NOPERM this user has no permissions",
+            "User is not allowed",
+            "unknown command 'BLPOPP'",
+            "invalid port specifier",
+        ] {
+            assert!(
+                !is_temporary_redis_error(&text),
+                "should be permanent: {text}"
+            );
+        }
+        // Temporary: connection/timeout/io wording falls through.
+        for text in [
+            "connection reset by peer",
+            "IO timeout while reading",
+            "cluster is down",
+        ] {
+            assert!(
+                is_temporary_redis_error(&text),
+                "should be temporary: {text}"
+            );
+        }
+    }
+
+    fn builder() -> RedisInputBuilder {
+        RedisInputBuilder
+    }
+
+    fn config(value: serde_json::Value) -> Option<serde_json::Value> {
+        Some(value)
+    }
+
+    #[test]
+    fn builder_rejects_malformed_config() {
+        let Err(err) = builder().build(
+            None,
+            &config(serde_json::json!({"unexpected": true})),
+            None,
+            &test_resource(),
+        ) else {
+            panic!("malformed config must be rejected");
+        };
+        assert!(err.to_string().contains("Invalid Redis input config"));
+    }
+
+    #[test]
+    fn builder_rejects_invalid_single_url() {
+        let Err(err) = builder().build(
+            None,
+            &config(serde_json::json!({
+                "mode": {"type": "single", "url": "not-a-redis-url"},
+                "redis_type": {"type": "list", "list": ["k"]}
+            })),
+            None,
+            &test_resource(),
+        ) else {
+            panic!("invalid single url must be rejected");
+        };
+        assert!(err.to_string().contains("Invalid Redis URL"));
+    }
+
+    #[test]
+    fn builder_rejects_invalid_cluster_url() {
+        let Err(err) = builder().build(
+            None,
+            &config(serde_json::json!({
+                "mode": {"type": "cluster", "urls": ["redis://ok:6379", "bad-url"]},
+                "redis_type": {"type": "list", "list": ["k"]}
+            })),
+            None,
+            &test_resource(),
+        ) else {
+            panic!("invalid cluster url must be rejected");
+        };
+        assert!(err.to_string().contains("Invalid Redis URL"));
+    }
+
+    #[test]
+    fn read_before_connect_reports_disconnection() {
+        let input = RedisInput::new(
+            None,
+            serde_json::from_value(serde_json::json!({
+                "mode": {"type": "single", "url": "redis://127.0.0.1:6379"},
+                "redis_type": {"type": "list", "list": ["k"]}
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(matches!(rt.block_on(input.read()), Err(Error::Disconnection)));
+    }
+
+    #[test]
+    fn close_before_connect_is_a_clean_noop() {
+        let input = RedisInput::new(
+            None,
+            serde_json::from_value(serde_json::json!({
+                "mode": {"type": "single", "url": "redis://127.0.0.1:6379"},
+                "redis_type": {"type": "subscribe", "subscribe": {"type": "channels", "channels": ["c"]}}
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(input.close()).unwrap();
+        // After close, read still reports the disconnected state.
+        assert!(matches!(rt.block_on(input.read()), Err(Error::Disconnection)));
+    }
+
+    fn test_resource() -> Resource {
+        Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    // ===== Offline connection-error paths (no Redis server required) =====
+
+    fn input_from(value: serde_json::Value) -> RedisInput {
+        RedisInput::new(
+            None,
+            serde_json::from_value(value).unwrap(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The builder accepts both well-formed mode shapes (validation of the
+    /// URL *format* happens in `new`; reachability is only checked at
+    /// `connect`).
+    #[test]
+    fn builder_accepts_well_formed_cluster_and_single_configs() {
+        let ok = builder().build(
+            None,
+            &config(serde_json::json!({
+                "mode": {"type": "cluster", "urls": ["redis://127.0.0.1:7001", "redis://127.0.0.1:7002"]},
+                "redis_type": {"type": "subscribe", "subscribe": {"type": "patterns", "patterns": ["news.*"]}}
+            })),
+            None,
+            &test_resource(),
+        );
+        assert!(ok.is_ok(), "well-formed cluster config must build");
+
+        let ok = builder().build(
+            None,
+            &config(serde_json::json!({
+                "mode": {"type": "single", "url": "redis://127.0.0.1:6379"},
+                "redis_type": {"type": "list", "list": ["work"]}
+            })),
+            None,
+            &test_resource(),
+        );
+        assert!(ok.is_ok(), "well-formed single config must build");
+    }
+
+    /// Cluster mode: an empty URL list fails at `ClusterClientBuilder`
+    /// construction (offline — no connection attempted).
+    #[tokio::test]
+    async fn cluster_connect_with_no_urls_fails_at_client_build() {
+        let input = input_from(serde_json::json!({
+            "mode": {"type": "cluster", "urls": []},
+            "redis_type": {"type": "list", "list": ["k"]}
+        }));
+        let err = input.connect().await.expect_err("no cluster nodes");
+        assert!(
+            err.to_string().contains("Failed to connect to Redis cluster"),
+            "got: {err}"
+        );
+    }
+
+    /// Cluster mode with a subscribable type still registers the push
+    /// sender before attempting the connection; an unreachable seed node
+    /// (port 1 → refused) surfaces as a connection error.
+    #[tokio::test]
+    async fn cluster_connect_with_unreachable_urls_fails_at_connection() {
+        let input = input_from(serde_json::json!({
+            "mode": {"type": "cluster", "urls": ["redis://127.0.0.1:1/", "redis://127.0.0.1:2/"]},
+            "redis_type": {"type": "subscribe", "subscribe": {"type": "channels", "channels": ["c"]}}
+        }));
+        let err = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            input.connect(),
+        )
+        .await
+        {
+            Ok(Err(e)) => e,
+            Ok(Ok(())) => panic!("unreachable cluster seeds must not connect"),
+            Err(_) => panic!("cluster connect must fail fast on refused ports"),
+        };
+        assert!(
+            err.to_string().contains("Failed to connect to Redis cluster"),
+            "got: {err}"
+        );
+        // A failed connect leaves the client slot empty: read reports the
+        // disconnected state rather than parking on the channel.
+        assert!(matches!(input.read().await, Err(Error::Disconnection)));
+        // close() on the never-connected input stays a clean no-op.
+        input.close().await.unwrap();
+    }
+
+    /// Single mode: a URL whose path is not a valid database number passes
+    /// the builder's scheme-level validation but fails `Client::open`
+    /// offline, instantly and deterministically (no server involved).
+    #[tokio::test]
+    async fn single_connect_with_invalid_db_fails_at_client_open() {
+        let input = input_from(serde_json::json!({
+            "mode": {"type": "single", "url": "redis://127.0.0.1:6379/not-a-number"},
+            "redis_type": {"type": "subscribe", "subscribe": {"type": "channels", "channels": ["c"]}}
+        }));
+        let err = input.connect().await.expect_err("invalid db path");
+        assert!(
+            err.to_string().contains("Failed to connect to Redis server"),
+            "got: {err}"
+        );
+        // The failed connect leaves the client slot empty.
+        assert!(matches!(input.read().await, Err(Error::Disconnection)));
+        input.close().await.unwrap();
+    }
+}

@@ -808,6 +808,272 @@ mod tests {
         }
     }
 
+    #[test]
+    fn blank_url_and_table_rejected_with_specific_errors() {
+        // Missing keys fail serde; present-but-blank values must hit the
+        // dedicated build-time checks.
+        let err = PgVectorOutputBuilder
+            .build(
+                None,
+                &Some(serde_json::json!({"url": "   ", "table": "t"})),
+                None,
+                &test_resource(),
+            )
+            .err()
+            .expect("blank url must be rejected");
+        assert!(format!("{err}").contains("'url' must not be empty"), "{err}");
+
+        let err = PgVectorOutputBuilder
+            .build(
+                None,
+                &Some(serde_json::json!({"url": "postgres://localhost/db", "table": "  "})),
+                None,
+                &test_resource(),
+            )
+            .err()
+            .expect("blank table must be rejected");
+        assert!(format!("{err}").contains("'table' must not be empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn close_without_connect_is_ok_and_resets_state() {
+        let output = build_output(serde_json::json!({
+            "url": "postgres://postgres:postgres@localhost:5432/vectors",
+            "table": "documents",
+        }));
+        assert!(output.close().await.is_ok());
+        // A write after close still reports the connection error.
+        let err = output.write(sample_batch()).await.unwrap_err().to_string();
+        assert!(err.to_lowercase().contains("not connected"), "{err}");
+    }
+
+    // ---- id extraction matrix ----
+
+    fn single_column_batch(field: &str, array: ArrayRef) -> MessageBatchRef {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            field,
+            array.data_type().clone(),
+            true,
+        )]));
+        Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(schema, vec![array]).unwrap(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn extract_ids_supports_int32_int64_utf8_and_large_utf8() {
+        let i64s = single_column_batch(
+            "doc_id",
+            Arc::new(Int64Array::from(vec![Some(7i64), Some(0)])),
+        );
+        let ids = extract_ids(&i64s, &Some("doc_id".to_string())).unwrap().unwrap();
+        assert!(matches!(ids[0], IdValue::Int(7)));
+        assert!(matches!(ids[1], IdValue::Int(0)));
+
+        let i32s = single_column_batch(
+            "doc_id",
+            Arc::new(Int32Array::from(vec![Some(42i32)])),
+        );
+        let ids = extract_ids(&i32s, &Some("doc_id".to_string())).unwrap().unwrap();
+        assert!(matches!(ids[0], IdValue::Int(42)));
+
+        let utf8 = single_column_batch(
+            "doc_id",
+            Arc::new(StringArray::from(vec![Some("doc-1")])),
+        );
+        let ids = extract_ids(&utf8, &Some("doc_id".to_string())).unwrap().unwrap();
+        assert!(matches!(&ids[0], IdValue::Text(t) if t == "doc-1"));
+
+        let large = single_column_batch(
+            "doc_id",
+            Arc::new(LargeStringArray::from(vec![Some("doc-2")])),
+        );
+        let ids = extract_ids(&large, &Some("doc_id".to_string())).unwrap().unwrap();
+        assert!(matches!(&ids[0], IdValue::Text(t) if t == "doc-2"));
+    }
+
+    #[tokio::test]
+    async fn extract_ids_rejects_nulls_and_negative_values() {
+        let null_i64 = single_column_batch(
+            "doc_id",
+            Arc::new(Int64Array::from(vec![Some(1), None])),
+        );
+        let err = extract_ids(&null_i64, &Some("doc_id".to_string()))
+            .err()
+            .expect("null id must be rejected")
+            .to_string();
+        assert!(err.contains("null value at row 1"), "{err}");
+
+        let negative_i64 = single_column_batch("doc_id", Arc::new(Int64Array::from(vec![-1])));
+        let err = extract_ids(&negative_i64, &Some("doc_id".to_string()))
+            .err()
+            .expect("negative id must be rejected")
+            .to_string();
+        assert!(err.contains("negative value"), "{err}");
+
+        let null_i32 = single_column_batch("doc_id", Arc::new(Int32Array::from(vec![None::<i32>])));
+        let err = extract_ids(&null_i32, &Some("doc_id".to_string()))
+            .err()
+            .expect("null int32 id must be rejected")
+            .to_string();
+        assert!(err.contains("null value at row 0"), "{err}");
+
+        let negative_i32 = single_column_batch("doc_id", Arc::new(Int32Array::from(vec![-5])));
+        let err = extract_ids(&negative_i32, &Some("doc_id".to_string()))
+            .err()
+            .expect("negative int32 id must be rejected")
+            .to_string();
+        assert!(err.contains("negative value"), "{err}");
+
+        let null_text =
+            single_column_batch("doc_id", Arc::new(StringArray::from(vec![None::<&str>])));
+        let err = extract_ids(&null_text, &Some("doc_id".to_string()))
+            .err()
+            .expect("null text id must be rejected")
+            .to_string();
+        assert!(err.contains("null value at row 0"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn extract_ids_rejects_unsupported_types_and_missing_columns() {
+        let floats = single_column_batch(
+            "doc_id",
+            Arc::new(datafusion::arrow::array::Float64Array::from(vec![1.5])),
+        );
+        let err = extract_ids(&floats, &Some("doc_id".to_string()))
+            .err()
+            .expect("float id column must be rejected")
+            .to_string();
+        assert!(
+            err.contains("must be Int64/Int32 or Utf8") && err.contains("Float64"),
+            "{err}"
+        );
+
+        let err = extract_ids(&sample_batch(), &Some("absent".to_string()))
+            .err()
+            .expect("missing id column must be rejected")
+            .to_string();
+        assert!(err.contains("'absent' not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn extract_ids_blank_or_missing_field_yields_none() {
+        assert!(extract_ids(&sample_batch(), &None).unwrap().is_none());
+        assert!(
+            extract_ids(&sample_batch(), &Some("   ".to_string()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // ---- vector extraction edge cases ----
+
+    #[tokio::test]
+    async fn variable_length_list_vectors_are_extracted() {
+        let list = Arc::new(ListArray::from_iter_primitive::<
+            datafusion::arrow::datatypes::Float32Type,
+            _,
+            _,
+        >(vec![
+            Some(vec![Some(1.0), Some(2.0)]),
+            Some(vec![Some(-3.5)]),
+        ]));
+        let batch = single_column_batch("embedding", list);
+        let vectors = extract_vectors(&batch, "embedding").unwrap();
+        assert_eq!(vectors, vec!["[1.0,2.0]", "[-3.5]"]);
+    }
+
+    #[tokio::test]
+    async fn empty_list_vector_errors() {
+        let list = Arc::new(ListArray::from_iter_primitive::<
+            datafusion::arrow::datatypes::Float32Type,
+            _,
+            _,
+        >(vec![Some(vec![])]));
+        let batch = single_column_batch("embedding", list);
+        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        assert!(err.contains("empty vector at row 0"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn non_float32_list_values_error() {
+        let list = Arc::new(ListArray::from_iter_primitive::<
+            datafusion::arrow::datatypes::Int32Type,
+            _,
+            _,
+        >(vec![Some(vec![Some(1)])]));
+        let batch = single_column_batch("embedding", list);
+        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        assert!(err.contains("not a Float32 vector list"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn non_float32_fixed_size_list_values_error() {
+        let dim = 1i32;
+        let values = Arc::new(datafusion::arrow::array::Float64Array::from(vec![1.0]));
+        let list = Arc::new(FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float64, true)),
+            dim,
+            values,
+            None,
+        ));
+        let batch = single_column_batch("embedding", list);
+        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        assert!(err.contains("not a Float32 vector list"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn scalar_vector_column_errors() {
+        let batch = single_column_batch("embedding", Arc::new(StringArray::from(vec!["x"])));
+        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        assert!(
+            err.contains("must be FixedSizeList(Float32) or List(Float32)"),
+            "{err}"
+        );
+    }
+
+    // ---- payload extraction edge cases ----
+
+    #[tokio::test]
+    async fn payload_without_remaining_columns_is_empty_object_per_row() {
+        // Only the id and vector columns exist: every row packs to `{}`.
+        let dim = 2i32;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let vectors = Arc::new(FixedSizeListArray::new(
+            item_field,
+            dim,
+            Arc::new(Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0])),
+            None,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Int64, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim,
+                ),
+                true,
+            ),
+        ]));
+        let batch = Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1i64, 2])),
+                    vectors,
+                ],
+            )
+            .unwrap(),
+        ));
+        let config = config_with(serde_json::json!({}));
+        let payloads = extract_payloads(&batch, &config).unwrap().unwrap();
+        assert_eq!(payloads.len(), 2);
+        for payload in payloads {
+            assert_eq!(payload, "{}");
+        }
+    }
+
     /// Live round-trip against a real Postgres with pgvector. Run with:
     /// `docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg16`
     /// then `cargo test -p arkflow-plugin --lib output::pgvector -- --ignored`

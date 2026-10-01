@@ -1570,4 +1570,417 @@ mod tests {
             "{error}"
         );
     }
+
+    // ---------- validation coverage ----------
+
+    #[test]
+    fn config_validation_rejects_each_invalid_field() {
+        let mut cfg = config();
+        cfg.left_key = String::new();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty left_key"));
+
+        let mut cfg = config();
+        cfg.right_key = String::new();
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = config();
+        cfg.window_ms = -1;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("window_ms must be non-negative"));
+
+        let mut cfg = config();
+        cfg.ttl_ms = -1;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("ttl_ms must be non-negative"));
+
+        let mut cfg = config();
+        cfg.max_per_key = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_per_key must be at least 1"));
+
+        // The all-valid configuration still passes.
+        assert!(config().validate().is_ok());
+    }
+
+    #[test]
+    fn input_producer_resolution_positional_fallback_and_unknown_producer() {
+        // Undeclared sides fall back positionally when each fallback position
+        // is occupied by exactly one producer channel.
+        let join = JoinOperator::new(config())
+            .unwrap()
+            .with_input_producers(&["orders".to_string(), "profiles".to_string()])
+            .expect("positional fallback resolves unique producers");
+        assert_eq!(join.left_index, 0);
+        assert_eq!(join.right_index, 1);
+
+        // A declared side naming a producer that does not feed the join is a
+        // build-time error.
+        let mut cfg = config();
+        cfg.left_from = Some("ghost".into());
+        let error = match JoinOperator::new(cfg)
+            .unwrap()
+            .with_input_producers(&["orders".to_string(), "profiles".to_string()])
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expected a rejection for an unknown declared producer"),
+        };
+        assert!(
+            error.to_string().contains("which does not feed this join"),
+            "{error}"
+        );
+    }
+
+    // ---------- column extraction coverage ----------
+
+    fn typed_side_batch(
+        side: u32,
+        key_column: Field,
+        key_values: ArrayRef,
+        timestamp_column: Field,
+        timestamp_values: ArrayRef,
+    ) -> MessageBatchRef {
+        let schema = Arc::new(Schema::new(vec![
+            key_column,
+            timestamp_column,
+            Field::new(META_INPUT_INDEX, DataType::UInt32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                key_values,
+                timestamp_values,
+                Arc::new(UInt32Array::from(vec![side; 1])),
+            ],
+        )
+        .unwrap();
+        Arc::new(MessageBatch::new_arrow(batch))
+    }
+
+    fn key_batch(side: u32, key: Option<&str>) -> MessageBatchRef {
+        typed_side_batch(
+            side,
+            Field::new("key", DataType::Utf8, true),
+            Arc::new(StringArray::from(vec![key])),
+            Field::new("ts", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![Some(100)])),
+        )
+    }
+
+    #[tokio::test]
+    async fn key_column_must_be_a_non_null_string() {
+        // A non-string key column is rejected.
+        let join = JoinOperator::new(config()).unwrap();
+        let batch = typed_side_batch(
+            0,
+            Field::new("key", DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![1])),
+            Field::new("ts", DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![100])),
+        );
+        let error = join.process(batch).await.unwrap_err();
+        assert!(
+            error.to_string().contains("must be a string column"),
+            "{error}"
+        );
+
+        // A null key value is rejected.
+        let join = JoinOperator::new(config()).unwrap();
+        let error = join.process(key_batch(0, None)).await.unwrap_err();
+        assert!(
+            error.to_string().contains("is null at row 0"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_tag_column_must_be_a_non_null_uint32() {
+        // A wrongly-typed tag column is rejected.
+        let join = JoinOperator::new(config()).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new(META_INPUT_INDEX, DataType::Utf8, false),
+        ]));
+        let batch = Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])),
+                    Arc::new(Int64Array::from(vec![100])),
+                    Arc::new(StringArray::from(vec!["zero"])),
+                ],
+            )
+            .unwrap(),
+        ));
+        let error = join.process(batch).await.unwrap_err();
+        assert!(
+            error.to_string().contains("must be a UInt32 column"),
+            "{error}"
+        );
+
+        // A null tag value is rejected.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new(META_INPUT_INDEX, DataType::UInt32, true),
+        ]));
+        let batch = Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])),
+                    Arc::new(Int64Array::from(vec![100])),
+                    Arc::new(UInt32Array::from(vec![None::<u32>])),
+                ],
+            )
+            .unwrap(),
+        ));
+        let error = join.process(batch).await.unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("'{META_INPUT_INDEX}' is null")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn timestamp_columns_support_arrow_temporal_types_and_reject_others() {
+        use datafusion::arrow::array::{
+            TimestampMillisecondArray, TimestampNanosecondArray,
+        };
+
+        // TimestampMillisecondArray values pass through unchanged.
+        let join = JoinOperator::new(config()).unwrap();
+        join.process(typed_side_batch(
+            0,
+            Field::new("key", DataType::Utf8, false),
+            Arc::new(StringArray::from(vec!["a"])),
+            Field::new("ts", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, None), true),
+            Arc::new(TimestampMillisecondArray::from(vec![Some(5_000)])),
+        ))
+        .await
+        .unwrap();
+        let output = join
+            .process(side_batch(1, &["a"], &[5_000]))
+            .await
+            .unwrap();
+        assert!(matches!(output, ProcessResult::Single(_)));
+
+        // TimestampMillisecondArray nulls are rejected.
+        let join = JoinOperator::new(config()).unwrap();
+        let error = join
+            .process(typed_side_batch(
+                0,
+                Field::new("key", DataType::Utf8, false),
+                Arc::new(StringArray::from(vec!["a"])),
+                Field::new("ts", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, None), true),
+                Arc::new(TimestampMillisecondArray::from(vec![None::<i64>])),
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is null at row 0"), "{error}");
+
+        // TimestampNanosecondArray values normalize to milliseconds.
+        let join = JoinOperator::new(config()).unwrap();
+        join.process(typed_side_batch(
+            0,
+            Field::new("key", DataType::Utf8, false),
+            Arc::new(StringArray::from(vec!["a"])),
+            Field::new("ts", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None), true),
+            Arc::new(TimestampNanosecondArray::from(vec![Some(2_000_000_000)])),
+        ))
+        .await
+        .unwrap();
+        // 2s in nanoseconds matches a right row at 2_000ms.
+        let output = join
+            .process(side_batch(1, &["a"], &[2_000]))
+            .await
+            .unwrap();
+        assert!(matches!(output, ProcessResult::Single(_)));
+
+        // TimestampNanosecondArray nulls are rejected.
+        let join = JoinOperator::new(config()).unwrap();
+        let error = join
+            .process(typed_side_batch(
+                0,
+                Field::new("key", DataType::Utf8, false),
+                Arc::new(StringArray::from(vec!["a"])),
+                Field::new("ts", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None), true),
+                Arc::new(TimestampNanosecondArray::from(vec![None::<i64>])),
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is null at row 0"), "{error}");
+
+        // Int64 nulls are rejected.
+        let join = JoinOperator::new(config()).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, true),
+            Field::new(META_INPUT_INDEX, DataType::UInt32, false),
+        ]));
+        let batch = Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])),
+                    Arc::new(Int64Array::from(vec![None::<i64>])),
+                    Arc::new(UInt32Array::from(vec![0])),
+                ],
+            )
+            .unwrap(),
+        ));
+        let error = join.process(batch).await.unwrap_err();
+        assert!(error.to_string().contains("is null at row 0"), "{error}");
+
+        // A non-numeric timestamp column is rejected.
+        let join = JoinOperator::new(config()).unwrap();
+        let error = join
+            .process(typed_side_batch(
+                0,
+                Field::new("key", DataType::Utf8, false),
+                Arc::new(StringArray::from(vec!["a"])),
+                Field::new("ts", DataType::Utf8, false),
+                Arc::new(StringArray::from(vec!["not-a-number"])),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be an Int64 or Timestamp column"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_side_schema_must_stay_stable() {
+        let join = JoinOperator::new(config()).unwrap();
+        join.process(side_batch(0, &["a"], &[100])).await.unwrap();
+        // A second left batch with a different schema is rejected.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new(META_INPUT_INDEX, DataType::UInt32, false),
+        ]));
+        let batch = Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])),
+                    Arc::new(Int64Array::from(vec![1])),
+                    Arc::new(Int64Array::from(vec![100])),
+                    Arc::new(UInt32Array::from(vec![0])),
+                ],
+            )
+            .unwrap(),
+        ));
+        let error = join.process(batch).await.unwrap_err();
+        assert!(
+            error.to_string().contains("schema changed mid-stream"),
+            "{error}"
+        );
+    }
+
+    // ---------- right-side / pending unmatched coverage ----------
+
+    #[tokio::test]
+    async fn right_side_capacity_eviction_is_observable_on_inner_join() {
+        // Inner join drops capacity-evicted rows; the throttled eviction log
+        // must still observe them (right-side index of the throttle).
+        let mut cfg = config();
+        cfg.max_per_key = 1;
+        let join = JoinOperator::new(cfg).unwrap();
+        // Three rows for one key evict twice: the first eviction logs, the
+        // second is suppressed inside the throttle interval.
+        assert!(matches!(
+            join.process(side_batch(1, &["a", "a", "a"], &[100, 110, 120]))
+                .await
+                .unwrap(),
+            ProcessResult::None
+        ));
+        // The surviving newest row still matches.
+        let output = join.process(side_batch(0, &["a"], &[120])).await.unwrap();
+        assert!(matches!(output, ProcessResult::Single(_)));
+    }
+
+    #[tokio::test]
+    async fn right_pending_unmatched_parks_reparks_and_flushes() {
+        // RightOuter: right rows evicted while the LEFT schema is unknown park
+        // in the bounded pending queue (dropping the oldest on overflow), stay
+        // parked across further watermarks, and flush once a left batch
+        // establishes the schema.
+        let mut cfg = config();
+        cfg.join_type = JoinType::RightOuter;
+        cfg.max_per_key = 1;
+        let join = JoinOperator::new(cfg).unwrap();
+        join.process(side_batch(1, &["a", "b"], &[100, 200])).await
+            .unwrap();
+        // Both right rows evict with no left schema: "a" overflows the
+        // bounded pending queue and drops.
+        assert!(matches!(
+            join.on_watermark(6_000).await.unwrap(),
+            ProcessResult::None
+        ));
+        // A further watermark still has no left schema: the parked row
+        // re-parks instead of emitting.
+        assert!(matches!(
+            join.on_watermark(7_000).await.unwrap(),
+            ProcessResult::None
+        ));
+        // The first left batch establishes the schema; the parked right row
+        // flushes as this call's unmatched emission.
+        let output = join.process(side_batch(0, &["c"], &[100])).await.unwrap();
+        let ProcessResult::Single(batch) = output else {
+            panic!("expected the parked right unmatched emission to flush");
+        };
+        assert_eq!(string_column(&batch, "r_key").value(0), "b");
+        assert!(string_column(&batch, "l_key").is_null(0));
+    }
+
+    #[tokio::test]
+    async fn capacity_unmatched_parks_before_opposite_schema_and_flushes_with_match() {
+        // LeftOuter with a capacity eviction BEFORE any right batch: the
+        // unmatched row parks (no right schema yet). The next right batch
+        // flushes the parked emission AND emits a fresh matched pair — two
+        // outputs in one process call.
+        let mut cfg = config();
+        cfg.join_type = JoinType::LeftOuter;
+        cfg.max_per_key = 1;
+        let join = JoinOperator::new(cfg).unwrap();
+        join.process(side_batch(0, &["a"], &[100])).await.unwrap();
+        // Pushing a second "a" evicts the first; with no right schema the
+        // unmatched row parks and the call emits nothing.
+        assert!(matches!(
+            join.process(side_batch(0, &["a"], &[200])).await.unwrap(),
+            ProcessResult::None
+        ));
+        let output = join.process(side_batch(1, &["a"], &[200])).await.unwrap();
+        let ProcessResult::Multiple(batches) = output else {
+            panic!("expected a parked flush plus a matched pair");
+        };
+        assert_eq!(batches.len(), 2);
+        let has_unmatched = batches.iter().any(|batch| {
+            string_column(batch, "l_key").value(0) == "a"
+                && string_column(batch, "r_key").is_null(0)
+        });
+        let has_pair = batches
+            .iter()
+            .any(|batch| !string_column(batch, "r_key").is_null(0));
+        assert!(has_unmatched, "parked unmatched emission missing");
+        assert!(has_pair, "matched pair missing");
+    }
 }

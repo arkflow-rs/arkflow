@@ -769,4 +769,223 @@ mod tests {
         ack.abort().await.unwrap();
         assert_eq!(tracker.blocking(), 0);
     }
+
+    #[test]
+    fn default_frontier_behaves_like_new() {
+        let frontier = CommitFrontier::default();
+        assert!(frontier.contiguous_positions().is_empty());
+        assert!(frontier.next_offset_of(None, 0).is_none());
+    }
+
+    #[test]
+    fn record_failure_fences_one_partition_until_cleared() {
+        let frontier = CommitFrontier::new();
+        frontier.record_failure(Some("orders"), 0, 12, "store_offset failed");
+        let failure = frontier.failure(Some("orders"), 0).expect("failure is fenced");
+        assert_eq!(failure.next_offset, 12);
+        assert_eq!(failure.error, "store_offset failed");
+        // Other partitions (and the same partition by another key) are not
+        // fenced.
+        assert!(frontier.failure(Some("orders"), 1).is_none());
+        assert!(frontier.failure(None, 0).is_none());
+
+        // A retry for a different offset must not lift the fence.
+        assert!(!frontier.clear_failure_if(Some("orders"), 0, 13));
+        assert!(frontier.failure(Some("orders"), 0).is_some());
+        // The retrying offset clears it.
+        assert!(frontier.clear_failure_if(Some("orders"), 0, 12));
+        assert!(frontier.failure(Some("orders"), 0).is_none());
+        // Clearing again is a no-op.
+        assert!(!frontier.clear_failure_if(Some("orders"), 0, 12));
+    }
+
+    #[test]
+    fn seed_clears_failures_for_restored_partitions() {
+        let frontier = CommitFrontier::new();
+        frontier.record_failure(Some("orders"), 0, 12, "store_offset failed");
+        frontier.seed(&[position("orders", 0, 12)]);
+        assert!(
+            frontier.failure(Some("orders"), 0).is_none(),
+            "restore must lift the fence for the restored partition"
+        );
+    }
+
+    #[test]
+    fn snapshot_partition_of_an_unknown_partition_is_inactive() {
+        let frontier = CommitFrontier::new();
+        let snapshot = frontier.snapshot_partition(Some("orders"), 7);
+        // Round-tripping an inactive snapshot removes a frontier that has not
+        // moved since (used to compensate a first-delivery failure).
+        frontier.acknowledge(&position("orders", 7, 3));
+        assert!(frontier.restore_partition_if_current(Some("orders"), 7, 3, snapshot));
+        assert!(frontier.next_offset_of(Some("orders"), 7).is_none());
+    }
+
+    #[test]
+    fn restore_partition_is_rejected_when_the_frontier_moved() {
+        let frontier = CommitFrontier::new();
+        frontier.acknowledge(&position("orders", 0, 5));
+        let snapshot = frontier.snapshot_partition(Some("orders"), 0);
+        // The frontier advanced past the value the caller expected.
+        frontier.acknowledge(&position("orders", 0, 6));
+        assert!(!frontier.restore_partition_if_current(
+            Some("orders"),
+            0,
+            5,
+            snapshot
+        ));
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(6));
+    }
+
+    #[test]
+    fn restore_partition_is_rejected_for_an_unknown_partition() {
+        let frontier = CommitFrontier::new();
+        let snapshot = frontier.snapshot_partition(Some("orders"), 0);
+        // An active snapshot can only restore onto an existing frontier.
+        assert!(!frontier.restore_partition_if_current(
+            Some("orders"),
+            0,
+            0,
+            snapshot
+        ));
+    }
+
+    #[test]
+    fn restore_partition_reverts_pending_sets() {
+        let frontier = CommitFrontier::new();
+        frontier.acknowledge(&position("orders", 0, 5));
+        let snapshot = frontier.snapshot_partition(Some("orders"), 0);
+        // An out-of-order acknowledgement creates a pending gap.
+        frontier.acknowledge(&position("orders", 0, 9));
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, 7)),
+            AckAdvance::Pending { gap: 6 }
+        );
+        // The frontier itself did not move, so the snapshot restores both the
+        // pending set and the offset.
+        assert!(frontier.restore_partition_if_current(
+            Some("orders"),
+            0,
+            5,
+            snapshot
+        ));
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(5));
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, 6)),
+            AckAdvance::Advanced { next_offset: 6 },
+            "the reverted pending set no longer contains 7 and 9"
+        );
+    }
+
+    #[test]
+    fn rewind_position_requires_the_expected_offset() {
+        let frontier = CommitFrontier::new();
+        // Unknown partition and inactive frontiers refuse.
+        assert!(!frontier.rewind_position(Some("orders"), 0, 4));
+        frontier.anchor_delivery(&position("orders", 0, 4));
+        frontier.acknowledge(&position("orders", 0, 5));
+        frontier.acknowledge(&position("orders", 0, 6));
+        frontier.acknowledge(&position("orders", 0, 7));
+        // Wrong expected offset (or a different partition) refuses.
+        assert!(!frontier.rewind_position(Some("orders"), 0, 6));
+        assert!(!frontier.rewind_position(Some("orders"), 1, 7));
+
+        frontier.record_failure(Some("orders"), 0, 7, "compensating");
+        assert!(frontier.rewind_position(Some("orders"), 0, 7));
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(6));
+        assert!(
+            frontier.failure(Some("orders"), 0).is_none(),
+            "a compensated rewind clears the partition's fence"
+        );
+
+        // A pending acknowledgement beyond the rewound offset is dropped.
+        frontier.acknowledge(&position("orders", 0, 9));
+        assert!(frontier.rewind_position(Some("orders"), 0, 6));
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, 6)),
+            AckAdvance::Advanced { next_offset: 6 },
+            "6 is contiguous after the rewind to 5"
+        );
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, 9)),
+            AckAdvance::Pending { gap: 7 },
+            "9 no longer sits in the pending set after the rewind"
+        );
+    }
+
+    #[test]
+    fn rewind_position_at_zero_saturates() {
+        let frontier = CommitFrontier::new();
+        frontier.acknowledge(&position("orders", 0, 0));
+        assert!(frontier.rewind_position(Some("orders"), 0, 0));
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(0));
+    }
+
+    #[tokio::test]
+    async fn undo_reopens_a_completed_acknowledgement() {
+        let tracker = Arc::new(AckTracker::new());
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            Arc::new(crate::input::NoopAck),
+        ));
+        assert_eq!(tracker.blocking(), 1);
+        ack.ack().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
+        // A compensated durable commit undoes the completion: the delivery
+        // blocks the next checkpoint cut again until it is retried.
+        ack.undo().await.unwrap();
+        assert_eq!(tracker.blocking(), 1);
+        // The retry settles it once more.
+        ack.ack().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
+    }
+
+    #[tokio::test]
+    async fn undo_releases_held_claims() {
+        let tracker = Arc::new(AckTracker::new());
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            Arc::new(crate::input::NoopAck),
+        ));
+        ack.mark_held();
+        assert_eq!(tracker.blocking(), 0);
+        ack.undo().await.unwrap();
+        // The undo settled the held claim too: an undone delivery is no
+        // longer parked inside a buffering operator.
+        assert_eq!(tracker.blocking(), 1);
+    }
+
+    #[tokio::test]
+    async fn abort_settles_held_claims() {
+        let tracker = Arc::new(AckTracker::new());
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            Arc::new(crate::input::NoopAck),
+        ));
+        ack.mark_held();
+        ack.mark_held();
+        // Nested holds count once; the abort clears the whole claim stack.
+        assert_eq!(tracker.blocking(), 0);
+        ack.abort().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
+        // After the abort the delivery is terminally settled; releasing
+        // stale holds cannot resurrect it.
+        ack.release_held();
+        assert_eq!(tracker.blocking(), 0);
+    }
+
+    #[tokio::test]
+    async fn undo_and_ack_are_idempotent() {
+        let tracker = Arc::new(AckTracker::new());
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            Arc::new(crate::input::NoopAck),
+        ));
+        ack.ack().await.unwrap();
+        ack.ack().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
+        ack.undo().await.unwrap();
+        ack.undo().await.unwrap();
+        assert_eq!(tracker.blocking(), 1);
+    }
 }

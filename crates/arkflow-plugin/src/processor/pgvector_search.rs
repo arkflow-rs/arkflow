@@ -515,6 +515,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn blank_url_and_table_rejected_with_specific_errors() {
+        // Present-but-blank values hit the dedicated build-time checks
+        // (missing keys already fail at parse time).
+        let err = PgVectorSearchProcessorBuilder
+            .build(
+                None,
+                &Some(serde_json::json!({"url": "  ", "table": "t"})),
+                &test_resource(),
+            )
+            .err()
+            .expect("blank url must be rejected");
+        assert!(format!("{err}").contains("'url' must not be empty"), "{err}");
+
+        let err = PgVectorSearchProcessorBuilder
+            .build(
+                None,
+                &Some(serde_json::json!({"url": "postgres://localhost/db", "table": " "})),
+                &test_resource(),
+            )
+            .err()
+            .expect("blank table must be rejected");
+        assert!(format!("{err}").contains("'table' must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn malformed_url_is_rejected_at_build_time() {
+        let err = PgVectorSearchProcessorBuilder
+            .build(
+                None,
+                &Some(serde_json::json!({"url": "not a url", "table": "t"})),
+                &test_resource(),
+            )
+            .err()
+            .expect("malformed url must be rejected");
+        assert!(format!("{err}").contains("invalid 'url'"), "{err}");
+    }
+
+    #[test]
+    fn malformed_payload_json_in_rows_errors() {
+        // A payload column that does not hold JSON must surface a parse
+        // error rather than silently corrupting the matches output.
+        let err = rows_to_matches(
+            vec![("1".to_string(), Some("not json {".to_string()), 0.5)],
+            true,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("payload parse failed"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn close_is_ok_without_any_connection() {
+        let processor = build_processor(serde_json::json!({
+            "url": "postgres://postgres:postgres@localhost:5432/vectors",
+            "table": "documents",
+        }));
+        assert!(processor.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn query_against_closed_port_fails_with_process_error() {
+        // The pool is lazy, so the failure surfaces on the first query.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let processor = build_processor(serde_json::json!({
+            "url": format!("postgres://postgres:postgres@127.0.0.1:{port}/vectors"),
+            "table": "documents",
+            "timeout_ms": 1000,
+        }));
+        let err = processor
+            .process(vector_batch(vec![vec![1.0, 0.0]]))
+            .await
+            .expect_err("query against a closed port must fail");
+        assert!(format!("{err}").contains("query failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn vector_batch_helper_builds_row_per_vector() {
+        let batch = vector_batch(vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]);
+        assert_eq!(batch.num_rows(), 3);
+        let vectors =
+            vector_util::extract_vectors("pgvector_search processor", &batch, "embedding")
+                .unwrap();
+        assert_eq!(vectors, vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]);
+    }
+
+
     /// Live round-trip against a real Postgres with pgvector. Run with:
     /// `docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg16`
     /// then `cargo test -p arkflow-plugin --lib processor::pgvector_search -- --ignored`

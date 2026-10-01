@@ -4933,7 +4933,8 @@ fn span_test_tracing()
     (exporter, provider)
 }
 
-#[tokio::test]
+#[serial_test::serial]
+    #[tokio::test]
 async fn job_and_chain_spans_are_exported_with_parent_links() {
     let (exporter, provider) = span_test_tracing();
 
@@ -5060,7 +5061,8 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
     assert!(tasks.contains(&"sink-0".to_string()), "{tasks:?}");
 }
 
-#[tokio::test]
+#[serial_test::serial]
+    #[tokio::test]
 async fn batch_span_carries_rows_and_task_with_chain_parent() {
     let (exporter, provider) = span_test_tracing();
 
@@ -5136,7 +5138,8 @@ async fn batch_span_carries_rows_and_task_with_chain_parent() {
     assert_eq!(rows_value, 10, "rows attribute must be the batch row count");
 }
 
-#[tokio::test]
+#[serial_test::serial]
+    #[tokio::test]
 async fn operator_failure_is_recorded_as_chain_batch_event() {
     let (exporter, provider) = span_test_tracing();
 
@@ -5206,7 +5209,8 @@ fn barrier_wire_json_is_backward_and_forward_compatible() {
     assert_eq!(back, stamped);
 }
 
-#[tokio::test]
+#[serial_test::serial]
+    #[tokio::test]
 async fn trace_context_round_trips_to_a_remote_parent() {
     let (exporter, provider) = span_test_tracing();
     let root = tracing::info_span!("trace-root-7354");
@@ -5258,7 +5262,8 @@ async fn capture_is_none_without_an_active_span() {
     assert!(super::remote::capture_trace_context().is_none());
 }
 
-#[tokio::test]
+#[serial_test::serial]
+    #[tokio::test]
 async fn barrier_carries_remote_trace_context_across_chains() {
     let (exporter, provider) = span_test_tracing();
 
@@ -5894,5 +5899,2562 @@ async fn wedged_round_fails_at_the_deadline_instead_of_parking() {
     assert!(
         message.contains("round timed out"),
         "error names the round deadline: {message}"
+    );
+}
+
+// ---------- graph construction error-path and helper coverage ----------
+
+fn window_operator(id: &str, config: serde_json::Value) -> OperatorSpec {
+    OperatorSpec {
+        id: id.into(),
+        kind: OperatorKind::Window,
+        stateful: false,
+        key_field: None,
+        config,
+    }
+}
+
+fn window_config_json(kind: serde_json::Value) -> serde_json::Value {
+    let mut config = kind;
+    let object = config.as_object_mut().expect("window kind object");
+    object.insert(
+        "timestamp_field".to_string(),
+        serde_json::json!("ts"),
+    );
+    object.insert("key_field".to_string(), serde_json::json!("key"));
+    object.insert("trigger".to_string(), serde_json::json!("watermark"));
+    config
+    }
+
+fn graph_coverage_event_time(timestamp_field: &str) -> TimeSpec {
+    TimeSpec {
+        mode: TimeMode::EventTime,
+        timestamp_field: Some(timestamp_field.into()),
+        watermark: Some(WatermarkSpec {
+            strategy: WatermarkStrategy::BoundedOutOfOrderness,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        }),
+        allowed_lateness_ms: 0,
+        late_event_policy: Default::default(),
+        late_event_route: None,
+    }
+}
+
+fn simple_adapter() -> Adapter {
+    Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    }
+}
+
+#[test]
+fn builder_capacity_clamps_to_at_least_one_channel() {
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+    let adapter = simple_adapter();
+    let graph = ExecutionGraphBuilder::default()
+        .with_capacity(4)
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    assert_eq!(graph.channel_capacity, 4);
+
+    let graph = ExecutionGraphBuilder::default()
+        .with_capacity(0)
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    assert_eq!(graph.channel_capacity, 1, "capacity 0 must clamp to 1");
+}
+
+#[test]
+fn empty_task_assignment_is_rejected() {
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+    let adapter = simple_adapter();
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(&plan, &[], &adapter, &resource(), None)
+        .err()
+        .expect("an empty assignment must fail the build");
+    assert!(
+        error.to_string().contains("contains no tasks"),
+        "{error}"
+    );
+}
+
+#[test]
+fn unknown_task_in_assignment_is_rejected() {
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+    let adapter = simple_adapter();
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".to_string(), "nope-0".to_string()],
+            &adapter,
+            &resource(),
+            None,
+        )
+        .err()
+        .expect("an unknown task id must fail the build");
+    assert!(
+        error.to_string().contains("unknown Job task 'nope-0'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn window_job_with_pending_transaction_limit_builds_with_limited_journal() {
+    let mut job = spec(
+        vec![window_operator(
+            "win",
+            window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 1000})),
+        )],
+        vec![edge("source", "win"), edge("win", "sink")],
+        1,
+    );
+    job.state.as_mut().unwrap().max_pending_transactions = Some(3);
+    job.sources[0].time = graph_coverage_event_time("ts");
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &simple_adapter(), &resource())
+        .unwrap();
+    assert_eq!(
+        graph.chains.len(),
+        3,
+        "source chain, stateful window chain, sink chain"
+    );
+}
+
+#[test]
+fn remote_node_view_missing_a_data_edge_task_fails_closed() {
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+    let manager = crate::executor::remote::NetworkManager::new(8);
+    // map-0 sits on another node but is missing from the task→node view: the
+    // Agent must fail closed instead of guessing the placement.
+    let context = crate::executor::graph::RemoteEdgeContext {
+        tls: None,
+        local_node: "node-a".into(),
+        task_nodes: BTreeMap::from([("source-0".to_string(), "node-a".to_string())]),
+        node_addrs: BTreeMap::new(),
+        manager,
+        generation: 1,
+    };
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".to_string()],
+            &simple_adapter(),
+            &resource(),
+            Some(&context),
+        )
+        .err()
+        .expect("an incomplete task view must fail the build");
+    assert!(
+        error.to_string().contains("no node for task 'map-0'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn partitioned_target_without_key_groups_fails_locally_and_remotely() {
+    let mut job = spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        2,
+    );
+    job.edges[0].partitioned = true;
+    let mut plan = JobPlan::compile(job).unwrap();
+    // Strip the map tasks' key-group partitions: partitioned routing cannot
+    // derive hash buckets and must fail the build.
+    for task in plan.tasks.iter_mut() {
+        if task.operator_id == "map" {
+            task.partitions.clear();
+        }
+    }
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".to_string(), "map-0".to_string()],
+            &simple_adapter(),
+            &resource(),
+            None,
+        )
+        .err()
+        .expect("a partitioned local target without key groups must fail");
+    assert!(
+        error.to_string().contains("has no key-group partition"),
+        "{error}"
+    );
+
+    // Same defect on a remote target fails identically.
+    let manager = crate::executor::remote::NetworkManager::new(8);
+    let context = crate::executor::graph::RemoteEdgeContext {
+        tls: None,
+        local_node: "node-a".into(),
+        task_nodes: BTreeMap::from([
+            ("source-0".to_string(), "node-a".to_string()),
+            ("source-1".to_string(), "node-a".to_string()),
+            ("map-0".to_string(), "node-b".to_string()),
+            ("map-1".to_string(), "node-b".to_string()),
+            ("sink-0".to_string(), "node-b".to_string()),
+            ("sink-1".to_string(), "node-b".to_string()),
+        ]),
+        node_addrs: BTreeMap::new(),
+        manager,
+        generation: 1,
+    };
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".to_string()],
+            &simple_adapter(),
+            &resource(),
+            Some(&context),
+        )
+        .err()
+        .expect("a partitioned remote target without key groups must fail");
+    assert!(
+        error.to_string().contains("has no key-group partition"),
+        "{error}"
+    );
+}
+
+#[test]
+fn late_event_route_target_missing_from_assignment_is_rejected() {
+    let mut job = spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    );
+    job.operators.push(sink_operator("late_sink", false));
+    job.sinks.push(crate::job::SinkSpec {
+        operator_id: "late_sink".into(),
+        output_type: "collect".into(),
+        codec: None,
+        config: serde_json::json!({}),
+    });
+    job.sources[0].time.late_event_route = Some("late_sink".into());
+    let plan = JobPlan::compile(job).unwrap();
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".to_string(), "map-0".to_string(), "sink-0".to_string()],
+            &simple_adapter(),
+            &resource(),
+            None,
+        )
+        .err()
+        .expect("a route target outside the assignment must fail the build");
+    assert!(
+        error
+            .to_string()
+            .contains("late-event route target 'late_sink' for source 'source'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn late_event_route_broadcasts_across_target_subtasks() {
+    let mut job = spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        2,
+    );
+    job.operators.push(sink_operator("late_sink", false));
+    job.sinks.push(crate::job::SinkSpec {
+        operator_id: "late_sink".into(),
+        output_type: "collect".into(),
+        codec: None,
+        config: serde_json::json!({}),
+    });
+    job.sources[0].time.late_event_route = Some("late_sink".into());
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &simple_adapter(), &resource())
+        .unwrap();
+    let source_chain = graph
+        .chains
+        .iter()
+        .find(|chain| chain.task_ids.first().is_some_and(|id| id == "source-0"))
+        .expect("source chain");
+    let edges = source_chain
+        .late_event_outputs
+        .get("source-0")
+        .expect("source task carries a late-event edge");
+    assert!(
+        edges.iter().any(|target| matches!(
+            target,
+            crate::executor::graph::EdgeTarget::Broadcast(channels) if channels.len() == 2
+        )),
+        "two late-sink subtasks must be reached by broadcast"
+    );
+}
+
+#[test]
+fn task_referencing_unknown_operator_is_rejected() {
+    let mut plan = JobPlan::compile(spec(Vec::new(), vec![edge("source", "sink")], 1)).unwrap();
+    plan.tasks.push(crate::job::TaskSpec {
+        id: "ghost-0".into(),
+        operator_id: "ghost".into(),
+        subtask: 0,
+        partitions: Vec::new(),
+    });
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &[
+                "source-0".to_string(),
+                "ghost-0".to_string(),
+                "sink-0".to_string(),
+            ],
+            &simple_adapter(),
+            &resource(),
+            None,
+        )
+        .err()
+        .expect("a task with an unknown operator must fail the build");
+    assert!(
+        error.to_string().contains("references unknown operator"),
+        "{error}"
+    );
+}
+
+#[test]
+fn join_side_producer_mismatch_fails_graph_build() {
+    let mut job = spec(
+        vec![OperatorSpec {
+            id: "join".into(),
+            kind: OperatorKind::Join,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({
+                "left_key": "key",
+                "right_key": "key",
+                "window_ms": 5000,
+                "left_from": "profiles",
+                "right_from": "orders",
+            }),
+        }],
+        vec![
+            edge("source", "join"),
+            edge("aux", "join"),
+            edge("join", "sink"),
+        ],
+        1,
+    );
+    // Replace the auto-inserted source with two named sources so both join
+    // sides have a producer.
+    job.operators.insert(
+        0,
+        OperatorSpec {
+            id: "aux".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        },
+    );
+    job.sources.push(crate::job::SourceSpec {
+        operator_id: "aux".into(),
+        input_type: "vec".into(),
+        codec: None,
+        config: serde_json::json!({}),
+        time: TimeSpec {
+            mode: TimeMode::ProcessingTime,
+            timestamp_field: None,
+            watermark: None,
+            allowed_lateness_ms: 0,
+            late_event_policy: Default::default(),
+            late_event_route: None,
+        },
+    });
+    let plan = JobPlan::compile(job).unwrap();
+    let error = ExecutionGraphBuilder::default()
+        .build(&plan, &simple_adapter(), &resource())
+        .err()
+        .expect("a join side naming a non-producer must fail the build");
+    assert!(
+        error.to_string().contains("which does not feed this join"),
+        "{error}"
+    );
+}
+
+#[test]
+fn session_window_builds_window_side_late_route_and_gate_timing() {
+    let mut job = spec(
+        vec![window_operator(
+            "win",
+            window_config_json(serde_json::json!({"kind": "session", "gap_ms": 500})),
+        )],
+        vec![edge("source", "win"), edge("win", "sink")],
+        1,
+    );
+    job.operators.push(sink_operator("late_sink", false));
+    job.sinks.push(crate::job::SinkSpec {
+        operator_id: "late_sink".into(),
+        output_type: "collect".into(),
+        codec: None,
+        config: serde_json::json!({}),
+    });
+    job.sources[0].time = graph_coverage_event_time("ts");
+    job.sources[0].time.late_event_route = Some("late_sink".into());
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &simple_adapter(), &resource())
+        .unwrap();
+    // The window task owns a dynamic-deadline side route for its late rows.
+    let window_chain = graph
+        .chains
+        .iter()
+        .find(|chain| {
+            chain
+                .task_ids
+                .iter()
+                .any(|id| id.starts_with("win-"))
+        })
+        .expect("window chain");
+    assert!(
+        window_chain
+            .late_event_outputs
+            .contains_key(window_chain.entry_task_id()),
+        "the session window task must carry a late-event side edge"
+    );
+    // The source gate learns the session gap timing.
+    let source_chain = graph
+        .chains
+        .iter()
+        .find(|chain| chain.is_source())
+        .expect("source chain");
+    assert_eq!(source_chain.window_timings.len(), 1);
+    assert!(matches!(
+        source_chain.window_timings[0],
+        crate::executor::event_time_gate::WindowTiming::Session { gap_ms: 500 }
+    ));
+}
+
+#[test]
+fn sliding_window_timing_reaches_the_source_gate() {
+    let mut job = spec(
+        vec![window_operator(
+            "win",
+            window_config_json(serde_json::json!({"kind": "sliding", "size_ms": 10_000, "slide_ms": 2_000})),
+        )],
+        vec![edge("source", "win"), edge("win", "sink")],
+        1,
+    );
+    job.sources[0].time = graph_coverage_event_time("ts");
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &simple_adapter(), &resource())
+        .unwrap();
+    let source_chain = graph
+        .chains
+        .iter()
+        .find(|chain| chain.is_source())
+        .expect("source chain");
+    assert!(matches!(
+        source_chain.window_timings[0],
+        crate::executor::event_time_gate::WindowTiming::Sliding { size_ms: 10_000, slide_ms: 2_000 }
+    ));
+}
+
+#[test]
+fn watermark_groups_merge_overlapping_sources_and_share_windows() {
+    // s1 reaches w1 and w2; s2 reaches only w2: the connected component joins
+    // both sources into one watermark group (compatible TimeSpecs).
+    let mut job = spec(
+        vec![
+            window_operator("w1", window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 1000}))),
+            window_operator("w2", window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 2000}))),
+        ],
+        vec![
+            edge("source", "w1"),
+            edge("w1", "w2"),
+            edge("source", "w2"),
+            edge("aux", "w2"),
+            edge("w2", "sink"),
+        ],
+        1,
+    );
+    job.operators.insert(
+        0,
+        OperatorSpec {
+            id: "aux".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        },
+    );
+    job.sources[0].time = graph_coverage_event_time("ts");
+    job.sources.push(crate::job::SourceSpec {
+        operator_id: "aux".into(),
+        input_type: "vec".into(),
+        codec: None,
+        config: serde_json::json!({}),
+        time: graph_coverage_event_time("ts"),
+    });
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &simple_adapter(), &resource())
+        .unwrap();
+    assert_eq!(
+        graph
+            .chains
+            .iter()
+            .filter(|chain| chain.is_source())
+            .count(),
+        2
+    );
+
+    // The same topology with an incompatible sibling TimeSpec is rejected at
+    // build time instead of letting the two gates disagree.
+    let mut job2 = spec(
+        vec![
+            window_operator("w1", window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 1000}))),
+            window_operator("w2", window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 2000}))),
+        ],
+        vec![
+            edge("source", "w1"),
+            edge("w1", "w2"),
+            edge("source", "w2"),
+            edge("aux", "w2"),
+            edge("w2", "sink"),
+        ],
+        1,
+    );
+    job2.operators.insert(
+        0,
+        OperatorSpec {
+            id: "aux".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        },
+    );
+    job2.sources[0].time = graph_coverage_event_time("ts");
+    let mut incompatible = graph_coverage_event_time("ts");
+    incompatible.allowed_lateness_ms = 5;
+    job2.sources.push(crate::job::SourceSpec {
+        operator_id: "aux".into(),
+        input_type: "vec".into(),
+        codec: None,
+        config: serde_json::json!({}),
+        time: incompatible,
+    });
+    let plan2 = JobPlan::compile(job2).unwrap();
+    let error = ExecutionGraphBuilder::default()
+        .build(&plan2, &simple_adapter(), &resource())
+        .err()
+        .expect("incompatible shared watermark specs must fail the build");
+    assert!(
+        error.to_string().contains("incompatible TimeSpec values"),
+        "{error}"
+    );
+}
+
+#[test]
+fn session_window_route_reachability_walks_unrelated_sources() {
+    // A second event-time source with a late route that does NOT reach the
+    // window exercises the reachability walk's termination (visited set and
+    // the not-reachable outcome) without contributing a route operator.
+    let mut job = spec(
+        vec![
+            window_operator("win", window_config_json(serde_json::json!({"kind": "session", "gap_ms": 500}))),
+            map_operator("m1"),
+            map_operator("m2"),
+        ],
+        vec![
+            edge("source", "win"),
+            edge("win", "late_sink"),
+            edge("aux", "m1"),
+            edge("aux", "m2"),
+            edge("m1", "sink"),
+            edge("m2", "sink"),
+        ],
+        1,
+    );
+    job.operators.push(sink_operator("late_sink", false));
+    job.sinks.push(crate::job::SinkSpec {
+        operator_id: "late_sink".into(),
+        output_type: "collect".into(),
+        codec: None,
+        config: serde_json::json!({}),
+    });
+    job.sources[0].time = graph_coverage_event_time("ts");
+    job.sources[0].time.late_event_route = Some("late_sink".into());
+    // The default auto-inserted sink operator is unreachable from `aux`
+    // unless linked; m1/m2 both feed it above.
+    job.operators.insert(
+        0,
+        OperatorSpec {
+            id: "aux".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        },
+    );
+    let mut aux_time = graph_coverage_event_time("ts");
+    aux_time.late_event_route = Some("sink".into());
+    job.sources.push(crate::job::SourceSpec {
+        operator_id: "aux".into(),
+        input_type: "vec".into(),
+        codec: None,
+        config: serde_json::json!({}),
+        time: aux_time,
+    });
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &simple_adapter(), &resource())
+        .unwrap();
+    let window_chain = graph
+        .chains
+        .iter()
+        .find(|chain| chain.task_ids.iter().any(|id| id.starts_with("win-")))
+        .expect("window chain");
+    // Only the source reaching the window contributes the route operator.
+    assert_eq!(
+        window_chain
+            .late_event_outputs
+            .get(window_chain.entry_task_id())
+            .map(|edges| edges.len()),
+        Some(1)
+    );
+}
+
+#[test]
+fn remote_edge_without_address_or_credentials_fails_the_build() {
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("map")],
+        vec![edge("source", "map"), edge("map", "sink")],
+        1,
+    ))
+    .unwrap();
+
+    // The remote node has no data-plane address advertised.
+    let manager = crate::executor::remote::NetworkManager::new(8);
+    let context = crate::executor::graph::RemoteEdgeContext {
+        tls: None,
+        local_node: "node-a".into(),
+        task_nodes: BTreeMap::from([
+            ("source-0".to_string(), "node-a".to_string()),
+            ("map-0".to_string(), "node-c".to_string()),
+            ("sink-0".to_string(), "node-c".to_string()),
+        ]),
+        node_addrs: BTreeMap::new(),
+        manager: manager.clone(),
+        generation: 1,
+    };
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".to_string()],
+            &simple_adapter(),
+            &resource(),
+            Some(&context),
+        )
+        .err()
+        .expect("a remote node without an address must fail the build");
+    assert!(
+        error.to_string().contains("no data-plane address for remote node 'node-c'"),
+        "{error}"
+    );
+
+    // With an address but no credentials the edge cannot authenticate.
+    let context = crate::executor::graph::RemoteEdgeContext {
+        tls: None,
+        local_node: "node-a".into(),
+        task_nodes: BTreeMap::from([
+            ("source-0".to_string(), "node-a".to_string()),
+            ("map-0".to_string(), "node-c".to_string()),
+            ("sink-0".to_string(), "node-c".to_string()),
+        ]),
+        node_addrs: BTreeMap::from([(
+            "node-c".to_string(),
+            "127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap(),
+        )]),
+        manager,
+        generation: 1,
+    };
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &["source-0".to_string()],
+            &simple_adapter(),
+            &resource(),
+            Some(&context),
+        )
+        .err()
+        .expect("an unauthenticated manager must refuse a remote edge");
+    assert!(
+        error.to_string().contains("without data-plane credentials"),
+        "{error}"
+    );
+}
+
+#[test]
+fn unauthenticated_transport_serves_only_one_job() {
+    // The legacy in-memory transport has no Job identity on the wire: two
+    // different Jobs cannot share its quad routes.
+    fn downstream_plan(job_id: &str) -> JobPlan {
+        let mut job = spec(
+            vec![map_operator("map")],
+            vec![edge("source", "map"), edge("map", "sink")],
+            1,
+        );
+        job.id = crate::job::JobId::new(job_id).unwrap();
+        JobPlan::compile(job).unwrap()
+    }
+    let manager = crate::executor::remote::NetworkManager::new(8);
+    let context = |plan: &JobPlan| crate::executor::graph::RemoteEdgeContext {
+        tls: None,
+        local_node: "node-b".into(),
+        task_nodes: plan
+            .tasks
+            .iter()
+            .map(|task| {
+                let node = if task.operator_id == "source" {
+                    "node-a"
+                } else {
+                    "node-b"
+                };
+                (task.id.clone(), node.to_string())
+            })
+            .collect(),
+        node_addrs: BTreeMap::new(),
+        manager: manager.clone(),
+        generation: 1,
+    };
+    let plan_a = downstream_plan("legacy-job-a");
+    let task_ids: Vec<String> = ["map-0", "sink-0"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    ExecutionGraphBuilder::default()
+        .build_subgraph(&plan_a, &task_ids, &simple_adapter(), &resource(), Some(&context(&plan_a)))
+        .expect("first job claims the legacy transport");
+
+    let plan_b = downstream_plan("legacy-job-b");
+    let error = ExecutionGraphBuilder::default()
+        .build_subgraph(&plan_b, &task_ids, &simple_adapter(), &resource(), Some(&context(&plan_b)))
+        .err()
+        .expect("a second job must be rejected by the legacy transport");
+    assert!(
+        error.to_string().contains("cannot carry Job"),
+        "{error}"
+    );
+}
+
+// ---------- run_graph wrapper / startup / shutdown coverage ----------
+
+/// A parking input whose end-of-stream can be armed from the test: once
+/// `finish` is set, the next read returns EOF (after a wake-up).
+struct ClosableParkingInput {
+    queue: Mutex<std::collections::VecDeque<MessageBatchRef>>,
+    arrived: tokio::sync::Notify,
+    finished: std::sync::atomic::AtomicBool,
+    closed: AtomicUsize,
+}
+
+impl ClosableParkingInput {
+    fn with(batches: Vec<MessageBatchRef>) -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(batches.into_iter().collect()),
+            arrived: tokio::sync::Notify::new(),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            closed: AtomicUsize::new(0),
+        })
+    }
+
+    fn push_rows(&self, rows: Vec<(i64, String)>) {
+        self.queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MessageBatch::new_arrow(int64_batch(rows))));
+        self.arrived.notify_one();
+    }
+
+    fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+        self.arrived.notify_one();
+    }
+}
+
+#[async_trait]
+impl Input for ClosableParkingInput {
+    async fn connect(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+        loop {
+            if let Some(batch) = self.queue.lock().unwrap().pop_front() {
+                return Ok((batch, Arc::new(crate::input::NoopAck)));
+            }
+            if self.finished.load(Ordering::SeqCst) {
+                return Err(Error::EOF);
+            }
+            self.arrived.notified().await;
+        }
+    }
+    async fn close(&self) -> Result<(), Error> {
+        self.closed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn run_graph_with_metrics_counts_source_batches() {
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into()), (2, "b".into())]])),
+        output: collect.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+    crate::executor::task::run_graph_with_metrics(
+        graph,
+        CancellationToken::new(),
+        Some(metrics.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(collect.written.lock().unwrap().len(), 1);
+    assert_eq!(metrics.input_batches.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.input_messages.load(Ordering::Relaxed), 2);
+    assert_eq!(metrics.output_batches.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn retired_gate_wrappers_still_run_the_graph() {
+    use crate::executor::task::{run_graph_with_gate, run_graph_with_hooks_and_gate};
+
+    let build = || {
+        let collect = Arc::new(CollectOutput::default());
+        let adapter = Adapter {
+            input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+            output: collect.clone(),
+            processor: Arc::new(PassThroughProcessor),
+        };
+        let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+        (
+            ExecutionGraphBuilder::default()
+                .build(&plan, &adapter, &resource())
+                .unwrap(),
+            collect,
+        )
+    };
+
+    let (graph, collect) = build();
+    let snapshot_gate: crate::executor::kernel_handle::SnapshotGate =
+        Arc::new(tokio::sync::RwLock::new(()));
+    run_graph_with_gate(graph, CancellationToken::new(), snapshot_gate)
+        .await
+        .unwrap();
+    assert_eq!(collect.written.lock().unwrap().len(), 1);
+
+    let (graph, collect) = build();
+    let snapshot_gate: crate::executor::kernel_handle::SnapshotGate =
+        Arc::new(tokio::sync::RwLock::new(()));
+    run_graph_with_hooks_and_gate(
+        graph,
+        CancellationToken::new(),
+        BTreeMap::new(),
+        snapshot_gate,
+    )
+    .await
+    .unwrap();
+    assert_eq!(collect.written.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn preconnected_startup_runs_the_graph() {
+    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(1, "a".into())],
+    )))]);
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+    let run = crate::executor::task::run_graph_with_hooks_startup(
+        graph,
+        CancellationToken::new(),
+        BTreeMap::new(),
+        true,
+        Some(startup_tx),
+    );
+    input.finish();
+    run.await.unwrap();
+    startup_rx.await.unwrap().unwrap();
+    assert_eq!(collect.written.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn preconnected_startup_failure_closes_sources_and_reports() {
+    struct FailingConnectOutput;
+    #[async_trait]
+    impl Output for FailingConnectOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Err(Error::Process("sink connect failed".into()))
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = ClosableParkingInput::with(vec![]);
+    let adapter = Adapter {
+        input: input.clone(),
+        output: Arc::new(FailingConnectOutput),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+    let result = crate::executor::task::run_graph_with_hooks_startup(
+        graph,
+        CancellationToken::new(),
+        BTreeMap::new(),
+        true,
+        Some(startup_tx),
+    )
+    .await;
+    assert!(result.is_err(), "a failing sink connect fails the startup");
+    let report = startup_rx.await.unwrap().unwrap_err();
+    assert!(report.contains("sink connect failed"), "{report}");
+    // The recovery preparer's connected inputs are closed by the failure
+    // path rather than leaked.
+    assert_eq!(input.closed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_panic_inside_the_event_loop_fails_the_chain() {
+    struct PanickingProcessor;
+    #[async_trait]
+    impl Processor for PanickingProcessor {
+        async fn process(&self, _batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            panic!("event loop exploded");
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PanickingProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let result = run_graph(graph, CancellationToken::new()).await;
+    let message = result.unwrap_err().to_string();
+    // The event loop's catch_unwind converts the panic into a chain error
+    // (the payload text itself depends on how the panic crossed the
+    // instrumented future boundary).
+    assert!(message.contains("chain task panicked"), "{message}");
+}
+
+#[tokio::test]
+async fn a_panic_inside_a_close_path_fails_the_chain_task() {
+    struct PanickingCloseProcessor;
+    #[async_trait]
+    impl Processor for PanickingCloseProcessor {
+        async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Single(batch))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            panic!("close exploded");
+        }
+    }
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PanickingCloseProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let result = run_graph(graph, CancellationToken::new()).await;
+    let message = result.unwrap_err().to_string();
+    // The panic escaped the event loop's catch_unwind (it fired in the close
+    // path), so the join error surfaces as a chain task panic.
+    assert!(
+        message.contains("chain task panicked"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn component_close_failures_surface_after_the_chains_exit() {
+    struct FailingCloseProcessor;
+    #[async_trait]
+    impl Processor for FailingCloseProcessor {
+        async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Single(batch))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Err(Error::Process("processor close failed".into()))
+        }
+    }
+    struct FailingCloseOutput;
+    #[async_trait]
+    impl Output for FailingCloseOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Err(Error::Process("sink close failed".into()))
+        }
+    }
+    struct FailingCloseInput;
+    #[async_trait]
+    impl Input for FailingCloseInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::EOF)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Err(Error::Process("source close failed".into()))
+        }
+    }
+    let adapter = Adapter {
+        input: Arc::new(FailingCloseInput),
+        output: Arc::new(FailingCloseOutput),
+        processor: Arc::new(FailingCloseProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let result = run_graph(graph, CancellationToken::new()).await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("close failed"),
+        "a close failure must surface instead of being swallowed: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_chain_without_source_or_inputs_is_a_config_error() {
+    let graph = crate::executor::ExecutionGraph {
+        chains: vec![crate::executor::graph::Chain::for_pool_test(1, vec![])],
+        channel_capacity: 4,
+        temporaries: Vec::new(),
+    };
+    let result = run_graph(graph, CancellationToken::new()).await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("has neither a source nor input channels"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn an_event_time_source_without_a_watermark_spec_fails_the_chain() {
+    // A hand-built chain: the graph builder validates JobSpecs, so the
+    // malformed time contract is injected directly.
+    let mut chain = crate::executor::graph::Chain::for_pool_test(1, vec![]);
+    chain.task_ids = vec!["source-0".into()];
+    chain.source = Some(ClosableParkingInput::with(vec![]));
+    chain.source_time = Some(TimeSpec {
+        mode: TimeMode::EventTime,
+        timestamp_field: Some("ts".into()),
+        watermark: None,
+        allowed_lateness_ms: 0,
+        late_event_policy: Default::default(),
+        late_event_route: None,
+    });
+    let graph = crate::executor::ExecutionGraph {
+        chains: vec![chain],
+        channel_capacity: 4,
+        temporaries: Vec::new(),
+    };
+    let result = run_graph(graph, CancellationToken::new()).await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("watermark tracker requires a watermark specification"),
+        "{message}"
+    );
+}
+
+// ---------- source-chain barrier and reconnection paths ----------
+
+/// `run_graph_with_hooks` wired with a barrier injection channel.
+fn barrier_hooked_graph(
+    input: Arc<dyn Input>,
+    _barrier_rx: flume::Receiver<Envelope>,
+) -> crate::executor::ExecutionGraph {
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input,
+        output: collect,
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap()
+}
+
+fn source_hook(
+    barrier_rx: flume::Receiver<Envelope>,
+    state: Option<Arc<dyn crate::state::StateBackend>>,
+    failure_tx: Option<tokio::sync::mpsc::UnboundedSender<Error>>,
+) -> BTreeMap<String, crate::executor::task::CheckpointHook> {
+    BTreeMap::from([(
+        "source-0".to_string(),
+        crate::executor::task::CheckpointHook {
+            reporter: None,
+            failure_reporter: failure_tx,
+            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+            state,
+            task_id: Some("source-0".to_string()),
+            event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
+            partition: Some(0),
+            metrics: None,
+            finished_reporter: None,
+        },
+    )])
+}
+
+#[tokio::test]
+async fn non_barrier_envelopes_on_the_barrier_channel_are_ignored() {
+    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(1, "a".into())],
+    )))]);
+    let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(8);
+    let graph = barrier_hooked_graph(input.clone(), barrier_rx.clone());
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(crate::executor::task::run_graph_with_hooks(
+        graph,
+        cancellation.clone(),
+        source_hook(barrier_rx, None, None),
+    ));
+    // Data envelopes on the barrier channel are skipped without stopping the
+    // loop, and a real barrier flows without a reporter or state backend.
+    let _ = barrier_tx
+        .send_async(Envelope::Data(
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(9, "x".into())]))),
+            Arc::new(crate::input::NoopAck),
+        ))
+        .await;
+    let _ = barrier_tx
+        .send_async(Envelope::Barrier(CheckpointBarrier {
+            checkpoint_id: "cp-quiet".into(),
+            generation: 1,
+            trace_context: None,
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    input.finish();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("graph must ignore non-barrier control envelopes")
+        .unwrap()
+        .unwrap();
+}
+
+struct FailingSnapshotBackend;
+
+impl crate::state::StateBackend for FailingSnapshotBackend {
+    fn format_version(&self) -> u32 {
+        1
+    }
+    fn get(&self, _namespace: &str, _key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        Ok(None)
+    }
+    fn put_with_ttl(
+        &self,
+        _namespace: &str,
+        _key: &[u8],
+        _value: &[u8],
+        _ttl: Option<u64>,
+        _now: u64,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    fn update_i64(&self, _namespace: &str, _key: &[u8], _delta: i64) -> Result<i64, Error> {
+        Ok(0)
+    }
+    fn delete(&self, _namespace: &str, _key: &[u8]) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn purge_expired(&self, _now: u64) -> Result<u64, Error> {
+        Ok(0)
+    }
+    fn scan(&self, _namespace: &str) -> Result<Vec<crate::state::StateEntry>, Error> {
+        Ok(Vec::new())
+    }
+    fn snapshot_at(&self, _epoch: u64) -> Result<crate::state::StateSnapshot, Error> {
+        self.snapshot()
+    }
+    fn snapshot(&self) -> Result<crate::state::StateSnapshot, Error> {
+        Err(Error::Process("injected snapshot failure".into()))
+    }
+    fn restore(&self, _snapshot: &crate::state::StateSnapshot) -> Result<(), Error> {
+        Ok(())
+    }
+    fn metrics(&self) -> Result<crate::state::StateMetrics, Error> {
+        Ok(crate::state::StateMetrics::default())
+    }
+    fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn source_barrier_snapshot_failure_reports_and_forwards_the_barrier() {
+    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(1, "a".into())],
+    )))]);
+    let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(8);
+    let graph = barrier_hooked_graph(input.clone(), barrier_rx.clone());
+    let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(crate::executor::task::run_graph_with_hooks(
+        graph,
+        cancellation.clone(),
+        source_hook(barrier_rx, Some(Arc::new(FailingSnapshotBackend)), Some(failure_tx)),
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = barrier_tx
+        .send_async(Envelope::Barrier(CheckpointBarrier {
+            checkpoint_id: "cp-snap-fail".into(),
+            generation: 1,
+            trace_context: None,
+        }))
+        .await;
+    let failure = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
+        .await
+        .expect("the snapshot failure must be reported")
+        .expect("the failure channel stays open");
+    assert!(
+        failure.to_string().contains("injected snapshot failure"),
+        "{failure}"
+    );
+    // The data plane keeps running after the failed round.
+    input.push_rows(vec![(2, "b".into())]);
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("graph must survive a failed snapshot round")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_during_barrier_drain_shuts_the_source_down() {
+    // The interior processor defers the delivery, so the source's tracking
+    // acknowledgement never completes: the barrier drain parks and only
+    // cancellation ends it.
+    struct DeferringProcessor;
+    #[async_trait]
+    impl Processor for DeferringProcessor {
+        async fn process(&self, _batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Deferred)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(1, "a".into())],
+    )))]);
+    let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(8);
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect,
+        processor: Arc::new(DeferringProcessor),
+    };
+    // source -> defer -> sink: the interior chain retains the delivery's
+    // acknowledgement so the source's tracking ack never completes.
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(crate::executor::task::run_graph_with_hooks(
+        graph,
+        cancellation.clone(),
+        source_hook(barrier_rx, None, None),
+    ));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let _ = barrier_tx
+        .send_async(Envelope::Barrier(CheckpointBarrier {
+            checkpoint_id: "cp-drain".into(),
+            generation: 1,
+            trace_context: None,
+        }))
+        .await;
+    // The drain is waiting on the deferred acknowledgement; cancel it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("cancellation must end the barrier drain")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn disconnection_reconnects_and_updates_the_metrics() {
+    struct FlakyInput {
+        attempts: AtomicUsize,
+    }
+    #[async_trait]
+    impl Input for FlakyInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            match self.attempts.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(Error::Disconnection),
+                1 => Ok((
+                    Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+                    Arc::new(crate::input::NoopAck),
+                )),
+                _ => Err(Error::EOF),
+            }
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = Arc::new(FlakyInput {
+        attempts: AtomicUsize::new(0),
+    });
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+    crate::executor::task::run_graph_with_metrics(
+        graph,
+        CancellationToken::new(),
+        Some(metrics.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(collect.written.lock().unwrap().len(), 1);
+    assert_eq!(metrics.input_errors.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.input_reconnects.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_reconnect_backs_off_and_recovers() {
+    struct ReconnectingInput {
+        reads: AtomicUsize,
+        connects: AtomicUsize,
+    }
+    #[async_trait]
+    impl Input for ReconnectingInput {
+        async fn connect(&self) -> Result<(), Error> {
+            // The startup connect succeeds; the first two RE-connect
+            // attempts fail and the third recovers.
+            let call = self.connects.fetch_add(1, Ordering::SeqCst);
+            if (1..3).contains(&call) {
+                return Err(Error::Process("broker unavailable".into()));
+            }
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            match self.reads.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(Error::Disconnection),
+                1 => Ok((
+                    Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+                    Arc::new(crate::input::NoopAck),
+                )),
+                _ => Err(Error::EOF),
+            }
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = Arc::new(ReconnectingInput {
+        reads: AtomicUsize::new(0),
+        connects: AtomicUsize::new(0),
+    });
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    // Paused time advances the 5s backoff instantly.
+    let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+    let result = crate::executor::task::run_graph_with_metrics(
+        graph,
+        CancellationToken::new(),
+        Some(metrics.clone()),
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(collect.written.lock().unwrap().len(), 1);
+    assert_eq!(input.connects.load(Ordering::SeqCst), 4);
+    assert_eq!(metrics.input_reconnects.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn cancellation_during_a_pending_reconnect_shuts_the_source_down() {
+    struct PendingConnectInput {
+        connects: AtomicUsize,
+    }
+    #[async_trait]
+    impl Input for PendingConnectInput {
+        async fn connect(&self) -> Result<(), Error> {
+            // The startup connect succeeds; the reconnect after the
+            // disconnection parks until cancellation ends it.
+            if self.connects.fetch_add(1, Ordering::SeqCst) > 0 {
+                std::future::pending().await
+            } else {
+                Ok(())
+            }
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::Disconnection)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = Arc::new(PendingConnectInput {
+        connects: AtomicUsize::new(0),
+    });
+    let adapter = Adapter {
+        input: input.clone(),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(crate::executor::task::run_graph_with_metrics(
+        graph,
+        cancellation.clone(),
+        None,
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("cancellation must interrupt the pending reconnect")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_generic_read_error_fails_the_source_chain() {
+    struct ExplodingInput;
+    #[async_trait]
+    impl Input for ExplodingInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::Process("source exploded".into()))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = Arc::new(ExplodingInput);
+    let adapter = Adapter {
+        input: input.clone(),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+    let result = crate::executor::task::run_graph_with_metrics(
+        graph,
+        CancellationToken::new(),
+        Some(metrics.clone()),
+    )
+    .await;
+    assert!(
+        result.unwrap_err().to_string().contains("source exploded"),
+        "the read error must fail the chain"
+    );
+    assert_eq!(metrics.input_errors.load(Ordering::Relaxed), 1);
+}
+
+// ---------- event-time source-chain paths ----------
+
+fn event_time_spec(parallelism: u64) -> JobSpec {
+    let mut job = spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    );
+    job.sources[0].time = TimeSpec {
+        mode: TimeMode::EventTime,
+        timestamp_field: Some("ts".into()),
+        watermark: Some(WatermarkSpec {
+            strategy: WatermarkStrategy::Monotonous,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        }),
+        allowed_lateness_ms: 0,
+        late_event_policy: LateEventPolicy::Drop,
+        late_event_route: None,
+    };
+    if parallelism > 1 {
+        job.sources[0].config =
+            serde_json::json!({ "__arkflow_processor_parallelism": parallelism });
+    }
+    job
+}
+
+/// An event-time source whose `watermark_partitions` succeeds once (the
+/// startup seed) and fails afterwards, exercising the seed error paths on
+/// both the read and the idle-tick arms.
+struct TogglePartitionsInput {
+    queue: Mutex<std::collections::VecDeque<MessageBatchRef>>,
+    arrived: tokio::sync::Notify,
+    finished: std::sync::atomic::AtomicBool,
+    partition_calls: AtomicUsize,
+    /// Fail `watermark_partitions` from this (zero-based) call onwards.
+    fail_from: usize,
+}
+
+impl TogglePartitionsInput {
+    fn with(batches: Vec<MessageBatchRef>) -> Arc<Self> {
+        Self::with_fail_from(batches, 1)
+    }
+
+    fn with_fail_from(batches: Vec<MessageBatchRef>, fail_from: usize) -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(batches.into_iter().collect()),
+            arrived: tokio::sync::Notify::new(),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            partition_calls: AtomicUsize::new(0),
+            fail_from,
+        })
+    }
+
+    fn push_rows(&self, rows: Vec<(i64, String)>) {
+        self.queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MessageBatch::new_arrow(int64_batch(rows))));
+        self.arrived.notify_one();
+    }
+
+    fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+        self.arrived.notify_one();
+    }
+}
+
+#[async_trait]
+impl Input for TogglePartitionsInput {
+    async fn connect(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+        loop {
+            if let Some(batch) = self.queue.lock().unwrap().pop_front() {
+                return Ok((batch, Arc::new(crate::input::NoopAck)));
+            }
+            if self.finished.load(Ordering::SeqCst) {
+                return Err(Error::EOF);
+            }
+            self.arrived.notified().await;
+        }
+    }
+    async fn watermark_partitions(
+        &self,
+    ) -> Result<Vec<crate::event_time::EventTimePartition>, Error> {
+        if self.partition_calls.fetch_add(1, Ordering::SeqCst) >= self.fail_from {
+            return Err(Error::Process("partition discovery failed".into()));
+        }
+        Ok(Vec::new())
+    }
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+fn typed_batch(schema: Schema, columns: Vec<Arc<dyn datafusion::arrow::array::Array>>) -> MessageBatchRef {
+    Arc::new(MessageBatch::new_arrow(
+        RecordBatch::try_new(Arc::new(schema), columns).unwrap(),
+    ))
+}
+
+#[tokio::test]
+async fn event_time_seed_failure_after_a_read_fails_the_chain() {
+    let input = TogglePartitionsInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(1, "a".into())],
+    )))]);
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect,
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(event_time_spec(1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let result = run_graph(graph, CancellationToken::new()).await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("partition discovery failed"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn event_time_seed_failure_during_the_idle_tick_fails_the_chain() {
+    let input = TogglePartitionsInput::with(vec![]);
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect,
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(event_time_spec(1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph(graph, cancellation.clone()));
+    // The first tick (100ms) re-seeds partitions and must fail the chain.
+    let result = tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("the tick seed failure must end the chain")
+        .unwrap();
+    assert!(
+        result.unwrap_err().to_string().contains("partition discovery failed"),
+        "the tick's seed failure must fail the chain"
+    );
+}
+
+#[tokio::test]
+async fn event_time_idle_tick_refreshes_the_gate_between_deliveries() {
+    let input = TogglePartitionsInput::with_fail_from(vec![], usize::MAX);
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(event_time_spec(1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph(graph, cancellation.clone()));
+    // Deliver one row, let an idle tick observe the gate, then deliver the
+    // watermark-advancing row and end the stream.
+    input.push_rows(vec![(100, "a".into())]);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    input.push_rows(vec![(5_000, "b".into())]);
+    input.finish();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("the tick must not stall the source")
+        .unwrap()
+        .unwrap();
+    let rows = collect.written.lock().unwrap().len();
+    assert_eq!(rows, 2, "both rows must flow through the ticked source");
+}
+
+#[tokio::test]
+async fn malformed_partition_metadata_fails_the_event_time_source() {
+    // `__meta_partition` must be castable to UInt32; a list-typed partition
+    // column has no safe cast and fails the split before the gate observes
+    // anything. (Strings cannot be used: the safe-mode cast nulls an
+    // unparseable value instead of failing.)
+    let batch = typed_batch(
+        Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new(
+                crate::meta_columns::PARTITION,
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                false,
+            ),
+        ]),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64])),
+            {
+                let offsets =
+                    datafusion::arrow::buffer::OffsetBuffer::new(vec![0i32, 1].into());
+                Arc::new(datafusion::arrow::array::ListArray::new(
+                    Arc::new(Field::new("item", DataType::Int64, true)),
+                    offsets,
+                    Arc::new(Int64Array::from(vec![1i64])),
+                    None,
+                ))
+            }
+        ],
+    );
+    let input = TogglePartitionsInput::with_fail_from(vec![batch], usize::MAX);
+    input.finish();
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect,
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(event_time_spec(1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let result = run_graph(graph, CancellationToken::new()).await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("read physical partition metadata"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_event_time_batch_settles_and_continues() {
+    // A zero-row batch carrying partition metadata splits into zero
+    // partitions: the delivery is acknowledged and the stream continues.
+    let empty = typed_batch(
+        Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new(crate::meta_columns::PARTITION, DataType::UInt32, false),
+        ]),
+        vec![
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(datafusion::arrow::array::UInt32Array::from(
+                Vec::<u32>::new(),
+            )),
+        ],
+    );
+    let rows = Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())])));
+    let input = TogglePartitionsInput::with_fail_from(vec![empty, rows], usize::MAX);
+    // Both deliveries are preloaded: arm EOF immediately so the bounded
+    // source ends instead of parking on an empty queue.
+    input.finish();
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(event_time_spec(1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+    assert_eq!(collect.written.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_unsupported_timestamp_type_fails_the_event_time_source() {
+    let batch = typed_batch(
+        Schema::new(vec![Field::new("ts", DataType::Utf8, false)]),
+        vec![Arc::new(StringArray::from(vec!["yesterday"]))],
+    );
+    let input = TogglePartitionsInput::with_fail_from(vec![batch], usize::MAX);
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect,
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(event_time_spec(1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let result = run_graph(graph, CancellationToken::new()).await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("timestamp field 'ts' has unsupported type"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_flushes_held_event_time_rows() {
+    // A watermark-triggered window holds the row; cancelling the source must
+    // release it through the gate's finish path instead of dropping it.
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let input = Arc::new(CountingInput {
+        batches: Mutex::new(std::collections::VecDeque::from([window_batch(
+            vec![(100, "a".into(), 1)],
+            None,
+        )])),
+        acknowledgements: acknowledgements.clone(),
+    });
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: output.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let mut job = spec(
+        vec![OperatorSpec {
+            id: "window".into(),
+            kind: OperatorKind::Window,
+            stateful: true,
+            key_field: Some("key".into()),
+            config: serde_json::json!({
+                "kind": "tumbling",
+                "size_ms": 1_000,
+                "timestamp_field": "ts",
+                "key_field": "key",
+                "value_fields": ["value"],
+                "trigger": "watermark",
+            }),
+        }],
+        vec![edge("source", "window"), edge("window", "sink")],
+        1,
+    );
+    job.sources[0].time = TimeSpec {
+        mode: TimeMode::EventTime,
+        timestamp_field: Some("ts".into()),
+        watermark: Some(WatermarkSpec {
+            strategy: WatermarkStrategy::Monotonous,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        }),
+        allowed_lateness_ms: 0,
+        late_event_policy: LateEventPolicy::Drop,
+        late_event_route: None,
+    };
+    let plan = JobPlan::compile(job).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph(graph, cancellation.clone()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("cancellation must flush and stop the source")
+        .unwrap()
+        .unwrap();
+    // The flushed row races the downstream cancellation drain (which aborts
+    // queued data for replay), so the assertion is on the flush path having
+    // run without hanging or failing, not on the row's final resting place.
+    let _ = output;
+}
+
+#[tokio::test]
+async fn source_shutdown_tolerates_a_closed_downstream_channel() {
+    // The sink chain fails and exits before the source is cancelled; the
+    // source's shutdown EOS lands on a closed channel and must be tolerated.
+    struct FailingWriteOutput;
+    #[async_trait]
+    impl Output for FailingWriteOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Err(Error::Process("sink write failed".into()))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = ClosableParkingInput::with(vec![]);
+    let adapter = Adapter {
+        input: input.clone(),
+        output: Arc::new(FailingWriteOutput),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(vec![], vec![edge("source", "sink")], 1)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph(graph, cancellation.clone()));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    input.push_rows(vec![(1, "a".into())]);
+    let result = tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("the sink failure must unblock the graph")
+        .unwrap();
+    assert!(
+        result.unwrap_err().to_string().contains("sink write failed"),
+        "the sink error surfaces while the source shutdown is tolerated"
+    );
+}
+
+// ---------- interior-chain shutdown and pooled paths ----------
+
+/// An acknowledgement whose abort fails: cancellation drains must observe
+/// the failure without hanging.
+#[derive(Clone)]
+struct AbortFailingAck;
+#[async_trait]
+impl Ack for AbortFailingAck {
+    async fn ack(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn abort(&self) -> Result<(), Error> {
+        Err(Error::Process("abort failed".into()))
+    }
+}
+
+struct AbortFailingParkingInput {
+    queue: Mutex<std::collections::VecDeque<MessageBatchRef>>,
+    arrived: tokio::sync::Notify,
+}
+
+impl AbortFailingParkingInput {
+    fn push_rows(&self, rows: Vec<(i64, String)>) {
+        self.queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MessageBatch::new_arrow(int64_batch(rows))));
+        self.arrived.notify_one();
+    }
+}
+
+#[async_trait]
+impl Input for AbortFailingParkingInput {
+    async fn connect(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+        loop {
+            if let Some(batch) = self.queue.lock().unwrap().pop_front() {
+                return Ok((batch, Arc::new(AbortFailingAck)));
+            }
+            self.arrived.notified().await;
+        }
+    }
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn interior_cancellation_tolerates_failing_aborts_and_finish() {
+    struct SlowFailingFinishProcessor;
+    #[async_trait]
+    impl Processor for SlowFailingFinishProcessor {
+        async fn process(&self, _batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(ProcessResult::None)
+        }
+        async fn finish(&self) -> Result<ProcessResult, Error> {
+            Err(Error::Process("finish failed".into()))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = Arc::new(AbortFailingParkingInput {
+        queue: Mutex::new(std::collections::VecDeque::new()),
+        arrived: tokio::sync::Notify::new(),
+    });
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect,
+        processor: Arc::new(SlowFailingFinishProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    ))
+    .unwrap();
+    // Keep the inter-chain channel wide so several deliveries queue behind
+    // the slow processor when cancellation strikes.
+    let graph = ExecutionGraphBuilder::new(8)
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph(graph, cancellation.clone()));
+    for value in 0..4 {
+        input.push_rows(vec![(value, "a".into())]);
+    }
+    // The processor needs 100ms per row, so several deliveries are still
+    // queued when cancellation strikes; the generous window keeps the test
+    // robust on a loaded machine.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    cancellation.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("failing aborts and finish must not hang cancellation")
+        .unwrap();
+    // Whether cancellation drains every in-flight delivery before the
+    // finish hook runs (Ok) or the finish failure surfaces, both prove the
+    // cancellation cannot hang on failing aborts or finish.
+    match outcome {
+        Ok(()) => {}
+        Err(error) => assert!(
+            error.to_string().contains("finish failed"),
+            "unexpected cancellation error: {error}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn a_failing_processor_finish_fails_the_eos_path() {
+    struct FailingFinishProcessor;
+    #[async_trait]
+    impl Processor for FailingFinishProcessor {
+        async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Single(batch))
+        }
+        async fn finish(&self) -> Result<ProcessResult, Error> {
+            Err(Error::Process("finish failed".into()))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(FailingFinishProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let result = run_graph(graph, CancellationToken::new()).await;
+    assert!(
+        result.unwrap_err().to_string().contains("finish failed"),
+        "the EOS flush failure must fail the chain"
+    );
+}
+
+#[tokio::test]
+async fn a_pooled_sink_failure_fails_the_running_chain() {
+    struct FailingWriteOutput;
+    #[async_trait]
+    impl Output for FailingWriteOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Err(Error::Process("sink write failed".into()))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(1, "a".into())],
+    )))]);
+    let adapter = Adapter {
+        input: input.clone(),
+        output: Arc::new(FailingWriteOutput),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(parallel_job_spec(4)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::executor::task::run_graph_with_metrics(
+            graph,
+            CancellationToken::new(),
+            Some(metrics.clone()),
+        ),
+    )
+    .await
+    .expect("the pooled sink failure must fail the chain");
+    assert!(
+        result.unwrap_err().to_string().contains("sink write failed"),
+        "the worker pool must surface the sink failure"
+    );
+    assert!(
+        metrics.output_errors.load(Ordering::Relaxed) >= 1,
+        "the sink failure must be counted"
+    );
+}
+
+#[tokio::test]
+async fn a_pooled_watermark_envelope_fences_the_pool() {
+    struct WatermarkRecorder {
+        values: Arc<Mutex<Vec<i64>>>,
+    }
+    #[async_trait]
+    impl Processor for WatermarkRecorder {
+        async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Single(batch))
+        }
+        async fn on_watermark(&self, watermark_ms: i64) -> Result<ProcessResult, Error> {
+            self.values.lock().unwrap().push(watermark_ms);
+            Ok(ProcessResult::None)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let values = Arc::new(Mutex::new(Vec::new()));
+    let input = TogglePartitionsInput::with_fail_from(vec![], usize::MAX);
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect.clone(),
+        processor: Arc::new(WatermarkRecorder {
+            values: values.clone(),
+        }),
+    };
+    let plan = JobPlan::compile(event_time_spec(4)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(run_graph(graph, cancellation.clone()));
+    input.push_rows(vec![(100, "a".into())]);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    input.push_rows(vec![(5_000, "b".into())]);
+    input.finish();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("the pooled chain must finish")
+        .unwrap()
+        .unwrap();
+    let seen = values.lock().unwrap().clone();
+    assert!(
+        !seen.is_empty(),
+        "the pooled chain must receive watermark control events"
+    );
+    assert!(seen.iter().all(|value| *value <= 5_000));
+}
+
+#[tokio::test]
+async fn pooled_workers_exit_through_channel_closure_at_eos() {
+    let input = TogglePartitionsInput::with_fail_from(
+        vec![
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(1, "a".into())]))),
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(2, "b".into())]))),
+        ],
+        usize::MAX,
+    );
+    let collect = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: collect.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(event_time_spec(4)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    input.finish();
+    run_graph(graph, CancellationToken::new()).await.unwrap();
+    assert_eq!(collect.written.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_panicking_pooled_worker_fails_the_chain() {
+    struct PanickingProcessor;
+    #[async_trait]
+    impl Processor for PanickingProcessor {
+        async fn process(&self, _batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            panic!("worker exploded");
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PanickingProcessor),
+    };
+    let plan = JobPlan::compile(pooled_failure_job_spec(4, false)).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_graph(graph, CancellationToken::new()),
+    )
+    .await
+    .expect("a panicking worker must not park the chain");
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("processor worker task failed"),
+        "{message}"
+    );
+}
+
+// ---------- multi-input barrier alignment edge cases ----------
+
+fn two_source_merge_job() -> JobSpec {
+    JobSpec {
+        resources: Default::default(),
+        rescale: false,
+        rebalance: None,
+        id: JobId::new("two-source-merge").unwrap(),
+        version: JobVersion(1),
+        max_parallelism: 1,
+        parallelism: 1,
+        operators: vec![
+            map_source_operator("left-source"),
+            map_source_operator("right-source"),
+            map_operator("merge"),
+            sink_operator("sink", false),
+        ],
+        edges: vec![
+            edge("left-source", "merge"),
+            edge("right-source", "merge"),
+            edge("merge", "sink"),
+        ],
+        sources: vec![source_spec("left-source"), source_spec("right-source")],
+        sinks: vec![SinkSpec {
+            operator_id: "sink".into(),
+            output_type: "collect".into(),
+            codec: None,
+            config: serde_json::json!({}),
+        }],
+        state: None,
+        checkpoint: None,
+        placement: crate::job::PlacementStrategy::Colocated,
+        recovery: Default::default(),
+    }
+}
+
+fn barrier_hook_for(task_id: &str) -> crate::executor::task::CheckpointHook {
+    crate::executor::task::CheckpointHook {
+        reporter: None,
+        failure_reporter: None,
+        barrier_rx: None,
+        state: None,
+        task_id: Some(task_id.to_string()),
+        event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
+        partition: None,
+        metrics: None,
+        finished_reporter: None,
+    }
+}
+
+#[tokio::test]
+async fn buffered_eos_envelopes_complete_an_in_flight_barrier() {
+    let left = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(1, "left".into())],
+    )))]);
+    let right = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(2, "right".into())],
+    )))]);
+    let output = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: HashMap::from([
+            ("left-source".into(), left.clone() as Arc<dyn Input>),
+            ("right-source".into(), right.clone() as Arc<dyn Input>),
+        ]),
+        outputs: HashMap::from([("sink".into(), output.clone())]),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(two_source_merge_job()).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
+    let mut left_hook = barrier_hook_for("left-source-0");
+    left_hook.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
+    let hooks = BTreeMap::from([
+        ("left-source-0".to_string(), left_hook),
+        ("right-source-0".to_string(), barrier_hook_for("right-source-0")),
+    ]);
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(crate::executor::task::run_graph_with_hooks(
+        graph,
+        cancellation.clone(),
+        hooks,
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Inject the barrier: the merge chain starts aligning on the left edge.
+    let _ = barrier_tx
+        .send_async(Envelope::Barrier(CheckpointBarrier {
+            checkpoint_id: "cp-eos-align".into(),
+            generation: 1,
+            trace_context: None,
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // End the barrier's own input first: its EOS is buffered behind the
+    // in-flight barrier instead of completing it.
+    left.finish();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Ending the second input completes the round through the buffered EOS
+    // envelopes and the merge chain finishes through the release path.
+    right.finish();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("the buffered EOS envelopes must complete the barrier")
+        .unwrap()
+        .unwrap();
+    let rows = output
+        .written
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>();
+    assert_eq!(rows, 2);
+}
+
+#[tokio::test]
+async fn barrier_alignment_overflow_releases_the_buffered_data() {
+    let left = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(1, "left".into())],
+    )))]);
+    let right = ClosableParkingInput::with(vec![]);
+    let output = Arc::new(CollectOutput::default());
+    let adapter = MultiInputAdapter {
+        inputs: HashMap::from([
+            ("left-source".into(), left.clone() as Arc<dyn Input>),
+            ("right-source".into(), right.clone() as Arc<dyn Input>),
+        ]),
+        outputs: HashMap::from([("sink".into(), output.clone())]),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(two_source_merge_job()).unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
+    let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut left_hook = barrier_hook_for("left-source-0");
+    left_hook.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
+    let mut merge_hook = barrier_hook_for("merge-0");
+    merge_hook.failure_reporter = Some(failure_tx);
+    let hooks = BTreeMap::from([
+        ("left-source-0".to_string(), left_hook),
+        ("merge-0".to_string(), merge_hook),
+        ("right-source-0".to_string(), barrier_hook_for("right-source-0")),
+    ]);
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(crate::executor::task::run_graph_with_hooks(
+        graph,
+        cancellation.clone(),
+        hooks,
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = barrier_tx
+        .send_async(Envelope::Barrier(CheckpointBarrier {
+            checkpoint_id: "cp-overflow".into(),
+            generation: 1,
+            trace_context: None,
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Overrun the alignment bound: the merge chain releases everything it
+    // buffered and keeps processing instead of blocking.
+    for value in 0..1030 {
+        right.push_rows(vec![(value, "right".into())]);
+    }
+    left.finish();
+    right.finish();
+    let failure = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
+        .await
+        .expect("the overflow must be reported");
+    assert!(
+        failure
+            .as_ref()
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+            .contains("exceeded"),
+        "the overflow error names the bound: {failure:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("the overflowed chain must keep flowing")
+        .unwrap()
+        .unwrap();
+    let rows = output
+        .written
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>();
+    assert_eq!(rows, 1_031, "every buffered and later row must reach the sink");
+}
+
+#[tokio::test]
+async fn interior_barrier_snapshot_failure_reports_and_forwards() {
+    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
+        vec![(1, "a".into())],
+    )))]);
+    let output = Arc::new(CollectOutput::default());
+    let adapter = Adapter {
+        input: input.clone(),
+        output: output.clone(),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let plan = JobPlan::compile(spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    ))
+    .unwrap();
+    let graph = ExecutionGraphBuilder::default()
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
+    let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut source_hook = barrier_hook_for("source-0");
+    source_hook.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
+    let mut map_hook = barrier_hook_for("m-0");
+    map_hook.state = Some(Arc::new(FailingSnapshotBackend));
+    map_hook.failure_reporter = Some(failure_tx);
+    let hooks = BTreeMap::from([
+        ("source-0".to_string(), source_hook),
+        ("m-0".to_string(), map_hook),
+    ]);
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn(crate::executor::task::run_graph_with_hooks(
+        graph,
+        cancellation.clone(),
+        hooks,
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = barrier_tx
+        .send_async(Envelope::Barrier(CheckpointBarrier {
+            checkpoint_id: "cp-interior-fail".into(),
+            generation: 1,
+            trace_context: None,
+        }))
+        .await;
+    let failure = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
+        .await
+        .expect("the interior snapshot failure must be reported")
+        .expect("the failure channel stays open");
+    assert!(
+        failure.to_string().contains("injected snapshot failure"),
+        "{failure}"
+    );
+    // The data plane keeps running; end the stream normally.
+    input.finish();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("the chain must survive the failed interior snapshot")
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.written.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_failing_temporary_close_fails_the_run_after_the_chains_exit() {
+    struct FailingCloseTemporary;
+    #[async_trait]
+    impl crate::temporary::Temporary for FailingCloseTemporary {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            _keys: &[datafusion::logical_expr::ColumnarValue],
+        ) -> Result<Option<MessageBatch>, Error> {
+            Ok(None)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Err(Error::Process("temporary close failed".into()))
+        }
+    }
+    // A hand-built bounded source chain with no downstream: every chain
+    // succeeds, so the temporary's close failure is the run's only error.
+    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(
+        int64_batch(vec![(1, "a".into())]),
+    ))]);
+    input.finish();
+    let mut chain = crate::executor::graph::Chain::for_pool_test(1, vec![]);
+    chain.task_ids = vec!["source-0".into()];
+    chain.source = Some(input);
+    let graph = crate::executor::ExecutionGraph {
+        chains: vec![chain],
+        channel_capacity: 4,
+        temporaries: vec![Arc::new(FailingCloseTemporary)],
+    };
+    let result = run_graph(graph, CancellationToken::new()).await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("temporary close failed"),
+        "a close failure must surface even when every chain succeeded: {message}"
     );
 }

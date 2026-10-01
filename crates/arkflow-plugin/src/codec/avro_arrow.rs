@@ -161,11 +161,13 @@ fn null_column(schema: &AvroSchema, name: &str) -> Result<(DataType, Arc<dyn Arr
         ),
         AvroSchema::LocalTimestampMillis => (
             DataType::Timestamp(TimeUnit::Millisecond, None),
-            Arc::new(TimestampMillisecondArray::from(vec![None]).with_timezone(Arc::from(UTC))),
+            // Local timestamps carry no timezone; stamping one would make the
+            // array type diverge from the declared column type.
+            Arc::new(TimestampMillisecondArray::from(vec![None])),
         ),
         AvroSchema::LocalTimestampMicros => (
             DataType::Timestamp(TimeUnit::Microsecond, None),
-            Arc::new(TimestampMicrosecondArray::from(vec![None]).with_timezone(Arc::from(UTC))),
+            Arc::new(TimestampMicrosecondArray::from(vec![None])),
         ),
         AvroSchema::Decimal(d) => {
             let (precision, scale) = decimal_metadata(d, name)?;
@@ -259,11 +261,12 @@ fn leaf_to_arrow(
         ),
         (AvroSchema::LocalTimestampMillis, AvroValue::LocalTimestampMillis(v)) => (
             DataType::Timestamp(TimeUnit::Millisecond, None),
-            Arc::new(TimestampMillisecondArray::from(vec![Some(*v)]).with_timezone(Arc::from(UTC))),
+            // Local timestamps carry no timezone (mirrors null_column).
+            Arc::new(TimestampMillisecondArray::from(vec![Some(*v)])),
         ),
         (AvroSchema::LocalTimestampMicros, AvroValue::LocalTimestampMicros(v)) => (
             DataType::Timestamp(TimeUnit::Microsecond, None),
-            Arc::new(TimestampMicrosecondArray::from(vec![Some(*v)]).with_timezone(Arc::from(UTC))),
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(*v)])),
         ),
         (AvroSchema::Decimal(d), AvroValue::Decimal(dec)) => {
             let (precision, scale) = decimal_metadata(d, name)?;
@@ -525,6 +528,184 @@ mod tests {
         assert_eq!(
             batch.column_by_name("uid").unwrap().as_string::<i32>().value(0),
             "00000000-0000-0000-0000-000000000001"
+        );
+    }
+
+    #[test]
+    fn null_union_rows_cover_every_supported_leaf_type() {
+        let cases: Vec<(&str, &str)> = vec![
+            ("b", "\"boolean\""),
+            ("i", "\"int\""),
+            ("l", "\"long\""),
+            ("f", "\"float\""),
+            ("d", "\"double\""),
+            ("by", "\"bytes\""),
+            ("s", "\"string\""),
+            ("date", "{\"type\": \"int\", \"logicalType\": \"date\"}"),
+            (
+                "tms",
+                "{\"type\": \"int\", \"logicalType\": \"time-millis\"}",
+            ),
+            (
+                "tmcs",
+                "{\"type\": \"long\", \"logicalType\": \"time-micros\"}",
+            ),
+            (
+                "tsms",
+                "{\"type\": \"long\", \"logicalType\": \"timestamp-millis\"}",
+            ),
+            (
+                "tslocal",
+                "{\"type\": \"long\", \"logicalType\": \"local-timestamp-millis\"}",
+            ),
+        ];
+        for (name, type_json) in cases {
+            let schema = parse(&format!(
+                "{{\"type\": \"record\", \"name\": \"R\", \"fields\": [{{\"name\": \"{name}\", \"type\": [\"null\", {type_json}]}}]}}"
+            ));
+            let payload = encode(
+                &schema,
+                Value::Record(vec![(name.into(), Value::Union(0, Box::new(Value::Null)))]),
+            );
+            let batch = avro_to_arrow(&schema, &payload)
+                .unwrap_or_else(|e| panic!("field {name} with null union: {e}"));
+            assert_eq!(batch.num_rows(), 1, "field {name}");
+            assert!(batch.column(0).is_null(0), "field {name}");
+        }
+    }
+
+    #[test]
+    fn union_with_three_branches_is_rejected() {
+        let schema = parse(
+            r#"{"type": "record", "name": "R", "fields": [
+                {"name": "x", "type": ["null", "int", "string"]}
+            ]}"#,
+        );
+        let payload = encode(
+            &schema,
+            Value::Record(vec![("x".into(), Value::Union(1, Box::new(Value::Int(5))))]),
+        );
+        let err = avro_to_arrow(&schema, &payload).unwrap_err();
+        assert!(err.to_string().contains("only [null, T] unions"), "{err}");
+    }
+
+    #[test]
+    fn null_value_under_a_non_nullable_schema_is_rejected() {
+        let schema = parse(
+            r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": "int"}]}"#,
+        );
+        // Build the mismatch directly through avro_value_to_arrow so the
+        // null-under-non-nullable branch is exercised without the encoder
+        // refusing first.
+        let value = Value::Record(vec![("x".into(), Value::Null)]);
+        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        assert!(err.to_string().contains("not nullable"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_leaf_kinds_are_rejected() {
+        // An array leaf reaches leaf_to_arrow's unsupported arm.
+        let schema = parse(
+            r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": {"type": "array", "items": "int"}}]}"#,
+        );
+        let value = Value::Record(vec![(
+            "x".into(),
+            Value::Array(vec![Value::Int(1)]),
+        )]);
+        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported nested Avro type"),
+            "{err}"
+        );
+
+        // A map leaf also lands on the same rejection.
+        let schema = parse(
+            r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": {"type": "map", "values": "int"}}]}"#,
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("k".to_string(), Value::Int(1));
+        let value = Value::Record(vec![("x".into(), Value::Map(map))]);
+        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported nested Avro type"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_leaf_type_maps_to_its_arrow_column() {
+        // Direct value conversion (no encoder round trip) so every logical
+        // type and value form can be exercised.
+        let cases: Vec<(&str, Value)> = vec![
+            ("f32", Value::Float(1.5)),
+            ("by", Value::Bytes(vec![0xAB])),
+            ("s", Value::String("text".into())),
+            ("tmcs", Value::TimeMicros(1_500)),
+            (
+                "tslocal",
+                Value::LocalTimestampMillis(1_700_000_000_000),
+            ),
+            (
+                "tslocal_us",
+                Value::LocalTimestampMicros(1_700_000_000_000_000),
+            ),
+            ("uuid_str", Value::String(uuid_like())),
+        ];
+        let schema = parse(
+            r#"{"type": "record", "name": "R", "fields": [
+                {"name": "f32", "type": "float"},
+                {"name": "by", "type": "bytes"},
+                {"name": "s", "type": "string"},
+                {"name": "tmcs", "type": {"type": "long", "logicalType": "time-micros"}},
+                {"name": "tslocal", "type": {"type": "long", "logicalType": "local-timestamp-millis"}},
+                {"name": "tslocal_us", "type": {"type": "long", "logicalType": "local-timestamp-micros"}},
+                {"name": "uuid_str", "type": {"type": "string", "logicalType": "uuid"}}
+            ]}"#,
+        );
+        let value = Value::Record(
+            cases
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone()))
+                .collect(),
+        );
+        let batch = avro_value_to_arrow(&schema, &value)
+            .unwrap_or_else(|e| panic!("leaf mapping failed: {e}"));
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), cases.len());
+        // The uuid-as-string branch keeps text form.
+        let uuid_col = batch.column_by_name("uuid_str").unwrap();
+        assert_eq!(uuid_col.data_type(), &DataType::Utf8);
+    }
+
+    // A Uuid-shaped string for the schema-vs-value widening branch.
+    fn uuid_like() -> String {
+        "550e8400-e29b-41d4-a716-446655440000".to_string()
+    }
+
+    #[test]
+    fn schema_value_mismatch_is_rejected_in_leaf_mapping() {
+        // Schema says long but the value is a string: the catch-all arm.
+        let schema = parse(
+            r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": "long"}]}"#,
+        );
+        let value = Value::Record(vec![("x".into(), Value::String("nope".into()))]);
+        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported Avro type"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn union_schema_with_non_union_value_is_rejected() {
+        let schema = parse(
+            r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": ["null", "int"]}]}"#,
+        );
+        let value = Value::Record(vec![("x".into(), Value::Int(3))]);
+        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        assert!(
+            err.to_string().contains("does not hold a union value"),
+            "{err}"
         );
     }
 

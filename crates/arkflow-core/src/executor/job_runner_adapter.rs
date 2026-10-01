@@ -156,7 +156,13 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
         );
         let namespace_prefix =
             crate::job::state_namespace_prefix(&plan.spec.id, plan.spec.state.as_ref());
-        restore_local_snapshot(&repository, manifest, state, &namespace_prefix, rescale_context.as_ref())?;
+        restore_local_snapshot(
+            &repository,
+            manifest,
+            state,
+            &namespace_prefix,
+            rescale_context.as_ref(),
+        )?;
         for input in &inputs {
             if let Err(error) = input.connect().await {
                 close_inputs(&inputs).await;
@@ -567,9 +573,9 @@ async fn seed_event_time_partitions(
             }
         }
         if !partitions.is_empty() {
-            if let Some(gate) = gate.lock()
-                .await
-                .as_mut() { gate.seed_partitions(&partitions) }
+            if let Some(gate) = gate.lock().await.as_mut() {
+                gate.seed_partitions(&partitions)
+            }
         }
     }
     Ok(())
@@ -818,18 +824,11 @@ impl RescaleContext {
 
     /// The routing-hash input for one state entry: the user key in the exact
     /// byte form `hash_column`/`task_for_key` hash.
-    fn routing_key_bytes(
-        &self,
-        namespace: &str,
-        key: &[u8],
-    ) -> Result<Vec<u8>, Error> {
+    fn routing_key_bytes(&self, namespace: &str, key: &[u8]) -> Result<Vec<u8>, Error> {
         let operator_id = namespace_operator(namespace)?;
-        let is_window = self
-            .plan
-            .spec
-            .operators
-            .iter()
-            .any(|operator| operator.id == operator_id && operator.kind == crate::job::OperatorKind::Window);
+        let is_window = self.plan.spec.operators.iter().any(|operator| {
+            operator.id == operator_id && operator.kind == crate::job::OperatorKind::Window
+        });
         if is_window {
             // Window state key = window_start (8-byte BE) + utf8 user key.
             let user_key = key
@@ -1368,12 +1367,8 @@ mod validation_tests {
             .iter()
             .find(|task| task.operator_id == "agg")
             .unwrap();
-        let old_namespace = crate::job::effective_state_namespace(
-            &old_plan.spec.id,
-            None,
-            "agg",
-            &old_task.id,
-        );
+        let old_namespace =
+            crate::job::effective_state_namespace(&old_plan.spec.id, None, "agg", &old_task.id);
         for user_key in ["alpha", "beta", "gamma", "delta"] {
             let state_key = format!("utf8:{user_key}").into_bytes();
             let entry = crate::state::StateEntry {
@@ -1396,12 +1391,8 @@ mod validation_tests {
                             .any(|partition| partition.key_group.contains(group))
                 })
                 .unwrap();
-            let expected = crate::job::effective_state_namespace(
-                &new_plan.spec.id,
-                None,
-                "agg",
-                &owner.id,
-            );
+            let expected =
+                crate::job::effective_state_namespace(&new_plan.spec.id, None, "agg", &owner.id);
             assert_eq!(moved.namespace, expected, "key {user_key}");
             assert_eq!(moved.key, state_key);
             assert_eq!(moved.value, b"42".to_vec());
@@ -1643,6 +1634,2545 @@ mod validation_tests {
         );
         assert!(!durable_local_recovery_required(&plan));
     }
+
+    #[test]
+    fn rescale_routing_keys_decode_every_supported_encoding() {
+        let new_plan = JobPlan::compile(rescale_job_spec(4)).unwrap();
+        let context = RescaleContext::from_plan(&new_plan).unwrap();
+        let old_plan = JobPlan::compile(rescale_job_spec(1)).unwrap();
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let namespace = crate::job::effective_state_namespace(
+            &old_plan.spec.id,
+            old_plan.spec.state.as_ref(),
+            "agg",
+            &old_task.id,
+        );
+        for key in [
+            b"binary:\x01\x02".to_vec(),
+            b"i8:7".to_vec(),
+            b"i64:-1".to_vec(),
+            b"u64:9".to_vec(),
+            b"null:".to_vec(),
+        ] {
+            let entry = crate::state::StateEntry {
+                namespace: namespace.clone(),
+                key: key.clone(),
+                value: b"42".to_vec(),
+                expires_at_ms: None,
+            };
+            let moved = context.redistribute(entry).unwrap();
+            assert_eq!(moved.key, key, "the state key must survive redistribution");
+            assert_ne!(
+                moved.namespace, namespace,
+                "the entry must move to a new owner namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn rescale_redistribute_rejects_operators_missing_from_the_plan() {
+        let new_plan = JobPlan::compile(rescale_job_spec(4)).unwrap();
+        let context = RescaleContext::from_plan(&new_plan).unwrap();
+        let old_plan = JobPlan::compile(rescale_job_spec(1)).unwrap();
+        let namespace = crate::job::effective_state_namespace(
+            &old_plan.spec.id,
+            old_plan.spec.state.as_ref(),
+            "ghost",
+            "ghost-0",
+        );
+        let entry = crate::state::StateEntry {
+            namespace,
+            key: b"utf8:k".to_vec(),
+            value: Vec::new(),
+            expires_at_ms: None,
+        };
+        let error = context
+            .redistribute(entry)
+            .expect_err("an operator absent from the plan can have no owner task");
+        assert!(
+            error.to_string().contains("no owner task"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn task_of_namespace_extracts_and_decodes_the_task_segment() {
+        assert_eq!(
+            RescaleContext::task_of_namespace("job:j:state:d:operator:agg:task:agg-0").unwrap(),
+            "agg-0"
+        );
+        // The segment ends at the next separator; percent escapes decode.
+        assert_eq!(
+            RescaleContext::task_of_namespace(
+                "job:j:state:d:operator:agg:task:agg%3A2:x:rest"
+            )
+            .unwrap(),
+            "agg:2"
+        );
+        assert_eq!(
+            RescaleContext::task_of_namespace("job:j:state:d:operator:agg:task:agg%252")
+                .unwrap(),
+            "agg%2"
+        );
+        assert!(
+            RescaleContext::task_of_namespace("job:j:state:d:operator:agg").is_err(),
+            "a namespace without a task segment must be rejected"
+        );
+    }
+
+    fn snapshot_entry(namespace: String, key: &[u8]) -> crate::state::StateEntry {
+        crate::state::StateEntry {
+            namespace,
+            key: key.to_vec(),
+            value: b"v".to_vec(),
+            expires_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn restore_local_snapshot_rejects_format_mismatches() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn crate::state::StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(directory.path().join("backend"), 1).unwrap());
+        let repository = crate::checkpoint::CheckpointRepository::new(
+            crate::checkpoint::FileCheckpointStore::new(directory.path().join("store")).unwrap(),
+        );
+        let plan = JobPlan::compile(rescale_job_spec(1)).unwrap();
+        let old_task = plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let namespace = crate::job::effective_state_namespace(
+            &plan.spec.id,
+            plan.spec.state.as_ref(),
+            "agg",
+            &old_task.id,
+        );
+        // Snapshot sealed under format 2 while the backend runs format 1.
+        let snapshot = crate::state::StateSnapshot::new(
+            2,
+            vec![snapshot_entry(namespace, b"utf8:k")],
+        );
+        let reference = repository.write_state_snapshot("cp-format", &snapshot).unwrap();
+        let manifest = crate::checkpoint::CheckpointManifest {
+            checkpoint_id: "cp-format".into(),
+            job_id: plan.spec.id.clone(),
+            job_version: plan.spec.version,
+            generation: 1,
+            task_attempts: Vec::new(),
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: crate::checkpoint::CheckpointBarrier {
+                checkpoint_id: "cp-format".into(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: vec![reference],
+            format_version: 2,
+            checksum: 0,
+        };
+        let prefix = crate::job::state_namespace_prefix(&plan.spec.id, plan.spec.state.as_ref());
+        let error = restore_local_snapshot(&repository, &manifest, &backend, &prefix, None)
+            .expect_err("a foreign snapshot format must fail the restore");
+        assert!(
+            error
+                .to_string()
+                .contains("state format 2 is incompatible with local backend format 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn restore_local_snapshot_redistributes_entries_during_rescale() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn crate::state::StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(directory.path().join("backend"), 1).unwrap());
+        let repository = crate::checkpoint::CheckpointRepository::new(
+            crate::checkpoint::FileCheckpointStore::new(directory.path().join("store")).unwrap(),
+        );
+        let old_plan = JobPlan::compile(rescale_job_spec(1)).unwrap();
+        let new_plan = JobPlan::compile(rescale_job_spec(4)).unwrap();
+        let context = RescaleContext::from_plan(&new_plan).unwrap();
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let old_namespace = crate::job::effective_state_namespace(
+            &old_plan.spec.id,
+            old_plan.spec.state.as_ref(),
+            "agg",
+            &old_task.id,
+        );
+        let key = b"utf8:omega".to_vec();
+        let snapshot = crate::state::StateSnapshot::new(
+            1,
+            vec![snapshot_entry(old_namespace.clone(), &key)],
+        );
+        let reference = repository.write_state_snapshot("cp-rescale", &snapshot).unwrap();
+        let manifest = crate::checkpoint::CheckpointManifest {
+            checkpoint_id: "cp-rescale".into(),
+            job_id: old_plan.spec.id.clone(),
+            job_version: old_plan.spec.version,
+            generation: 1,
+            task_attempts: Vec::new(),
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: crate::checkpoint::CheckpointBarrier {
+                checkpoint_id: "cp-rescale".into(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: vec![reference],
+            format_version: 1,
+            checksum: 0,
+        };
+        let prefix =
+            crate::job::state_namespace_prefix(&old_plan.spec.id, old_plan.spec.state.as_ref());
+        restore_local_snapshot(&repository, &manifest, &backend, &prefix, Some(&context))
+            .expect("rescale restore must succeed");
+
+        // The entry moved off the old namespace onto the owning task's.
+        assert!(
+            backend.get(&old_namespace, &key).unwrap().is_none(),
+            "the old namespace must be empty after redistribution"
+        );
+        let group = crate::job::key_group_for_key(b"omega", 16).unwrap();
+        let owner = new_plan
+            .tasks
+            .iter()
+            .find(|task| {
+                task.operator_id == "agg"
+                    && task
+                        .partitions
+                        .iter()
+                        .any(|partition| partition.key_group.contains(group))
+            })
+            .unwrap();
+        let owner_namespace = crate::job::effective_state_namespace(
+            &new_plan.spec.id,
+            new_plan.spec.state.as_ref(),
+            "agg",
+            &owner.id,
+        );
+        assert_eq!(
+            backend.get(&owner_namespace, &key).unwrap(),
+            Some(b"v".to_vec()),
+            "the entry must land on the new owning task's namespace"
+        );
+
+        // The ordinary (non-rescale) path restores entries unchanged.
+        let direct = crate::state::StateSnapshot::new(
+            1,
+            vec![snapshot_entry(owner_namespace.clone(), b"utf8:direct")],
+        );
+        let reference = repository
+            .write_state_snapshot("cp-direct", &direct)
+            .unwrap();
+        let manifest = crate::checkpoint::CheckpointManifest {
+            checkpoint_id: "cp-direct".into(),
+            job_id: old_plan.spec.id.clone(),
+            job_version: old_plan.spec.version,
+            generation: 1,
+            task_attempts: Vec::new(),
+            source_positions: Vec::new(),
+            watermarks_ms: Default::default(),
+            watermark_partitions: Default::default(),
+            in_flight_barrier: crate::checkpoint::CheckpointBarrier {
+                checkpoint_id: "cp-direct".into(),
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: vec![reference],
+            format_version: 1,
+            checksum: 0,
+        };
+        restore_local_snapshot(&repository, &manifest, &backend, &prefix, None)
+            .expect("the ordinary restore must succeed");
+        assert_eq!(
+            backend.get(&owner_namespace, b"utf8:direct").unwrap(),
+            Some(b"v".to_vec()),
+            "the non-rescale path must keep the entry's namespace"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+    use crate::input::{Ack, Input, InputBuilder};
+    use crate::job::{
+        CheckpointSpec, EdgeSpec, JobId, JobVersion, OperatorKind, OperatorSpec, RecoveryPolicy,
+        SinkSpec, SourceSpec, StateDurability, StateSpec, TimeMode, TimeSpec, WatermarkSpec,
+        WatermarkStrategy,
+    };
+    use crate::output::{Output, OutputBuilder};
+    use crate::processor::Processor;
+    use crate::{Error, MessageBatch, MessageBatchRef, ProcessResult};
+    use async_trait::async_trait;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    // ---------- component doubles ----------
+
+    /// An input that never delivers a batch and never ends: the Job stays
+    /// alive across checkpoint ticks until the test cancels it.
+    struct NeverEndingInput {
+        connects: AtomicUsize,
+        closes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Input for NeverEndingInput {
+        async fn connect(&self) -> Result<(), Error> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            std::future::pending().await
+        }
+        async fn close(&self) -> Result<(), Error> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct OneBatchThenEofInput {
+        sent: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Input for OneBatchThenEofInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let mut sent = self.sent.lock().unwrap();
+            if *sent {
+                return Err(Error::EOF);
+            }
+            *sent = true;
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap();
+            Ok((
+                Arc::new(MessageBatch::new_arrow(batch)),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct FailingConnectInput {
+        closes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Input for FailingConnectInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Err(Error::Connection("injected restart connect failure".into()))
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            Err(Error::EOF)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// An input whose checkpoint-position restore fails after connecting.
+    struct FailingRestoreInput;
+
+    #[async_trait]
+    impl Input for FailingRestoreInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            std::future::pending().await
+        }
+        async fn restore_positions(
+            &self,
+            _positions: &[crate::checkpoint::SourcePosition],
+        ) -> Result<(), Error> {
+            Err(Error::Process("injected restore failure".into()))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// An event-time-capable input whose physical partitions can be made to
+    /// fail enumeration for the seeding error path.
+    struct PartitionedInput {
+        partitions: Vec<crate::event_time::EventTimePartition>,
+        fail_enumeration: bool,
+    }
+
+    #[async_trait]
+    impl Input for PartitionedInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            std::future::pending().await
+        }
+        async fn watermark_partitions(
+            &self,
+        ) -> Result<Vec<crate::event_time::EventTimePartition>, Error> {
+            if self.fail_enumeration {
+                return Err(Error::Connection("injected enumeration failure".into()));
+            }
+            Ok(self.partitions.clone())
+        }
+        fn supports_partitioning(&self) -> bool {
+            true
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct DevNullOutput;
+
+    #[async_trait]
+    impl Output for DevNullOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct FailingSinkOutput;
+
+    #[async_trait]
+    impl Output for FailingSinkOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Err(Error::Connection("injected sink reconnect failure".into()))
+        }
+        async fn write(&self, _msg: MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct PassThroughProcessor;
+
+    #[async_trait]
+    impl Processor for PassThroughProcessor {
+        async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::Single(batch))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct RunnerAdapter {
+        input: Arc<dyn Input>,
+        output: Arc<dyn Output>,
+    }
+
+    impl crate::job::JobComponentAdapter for RunnerAdapter {
+        fn build_input(
+            &self,
+            _source: &SourceSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(self.input.clone())
+        }
+        fn build_output(
+            &self,
+            _sink: &SinkSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(self.output.clone())
+        }
+        fn build_processor(
+            &self,
+            _operator: &OperatorSpec,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Processor>, Error> {
+            Ok(Arc::new(PassThroughProcessor))
+        }
+    }
+
+    fn adapter_with(input: Arc<dyn Input>) -> RunnerAdapter {
+        RunnerAdapter {
+            input,
+            output: Arc::new(DevNullOutput),
+        }
+    }
+
+    // ---------- spec helpers ----------
+
+    fn processing_time() -> TimeSpec {
+        TimeSpec {
+            mode: TimeMode::ProcessingTime,
+            timestamp_field: None,
+            watermark: None,
+            allowed_lateness_ms: 0,
+            late_event_policy: Default::default(),
+            late_event_route: None,
+        }
+    }
+
+    fn event_time(watermark: Option<WatermarkSpec>) -> TimeSpec {
+        TimeSpec {
+            mode: TimeMode::EventTime,
+            timestamp_field: Some("ts".into()),
+            watermark,
+            allowed_lateness_ms: 0,
+            late_event_policy: Default::default(),
+            late_event_route: None,
+        }
+    }
+
+    fn bounded_watermark() -> WatermarkSpec {
+        WatermarkSpec {
+            strategy: WatermarkStrategy::BoundedOutOfOrderness,
+            out_of_orderness_ms: 0,
+            idle_timeout_ms: None,
+        }
+    }
+
+    struct SpecBuilder {
+        spec: JobSpec,
+    }
+
+    impl SpecBuilder {
+        fn new(job: &str, stateful: bool) -> Self {
+            let mut operators = vec![OperatorSpec {
+                id: "source".into(),
+                kind: OperatorKind::Source,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            }];
+            if stateful {
+                operators.push(OperatorSpec {
+                    id: "agg".into(),
+                    kind: OperatorKind::Aggregate,
+                    stateful: true,
+                    key_field: Some("key".into()),
+                    config: serde_json::json!({}),
+                });
+            }
+            operators.push(OperatorSpec {
+                id: "sink".into(),
+                kind: OperatorKind::Sink,
+                stateful: false,
+                key_field: None,
+                config: serde_json::json!({}),
+            });
+            let mut edges = vec![EdgeSpec {
+                id: "source-agg".into(),
+                from: "source".into(),
+                to: "agg".into(),
+                partitioned: false,
+            }];
+            edges.push(EdgeSpec {
+                id: "agg-sink".into(),
+                from: "agg".into(),
+                to: "sink".into(),
+                partitioned: false,
+            });
+            let edges = if stateful {
+                edges
+            } else {
+                vec![EdgeSpec {
+                    id: "source-sink".into(),
+                    from: "source".into(),
+                    to: "sink".into(),
+                    partitioned: false,
+                }]
+            };
+            Self {
+                spec: JobSpec {
+                    resources: Default::default(),
+                    rescale: false,
+                    rebalance: None,
+                    id: JobId::new(job).unwrap(),
+                    version: JobVersion(1),
+                    max_parallelism: 4,
+                    parallelism: 1,
+                    operators,
+                    edges,
+                    sources: vec![SourceSpec {
+                        operator_id: "source".into(),
+                        input_type: "vec".into(),
+                        codec: None,
+                        config: serde_json::json!({}),
+                        time: processing_time(),
+                    }],
+                    sinks: vec![SinkSpec {
+                        operator_id: "sink".into(),
+                        output_type: "collect".into(),
+                        codec: None,
+                        config: serde_json::json!({}),
+                    }],
+                    state: None,
+                    checkpoint: None,
+                    placement: crate::job::PlacementStrategy::Colocated,
+                    recovery: RecoveryPolicy::LatestCheckpoint,
+                },
+            }
+        }
+
+        fn stateless_edges(mut self) -> Self {
+            self.spec.edges = vec![EdgeSpec {
+                id: "source-sink".into(),
+                from: "source".into(),
+                to: "sink".into(),
+                partitioned: false,
+            }];
+            self.spec
+                .operators
+                .retain(|operator| operator.id == "source" || operator.id == "sink");
+            self
+        }
+
+        fn event_time(mut self, time: TimeSpec) -> Self {
+            self.spec.sources[0].time = time;
+            self
+        }
+
+        fn parallelism(mut self, parallelism: u32) -> Self {
+            self.spec.parallelism = parallelism;
+            self
+        }
+
+        fn ephemeral_state(mut self) -> Self {
+            self.spec.state = Some(StateSpec {
+                backend: "embedded_kv".into(),
+                durability: StateDurability::Ephemeral,
+                root: None,
+                namespace: None,
+                ttl_ms: None,
+                format_version: 1,
+                max_pending_transactions: None,
+                max_bytes: None,
+            });
+            self
+        }
+
+        fn durable_state(
+            mut self,
+            root: &std::path::Path,
+            checkpoint_root: &std::path::Path,
+        ) -> Self {
+            self.spec.state = Some(StateSpec {
+                backend: "embedded_kv".into(),
+                durability: StateDurability::Durable,
+                root: Some(root.display().to_string()),
+                namespace: None,
+                ttl_ms: None,
+                format_version: 1,
+                max_pending_transactions: None,
+                max_bytes: None,
+            });
+            self.spec.checkpoint = Some(CheckpointSpec {
+                interval_ms: 50,
+                retention: 2,
+                object_store_uri: format!("file://{}", checkpoint_root.display()),
+            });
+            self
+        }
+
+        fn build(self) -> JobSpec {
+            self.spec
+        }
+    }
+
+    fn resource() -> Resource {
+        Resource {
+            temporary: HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    // ---------- plain runner wrappers ----------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_runs_a_stateless_job_to_completion() {
+        let spec = SpecBuilder::new("runner-plain-job", false)
+            .stateless_edges()
+            .build();
+        let adapter = adapter_with(Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        }));
+        run_job(&spec, &adapter, &mut resource(), CancellationToken::new())
+            .await
+            .expect("an EOF Job must complete successfully");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_with_metrics_started_counts_input_and_reports_startup() {
+        let spec = SpecBuilder::new("runner-metrics-job", false)
+            .stateless_edges()
+            .build();
+        let adapter = adapter_with(Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        }));
+        let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        run_job_with_metrics_started(
+            &spec,
+            &adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            Some(metrics.clone()),
+            Some(startup_tx),
+        )
+        .await
+        .expect("an EOF Job must complete successfully");
+        startup_rx
+            .await
+            .expect("startup handshake must fire")
+            .expect("resource startup must succeed");
+        let snapshot = metrics.snapshot();
+        assert!(
+            snapshot.input_batches >= 1,
+            "the source batch must be counted: {snapshot:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_with_hooks_runs_the_graph_and_reports_chain_exits() {
+        let spec = SpecBuilder::new("runner-hooks-job", false)
+            .stateless_edges()
+            .build();
+        let adapter = adapter_with(Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        }));
+        let plan = JobPlan::compile(spec.clone()).unwrap();
+        let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hooks = plan
+            .tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    crate::executor::task::CheckpointHook {
+                        task_id: Some(task.id.clone()),
+                        finished_reporter: Some(finished_tx.clone()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        run_job_with_hooks(
+            &spec,
+            &adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            hooks,
+        )
+        .await
+        .expect("an EOF Job must complete successfully");
+        let mut finished = Vec::new();
+        while let Ok(task_id) = finished_rx.try_recv() {
+            finished.push(task_id);
+        }
+        assert!(
+            !finished.is_empty(),
+            "chain exits must be reported through the hooks"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_tasks_runs_the_assigned_subgraph() {
+        let spec = SpecBuilder::new("runner-subgraph-job", false).build();
+        let adapter = adapter_with(Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        }));
+        let plan = JobPlan::compile(spec).unwrap();
+        let task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        run_job_tasks(
+            &plan,
+            &task_ids,
+            &adapter,
+            &mut resource(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the full assignment must run to completion");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_rejects_unsupported_local_state_backends() {
+        let mut spec = SpecBuilder::new("runner-bad-backend-job", true).build();
+        spec.state = Some(StateSpec {
+            backend: "remote_kv".into(),
+            durability: StateDurability::Ephemeral,
+            root: None,
+            namespace: None,
+            ttl_ms: None,
+            format_version: 1,
+            max_pending_transactions: None,
+            max_bytes: None,
+        });
+        let adapter = adapter_with(Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        }));
+        let error =
+            run_job_with_checkpoints(&spec, &adapter, &mut resource(), CancellationToken::new())
+                .await
+                .expect_err("an unsupported backend must fail the run");
+        assert!(
+            error
+                .to_string()
+                .contains("local Job state backend 'remote_kv' is not supported"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn local_state_backend_applies_the_configured_byte_cap() {
+        let mut spec = SpecBuilder::new("runner-capped-backend-job", true)
+            .ephemeral_state()
+            .build();
+        if let Some(state) = spec.state.as_mut() {
+            state.max_bytes = Some(4096);
+        }
+        let plan = JobPlan::compile(spec).unwrap();
+        let backend = local_state_backend(&plan)
+            .expect("a capped embedded backend must open")
+            .expect("the state section is present");
+        assert_eq!(backend.format_version(), 1);
+    }
+
+    // ---------- durability and recovery ----------
+
+    /// True once at least one completed checkpoint artifact exists under the
+    /// checkpoint root.
+    fn any_checkpoint_artifact(checkpoint_root: &std::path::Path) -> bool {
+        std::fs::read_dir(checkpoint_root.join("checkpoints"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.path().join("manifest.json").is_file())
+            })
+            .unwrap_or(false)
+    }
+
+    /// Run a durable Job until the interval-driven checkpoint loop has
+    /// persisted at least one artifact, then cancel it. The first barrier
+    /// round is timing-sensitive (coverage instrumentation slows it several
+    /// fold), so the helper polls for the artifact instead of sleeping a
+    /// fixed duration; `budget` only bounds the wait.
+    async fn drive_durable_job(
+        spec: &JobSpec,
+        adapter: &RunnerAdapter,
+        budget: Duration,
+        checkpoint_root: &std::path::Path,
+    ) -> Result<(), Error> {
+        let cancellation = CancellationToken::new();
+        let run = {
+            let spec = spec.clone();
+            let cancellation = cancellation.clone();
+            let adapter_input = adapter.input.clone();
+            tokio::spawn(async move {
+                let runner = RunnerAdapter {
+                    input: adapter_input,
+                    output: Arc::new(DevNullOutput),
+                };
+                run_job_with_checkpoints(&spec, &runner, &mut resource(), cancellation).await
+            })
+        };
+        let deadline = tokio::time::Instant::now() + budget;
+        while !any_checkpoint_artifact(checkpoint_root) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the durable attempt must persist a checkpoint within {budget:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("the durable run must settle after cancellation")
+            .unwrap()
+    }
+
+    fn durable_spec(root: &std::path::Path, checkpoint_root: &std::path::Path) -> JobSpec {
+        SpecBuilder::new("runner-durable-job", true)
+            .durable_state(root, checkpoint_root)
+            .build()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn durable_job_persists_local_checkpoints_and_recovers_on_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = durable_spec(&state_root, &checkpoint_root);
+
+        // First attempt: run long enough for several checkpoint rounds.
+        let adapter = adapter_with(Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        }));
+        drive_durable_job(&spec, &adapter, Duration::from_secs(10), &checkpoint_root)
+            .await
+            .expect("the first durable attempt must settle cleanly");
+        let plan = JobPlan::compile(spec.clone()).unwrap();
+        let marker = local_state_start_marker(&plan).unwrap();
+        assert!(
+            marker.is_file(),
+            "the start marker must survive the attempt"
+        );
+        let artifacts = std::fs::read_dir(checkpoint_root.join("checkpoints"))
+            .unwrap()
+            .count();
+        assert!(artifacts >= 1, "at least one checkpoint must be persisted");
+
+        // Restart: the marker turns the start into recovery; the latest
+        // compatible artifact is restored before the graph spawns.
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let restart = {
+            let spec = spec.clone();
+            let cancellation = cancellation.clone();
+            let adapter_input = adapter.input.clone();
+            tokio::spawn(async move {
+                let runner = RunnerAdapter {
+                    input: adapter_input,
+                    output: Arc::new(DevNullOutput),
+                };
+                run_job_with_checkpoints_started(
+                    &spec,
+                    &runner,
+                    &mut resource(),
+                    cancellation,
+                    Some(startup_tx),
+                    None,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), startup_rx)
+            .await
+            .expect("recovery startup must complete")
+            .unwrap()
+            .expect("recovered startup must succeed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(10), restart)
+            .await
+            .expect("the recovered run must settle after cancellation")
+            .unwrap()
+            .expect("the recovered run must settle cleanly");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn durable_restart_without_a_compatible_checkpoint_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = durable_spec(&state_root, &checkpoint_root);
+        let plan = JobPlan::compile(spec.clone()).unwrap();
+        // Simulate an unclean shutdown: the marker exists but no artifact
+        // was ever completed.
+        let marker = local_state_start_marker(&plan).unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"started\n").unwrap();
+        let adapter = adapter_with(Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        }));
+        let error =
+            run_job_with_checkpoints(&spec, &adapter, &mut resource(), CancellationToken::new())
+                .await
+                .expect_err("an unrecoverable marker must fail the restart");
+        assert!(
+            error
+                .to_string()
+                .contains("requires recovery but no compatible checkpoint was found"),
+            "{error}"
+        );
+    }
+
+    /// Produce one valid checkpoint artifact, then hand back the paths to
+    /// mutate for the artifact-selection tests.
+    async fn checkpointed_job(
+        directory: &tempfile::TempDir,
+    ) -> (JobSpec, JobPlan, std::path::PathBuf) {
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = durable_spec(&state_root, &checkpoint_root);
+        let adapter = adapter_with(Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        }));
+        drive_durable_job(&spec, &adapter, Duration::from_secs(10), &checkpoint_root)
+            .await
+            .expect("the durable attempt must settle cleanly");
+        let plan = JobPlan::compile(spec.clone()).unwrap();
+        (spec, plan, checkpoint_root)
+    }
+
+    fn all_manifest_paths(checkpoint_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let entries: Vec<_> = std::fs::read_dir(checkpoint_root.join("checkpoints"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path().join("manifest.json"))
+            .filter(|path| path.is_file())
+            .collect();
+        assert!(!entries.is_empty(), "at least one artifact must persist");
+        entries
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn latest_local_checkpoint_skips_unreadable_and_incompatible_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_spec, plan, checkpoint_root) = checkpointed_job(&directory).await;
+        let manifests = all_manifest_paths(&checkpoint_root);
+        let original = std::fs::read_to_string(&manifests[0]).unwrap();
+
+        // A corrupt manifest is skipped.
+        for path in &manifests {
+            std::fs::write(path, b"not json").unwrap();
+        }
+        assert!(latest_local_checkpoint(&checkpoint_root, &plan)
+            .unwrap()
+            .is_none());
+
+        // An artifact without task snapshots is skipped.
+        let mut emptied: serde_json::Value =
+            serde_json::from_str(&original).expect("the produced manifest is valid");
+        emptied["state_snapshots"] = serde_json::json!([]);
+        for path in &manifests {
+            std::fs::write(path, emptied.to_string()).unwrap();
+        }
+        assert!(latest_local_checkpoint(&checkpoint_root, &plan)
+            .unwrap()
+            .is_none());
+
+        // An artifact written under a different task set is skipped.
+        let mut rescaled = emptied.clone();
+        rescaled["state_snapshots"] = serde_json::json!([
+            { "task_id": "agg-9", "snapshot_key": "state.snap" }
+        ]);
+        rescaled["task_attempts"] = serde_json::json!([
+            { "task_id": "agg-9", "attempt_id": "agg-9:local:0", "node_id": "local" }
+        ]);
+        for path in &manifests {
+            std::fs::write(path, rescaled.to_string()).unwrap();
+        }
+        assert!(latest_local_checkpoint(&checkpoint_root, &plan)
+            .unwrap()
+            .is_none());
+
+        // Restoring the original artifact makes it selectable again.
+        for path in &manifests {
+            std::fs::write(path, original.clone()).unwrap();
+        }
+        assert!(latest_local_checkpoint(&checkpoint_root, &plan).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn savepoint_recovery_policy_reads_the_savepoints_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut spec, _plan, checkpoint_root) = checkpointed_job(&directory).await;
+        spec.recovery = RecoveryPolicy::LatestSavepoint;
+        let plan = JobPlan::compile(spec).unwrap();
+        // Nothing was written under savepoints/: no artifact is selected even
+        // though checkpoints exist.
+        assert!(latest_local_checkpoint(&checkpoint_root, &plan)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_connect_failure_closes_inputs_and_fails_the_startup_handshake() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = durable_spec(&state_root, &checkpoint_root);
+        let adapter = adapter_with(Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        }));
+        drive_durable_job(&spec, &adapter, Duration::from_secs(10), &checkpoint_root)
+            .await
+            .expect("the first attempt must settle cleanly");
+
+        // The restart's source fails to reconnect after position restore.
+        let failing = Arc::new(FailingConnectInput {
+            closes: AtomicUsize::new(0),
+        });
+        let restart_adapter = adapter_with(failing.clone());
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let error = run_job_with_checkpoints_started(
+            &spec,
+            &restart_adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            Some(startup_tx),
+            None,
+        )
+        .await
+        .expect_err("a failing reconnect must fail the restart");
+        assert!(
+            error
+                .to_string()
+                .contains("injected restart connect failure"),
+            "{error}"
+        );
+        let startup = startup_rx
+            .await
+            .expect("the startup handshake must observe the failure");
+        assert!(startup.is_err(), "startup must report the failure");
+        assert_eq!(
+            failing.closes.load(Ordering::SeqCst),
+            1,
+            "the failed input must be closed during cleanup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_position_restore_failure_fails_the_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = durable_spec(&state_root, &checkpoint_root);
+        let adapter = adapter_with(Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        }));
+        drive_durable_job(&spec, &adapter, Duration::from_secs(10), &checkpoint_root)
+            .await
+            .expect("the first attempt must settle cleanly");
+
+        let restart_adapter = adapter_with(Arc::new(FailingRestoreInput));
+        let error = run_job_with_checkpoints(
+            &spec,
+            &restart_adapter,
+            &mut resource(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a failing position restore must fail the restart");
+        assert!(
+            error.to_string().contains("injected restore failure"),
+            "{error}"
+        );
+    }
+
+    /// A graph whose startup fails AFTER recovery (a sink that cannot
+    /// reconnect) must clean up the start marker, close the restored inputs,
+    /// and fail the startup handshake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovered_run_cleans_up_when_the_graph_startup_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = durable_spec(&state_root, &checkpoint_root);
+        let adapter = adapter_with(Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        }));
+        drive_durable_job(&spec, &adapter, Duration::from_secs(10), &checkpoint_root)
+            .await
+            .expect("the first attempt must settle cleanly");
+        let plan = JobPlan::compile(spec.clone()).unwrap();
+        let marker = local_state_start_marker(&plan).unwrap();
+        assert!(marker.is_file());
+
+        let restart_adapter = RunnerAdapter {
+            input: Arc::new(NeverEndingInput {
+                connects: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+            }),
+            output: Arc::new(FailingSinkOutput),
+        };
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let error = run_job_with_checkpoints_started(
+            &spec,
+            &restart_adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            Some(startup_tx),
+            None,
+        )
+        .await
+        .expect_err("a failing graph startup must fail the recovered run");
+        assert!(
+            error
+                .to_string()
+                .contains("injected sink reconnect failure"),
+            "{error}"
+        );
+        assert!(
+            startup_rx
+                .await
+                .expect("the startup handshake must observe the failure")
+                .is_err(),
+            "startup must report the failure"
+        );
+        assert!(
+            !marker.exists(),
+            "the start marker must be removed so the next attempt can retry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn durable_start_marker_write_failure_fails_the_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = durable_spec(&state_root, &checkpoint_root);
+        let plan = JobPlan::compile(spec.clone()).unwrap();
+        let marker = local_state_start_marker(&plan).unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        // A directory squatting on the marker's temporary write path makes
+        // the atomic persist fail after the state backend already opened.
+        let temporary = marker.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&temporary).unwrap();
+        let adapter = adapter_with(Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        }));
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let error = run_job_with_checkpoints_started(
+            &spec,
+            &adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            Some(startup_tx),
+            None,
+        )
+        .await
+        .expect_err("a failed marker persist must fail the run");
+        assert!(
+            error
+                .to_string()
+                .contains("could not persist its start marker"),
+            "{error}"
+        );
+        assert!(
+            startup_rx
+                .await
+                .expect("startup handshake must fire")
+                .is_err(),
+            "startup must report the failure"
+        );
+        let _ = std::fs::remove_dir_all(&temporary);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn durable_start_marker_rename_failure_cleans_up_the_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = durable_spec(&state_root, &checkpoint_root);
+        let plan = JobPlan::compile(spec.clone()).unwrap();
+        let marker = local_state_start_marker(&plan).unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        // A directory at the final marker path makes the rename step fail.
+        std::fs::create_dir_all(&marker).unwrap();
+        let adapter = adapter_with(Arc::new(OneBatchThenEofInput {
+            sent: Mutex::new(false),
+        }));
+        let error =
+            run_job_with_checkpoints(&spec, &adapter, &mut resource(), CancellationToken::new())
+                .await
+                .expect_err("a failed marker rename must fail the run");
+        assert!(
+            error
+                .to_string()
+                .contains("could not persist its start marker"),
+            "{error}"
+        );
+        let temporary = marker.with_extension(format!("tmp-{}", std::process::id()));
+        assert!(
+            !temporary.exists(),
+            "the written temporary must be cleaned up after the failed rename"
+        );
+        let _ = std::fs::remove_dir_all(&marker);
+    }
+
+    // ---------- checkpoint URI handling ----------
+
+    #[test]
+    fn local_checkpoint_root_validates_uri_forms() {
+        assert_eq!(
+            local_checkpoint_root("file:///tmp/arkflow").unwrap(),
+            PathBuf::from("/tmp/arkflow")
+        );
+        assert_eq!(
+            local_checkpoint_root("data/ckpt").unwrap(),
+            PathBuf::from("data/ckpt")
+        );
+        let empty = local_checkpoint_root("file://").expect_err("empty path");
+        assert!(empty.to_string().contains("empty path"), "{empty}");
+        let remote = local_checkpoint_root("s3://bucket/checkpoints").expect_err("remote URI");
+        assert!(remote.to_string().contains("use file:///path"), "{remote}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_local_checkpoint_loop_stops_when_the_store_cannot_be_opened() {
+        // An empty graph spawns a handle whose run is already complete.
+        let graph = crate::executor::graph::ExecutionGraph {
+            chains: Vec::new(),
+            channel_capacity: 1024,
+            temporaries: Vec::new(),
+        };
+        let handle = Arc::new(
+            KernelJobRunner::spawn(graph, Vec::new(), BTreeMap::new(), BTreeMap::new(), false)
+                .await
+                .unwrap(),
+        );
+        let plan = JobPlan::compile(
+            SpecBuilder::new("runner-checkpoint-loop-job", false)
+                .stateless_edges()
+                .build(),
+        )
+        .unwrap();
+        let participants: Vec<String> = plan.tasks.iter().map(|task| task.id.clone()).collect();
+
+        // A non-local store URI disables the loop immediately.
+        let remote = CheckpointSpec {
+            interval_ms: 10,
+            retention: 1,
+            object_store_uri: "s3://bucket/nope".into(),
+        };
+        run_local_checkpoint_loop(
+            handle.clone(),
+            plan.clone(),
+            participants.clone(),
+            remote,
+            CancellationToken::new(),
+        )
+        .await;
+
+        // A store root that cannot be created also stops the loop.
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("not-a-directory");
+        std::fs::write(&blocked, b"file").unwrap();
+        let unwritable = CheckpointSpec {
+            interval_ms: 10,
+            retention: 1,
+            object_store_uri: format!("file://{}", blocked.display()),
+        };
+        run_local_checkpoint_loop(
+            handle.clone(),
+            plan,
+            participants,
+            unwritable,
+            CancellationToken::new(),
+        )
+        .await;
+
+        // With an already-ended graph the barrier fails and the loop keeps
+        // logging until the stop token fires.
+        let directory = tempfile::tempdir().unwrap();
+        let healthy = CheckpointSpec {
+            interval_ms: 1,
+            retention: 1,
+            object_store_uri: format!("file://{}", directory.path().display()),
+        };
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let plan = JobPlan::compile(
+            SpecBuilder::new("runner-checkpoint-loop-job", false)
+                .stateless_edges()
+                .build(),
+        )
+        .unwrap();
+        let participants = plan.tasks.iter().map(|task| task.id.clone()).collect();
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            run_local_checkpoint_loop(handle, plan, participants, healthy, stop),
+        )
+        .await
+        .expect("a cancelled loop must return promptly");
+    }
+
+    // ---------- event-time wiring ----------
+
+    fn build_event_time_graph(
+        time: TimeSpec,
+        input: Arc<dyn Input>,
+        parallelism: u32,
+    ) -> crate::executor::graph::ExecutionGraph {
+        let mut builder = SpecBuilder::new("runner-event-time-job", false)
+            .stateless_edges()
+            .ephemeral_state()
+            .event_time(time)
+            .parallelism(parallelism);
+        builder.spec.operators.insert(
+            1,
+            OperatorSpec {
+                id: "window".into(),
+                kind: OperatorKind::Window,
+                stateful: true,
+                key_field: Some("key".into()),
+                config: serde_json::json!({
+                    "type": "window",
+                    "kind": "tumbling",
+                    "size_ms": 10_000,
+                    "timestamp_field": "ts",
+                    "key_field": "key",
+                    "value_fields": ["value"],
+                    "trigger": "watermark",
+                    "watermark_field": "__watermark_ms"
+                }),
+            },
+        );
+        builder.spec.edges = vec![
+            EdgeSpec {
+                id: "source-window".into(),
+                from: "source".into(),
+                to: "window".into(),
+                partitioned: false,
+            },
+            EdgeSpec {
+                id: "window-sink".into(),
+                from: "window".into(),
+                to: "sink".into(),
+                partitioned: false,
+            },
+        ];
+        let spec = builder.build();
+        let plan = JobPlan::compile(spec).unwrap();
+        let adapter = adapter_with(input);
+        ExecutionGraphBuilder::default()
+            .build(&plan, &adapter, &resource())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn event_time_gates_reject_sources_without_a_watermark() {
+        // Plan validation normally rejects event-time sources without a
+        // watermark; the gate wiring must still fail closed if one reaches it
+        // (a graph assembled outside the plan compiler).
+        let mut graph = build_event_time_graph(
+            event_time(Some(bounded_watermark())),
+            Arc::new(OneBatchThenEofInput {
+                sent: Mutex::new(false),
+            }),
+            1,
+        );
+        for chain in &mut graph.chains {
+            if let Some(time) = &mut chain.source_time {
+                time.watermark = None;
+            }
+        }
+        let error = event_time_gates(&graph)
+            .err()
+            .expect("a missing watermark must fail gate construction");
+        assert!(
+            error.to_string().contains("watermark specification"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seed_event_time_partitions_uses_the_connector_assignment() {
+        let graph = build_event_time_graph(
+            event_time(Some(bounded_watermark())),
+            Arc::new(PartitionedInput {
+                partitions: vec![crate::event_time::EventTimePartition::new(
+                    Some("orders".into()),
+                    3,
+                )],
+                fail_enumeration: false,
+            }),
+            1,
+        );
+        let gates = event_time_gates(&graph).unwrap();
+        assert!(!gates.is_empty());
+        seed_event_time_partitions(&graph, &gates)
+            .await
+            .expect("seeding must succeed");
+        for gate in gates.values() {
+            let gate = gate.lock().await;
+            let known = gate.as_ref().unwrap().known_partitions();
+            assert_eq!(
+                known,
+                vec![crate::event_time::EventTimePartition::new(
+                    Some("orders".into()),
+                    3
+                )]
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seed_event_time_partitions_falls_back_to_the_chain_partition() {
+        // No physical partitions from the connector: the chain's plan
+        // partition seeds the gate instead (parallelism 2 assigns the second
+        // source chain partition 1).
+        let graph = build_event_time_graph(
+            event_time(Some(bounded_watermark())),
+            Arc::new(PartitionedInput {
+                partitions: Vec::new(),
+                fail_enumeration: false,
+            }),
+            2,
+        );
+        let gates = event_time_gates(&graph).unwrap();
+        seed_event_time_partitions(&graph, &gates)
+            .await
+            .expect("seeding must succeed");
+        let mut all_known = Vec::new();
+        for gate in gates.values() {
+            let gate = gate.lock().await;
+            all_known.extend(gate.as_ref().unwrap().known_partitions());
+        }
+        assert!(
+            all_known.contains(&crate::event_time::EventTimePartition::for_source(
+                "source-1", 1
+            )),
+            "the source-1 chain must seed its plan partition: {all_known:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seed_event_time_partitions_surfaces_enumeration_failures() {
+        let graph = build_event_time_graph(
+            event_time(Some(bounded_watermark())),
+            Arc::new(PartitionedInput {
+                partitions: Vec::new(),
+                fail_enumeration: true,
+            }),
+            1,
+        );
+        let gates = event_time_gates(&graph).unwrap();
+        let error = seed_event_time_partitions(&graph, &gates)
+            .await
+            .expect_err("an enumeration failure must surface");
+        assert!(
+            error.to_string().contains("injected enumeration failure"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_event_time_watermarks_installs_physical_and_legacy_progress() {
+        let graph = build_event_time_graph(
+            event_time(Some(bounded_watermark())),
+            Arc::new(OneBatchThenEofInput {
+                sent: Mutex::new(false),
+            }),
+            1,
+        );
+        let gates = event_time_gates(&graph).unwrap();
+        let source_task = graph.chains[0].entry_task_id().to_string();
+
+        // Physical per-partition progress restores onto the real partitions.
+        restore_event_time_watermarks(
+            &graph,
+            &gates,
+            &BTreeMap::new(),
+            &BTreeMap::from([(
+                source_task.clone(),
+                vec![crate::checkpoint::WatermarkPosition::new(
+                    Some("orders".into()),
+                    3,
+                    1_000,
+                )],
+            )]),
+        )
+        .await;
+        let gate = gates.get(&source_task).unwrap().clone();
+        let known = gate.lock().await.as_ref().unwrap().known_partitions();
+        assert_eq!(
+            known,
+            vec![
+                crate::event_time::EventTimePartition::new(Some("orders".into()), 3)
+                    .with_source_identity(&source_task)
+            ]
+        );
+
+        // Legacy task-level restore fans out to every known partition and is
+        // skipped for tasks that already carry physical progress.
+        restore_event_time_watermarks(
+            &graph,
+            &gates,
+            &BTreeMap::from([(source_task.clone(), 2_000_i64)]),
+            &BTreeMap::from([(
+                source_task.clone(),
+                vec![crate::checkpoint::WatermarkPosition::new(
+                    Some("orders".into()),
+                    3,
+                    1_000,
+                )],
+            )]),
+        )
+        .await;
+
+        // A watermark for a task without a gate is ignored.
+        restore_event_time_watermarks(
+            &graph,
+            &gates,
+            &BTreeMap::from([("missing-task".to_string(), 5_i64)]),
+            &BTreeMap::new(),
+        )
+        .await;
+    }
+
+    // ---------- deep validation ----------
+
+    struct EofInputBuilder;
+
+    impl InputBuilder for EofInputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(OneBatchThenEofInput {
+                sent: Mutex::new(false),
+            }))
+        }
+    }
+
+    struct DevNullOutputBuilder;
+
+    impl OutputBuilder for DevNullOutputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(Arc::new(DevNullOutput))
+        }
+    }
+
+    #[test]
+    fn validate_local_job_accepts_registered_components() {
+        let input_type = "runner-validate-eof-input";
+        let output_type = "runner-validate-devnull-output";
+        let _ = crate::input::register_input_builder(input_type, Arc::new(EofInputBuilder));
+        let _ = crate::output::register_output_builder(output_type, Arc::new(DevNullOutputBuilder));
+        let spec = SpecBuilder::new("runner-validate-job", false)
+            .stateless_edges()
+            .build();
+        let mut spec = spec;
+        spec.sources[0].input_type = input_type.into();
+        spec.operators[0].config = serde_json::json!({"type": input_type});
+        spec.sinks[0].output_type = output_type.into();
+        spec.operators.last_mut().unwrap().config = serde_json::json!({"type": output_type});
+        validate_local_job(&spec).expect("registered components must validate");
+    }
+
+    #[test]
+    fn shared_resource_wraps_a_resource_for_cheap_cloning() {
+        let shared = shared_resource(resource());
+        assert!(shared.temporary.is_empty());
+    }
+
+    // ---------- stateful runs through the plain runners ----------
+
+    /// A one-batch EOF input whose batch carries the aggregate's key column.
+    struct KeyedBatchThenEofInput {
+        sent: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Input for KeyedBatchThenEofInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let mut sent = self.sent.lock().unwrap();
+            if *sent {
+                return Err(Error::EOF);
+            }
+            *sent = true;
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(datafusion::arrow::array::StringArray::from(vec!["k1"])),
+                    Arc::new(Int64Array::from(vec![1])),
+                ],
+            )
+            .unwrap();
+            Ok((
+                Arc::new(MessageBatch::new_arrow(batch)),
+                Arc::new(crate::input::NoopAck),
+            ))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn keyed_eof_input() -> Arc<KeyedBatchThenEofInput> {
+        Arc::new(KeyedBatchThenEofInput {
+            sent: Mutex::new(false),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stateful_job_flows_batches_through_the_processor() {
+        let spec = SpecBuilder::new("runner-stateful-flow-job", true)
+            .ephemeral_state()
+            .build();
+        let adapter = adapter_with(keyed_eof_input());
+        run_job(&spec, &adapter, &mut resource(), CancellationToken::new())
+            .await
+            .expect("an EOF stateful Job must complete successfully");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_with_metrics_started_opens_and_closes_the_state_backend() {
+        let spec = SpecBuilder::new("runner-metrics-state-job", true)
+            .ephemeral_state()
+            .build();
+        let adapter = adapter_with(keyed_eof_input());
+        run_job_with_metrics_started(
+            &spec,
+            &adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("an EOF stateful Job must complete and close its backend");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_with_hooks_opens_and_closes_the_state_backend() {
+        let spec = SpecBuilder::new("runner-hooks-state-job", true)
+            .ephemeral_state()
+            .build();
+        let adapter = adapter_with(keyed_eof_input());
+        let plan = JobPlan::compile(spec.clone()).unwrap();
+        let hooks = plan
+            .tasks
+            .iter()
+            .map(|task| (task.id.clone(), crate::executor::task::CheckpointHook::default()))
+            .collect::<BTreeMap<_, _>>();
+        run_job_with_hooks(
+            &spec,
+            &adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            hooks,
+        )
+        .await
+        .expect("an EOF stateful Job must complete through the hooks runner");
+    }
+
+    struct PassThroughProcessorBuilder;
+
+    impl crate::processor::ProcessorBuilder for PassThroughProcessorBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Processor>, Error> {
+            Ok(Arc::new(PassThroughProcessor))
+        }
+    }
+
+    #[test]
+    fn validate_local_job_builds_through_the_state_backend() {
+        let input_type = "runner-validate-eof-input";
+        let output_type = "runner-validate-devnull-output";
+        let processor_type = "runner-validate-passthrough";
+        let _ = crate::input::register_input_builder(input_type, Arc::new(EofInputBuilder));
+        let _ = crate::output::register_output_builder(output_type, Arc::new(DevNullOutputBuilder));
+        let _ = crate::processor::register_processor_builder(
+            processor_type,
+            Arc::new(PassThroughProcessorBuilder),
+        );
+        let spec = SpecBuilder::new("runner-validate-state-job", true)
+            .ephemeral_state()
+            .build();
+        let mut spec = spec;
+        spec.sources[0].input_type = input_type.into();
+        spec.operators[0].config = serde_json::json!({"type": input_type});
+        spec.sinks[0].output_type = output_type.into();
+        spec.operators.last_mut().unwrap().config = serde_json::json!({"type": output_type});
+        spec.operators[1].config = serde_json::json!({"type": processor_type});
+        validate_local_job(&spec).expect("a registered stateful Job must deep-validate");
+    }
+
+    // ---------- recovery: seed failures and marker persistence ----------
+
+    /// An input whose watermark-partition enumeration fails after connecting;
+    /// optionally its close also fails so the cleanup warn path runs.
+    struct BrokenSeedInput {
+        closes: AtomicUsize,
+        fail_close: bool,
+    }
+
+    #[async_trait]
+    impl Input for BrokenSeedInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            std::future::pending().await
+        }
+        async fn watermark_partitions(
+            &self,
+        ) -> Result<Vec<crate::event_time::EventTimePartition>, Error> {
+            Err(Error::Connection("injected enumeration failure".into()))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_close {
+                return Err(Error::Connection("injected close failure".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn event_time_durable_spec(
+        state_root: &std::path::Path,
+        checkpoint_root: &std::path::Path,
+    ) -> JobSpec {
+        let mut builder = SpecBuilder::new("runner-seed-recovery-job", false)
+            .durable_state(state_root, checkpoint_root)
+            .event_time(event_time(Some(bounded_watermark())));
+        builder.spec.operators.insert(
+            1,
+            OperatorSpec {
+                id: "window".into(),
+                kind: OperatorKind::Window,
+                stateful: true,
+                key_field: Some("key".into()),
+                config: serde_json::json!({
+                    "type": "window",
+                    "kind": "tumbling",
+                    "size_ms": 10_000,
+                    "timestamp_field": "ts",
+                    "key_field": "key",
+                    "value_fields": ["value"],
+                    "trigger": "watermark",
+                    "watermark_field": "__watermark_ms"
+                }),
+            },
+        );
+        builder.spec.edges = vec![
+            EdgeSpec {
+                id: "source-window".into(),
+                from: "source".into(),
+                to: "window".into(),
+                partitioned: false,
+            },
+            EdgeSpec {
+                id: "window-sink".into(),
+                from: "window".into(),
+                to: "sink".into(),
+                partitioned: false,
+            },
+        ];
+        builder.build()
+    }
+
+    /// Recovery seeding failure: the restarted source cannot enumerate its
+    /// watermark partitions. Inputs are closed (even when close itself
+    /// fails, exercising the cleanup warn), state is closed, and the startup
+    /// handshake observes the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_seed_failure_fails_the_restart_and_closes_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = event_time_durable_spec(&state_root, &checkpoint_root);
+        let adapter = adapter_with(Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        }));
+        drive_durable_job(&spec, &adapter, Duration::from_secs(10), &checkpoint_root)
+            .await
+            .expect("the first attempt must settle cleanly");
+
+        let broken = Arc::new(BrokenSeedInput {
+            closes: AtomicUsize::new(0),
+            fail_close: true,
+        });
+        let restart_adapter = adapter_with(broken.clone());
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let error = run_job_with_checkpoints_started(
+            &spec,
+            &restart_adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            Some(startup_tx),
+            None,
+        )
+        .await
+        .expect_err("a failing seed must fail the restart");
+        assert!(
+            error.to_string().contains("injected enumeration failure"),
+            "{error}"
+        );
+        assert!(
+            startup_rx
+                .await
+                .expect("the startup handshake must observe the failure")
+                .is_err(),
+            "startup must report the failure"
+        );
+        assert_eq!(
+            broken.closes.load(Ordering::SeqCst),
+            1,
+            "the failed input must be closed during cleanup"
+        );
+    }
+
+    /// The start-marker persist fails AFTER recovery prepared the inputs:
+    /// the restored inputs must be closed before surfacing the error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_marker_persist_failure_closes_restored_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let checkpoint_root = directory.path().join("checkpoints");
+        let spec = durable_spec(&state_root, &checkpoint_root);
+        let adapter = adapter_with(Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        }));
+        drive_durable_job(&spec, &adapter, Duration::from_secs(10), &checkpoint_root)
+            .await
+            .expect("the first attempt must settle cleanly");
+        let plan = JobPlan::compile(spec.clone()).unwrap();
+        let marker = local_state_start_marker(&plan).unwrap();
+        // A directory squatting on the atomic-rename temporary makes the
+        // marker persist fail after recovery reconnected the inputs.
+        let temporary = marker.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&temporary).unwrap();
+        let restart_input = Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        });
+        let restart_adapter = adapter_with(restart_input.clone());
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let error = run_job_with_checkpoints_started(
+            &spec,
+            &restart_adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            Some(startup_tx),
+            None,
+        )
+        .await
+        .expect_err("a failed marker persist must fail the restart");
+        assert!(
+            error.to_string().contains("could not persist its start marker"),
+            "{error}"
+        );
+        assert!(
+            startup_rx
+                .await
+                .expect("the startup handshake must observe the failure")
+                .is_err(),
+            "startup must report the failure"
+        );
+        assert_eq!(
+            restart_input.closes.load(Ordering::SeqCst),
+            1,
+            "the restored input must be closed during cleanup"
+        );
+        let _ = std::fs::remove_dir_all(&temporary);
+    }
+
+    // ---------- checkpoint artifact scan (latest_local_checkpoint) ----------
+
+    /// Recompute the manifest envelope checksum the same way the product's
+    /// coordinator seals it, so hand-built test manifests pass `verify()`.
+    fn seal_manifest(
+        mut manifest: crate::checkpoint::CheckpointManifest,
+    ) -> crate::checkpoint::CheckpointManifest {
+        let encoded = serde_json::to_vec(&(
+            &manifest.checkpoint_id,
+            &manifest.job_id,
+            manifest.job_version,
+            manifest.generation,
+            &manifest.task_attempts,
+            &manifest.source_positions,
+            &manifest.watermarks_ms,
+            &manifest.watermark_partitions,
+            &manifest.in_flight_barrier,
+            &manifest.state_snapshots,
+            manifest.format_version,
+        ))
+        .expect("manifest fields must serialize");
+        manifest.checksum = encoded.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+            hash.wrapping_mul(0x100000001b3) ^ u64::from(*byte)
+        });
+        manifest
+    }
+
+    fn probe_manifest(job: &str, tasks: &[String]) -> crate::checkpoint::CheckpointManifest {
+        let checkpoint_id = format!("local-{job}-probe");
+        crate::checkpoint::CheckpointManifest {
+            checkpoint_id: checkpoint_id.clone(),
+            job_id: JobId::new(job).unwrap(),
+            job_version: JobVersion(1),
+            generation: 1,
+            task_attempts: tasks
+                .iter()
+                .map(|task| crate::checkpoint::TaskAttemptSnapshot {
+                    task_id: task.clone(),
+                    attempt_id: format!("{task}:local:0"),
+                    node_id: "local".into(),
+                })
+                .collect(),
+            source_positions: Vec::new(),
+            watermarks_ms: BTreeMap::new(),
+            watermark_partitions: BTreeMap::new(),
+            in_flight_barrier: crate::checkpoint::CheckpointBarrier {
+                checkpoint_id,
+                generation: 1,
+                trace_context: None,
+            },
+            state_snapshots: Vec::new(),
+            format_version: 1,
+            checksum: 0,
+        }
+    }
+
+    fn write_manifest_under(
+        root: &std::path::Path,
+        manifest: &crate::checkpoint::CheckpointManifest,
+    ) {
+        let directory = root.join("checkpoints").join(&manifest.checkpoint_id);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("manifest.json"),
+            serde_json::to_vec(manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn scan_plan_tasks() -> (JobPlan, Vec<String>) {
+        let spec = SpecBuilder::new("runner-scan-job", true)
+            .ephemeral_state()
+            .build();
+        let plan = JobPlan::compile(spec).unwrap();
+        let tasks = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        (plan, tasks)
+    }
+
+    #[test]
+    fn latest_local_checkpoint_surfaces_scan_and_skip_variants() {
+        let (plan, _tasks) = scan_plan_tasks();
+
+        // A file squatting on the checkpoints directory makes the scan fail.
+        let blocked = tempfile::tempdir().unwrap();
+        std::fs::write(blocked.path().join("checkpoints"), b"not a directory").unwrap();
+        let error = latest_local_checkpoint(blocked.path(), &plan)
+            .expect_err("an unreadable checkpoints directory must fail the scan");
+        assert!(
+            error.to_string().contains("scan local recovery directory"),
+            "{error}"
+        );
+
+        // A candidate directory without a manifest is skipped.
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(empty.path().join("checkpoints").join("junk")).unwrap();
+        assert!(
+            latest_local_checkpoint(empty.path(), &plan).unwrap().is_none(),
+            "a directory without a manifest must be skipped"
+        );
+
+        // A non-UTF-8 directory name cannot yield an artifact id. APFS
+        // (macOS) rejects creating such names outright, so this branch is
+        // only exercisable on filesystems that accept arbitrary bytes.
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let weird = tempfile::tempdir().unwrap();
+            let invalid = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]);
+            let directory = weird.path().join("checkpoints").join(invalid);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("manifest.json"), b"{}").unwrap();
+            assert!(
+                latest_local_checkpoint(weird.path(), &plan)
+                    .unwrap()
+                    .is_none(),
+                "a non-UTF-8 artifact directory must be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_local_checkpoint_skips_sealed_but_unusable_artifacts() {
+        let (plan, tasks) = scan_plan_tasks();
+
+        // Sealed manifest with no state snapshots at all.
+        let directory = tempfile::tempdir().unwrap();
+        write_manifest_under(directory.path(), &seal_manifest(probe_manifest(
+            plan.spec.id.as_str(),
+            &tasks,
+        )));
+        assert!(
+            latest_local_checkpoint(directory.path(), &plan)
+                .unwrap()
+                .is_none(),
+            "an artifact without state snapshots must be skipped"
+        );
+
+        // Sealed manifest written for a different Job identity.
+        let directory = tempfile::tempdir().unwrap();
+        let mut foreign = probe_manifest("runner-other-job", &tasks);
+        foreign.state_snapshots = vec![crate::checkpoint::StateSnapshotRef {
+            task_id: tasks[0].clone(),
+            node_id: None,
+            uri: "checkpoints/x/state-1.json".into(),
+            checksum: 1,
+            bytes: 1,
+        }];
+        write_manifest_under(directory.path(), &seal_manifest(foreign));
+        assert!(
+            latest_local_checkpoint(directory.path(), &plan)
+                .unwrap()
+                .is_none(),
+            "an artifact sealed for another Job must be skipped"
+        );
+
+        // Sealed manifest whose snapshot task set does not match the plan
+        // even though the task attempts do.
+        let directory = tempfile::tempdir().unwrap();
+        let mut mismatched = probe_manifest(plan.spec.id.as_str(), &tasks);
+        mismatched.state_snapshots = vec![crate::checkpoint::StateSnapshotRef {
+            task_id: "agg-9".into(),
+            node_id: None,
+            uri: "checkpoints/x/state-1.json".into(),
+            checksum: 1,
+            bytes: 1,
+        }];
+        write_manifest_under(directory.path(), &seal_manifest(mismatched));
+        assert!(
+            latest_local_checkpoint(directory.path(), &plan)
+                .unwrap()
+                .is_none(),
+            "an artifact with a foreign snapshot task set must be skipped"
+        );
+    }
+
+    #[test]
+    fn latest_local_checkpoint_skips_snapshots_outside_the_job_namespace() {
+        let (plan, tasks) = scan_plan_tasks();
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            crate::checkpoint::FileCheckpointStore::new(directory.path()).unwrap();
+        let repository = crate::checkpoint::CheckpointRepository::new(store);
+        // A perfectly readable snapshot whose entries live under another
+        // Job's namespace: the manifest seals fine, every structural check
+        // passes, and only the namespace boundary rejects it.
+        let snapshot = crate::state::StateSnapshot::new(
+            1,
+            vec![crate::state::StateEntry {
+                namespace: "job:someone-else:state:default:operator:agg:task:agg-0".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
+        let reference = repository
+            .write_state_snapshot("local-probe", &snapshot)
+            .unwrap();
+        let mut manifest = probe_manifest(plan.spec.id.as_str(), &tasks);
+        manifest.state_snapshots = tasks
+            .iter()
+            .map(|task| crate::checkpoint::StateSnapshotRef {
+                task_id: task.clone(),
+                node_id: None,
+                uri: reference.uri.clone(),
+                checksum: reference.checksum,
+                bytes: reference.bytes,
+            })
+            .collect();
+        write_manifest_under(directory.path(), &seal_manifest(manifest));
+        assert!(
+            latest_local_checkpoint(directory.path(), &plan)
+                .unwrap()
+                .is_none(),
+            "snapshots outside the Job namespace must be skipped"
+        );
+    }
+
+    #[test]
+    fn local_checkpoint_catalog_skips_foreign_and_malformed_entries() {
+        let (plan, tasks) = scan_plan_tasks();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+
+        // Non-UTF-8 directory name: no artifact id (not creatable on APFS).
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let invalid = std::ffi::OsStr::from_bytes(&[0xff, 0xfd]);
+            std::fs::create_dir_all(root.join("checkpoints").join(invalid)).unwrap();
+        }
+        // Directory without a manifest.
+        std::fs::create_dir_all(root.join("checkpoints").join("junk")).unwrap();
+        // Corrupt manifest: readable directory, unusable content.
+        std::fs::create_dir_all(root.join("checkpoints").join("corrupt")).unwrap();
+        std::fs::write(
+            root.join("checkpoints").join("corrupt").join("manifest.json"),
+            b"not json",
+        )
+        .unwrap();
+        // Sealed manifest belonging to another Job: readable but not recorded.
+        write_manifest_under(root, &seal_manifest(probe_manifest("runner-other-job", &tasks)));
+        let store = crate::checkpoint::FileCheckpointStore::new(root).unwrap();
+        let catalog = local_checkpoint_catalog(root, &store, &plan);
+        assert!(
+            catalog.artifacts().is_empty(),
+            "foreign and malformed entries must not be recorded"
+        );
+
+        // A sealed manifest for this Job is recorded.
+        write_manifest_under(root, &seal_manifest_for(&plan, &tasks));
+        let catalog = local_checkpoint_catalog(root, &store, &plan);
+        assert_eq!(catalog.artifacts().len(), 1);
+    }
+
+    fn seal_manifest_for(
+        plan: &JobPlan,
+        tasks: &[String],
+    ) -> crate::checkpoint::CheckpointManifest {
+        let mut manifest = probe_manifest(plan.spec.id.as_str(), tasks);
+        manifest.state_snapshots = vec![crate::checkpoint::StateSnapshotRef {
+            task_id: tasks[0].clone(),
+            node_id: None,
+            uri: "checkpoints/none/state-1.json".into(),
+            checksum: 1,
+            bytes: 1,
+        }];
+        seal_manifest(manifest)
+    }
+
+    // ---------- checkpoint loop: retention and persistence failures ----------
+
+    fn checkpoint_directory_state(
+        root: &std::path::Path,
+    ) -> (usize, usize, Option<std::path::PathBuf>) {
+        // (directory count, manifest count, one directory holding a manifest)
+        let mut directories = 0usize;
+        let mut manifests = 0usize;
+        let mut manifest_dir = None;
+        if let Ok(entries) = std::fs::read_dir(root.join("checkpoints")) {
+            for entry in entries.flatten() {
+                directories += 1;
+                if entry.path().join("manifest.json").is_file() {
+                    manifests += 1;
+                    manifest_dir = Some(entry.path());
+                }
+            }
+        }
+        (directories, manifests, manifest_dir)
+    }
+
+    /// The interval loop keeps running when persistence fails: retention
+    /// deletes old artifacts once the retention window is exceeded, and a
+    /// failed delete (read-only artifact directory) only logs a warning —
+    /// data processing continues.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn checkpoint_loop_enforces_retention_and_survives_persist_failures() {
+        let spec = SpecBuilder::new("runner-retention-job", false)
+            .stateless_edges()
+            .build();
+        let plan = JobPlan::compile(spec).unwrap();
+        let participants: Vec<String> = plan
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let adapter = adapter_with(Arc::new(NeverEndingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        }));
+        let graph = crate::executor::graph::ExecutionGraphBuilder::default()
+            .build(&plan, &adapter, &resource())
+            .unwrap();
+        let handle = Arc::new(
+            KernelJobRunner::spawn(graph, Vec::new(), BTreeMap::new(), BTreeMap::new(), true)
+                .await
+                .unwrap(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let checkpoint = CheckpointSpec {
+            interval_ms: 10,
+            retention: 1,
+            object_store_uri: format!("file://{}", root.display()),
+        };
+        let stop = CancellationToken::new();
+        let loop_task = {
+            let handle = handle.clone();
+            let plan = plan.clone();
+            let participants = participants.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                run_local_checkpoint_loop(handle, plan, participants, checkpoint, stop).await;
+            })
+        };
+
+        // Wait until retention has deleted at least one predecessor:
+        // two checkpoint directories exist but only one manifest remains.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let protected = loop {
+            let (directories, manifests, manifest_dir) = checkpoint_directory_state(root);
+            if directories >= 2 && manifests == 1 {
+                break manifest_dir.expect("a manifest directory must exist");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "retention must prune old artifacts: {directories} dirs, {manifests} manifests"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        // The surviving artifact's directory becomes read-only: the next
+        // retention delete fails, the loop logs and keeps going, and a new
+        // checkpoint still appears in a different directory.
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&protected).unwrap().permissions();
+        permissions.set_mode(0o500);
+        std::fs::set_permissions(&protected, permissions).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_, manifests, manifest_dir) = checkpoint_directory_state(root);
+            let advanced = manifest_dir.is_some_and(|dir| dir != protected);
+            if advanced && manifests >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loop must persist new checkpoints after a failed delete"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            protected.join("manifest.json").is_file(),
+            "the read-only artifact must survive its failed deletion"
+        );
+
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(10), loop_task)
+            .await
+            .expect("the loop must return after cancellation")
+            .unwrap();
+        handle.stop();
+        tokio::time::timeout(Duration::from_secs(10), handle.watcher())
+            .await
+            .expect("the kernel must settle after cancellation")
+            .unwrap()
+            .expect("a cancelled run must complete gracefully");
+        let mut permissions = std::fs::metadata(&protected).unwrap().permissions();
+        permissions.set_mode(0o755);
+        let _ = std::fs::set_permissions(&protected, permissions);
+    }
+
+    // ---------- event-time gate wiring edge cases ----------
+
+    fn event_time_chain(
+        task: &str,
+        time: TimeSpec,
+        group: Option<&str>,
+    ) -> crate::executor::graph::Chain {
+        let mut chain =
+            crate::executor::graph::Chain::for_pool_test(1, Vec::new());
+        chain.task_ids = vec![task.to_string()];
+        chain.source_time = Some(time);
+        chain.watermark_group = group.map(str::to_string);
+        chain
+    }
+
+    /// The second member of a shared watermark group skips tracker
+    /// construction (the shared tracker already exists) — a gate that then
+    /// lacks a timestamp field must still fail closed.
+    #[tokio::test]
+    async fn event_time_gates_reject_shared_group_members_without_a_timestamp_field() {
+        let mut healthy = event_time(Some(bounded_watermark()));
+        healthy.timestamp_field = Some("ts".into());
+        let mut broken = event_time(Some(bounded_watermark()));
+        broken.timestamp_field = None;
+        let graph = crate::executor::graph::ExecutionGraph {
+            chains: vec![
+                event_time_chain("a", healthy, Some("group-1")),
+                event_time_chain("b", broken, Some("group-1")),
+            ],
+            channel_capacity: 8,
+            temporaries: Vec::new(),
+        };
+        let error = event_time_gates(&graph)
+            .err()
+            .expect("a timestamp-less group member must fail gate construction");
+        assert!(
+            error.to_string().contains("timestamp_field"),
+            "{error}"
+        );
+    }
+
+    /// Seeding skips chains that own a gate but no source, and gates whose
+    /// Option was already taken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seed_event_time_partitions_skips_sourceless_chains_and_taken_gates() {
+        let graph = build_event_time_graph(
+            event_time(Some(bounded_watermark())),
+            Arc::new(PartitionedInput {
+                partitions: vec![crate::event_time::EventTimePartition::new(
+                    Some("orders".into()),
+                    3,
+                )],
+                fail_enumeration: false,
+            }),
+            1,
+        );
+        let mut gates = event_time_gates(&graph).unwrap();
+        let source_task = graph
+            .chains
+            .iter()
+            .find(|chain| chain.is_source())
+            .unwrap()
+            .entry_task_id()
+            .to_string();
+        let window_task = graph
+            .chains
+            .iter()
+            .find(|chain| !chain.is_source())
+            .unwrap()
+            .entry_task_id()
+            .to_string();
+        // The window chain owns a gate but has no source to enumerate.
+        gates.insert(
+            window_task,
+            gates.get(&source_task).unwrap().clone(),
+        );
+        // The source chain's gate was taken: seeding must skip it silently.
+        gates.insert(source_task, Arc::new(tokio::sync::Mutex::new(None)));
+        seed_event_time_partitions(&graph, &gates)
+            .await
+            .expect("seeding must skip silently instead of failing");
+    }
+
+    /// Legacy task-level watermark restore reaches gates without physical
+    /// progress: fresh gates fall back to the chain partition, gates with
+    /// known partitions fan out, and taken gates are skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_event_time_watermarks_fans_out_legacy_progress() {
+        let graph = build_event_time_graph(
+            event_time(Some(bounded_watermark())),
+            Arc::new(OneBatchThenEofInput {
+                sent: Mutex::new(false),
+            }),
+            1,
+        );
+        let mut gates = event_time_gates(&graph).unwrap();
+        let source_task = graph.chains[0].entry_task_id().to_string();
+
+        // A taken gate is skipped even when physical progress targets it.
+        gates.insert("ghost".into(), Arc::new(tokio::sync::Mutex::new(None)));
+        restore_event_time_watermarks(
+            &graph,
+            &gates,
+            &BTreeMap::new(),
+            &BTreeMap::from([(
+                "ghost".to_string(),
+                vec![crate::checkpoint::WatermarkPosition::new(
+                    Some("orders".into()),
+                    0,
+                    5_000,
+                )],
+            )]),
+        )
+        .await;
+
+        // Legacy restore with no known partitions: the chain partition
+        // fallback installs the progress.
+        restore_event_time_watermarks(
+            &graph,
+            &gates,
+            &BTreeMap::from([(source_task.clone(), 1_000_i64)]),
+            &BTreeMap::new(),
+        )
+        .await;
+        let gate = gates.get(&source_task).unwrap().clone();
+        let known = gate.lock().await.as_ref().unwrap().known_partitions();
+        assert_eq!(
+            known,
+            vec![crate::event_time::EventTimePartition::for_source(
+                &source_task, 0
+            )],
+            "a fresh gate must seed its chain partition"
+        );
+
+        // With known partitions the same task-level value fans out to all
+        // of them.
+        restore_event_time_watermarks(
+            &graph,
+            &gates,
+            &BTreeMap::from([(source_task.clone(), 2_000_i64)]),
+            &BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(
+            gate.lock().await.as_ref().unwrap().known_partitions().len(),
+            1,
+            "the fan-out must keep the known partition set"
+        );
+
+        // A taken gate is skipped by the legacy fan-out as well.
+        restore_event_time_watermarks(
+            &graph,
+            &gates,
+            &BTreeMap::from([("ghost".to_string(), 4_000_i64)]),
+            &BTreeMap::new(),
+        )
+        .await;
+        let taken = gates.get("ghost").unwrap().clone();
+        assert!(
+            taken.lock().await.as_ref().is_none(),
+            "a taken gate must stay untouched"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1770,6 +4300,13 @@ mod metrics_registry_tests {
                     config: serde_json::json!({}),
                 },
                 OperatorSpec {
+                    id: "map".into(),
+                    kind: OperatorKind::Map,
+                    stateful: false,
+                    key_field: None,
+                    config: serde_json::json!({}),
+                },
+                OperatorSpec {
                     id: "sink".into(),
                     kind: OperatorKind::Sink,
                     stateful: false,
@@ -1777,12 +4314,20 @@ mod metrics_registry_tests {
                     config: serde_json::json!({}),
                 },
             ],
-            edges: vec![EdgeSpec {
-                id: "source-sink".into(),
-                from: "source".into(),
-                to: "sink".into(),
-                partitioned: false,
-            }],
+            edges: vec![
+                EdgeSpec {
+                    id: "source-map".into(),
+                    from: "source".into(),
+                    to: "map".into(),
+                    partitioned: false,
+                },
+                EdgeSpec {
+                    id: "map-sink".into(),
+                    from: "map".into(),
+                    to: "sink".into(),
+                    partitioned: false,
+                },
+            ],
             sources: vec![SourceSpec {
                 codec: None,
                 operator_id: "source".into(),

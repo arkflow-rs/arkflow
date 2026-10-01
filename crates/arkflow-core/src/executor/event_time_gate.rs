@@ -1794,6 +1794,504 @@ mod tests {
         assert_eq!(source_a.partition, source_b.partition);
         assert_ne!(source_a.topic, source_b.topic);
     }
+
+    /// Ack whose abort always fails, used to pin `abort_held` error surfacing.
+    struct AlwaysFailingAbortAck {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::input::Ack for AlwaysFailingAbortAck {
+        async fn ack(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn abort(&self) -> Result<(), Error> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Process("held abort failed".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_held_surfaces_a_failing_held_acknowledgement() {
+        let mut gate = EventTimeGate::new(&time_spec(LateEventPolicy::Drop), vec![1_000]).unwrap();
+        let failing = Arc::new(AlwaysFailingAbortAck {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        gate.observe_with_ack(0, batch(vec![2_500]), failing.clone())
+            .unwrap();
+        assert!(gate.has_held());
+        let error = gate.abort_held().await.unwrap_err();
+        assert!(error.to_string().contains("held abort failed"), "{error}");
+        assert!(!gate.has_held(), "the held delivery is taken either way");
+        assert_eq!(
+            failing.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn window_timing_edge_cases_return_no_window_ends() {
+        // Session boundaries are owned by the window operator: the gate never
+        // converts them into a static event+gap deadline.
+        assert!(
+            WindowTiming::Session { gap_ms: 100 }
+                .window_ends_for(1_000)
+                .is_empty()
+        );
+        // Degenerate arithmetic produces no memberships instead of panicking.
+        assert!(
+            WindowTiming::Tumbling { size_ms: 0 }
+                .window_ends_for(1_000)
+                .is_empty()
+        );
+        assert!(
+            WindowTiming::Sliding {
+                size_ms: 0,
+                slide_ms: 10
+            }
+            .window_ends_for(1_000)
+            .is_empty()
+        );
+        assert!(
+            WindowTiming::Sliding {
+                size_ms: 10,
+                slide_ms: 0
+            }
+            .window_ends_for(1_000)
+            .is_empty()
+        );
+        // Extreme timestamps saturate instead of panicking: the aligned start
+        // of i64::MIN with slide 3 cannot be represented.
+        assert!(
+            WindowTiming::Sliding { size_ms: 5, slide_ms: 3 }
+                .window_ends_for(i64::MIN)
+                .is_empty()
+        );
+        // A tumbling end that overflows i64 yields no membership.
+        assert!(
+            WindowTiming::Tumbling { size_ms: 4 }
+                .window_ends_for(i64::MAX - 1)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sliding_enumeration_stops_cleanly_at_the_i64_floor() {
+        // Stepping back from the lowest aligned start underflows: the loop
+        // breaks after the one representable membership.
+        let ends = WindowTiming::Sliding {
+            size_ms: 4,
+            slide_ms: 2,
+        }
+        .window_ends_for(i64::MIN);
+        assert_eq!(ends, vec![i64::MIN + 4]);
+    }
+
+    #[test]
+    fn processing_time_gate_reports_no_event_time_state() {
+        let gate = EventTimeGate::processing_time();
+        assert!(!gate.is_event_time());
+        assert_eq!(gate.watermark(), None);
+        assert!(gate.watermark_positions().is_empty());
+        assert!(gate.known_partitions().is_empty());
+        assert_eq!(gate.partition_watermark(0), None);
+        assert_eq!(
+            gate.physical_partition_watermark(&EventTimePartition::numeric(0)),
+            None
+        );
+        // The mutation hooks are safe no-ops without a tracker.
+        let mut gate = EventTimeGate::processing_time();
+        gate.seed_partitions(&[EventTimePartition::numeric(0)]);
+        gate.restore_partition(0, 1_000);
+        gate.restore_partition_key(&EventTimePartition::numeric(1), 1_000);
+        let decision = gate.refresh().unwrap();
+        assert!(decision.ready.is_empty());
+        assert_eq!(decision.watermark_ms, None);
+    }
+
+    #[test]
+    fn event_time_gate_requires_a_timestamp_field() {
+        let mut spec = time_spec(LateEventPolicy::Drop);
+        spec.timestamp_field = None;
+        let Err(error) = EventTimeGate::new(&spec, vec![1_000]) else {
+            panic!("a missing timestamp_field must fail the gate construction");
+        };
+        assert!(
+            error.to_string().contains("timestamp_field"),
+            "error names the missing field: {error}"
+        );
+    }
+
+    #[test]
+    fn shared_tracker_gates_expose_partition_watermarks() {
+        let tracker = Arc::new(std::sync::Mutex::new(
+            WatermarkTracker::from_time_spec(&time_spec(LateEventPolicy::Drop)).unwrap(),
+        ));
+        let mut gate = EventTimeGate::new_with_shared_tracker(
+            &time_spec(LateEventPolicy::Drop),
+            vec![1_000],
+            tracker.clone(),
+        )
+        .unwrap();
+        assert!(gate.is_event_time());
+        gate.observe(0, batch(vec![2_000])).unwrap();
+
+        assert_eq!(gate.partition_watermark(0), Some(2_000));
+        assert_eq!(
+            gate.physical_partition_watermark(&EventTimePartition::numeric(0)),
+            Some(2_000)
+        );
+        let positions = gate.watermark_positions();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].partition, 0);
+        assert_eq!(positions[0].watermark_ms, 2_000);
+        assert_eq!(
+            gate.known_partitions(),
+            vec![EventTimePartition::numeric(0)]
+        );
+
+        // Restore paths through the gate reseed the shared tracker and stay
+        // observable through the compatibility accessors.
+        gate.restore_partition(1, 5_000);
+        assert_eq!(gate.partition_watermark(1), Some(5_000));
+        gate.restore_partition_key(&EventTimePartition::numeric(2), 6_000);
+        assert_eq!(gate.partition_watermark(2), Some(6_000));
+        gate.seed_partitions(&[EventTimePartition::numeric(3)]);
+        assert_eq!(
+            gate.partition_watermark(3),
+            Some(i64::MIN),
+            "a seeded silent partition is active at the minimum watermark"
+        );
+    }
+
+    #[test]
+    fn ambiguous_namespaced_partitions_report_no_numeric_watermark() {
+        let tracker = Arc::new(std::sync::Mutex::new(
+            WatermarkTracker::from_time_spec(&time_spec(LateEventPolicy::Drop)).unwrap(),
+        ));
+        tracker.lock().unwrap().observe_partition(
+            &EventTimePartition::for_source("a", 0),
+            1_000,
+            0,
+        );
+        tracker.lock().unwrap().observe_partition(
+            &EventTimePartition::for_source("b", 0),
+            2_000,
+            0,
+        );
+        let gate = EventTimeGate::new_with_shared_tracker(
+            &time_spec(LateEventPolicy::Drop),
+            Vec::<i64>::new(),
+            tracker,
+        )
+        .unwrap();
+        assert_eq!(
+            gate.partition_watermark(0),
+            None,
+            "two sources on partition 0 are ambiguous for the numeric accessor"
+        );
+        // A single namespaced match is still reported.
+        let tracker = Arc::new(std::sync::Mutex::new(
+            WatermarkTracker::from_time_spec(&time_spec(LateEventPolicy::Drop)).unwrap(),
+        ));
+        tracker
+            .lock()
+            .unwrap()
+            .observe_partition(&EventTimePartition::for_source("a", 0), 1_000, 0);
+        let gate = EventTimeGate::new_with_shared_tracker(
+            &time_spec(LateEventPolicy::Drop),
+            Vec::<i64>::new(),
+            tracker,
+        )
+        .unwrap();
+        assert_eq!(gate.partition_watermark(0), Some(1_000));
+    }
+
+    #[test]
+    fn refresh_releases_held_rows_when_a_sibling_gate_advances_the_shared_watermark() {
+        let tracker = Arc::new(std::sync::Mutex::new(
+            WatermarkTracker::from_time_spec(&time_spec(LateEventPolicy::Drop)).unwrap(),
+        ));
+        let mut slow = EventTimeGate::new_with_shared_tracker(
+            &time_spec(LateEventPolicy::Drop),
+            vec![1_000],
+            tracker.clone(),
+        )
+        .unwrap();
+        let mut fast = EventTimeGate::new_with_shared_tracker(
+            &time_spec(LateEventPolicy::Drop),
+            vec![1_000],
+            tracker,
+        )
+        .unwrap();
+        slow.observe(0, batch(vec![100])).unwrap();
+        assert!(slow.has_held());
+        // A sibling gate on the same partition pushes the shared watermark
+        // forward; the idle tick must re-evaluate the stalled gate's rows.
+        fast.observe(0, batch(vec![5_000])).unwrap();
+        assert!(slow.has_held(), "an observation never touches the sibling");
+        let decision = slow.refresh().unwrap();
+        let released: Vec<i64> = decision
+            .ready
+            .iter()
+            .flat_map(|(batch, _)| {
+                batch
+                    .record_batch()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(released, vec![100]);
+        assert!(!slow.has_held());
+    }
+
+    #[test]
+    fn an_empty_delivery_settles_its_acknowledgement_as_dropped() {
+        let mut gate = EventTimeGate::new(&time_spec(LateEventPolicy::Drop), vec![1_000]).unwrap();
+        let decision = gate.observe(0, batch(Vec::new())).unwrap();
+        assert!(decision.ready.is_empty());
+        assert_eq!(
+            decision.dropped_acks.len(),
+            1,
+            "an empty batch still settles its source acknowledgement"
+        );
+        assert!(!gate.has_held());
+    }
+
+    /// Build a two-column batch carrying an extra arbitrary column so the
+    /// marker helpers can be exercised against pre-marked deliveries.
+    fn batch_with_extra(
+        times: Vec<i64>,
+        name: &'static str,
+        column: datafusion::arrow::array::ArrayRef,
+    ) -> crate::MessageBatchRef {
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("ts", DataType::Int64, false),
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new(name, column.data_type().clone(), true),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(times.clone())),
+                    Arc::new(StringArray::from(
+                        times.iter().map(|_| "a".to_string()).collect::<Vec<_>>(),
+                    )),
+                    column,
+                ],
+            )
+            .unwrap(),
+        ))
+    }
+
+    #[test]
+    fn window_exclusion_marker_appends_merges_and_validates() {
+        use datafusion::arrow::array::Array;
+
+        // Fresh batch: the marker column is appended with per-row CSV values.
+        let fresh = mark_window_exclusions(batch(vec![1, 2]), &[vec![5, 7], Vec::new()]).unwrap();
+        let marker = fresh
+            .record_batch()
+            .column_by_name("__arkflow_late_window_ends")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        assert_eq!(marker.value(0), "5,7");
+        assert!(!marker.is_valid(1), "rows without exclusions stay null");
+
+        // An existing marker is merged: unparseable entries are ignored, a
+        // null slot contributes nothing, and the union stays sorted/unique.
+        let existing = batch_with_extra(
+            vec![1, 2],
+            "__arkflow_late_window_ends",
+            Arc::new(StringArray::from(vec![Some("garbage,7"), None])),
+        );
+        let merged = mark_window_exclusions(existing, &[vec![9, 7], Vec::new()]).unwrap();
+        let marker = merged
+            .record_batch()
+            .column_by_name("__arkflow_late_window_ends")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        assert_eq!(marker.value(0), "7,9");
+        assert!(!marker.is_valid(1));
+
+        // A length mismatch is rejected instead of corrupting the batch.
+        let Err(error) = mark_window_exclusions(batch(vec![1]), &[Vec::new(), Vec::new()]) else {
+            panic!("a length mismatch must fail");
+        };
+        assert!(error.to_string().contains("lengths differ"), "{error}");
+
+        // A marker column of the wrong type is an error, not a silent skip.
+        let typed = batch_with_extra(
+            vec![1],
+            "__arkflow_late_window_ends",
+            Arc::new(Int64Array::from(vec![5])),
+        );
+        let Err(error) = mark_window_exclusions(typed, &[vec![5]]) else {
+            panic!("an invalid marker type must fail");
+        };
+        assert!(error.to_string().contains("invalid type"), "{error}");
+    }
+
+    #[test]
+    fn window_update_marker_appends_merges_and_validates() {
+        use datafusion::arrow::array::Array;
+
+        let fresh = mark_window_updates(batch(vec![1, 2]), &[vec![5], Vec::new()]).unwrap();
+        let marker = fresh
+            .record_batch()
+            .column_by_name("__arkflow_late_window_updates")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        assert_eq!(marker.value(0), "5");
+        assert!(!marker.is_valid(1));
+
+        // Merging into an existing marker column replaces it with the union.
+        let existing = batch_with_extra(
+            vec![1],
+            "__arkflow_late_window_updates",
+            Arc::new(StringArray::from(vec![Some("7,garbage")])),
+        );
+        let merged = mark_window_updates(existing, &[vec![9, 7]]).unwrap();
+        let marker = merged
+            .record_batch()
+            .column_by_name("__arkflow_late_window_updates")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        assert_eq!(marker.value(0), "7,9");
+
+        let Err(error) = mark_window_updates(batch(vec![1]), &[Vec::new(), Vec::new()]) else {
+            panic!("a length mismatch must fail");
+        };
+        assert!(error.to_string().contains("lengths differ"), "{error}");
+
+        let typed = batch_with_extra(
+            vec![1],
+            "__arkflow_late_window_updates",
+            Arc::new(Int64Array::from(vec![5])),
+        );
+        let Err(error) = mark_window_updates(typed, &[vec![5]]) else {
+            panic!("an invalid marker type must fail");
+        };
+        assert!(error.to_string().contains("invalid type"), "{error}");
+    }
+
+    #[test]
+    fn physical_partition_split_groups_by_topic_partition_and_null_fallback() {
+        use datafusion::arrow::array::{MapBuilder, StringBuilder, UInt32Array};
+
+        fn ext_map(topics: Vec<Option<&str>>, rows: usize) -> datafusion::arrow::array::ArrayRef {
+            let mut builder =
+                MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+            for topic in &topics {
+                if let Some(topic) = topic {
+                    builder.keys().append_value("topic");
+                    builder.values().append_value(topic);
+                }
+                builder.append(true).unwrap();
+            }
+            for _ in topics.len()..rows {
+                builder.append(true).unwrap();
+            }
+            Arc::new(builder.finish()) as datafusion::arrow::array::ArrayRef
+        }
+
+        // Row 0: topic-a/0; row 1: topic-a/1; row 2: no topic and a NULL
+        // partition, so it falls back to the connector-neutral partition 7
+        // namespaced by the source id.
+        let ext = ext_map(vec![Some("topic-a"), Some("topic-a")], 3);
+        let ext_type = ext.data_type().clone();
+        let marked = Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("ts", DataType::Int64, false),
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new(crate::meta_columns::PARTITION, DataType::UInt32, true),
+                    Field::new(crate::meta_columns::EXT, ext_type, true),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "a", "a"])),
+                    Arc::new(UInt32Array::from(vec![Some(0), Some(1), None])),
+                    ext,
+                ],
+            )
+            .unwrap(),
+        ));
+
+        let groups = split_by_physical_partition_for_source(&marked, 7, Some("src")).unwrap();
+        assert_eq!(groups.len(), 3, "three distinct physical partitions");
+        let identities = groups.iter().map(|(partition, _)| partition.clone()).collect::<Vec<_>>();
+        assert!(identities.contains(&EventTimePartition::new(Some("topic-a".into()), 0)));
+        assert!(identities.contains(&EventTimePartition::new(Some("topic-a".into()), 1)));
+        assert!(
+            identities.contains(&EventTimePartition::for_source("src", 7)),
+            "a NULL partition falls back to the namespaced source partition"
+        );
+        for (_, slice) in &groups {
+            assert_eq!(slice.len(), 1, "each physical partition keeps exactly its row");
+        }
+
+        // Without a partition column the whole delivery is one fallback group.
+        let plain = batch(vec![1, 2]);
+        let groups = split_by_physical_partition_for_source(&plain, 3, None).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, EventTimePartition::numeric(3));
+        assert_eq!(groups[0].1.len(), 2);
+
+        // With a source id the neutral fallback becomes namespaced.
+        let groups = split_by_physical_partition_for_source(&plain, 3, Some("s")).unwrap();
+        assert_eq!(groups[0].0.topic.as_deref(), Some("__arkflow_source__:s"));
+
+        // An Int64 partition column is cast to UInt32 instead of rejected.
+        let numeric = batch_with_extra(
+            vec![1, 2],
+            crate::meta_columns::PARTITION,
+            Arc::new(Int64Array::from(vec![Some(4), Some(5)])),
+        );
+        let groups = split_by_physical_partition_for_source(&numeric, 0, None).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0.partition, 4);
+        assert_eq!(groups[1].0.partition, 5);
+
+        // An un-castable partition column fails with an actionable error.
+        let bad = batch_with_extra(
+            vec![1],
+            crate::meta_columns::PARTITION,
+            Arc::new(datafusion::arrow::array::ListArray::from_iter_primitive::<
+                datafusion::arrow::datatypes::Int32Type,
+                _,
+                _,
+            >(vec![Some(vec![Some(1)])])),
+        );
+        let Err(error) = split_by_physical_partition_for_source(&bad, 0, None) else {
+            panic!("an un-castable partition column must fail");
+        };
+        assert!(
+            error.to_string().contains("read physical partition metadata"),
+            "{error}"
+        );
+    }
+
+    /// The abort-failure acknowledgement still acknowledges normally; only
+    /// its abort path is broken.
+    #[tokio::test]
+    async fn always_failing_abort_ack_still_acknowledges() {
+        let ack = AlwaysFailingAbortAck {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+        crate::input::Ack::ack(&ack).await.unwrap();
+        assert_eq!(
+            ack.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "acking never touches the abort counter"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2267,5 +2765,33 @@ mod cut_consistency_tests {
         gate.observe(0, nullable_batch(vec![Some(2_600)])).unwrap();
         assert_eq!(gate.held_row_totals_for_test(), (2, 2, 0));
         assert!(gate.has_held());
+    }
+
+    /// The eviction-path acknowledgement helpers all acknowledge normally;
+    /// only their abort behaviour differs.
+    #[tokio::test]
+    async fn eviction_helper_acks_acknowledge_normally() {
+        let settled = SettlementRecordingAck {
+            acked: std::sync::atomic::AtomicBool::new(false),
+            aborted: std::sync::atomic::AtomicBool::new(false),
+        };
+        crate::input::Ack::ack(&settled).await.unwrap();
+        assert!(settled.acked.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!settled.aborted.load(std::sync::atomic::Ordering::Acquire));
+
+        let hanging = HangingAbortAck {
+            gate: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        crate::input::Ack::ack(&hanging).await.unwrap();
+
+        let failing = FailingAbortAck {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+        crate::input::Ack::ack(&failing).await.unwrap();
+        assert_eq!(
+            failing.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "acking never touches the abort counter"
+        );
     }
 }
