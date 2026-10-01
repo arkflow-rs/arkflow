@@ -27,6 +27,8 @@ The Pulsar output publishes messages to an Apache Pulsar topic. It supports toke
 | value | string | yes (`value`) | Static topic name (e.g. `persistent://tenant/namespace/topic`). |
 | expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
+An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
+
 ### auth
 
 `auth` is a tagged object (selected by its `type` field). Supported variants: `token` and `o_auth2`.

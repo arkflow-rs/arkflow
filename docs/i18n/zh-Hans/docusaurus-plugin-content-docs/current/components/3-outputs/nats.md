@@ -34,6 +34,8 @@ NATS 输出(Output)将消息(Message)发布到 NATS 服务器,可以是常规主
 | value | string | yes (`value`) | 静态主题名称。 |
 | expr | string | yes (`expr`) | 对每条消息求值的 SQL 表达式。 |
 
+表达式必须对每一行求出非 null 字符串:任意行为 NULL 时整批报错,错误信息指名表达式与行号(可用 `COALESCE(expr, 'fallback')` 规避,或在上游过滤这类行)。
+
 ### auth
 
 | Field | Type | Required | Default | 描述 |

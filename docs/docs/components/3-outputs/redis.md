@@ -69,6 +69,8 @@ The Redis output writes messages to Redis using one of four data-structure opera
 | value | string | yes (`value`) | Static value. |
 | expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
+An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
+
 ## Examples
 
 ### Publish to a channel

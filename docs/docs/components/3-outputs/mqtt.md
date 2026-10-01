@@ -34,6 +34,8 @@ The MQTT output publishes each message to an MQTT broker topic. It supports QoS 
 | value | string | yes (`value`) | Static topic name. |
 | expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
+An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
+
 ## TLS
 
 Set the `tls` block to connect over TLS (MQTT over port 8883):

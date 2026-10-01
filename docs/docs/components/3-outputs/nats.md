@@ -34,6 +34,8 @@ The NATS output publishes messages to a NATS server, either to a regular subject
 | value | string | yes (`value`) | Static subject name. |
 | expr | string | yes (`expr`) | SQL expression evaluated per message. |
 
+An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
+
 ### auth
 
 | Field | Type | Required | Default | Description |

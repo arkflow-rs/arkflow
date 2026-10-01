@@ -279,11 +279,24 @@ impl Output for KafkaOutput {
         let key = self.get_key(&msg).await?;
 
         // Prepare all records for sending
+        let payloads_len = payloads.len();
         for (i, x) in payloads.into_iter().enumerate() {
-            // Create record
+            // Create record. The per-row topic must exist for every row:
+            // index panicking here would take the whole stream down, so a
+            // short result (a broken row-alignment invariant) is a named
+            // error instead.
             let mut record = match &topic {
                 EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
-                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => match v.get(i) {
+                    Some(t) => FutureRecord::to(t).payload(x.as_slice()),
+                    None => {
+                        return Err(Error::Process(format!(
+                            "Kafka topic expression produced {} values for {} rows (row {i} has no topic)",
+                            v.len(),
+                            payloads_len,
+                        )))
+                    }
+                },
             };
 
             // Add key if available
@@ -498,10 +511,23 @@ impl KafkaOutput {
         let topic = self.get_topic(&msg).await?;
         let key = self.get_key(&msg).await?;
 
+        let payloads_len = payloads.len();
         for (i, x) in payloads.into_iter().enumerate() {
+            // Same row-alignment guard as the non-transactional path: a
+            // short topic result must be a named error, never an index
+            // panic inside a transaction.
             let mut record = match &topic {
                 EvaluateResult::Scalar(s) => FutureRecord::to(s).payload(x.as_slice()),
-                EvaluateResult::Vec(v) => FutureRecord::to(&v[i]).payload(x.as_slice()),
+                EvaluateResult::Vec(v) => match v.get(i) {
+                    Some(t) => FutureRecord::to(t).payload(x.as_slice()),
+                    None => {
+                        return Err(Error::Process(format!(
+                            "Kafka topic expression produced {} values for {} rows (row {i} has no topic)",
+                            v.len(),
+                            payloads_len,
+                        )))
+                    }
+                },
             };
             match &key {
                 Some(EvaluateResult::Scalar(s)) => record = record.key(s),
@@ -977,6 +1003,47 @@ mod tests {
         assert!(
             err.to_string().contains("security.sasl.password"),
             "expected the error to name security.sasl.password, got: {err}"
+        );
+    }
+
+    /// Spec: expr-row-routing — a topic expression that evaluates to NULL
+    /// for some row must fail the batch with the expression and row named.
+    /// Before the row-alignment fix the null was silently dropped, the
+    /// result vector ran short, and the per-row topic lookup panicked on
+    /// the index.
+    #[tokio::test]
+    async fn test_topic_expression_null_fails_loudly_not_panic() {
+        let config = output_config(serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topic": {"type": "expr", "expr": "device_topic"}
+        }));
+        let output = KafkaOutput::new(config, None).unwrap();
+
+        use datafusion::arrow::array::{ArrayRef, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let rb = datafusion::arrow::array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "device_topic",
+                datafusion::arrow::datatypes::DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![
+                Some("devices/a"),
+                None,
+                Some("devices/c"),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let msg = MessageBatch::new_arrow(rb);
+
+        let err = match output.get_topic(&msg).await {
+            Ok(_) => panic!("a null topic cell must fail the evaluation"),
+            Err(e) => e,
+        };
+        let text = format!("{err}");
+        assert!(
+            text.contains("device_topic") && text.contains("row 1"),
+            "error must name the expression and the null row, got: {text}"
         );
     }
 }
