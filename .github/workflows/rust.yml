@@ -80,6 +80,15 @@ jobs:
       - name: Set PROTOC Environment Variable
         run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
 
+      # The python processor tests round-trip MessageBatch through the
+      # embedded CPython interpreter via arrow-pyarrow, which needs the
+      # `pyarrow` package in the interpreter pyo3 links against (the
+      # system python3). Newer Ubuntu images mark it externally managed
+      # (PEP 668), hence the --break-system-packages fallback.
+      - name: Install pyarrow for python UDF tests
+        run: |
+          python3 -m pip install pyarrow || python3 -m pip install --break-system-packages pyarrow
+
       - name: Build (debug)
         run: cargo build --workspace --all-targets --verbose
 

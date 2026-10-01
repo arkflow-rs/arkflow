@@ -320,16 +320,12 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     const body = (await response.json().catch(() => ({}))) as Partial<ApiError>
     throw Object.assign(
-      new Error(
-        body.message ??
-          translate(currentLocale(), 'api.requestFailed', { status: response.status }),
-      ),
+      new Error(body.message ?? translate(currentLocale(), 'api.requestFailed', { status: response.status })),
       {
         code: body.code ?? 'request_failed',
         field: body.field,
         stream_id: body.stream_id,
-        correlation_id:
-          body.correlation_id ?? response.headers.get('x-correlation-id') ?? correlationId,
+        correlation_id: body.correlation_id ?? response.headers.get('x-correlation-id') ?? correlationId,
         status: response.status,
       },
     )
