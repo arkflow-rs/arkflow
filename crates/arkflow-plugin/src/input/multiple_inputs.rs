@@ -269,8 +269,8 @@ pub(crate) fn init() -> Result<(), Error> {
         }),
     ).with_example(serde_json::json!({
         "inputs": [
-            {"type": "kafka", "name": "events", "topics": ["events"]},
-            {"type": "kafka", "name": "logs", "topics": ["logs"]}
+            {"type": "kafka", "name": "events", "brokers": ["localhost:9092"], "topics": ["events"], "consumer_group": "arkflow", "start_from_latest": false},
+            {"type": "kafka", "name": "logs", "brokers": ["localhost:9092"], "topics": ["logs"], "consumer_group": "arkflow", "start_from_latest": false}
         ]
     })))
 }
@@ -278,8 +278,8 @@ pub(crate) fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arkflow_core::MessageBatch;
     use arkflow_core::input::NoopAck;
+    use arkflow_core::MessageBatch;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -385,7 +385,12 @@ mod tests {
             input_names: std::cell::RefCell::new(Vec::new()),
         };
         let error = MultipleInputsBuilder
-            .build(None, &Some(serde_json::json!({"inputs": []})), None, &resource)
+            .build(
+                None,
+                &Some(serde_json::json!({"inputs": []})),
+                None,
+                &resource,
+            )
             .err()
             .expect("an empty child list must be rejected at build time");
         assert!(error.to_string().contains("at least one"));
@@ -405,9 +410,12 @@ mod tests {
         input.connect().await.unwrap();
         wait_reads(&total_reads, 2).await;
         assert_eq!(
-            input.generation.lock().await.as_ref().map(|g| {
-                g.token.is_cancelled()
-            }),
+            input
+                .generation
+                .lock()
+                .await
+                .as_ref()
+                .map(|g| { g.token.is_cancelled() }),
             Some(false),
             "the live generation must not be cancelled"
         );

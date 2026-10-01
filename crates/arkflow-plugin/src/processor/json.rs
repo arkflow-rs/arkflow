@@ -162,7 +162,8 @@ pub fn init() -> Result<(), Error> {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "pretty": {"type": "boolean", "default": false, "description": "Pretty-print JSON output."}
+                "value_field": {"type": "string", "description": "Binary column carrying one JSON payload per row (defaults to the standard binary value column)."},
+                "fields_to_include": {"type": "array", "items": {"type": "string"}, "description": "Only emit these top-level fields."}
             }
         }),
     ).with_optional())?;
@@ -173,7 +174,8 @@ pub fn init() -> Result<(), Error> {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "batch_size": {"type": "integer", "minimum": 1, "description": "Rows per output batch."}
+                "value_field": {"type": "string", "description": "Binary column carrying one JSON payload per row (defaults to the standard binary value column)."},
+                "fields_to_include": {"type": "array", "items": {"type": "string"}, "description": "Only parse these top-level fields into columns."}
             }
         }),
     ).with_optional())?;

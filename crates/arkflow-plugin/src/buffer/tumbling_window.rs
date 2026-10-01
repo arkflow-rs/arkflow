@@ -108,21 +108,22 @@ impl Buffer for TumblingWindow {
     /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
-        // If the buffer is closed, return None
-        if self.close.is_cancelled() {
-            return Ok(None);
-        }
-
         loop {
-            {
-                // If there are messages available, break the loop and process them
-                if !self.base_window.queue_is_empty().await {
-                    break;
-                }
+            // If there are messages available, break the loop and process
+            // them (this also implements close semantics: a closed buffer
+            // drains its remainder before ending).
+            if !self.base_window.queue_is_empty().await {
+                break;
             }
-            // Wait for notification from timer, write operation, or close
-            let notify = Arc::clone(&self.notify);
-            notify.notified().await;
+            if self.close.is_cancelled() {
+                return Ok(None); // closed and drained
+            }
+            // Wait for notification from timer or write, racing with close:
+            // a missed final notify_waiters must not park the reader forever.
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = self.close.cancelled() => {}
+            }
         }
         // Process and return the current window
         self.base_window.process_window().await
@@ -373,5 +374,163 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    fn arrow_batch(input_name: &str, columns: Vec<(&str, Vec<Option<&str>>)>) -> MessageBatch {
+        use datafusion::arrow::array::{ArrayRef, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(name, _)| Field::new(*name, datafusion::arrow::datatypes::DataType::Utf8, true))
+            .collect();
+        let arrays: Vec<ArrayRef> = columns
+            .iter()
+            .map(|(_, vals)| Arc::new(StringArray::from(vals.clone())) as ArrayRef)
+            .collect();
+        let rb =
+            datafusion::arrow::array::RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                .unwrap();
+        let mut mb = MessageBatch::new_arrow(rb);
+        mb.set_input_name(Some(input_name.to_string()));
+        mb
+    }
+
+    #[tokio::test]
+    async fn heterogeneous_input_schemas_null_fill_on_the_union() {
+        // Input A carries `id`+`value`, input B only `id`: the window merge
+        // must union the schemas and null-fill instead of failing.
+        let config = TumblingWindowConfig {
+            interval: Duration::from_millis(50),
+            join: None,
+        };
+        let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
+
+        buffer
+            .write(
+                Arc::new(arrow_batch(
+                    "a",
+                    vec![("id", vec![Some("1")]), ("value", vec![Some("x")])],
+                )),
+                Arc::new(NoopAck),
+            )
+            .await
+            .unwrap();
+        buffer
+            .write(
+                Arc::new(arrow_batch("b", vec![("id", vec![Some("2")])])),
+                Arc::new(NoopAck),
+            )
+            .await
+            .unwrap();
+
+        let (batch, _) = buffer.read().await.unwrap().expect("merged batch");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.record_batch().num_columns(), 2, "union schema");
+        let value = batch
+            .record_batch()
+            .column_by_name("value")
+            .expect("value column");
+        use datafusion::arrow::array::Array;
+        // Row order follows DashMap iteration and is not fixed; exactly one
+        // row (input B's) must be null-filled.
+        let nulls = (0..batch.len()).filter(|i| value.is_null(*i)).count();
+        assert_eq!(nulls, 1, "input B's row must be null-filled");
+    }
+
+    #[tokio::test]
+    async fn conflicting_types_error_preserves_queue_for_retry() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let config = TumblingWindowConfig {
+            interval: Duration::from_millis(50),
+            join: None,
+        };
+        let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
+
+        // `id` as Utf8 on input A, Int64 on input B: a genuine conflict.
+        let a = {
+            let rb = datafusion::arrow::array::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "id",
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    true,
+                )])),
+                vec![Arc::new(StringArray::from(vec![Some("1")])) as ArrayRef],
+            )
+            .unwrap();
+            let mut mb = MessageBatch::new_arrow(rb);
+            mb.set_input_name(Some("a".to_string()));
+            mb
+        };
+        let b = {
+            let rb = datafusion::arrow::array::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "id",
+                    datafusion::arrow::datatypes::DataType::Int64,
+                    true,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![Some(2)])) as ArrayRef],
+            )
+            .unwrap();
+            let mut mb = MessageBatch::new_arrow(rb);
+            mb.set_input_name(Some("b".to_string()));
+            mb
+        };
+        buffer.write(Arc::new(a), Arc::new(NoopAck)).await.unwrap();
+        buffer.write(Arc::new(b), Arc::new(NoopAck)).await.unwrap();
+
+        let err = match buffer.read().await {
+            Err(e) => e,
+            Ok(_) => panic!("type conflict must error"),
+        };
+        assert!(
+            format!("{err}").contains("`id`"),
+            "error must name the column, got: {err}"
+        );
+
+        // The queues went back: the same messages are retryable (still an
+        // error, but NOT "lost" — and per-input read still works).
+        assert!(!buffer.base_window.queue_is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn close_with_empty_queue_returns_promptly() {
+        // A reader that misses the final notify_waiters must still be woken
+        // by the close token: bounded wait, never a permanent park.
+        let config = TumblingWindowConfig {
+            interval: Duration::from_secs(3600), // timer never fires
+            join: None,
+        };
+        let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
+
+        let reader = buffer.read();
+        tokio::time::sleep(Duration::from_millis(50)).await; // reader parks first
+        buffer.close().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("close must wake a parked reader within the timeout");
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_drains_pending_messages_before_ending() {
+        let config = TumblingWindowConfig {
+            interval: Duration::from_millis(50),
+            join: None,
+        };
+        let buffer = TumblingWindow::new(config, &create_test_resource()).unwrap();
+        buffer
+            .write(
+                Arc::new(arrow_batch("a", vec![("id", vec![Some("1")])])),
+                Arc::new(NoopAck),
+            )
+            .await
+            .unwrap();
+        buffer.close().await.unwrap();
+        // First read after close drains the remainder...
+        let (batch, _) = buffer.read().await.unwrap().expect("remainder drained");
+        assert_eq!(batch.len(), 1);
+        // ...the next read ends the stream.
+        assert!(buffer.read().await.unwrap().is_none());
     }
 }

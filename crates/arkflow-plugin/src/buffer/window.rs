@@ -16,7 +16,6 @@ use crate::component;
 use arkflow_core::input::{Ack, VecAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use dashmap::DashMap;
-use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -124,13 +123,23 @@ impl BaseWindow {
                     acks.push(ack);
                 }
 
-                let schema = messages[0].schema();
+                // Per-input merge: batches of one input may legitimately
+                // differ in schema (drift); normalize to the field union
+                // instead of failing the concat. On failure the drained
+                // items go back untouched so a later read retries them.
                 let batches: Vec<RecordBatch> = messages
-                    .into_iter()
-                    .map(|batch| (*batch).clone().into())
+                    .iter()
+                    .map(|batch| (**batch).clone().into())
                     .collect();
-                let new_batch = arrow::compute::concat_batches(&schema, &batches)
-                    .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
+                let new_batch = match crate::component::batch_merge::normalize_and_concat(&batches)
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.queue
+                            .insert(input_name, messages.into_iter().zip(acks).collect());
+                        return Err(e);
+                    }
+                };
                 let mut new_batch: MessageBatch = new_batch.into();
                 new_batch.set_input_name(Some(input_name.clone()));
                 let new_ack = Arc::new(VecAck(acks));
@@ -143,36 +152,40 @@ impl BaseWindow {
             return Ok(None);
         }
 
-        let new_ack = Arc::new(VecAck(all_acks));
+        let new_ack = Arc::new(VecAck(all_acks.clone()));
 
-        match &self.join_operation {
+        let merged = match &self.join_operation {
             None => {
-                let schema = all_messages[0].schema();
                 let batches: Vec<RecordBatch> = all_messages
-                    .into_iter()
-                    .map(|batch| (*batch).clone().into())
+                    .iter()
+                    .map(|batch| (**batch).clone().into())
                     .collect();
-
-                if batches.is_empty() {
-                    return Ok(None);
-                }
-
-                let new_batch = arrow::compute::concat_batches(&schema, &batches)
-                    .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
-
-                Ok(Some((
-                    Arc::new(MessageBatch::new_arrow(new_batch)),
-                    new_ack,
-                )))
+                // Cross-input merge: heterogeneous input schemas are
+                // null-filled on the union; a genuine type conflict errors.
+                crate::component::batch_merge::normalize_and_concat(&batches)
             }
             Some(join) => {
                 let ctx = component::sql::create_session_context()?;
-                let messages: Vec<_> = all_messages.into_iter().map(|m| (*m).clone()).collect();
-                let new_batch = join.join_operation(&ctx, messages).await?;
-                Ok(Some((
-                    Arc::new(MessageBatch::new_arrow(new_batch)),
-                    new_ack,
-                )))
+                let messages: Vec<_> = all_messages.iter().map(|m| (**m).clone()).collect();
+                join.join_operation(&ctx, messages).await
+            }
+        };
+
+        match merged {
+            Ok(new_batch) => Ok(Some((
+                Arc::new(MessageBatch::new_arrow(new_batch)),
+                new_ack,
+            ))),
+            Err(e) => {
+                // Cross-input failure (type conflict or join error): the
+                // per-input merged batches and their acks go back to their
+                // queues — content-equivalent to the original messages — so
+                // nothing is dropped and a later read can retry.
+                for (msg, ack) in all_messages.into_iter().zip(all_acks) {
+                    let name = msg.get_input_name().unwrap_or_default();
+                    self.queue.entry(name).or_default().push_front((msg, ack));
+                }
+                Err(e)
             }
         }
     }

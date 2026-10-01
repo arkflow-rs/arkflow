@@ -154,23 +154,16 @@ struct FileInput {
     config: FileInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
-    #[allow(dead_code)]
-    codec: Option<Arc<dyn Codec>>,
 }
 
 impl FileInput {
-    fn new(
-        name: Option<&String>,
-        config: FileInputConfig,
-        codec: Option<Arc<dyn Codec>>,
-    ) -> Result<Self, Error> {
+    fn new(name: Option<&String>, config: FileInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.cloned(),
             config,
             stream: Arc::new(Mutex::new(None)),
             cancellation_token,
-            codec,
         })
     }
 
@@ -472,8 +465,17 @@ impl InputBuilder for FileBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
+        // The file is parsed whole by its `format` (DataFusion reader); a
+        // codec has no decode integration point here. Reject instead of
+        // building a codec that is silently dropped.
+        if codec.is_some() {
+            return Err(Error::Config(
+                "file input does not support a codec: the file is parsed by its `format`"
+                    .to_string(),
+            ));
+        }
         let config: FileInputConfig = parse_config(config, "File input")?;
-        Ok(Arc::new(FileInput::new(name, config, codec)?))
+        Ok(Arc::new(FileInput::new(name, config)?))
     }
 }
 

@@ -60,6 +60,14 @@ Each Debezium Envelope `{ before, after, op, source, ts_ms }` is flattened into 
 - The CDC offset is provided by the Kafka input's ack-gated offset (at-least-once). Ensure downstream sinks are idempotent.
 - When `op="d"`, `after` is null and business fields are taken from `before`.
 
+### Name collisions with business fields
+
+If the business payload itself contains a field named `op`, `ts_ms`, `source_db`, `source_table`, `before` or `source`, the business value keeps its column and the envelope metadata value moves to a reserved `__debezium_<name>` column, with one warning per batch. Without a collision the metadata columns keep their canonical names, so existing pipelines are unaffected.
+
+### Tombstones
+
+A zero-length payload (a Debezium tombstone — Kafka null-value messages are usually intercepted by the Kafka input before the codec) is skipped with a warning instead of failing the batch; the remaining messages decode normally. A JSON literal `null` is not a tombstone and keeps its existing all-null-row behavior.
+
 ## Notes / Non-goals
 
 - Does not connect directly to MySQL binlog / PostgreSQL logical replication (planned as a separate input in the future).

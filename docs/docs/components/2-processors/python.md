@@ -15,7 +15,8 @@ The Python processor executes user-supplied Python code on each message batch vi
 | script | string | no | — | Inline Python source to execute. When provided, the code runs in the configured module. |
 | module | string | no | `__main__` | Python module to import the function from. Ignored when `script` is provided. |
 | function | string | yes | — | Name of the Python function to call. It must accept a PyArrow batch and return a list of PyArrow batches. |
-| python_path | array&lt;string&gt; | no | `[]` | Additional paths added to `sys.path` for module imports. |
+| python_path | array&lt;string&gt; | no | `[]` | Additional paths added to `sys.path` for module imports; earlier entries take precedence, entries already present are not re-added, and the working directory `.` follows the configured paths. |
+| timeout_ms | integer | no | `60000` | Upper bound for one function call in milliseconds. A call exceeding it fails the batch instead of blocking the stream; the abandoned Python call keeps running on its thread until it returns. |
 
 ## Examples
 

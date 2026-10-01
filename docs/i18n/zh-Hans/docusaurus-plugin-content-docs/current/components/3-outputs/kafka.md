@@ -18,7 +18,7 @@ Kafka 输出(Output)基于 librdkafka 向 Apache Kafka 主题(Topic)生产消息
 | client_id | string | no | — | 客户端标识符。 |
 | compression | string | no | — | `none`、`gzip`、`snappy`、`lz4` 之一。 |
 | acks | string | no | — | 确认级别:`0`、`1` 或 `all`。 |
-| value_field | string | no | — | 用作消息载荷的记录字段。 |
+| value_field | string | no | — | 二进制或字符串列,其逐行值作为该条消息的载荷(null 值或缺失列会报错)。未配置时按 codec 编码整批。 |
 | exactly_once | boolean | no | `false` | 启用精确一次事务性生产(L2)。 |
 | transactional_id | string | no | — | 稳定的事务 ID;当 `exactly_once` 为 `true` 时必填。 |
 | offset_commit_group | string | no | — | L3 精确一次:同进程配对 Kafka 输入(声明 `transactional_offsets: true`)的消费者组,其源位点在本输出的事务内提交。要求 `exactly_once`。 |

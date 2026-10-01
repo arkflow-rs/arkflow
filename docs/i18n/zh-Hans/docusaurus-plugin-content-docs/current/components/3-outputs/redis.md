@@ -14,7 +14,7 @@ Redis 输出(Output)使用四种数据结构操作之一将消息(Message)写入
 | type  | string | yes | — | 固定值 `"redis"` |
 | mode | object | yes | — | 连接模式(见下文)。 |
 | redis_type | object | yes | — | 要执行的 Redis 操作(见下文)。 |
-| value_field | string | no | — | 用作消息载荷的记录字段。 |
+| value_field | string | no | — | 二进制或字符串列,其逐行值作为该条消息的载荷(null 值或缺失列会报错)。未配置时按 codec 编码整批。 |
 
 ### mode
 

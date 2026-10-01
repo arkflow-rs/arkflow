@@ -160,12 +160,9 @@ impl KafkaOutput {
         if exactly_once {
             client_config.set(
                 "transactional.id",
-                config
-                    .transactional_id
-                    .as_ref()
-                    .expect(
-                        "transactional_id presence is validated by the builder when exactly_once is on",
-                    ),
+                config.transactional_id.as_ref().expect(
+                    "transactional_id presence is validated by the builder when exactly_once is on",
+                ),
             );
             client_config.set("enable.idempotence", "true");
         }
@@ -263,8 +260,17 @@ impl Output for KafkaOutput {
             Error::Connection("The Kafka producer is not initialized".to_string())
         })?;
 
-        // Apply codec encoding if configured
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
+        // Payload selection: an explicit `value_field` takes the named
+        // column's value per row, otherwise the codec encoding applies.
+        let payloads: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
+            crate::output::payload::field_payloads("kafka", &msg, field)?
+        } else {
+            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)
+                .await?
+                .into_iter()
+                .map(|p| p.to_vec())
+                .collect()
+        };
         if payloads.is_empty() {
             return Ok(());
         }
@@ -428,13 +434,13 @@ impl KafkaOutput {
                 transactional_offsets_for_batches(msgs, Some(group_topic.as_str()))?;
             if covered {
                 let metadata = crate::kafka_txn::group_metadata(group)
-                .await
-                .ok_or_else(|| {
-                    Error::Config(format!(
+                    .await
+                    .ok_or_else(|| {
+                        Error::Config(format!(
                         "Kafka offset commit group '{group}' has no live input in this process; \
                          the paired Kafka input must declare transactional_offsets"
                     ))
-                })?;
+                    })?;
                 let p = producer.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     p.send_offsets_to_transaction(
@@ -477,7 +483,15 @@ impl KafkaOutput {
         producer: &FutureProducer,
         msg: MessageBatchRef,
     ) -> Result<(), Error> {
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
+        let payloads: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
+            crate::output::payload::field_payloads("kafka", &msg, field)?
+        } else {
+            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)
+                .await?
+                .into_iter()
+                .map(|p| p.to_vec())
+                .collect()
+        };
         if payloads.is_empty() {
             return Ok(());
         }
@@ -590,8 +604,10 @@ pub fn init() -> Result<(), Error> {
             "additionalProperties": false,
             "properties": {
                 "brokers": {"type": "array", "items": {"type": "string"}, "description": "List of Kafka broker addresses."},
-                "topic": {"type": "string", "description": "Destination topic (supports {field} placeholders)."},
-                "key": {"type": "string", "description": "Field used as the message key for partitioning."},
+                "topic": {"oneOf": [ {"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}
+                    ], "description": "Literal value or a SQL expression evaluated per batch."},
+                "key": {"oneOf": [ {"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}
+                    ], "description": "Literal value or a SQL expression evaluated per batch."},
                 "client_id": {"type": "string", "description": "Optional client identifier."},
                 "compression": {"type": "string", "enum": ["none", "gzip", "snappy", "lz4", "zstd"], "description": "Compression algorithm."},
                 "acks": {"type": "string", "enum": ["0", "1", "all"], "description": "Acknowledgment level."},
@@ -605,7 +621,7 @@ pub fn init() -> Result<(), Error> {
         }),
     ).with_example(serde_json::json!({
         "brokers": ["localhost:9092"],
-        "topic": "events"
+        "topic": {"type": "value", "value": "events"}
     })))
 }
 
@@ -733,9 +749,8 @@ fn ext_map_entry(
     let offsets = map.offsets();
     let start = offsets.get(row).copied()? as usize;
     let end = offsets.get(row + 1).copied()? as usize;
-    (start..end).find_map(|index| {
-        (keys.value(index) == key).then(|| values.value(index).to_owned())
-    })
+    (start..end)
+        .find_map(|index| (keys.value(index) == key).then(|| values.value(index).to_owned()))
 }
 
 #[cfg(test)]
@@ -823,19 +838,21 @@ mod tests {
             Err(e) => e,
         };
         let message = err.to_string();
-        assert!(message.contains("clickstream"), "error names the conflict: {message}");
-        assert!(message.contains("orders"), "error names the group topic: {message}");
+        assert!(
+            message.contains("clickstream"),
+            "error names the conflict: {message}"
+        );
+        assert!(
+            message.contains("orders"),
+            "error names the group topic: {message}"
+        );
     }
 
     /// Rows attributed to the group topic fold into the offset list as
     /// before.
     #[test]
     fn l3_accepts_rows_matching_group_topic() {
-        let batch = l3_meta_batch(
-            vec![0, 1],
-            vec![10, 20],
-            Some(vec!["orders", "orders"]),
-        );
+        let batch = l3_meta_batch(vec![0, 1], vec![10, 20], Some(vec!["orders", "orders"]));
         let (offsets, covered) =
             transactional_offsets_for_batches(&[batch], Some("orders")).expect("accepted");
         assert!(covered);
@@ -908,7 +925,10 @@ mod tests {
             "topic": {"type": "value", "value": "t"}
         }));
         let client_config = KafkaOutput::build_client_config(&config).unwrap();
-        assert_eq!(client_config.get("bootstrap.servers"), Some("localhost:9092"));
+        assert_eq!(
+            client_config.get("bootstrap.servers"),
+            Some("localhost:9092")
+        );
         for key in client_config.config_map().keys() {
             assert!(
                 !key.starts_with("security.")

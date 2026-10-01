@@ -110,7 +110,9 @@ output:
 
 ## 注意事项
 
-- 支持的列类型:Utf8、Int64、UInt64、Float64、Boolean。其他 Arrow 类型会被拒绝并报进程错误。
+- 支持的列类型:Utf8、Boolean;`Int8`/`Int16`/`Int32`/`Int64`(统一以 i64 绑定);`UInt8`/`UInt16`/`UInt32`/`UInt64`(统一以 u64 绑定);`Float32`/`Float64`(统一以 f64 绑定);`Date32`/`Date64`(ISO 日期字符串)与任意单位的 `Timestamp`(RFC3339 字符串)。其他 Arrow 类型会被拒绝,错误信息指明列名与类型。
+- 配置 `codec` 会在构建期被拒绝:SQL 写入按类型化列绑定参数,无法消费编码后的字节。(PostgreSQL 无无符号整数;`UInt64` 仍按既有方式经驱动的有符号通道传递。)
+- `close()` 显式关闭数据库连接,而不是留给对象析构。
 - 标识符引用遵循各自方言:MySQL 使用反引号,PostgreSQL 使用双引号。
 - `upsert: true` 要求 `upsert_keys` 列表非空且无重复;违规会在配置加载时、流(Stream)启动之前被拒绝。
 - `upsert_keys` 列必须存在于传入批次(Batch)模式中,否则写入失败并报错。

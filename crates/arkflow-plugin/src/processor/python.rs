@@ -33,13 +33,52 @@ struct PythonProcessorConfig {
     module: String,
     /// Function name to call for processing
     function: String,
-    /// Additional Python paths
+    /// Additional Python paths (earlier entries take precedence)
     #[serde(default = "default_python_path")]
     python_path: Vec<String>,
+    /// Upper bound for one UDF call; a longer call fails the batch instead of
+    /// blocking the stream forever. The abandoned blocking thread keeps
+    /// running until the UDF itself returns.
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
+/// Default UDF call timeout: 60s.
+fn default_timeout_ms() -> u64 {
+    60_000
 }
 
 struct PythonProcessor {
     func: Py<PyAny>, // Stores the Python function to be called
+    timeout_ms: u64,
+}
+
+/// Run one UDF call on the blocking thread: convert the batch to PyArrow,
+/// invoke the function, convert the returned list back to RecordBatches.
+fn call_udf(func: Py<PyAny>, batch: MessageBatchRef) -> Result<Vec<RecordBatch>, Error> {
+    Python::attach(|py| -> Result<Vec<RecordBatch>, Error> {
+        // Convert MessageBatch to PyArrow
+        let py_batch = batch.record_batch().to_pyarrow(py).map_err(|e| {
+            Error::Process(format!("Failed to convert MessageBatch to PyArrow: {}", e))
+        })?;
+
+        let func_bound = func.bind(py);
+        let result = func_bound
+            .call1((py_batch,))
+            .map_err(|e| Error::Process(format!("Python function call failed: {}", e)))?;
+
+        let py_list = result.cast::<PyList>().map_err(|_| {
+            Error::Process("Failed to downcast Python result to PyList".to_string())
+        })?;
+        py_list
+            .into_iter()
+            .map(|item| {
+                RecordBatch::from_pyarrow_bound(&item).map_err(|e| {
+                    Error::Process(format!("Failed to convert PyArrow to RecordBatch: {}", e))
+                })
+            })
+            .collect::<Result<Vec<RecordBatch>, Error>>()
+    })
 }
 
 #[async_trait]
@@ -47,37 +86,17 @@ impl Processor for PythonProcessor {
     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
         let func_to_call = Python::attach(|py| self.func.clone_ref(py));
 
-        let result = tokio::task::spawn_blocking(move || {
-            Python::attach(|py| -> Result<Vec<RecordBatch>, Error> {
-                // Convert MessageBatch to PyArrow
-                let py_batch = batch.record_batch().to_pyarrow(py).map_err(|e| {
-                    Error::Process(format!("Failed to convert MessageBatch to PyArrow: {}", e))
-                })?;
-
-                let func_bound = func_to_call.bind(py);
-                let result = func_bound
-                    .call1((py_batch,))
-                    .map_err(|e| Error::Process(format!("Python function call failed: {}", e)))?;
-
-                let py_list = result.cast::<PyList>().map_err(|_| {
-                    Error::Process("Failed to downcast Python result to PyList".to_string())
-                })?;
-                let vec_rb = py_list
-                    .into_iter()
-                    .map(|item| {
-                        RecordBatch::from_pyarrow_bound(&item).map_err(|e| {
-                            Error::Process(format!(
-                                "Failed to convert PyArrow to RecordBatch: {}",
-                                e
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<RecordBatch>, Error>>()?;
-                Ok(vec_rb)
-            })
-        })
-        .await
-        .map_err(|e| Error::Process(format!("Failed to spawn blocking task: {}", e)))??;
+        let timeout = std::time::Duration::from_millis(self.timeout_ms);
+        let handle = tokio::task::spawn_blocking(move || call_udf(func_to_call, batch));
+        let result = tokio::time::timeout(timeout, handle)
+            .await
+            .map_err(|_| {
+                Error::Process(format!(
+                    "Python function call timed out after {} ms (the UDF may still occupy its blocking thread until it returns)",
+                    self.timeout_ms
+                ))
+            })?
+            .map_err(|e| Error::Process(format!("Failed to spawn blocking task: {}", e)))??;
 
         let vec_mb = result
             .into_iter()
@@ -105,20 +124,7 @@ impl Processor for PythonProcessor {
 impl PythonProcessor {
     fn new(config: PythonProcessorConfig) -> Result<Self, Error> {
         Python::attach(|py| -> Result<Self, Error> {
-            let sys = py
-                .import("sys")
-                .map_err(|_| Error::Process("Failed to import sys".to_string()))?;
-            let binding = sys
-                .getattr("path")
-                .map_err(|_| Error::Process("Failed to get sys.path".to_string()))?;
-            let path = binding
-                .cast::<PyList>()
-                .map_err(|_| Error::Process("Failed to downcast sys.path".to_string()))?;
-            path.insert(0, ".").unwrap();
-            let _ = &config
-                .python_path
-                .iter()
-                .for_each(|p| path.insert(0, p).unwrap());
+            Self::setup_sys_path(py, &config.python_path)?;
 
             // Get the Python module either from the script or from an imported module
             let py_module = py.import(&config.module).map_err(|e| {
@@ -142,8 +148,51 @@ impl PythonProcessor {
 
             // Convert the bound function reference to a PyObject for storage.
             let func_obj: Py<PyAny> = func.into_any().unbind();
-            Ok(PythonProcessor { func: func_obj })
+            Ok(PythonProcessor {
+                func: func_obj,
+                timeout_ms: config.timeout_ms,
+            })
         })
+    }
+
+    /// Prepend the configured python paths (in config order, earlier =
+    /// higher precedence) followed by the working directory `"."` to
+    /// `sys.path`, skipping entries already present. Insert results are
+    /// checked — a failed insert is a configuration error, never a panic.
+    fn setup_sys_path(py: Python<'_>, python_path: &[String]) -> Result<(), Error> {
+        let sys = py
+            .import("sys")
+            .map_err(|_| Error::Process("Failed to import sys".to_string()))?;
+        let binding = sys
+            .getattr("path")
+            .map_err(|_| Error::Process("Failed to get sys.path".to_string()))?;
+        let path = binding
+            .cast::<PyList>()
+            .map_err(|_| Error::Process("Failed to downcast sys.path".to_string()))?;
+        let existing: Vec<String> = path
+            .extract()
+            .map_err(|e| Error::Process(format!("Failed to read sys.path: {}", e)))?;
+
+        // Desired front segment: [p1, p2, ..., "."] — deduplicated in place
+        // (first occurrence wins) and inserted in reverse so the final order
+        // matches the configuration (the old code reversed the list and let
+        // `"."` fall behind user paths).
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let desired: Vec<&str> = python_path
+            .iter()
+            .map(|s| s.as_str())
+            .chain(std::iter::once("."))
+            .filter(|entry| seen.insert(entry))
+            .collect();
+        for entry in desired.into_iter().rev() {
+            if existing.iter().any(|e| e == entry) {
+                continue;
+            }
+            path.insert(0, entry).map_err(|e| {
+                Error::Config(format!("Failed to append '{}' to sys.path: {}", entry, e))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -187,14 +236,141 @@ pub fn init() -> Result<(), Error> {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "script": {"type": "string", "description": "Python source defining the transform function."},
+                "script": {"type": "string", "description": "Python source defining the transform function (optional when importing an existing module)."},
+                "module": {"type": "string", "default": "__main__", "description": "Python module providing the function."},
                 "function": {"type": "string", "description": "Name of the function to invoke for each batch."},
-                "extra_packages": {"type": "array", "items": {"type": "string"}, "description": "Optional list of pip packages to install before running."}
+                "python_path": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Extra sys.path entries, earlier entries take precedence."},
+                "timeout_ms": {"type": "integer", "minimum": 1, "default": 60000, "description": "Upper bound for one UDF call in milliseconds; longer calls fail the batch."}
             },
-            "required": ["script", "function"]
+            "required": ["function"]
         }),
     ).with_example(serde_json::json!({
         "script": "def transform(batch):\n    return batch",
         "function": "transform"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_resource() -> Resource {
+        Resource {
+            temporary: Default::default(),
+            input_names: std::cell::RefCell::new(Default::default()),
+        }
+    }
+
+    fn build(config: serde_json::Value) -> Result<Arc<dyn Processor>, Error> {
+        PythonProcessorBuilder.build(None, &Some(config), &test_resource())
+    }
+
+    fn sys_path_snapshot(py: Python<'_>) -> Vec<String> {
+        py.import("sys")
+            .and_then(|sys| sys.getattr("path"))
+            .and_then(|p| p.extract::<Vec<String>>())
+            .expect("sys.path snapshot")
+    }
+
+    #[test]
+    fn python_path_order_and_dedupe() {
+        // Insert a sentinel prefix list, build a processor, and check the
+        // resulting sys.path front segment: config order, then ".".
+        let config = serde_json::json!({
+            "function": "transform",
+            "script": "def transform(batch):\n    return batch",
+            "python_path": ["/arkflow/test/a", "/arkflow/test/b", "/arkflow/test/a"],
+        });
+        build(config).expect("processor must build");
+        Python::attach(|py| {
+            let path = sys_path_snapshot(py);
+            let a = path
+                .iter()
+                .position(|p| p == "/arkflow/test/a")
+                .expect("a present");
+            let b = path
+                .iter()
+                .position(|p| p == "/arkflow/test/b")
+                .expect("b present");
+            assert!(
+                a < b,
+                "config order must be preserved: {:?}",
+                &path[..4.min(path.len())]
+            );
+            // dedupe: the second "/arkflow/test/a" must not appear twice
+            assert_eq!(
+                path.iter().filter(|p| *p == "/arkflow/test/a").count(),
+                1,
+                "duplicate paths must be inserted once"
+            );
+            Ok::<(), pyo3::PyErr>(())
+        })
+        .expect("attach");
+    }
+
+    #[test]
+    fn second_instance_does_not_readd_paths() {
+        let config = serde_json::json!({
+            "function": "transform",
+            "script": "def transform(batch):\n    return batch",
+            "python_path": ["/arkflow/twice"],
+        });
+        build(config.clone()).expect("first build");
+        build(config).expect("second build");
+        Python::attach(|py| {
+            let path = sys_path_snapshot(py);
+            assert_eq!(
+                path.iter()
+                    .filter(|p| p.as_str() == "/arkflow/twice")
+                    .count(),
+                1,
+                "repeated builds must not pollute sys.path"
+            );
+            Ok::<(), pyo3::PyErr>(())
+        })
+        .expect("attach");
+    }
+
+    #[tokio::test]
+    async fn short_udf_processes_normally() {
+        let processor = build(serde_json::json!({
+            "function": "transform",
+            "script": "def transform(batch):\n    return [batch]",
+            "timeout_ms": 5000,
+        }))
+        .expect("build");
+        let batch = MessageBatch::from_string("hello").unwrap();
+        let result = processor.process(Arc::new(batch)).await.expect("process");
+        match result {
+            ProcessResult::Single(b) => assert_eq!(b.len(), 1),
+            other => panic!("expected single result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn long_udf_times_out() {
+        // A sleeping UDF (sleep releases the GIL, so other Python work in
+        // the process can proceed) that outlives the configured timeout:
+        // the stream must fail fast instead of waiting for the UDF.
+        let processor = build(serde_json::json!({
+            "function": "slow",
+            "script": "import time\ndef slow(batch):\n    time.sleep(5)\n    return batch",
+            "timeout_ms": 200,
+        }))
+        .expect("build");
+        let batch = MessageBatch::from_string("hello").unwrap();
+        let start = std::time::Instant::now();
+        let err = processor
+            .process(Arc::new(batch))
+            .await
+            .expect_err("must time out");
+        assert!(
+            format!("{err}").contains("timed out"),
+            "error must mention timeout, got: {err}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "timeout must fire near the configured bound"
+        );
+    }
 }

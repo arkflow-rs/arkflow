@@ -129,23 +129,16 @@ pub struct SqlInput {
     sql_config: SqlInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     cancellation_token: CancellationToken,
-    #[allow(dead_code)]
-    codec: Option<Arc<dyn Codec>>,
 }
 
 impl SqlInput {
-    pub fn new(
-        name: Option<&String>,
-        sql_config: SqlInputConfig,
-        codec: Option<Arc<dyn Codec>>,
-    ) -> Result<Self, Error> {
+    pub fn new(name: Option<&String>, sql_config: SqlInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.cloned(),
             sql_config,
             stream: Arc::new(Mutex::new(None)),
             cancellation_token,
-            codec,
         })
     }
 }
@@ -332,8 +325,16 @@ impl InputBuilder for SqlInputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
+        // Rows arrive typed from the SELECT result; a codec has no decode
+        // integration point here. Reject instead of dropping it silently.
+        if codec.is_some() {
+            return Err(Error::Config(
+                "sql input does not support a codec: rows come typed from the SELECT result"
+                    .to_string(),
+            ));
+        }
         let config: SqlInputConfig = parse_config(config, "Sql input")?;
-        Ok(Arc::new(SqlInput::new(name, config, codec)?))
+        Ok(Arc::new(SqlInput::new(name, config)?))
     }
 }
 
@@ -341,13 +342,12 @@ pub fn init() -> Result<(), Error> {
     register_input_builder("sql", Arc::new(SqlInputBuilder))?;
     register_input_metadata(ComponentMetadata::with_schema(
         "sql",
-        "Polls a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) with a SELECT statement and emits rows as batches.",
+        "Runs a one-shot SELECT against a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) and emits the rows as batches.",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "select_sql": {"type": "string", "description": "SELECT statement to execute on every poll."},
-                "poll_interval": {"type": "string", "description": "Optional poll interval (humantime)."},
+                "select_sql": {"type": "string", "description": "SELECT statement executed once at startup."},
                 "ballista": {"type": "object", "description": "Optional Ballista distributed compute configuration."},
                 "input_type": {"type": "object", "description": "Database connection settings."}
             },
@@ -355,7 +355,6 @@ pub fn init() -> Result<(), Error> {
         }),
     ).with_example(serde_json::json!({
         "select_sql": "SELECT id, name FROM users",
-        "poll_interval": "10s",
         "input_type": {"type": "sqlite", "name": "users", "path": "./data.db"}
     })))
 }

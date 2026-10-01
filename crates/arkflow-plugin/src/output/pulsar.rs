@@ -140,7 +140,9 @@ impl PulsarOutput {
                 ))
             })?
             .map_err(|e| {
-                Error::Process(format!("Pulsar broker rejected message on topic {topic}: {e}"))
+                Error::Process(format!(
+                    "Pulsar broker rejected message on topic {topic}: {e}"
+                ))
             })?;
         Ok(())
     }
@@ -161,9 +163,11 @@ impl Output for PulsarOutput {
             PulsarClientUtils::create_client_builder(&self.config.service_url, &self.config.auth)?;
         if let Some(tls) = &self.config.tls {
             if let Some(chain_file) = &tls.certificate_chain_file {
-                builder = builder.with_certificate_chain_file(chain_file).map_err(|e| {
-                    Error::Config(format!("pulsar: failed to load certificate chain: {e}"))
-                })?;
+                builder = builder
+                    .with_certificate_chain_file(chain_file)
+                    .map_err(|e| {
+                        Error::Config(format!("pulsar: failed to load certificate chain: {e}"))
+                    })?;
             }
             if let Some(enabled) = tls.hostname_verification {
                 builder = builder.with_tls_hostname_verification_enabled(enabled);
@@ -201,7 +205,7 @@ impl Output for PulsarOutput {
         // column's value per row (binary or string), otherwise the codec
         // (or the default binary-field) encoding applies.
         let owned_payloads: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
-            field_payloads(&msg, field)?
+            crate::output::payload::field_payloads("pulsar", &msg, field)?
         } else {
             let payloads =
                 crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
@@ -246,61 +250,6 @@ impl Output for PulsarOutput {
         }
 
         Ok(())
-    }
-}
-
-/// One payload per row, taken from the named column. Binary columns are
-/// sent verbatim, string columns as their UTF-8 bytes; nulls and any other
-/// type fail closed rather than guessing a serialization (silently dropping
-/// null rows would shift every later payload onto the previous row's topic
-/// when topics resolve per message).
-fn null_value_field(field: &str) -> Error {
-    Error::Config(format!("pulsar value_field '{field}' contains a null value"))
-}
-
-fn field_payloads(msg: &MessageBatchRef, field: &str) -> Result<Vec<Vec<u8>>, Error> {
-    use datafusion::arrow::array::{
-        Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
-    };
-    use datafusion::arrow::datatypes::DataType;
-
-    let column = msg.column_by_name(field).ok_or_else(|| {
-        Error::Config(format!("pulsar value_field '{field}' not found in the batch"))
-    })?;
-    match column.data_type() {
-        DataType::Binary => Ok(column
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("checked binary column")
-            .iter()
-            .map(|v| v.map(<[u8]>::to_vec).ok_or_else(|| null_value_field(field)))
-            .collect::<Result<Vec<_>, _>>()?),
-        DataType::LargeBinary => Ok(column
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .expect("checked large binary column")
-            .iter()
-            .flatten()
-            .map(<[u8]>::to_vec)
-            .collect()),
-        DataType::Utf8 => Ok(column
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("checked utf8 column")
-            .iter()
-            .map(|v| v.map(|s| s.as_bytes().to_vec()).ok_or_else(|| null_value_field(field)))
-            .collect::<Result<Vec<_>, _>>()?),
-        DataType::LargeUtf8 => Ok(column
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .expect("checked large utf8 column")
-            .iter()
-            .flatten()
-            .map(|s| s.as_bytes().to_vec())
-            .collect()),
-        other => Err(Error::Config(format!(
-            "pulsar value_field '{field}' has unsupported type {other} (use a binary or string column)"
-        ))),
     }
 }
 
@@ -361,8 +310,8 @@ mod tests {
 
     fn utf8_batch(rows: Vec<Option<&str>>) -> MessageBatchRef {
         let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(rows))]).expect("utf8 batch");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(rows))])
+            .expect("utf8 batch");
         Arc::new(MessageBatch::new_arrow(batch))
     }
 
@@ -370,7 +319,11 @@ mod tests {
     fn value_field_rejects_null_rows() {
         // Silently dropping nulls would shift later payloads onto the
         // previous row's topic when topics resolve per message.
-        let error = match field_payloads(&utf8_batch(vec![Some("a"), None]), "col") {
+        let error = match crate::output::payload::field_payloads(
+            "pulsar",
+            &utf8_batch(vec![Some("a"), None]),
+            "col",
+        ) {
             Err(error) => error,
             Ok(_) => panic!("null rows must be rejected"),
         };
@@ -380,12 +333,13 @@ mod tests {
     #[test]
     fn value_field_rejects_unsupported_types() {
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1i64]))],
-        )
-        .expect("int batch");
-        let error = match field_payloads(&Arc::new(MessageBatch::new_arrow(batch)), "n") {
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))])
+            .expect("int batch");
+        let error = match crate::output::payload::field_payloads(
+            "pulsar",
+            &Arc::new(MessageBatch::new_arrow(batch)),
+            "n",
+        ) {
             Err(error) => error,
             Ok(_) => panic!("non-string/binary columns must be rejected"),
         };

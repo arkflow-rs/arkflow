@@ -112,7 +112,8 @@ impl TableProvider for SwapBatchTable {
 /// Built-in functions the logical optimizer folds to a literal using the
 /// session's query execution start time. A cached optimized plan would freeze
 /// them at cache time, so queries using them re-optimize every batch.
-const TIME_FOLDING_FUNCTIONS: [&str; 4] = ["now", "current_date", "current_time", "current_timestamp"];
+const TIME_FOLDING_FUNCTIONS: [&str; 4] =
+    ["now", "current_date", "current_time", "current_timestamp"];
 
 fn expr_folds_time(expr: &LogicalExpr) -> bool {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -130,7 +131,8 @@ fn expr_folds_time(expr: &LogicalExpr) -> bool {
 }
 
 fn plan_folds_time(plan: &LogicalPlan) -> bool {
-    plan.expressions().iter().any(expr_folds_time) || plan.inputs().iter().any(|p| plan_folds_time(p))
+    plan.expressions().iter().any(expr_folds_time)
+        || plan.inputs().iter().any(|p| plan_folds_time(p))
 }
 
 /// Per pooled-context fast-path state: the swap table registered under the
@@ -146,6 +148,34 @@ struct ContextPlanCache {
 }
 
 /// SQL processor component
+/// RAII deregistration for the per-batch tables of the temporary path:
+/// the main batch table plus every temporary table. Dropping on any path
+/// (success, `?` error, future cancellation) keeps pooled contexts clean.
+struct TempTablesGuard {
+    ctx: Arc<SessionContext>,
+    main_table: String,
+    temporary_tables: Vec<String>,
+}
+
+impl TempTablesGuard {
+    fn new(ctx: Arc<SessionContext>, main_table: String, temporary_tables: Vec<String>) -> Self {
+        Self {
+            ctx,
+            main_table,
+            temporary_tables,
+        }
+    }
+}
+
+impl Drop for TempTablesGuard {
+    fn drop(&mut self) {
+        let _ = self.ctx.deregister_table(&self.main_table);
+        for name in &self.temporary_tables {
+            let _ = self.ctx.deregister_table(name);
+        }
+    }
+}
+
 struct SqlProcessor {
     config: SqlProcessorConfig,
     statement: Statement,
@@ -217,7 +247,19 @@ impl SqlProcessor {
         let record: RecordBatch = batch.into();
 
         let result_batches = if self.temporary.is_some() {
-            // Temporary tables vary per batch, so every batch re-plans.
+            // Temporary tables vary per batch, so every batch re-plans. The
+            // guard deregisters the main table and every temporary table on
+            // ALL paths — `?` early exits included — so a failed batch can
+            // never leave stale registrations that break the next batch's
+            // registration on this pooled context.
+            let mut temp_table_names = Vec::new();
+            if let Some(temporary) = self.temporary.as_ref() {
+                for (_, config) in temporary.values() {
+                    temp_table_names.push(config.table_name.clone());
+                }
+            }
+            let _tables_guard =
+                TempTablesGuard::new(ctx_arc.clone(), table_name.to_string(), temp_table_names);
             self.get_temporary_message_batch(&ctx_arc, &record).await?;
             ctx_arc
                 .register_batch(table_name, record)
@@ -226,19 +268,9 @@ impl SqlProcessor {
                 .execute_query_with_statement(&ctx_arc)
                 .await
                 .map_err(|e| Error::Process(format!("Execution query error: {}", e)))?;
-            let batches = df
-                .collect()
+            df.collect()
                 .await
-                .map_err(|e| Error::Process(format!("Collection query results error: {}", e)))?;
-            let _ = ctx_arc.deregister_table(table_name);
-            // Temporary tables are re-registered on every batch; leaving one
-            // behind would fail the next registration on this pooled context.
-            if let Some(temporary) = self.temporary.as_ref() {
-                for (_, config) in temporary.values() {
-                    let _ = ctx_arc.deregister_table(&config.table_name);
-                }
-            }
-            batches
+                .map_err(|e| Error::Process(format!("Collection query results error: {}", e)))?
         } else {
             self.execute_with_cached_plan(&ctx_arc, table_name, record)
                 .await?
@@ -572,14 +604,14 @@ mod tests {
 
         fn matching_batch() -> MessageBatchRef {
             let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
-                .unwrap();
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
             Arc::new(MessageBatch::new_arrow(batch))
         }
         fn drifting_batch() -> MessageBatchRef {
             let schema = Arc::new(Schema::new(vec![Field::new("w", DataType::Int64, false)]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
-                .unwrap();
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
             Arc::new(MessageBatch::new_arrow(batch))
         }
 
@@ -708,17 +740,11 @@ mod tests {
         )
         .unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let sum_of = |values: Vec<i64>| {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from(values))],
-            )
-            .unwrap();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])
+                    .unwrap();
             async {
                 match processor
                     .process(Arc::new(MessageBatch::new_arrow(batch)))
@@ -762,11 +788,8 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let int_batch = RecordBatch::try_new(
-            int_schema,
-            vec![Arc::new(Int64Array::from(vec![1, 2]))],
-        )
-        .unwrap();
+        let int_batch =
+            RecordBatch::try_new(int_schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
         let result = processor
             .process(Arc::new(MessageBatch::new_arrow(int_batch)))
             .await
@@ -792,9 +815,9 @@ mod tests {
         )]));
         let float_batch = RecordBatch::try_new(
             float_schema,
-            vec![Arc::new(datafusion::arrow::array::Float64Array::from(vec![
-                1.5, 2.5,
-            ]))],
+            vec![Arc::new(datafusion::arrow::array::Float64Array::from(
+                vec![1.5, 2.5],
+            ))],
         )
         .unwrap();
         let result = processor
@@ -832,11 +855,7 @@ mod tests {
             .unwrap(),
         );
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let mut handles = Vec::new();
         for task in 0..4i64 {
             let processor = processor.clone();
@@ -901,7 +920,11 @@ mod tests {
     #[tokio::test]
     async fn test_sql_processor_temporary_tables_join() {
         let reference = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("extra", DataType::Utf8, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "extra",
+                DataType::Utf8,
+                false,
+            )])),
             vec![Arc::new(StringArray::from(vec!["enriched"]))],
         )
         .unwrap();
@@ -928,11 +951,7 @@ mod tests {
         )
         .unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
         // The slow path re-registers per batch; run it twice.
         for expected in [7i64, 9i64] {
@@ -986,11 +1005,7 @@ mod tests {
         )
         .unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
 
@@ -1024,17 +1039,11 @@ mod tests {
         )
         .unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ts_of = || async {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from(vec![1]))],
-            )
-            .unwrap();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
+                    .unwrap();
             match processor
                 .process(Arc::new(MessageBatch::new_arrow(batch)))
                 .await
@@ -1108,5 +1117,67 @@ mod tests {
         );
 
         println!("10 queries completed in {:?}", duration);
+    }
+
+    #[tokio::test]
+    async fn temporary_tables_error_path_keeps_context_reusable() {
+        // A failing statement on the temporary path used to skip
+        // deregistration via `?`, leaving stale tables on the pooled
+        // context; the next batch then failed registration with a
+        // different ("already exists") error. Both failures must now be
+        // the original query error.
+        let reference = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "extra",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["enriched"]))],
+        )
+        .unwrap();
+
+        let mut temporary: HashMap<String, Arc<dyn Temporary>> = HashMap::new();
+        temporary.insert("ref".to_string(), Arc::new(StaticTemporary(reference)));
+
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT f.nope FROM flow f JOIN temp_ref t ON 1=1".to_string(),
+                table_name: None,
+                temporary_list: Some(vec![TemporaryConfig {
+                    name: "ref".to_string(),
+                    table_name: "temp_ref".to_string(),
+                    key: Expr::Value {
+                        value: "ignored".to_string(),
+                    },
+                }]),
+            },
+            &Resource {
+                temporary,
+                input_names: RefCell::new(Default::default()),
+            },
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+
+        let first = processor
+            .process(Arc::new(MessageBatch::new_arrow(batch.clone())))
+            .await;
+        let first_err = format!("{}", first.unwrap_err());
+        assert!(
+            !first_err.contains("already exists"),
+            "first failure must be the query error, got: {first_err}"
+        );
+
+        let second = processor
+            .process(Arc::new(MessageBatch::new_arrow(batch)))
+            .await;
+        let second_err = format!("{}", second.unwrap_err());
+        assert!(
+            !second_err.contains("already exists"),
+            "stale tables must be deregistered on the error path, got: {second_err}"
+        );
     }
 }

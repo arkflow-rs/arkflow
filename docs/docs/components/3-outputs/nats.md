@@ -15,7 +15,7 @@ The NATS output publishes messages to a NATS server, either to a regular subject
 | url | string | yes | — | NATS server URL (e.g. `nats://localhost:4222`). |
 | mode | object | yes | — | Publishing mode (see below). |
 | auth | object | no | — | Authentication configuration (see below). |
-| value_field | string | no | — | Record field used as the message payload. |
+| value_field | string | no | — | Binary or string column whose per-row value becomes that message's payload (a null value or a missing column is an error). When unset, the codec encoding of the batch applies. |
 
 ### mode
 

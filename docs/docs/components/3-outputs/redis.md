@@ -14,7 +14,7 @@ The Redis output writes messages to Redis using one of four data-structure opera
 | type  | string | yes | — | Fixed value `"redis"` |
 | mode | object | yes | — | Connection mode (see below). |
 | redis_type | object | yes | — | Redis operation to perform (see below). |
-| value_field | string | no | — | Record field used as the message payload. |
+| value_field | string | no | — | Binary or string column whose per-row value becomes that message's payload (a null value or a missing column is an error). When unset, the codec encoding of the batch applies. |
 
 ### mode
 

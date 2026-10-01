@@ -29,7 +29,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | input | `nats` | Consumes messages from NATS, supporting both regular subjects and JetStream consumers. | [reference](../components/inputs/nats) |
 | input | `pulsar` | Subscribes to an Apache Pulsar topic with configurable subscription type and authentication. | [reference](../components/inputs/pulsar) |
 | input | `redis` | Reads from Redis: list blocking pops, pub/sub subscriptions, or stream consumer groups. | [reference](../components/inputs/redis) |
-| input | `sql` | Polls a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) with a SELECT statement and emits rows as batches. | [reference](../components/inputs/sql) |
+| input | `sql` | Runs a one-shot SELECT against a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) and emits the rows as batches. | [reference](../components/inputs/sql) |
 | input | `websocket` | Connects to a WebSocket server and forwards each incoming message as a batch. | [reference](../components/inputs/websocket) |
 | output | `drop` | Discards all messages. Useful for performance benchmarks and dead-end pipelines. | [reference](../components/outputs/drop) |
 | output | `http` | Posts each batch to an HTTP endpoint. Supports custom headers, retry, and auth. | [reference](../components/outputs/http) |
@@ -42,12 +42,12 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | output | `pgvector` | Upserts batch rows into a PostgreSQL table with the pgvector extension: a Float32 list column becomes the vector, other columns are packed into a jsonb payload, and an optional id column keys ON CONFLICT upserts. | [reference](../components/outputs/pgvector) |
 | output | `pulsar` | Produces messages to an Apache Pulsar topic. | [reference](../components/outputs/pulsar) |
 | output | `qdrant` | Upserts batch rows as Qdrant points over the REST API: a vector column, an optional id column, and all remaining columns as payload. | [reference](../components/outputs/qdrant) |
-| output | `redis` | Writes messages to Redis: streams, lists, or pub/sub channels. | [reference](../components/outputs/redis) |
+| output | `redis` | Writes messages to Redis via publish, list rpush, hashes, or plain strings. | [reference](../components/outputs/redis) |
 | output | `sql` | Batch-inserts records into a MySQL or PostgreSQL database, with optional upsert (ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE) for idempotent writes. | [reference](../components/outputs/sql) |
 | output | `stdout` | Writes each message to the console. Useful for debugging and demos. | [reference](../components/outputs/stdout) |
 | processor | `arrow_to_json` | Converts an Arrow RecordBatch into JSON byte payloads (one per row). | [reference](../components/processors/json) |
 | processor | `arrow_to_protobuf` | Serializes Arrow RecordBatches into Protobuf wire-format bytes. | [reference](../components/processors/protobuf) |
-| processor | `batch` | Batches messages by count, size, or time interval before forwarding. | [reference](../components/processors/batch) |
+| processor | `batch` | Batches messages by count with an idle timeout before forwarding. | [reference](../components/processors/batch) |
 | processor | `embedding` | Batch-embeds a text column through an OpenAI-compatible embeddings API and appends the vectors as a FixedSizeList(Float32) column. | [reference](../components/processors/embedding) |
 | processor | `json_to_arrow` | Parses JSON byte payloads into an Arrow RecordBatch with inferred schema. | [reference](../components/processors/json) |
 | processor | `llm` | Sends each row of a text column to an OpenAI-compatible chat completions API and appends the completion as a Utf8 column, with bounded ordered concurrency. | [reference](../components/processors/llm) |

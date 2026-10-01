@@ -25,7 +25,6 @@ use arkflow_core::component::{register_buffer_metadata, ComponentMetadata};
 use arkflow_core::input::{Ack, VecAck};
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
-use datafusion::arrow;
 use datafusion::arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -111,17 +110,24 @@ impl SlidingWindow {
     /// # Returns
     /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if there aren't enough messages to form a window
-    async fn process_slide(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
+    async fn process_slide(
+        &self,
+        force: bool,
+    ) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         let mut queue_lock = self.queue.write().await;
-        if queue_lock.len() < self.config.window_size as usize {
+        if queue_lock.is_empty() {
             return Ok(None);
         }
+        let take = if force {
+            queue_lock.len()
+        } else {
+            if queue_lock.len() < self.config.window_size as usize {
+                return Ok(None);
+            }
+            self.config.window_size as usize
+        };
 
-        let window_messages: Vec<_> = queue_lock
-            .iter()
-            .take(self.config.window_size as usize)
-            .cloned()
-            .collect();
+        let window_messages: Vec<_> = queue_lock.iter().take(take).cloned().collect();
         let size = window_messages.len();
         let mut messages = Vec::with_capacity(size);
         let mut acks = Vec::with_capacity(size);
@@ -135,13 +141,14 @@ impl SlidingWindow {
             return Ok(None);
         }
 
-        let schema = messages[0].schema();
         let batches: Vec<RecordBatch> = messages
-            .into_iter()
-            .map(|batch| (*batch).clone().into())
+            .iter()
+            .map(|batch| (**batch).clone().into())
             .collect();
-        let new_batch = arrow::compute::concat_batches(&schema, &batches)
-            .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
+        // Heterogeneous window batches are normalized to the field union;
+        // a genuine type conflict errors (items are still in the queue, so
+        // nothing is lost on failure).
+        let new_batch = crate::component::batch_merge::normalize_and_concat(&batches)?;
 
         let new_ack = Arc::new(VecAck(acks));
 
@@ -183,10 +190,7 @@ impl Buffer for SlidingWindow {
     /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
-        if self.close.is_cancelled() {
-            return Ok(None);
-        }
-
+        let closed = self.close.is_cancelled();
         loop {
             {
                 let queue_arc = Arc::clone(&self.queue);
@@ -195,14 +199,26 @@ impl Buffer for SlidingWindow {
                 if queue_lock.len() >= self.config.window_size as usize {
                     break;
                 }
-                // If the buffer is closed, return None
+                if queue_lock.is_empty() && self.close.is_cancelled() {
+                    return Ok(None); // closed and drained
+                }
+            }
+            if self.close.is_cancelled() {
+                // Closed: emit the partial window instead of waiting for it
+                // to fill (a missed final notify_waiters must not park the
+                // reader forever either way).
+                break;
             }
             // Wait for notification from timer, write operation, or close
-            let notify = Arc::clone(&self.notify);
-            notify.notified().await;
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = self.close.cancelled() => {}
+            }
         }
-        // Process the current window and slide forward
-        self.process_slide().await
+        // Process the current window and slide forward; `force` flushes the
+        // partial window when closing.
+        self.process_slide(closed || self.close.is_cancelled())
+            .await
     }
 
     /// Flushes the buffer by cancelling the background task and notifying waiters

@@ -137,14 +137,20 @@ impl Output for NatsOutput {
             .as_ref()
             .ok_or_else(|| Error::Connection("NATS client not connected".to_string()))?;
 
-        // Apply codec encoding if configured
-        let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
-        if payloads.is_empty() {
+        // Payload selection: an explicit `value_field` takes the named
+        // column's value per row, otherwise the codec encoding applies.
+        let owned_payloads: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
+            crate::output::payload::field_payloads("nats", &msg, field)?
+        } else {
+            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)
+                .await?
+                .into_iter()
+                .map(|p| p.to_vec())
+                .collect()
+        };
+        if owned_payloads.is_empty() {
             return Ok(());
         }
-
-        // Clone payloads to avoid lifetime issues
-        let owned_payloads: Vec<Vec<u8>> = payloads.into_iter().map(|p| p.to_vec()).collect();
         // Get subject
         let subject = match &self.config.mode {
             Mode::Regular { subject } | Mode::JetStream { subject } => {
@@ -243,8 +249,8 @@ pub fn init() -> Result<(), Error> {
                     "type": "object",
                     "description": "Select regular or JetStream publishing.",
                     "oneOf": [
-                        {"properties": {"type": {"const": "regular"}, "subject": {"type": "string"}}, "required": ["type", "subject"]},
-                        {"properties": {"type": {"const": "jet_stream"}, "stream": {"type": "string"}, "subject": {"type": "string"}}, "required": ["type", "stream", "subject"]}
+                        {"properties": {"type": {"const": "regular"}, "subject": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}}, "required": ["type", "subject"]},
+                        {"properties": {"type": {"const": "jet_stream"}, "stream": {"type": "string"}, "subject": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}}, "required": ["type", "stream", "subject"]}
                     ]
                 },
                 "auth": {"type": "object", "description": "NATS authentication configuration."},
@@ -254,7 +260,7 @@ pub fn init() -> Result<(), Error> {
         }),
     ).with_example(serde_json::json!({
         "url": "nats://localhost:4222",
-        "mode": {"type": "regular", "subject": "events"}
+        "mode": {"type": "regular", "subject": {"type": "value", "value": "events"}}
     })))
 }
 

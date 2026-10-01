@@ -118,10 +118,6 @@ impl Buffer for SessionWindow {
     /// * `Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error>` - The merged message batch and combined acknowledgment,
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
-        if self.close.is_cancelled() {
-            return Ok(None);
-        }
-
         loop {
             {
                 if !self.base_window.queue_is_empty().await {
@@ -133,10 +129,22 @@ impl Buffer for SessionWindow {
                     }
                 }
             }
+            if self.close.is_cancelled() {
+                // Closed: drain whatever is buffered without waiting out the
+                // session gap; an empty queue ends the stream.
+                if self.base_window.queue_is_empty().await {
+                    return Ok(None);
+                }
+                break;
+            }
 
-            // Wait for notification from timer or write operation
-            let notify = Arc::clone(&self.notify);
-            notify.notified().await;
+            // Wait for notification from timer or write operation, racing
+            // with close: a missed final notify_waiters must not park the
+            // reader forever.
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = self.close.cancelled() => {}
+            }
         }
         // Process and return the current session
         self.base_window.process_window().await

@@ -16,10 +16,10 @@
 //!
 //! Receive data from a WebSocket server
 
+use crate::input::codec_helper::Delivery;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
-use crate::input::codec_helper::Delivery;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
@@ -32,7 +32,9 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{
-    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
+    connect_async,
+    tungstenite::{client::IntoClientRequest, protocol::Message},
+    MaybeTlsStream, WebSocketStream,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -94,8 +96,33 @@ impl Input for WebSocketInput {
             Error::Connection(format!("Invalid WebSocket URL {}: {}", self.config.url, e))
         })?;
 
+        // Build the handshake request, carrying the configured headers
+        // (previously parsed but silently dropped from the handshake).
+        let mut request = url.to_string().into_client_request().map_err(|e| {
+            Error::Connection(format!(
+                "Invalid WebSocket request for {}: {}",
+                self.config.url, e
+            ))
+        })?;
+        if let Some(headers) = &self.config.headers {
+            for (name, value) in headers {
+                let header_name =
+                    tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|e| {
+                        Error::Config(format!("Invalid WebSocket header name '{name}': {e}"))
+                    })?;
+                let header_value = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(
+                    value,
+                )
+                .map_err(|e| {
+                    Error::Config(format!("Invalid WebSocket header value for '{name}': {e}"))
+                })?;
+                request.headers_mut().insert(header_name, header_value);
+            }
+        }
+
         // Set up connection timeout if specified
-        let connect_future = connect_async(url.to_string());
+        let connect_future = connect_async(request);
         let connect_result = if let Some(timeout_secs) = self.config.timeout {
             let timeout_duration = std::time::Duration::from_secs(timeout_secs);
             tokio::time::timeout(timeout_duration, connect_future)
@@ -288,9 +315,7 @@ pub fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::codec_helper::contract::{
-        cancel_pending_read_then_expect_delivery, gate,
-    };
+    use crate::input::codec_helper::contract::{cancel_pending_read_then_expect_delivery, gate};
     use arkflow_core::input::Input;
 
     /// Spec "解码进行中的取消不丢消息" (end-to-end): a local WebSocket server
@@ -308,8 +333,10 @@ mod tests {
         let server = tokio::spawn(async move {
             use futures_util::SinkExt;
             let (stream, _) = listener.accept().await.unwrap();
-            let (mut write, _read) =
-                tokio_tungstenite::accept_async(stream).await.unwrap().split();
+            let (mut write, _read) = tokio_tungstenite::accept_async(stream)
+                .await
+                .unwrap()
+                .split();
             write.send(Message::Text("payload".into())).await.unwrap();
             // Keep the server side alive until the client is done.
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
@@ -333,6 +360,64 @@ mod tests {
             .await
             .expect("delivery must survive a cancelled read");
         assert_eq!(batch.len(), 1);
+
+        server.abort();
+    }
+
+    /// Spec "websocket 握手携带配置头": a local server captures the handshake
+    /// request and must observe the configured HTTP headers.
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // the tungstenite callback's error type is fixed by the trait
+    async fn handshake_carries_configured_headers() {
+        use futures_util::SinkExt;
+        use std::sync::mpsc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let callback = move |req: &tokio_tungstenite::tungstenite::http::Request<()>,
+                                 resp: tokio_tungstenite::tungstenite::http::Response<()>|
+                  -> Result<
+                tokio_tungstenite::tungstenite::http::Response<()>,
+                tokio_tungstenite::tungstenite::http::Response<Option<String>>,
+            > {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let _ = tx.send(auth);
+                Ok(resp)
+            };
+            let (mut write, _read) = tokio_tungstenite::accept_hdr_async(stream, callback)
+                .await
+                .unwrap()
+                .split();
+            write.send(Message::Text("hi".into())).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer tok".to_string());
+        let input = WebSocketInput::new(
+            None,
+            WebSocketInputConfig {
+                url: format!("ws://{addr}"),
+                headers: Some(headers),
+                timeout: Some(5),
+            },
+            None,
+        )
+        .unwrap();
+        input.connect().await.unwrap();
+
+        let observed = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("server must observe the handshake");
+        assert_eq!(observed.as_deref(), Some("Bearer tok"));
 
         server.abort();
     }

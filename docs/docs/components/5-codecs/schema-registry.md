@@ -71,7 +71,7 @@ The codec validates the magic byte, splits out the id and payload, then resolves
 
 1. Parse the Confluent wire format (magic + id + payload).
 2. Resolve the schema by id (`GET {registry}/schemas/ids/{id}`), caching it per id. The dispatch target comes from the response's `schemaType`:
-   - `PROTOBUF` (also the default when the field is absent) → build a `MessageDescriptor` and decode the payload via the flat Protobuf→Arrow mapping.
+   - `PROTOBUF` → build a `MessageDescriptor` and decode the payload via the flat Protobuf→Arrow mapping. When `schemaType` is **absent** (older registries), the schema text is detected by content: a JSON object decodes as Avro, anything else as Protobuf. If the text parses as neither, the error names both attempts.
    - `AVRO` → parse the Avro writer schema and decode the payload via the flat Avro→Arrow mapping.
 3. Merge the single-row batches of the request into one columnar batch.
 
@@ -103,12 +103,12 @@ Nested records, arrays, maps and unions with more than two branches are rejected
 
 ### Subject compatibility gate
 
-With `subject` and `min_compatibility` configured, the first decoded message triggers a single `GET {registry}/config/{subject}?defaultToGlobal=true` request. The subject's registered level is ranked (`NONE` < `BACKWARD`/`FORWARD` incl. their `_TRANSITIVE` variants < `FULL` incl. `FULL_TRANSITIVE`); if it is below the configured minimum the stream fails with an error naming the subject, the actual level and the requirement. The verdict (pass or fail) is cached for the codec lifetime, so the config endpoint is hit at most once. This catches compatibility-policy degradation (e.g. a subject switched to `NONE`) at the pipeline instead of silently decoding incompatible future versions.
+With `subject` and `min_compatibility` configured, the first decoded message triggers a single `GET {registry}/config/{subject}?defaultToGlobal=true` request. The subject's registered level is ranked (`NONE` < `BACKWARD`/`FORWARD` incl. their `_TRANSITIVE` variants < `FULL` incl. `FULL_TRANSITIVE`); if it is below the configured minimum the stream fails with an error naming the subject, the actual level and the requirement. A **pass** verdict is cached for the codec lifetime (the endpoint is hit at most once); a **failure** is retried on later decodes no sooner than every 30 seconds — decodes inside that window return the last error without another request — so a transient registry outage does not brick the codec after the registry recovers. This catches compatibility-policy degradation (e.g. a subject switched to `NONE`) at the pipeline instead of silently decoding incompatible future versions.
 
 ## Notes / Non-goals
 
 - Decode-side only: it resolves schemas by id; it never registers new schemas, and encoding emits line-delimited JSON (registry-agnostic).
-- `schemaType` absent in the registry response is treated as `PROTOBUF` (ArkFlow convention kept for backward compatibility; note this differs from the Confluent API default of AVRO).
+- `schemaType` absent from the registry response is resolved by content detection: schema text that is a JSON object decodes as Avro (the original Confluent default — older registries usually omit the field for Avro subjects), any other text as Protobuf. Both old-registry Avro streams and Protobuf streams therefore keep working.
 - Debezium envelope flattening is not performed — payloads are mapped as their registered schema declares; nested envelope structs (`source`, `before`) are rejected by the flat mapping.
 - Protobuf schema references (imports) are not supported — only single-file schemas.
 - Avro decoding uses the writer schema only (no reader-schema resolution), matching the Protobuf path.

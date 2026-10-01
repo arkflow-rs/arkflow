@@ -15,6 +15,8 @@ VRL 处理器使用 Vector Remap Language(VRL)来变换消息——这是一种�
 | statement | string | yes | — | 用于变换每条消息的 VRL 程序。 |
 | timezone | string | no | — | 在程序中解析/格式化时间值时使用的时区(如 `UTC`、`Asia/Shanghai`)。 |
 
+输入列到 VRL 值的映射采用显式报错而非静默丢失:`UInt64` 值超出 `i64::MAX` 时整批报错(VRL 整数是 i64——不再静默回绕为负数);不在支持集合内的列类型(布尔、整数、浮点、utf8/binary、日期、时间戳、null 之外,如 `List`/`Struct`)会报错并指明列名与类型。请先用 `filter_columns` 或 SQL processor 移除这类列。
+
 ## 示例
 
 ```yaml validate=fragment wrap=processors

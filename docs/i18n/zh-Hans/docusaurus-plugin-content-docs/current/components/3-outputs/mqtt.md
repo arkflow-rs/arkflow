@@ -22,7 +22,7 @@ MQTT 输出(Output)将每条消息(Message)发布到 MQTT 代理(Broker)的主�
 | clean_session | boolean | no | — | 是否使用干净会话。 |
 | keep_alive | integer | no | — | 保活间隔(秒)。 |
 | retain | boolean | no | — | 是否在代理上保留该消息。 |
-| value_field | string | no | — | 用作消息载荷的记录字段。 |
+| value_field | string | no | — | 二进制或字符串列,其逐行值作为该条消息的载荷(null 值或缺失列会报错)。未配置时按 codec 编码整批。 |
 
 ### topic
 

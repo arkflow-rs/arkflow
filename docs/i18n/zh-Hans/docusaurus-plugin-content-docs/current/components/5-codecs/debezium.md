@@ -60,6 +60,14 @@ Database → Debezium (Kafka Connect / Debezium Server) → Kafka topic → ArkF
 - CDC 偏移量由 Kafka 输入的 ack 门控偏移量提供(至少一次/at-least-once)。请确保下游输出是幂等的。
 - 当 `op="d"` 时,`after` 为 null,业务字段取自 `before`。
 
+### 与业务字段的同名冲突
+
+若业务数据本身含有名为 `op`、`ts_ms`、`source_db`、`source_table`、`before` 或 `source` 的字段,业务值保留在原列,envelope 元数据值改投保留名 `__debezium_<name>` 列,并每批告警一次。无冲突时元数据列保持既有列名,存量管道不受影响。
+
+### Tombstone
+
+零长度 payload(Debezium tombstone——Kafka 的 null 值消息通常已被 Kafka input 在 codec 之前拦截)会被告警后跳过而不是使整批失败,同批其余消息正常解码。JSON 字面量 `null` 不是 tombstone,维持既有的全 null 行为。
+
 ## 说明 / 非目标
 
 - 不直接连接 MySQL binlog / PostgreSQL 逻辑复制(计划在未来作为独立的输入实现)。
