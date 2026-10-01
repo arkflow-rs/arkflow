@@ -4403,6 +4403,10 @@ mod tests {
     #[tokio::test]
     async fn declared_cpu_runs_on_a_dedicated_bounded_runtime() {
         let _serial = ONE_KERNEL_AT_A_TIME.lock().await;
+        // The component catalogue is process-global: resolve it explicitly
+        // instead of depending on a sibling test having initialized it (a
+        // process-per-test runner like nextest runs this test alone).
+        let _ = arkflow_plugin::initialize();
         let runtime = Arc::new(JobRuntime::default());
         let mut spec_value = serde_json::json!({
             "id": "orders-cpu",

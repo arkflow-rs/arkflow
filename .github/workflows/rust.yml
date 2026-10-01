@@ -1,4 +1,6 @@
-# Faster Rust CI: cache cargo registry/git and target; use stable toolchain; keep PR fast (debug).
+# Faster Rust CI: Swatinem/rust-cache keeps a deps-only target cache that
+# fits the 10GB repo cache quota, debuginfo/incremental stay off to keep
+# artifacts small, and nextest runs the suite.
 name: Rust (fast CI)
 
 on:
@@ -7,9 +9,22 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# A superseded push to the same branch/PR cancels the older run instead of
+# burning 30+ minutes of runner time nobody will look at.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  # CI never reuses incremental artifacts, and they dominated the old ~14GB
+  # target cache: it blew the 10GB repo cache quota, got evicted between
+  # runs, and every run paid a 27-minute cold rebuild plus a 4-minute save.
+  CARGO_INCREMENTAL: 0
+  # Full debuginfo is dead weight in CI; line tables keep backtrace line
+  # numbers while cutting compile/link time and cache size roughly in half.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   build-and-test:
@@ -23,8 +38,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       # The workspace's debug build (--all-targets) plus the restored target
       # cache overflow the runner's ~20GB of free disk: drop the preinstalled
@@ -38,39 +51,17 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h /
 
-      - name: Cache cargo registry & git index
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Cache target dir (per profile)
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-target-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-target-${{ matrix.profile }}-
-            ${{ runner.os }}-cargo-target-
+      # Replaces the previous actions/cache pair: rust-cache keys on the
+      # rustc version + Cargo.lock, caches the cargo home alongside target/,
+      # and strips the workspace's own crates before saving, so the entry
+      # stays a few GB instead of ~14GB and survives the repo cache quota.
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Setup Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          override: true
           components: clippy, rustfmt
-
-      # Optional: enable sccache for larger repos to speed up repeated compilations.
-      # - name: Install and enable sccache
-      #   uses: actions-rs/sccache@v1
-      #   with:
-      #     install: true
-      #     version: latest
-      # After this step, the action will set RUSTC_WRAPPER to sccache automatically.
 
       - name: Install system dependencies (protoc)
         run: |
@@ -92,6 +83,26 @@ jobs:
       - name: Build (debug)
         run: cargo build --workspace --all-targets --verbose
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # nextest runs each test in its own process: better cross-binary
+      # parallelism than cargo test's in-process threads and clearer
+      # failure isolation. Three constraints shape the suite split:
+      # - Job-carrying configs open an embedded redb state store at a fixed
+      #   repo-relative path, so tests validating such configs from the
+      #   repository root must sandbox their working directory (see
+      #   sandboxed_repo_root in docs_snippets_validate.rs) or concurrent
+      #   binaries collide on the database lock.
+      # - arkflow-plugin's broker integration suites (kafka_eos, pulsar_io,
+      #   mongodb_io, nats_io, mqtt_io, ...) share one testcontainers
+      #   container per binary on a fixed host port and rely on
+      #   same-process serial execution, so the whole package stays on
+      #   cargo test, which runs test binaries sequentially and keeps
+      #   future suites of that shape working without workflow edits.
       - name: Run tests
-        # cargo runs tests in parallel by default; adjust flags if you want per-crate parallelism control
-        run: cargo test --workspace --all-targets --verbose
+        run: |
+          cargo nextest run --workspace --all-targets -E 'not package(arkflow-plugin)'
+          cargo test -p arkflow-plugin
