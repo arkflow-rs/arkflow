@@ -90,7 +90,17 @@ jobs:
 
       # nextest runs each test in its own process: better cross-binary
       # parallelism than cargo test's in-process threads and clearer
-      # failure isolation. The suite has no CARGO_BIN_EXE/current_exe
-      # dependencies, so it is a drop-in replacement here.
+      # failure isolation. Two constraints shape the suite split:
+      # - Job-carrying configs open an embedded redb state store at a fixed
+      #   repo-relative path, so tests validating such configs from the
+      #   repository root must sandbox their working directory (see
+      #   sandboxed_repo_root in docs_snippets_validate.rs) or concurrent
+      #   binaries collide on the database lock.
+      # - kafka_eos and pulsar_io share one testcontainers broker per binary
+      #   on a fixed host port and rely on same-process serial execution;
+      #   they stay on cargo test, which runs test binaries sequentially.
       - name: Run tests
-        run: cargo nextest run --workspace --all-targets
+        run: |
+          cargo nextest run --workspace --all-targets \
+            -E 'not binary(kafka_eos) and not binary(pulsar_io)'
+          cargo test -p arkflow-plugin --test kafka_eos --test pulsar_io

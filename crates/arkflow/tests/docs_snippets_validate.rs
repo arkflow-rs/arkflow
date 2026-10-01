@@ -29,8 +29,8 @@
 
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 /// Classifications accepted by this test and by `docs/scripts/docs-check.mjs`.
 const CLASSIFICATIONS: &[&str] = &["full", "fragment", "foreign"];
@@ -53,6 +53,45 @@ fn repo_root() -> PathBuf {
         .expect("repository root resolves")
 }
 
+/// A throwaway working directory that mirrors the repository root through
+/// symlinks — everything except `data/`.
+///
+/// Deep validation constructs job state backends, and the job snippets pin
+/// the state root to the repo-relative `./data/arkflow-state` (the default
+/// when unset resolves there too). Running from the real repository root
+/// takes the shared redb lock: a concurrently running test binary that
+/// touches the same path (any parallel runner such as cargo-nextest) fails
+/// with "Database already open. Cannot acquire lock", and every local run
+/// litters `data/` into the working tree. The mirror keeps auxiliary file
+/// references (`examples/…`, `docs/…`) resolving while writes stay inside
+/// the sandbox.
+#[cfg(unix)]
+fn sandboxed_repo_root() -> PathBuf {
+    use std::os::unix::fs::symlink;
+
+    let root = repo_root();
+    let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+    for entry in std::fs::read_dir(&root).expect("repository root is readable") {
+        let entry = entry.expect("directory entry is readable");
+        if entry.file_name() == "data" {
+            continue;
+        }
+        symlink(entry.path(), sandbox.path().join(entry.file_name()))
+            .unwrap_or_else(|error| panic!("cannot mirror {}: {error}", entry.path().display()));
+    }
+    // The process runs from the sandbox for its whole lifetime; nothing else
+    // needs the handle, so hand the path over without deleting it.
+    sandbox.keep()
+}
+
+/// Directory symlinks need elevated privileges on Windows; keep running from
+/// the real repository root there (test binaries execute sequentially under
+/// cargo test on the supported platforms).
+#[cfg(not(unix))]
+fn sandboxed_repo_root() -> PathBuf {
+    repo_root()
+}
+
 fn docs_root() -> PathBuf {
     repo_root().join("docs/docs")
 }
@@ -63,7 +102,11 @@ fn walk_markdown(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             walk_markdown(&path, out);
-        } else if path.extension().map(|e| e == "md" || e == "mdx").unwrap_or(false) {
+        } else if path
+            .extension()
+            .map(|e| e == "md" || e == "mdx")
+            .unwrap_or(false)
+        {
             out.push(path);
         }
     }
@@ -92,7 +135,11 @@ fn yaml_blocks(text: &str) -> Vec<Block> {
             if !in_fence {
                 in_fence = true;
                 fence_start = index + 1; // 1-based line number of the fence line
-                meta = trimmed.trim_start_matches("```").trim_start_matches("~~~").trim().to_string();
+                meta = trimmed
+                    .trim_start_matches("```")
+                    .trim_start_matches("~~~")
+                    .trim()
+                    .to_string();
                 body.clear();
             } else {
                 in_fence = false;
@@ -135,10 +182,18 @@ fn classify(meta: &str) -> Result<Classification, String> {
             "unknown validate kind 'validate={kind}' (expected full, fragment, or foreign)"
         ));
     }
-    let wrap = meta.split_whitespace().find_map(|token| token.strip_prefix("wrap="));
-    let reason = meta.split_whitespace().find_map(|token| token.strip_prefix("reason="));
+    let wrap = meta
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("wrap="));
+    let reason = meta
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("reason="));
     match kind {
-        "full" => Ok(Classification { kind: kind.into(), wrap: None, reason: None }),
+        "full" => Ok(Classification {
+            kind: kind.into(),
+            wrap: None,
+            reason: None,
+        }),
         "fragment" => {
             let wrap = wrap.ok_or({
                 "validate=fragment requires wrap=<input|output|processors|durability|engine>"
@@ -149,7 +204,11 @@ fn classify(meta: &str) -> Result<Classification, String> {
                     WRAP_KINDS.join(", ")
                 ));
             }
-            Ok(Classification { kind: kind.into(), wrap: Some(wrap.into()), reason: None })
+            Ok(Classification {
+                kind: kind.into(),
+                wrap: Some(wrap.into()),
+                reason: None,
+            })
         }
         _ => {
             let reason = reason
@@ -158,7 +217,11 @@ fn classify(meta: &str) -> Result<Classification, String> {
                 .ok_or({
                     "validate=foreign requires a reason=\"...\" (why this block is not an ArkFlow config)"
                 })?;
-            Ok(Classification { kind: kind.into(), wrap: None, reason: Some(reason) })
+            Ok(Classification {
+                kind: kind.into(),
+                wrap: None,
+                reason: Some(reason),
+            })
         }
     }
 }
@@ -207,7 +270,10 @@ fn wrap_fragment(fragment: &Value, wrap: &str) -> Value {
             }
             // metadata-style snippet: `pipeline: {processors: [...]}`
             Value::Object(map) if map.contains_key("pipeline") => {
-                deep_merge(stream.get_mut("pipeline").expect("stub has pipeline"), &map["pipeline"]);
+                deep_merge(
+                    stream.get_mut("pipeline").expect("stub has pipeline"),
+                    &map["pipeline"],
+                );
             }
             _ => panic!("processors snippet must be a list or a pipeline mapping"),
         },
@@ -226,11 +292,16 @@ fn contains(parent: &Value, child: &Value) -> bool {
         // A null slot cannot hold a structured child — e.g. an Optional
         // section that deserialized as absent.
         (Value::Null, _) => false,
-        (Value::Object(p), Value::Object(c)) => c
-            .iter()
-            .all(|(key, value)| p.get(key).map(|target| contains(target, value)).unwrap_or(false)),
+        (Value::Object(p), Value::Object(c)) => c.iter().all(|(key, value)| {
+            p.get(key)
+                .map(|target| contains(target, value))
+                .unwrap_or(false)
+        }),
         (Value::Array(p), Value::Array(c)) => {
-            p.len() >= c.len() && p.iter().zip(c.iter()).all(|(target, value)| contains(target, value))
+            p.len() >= c.len()
+                && p.iter()
+                    .zip(c.iter())
+                    .all(|(target, value)| contains(target, value))
         }
         _ => true,
     }
@@ -255,7 +326,10 @@ fn containment_target<'a>(wrap: &str, fragment: &Value, parsed: &'a Value) -> &'
 /// Parse and semantically validate a complete engine configuration, mirroring
 /// `--validate` (see examples_validate.rs). Returns the parsed config so
 /// callers can run containment checks.
-fn validate_engine_config(yaml: &str, label: &str) -> Result<arkflow_core::config::EngineConfig, String> {
+fn validate_engine_config(
+    yaml: &str,
+    label: &str,
+) -> Result<arkflow_core::config::EngineConfig, String> {
     let mut temp = tempfile::Builder::new()
         .prefix("arkflow-docs-snippet-")
         .suffix(".yaml")
@@ -265,8 +339,10 @@ fn validate_engine_config(yaml: &str, label: &str) -> Result<arkflow_core::confi
         .map_err(|e| format!("{label}: cannot write temp file: {e}"))?;
     let path = temp.path().to_path_buf();
 
-    let config = arkflow_core::config::EngineConfig::from_file(path.to_str().expect("temp path is valid UTF-8"))
-        .map_err(|e| format!("{label}: failed to load configuration: {e}"))?;
+    let config = arkflow_core::config::EngineConfig::from_file(
+        path.to_str().expect("temp path is valid UTF-8"),
+    )
+    .map_err(|e| format!("{label}: failed to load configuration: {e}"))?;
     config
         .stream_ids()
         .map_err(|e| format!("{label}: stream id check failed: {e}"))?;
@@ -292,8 +368,10 @@ async fn docs_yaml_snippets_validate() {
     arkflow_plugin::initialize().expect("component catalogue registers");
 
     // Snippets may reference auxiliary files relative to the repository root,
-    // matching how users run the binary from there.
-    std::env::set_current_dir(repo_root()).expect("chdir to repository root");
+    // matching how users run the binary from there. The symlink mirror keeps
+    // those references resolving while isolating the shared redb state path
+    // from concurrent test binaries.
+    std::env::set_current_dir(sandboxed_repo_root()).expect("chdir to sandboxed repository root");
 
     let mut files = Vec::new();
     walk_markdown(&docs_root(), &mut files);
@@ -374,7 +452,10 @@ async fn docs_yaml_snippets_validate() {
         "documentation snippet validation failed (checked {checked} yaml blocks):\n{}",
         failures.join("\n")
     );
-    assert!(checked > 0, "no yaml blocks were discovered under docs/docs — the walk is broken");
+    assert!(
+        checked > 0,
+        "no yaml blocks were discovered under docs/docs — the walk is broken"
+    );
 }
 
 /// The classification vocabulary in `docs/scripts/docs-check.mjs` must stay
@@ -382,9 +463,8 @@ async fn docs_yaml_snippets_validate() {
 /// rejects. The sets are parsed out of the Node source to fail loudly.
 #[test]
 fn node_gate_vocabulary_is_in_sync() {
-    let source =
-        std::fs::read_to_string(repo_root().join("docs/scripts/docs-check.mjs"))
-            .expect("docs-check.mjs is readable");
+    let source = std::fs::read_to_string(repo_root().join("docs/scripts/docs-check.mjs"))
+        .expect("docs-check.mjs is readable");
 
     fn parse_set(source: &str, name: &str) -> BTreeSet<String> {
         let anchor = format!("{name} = new Set([");
