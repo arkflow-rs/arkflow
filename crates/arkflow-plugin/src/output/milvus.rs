@@ -705,4 +705,162 @@ mod tests {
             .unwrap();
         Arc::new(MessageBatch::new_arrow(batch))
     }
+
+    /// A 2-row batch with a 2-dim vector column and the id column of the
+    /// caller's choosing (added by `id_array`).
+    fn vector_batch_with_id(name: &str, id_array: ArrayRef, id_type: DataType) -> MessageBatchRef {
+        let dim = 2i32;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let flat = Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0]);
+        let vectors = Arc::new(FixedSizeListArray::new(item_field, dim, Arc::new(flat), None));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(name, id_type, true),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
+        ]));
+        Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(schema, vec![id_array, vectors]).unwrap(),
+        ))
+    }
+
+    fn last_body(mock: &MockMilvus) -> Value {
+        let (_, body) = mock.last_request();
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_and_close_are_no_ops() {
+        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
+        output.connect().await.unwrap();
+        output.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_headers_are_sent() {
+        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
+        let output = build_output(base_config(
+            mock.addr(),
+            serde_json::json!({"headers": {"x-trace-id": "abc123"}}),
+        ));
+        output.write(sample_batch()).await.unwrap();
+        let (head, _) = mock.last_request();
+        assert!(head.to_ascii_lowercase().contains("x-trace-id: abc123"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn unreachable_server_maps_to_connection_error_without_retry() {
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let output = build_output(base_config(addr, serde_json::json!({"retry_count": 0})));
+        let error = output.write(sample_batch()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("Milvus request failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn int32_and_utf8_id_columns_are_supported() {
+        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
+
+        let int32 = build_output(base_config(mock.addr(), serde_json::json!({"id_field": "doc_id"})));
+        int32
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![7, 8])),
+                DataType::Int32,
+            ))
+            .await
+            .unwrap();
+        let body = last_body(&mock);
+        assert_eq!(body["data"][0]["doc_id"], 7);
+        assert_eq!(body["data"][1]["doc_id"], 8);
+
+        let utf8 = build_output(base_config(mock.addr(), serde_json::json!({"id_field": "doc_id"})));
+        utf8.write(vector_batch_with_id(
+            "doc_id",
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+            DataType::Utf8,
+        ))
+        .await
+        .unwrap();
+        let body = last_body(&mock);
+        assert_eq!(body["data"][0]["doc_id"], "a");
+        assert_eq!(body["data"][1]["doc_id"], "b");
+
+        let large = build_output(base_config(mock.addr(), serde_json::json!({"id_field": "doc_id"})));
+        large
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(LargeStringArray::from(vec![Some("x"), Some("y")])),
+                DataType::LargeUtf8,
+            ))
+            .await
+            .unwrap();
+        let body = last_body(&mock);
+        assert_eq!(body["data"][0]["doc_id"], "x");
+    }
+
+    #[tokio::test]
+    async fn null_id_value_errors() {
+        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
+        let error = output
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![Some(1), None])),
+                DataType::Int64,
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("null value at row 1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn missing_and_unsupported_id_columns_error() {
+        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
+        // Missing column.
+        let output = build_output(base_config(mock.addr(), serde_json::json!({"id_field": "nope"})));
+        let error = output.write(sample_batch()).await.unwrap_err().to_string();
+        assert!(error.contains("column 'nope' not found"), "{error}");
+
+        // Unsupported id type.
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
+        let error = output
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(datafusion::arrow::array::Float64Array::from(vec![1.0, 2.0])),
+                DataType::Float64,
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must be Int64/Int32 or Utf8"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_is_an_empty_object_without_payload_columns() {
+        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
+        let output = build_output(base_config(mock.addr(), serde_json::json!({})));
+        output
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![1, 2])),
+                DataType::Int64,
+            ))
+            .await
+            .unwrap();
+        let body = last_body(&mock);
+        for row in body["data"].as_array().unwrap() {
+            assert_eq!(row["payload"], serde_json::json!({}));
+            assert!(row.get("embedding").is_some());
+        }
+    }
 }

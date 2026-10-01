@@ -1,55 +1,18 @@
-use arkflow_server::{
-    hub::{Hub, HubConfig},
-    oidc::OidcFederation,
-    serve_hub,
-    storage::{migrate_tool, ControlPlaneStore, StorageActor},
-    ServerConfig,
-};
+use arkflow_server::bootstrap;
+use arkflow_server::hub::{HubConfig, HubHaConfig};
+use arkflow_server::ServerConfig;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // `arkflow-server migrate --from sqlite:<path> --to postgres:<url>`:
-    // one-shot offline storage migration (see the hub-ha deployment docs).
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("migrate") {
-        let mut from: Option<String> = None;
-        let mut to: Option<String> = None;
-        let mut current: Option<&mut Option<String>> = None;
-        for arg in args {
-            match arg.as_str() {
-                "--from" => current = Some(&mut from),
-                "--to" => current = Some(&mut to),
-                _ => {
-                    if let Some(slot) = current.as_deref_mut() {
-                        *slot = Some(arg);
-                    }
-                }
-            }
+        let rest: Vec<String> = args.collect();
+        let mut stderr = |message: String| eprintln!("{message}");
+        let code = bootstrap::run_migrate(&rest, &mut stderr).await?;
+        if code != 0 {
+            std::process::exit(code);
         }
-        let (Some(from), Some(to)) = (from, to) else {
-            eprintln!("usage: arkflow-server migrate --from sqlite:<path> --to postgres:<url>");
-            std::process::exit(2);
-        };
-        let Some(sqlite_path) = from.strip_prefix("sqlite:") else {
-            eprintln!("--from must start with sqlite: (got {from})");
-            std::process::exit(2);
-        };
-        if !(to.starts_with("postgres://") || to.starts_with("postgresql://")) {
-            eprintln!("--to must start with postgres:// or postgresql:// (got {to})");
-            std::process::exit(2);
-        }
-        let postgres_url = to;
-        let report = migrate_tool::migrate_sqlite_to_postgres(sqlite_path, &postgres_url)
-            .await
-            .map_err(|error| {
-                eprintln!("migration failed: {error}");
-                error
-            })?;
-        for (table, rows) in &report.rows_per_table {
-            eprintln!("{table}: {rows} rows");
-        }
-        eprintln!("migration complete: {} rows total", report.total_rows());
         return Ok(());
     }
 
@@ -70,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tls_key: std::env::var("ARKFLOW_HUB_TLS_KEY").ok(),
         ..ServerConfig::default()
     };
-    let ha = arkflow_server::hub::HubHaConfig {
+    let ha = HubHaConfig {
         enabled: std::env::var("ARKFLOW_HUB_HA_ENABLED")
             .ok()
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
@@ -81,24 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .unwrap_or(15_000),
         holder_id: std::env::var("ARKFLOW_HUB_HA_HOLDER_ID").ok(),
     };
-    if ha.enabled {
-        if config.hub_storage.is_none() {
-            return Err(
-                "ARKFLOW_HUB_HA_ENABLED requires ARKFLOW_HUB_STORAGE (use a PostgreSQL URL for multi-instance HA)"
-                    .into(),
-            );
-        }
-        let is_postgres = config
-            .hub_storage
-            .as_deref()
-            .is_some_and(|value| value.starts_with("postgres://") || value.starts_with("postgresql://"));
-        if !is_postgres {
-            tracing::warn!(
-                "HA election is enabled on a SQLite store: multi-instance HA requires the \
-                 PostgreSQL backend; this configuration is for development and testing only"
-            );
-        }
-    }
+    bootstrap::validate_ha_config(&ha, &config).map_err(|message| {
+        eprintln!("{message}");
+        message
+    })?;
     let hub_config = HubConfig {
         operator_token: std::env::var("ARKFLOW_OPERATOR_TOKEN").ok(),
         node_token: config.node_token.clone(),
@@ -107,14 +56,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         poll_interval_ms: config.poll_interval_ms,
         session_ttl_ms: config.session_ttl_ms,
     };
-    let mut hub = if let Some(path) = config.hub_storage.as_deref() {
-        let store = ControlPlaneStore::open(path).await?;
-        Hub::with_storage(hub_config, StorageActor::start(store, 128)).with_ha(ha)
-    } else {
-        Hub::new(hub_config).with_ha(ha)
-    };
-    if let Some(oidc) = OidcFederation::from_env().await {
-        hub = hub.with_oidc(oidc);
-    }
-    serve_hub(hub, config, cancellation).await
+    bootstrap::serve_from_config(hub_config, config, ha, cancellation).await
 }

@@ -909,4 +909,179 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_numeric_boolean_date_and_timestamp_columns_roundtrip() -> Result<(), Error> {
+        let processor = build_processor(".")?;
+        use datafusion::arrow::array::{
+            BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int16Array,
+            Int8Array, Int32Array, TimestampMillisecondArray, UInt16Array, UInt32Array,
+            UInt64Array, UInt8Array,
+        };
+        let fields = vec![
+            Field::new("b", DataType::Boolean, true),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("i16", DataType::Int16, true),
+            Field::new("i8", DataType::Int8, true),
+            Field::new("u64", DataType::UInt64, true),
+            Field::new("u32", DataType::UInt32, true),
+            Field::new("u16", DataType::UInt16, true),
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("d32", DataType::Date32, true),
+            Field::new("d64", DataType::Date64, true),
+            Field::new("null", DataType::Null, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+        ];
+        let schema = Arc::new(Schema::new(fields));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(BooleanArray::from(vec![Some(true)])),
+            Arc::new(Float64Array::from(vec![Some(1.5)])),
+            Arc::new(Float32Array::from(vec![Some(2.5f32)])),
+            Arc::new(Int32Array::from(vec![Some(-7)])),
+            Arc::new(Int16Array::from(vec![Some(-8)])),
+            Arc::new(Int8Array::from(vec![Some(-9)])),
+            Arc::new(UInt64Array::from(vec![Some(u64::MAX / 2)])),
+            Arc::new(UInt32Array::from(vec![Some(7u32)])),
+            Arc::new(UInt16Array::from(vec![Some(8u16)])),
+            Arc::new(UInt8Array::from(vec![Some(9u8)])),
+            Arc::new(Date32Array::from(vec![Some(19_000)])),
+            Arc::new(Date64Array::from(vec![Some(1_700_000_000_000)])),
+            Arc::new(datafusion::arrow::array::NullArray::new(1)),
+            Arc::new(TimestampMillisecondArray::from(vec![Some(1_700_000_000_000)])),
+        ];
+        let rb = RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let result = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?;
+        match result {
+            ProcessResult::Single(b) => {
+                assert_eq!(b.num_rows(), 1);
+                // Booleans stay booleans through the VRL value model.
+                assert_eq!(b.column(0).data_type(), &DataType::Boolean);
+                // Timestamps travel through the VRL datetime model; the
+                // column survives (as text) rather than being dropped.
+                assert!(b.num_columns() >= 14);
+            }
+            _ => panic!("expected single result"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn builder_rejects_missing_config_and_bad_statement() {
+        let Err(missing) = VrlProcessorBuilder.build(None, &None, &test_resource()) else {
+            panic!("missing config must be rejected");
+        };
+        assert!(missing.to_string().contains("configuration is missing"));
+
+        let Err(bad) = VrlProcessorBuilder.build(
+            None,
+            &Some(json!({ "statement": "this is ((( not vrl" })),
+            &test_resource(),
+        ) else {
+            panic!("an uncompilable statement must be rejected");
+        };
+        assert!(bad.to_string().contains("compile"), "{bad}");
+    }
+
+    #[test]
+    fn timezone_configuration_accepts_valid_and_falls_back_on_invalid() {
+        let valid = VrlProcessorBuilder
+            .build(
+                None,
+                &Some(json!({ "statement": ".", "timezone": "Asia/Shanghai" })),
+                &test_resource(),
+            )
+            .unwrap();
+        drop(valid);
+        // An invalid timezone logs a warning and falls back to the default.
+        let fallback = VrlProcessorBuilder
+            .build(
+                None,
+                &Some(json!({ "statement": ".", "timezone": "Not/A_Zone" })),
+                &test_resource(),
+            )
+            .unwrap();
+        drop(fallback);
+    }
+
+    #[tokio::test]
+    async fn empty_input_batch_produces_process_result_none() -> Result<(), Error> {
+        let processor = build_processor(".")?;
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::Schema;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        let arr = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        match processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?
+        {
+            ProcessResult::None => Ok(()),
+            _ => panic!("an empty batch must produce ProcessResult::None"),
+        }
+    }
+
+    #[tokio::test]
+    async fn array_output_splits_into_rows_and_multiple_batches() -> Result<(), Error> {
+        // One input row whose statement yields an array of two objects:
+        // the output becomes two rows (single batch).
+        let processor = build_processor("[{ \"v\": .v }, { \"v\": .v }]")?;
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::Schema;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let arr = Arc::new(Int64Array::from(vec![Some(21)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        match processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?
+        {
+            ProcessResult::Single(b) => assert_eq!(b.num_rows(), 2),
+            other => panic!("expected single split batch, got {other:?}"),
+        }
+
+        // Two input rows each keeping their own object: Multiple batches.
+        let processor = build_processor(".")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let arr = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        match processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?
+        {
+            ProcessResult::Multiple(batches) => assert_eq!(batches.len(), 2),
+            other => panic!("expected multiple batches, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_uint64_beyond_i64_max_fails_loud() -> Result<(), Error> {
+        let processor = build_processor(".")?;
+        use datafusion::arrow::array::UInt64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("big", DataType::UInt64, true)]));
+        let arr = Arc::new(UInt64Array::from(vec![Some(u64::MAX)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let err = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await
+            .unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("exceeds i64::MAX"),
+            "overflow must fail loudly, got: {message}"
+        );
+        Ok(())
+    }
 }

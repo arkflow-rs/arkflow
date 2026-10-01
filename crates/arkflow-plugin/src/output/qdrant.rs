@@ -683,4 +683,218 @@ mod tests {
             );
         }
     }
+
+    /// A 2-row batch with a 2-dim vector column plus the id column of the
+    /// caller's choosing.
+    fn vector_batch_with_id(name: &str, id_array: ArrayRef, id_type: DataType) -> MessageBatchRef {
+        let dim = 2i32;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let flat = Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0]);
+        let vectors = Arc::new(FixedSizeListArray::new(item_field, dim, Arc::new(flat), None));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(name, id_type, true),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
+        ]));
+        Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(schema, vec![id_array, vectors]).unwrap(),
+        ))
+    }
+
+    fn last_body(mock: &MockQdrant) -> Value {
+        let (_, body) = mock.last_request();
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_and_close_are_no_ops() {
+        let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
+        let output = build_output(base_config(mock.addr, serde_json::json!({})));
+        output.connect().await.unwrap();
+        output.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_headers_are_sent() {
+        let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
+        let output = build_output(base_config(
+            mock.addr,
+            serde_json::json!({"headers": {"x-trace-id": "abc123"}}),
+        ));
+        output.write(sample_batch()).await.unwrap();
+        let (head, _) = mock.last_request();
+        assert!(head.to_ascii_lowercase().contains("x-trace-id: abc123"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn unreachable_server_maps_to_connection_error_without_retry() {
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let output = build_output(base_config(addr, serde_json::json!({"retry_count": 0})));
+        let error = output.write(sample_batch()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("Qdrant request failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn int32_and_large_utf8_ids_are_supported() {
+        let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
+
+        let int32 = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        int32
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![7, 8])),
+                DataType::Int32,
+            ))
+            .await
+            .unwrap();
+        let body = last_body(&mock);
+        assert_eq!(body["points"][0]["id"], 7);
+        assert_eq!(body["points"][1]["id"], 8);
+
+        let large = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        large
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(LargeStringArray::from(vec![Some("x"), Some("y")])),
+                DataType::LargeUtf8,
+            ))
+            .await
+            .unwrap();
+        let body = last_body(&mock);
+        assert_eq!(body["points"][0]["id"], "x");
+        assert_eq!(body["points"][1]["id"], "y");
+    }
+
+    #[tokio::test]
+    async fn null_and_negative_ids_error() {
+        let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
+
+        let output = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let error = output
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(Int64Array::from(vec![Some(1), None])),
+                DataType::Int64,
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("null value at row 1"), "{error}");
+
+        let output = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let error = output
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(Int64Array::from(vec![-5, 2])),
+                DataType::Int64,
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("negative value"), "{error}");
+
+        let output = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let error = output
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![-5, 2])),
+                DataType::Int32,
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("negative value"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unsupported_id_type_errors() {
+        let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
+        let output = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let error = output
+            .write(vector_batch_with_id(
+                "doc_id",
+                Arc::new(datafusion::arrow::array::Float64Array::from(vec![1.0, 2.0])),
+                DataType::Float64,
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must be Int64/Int32 or Utf8"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_fields_referencing_missing_column_errors() {
+        let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
+        let output = build_output(base_config(
+            mock.addr,
+            serde_json::json!({"payload_fields": ["nope"]}),
+        ));
+        let error = output.write(sample_batch()).await.unwrap_err().to_string();
+        assert!(
+            error.contains("payload column 'nope' not found"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_defaults_to_empty_object_without_payload_columns() {
+        let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
+        let output = build_output(base_config(mock.addr, serde_json::json!({})));
+
+        // Vector-only batch: no id and no payload columns remain, so every
+        // point carries an empty payload object and a generated UUID id.
+        let dim = 2i32;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let flat = Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0]);
+        let vectors = Arc::new(FixedSizeListArray::new(item_field, dim, Arc::new(flat), None));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            true,
+        )]));
+        let batch = Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(schema, vec![vectors]).unwrap(),
+        ));
+
+        output.write(batch).await.unwrap();
+        let body = last_body(&mock);
+        for point in body["points"].as_array().unwrap() {
+            assert_eq!(point["payload"], serde_json::json!({}));
+            assert!(point["vector"].is_array());
+            assert!(point["id"].is_string(), "generated UUID id expected");
+        }
+    }
+
+    #[test]
+    fn random_uuid_v4_has_version_and_variant_nibbles() {
+        for _ in 0..64 {
+            let uuid = random_uuid_v4();
+            assert_eq!(uuid.len(), 36, "{uuid}");
+            let parts: Vec<&str> = uuid.split('-').collect();
+            assert_eq!(
+                parts.iter().map(|part| part.len()).collect::<Vec<_>>(),
+                vec![8, 4, 4, 4, 12],
+                "{uuid}"
+            );
+            assert!(uuid.is_ascii(), "{uuid}");
+            // version 4 nibble
+            assert_eq!(uuid.as_bytes()[14], b'4', "{uuid}");
+            // RFC 4122 variant nibble
+            assert!(
+                matches!(uuid.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
+                "{uuid}"
+            );
+        }
+        // Basic uniqueness sanity.
+        assert_ne!(random_uuid_v4(), random_uuid_v4());
+    }
 }

@@ -222,6 +222,7 @@ mod tests {
         connects: AtomicUsize,
         closes: AtomicUsize,
         fail_connect: bool,
+        fail_close: bool,
     }
 
     #[async_trait]
@@ -241,6 +242,9 @@ mod tests {
         }
         async fn close(&self) -> Result<(), Error> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_close {
+                return Err(Error::Connection("injected temporary close failure".into()));
+            }
             Ok(())
         }
     }
@@ -248,12 +252,17 @@ mod tests {
     struct RecordingInput {
         connects: AtomicUsize,
         closes: AtomicUsize,
+        fail_connect: bool,
+        fail_close: bool,
     }
 
     #[async_trait]
     impl Input for RecordingInput {
         async fn connect(&self) -> Result<(), Error> {
             self.connects.fetch_add(1, Ordering::SeqCst);
+            if self.fail_connect {
+                return Err(Error::Connection("injected source failure".into()));
+            }
             Ok(())
         }
         async fn read(
@@ -263,6 +272,9 @@ mod tests {
         }
         async fn close(&self) -> Result<(), Error> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_close {
+                return Err(Error::Connection("injected source close failure".into()));
+            }
             Ok(())
         }
     }
@@ -271,6 +283,7 @@ mod tests {
         connects: AtomicUsize,
         closes: AtomicUsize,
         fail_connect: bool,
+        fail_close: bool,
     }
 
     #[async_trait]
@@ -287,6 +300,76 @@ mod tests {
         }
         async fn close(&self) -> Result<(), Error> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_close {
+                return Err(Error::Connection("injected sink close failure".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// State backend double delegating to the real in-memory backend so the
+    /// guard exercises the production `StateBackend` object path while
+    /// counting (and optionally failing) `close`.
+    struct RecordingState {
+        inner: crate::state::InMemoryStateBackend,
+        closes: AtomicUsize,
+        fail_close: bool,
+    }
+
+    impl RecordingState {
+        fn new() -> Self {
+            Self {
+                inner: crate::state::InMemoryStateBackend::new(1).unwrap(),
+                closes: AtomicUsize::new(0),
+                fail_close: false,
+            }
+        }
+    }
+
+    impl StateBackend for RecordingState {
+        fn format_version(&self) -> u32 {
+            self.inner.format_version()
+        }
+        fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            self.inner.get(namespace, key)
+        }
+        fn put_with_ttl(
+            &self,
+            namespace: &str,
+            key: &[u8],
+            value: &[u8],
+            ttl_ms: Option<u64>,
+            now_ms: u64,
+        ) -> Result<(), Error> {
+            self.inner
+                .put_with_ttl(namespace, key, value, ttl_ms, now_ms)
+        }
+        fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+            self.inner.update_i64(namespace, key, delta)
+        }
+        fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+            self.inner.delete(namespace, key)
+        }
+        fn purge_expired(&self, now_ms: u64) -> Result<u64, Error> {
+            self.inner.purge_expired(now_ms)
+        }
+        fn scan(&self, namespace: &str) -> Result<Vec<crate::state::StateEntry>, Error> {
+            self.inner.scan(namespace)
+        }
+        fn snapshot_at(&self, now_ms: u64) -> Result<crate::state::StateSnapshot, Error> {
+            self.inner.snapshot_at(now_ms)
+        }
+        fn restore(&self, snapshot: &crate::state::StateSnapshot) -> Result<(), Error> {
+            self.inner.restore(snapshot)
+        }
+        fn metrics(&self) -> Result<crate::state::StateMetrics, Error> {
+            self.inner.metrics()
+        }
+        fn close(&self) -> Result<(), Error> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_close {
+                return Err(Error::Connection("injected state close failure".into()));
+            }
             Ok(())
         }
     }
@@ -296,20 +379,9 @@ mod tests {
     // slices rely on array-literal trait coercion instead of from_ref.
     #[allow(clippy::cloned_ref_to_slice_refs)]
     async fn connects_in_dependency_order_and_closes_in_reverse() {
-        let temporary = Arc::new(RecordingTemporary {
-            connects: AtomicUsize::new(0),
-            closes: AtomicUsize::new(0),
-            fail_connect: false,
-        });
-        let source = Arc::new(RecordingInput {
-            connects: AtomicUsize::new(0),
-            closes: AtomicUsize::new(0),
-        });
-        let sink = Arc::new(RecordingOutput {
-            connects: AtomicUsize::new(0),
-            closes: AtomicUsize::new(0),
-            fail_connect: false,
-        });
+        let temporary = recording_temporary(false, false);
+        let source = recording_input(false, false);
+        let sink = recording_output(false, false);
         let guard = JobResourceGuard::connect(
             &[temporary.clone()],
             &[source.clone()],
@@ -337,20 +409,9 @@ mod tests {
     // slices rely on array-literal trait coercion instead of from_ref.
     #[allow(clippy::cloned_ref_to_slice_refs)]
     async fn partial_connect_failure_cleans_up_in_reverse_order() {
-        let temporary = Arc::new(RecordingTemporary {
-            connects: AtomicUsize::new(0),
-            closes: AtomicUsize::new(0),
-            fail_connect: false,
-        });
-        let source = Arc::new(RecordingInput {
-            connects: AtomicUsize::new(0),
-            closes: AtomicUsize::new(0),
-        });
-        let failing_sink = Arc::new(RecordingOutput {
-            connects: AtomicUsize::new(0),
-            closes: AtomicUsize::new(0),
-            fail_connect: true,
-        });
+        let temporary = recording_temporary(false, false);
+        let source = recording_input(false, false);
+        let failing_sink = recording_output(true, false);
         let result = JobResourceGuard::connect(
             &[temporary.clone()],
             &[source.clone()],
@@ -365,5 +426,216 @@ mod tests {
         // The failing connector itself may have acquired resources before
         // returning its error, so it is closed as part of startup cleanup.
         assert_eq!(failing_sink.closes.load(Ordering::SeqCst), 1);
+    }
+
+    fn recording_temporary(fail_connect: bool, fail_close: bool) -> Arc<RecordingTemporary> {
+        Arc::new(RecordingTemporary {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+            fail_connect,
+            fail_close,
+        })
+    }
+
+    fn recording_input(fail_connect: bool, fail_close: bool) -> Arc<RecordingInput> {
+        Arc::new(RecordingInput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+            fail_connect,
+            fail_close,
+        })
+    }
+
+    fn recording_output(fail_connect: bool, fail_close: bool) -> Arc<RecordingOutput> {
+        Arc::new(RecordingOutput {
+            connects: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+            fail_connect,
+            fail_close,
+        })
+    }
+
+    fn recording_state() -> Arc<RecordingState> {
+        Arc::new(RecordingState::new())
+    }
+
+    /// A temporary failing to connect still closes the state backends that
+    /// were registered before it, so an eager redb handle cannot leak its
+    /// exclusive lock across a failed startup.
+    #[tokio::test]
+    #[allow(clippy::cloned_ref_to_slice_refs)]
+    async fn temporary_connect_failure_closes_already_registered_states() {
+        let state = recording_state();
+        let failing_temporary = recording_temporary(true, false);
+        let result = JobResourceGuard::connect(
+            &[failing_temporary.clone()],
+            &[],
+            &[],
+            &[("job".to_string(), state.clone())],
+        )
+        .await;
+        let error = result
+            .err()
+            .expect("temporary connect failure must fail the guard");
+        assert!(error.to_string().contains("injected temporary failure"));
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(failing_temporary.closes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A source failing to connect closes the temporaries connected before it.
+    #[tokio::test]
+    #[allow(clippy::cloned_ref_to_slice_refs)]
+    async fn source_connect_failure_closes_earlier_temporaries() {
+        let temporary = recording_temporary(false, false);
+        let failing_source = recording_input(true, false);
+        let result =
+            JobResourceGuard::connect(&[temporary.clone()], &[failing_source.clone()], &[], &[])
+                .await;
+        assert!(result.is_err());
+        assert_eq!(temporary.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(failing_source.closes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A connector whose connect fails AND whose close fails surfaces the
+    /// connect error; the close failure is logged, not swallowed into the
+    /// returned error.
+    #[tokio::test]
+    #[allow(clippy::cloned_ref_to_slice_refs)]
+    async fn connect_failure_with_failing_close_still_reports_the_connect_error() {
+        let failing_temporary = recording_temporary(true, true);
+        let error = JobResourceGuard::connect(&[failing_temporary], &[], &[], &[])
+            .await
+            .err()
+            .expect("connect failure must surface");
+        assert!(
+            error.to_string().contains("injected temporary failure"),
+            "{error}"
+        );
+    }
+
+    /// The recovery path registers states and temporaries without connecting
+    /// them; close still reaches everything in reverse order.
+    #[tokio::test]
+    #[allow(clippy::cloned_ref_to_slice_refs)]
+    async fn attach_shutdown_only_closes_states_and_temporaries_in_reverse_order() {
+        let state = recording_state();
+        let temporary = recording_temporary(false, false);
+        let guard = JobResourceGuard::attach_shutdown_only(
+            &[temporary.clone()],
+            &[("job".to_string(), state.clone())],
+        );
+        assert_eq!(temporary.connects.load(Ordering::SeqCst), 0);
+        guard.close().await.unwrap();
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(temporary.closes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Closing a resource of every kind surfaces the first close error while
+    /// still closing the remaining resources.
+    #[tokio::test]
+    #[allow(clippy::cloned_ref_to_slice_refs)]
+    async fn close_failures_are_aggregated_and_every_resource_is_still_closed() {
+        let state = Arc::new(RecordingState {
+            inner: crate::state::InMemoryStateBackend::new(1).unwrap(),
+            closes: AtomicUsize::new(0),
+            fail_close: true,
+        });
+        let temporary = recording_temporary(false, true);
+        let source = recording_input(false, true);
+        let sink = recording_output(false, true);
+        let guard = JobResourceGuard::connect(
+            &[temporary.clone()],
+            &[source.clone()],
+            &[sink.clone()],
+            &[("job".to_string(), state.clone())],
+        )
+        .await
+        .unwrap();
+        let error = guard
+            .close()
+            .await
+            .expect_err("close failures must surface");
+        // Every close failed: the aggregated error is one of the injected ones.
+        assert!(error.to_string().contains("injected"), "{error}");
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(temporary.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(source.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.closes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Handing stream resources off leaves states and temporaries owned by
+    /// the guard so a later close still releases them.
+    #[tokio::test]
+    #[allow(clippy::cloned_ref_to_slice_refs)]
+    async fn hand_off_stream_resources_keeps_states_and_temporaries_for_shutdown() {
+        let state = recording_state();
+        let temporary = recording_temporary(false, false);
+        let source = recording_input(false, false);
+        let sink = recording_output(false, false);
+        let guard = JobResourceGuard::connect(
+            &[temporary.clone()],
+            &[source.clone()],
+            &[sink.clone()],
+            &[("job".to_string(), state.clone())],
+        )
+        .await
+        .unwrap();
+        guard.hand_off_stream_resources();
+        // The chains now own the source and sink: a guard close must not
+        // double-close them.
+        guard.close().await.unwrap();
+        assert_eq!(source.closes.load(Ordering::SeqCst), 0);
+        assert_eq!(sink.closes.load(Ordering::SeqCst), 0);
+        assert_eq!(temporary.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+    }
+
+    /// The recording doubles' remaining trait methods are exercised so the
+    /// doubles themselves stay fully covered.
+    #[tokio::test]
+    async fn recording_doubles_expose_working_trait_defaults() {
+        let temporary = recording_temporary(false, false);
+        assert!(temporary
+            .get(&[])
+            .await
+            .expect("temporary get must succeed")
+            .is_none());
+        let input = recording_input(false, false);
+        assert!(input.read().await.is_err());
+        let output = recording_output(false, false);
+        let batch = datafusion::arrow::record_batch::RecordBatch::try_from_iter(vec![(
+            "value",
+            std::sync::Arc::new(datafusion::arrow::array::Int64Array::from(vec![1]))
+                as std::sync::Arc<dyn datafusion::arrow::array::Array>,
+        )])
+        .unwrap();
+        output
+            .write(std::sync::Arc::new(crate::MessageBatch::new_arrow(batch)))
+            .await
+            .unwrap();
+    }
+
+    /// The state double delegates every backend method to the real in-memory
+    /// backend; keep each delegation exercised so the double itself stays
+    /// fully covered.
+    #[tokio::test]
+    async fn recording_state_double_delegates_every_backend_method() {
+        let state = recording_state();
+        assert_eq!(state.format_version(), 1);
+        assert!(state.get("ns", b"key").unwrap().is_none());
+        state
+            .put_with_ttl("ns", b"key", b"value", None, 0)
+            .unwrap();
+        assert_eq!(state.get("ns", b"key").unwrap().as_deref(), Some(b"value".as_slice()));
+        assert_eq!(state.update_i64("ns", b"counter", 2).unwrap(), 2);
+        assert!(!state.scan("ns").unwrap().is_empty());
+        assert!(state.delete("ns", b"key").unwrap());
+        assert_eq!(state.purge_expired(0).unwrap(), 0);
+        let snapshot = state.snapshot_at(0).unwrap();
+        assert!(snapshot.verify());
+        state.restore(&snapshot).unwrap();
+        let _ = state.metrics().unwrap();
+        state.close().unwrap();
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
     }
 }

@@ -785,6 +785,59 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
+    fn base_output_config() -> serde_json::Value {
+        serde_json::json!({
+            "brokers": ["127.0.0.1:9092"],
+            "topic": {"type": "value", "value": "events"},
+        })
+    }
+
+    #[test]
+    fn compression_display_and_config_knobs_round_trip() {
+        assert_eq!(CompressionType::None.to_string(), "none");
+        assert_eq!(CompressionType::Gzip.to_string(), "gzip");
+        assert_eq!(CompressionType::Snappy.to_string(), "snappy");
+        assert_eq!(CompressionType::Lz4.to_string(), "lz4");
+
+        let mut value = base_output_config();
+        value["client_id"] = serde_json::json!("producer-1");
+        value["compression"] = serde_json::json!("snappy");
+        value["acks"] = serde_json::json!("all");
+        let config = serde_json::from_value::<KafkaOutputConfig>(value).unwrap();
+        let client_config = KafkaOutput::build_client_config(&config).unwrap();
+        let get = |key: &str| client_config.get(key).map(str::to_string);
+        assert_eq!(get("bootstrap.servers").as_deref(), Some("127.0.0.1:9092"));
+        assert_eq!(get("client.id").as_deref(), Some("producer-1"));
+        assert_eq!(get("compression.type").as_deref(), Some("snappy"));
+        assert_eq!(get("acks").as_deref(), Some("all"));
+
+        // Defaults: no optional knob is set on the bare config.
+        let config = serde_json::from_value::<KafkaOutputConfig>(base_output_config()).unwrap();
+        let client_config = KafkaOutput::build_client_config(&config).unwrap();
+        assert!(client_config.get("client.id").is_none());
+        assert!(client_config.get("compression.type").is_none());
+        assert!(client_config.get("acks").is_none());
+    }
+
+    #[test]
+    fn transactional_settings_map_onto_the_client_config() {
+        let mut value = base_output_config();
+        value["exactly_once"] = serde_json::json!(true);
+        value["transactional_id"] = serde_json::json!("txn-1");
+        let config = serde_json::from_value::<KafkaOutputConfig>(value).unwrap();
+        let client_config = KafkaOutput::build_client_config(&config).unwrap();
+        assert_eq!(
+            client_config.get("transactional.id"),
+            Some("txn-1")
+        );
+        assert_eq!(
+            client_config.get("enable.idempotence"),
+            Some("true")
+        );
+    }
+
+
+
     fn resource() -> Resource {
         Resource {
             temporary: HashMap::new(),
@@ -1045,5 +1098,692 @@ mod tests {
             text.contains("device_topic") && text.contains("row 1"),
             "error must name the expression and the null row, got: {text}"
         );
+    }
+
+    // ===== Offline coverage: transaction error mapping, producer lifecycle,
+    // and the transactional-offset derivation edge cases. =====
+
+    /// `map_kafka_txn_error` wraps non-transactional errors without any
+    /// state classification.
+    #[test]
+    fn map_kafka_txn_error_wraps_plain_errors() {
+        let err = map_kafka_txn_error(KafkaError::Canceled, "begin_transaction");
+        assert!(matches!(err, Error::Connection(ref t) if t.contains("begin_transaction failed")));
+        let err = map_kafka_txn_error(
+            KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull),
+            "commit_transaction",
+        );
+        assert!(
+            matches!(err, Error::Connection(ref t) if t.contains("commit_transaction failed")),
+            "got: {err}"
+        );
+    }
+
+    /// Real native `RDKafkaError`s (the only constructible shape — the type
+    /// has no public constructor) produced offline by calling transactional
+    /// methods on an uninitialized transactional producer with a zero
+    /// timeout. Every classification combination the broker-less client can
+    /// emit must map to `Error::Connection` naming the failed stage.
+    #[tokio::test]
+    async fn map_kafka_txn_error_classifies_native_transaction_errors() {
+        use rdkafka::producer::Producer;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("transactional.id", "cov-txn-id")
+            .create()
+            .expect("producer creation is offline");
+
+        // begin_transaction on an uninitialized producer: a native
+        // Transaction error with every flag false.
+        let begin = tokio::task::spawn_blocking(move || {
+            let err = producer
+                .begin_transaction()
+                .expect_err("uninitialized producer cannot begin");
+            let KafkaError::Transaction(rd) = &err else {
+                panic!("begin must yield a Transaction error, got: {err}");
+            };
+            let flags = (rd.is_fatal(), rd.txn_requires_abort(), rd.is_retriable());
+            let code = rd.code();
+            (err, flags, code)
+        })
+        .await
+        .unwrap();
+        let (err, flags, code) = begin;
+        assert_eq!(
+            flags,
+            (false, false, false),
+            "the INIT-state error carries no classification flags (code {code:?})"
+        );
+        let mapped = map_kafka_txn_error(err, "begin_transaction");
+        assert!(
+            matches!(mapped, Error::Connection(ref t) if t.contains("begin_transaction failed")),
+            "got: {mapped}"
+        );
+
+        // Zero-timeout init/commit/abort surface native Transaction errors
+        // of other kinds; each must map to a Connection error, and the
+        // retriable flag (timeouts are retriable) exercises the log branch.
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("transactional.id", "cov-txn-id")
+            .create()
+            .unwrap();
+        let zero = Timeout::After(Duration::ZERO);
+        let results = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for (ctx, result) in [
+                (
+                    "init_transactions",
+                    producer.clone().init_transactions(zero),
+                ),
+                ("commit_transaction", producer.clone().commit_transaction(zero)),
+                ("abort_transaction", producer.abort_transaction(zero)),
+            ] {
+                let flags = match &result {
+                    Err(KafkaError::Transaction(rd)) => {
+                        (rd.is_fatal(), rd.txn_requires_abort(), rd.is_retriable())
+                    }
+                    other => panic!("{ctx} must yield a Transaction error, got: {other:?}"),
+                };
+                let err = match result {
+                    Err(e) => e,
+                    Ok(()) => panic!("{ctx} must yield a Transaction error"),
+                };
+                out.push((ctx, err, flags));
+            }
+            out
+        })
+        .await
+        .unwrap();
+        let mut saw_retriable = false;
+        for (ctx, err, flags) in results {
+            let mapped = map_kafka_txn_error(err, ctx);
+            assert!(
+                matches!(mapped, Error::Connection(ref t) if t.contains(&format!("{ctx} failed"))),
+                "{ctx}: got {mapped}"
+            );
+            saw_retriable |= flags.2;
+        }
+        assert!(
+            saw_retriable,
+            "the zero-timeout paths must include a retriable native error"
+        );
+    }
+
+    /// A codec emitting MORE payloads than the topic expression's rows makes
+    /// the row-alignment guard fail loudly instead of panicking on the index.
+    struct ThreePayloadsCodec;
+
+    #[async_trait]
+    impl arkflow_core::codec::Encoder for ThreePayloadsCodec {
+        async fn encode(&self, _batch: MessageBatch) -> Result<Vec<arkflow_core::Bytes>, Error> {
+            Ok(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+        }
+    }
+
+    #[async_trait]
+    impl arkflow_core::codec::Decoder for ThreePayloadsCodec {
+        async fn decode(&self, _b: Vec<arkflow_core::Bytes>) -> Result<MessageBatch, Error> {
+            Err(Error::Process("decode not used in this test".into()))
+        }
+    }
+
+    fn utf8_batch(columns: &[(&str, Vec<Option<&str>>)]) -> MessageBatchRef {
+        use datafusion::arrow::array::{ArrayRef, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let fields = columns
+            .iter()
+            .map(|(name, _)| Field::new(*name, datafusion::arrow::datatypes::DataType::Utf8, true))
+            .collect::<Vec<_>>();
+        let arrays = columns
+            .iter()
+            .map(|(_, values)| {
+                Arc::new(StringArray::from(
+                    values.iter().map(|v| v.map(|s| s.to_string())).collect::<Vec<_>>(),
+                )) as ArrayRef
+            })
+            .collect::<Vec<_>>();
+        let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            arrays,
+        )
+        .unwrap();
+        Arc::new(MessageBatch::new_arrow(rb))
+    }
+
+    /// A binary-column batch. `column` defaults to the binary codec's
+    /// implicit `__value__`; the value_field path names it explicitly.
+    fn binary_field_batch(rows: usize) -> MessageBatchRef {
+        binary_batch_in(arkflow_core::DEFAULT_BINARY_VALUE_FIELD, rows)
+    }
+
+    fn binary_batch_in(column: &str, rows: usize) -> MessageBatchRef {
+        use datafusion::arrow::array::{ArrayRef, BinaryArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let values = (0..rows)
+            .map(|i| Some(format!("row-{i}").into_bytes()))
+            .collect::<Vec<_>>();
+        let values = values.iter().map(|v| v.as_deref()).collect::<Vec<_>>();
+        let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                column,
+                datafusion::arrow::datatypes::DataType::Binary,
+                true,
+            )])),
+            vec![Arc::new(BinaryArray::from_opt_vec(values)) as ArrayRef],
+        )
+        .unwrap();
+        Arc::new(MessageBatch::new_arrow(rb))
+    }
+
+    /// connect() creates the producer offline (librdkafka connects lazily),
+    /// and close() on a freshly connected producer drains an empty queue.
+    #[tokio::test]
+    async fn connect_creates_producer_and_close_drains_it() {
+        let output = KafkaOutputBuilder
+            .build(
+                None,
+                &Some(serde_json::json!({
+                    "brokers": ["localhost:9092"],
+                    "topic": {"type": "value", "value": "t"}
+                })),
+                None,
+                &resource(),
+            )
+            .unwrap();
+        output.connect().await.expect("producer creation is offline");
+        output.close().await.expect("empty flush terminates");
+        // A second close (no producer) is a no-op.
+        output.close().await.unwrap();
+    }
+
+    /// write() before connect names the missing producer.
+    #[tokio::test]
+    async fn write_without_connect_errors() {
+        let output = KafkaOutput::new(
+            output_config(serde_json::json!({
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "value", "value": "t"}
+            })),
+            None,
+        )
+        .unwrap();
+        let err = output.write(binary_field_batch(1)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not initialized"),
+            "got: {err}"
+        );
+    }
+
+    /// The non-transactional write path, offline: records are enqueued
+    /// through `send_result` (delivery reports resolve lazily) for both the
+    /// codec path and the `value_field` path, with scalar and per-row keys.
+    #[tokio::test]
+    async fn write_enqueues_records_for_codec_and_value_field_paths() {
+        let output = KafkaOutput::new(
+            output_config(serde_json::json!({
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "value", "value": "events"},
+                "key": {"type": "expr", "expr": "k"}
+            })),
+            None,
+        )
+        .unwrap();
+        output.connect().await.unwrap();
+
+        // Codec path (no value_field): binary `__value__` rows with a
+        // per-row Utf8 key column.
+        use datafusion::arrow::array::{ArrayRef, BinaryArray, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", datafusion::arrow::datatypes::DataType::Utf8, true),
+                Field::new(
+                    arkflow_core::DEFAULT_BINARY_VALUE_FIELD,
+                    datafusion::arrow::datatypes::DataType::Binary,
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some("k1"), Some("k2")])) as ArrayRef,
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"v1" as &[u8]),
+                    Some(b"v2"),
+                ])),
+            ],
+        )
+        .unwrap();
+        output
+            .write(Arc::new(MessageBatch::new_arrow(rb)))
+            .await
+            .expect("codec path enqueues");
+
+        // value_field path: one payload per row of the named column.
+        let output = KafkaOutput::new(
+            output_config(serde_json::json!({
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "value", "value": "events"},
+                "key": {"type": "value", "value": "static-key"},
+                "value_field": "payload"
+            })),
+            None,
+        )
+        .unwrap();
+        output.connect().await.unwrap();
+        output
+            .write(binary_batch_in("payload", 2))
+            .await
+            .expect("value_field path enqueues");
+
+        // An empty batch short-circuits before any record is built.
+        output
+            .write(binary_batch_in("payload", 0))
+            .await
+            .expect("empty batch is a no-op");
+        // Do not close() here: unresolved delivery futures would block.
+    }
+
+    /// A codec producing more payloads than topic rows trips the
+    /// row-alignment guard (previously an index panic).
+    #[tokio::test]
+    async fn write_fails_loudly_when_topics_run_short() {
+        let output = KafkaOutput::new(
+            output_config(serde_json::json!({
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "expr", "expr": "device_topic"}
+            })),
+            Some(Arc::new(ThreePayloadsCodec) as Arc<dyn Codec>),
+        )
+        .unwrap();
+        output.connect().await.unwrap();
+        let batch = utf8_batch(&[("device_topic", vec![Some("a"), Some("b")])]);
+        let err = output.write(batch).await.unwrap_err();
+        assert!(
+            err.to_string().contains("has no topic"),
+            "got: {err}"
+        );
+    }
+
+    /// write_batch's non-transactional path aggregates per-message failures
+    /// (continue-on-error) and returns the last error.
+    #[tokio::test]
+    async fn write_batch_non_transactional_aggregates_errors() {
+        let good = output_config(serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topic": {"type": "value", "value": "t"}
+        }));
+        let output = KafkaOutput::new(good, None).unwrap();
+        output.connect().await.unwrap();
+        // All-good batch.
+        output
+            .write_batch(&[binary_field_batch(1)])
+            .await
+            .expect("single good message");
+
+        // A message whose value_field column is absent fails; the sibling
+        // still goes through.
+        let bad = output_config(serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topic": {"type": "value", "value": "t"},
+            "value_field": "missing_column"
+        }));
+        let output = KafkaOutput::new(bad, None).unwrap();
+        output.connect().await.unwrap();
+        let err = output
+            .write_batch(&[binary_field_batch(1), binary_field_batch(1)])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("value_field"),
+            "got: {err}"
+        );
+    }
+
+    /// The transactional path fails fast offline: begin_transaction on a
+    /// producer whose transactions were never initialized maps to a
+    /// Connection error naming the stage. The producer is installed
+    /// directly (connect()'s init_transactions would block on a broker).
+    #[tokio::test]
+    async fn write_batch_transactional_fails_fast_before_init() {
+        let output = KafkaOutput::new(
+            output_config(serde_json::json!({
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "value", "value": "t"},
+                "exactly_once": true,
+                "transactional_id": "cov-txn"
+            })),
+            None,
+        )
+        .unwrap();
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("transactional.id", "cov-txn")
+            .set("message.timeout.ms", "15000")
+            .create()
+            .unwrap();
+        *output.inner_kafka_output.producer.write().await = Some(producer);
+
+        let err = output
+            .write_batch(&[binary_field_batch(1)])
+            .await
+            .expect_err("uninitialized transactions cannot begin");
+        assert!(
+            err.to_string().contains("begin_transaction failed"),
+            "got: {err}"
+        );
+        // A transactional write before any producer is installed names the
+        // missing producer instead.
+        let output = KafkaOutput::new(
+            output_config(serde_json::json!({
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "value", "value": "t"},
+                "exactly_once": true,
+                "transactional_id": "cov-txn"
+            })),
+            None,
+        )
+        .unwrap();
+        let err = output
+            .write_batch(&[binary_field_batch(1)])
+            .await
+            .expect_err("no producer");
+        assert!(
+            err.to_string().contains("not initialized"),
+            "got: {err}"
+        );
+    }
+
+    /// The periodic flush loop runs while the output lives and stops on
+    /// close (virtual time auto-advances through the 1s tick).
+    #[tokio::test(start_paused = true)]
+    async fn periodic_flush_loop_runs_and_stops_on_close() {
+        let output = KafkaOutput::new(
+            output_config(serde_json::json!({
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "value", "value": "t"}
+            })),
+            None,
+        )
+        .unwrap();
+        // Two+ flush ticks fire (the queue is empty; flush drains nothing).
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        output.close().await.expect("close without producer");
+        // After cancellation the loop has exited; another virtual second
+        // proves no further work happens (and the test terminates).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    /// Builder guards: missing config and offset_commit_group without
+    /// exactly_once.
+    #[test]
+    fn builder_rejects_missing_and_inconsistent_configs() {
+        let err = KafkaOutputBuilder
+            .build(None, &None, None, &resource())
+            .err()
+            .expect("missing config rejected");
+        assert!(err.to_string().contains("configuration is missing"));
+
+        let err = KafkaOutputBuilder
+            .build(
+                None,
+                &Some(serde_json::json!({
+                    "brokers": ["localhost:9092"],
+                    "topic": {"type": "value", "value": "t"},
+                    "offset_commit_group": "g"
+                })),
+                None,
+                &resource(),
+            )
+            .err()
+            .expect("offset_commit_group requires exactly_once");
+        assert!(err.to_string().contains("offset_commit_group requires exactly_once"));
+    }
+
+    /// Batches without position metadata contribute nothing (covered=false).
+    #[test]
+    fn l3_plain_batches_contribute_nothing() {
+        let batch = utf8_batch(&[("v", vec![Some("x"), Some("y")])]);
+        let (offsets, covered) =
+            transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        assert!(!covered);
+        assert_eq!(offsets.count(), 0);
+    }
+
+    /// The metadata columns must be UInt32/UInt64 — anything else is a
+    /// named error, not a silent skip.
+    #[test]
+    fn l3_rejects_wrongly_typed_position_columns() {
+        use datafusion::arrow::array::{Int64Array, UInt64Array};
+        use arkflow_core::meta_columns;
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let batch = {
+            let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::Int64, false),
+                    Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::UInt64, false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(vec![0])),
+                    Arc::new(UInt64Array::from(vec![1u64])),
+                ],
+            )
+            .unwrap();
+            Arc::new(MessageBatch::new_arrow(rb))
+        };
+        let err = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap_err();
+        assert!(
+            err.to_string().contains(meta_columns::PARTITION),
+            "got: {err}"
+        );
+
+        let batch = {
+            let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::UInt32, false),
+                    Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::Utf8, false),
+                ])),
+                vec![
+                    Arc::new(datafusion::arrow::array::UInt32Array::from(vec![0u32])),
+                    Arc::new(datafusion::arrow::array::StringArray::from(vec!["1"])),
+                ],
+            )
+            .unwrap();
+            Arc::new(MessageBatch::new_arrow(rb))
+        };
+        let err = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap_err();
+        assert!(
+            err.to_string().contains(meta_columns::OFFSET),
+            "got: {err}"
+        );
+    }
+
+    /// Null position cells are skipped (they carry no committable position).
+    #[test]
+    fn l3_skips_rows_with_null_positions() {
+        use arkflow_core::meta_columns;
+        use datafusion::arrow::array::{UInt32Array, UInt64Array};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::UInt32, true),
+                Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::UInt64, true),
+            ])),
+            vec![
+                Arc::new(UInt32Array::from(vec![Some(0u32), None])),
+                Arc::new(UInt64Array::from(vec![Some(10u64), Some(11u64)])),
+            ],
+        )
+        .unwrap();
+        let batch = Arc::new(MessageBatch::new_arrow(rb));
+        let (offsets, covered) =
+            transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        assert!(covered, "the one positioned row still commits");
+        assert_eq!(offsets.count(), 1);
+        assert_eq!(offsets.elements()[0].offset(), rdkafka::Offset::Offset(11));
+    }
+
+    /// An offset at u64::MAX overflows the i64 commit position.
+    #[test]
+    fn l3_rejects_positions_that_overflow_i64() {
+        use arkflow_core::meta_columns;
+        use datafusion::arrow::array::{UInt32Array, UInt64Array};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::UInt32, false),
+                Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(UInt32Array::from(vec![0u32])),
+                Arc::new(UInt64Array::from(vec![u64::MAX])),
+            ],
+        )
+        .unwrap();
+        let batch = Arc::new(MessageBatch::new_arrow(rb));
+        let err = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap_err();
+        assert!(
+            err.to_string().contains("overflow"),
+            "got: {err}"
+        );
+    }
+
+    /// Duplicate rows for one partition fold to the max next-offset; a
+    /// partition that does not fit i32 lands on rdkafka's "all partitions"
+    /// sentinel (-1) rather than an invalid list entry.
+    #[test]
+    fn l3_folds_duplicate_partitions_and_handles_oversized_partitions() {
+        use arkflow_core::meta_columns;
+        use datafusion::arrow::array::{UInt32Array, UInt64Array};
+        use datafusion::arrow::datatypes::{Field, Schema};
+
+        let build = |partitions: Vec<u32>, offsets: Vec<u64>| {
+            let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::UInt32, false),
+                    Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::UInt64, false),
+                ])),
+                vec![
+                    Arc::new(UInt32Array::from(partitions)),
+                    Arc::new(UInt64Array::from(offsets)),
+                ],
+            )
+            .unwrap();
+            Arc::new(MessageBatch::new_arrow(rb))
+        };
+
+        // Two rows on partition 2: the max next-offset must be present.
+        // (rdkafka's add appends one element per call, so the list carries
+        // both the initial 11 and the folded 31 — observed behavior.)
+        let (offsets, covered) = transactional_offsets_for_batches(
+            &[build(vec![2, 2], vec![10, 30])],
+            Some("orders"),
+        )
+        .unwrap();
+        assert!(covered);
+        let committed: Vec<rdkafka::Offset> =
+            offsets.elements().iter().map(|e| e.offset()).collect();
+        assert!(
+            committed.contains(&rdkafka::Offset::Offset(31)),
+            "the max next-offset per partition is kept: {committed:?}"
+        );
+
+        // u32::MAX as a partition becomes i32 -1 — rdkafka's sentinel for
+        // "all partitions" — and is accepted as-is.
+        let (offsets, covered) = transactional_offsets_for_batches(
+            &[build(vec![u32::MAX], vec![1])],
+            Some("orders"),
+        )
+        .unwrap();
+        assert!(covered);
+        assert_eq!(offsets.elements()[0].partition(), -1);
+
+        // Without a group topic the rows fold into the empty topic name.
+        let (offsets, covered) =
+            transactional_offsets_for_batches(&[build(vec![0], vec![5])], None).unwrap();
+        assert!(covered);
+        assert_eq!(offsets.elements()[0].topic(), "");
+    }
+
+    /// close() drains queued delivery futures: with a short message timeout
+    /// the broker-less producer resolves them as delivery failures (the
+    /// `Ok(Err(..))` arm), then the final flush completes over an empty
+    /// queue.
+    #[tokio::test]
+    async fn close_drains_delivery_futures_that_failed_on_timeout() {
+        let output = KafkaOutput::new(
+            output_config(serde_json::json!({
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "value", "value": "t"}
+            })),
+            None,
+        )
+        .unwrap();
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("message.timeout.ms", "1000")
+            .create()
+            .unwrap();
+        *output.inner_kafka_output.producer.write().await = Some(producer);
+
+        // Two records → two delivery futures in the queue.
+        output
+            .write(binary_field_batch(2))
+            .await
+            .expect("records enqueue");
+        // Let the message timeout resolve the futures as failures.
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        output.close().await.expect("drain and flush complete");
+    }
+
+    /// An inconsistent TLS material block fails producer creation at
+    /// `connect` time, offline (the SSL context is built eagerly).
+    #[tokio::test]
+    async fn connect_maps_producer_creation_failures() {
+        let output = match KafkaOutputBuilder.build(
+            None,
+            &Some(serde_json::json!({
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "value", "value": "t"},
+                "security": {"protocol": "ssl", "tls": {"ca": "definitely-not-a-pem"}}
+            })),
+            None,
+            &resource(),
+        ) {
+            Ok(output) => output,
+            Err(e) => panic!("the security block is consistent, build must pass: {e}"),
+        };
+        match output.connect().await {
+            Err(e) => assert!(
+                e.to_string().contains("cannot be created"),
+                "got: {e}"
+            ),
+            Ok(()) => panic!("a garbage CA PEM must fail producer creation"),
+        }
+    }
+
+    /// flush() reports a delivery future cancelled by the producer's drop
+    /// (the `Err` arm) without panicking.
+    #[tokio::test]
+    async fn flush_reports_delivery_futures_cancelled_by_producer_drop() {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("message.timeout.ms", "60000")
+            .create()
+            .unwrap();
+        let payload = vec![1u8];
+        let future = producer
+            .send_result(FutureRecord::<String, Vec<u8>>::to("t").payload(&payload))
+            .expect("enqueue");
+        let inner = InnerKafkaOutput {
+            producer: Arc::new(RwLock::new(None)),
+            send_futures: Arc::new(Mutex::new(vec![future])),
+        };
+        // Dropping the producer cancels its outstanding delivery callbacks.
+        drop(producer);
+        tokio::time::timeout(Duration::from_secs(10), inner.flush())
+            .await
+            .expect("a cancelled future resolves promptly")
+            // The outcome is logged either way; flush itself never errors.
     }
 }

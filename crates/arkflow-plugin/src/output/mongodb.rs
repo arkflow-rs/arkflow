@@ -401,4 +401,196 @@ mod tests {
         )]);
         assert!(MongoDBOutput::documents(&msg).unwrap().is_empty());
     }
+
+    #[test]
+    fn converts_every_supported_arrow_scalar() {
+        use datafusion::arrow::array::{
+            BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+            Int8Array, LargeBinaryArray, LargeStringArray, UInt16Array, UInt32Array, UInt8Array,
+        };
+        let msg = batch(vec![
+            ("large_text", Arc::new(LargeStringArray::from(vec![Some("large")]))),
+            ("i8", Arc::new(Int8Array::from(vec![Some(-8)]))),
+            ("i16", Arc::new(Int16Array::from(vec![Some(-16)]))),
+            ("i32", Arc::new(Int32Array::from(vec![Some(-32)]))),
+            ("u8", Arc::new(UInt8Array::from(vec![Some(8)]))),
+            ("u16", Arc::new(UInt16Array::from(vec![Some(16)]))),
+            ("u32", Arc::new(UInt32Array::from(vec![Some(32)]))),
+            ("f32", Arc::new(Float32Array::from(vec![Some(2.5f32)]))),
+            ("f64", Arc::new(Float64Array::from(vec![Some(-1.25)]))),
+            ("flag", Arc::new(BooleanArray::from(vec![Some(true)]))),
+            ("blob", Arc::new(BinaryArray::from(vec![Some(b"raw" as &[u8])]))),
+            ("large_blob", Arc::new(LargeBinaryArray::from(vec![Some(b"big" as &[u8])]))),
+        ]);
+        let document = MongoDBOutput::row_to_document(&msg, 0).unwrap();
+        assert_eq!(document.get_str("large_text").unwrap(), "large");
+        assert_eq!(document.get_i32("i8").unwrap(), -8);
+        assert_eq!(document.get_i32("i16").unwrap(), -16);
+        assert_eq!(document.get_i32("i32").unwrap(), -32);
+        assert_eq!(document.get_i32("u8").unwrap(), 8);
+        assert_eq!(document.get_i32("u16").unwrap(), 16);
+        assert_eq!(document.get_i64("u32").unwrap(), 32);
+        assert_eq!(document.get_f64("f32").unwrap(), 2.5);
+        assert_eq!(document.get_f64("f64").unwrap(), -1.25);
+        assert!(document.get_bool("flag").unwrap());
+        let blob = document.get_binary_generic("blob").unwrap();
+        assert_eq!(blob, b"raw");
+        let large_blob = document.get_binary_generic("large_blob").unwrap();
+        assert_eq!(large_blob, b"big");
+        // Every row maps to its own document.
+        let two_rows = batch(vec![(
+            "value",
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+        )]);
+        let documents = MongoDBOutput::documents(&two_rows).unwrap();
+        assert_eq!(documents.len(), 2);
+        assert_eq!(documents[1].get_str("value").unwrap(), "b");
+    }
+
+    #[test]
+    fn validates_uri_scheme_and_non_empty_fields() {
+        for (uri, database, collection, field) in [
+            ("http://localhost:27017", "db", "events", "uri"),
+            (" ", "db", "events", "uri"),
+            ("mongodb://localhost:27017", "  ", "events", "database"),
+            ("mongodb://localhost:27017", "db", "", "collection"),
+        ] {
+            let error = match MongoDBOutput::new(MongoDBOutputConfig {
+                uri: uri.to_string(),
+                database: database.to_string(),
+                collection: collection.to_string(),
+            }) {
+                Ok(_) => panic!("config must be rejected: uri={uri:?} db={database:?}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(field),
+                "expected '{field}' in error for uri={uri:?} db={database:?}: {error}"
+            );
+        }
+        // mongodb+srv URIs are accepted.
+        assert!(
+            MongoDBOutput::new(MongoDBOutputConfig {
+                uri: "mongodb+srv://cluster.example.com".to_string(),
+                database: "db".to_string(),
+                collection: "events".to_string(),
+            })
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn write_before_connect_reports_disconnection() {
+        let output = MongoDBOutput::new(MongoDBOutputConfig {
+            uri: "mongodb://127.0.0.1:27017".to_string(),
+            database: "db".to_string(),
+            collection: "events".to_string(),
+        })
+        .unwrap();
+        let msg = batch(vec![(
+            "value",
+            Arc::new(StringArray::from(vec![Some("x")])),
+        )]);
+        assert!(matches!(
+            output.write(Arc::new(msg)).await,
+            Err(Error::Disconnection)
+        ));
+
+        // close() drops the collection handle; writes afterwards disconnect.
+        output.close().await.unwrap();
+        let msg = batch(vec![(
+            "value",
+            Arc::new(StringArray::from(vec![Some("x")])),
+        )]);
+        assert!(matches!(
+            output.write(Arc::new(msg)).await,
+            Err(Error::Disconnection)
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_failure_is_mapped_to_connection_error() {
+        // Nothing listens on port 1; force fast server-selection failure.
+        let output = MongoDBOutput::new(MongoDBOutputConfig {
+            uri: "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=500&connectTimeoutMS=500"
+                .to_string(),
+            database: "db".to_string(),
+            collection: "events".to_string(),
+        })
+        .unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            output.connect(),
+        )
+        .await
+        .expect("connect must fail within the selection timeout, not hang")
+        .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("connect"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_uri_is_rejected_as_config() {
+        // Passes string-prefix validation but the driver rejects the port.
+        let output = MongoDBOutput::new(MongoDBOutputConfig {
+            uri: "mongodb://127.0.0.1:99999".to_string(),
+            database: "db".to_string(),
+            collection: "events".to_string(),
+        })
+        .unwrap();
+        let error = output.connect().await.unwrap_err();
+        assert!(
+            error.to_string().contains("Invalid MongoDB URI"),
+            "{error}"
+        );
+    }
+
+    /// A no-op codec used to exercise the codec-rejection branch.
+    struct NoopCodec;
+
+    #[async_trait]
+    impl arkflow_core::codec::Encoder for NoopCodec {
+        async fn encode(&self, _b: MessageBatch) -> Result<Vec<arkflow_core::Bytes>, Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl arkflow_core::codec::Decoder for NoopCodec {
+        async fn decode(&self, b: Vec<arkflow_core::Bytes>) -> Result<MessageBatch, Error> {
+            MessageBatch::new_binary(b)
+        }
+    }
+
+    #[test]
+    fn builder_rejects_codec_and_bad_config() {
+        let resource = Resource {
+            temporary: Default::default(),
+            input_names: std::cell::RefCell::new(Default::default()),
+        };
+        let config = Some(serde_json::json!({
+            "uri": "mongodb://localhost:27017",
+            "database": "db",
+            "collection": "events"
+        }));
+        let error = match MongoDBOutputBuilder.build(None, &config, Some(Arc::new(NoopCodec)), &resource) {
+            Ok(_) => panic!("codec must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("codec"), "{error}");
+
+        // Missing config and unknown fields are configuration errors.
+        assert!(matches!(
+            MongoDBOutputBuilder.build(None, &None, None, &resource),
+            Err(Error::Config(_))
+        ));
+        let bad = Some(serde_json::json!({"uri": 42}));
+        assert!(matches!(
+            MongoDBOutputBuilder.build(None, &bad, None, &resource),
+            Err(Error::Config(_))
+        ));
+        assert!(MongoDBOutputBuilder.build(None, &config, None, &resource).is_ok());
+    }
 }

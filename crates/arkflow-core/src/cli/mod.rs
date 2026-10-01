@@ -29,12 +29,40 @@ pub struct Cli {
     pub config: Option<EngineConfig>,
 }
 
+/// Outcome of command-line parsing: `Run` continues into [`Cli::run`];
+/// `Exit(code)` marks a subcommand result or a config failure that already
+/// printed its message and wants the process to stop with that code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseOutcome {
+    Run,
+    Exit(i32),
+}
+
 impl Cli {
     pub fn config(&self) -> Option<EngineConfig> {
         self.config.clone()
     }
 
     pub fn parse(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        match self.parse_from(argv) {
+            Ok(ParseOutcome::Run) => Ok(()),
+            Ok(ParseOutcome::Exit(code)) => process::exit(code),
+            // clap errors (bad flags) keep clap's own usage output + exit 2.
+            Err(e) if e.is::<clap::Error>() => {
+                e.downcast_ref::<clap::Error>().unwrap().exit()
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Testable core of [`Cli::parse`]: identical logic, but the argument
+    /// vector is passed explicitly and exits surface as [`ParseOutcome`]
+    /// instead of terminating the process.
+    pub fn parse_from(
+        &mut self,
+        argv: impl IntoIterator<Item = String>,
+    ) -> Result<ParseOutcome, Box<dyn std::error::Error>> {
         let matches = Command::new("arkflow")
             .version(env!("CARGO_PKG_VERSION"))
             .author("chenquan")
@@ -105,18 +133,20 @@ impl Cli {
                     .help("Only the profile is verified, not the engine is started.")
                     .action(clap::ArgAction::SetTrue),
             )
-            .get_matches();
+            .try_get_matches_from(
+                std::iter::once("arkflow".to_string()).chain(argv),
+            )?;
 
         // Dispatch subcommands that don't require a config file.
         match matches.subcommand() {
             Some(("components", sub)) => {
                 handle_components_subcommand(sub)?;
-                process::exit(0);
+                return Ok(ParseOutcome::Exit(0));
             }
             Some(("schema", _)) => {
                 let schema = component::build_config_schema();
                 println!("{}", serde_json::to_string_pretty(&schema)?);
-                process::exit(0);
+                return Ok(ParseOutcome::Exit(0));
             }
             _ => {}
         }
@@ -133,7 +163,7 @@ impl Cli {
             Ok(config) => config,
             Err(e) => {
                 println!("Failed to load configuration file: {}", e);
-                process::exit(1);
+                return Ok(ParseOutcome::Exit(1));
             }
         };
 
@@ -141,11 +171,11 @@ impl Cli {
         // duplicate ids, operator references) beyond deserialization.
         if let Err(e) = config.stream_ids() {
             println!("Invalid configuration: {}", e);
-            process::exit(1);
+            return Ok(ParseOutcome::Exit(1));
         }
         if let Err(e) = config.job_specs() {
             println!("Invalid configuration: {}", e);
-            process::exit(1);
+            return Ok(ParseOutcome::Exit(1));
         }
         let validation = crate::configuration::validate_config(&config);
         if !validation.valid {
@@ -156,16 +186,16 @@ impl Cli {
                 .collect::<Vec<_>>()
                 .join("; ");
             println!("Invalid configuration: {details}");
-            process::exit(1);
+            return Ok(ParseOutcome::Exit(1));
         }
 
         // If you just verify the configuration, exit it
         if matches.get_flag("validate") {
             info!("The config is validated.");
-            return Ok(());
+            return Ok(ParseOutcome::Run);
         }
         self.config = Some(config);
-        Ok(())
+        Ok(ParseOutcome::Run)
     }
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         // `--validate` (and the subcommands handled inside `parse`) return
@@ -381,10 +411,12 @@ pub fn init_logging(config: &EngineConfig) {
     let otel_layer = build_otel_layer(&config.health_check.observability.tracing)
         .map(|layer| layer.with_filter(level_filter));
 
-    tracing_subscriber::registry()
+    // try_init: a second initialization (e.g. tests, or an engine restart in
+    // the same process) keeps the first subscriber instead of panicking.
+    let _ = tracing_subscriber::registry()
         .with(fmt_layer)
         .with(otel_layer)
-        .init();
+        .try_init();
 }
 
 /// Builds the OTel span-export layer when tracing is enabled. Any build
@@ -450,4 +482,382 @@ pub fn shutdown_otel_tracing() {
             eprintln!("Failed to shut down the OTel tracer provider cleanly: {error}");
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn write_config(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    const MINIMAL_CONFIG: &str = "logging:\n  level: info\nstreams: []\n";
+
+    #[test]
+    fn default_cli_has_no_config_and_config_accessor_round_trips() {
+        let cli = Cli::default();
+        assert!(cli.config().is_none());
+    }
+
+    #[test]
+    fn missing_config_without_subcommand_is_an_error() {
+        let mut cli = Cli::default();
+        let err = cli.parse_from(argv(&[])).unwrap_err();
+        assert!(err.to_string().contains("missing --config"));
+    }
+
+    #[test]
+    fn unknown_flag_surfaces_clap_error() {
+        let mut cli = Cli::default();
+        let err = cli
+            .parse_from(argv(&["--definitely-not-a-flag"]))
+            .unwrap_err();
+        assert!(err.is::<clap::Error>());
+    }
+
+    #[test]
+    fn config_file_that_cannot_be_read_exits_one() {
+        let mut cli = Cli::default();
+        let outcome = cli
+            .parse_from(argv(&[
+                "--config",
+                "/nonexistent/arkflow/does-not-exist.yaml",
+            ]))
+            .unwrap();
+        assert_eq!(outcome, ParseOutcome::Exit(1));
+        assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn valid_config_loads_and_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "ok.yaml", MINIMAL_CONFIG);
+        let mut cli = Cli::default();
+        let outcome = cli.parse_from(argv(&["--config", &path])).unwrap();
+        assert_eq!(outcome, ParseOutcome::Run);
+        assert!(cli.config().is_some());
+        assert!(cli.config().unwrap().streams.is_empty());
+    }
+
+    #[test]
+    fn validate_flag_reports_run_without_retaining_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "ok.yaml", MINIMAL_CONFIG);
+        let mut cli = Cli::default();
+        let outcome = cli
+            .parse_from(argv(&["--config", &path, "--validate"]))
+            .unwrap();
+        assert_eq!(outcome, ParseOutcome::Run);
+        assert!(
+            cli.config.is_none(),
+            "--validate must not keep a config for Cli::run"
+        );
+    }
+
+    #[test]
+    fn malformed_yaml_exits_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "broken.yaml", "logging: [oops\nstreams: ]]");
+        let mut cli = Cli::default();
+        assert_eq!(
+            cli.parse_from(argv(&["--config", &path])).unwrap(),
+            ParseOutcome::Exit(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_without_config_is_a_no_op() {
+        // Covers the early return in `run` when `--validate` left no config.
+        Cli::default().run().await.unwrap();
+    }
+
+    #[test]
+    fn schema_subcommand_exits_zero() {
+        let mut cli = Cli::default();
+        assert_eq!(
+            cli.parse_from(argv(&["schema"])).unwrap(),
+            ParseOutcome::Exit(0)
+        );
+        assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn components_bare_invocation_lists_and_exits_zero() {
+        let mut cli = Cli::default();
+        assert_eq!(
+            cli.parse_from(argv(&["components"])).unwrap(),
+            ParseOutcome::Exit(0)
+        );
+    }
+
+    #[test]
+    fn components_list_text_and_json_exit_zero() {
+        let mut cli = Cli::default();
+        assert_eq!(
+            cli.parse_from(argv(&["components", "list"])).unwrap(),
+            ParseOutcome::Exit(0)
+        );
+        assert_eq!(
+            cli.parse_from(argv(&["components", "list", "--format", "json"]))
+                .unwrap(),
+            ParseOutcome::Exit(0)
+        );
+        assert_eq!(
+            cli.parse_from(argv(&["components", "list", "--kind", "input"]))
+                .unwrap(),
+            ParseOutcome::Exit(0)
+        );
+        assert_eq!(
+            cli.parse_from(argv(&[
+                "components",
+                "list",
+                "--kind",
+                "input",
+                "--format",
+                "json"
+            ]))
+            .unwrap(),
+            ParseOutcome::Exit(0)
+        );
+    }
+
+    #[test]
+    fn components_list_with_unknown_kind_is_an_error() {
+        let mut cli = Cli::default();
+        let err = cli
+            .parse_from(argv(&["components", "list", "--kind", "not-a-kind"]))
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn components_show_for_unknown_type_reports_available_types() {
+        let err = print_component_details(
+            "not-a-kind".parse().unwrap_or(ComponentKind::Input),
+            "definitely-missing",
+            "text",
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Unknown"), "{message}");
+    }
+
+    #[test]
+    fn print_helpers_cover_formats_without_registered_components() {
+        // With an empty registry the list prints the fallback line; the JSON
+        // export still emits the envelope.
+        print_component_list(None);
+        print_component_list(Some(ComponentKind::Input));
+        print_component_list_json(None).unwrap();
+        print_component_list_json(Some(ComponentKind::Codec)).unwrap();
+    }
+
+    #[test]
+    fn registered_components_render_in_list_and_details() {
+        // Unique type names keep the process-global registry idempotent.
+        {
+            use crate::component::{ComponentMetadata, ComponentKind};
+            let metadata = ComponentMetadata {
+                name: "cli-test-fake".into(),
+                description: "fake component for cli tests".into(),
+                config_optional: true,
+                config_schema: serde_json::json!({"type": "object"}),
+                config_example: Some(serde_json::json!({"answer": 42})),
+            };
+            // Ignore the "already registered" error on re-runs in the same
+            // process: the important part is that listing finds it.
+            let _ = crate::component::register_component_metadata(
+                ComponentKind::Input,
+                metadata,
+            );
+
+            print_component_list(Some(ComponentKind::Input));
+            print_component_list(None);
+            print_component_list_json(Some(ComponentKind::Input)).unwrap();
+
+            print_component_details(ComponentKind::Input, "cli-test-fake", "text").unwrap();
+            print_component_details(ComponentKind::Input, "cli-test-fake", "json").unwrap();
+            print_component_details(
+                ComponentKind::Input,
+                "cli-test-fake",
+                "unknown-format",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn components_show_subcommand_round_trip() {
+        {
+            use crate::component::{ComponentMetadata, ComponentKind};
+            let metadata = ComponentMetadata {
+                name: "cli-show-fake".into(),
+                description: "fake component for the show subcommand".into(),
+                config_optional: false,
+                config_schema: serde_json::json!({"type": "object"}),
+                config_example: None,
+            };
+            let _ = crate::component::register_component_metadata(
+                ComponentKind::Buffer,
+                metadata,
+            );
+            let mut cli = Cli::default();
+            assert_eq!(
+                cli.parse_from(argv(&[
+                    "components", "show", "buffer", "cli-show-fake"
+                ]))
+                .unwrap(),
+                ParseOutcome::Exit(0)
+            );
+            assert_eq!(
+                cli.parse_from(argv(&[
+                    "components",
+                    "show",
+                    "buffer",
+                    "cli-show-fake",
+                    "--format",
+                    "json"
+                ]))
+                .unwrap(),
+                ParseOutcome::Exit(0)
+            );
+        }
+    }
+
+    #[test]
+    fn otel_layer_is_absent_when_tracing_is_disabled() {
+        let config = crate::config::TracingConfig::default();
+        let layer =
+            build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
+        assert!(layer.is_none());
+    }
+
+    #[test]
+    fn shutdown_without_provider_is_a_no_op() {
+        shutdown_otel_tracing();
+    }
+
+    const DUPLICATE_STREAM_ID_CONFIG: &str = "logging:\n  level: info\nstreams:\n  - id: dup\n    input: {type: generate}\n    pipeline: {processors: []}\n    output: {type: stdout}\n  - id: dup\n    input: {type: generate}\n    pipeline: {processors: []}\n    output: {type: stdout}\n";
+
+    #[test]
+    fn duplicate_stream_ids_exit_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "dup-stream.yaml", DUPLICATE_STREAM_ID_CONFIG);
+        let mut cli = Cli::default();
+        assert_eq!(
+            cli.parse_from(argv(&["--config", &path])).unwrap(),
+            ParseOutcome::Exit(1)
+        );
+        assert!(cli.config.is_none());
+    }
+
+    const BROKEN_JOB_CONFIG: &str = "logging:\n  level: info\nstreams: []\njobs:\n  - id: broken-job\n    version: 1\n    operators:\n      - id: only\n        kind: source\n    edges:\n      - id: e1\n        from: only\n        to: ghost\n    sources:\n      - operator_id: only\n        input_type: generate\n        time:\n          mode: processing_time\n";
+
+    #[test]
+    fn invalid_job_spec_exits_one_at_job_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "broken-job.yaml", BROKEN_JOB_CONFIG);
+        let mut cli = Cli::default();
+        assert_eq!(
+            cli.parse_from(argv(&["--config", &path])).unwrap(),
+            ParseOutcome::Exit(1)
+        );
+        assert!(cli.config.is_none());
+    }
+
+    const UNKNOWN_INPUT_CONFIG: &str = "logging:\n  level: info\nstreams:\n  - id: s1\n    input: {type: definitely-not-an-input}\n    pipeline: {processors: []}\n    output: {type: stdout}\n";
+
+    #[test]
+    fn unknown_input_type_fails_deep_validation_and_exits_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "unknown-input.yaml", UNKNOWN_INPUT_CONFIG);
+        let mut cli = Cli::default();
+        assert_eq!(
+            cli.parse_from(argv(&["--config", &path])).unwrap(),
+            ParseOutcome::Exit(1)
+        );
+        assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn components_show_rejects_an_unknown_kind() {
+        let mut cli = Cli::default();
+        let err = cli
+            .parse_from(argv(&["components", "show", "not-a-kind", "some-name"]))
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn components_list_renders_multiple_kinds_and_filters_the_json_export() {
+        // Unique type names keep the process-global registry idempotent.
+        {
+            use crate::component::{ComponentMetadata, ComponentKind};
+            for (kind, name) in [
+                (ComponentKind::Codec, "cli-coverage-codec"),
+                (ComponentKind::Temporary, "cli-coverage-temp"),
+            ] {
+                let _ = crate::component::register_component_metadata(
+                    kind,
+                    ComponentMetadata {
+                        name: name.into(),
+                        description: "coverage helper component".into(),
+                        config_optional: false,
+                        config_schema: serde_json::json!({"type": "object"}),
+                        config_example: None,
+                    },
+                );
+            }
+
+            // Two populated kinds exercise the separator between kind groups.
+            print_component_list(None);
+            // The JSON export filter retains only the matching kind.
+            print_component_list_json(Some(ComponentKind::Codec)).unwrap();
+        }
+    }
+
+    #[test]
+    fn unknown_type_for_a_populated_kind_lists_available_types() {
+        {
+            use crate::component::{ComponentMetadata, ComponentKind};
+            let _ = crate::component::register_component_metadata(
+                ComponentKind::Temporary,
+                ComponentMetadata {
+                    name: "cli-hint-temp".into(),
+                    description: "coverage helper component".into(),
+                    config_optional: false,
+                    config_schema: serde_json::json!({"type": "object"}),
+                    config_example: None,
+                },
+            );
+            let err = print_component_details(ComponentKind::Temporary, "definitely-missing", "text")
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("Available temporary types:"), "{message}");
+            assert!(message.contains("cli-hint-temp"), "{message}");
+        }
+    }
+
+    /// With tracing enabled but no OTLP http client compiled into this crate,
+    /// the exporter build fails and the failure is isolated: the data plane
+    /// keeps a `None` layer instead of losing its console logging.
+    #[test]
+    fn otel_layer_isolates_exporter_build_failures() {
+        let config = crate::config::TracingConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:1/v1/traces".to_string(),
+            service_name: "arkflow-coverage".to_string(),
+        };
+        let layer = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
+        assert!(layer.is_none());
+        shutdown_otel_tracing();
+    }
+
 }

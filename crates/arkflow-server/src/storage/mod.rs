@@ -2496,6 +2496,65 @@ impl ControlPlaneStore {
         Ok(Self::Sqlite(SqliteBackend::in_memory()?))
     }
 
+    /// Contract-test backend selector: SQLite in-memory normally; when
+    /// `ARKFLOW_TEST_POSTGRES_URL` points at a live server, the label gets a
+    /// dedicated database (dropped and recreated) so parallel contract tests
+    /// stay isolated while exercising the Postgres code paths.
+    #[cfg(test)]
+    pub async fn contract(label: &str) -> ControlPlaneStore {
+        match std::env::var("ARKFLOW_TEST_POSTGRES_URL") {
+            Ok(_) => ControlPlaneStore::open(&contract_database_url(label).await).await.unwrap(),
+            Err(_) => ControlPlaneStore::in_memory().unwrap(),
+        }
+    }
+}
+
+/// Create (or recreate) a dedicated Postgres database for a contract test
+/// and return the full URL to it. Panics without a live server: callers are
+/// gated on `ARKFLOW_TEST_POSTGRES_URL` first.
+#[cfg(test)]
+#[allow(clippy::await_holding_lock)] // the admin lock intentionally spans the awaits (test helper)
+pub(crate) async fn contract_database_url(label: &str) -> String {
+    use sqlx::Connection as _;
+    // CREATE/DROP DATABASE cannot run while other sessions touch template1;
+    // serialize the admin phase process-wide so parallel tests queue here.
+    // The guard intentionally spans the awaits: holding the lock across the
+    // admin session's lifetime is exactly the serialization we need (test
+    // helper only; the pool size is one admin connection at a time).
+    static ADMIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ADMIN_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A label can be requested more than once per test run (a fixture
+    // helper plus the test body); each request gets its own database so a
+    // recreate never drops a database another holder still uses.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let base = std::env::var("ARKFLOW_TEST_POSTGRES_URL").unwrap();
+    let suffix: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(50)
+        .collect();
+    let db = format!("ct_{suffix}_{sequence}");
+    let mut admin = sqlx::PgConnection::connect(&base).await.unwrap();
+    // FORCE drops concurrent connections from a previously aborted run.
+    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+        .execute(&mut admin)
+        .await;
+    sqlx::query(&format!("CREATE DATABASE {db}"))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    drop(admin);
+    // Swap the database name in "scheme://authority/dbname".
+    let pos = base.find("://").map(|p| p + 3).unwrap_or(0);
+    let after = &base[pos..];
+    match after.find('/') {
+        Some(i) => format!("{}{}/{db}", &base[..pos], &after[..i]),
+        None => format!("{}/{db}", base.trim_end_matches('/')),
+    }
+}
+
+impl ControlPlaneStore {
     /// Open a backend by storage value: `postgres://` / `postgresql://` URLs
     /// select PostgreSQL (with a startup connectivity probe); anything else
     /// is treated as a SQLite file path exactly as before.
@@ -3113,7 +3172,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_upgrade_record_round_trips_and_prunes() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("job_upgrade_record_round_trips_and_prunes").await;
         let mut record = JobUpgradeRecord {
             upgrade_id: "job-upgrade-1".into(),
             job_id: "job-a".into(),
@@ -3210,7 +3269,7 @@ mod tests {
     /// accepts the matching claim; lease operations themselves are exempt.
     #[tokio::test]
     async fn fenced_writes_reject_stale_leaders() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("fenced_writes_reject_stale_leaders").await;
         let actor = StorageActor::start(store.clone(), 16);
 
         // No lease row yet: any claim passes, behaviour identical to a
@@ -3268,7 +3327,7 @@ mod tests {
     /// is the explicit UNFENCED sentinel, not the absence of the row.
     #[tokio::test]
     async fn unfenced_claim_bypasses_a_leftover_lease_row() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("unfenced_claim_bypasses_a_leftover_lease_row").await;
         let actor = StorageActor::start(store.clone(), 16);
         // Simulate a prior HA deployment: a lease row exists (epoch 1 —
         // a live holder's self-acquire stays idempotent).
@@ -3298,7 +3357,7 @@ mod tests {
     /// release expires the caller's lease immediately.
     #[tokio::test]
     async fn hub_lease_acquire_renew_release_contract() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("hub_lease_acquire_renew_release_contract").await;
         // Fresh row: the first acquire is a takeover of the expired default.
         assert_eq!(
             store.try_acquire_hub_lease("hub-a", 1_000, 100).await.unwrap(),
@@ -3452,15 +3511,22 @@ mod tests {
 
     #[tokio::test]
     async fn rollout_creation_is_atomic_when_a_target_conflicts() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("rollout_creation_is_atomic_when_a_target_conflicts").await;
+        // Seed the config version through the public surface: a desired
+        // mutation carrying config + payload inserts the inline version row
+        // (PostgreSQL enforces the rollout foreign key).
         store
-            .with_connection(|connection| {
-                connection.execute(
-                    "INSERT INTO cp_config_versions (config_version_id, content_digest, content_ref, format, created_at_ms) VALUES ('cfg-1', 'digest', '{}', 'json', 10)",
-                    [],
-                )?;
-                Ok(())
+            .set_desired(DesiredMutation {
+                node_id: "node-seed".into(),
+                stream_id: "__configuration__".into(),
+                desired_state: "configured".into(),
+                config_version_id: Some("cfg-1".into()),
+                intent_type: Some("apply_configuration".into()),
+                payload_json: Some("{\"seed\":true}".into()),
+                expected_generation: Some(0),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let result = store.create_rollout(
             RolloutRecord {
@@ -3504,7 +3570,7 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_transitions_are_durable_and_audited() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("maintenance_transitions_are_durable_and_audited").await;
         store
             .upsert_node(NodeMutation {
                 node_id: "node-a".into(),
@@ -3542,28 +3608,75 @@ mod tests {
 
     #[tokio::test]
     async fn event_retention_prunes_oldest_durable_ids() {
-        let store = ControlPlaneStore::in_memory().unwrap();
-        store
-            .with_connection(|connection| {
-                for timestamp in 1..=3 {
-                    connection.execute(
-                        "INSERT INTO cp_events (event_type, outcome, occurred_at_ms) VALUES ('test', 'accepted', ?1)",
-                        [timestamp],
-                    )?;
-                }
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(store.prune_events(2).await.unwrap(), 1);
+        let store = ControlPlaneStore::contract("event_retention_prunes_oldest_durable_ids").await;
+        // Each desired mutation durably appends one intent_created event.
+        for stream in ["orders", "etl"] {
+            store
+                .set_desired(DesiredMutation {
+                    node_id: "node-a".into(),
+                    stream_id: stream.into(),
+                    desired_state: "running".into(),
+                    expected_generation: Some(0),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
         let events = store.list_events(None).await.unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_id, 3);
-        assert_eq!(events[1].event_id, 2);
+        assert!(events[0].event_id > events[1].event_id, "newest first");
+        assert_eq!(store.prune_events(1).await.unwrap(), 1);
+        let kept = store.list_events(None).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].event_id, events[0].event_id);
+    }
+
+    /// Audit retention reclaims by age and count bound while the resource
+    /// filter keeps addressing single resources.
+    #[tokio::test]
+    async fn audit_retention_reclaims_old_rows_and_keeps_the_filter_addressable() {
+        let store =
+            ControlPlaneStore::contract("audit_retention_reclaims_old_rows_and_keeps_the_filter_addressable")
+                .await;
+        let row = |resource: &str, occurred_at_ms: u64| AuditRecord {
+            event_id: 0,
+            actor: Some("retention-test".into()),
+            action: "probe.audit".into(),
+            resource_type: "probe".into(),
+            resource_id: Some(resource.into()),
+            node_id: None,
+            stream_id: None,
+            correlation_id: None,
+            outcome: "ok".into(),
+            failure_code: None,
+            message: None,
+            occurred_at_ms,
+        };
+        store.record_audit(row("probe-old", 100)).await.unwrap();
+        store.record_audit(row("probe-a", 9_000)).await.unwrap();
+        store.record_audit(row("probe-b", 9_001)).await.unwrap();
+        assert_eq!(store.list_audit(Some("probe-a")).await.unwrap().len(), 1);
+        assert_eq!(store.list_audit(Some("probe-old")).await.unwrap().len(), 1);
+        assert_eq!(store.list_audit(None::<&str>).await.unwrap().len(), 3);
+        // The age window reclaims only the row past the cutoff.
+        assert_eq!(store.prune_audit_events(1_000, 4_096).await.unwrap(), 1);
+        // The count bound keeps the newest rows when history accumulates
+        // faster than the age window reclaims it.
+        for index in 0..4 {
+            store
+                .record_audit(row("probe-bulk", 9_002 + index))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.prune_audit_events(1_000, 2).await.unwrap(), 4);
+        let audit = store.list_audit(None::<&str>).await.unwrap();
+        assert_eq!(audit.len(), 2);
+        assert!(audit.iter().all(|record| record.occurred_at_ms >= 9_004));
     }
 
     #[tokio::test]
     async fn operational_aggregates_are_bounded_and_include_pending_age() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("operational_aggregates_are_bounded_and_include_pending_age").await;
         store
             .upsert_node(NodeMutation {
                 node_id: "node-a".into(),
@@ -3679,7 +3792,8 @@ mod tests {
 
     #[tokio::test]
     async fn desired_mutation_commits_intent_and_outbox_atomically() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store =
+            ControlPlaneStore::contract("desired_mutation_commits_intent_and_outbox_atomically").await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -3703,15 +3817,14 @@ mod tests {
             events[0].intent_id.as_deref(),
             Some(intent.intent_id.as_str())
         );
-        assert!(
+        // The outbox row is committed in the same atomic unit as the intent.
+        assert_eq!(
             store
-                .with_connection(|connection| connection.query_row(
-                    "SELECT COUNT(*) FROM cp_outbox WHERE intent_id = ?1",
-                    [&intent.intent_id],
-                    |row| row.get::<_, i64>(0),
-                ))
+                .operational_aggregates(now_ms())
+                .await
                 .unwrap()
-                == 1
+                .outbox_pending,
+            1
         );
         assert!(matches!(
             store.set_desired(DesiredMutation {
@@ -3739,9 +3852,9 @@ mod tests {
     /// a stateless one.
     #[tokio::test]
     async fn conditional_job_write_preserves_a_newer_recovery_pointer() {
-        let store = ControlPlaneStore::in_memory().unwrap();
-        let job = |checkpoint_id: Option<&str>| JobRecord {
-            job_id: "orders".into(),
+        let store = ControlPlaneStore::contract("conditional_job_write_preserves_a_newer_recovery_pointer").await;
+        let job = |job_id: &str, checkpoint_id: Option<&str>| JobRecord {
+            job_id: job_id.into(),
             version: 2,
             spec_json: "{}".into(),
             desired_state: "stopped".into(),
@@ -3753,7 +3866,7 @@ mod tests {
             last_error: None,
             updated_at_ms: 0,
         };
-        store.upsert_job(job(Some("ckpt-old"))).await.unwrap();
+        store.upsert_job(job("orders", Some("ckpt-old"))).await.unwrap();
 
         // A concurrent checkpoint observation moves the pointer without
         // touching the generation.
@@ -3777,7 +3890,7 @@ mod tests {
 
         // The rollback handler writes the record it read (the older pointer).
         let written = store
-            .update_job_with_expected_generation(job(Some("ckpt-old")), 1)
+            .update_job_with_expected_generation(job("orders", Some("ckpt-old")), 1)
             .await.unwrap();
         assert_eq!(
             written.checkpoint_id.as_deref(),
@@ -3792,18 +3905,11 @@ mod tests {
         );
 
         // The conditional write never moves the pointer in either direction,
-        // so a NULL pointer stays NULL and the version/spec change lands.
-        store
-            .immediate_transaction(|connection| -> Result<(), StorageError> {
-                connection.execute(
-                    "UPDATE cp_jobs SET checkpoint_id = NULL WHERE job_id = 'orders'",
-                    [],
-                )?;
-                Ok(())
-            })
-            .unwrap();
+        // so a NULL pointer stays NULL and the version/spec change lands. A
+        // freshly created job stores a NULL pointer without SQL surgery.
+        store.upsert_job(job("etl", None)).await.unwrap();
         let written = store
-            .update_job_with_expected_generation(job(Some("ckpt-fresh")), 2)
+            .update_job_with_expected_generation(job("etl", Some("ckpt-fresh")), 1)
             .await.unwrap();
         assert_eq!(
             written.checkpoint_id, None,
@@ -3813,38 +3919,44 @@ mod tests {
 
         // A stale generation still conflicts.
         assert!(matches!(
-            store.update_job_with_expected_generation(job(None), 1).await,
+            store.update_job_with_expected_generation(job("orders", None), 1).await,
             Err(StorageError::GenerationConflict { .. })
         ));
     }
 
     #[tokio::test]
     async fn outbox_claim_is_idempotent_and_reclaimable_after_lease() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store =
+            ControlPlaneStore::contract("outbox_claim_is_idempotent_and_reclaimable_after_lease").await;
+        // A desired mutation enqueues exactly one reconcile outbox row.
         store
-            .immediate_transaction(|transaction| -> Result<(), StorageError> {
-                transaction.execute(
-                    "INSERT INTO cp_outbox (event_key, event_type, node_id, available_at_ms, created_at_ms) VALUES ('event-1', 'reconcile_intent', 'node-a', 10, 10)",
-                    [],
-                )?;
-                Ok(())
+            .set_desired(DesiredMutation {
+                node_id: "node-a".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
             })
+            .await
             .unwrap();
-        let first = store.claim_outbox("worker-a", 10).await.unwrap().unwrap();
-        assert_eq!(first.event_key, "event-1");
-        assert!(store.claim_outbox("worker-b", 11).await.unwrap().is_none());
+        let base = now_ms();
+        let first = store.claim_outbox("worker-a", base).await.unwrap().unwrap();
+        assert_eq!(first.event_type, "reconcile_intent");
+        assert_eq!(first.node_id, "node-a");
+        assert_eq!(first.stream_id.as_deref(), Some("orders"));
+        assert!(store.claim_outbox("worker-b", base + 1).await.unwrap().is_none());
         assert_eq!(
             store
-                .claim_outbox("worker-b", 30_011)
+                .claim_outbox("worker-b", base + 30_011)
                 .await.unwrap()
                 .unwrap()
-                .event_key,
-            "event-1"
+                .outbox_id,
+            first.outbox_id
         );
         store
-            .mark_outbox_processed(first.outbox_id, 30_012)
+            .mark_outbox_processed(first.outbox_id, base + 30_012)
             .await.unwrap();
-        assert!(store.claim_outbox("worker-c", 30_013).await.unwrap().is_none());
+        assert!(store.claim_outbox("worker-c", base + 30_013).await.unwrap().is_none());
     }
 
     /// The outbox retention reclaims only processed rows: the unprocessed
@@ -3852,57 +3964,83 @@ mod tests {
     /// counters — which only look at unprocessed rows — are unaffected.
     #[tokio::test]
     async fn prune_processed_outbox_reclaims_only_processed_rows() {
-        let store = ControlPlaneStore::in_memory().unwrap();
-        let insert = |event_key: &str, processed_at_ms: Option<i64>, claimed: bool| {
-            store
-                .immediate_transaction(|transaction| -> Result<(), StorageError> {
-                    transaction.execute(
-                        "INSERT INTO cp_outbox (event_key, event_type, node_id, available_at_ms, created_at_ms, claimed_at_ms, processed_at_ms) VALUES (?1, 'reconcile_intent', 'node-a', 1, 1, ?2, ?3)",
-                        rusqlite::params![
-                            event_key,
-                            if claimed { Some(5) } else { None },
-                            processed_at_ms
-                        ],
-                    )?;
-                    Ok(())
-                })
-                .unwrap();
+        let store =
+            ControlPlaneStore::contract("prune_processed_outbox_reclaims_only_processed_rows").await;
+        // Enqueue three rows: one to process early, one to leave claimed, and
+        // one to process recently.
+        let seed = |node: &str, stream: &str| {
+            let store = store.clone();
+            let node = node.to_owned();
+            let stream = stream.to_owned();
+            async move {
+                store
+                    .set_desired(DesiredMutation {
+                        node_id: node,
+                        stream_id: stream,
+                        desired_state: "running".into(),
+                        expected_generation: Some(0),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+            }
         };
-        insert("old-processed", Some(100), false);
-        insert("recent-processed", Some(9_000), false);
-        insert("claimed-pending", None, true);
+        seed("node-a", "orders").await;
+        seed("node-a", "etl").await;
+        seed("node-b", "etl").await;
+        // Capture the clock after the seeds: their availability timestamps
+        // were assigned at insert time (a remote backend may sit a few
+        // round trips after any earlier reading).
+        let base = now_ms();
+        let old_processed = store.claim_outbox("worker", base).await.unwrap().unwrap();
+        store
+            .mark_outbox_processed(old_processed.outbox_id, 100)
+            .await
+            .unwrap();
+        let claimed_pending = store.claim_outbox("worker", base + 1).await.unwrap().unwrap();
+        let recent_processed = store.claim_outbox("worker", base + 2).await.unwrap().unwrap();
+        store
+            .mark_outbox_processed(recent_processed.outbox_id, 9_000)
+            .await
+            .unwrap();
+        let aggregates_before = store.operational_aggregates(base + 10).await.unwrap();
+        assert_eq!(aggregates_before.outbox_pending, 1);
+        assert_eq!(aggregates_before.outbox_claimed, 1);
 
-        let aggregates_before = store.operational_aggregates(10_000).await.unwrap();
         // The age window reclaims only the processed row past the cutoff.
-        assert_eq!(store.prune_processed_outbox(1_000, 4096).await.unwrap(), 1);
+        assert_eq!(store.prune_processed_outbox(1_000, 4_096).await.unwrap(), 1);
+
         // The count bound keeps the newest processed rows when history
         // accumulates faster than the age window reclaims it.
-        for index in 0..6 {
-            insert(&format!("bulk-{index}"), Some(2_000 + index), false);
+        for index in 0u64..6 {
+            seed(&format!("node-c{index}"), "etl").await;
+            let bulk = store
+                .claim_outbox("worker", now_ms() + 10)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(bulk.outbox_id, recent_processed.outbox_id + 1 + index as i64);
+            store
+                .mark_outbox_processed(bulk.outbox_id, 2_000 + index)
+                .await
+                .unwrap();
         }
         assert_eq!(store.prune_processed_outbox(1_000, 2).await.unwrap(), 5);
-        let remaining = store
-            .immediate_transaction(|transaction| {
-                let mut statement =
-                    transaction.prepare("SELECT event_key FROM cp_outbox ORDER BY outbox_id")?;
-                let keys = statement
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(keys)
-            })
-            .unwrap();
-        assert_eq!(
-            remaining,
-            vec!["recent-processed", "claimed-pending", "bulk-5"]
-        );
-        let aggregates_after = store.operational_aggregates(10_000).await.unwrap();
+        let aggregates_after = store.operational_aggregates(base + 100).await.unwrap();
         assert_eq!(
             aggregates_before.outbox_pending,
-            aggregates_after.outbox_pending
+            aggregates_after.outbox_pending,
+            "the claimed-but-unprocessed work queue survives every sweep"
         );
+        assert_eq!(aggregates_before.outbox_claimed, aggregates_after.outbox_claimed);
+        // The claimed row is still reclaimable by its original bookkeeping.
         assert_eq!(
-            aggregates_before.outbox_claimed,
-            aggregates_after.outbox_claimed
+            store
+                .claim_outbox("worker-z", base + 30_011)
+                .await.unwrap()
+                .unwrap()
+                .outbox_id,
+            claimed_pending.outbox_id
         );
     }
 
@@ -3911,54 +4049,75 @@ mod tests {
     /// unique index — is preserved unchanged.
     #[tokio::test]
     async fn prune_terminal_attempts_reclaims_only_terminal_rows() {
-        let store = ControlPlaneStore::in_memory().unwrap();
-        store
-            .immediate_transaction(|transaction| -> Result<(), StorageError> {
-                transaction.execute(
-                    "INSERT INTO cp_intents (intent_id, node_id, stream_id, generation, intent_type, state, convergence_state, created_at_ms, updated_at_ms) VALUES ('intent-1', 'node-a', 'orders', 1, 'stream_lifecycle', 'converged', 'converged', 1, 1)",
-                    [],
-                )?;
-                let insert_attempt = |attempt_id: &str,
-                                      state: &str,
-                                      finished_at_ms: Option<i64>|
-                 -> Result<(), StorageError> {
-                    transaction.execute(
-                        "INSERT INTO cp_attempts (attempt_id, intent_id, command_id, node_id, stream_id, generation, operation, state, finished_at_ms, created_at_ms) VALUES (?1, 'intent-1', ?1, 'node-a', 'orders', 1, 'apply_configuration', ?2, ?3, 1)",
-                        rusqlite::params![attempt_id, state, finished_at_ms],
-                    )?;
-                    Ok(())
-                };
-                insert_attempt("old-terminal", "succeeded", Some(100))?;
-                insert_attempt("recent-terminal", "failed", Some(9_000))?;
-                insert_attempt("active-attempt", "running", None)?;
-                Ok(())
+        let store =
+            ControlPlaneStore::contract("prune_terminal_attempts_reclaims_only_terminal_rows").await;
+        // Past 2100-01-01: every attempt finished at wall-clock now is older.
+        const FAR_FUTURE_MS: i64 = 4_102_444_800_000;
+        let terminal_intent = |node: &str, stream: &str, state: &str| {
+            let store = store.clone();
+            let node = node.to_owned();
+            let stream = stream.to_owned();
+            let state = state.to_owned();
+            async move {
+                let intent = store
+                    .set_desired(DesiredMutation {
+                        node_id: node,
+                        stream_id: stream,
+                        desired_state: "running".into(),
+                        expected_generation: Some(0),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let attempt = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+                store
+                    .complete_attempt(&attempt.attempt_id, &state, None)
+                    .await
+                    .unwrap();
+            }
+        };
+        terminal_intent("node-a", "orders", "succeeded").await;
+        terminal_intent("node-a", "etl", "failed").await;
+        // A still-active attempt: claimed but never completed.
+        let active = store
+            .set_desired(DesiredMutation {
+                node_id: "node-b".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
             })
+            .await
             .unwrap();
-        // The age window reclaims only the terminal row past the cutoff.
-        assert_eq!(store.prune_terminal_attempts(1_000, 4096).await.unwrap(), 1);
-        // The count bound trims terminal history down to the newest rows.
-        assert_eq!(store.prune_terminal_attempts(1_000, 0).await.unwrap(), 1);
-        let remaining = store
-            .immediate_transaction(|transaction| {
-                let mut statement =
-                    transaction.prepare("SELECT attempt_id, state FROM cp_attempts")?;
-                let rows = statement
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .unwrap();
+        let active_attempt = store.claim_attempt(&active.intent_id).await.unwrap().unwrap();
+        assert_eq!(active_attempt.state, "queued");
+
+        // The age window reclaims only the terminal rows past the cutoff.
         assert_eq!(
-            remaining,
-            vec![("active-attempt".to_string(), "running".to_string())]
+            store.prune_terminal_attempts(FAR_FUTURE_MS, 4_096).await.unwrap(),
+            2
+        );
+        // The count bound trims terminal history down to the newest rows.
+        terminal_intent("node-b", "etl", "succeeded").await;
+        assert_eq!(store.prune_terminal_attempts(FAR_FUTURE_MS, 0).await.unwrap(), 1);
+        let aggregates = store.operational_aggregates(now_ms()).await.unwrap();
+        assert_eq!(aggregates.attempt_states, vec![("queued".into(), 1)]);
+        assert_eq!(aggregates.active_attempts, 1);
+        // The surviving active attempt is preserved unchanged.
+        assert_eq!(
+            store
+                .claim_attempt(&active.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt_id,
+            active_attempt.attempt_id
         );
     }
 
     #[tokio::test]
     async fn storage_actor_serializes_desired_mutations() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("storage_actor_serializes_desired_mutations").await;
         let actor = StorageActor::start(store, 8);
         let first = actor
             .set_desired(DesiredMutation {
@@ -3995,7 +4154,7 @@ mod tests {
 
     #[tokio::test]
     async fn observed_generation_converges_intent_and_attempt() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("observed_generation_converges_intent_and_attempt").await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4027,21 +4186,18 @@ mod tests {
                 last_error_message: None,
             })
             .await.unwrap();
-        let states: (String, String) = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT i.state, a.state FROM cp_intents i JOIN cp_attempts a ON a.intent_id = i.intent_id WHERE i.intent_id = ?1",
-                    [&intent.intent_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-        })
-        .unwrap();
-        assert_eq!(states, ("converged".into(), "succeeded".into()));
+        let converged = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
+        assert_eq!(converged.state, "converged");
+        assert_eq!(converged.convergence_state, "in_sync");
+        let aggregates = store.operational_aggregates(now_ms()).await.unwrap();
+        assert_eq!(aggregates.attempt_states, vec![("succeeded".into(), 1)]);
         let events = store.list_events(Some("node-a")).await.unwrap();
         assert!(events.iter().any(|event| {
             event.event_type == "intent_converged"
                 && event.intent_id.as_deref() == Some(intent.intent_id.as_str())
         }));
+        // A replayed report from the same session (seq below the cursor) is
+        // rejected: the stored observation keeps the newer state.
         store
             .record_observed(ObservedMutation {
                 node_id: "node-a".into(),
@@ -4057,16 +4213,15 @@ mod tests {
                 last_error_message: None,
             })
             .await.unwrap();
-        let observed: String = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT observed_state FROM cp_stream_observed WHERE node_id = 'node-a' AND stream_id = 'orders'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(observed, "running");
+        let reports = store
+            .list_events(Some("node-a"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "observed_report")
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1, "the replayed report leaves no durable trace");
+        assert_eq!(reports[0].outcome, "running");
     }
 
     /// A session rebuild (re-register with the same stable boot identity)
@@ -4076,7 +4231,8 @@ mod tests {
     /// high-water mark, blinding convergence for the whole rebuild gap.
     #[tokio::test]
     async fn stable_boot_session_rebuild_resets_the_observation_cursor() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store =
+            ControlPlaneStore::contract("stable_boot_session_rebuild_resets_the_observation_cursor").await;
         let observed = |seq: u64, state: &str| ObservedMutation {
             node_id: "node-a".into(),
             stream_id: "orders".into(),
@@ -4096,21 +4252,23 @@ mod tests {
         // Sequence 1 of the rebuilt session must be accepted, not dropped
         // as stale under the previous session's cursor of 7.
         store.record_observed(observed(1, "failed")).await.unwrap();
-        let (state, seq): (String, u64) = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT observed_state, report_seq FROM cp_stream_observed WHERE node_id = 'node-a' AND stream_id = 'orders'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-            })
-            .unwrap();
-        assert_eq!((state.as_str(), seq), ("failed", 1));
+        // The rebuilt report is durable: its observed_report event exists.
+        let reports = store
+            .list_events(Some("node-a"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "observed_report")
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].outcome, "failed");
+        assert_eq!(reports[1].outcome, "running");
     }
 
     #[tokio::test]
     async fn restart_intent_requires_matching_completed_action() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store =
+            ControlPlaneStore::contract("restart_intent_requires_matching_completed_action").await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4143,16 +4301,16 @@ mod tests {
                 last_error_message: None,
             })
             .await.unwrap();
-        let pending: String = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT state FROM cp_intents WHERE intent_id = ?1",
-                    [&intent.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(pending, "accepted");
+        // A different completed action does not satisfy the restart intent.
+        assert_eq!(
+            store
+                .get_intent(&intent.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "accepted"
+        );
         store
             .record_observed(ObservedMutation {
                 node_id: "node-a".into(),
@@ -4168,21 +4326,22 @@ mod tests {
                 last_error_message: None,
             })
             .await.unwrap();
-        let converged: String = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT state FROM cp_intents WHERE intent_id = ?1",
-                    [&intent.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(converged, "converged");
+        // The matching action id completes the restart.
+        assert_eq!(
+            store
+                .get_intent(&intent.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "converged"
+        );
     }
 
     #[tokio::test]
     async fn recovery_requeues_pending_intents_after_processed_outbox() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store =
+            ControlPlaneStore::contract("recovery_requeues_pending_intents_after_processed_outbox").await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4198,37 +4357,31 @@ mod tests {
             })
             .await.unwrap();
         let base = now_ms();
+        let pending = || async {
+            store
+                .operational_aggregates(now_ms())
+                .await
+                .unwrap()
+                .outbox_pending
+        };
+        // Recovery is a no-op while unprocessed work already exists.
         store.recover_reconciliation(base).await.unwrap();
-        let count: i64 = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM cp_outbox WHERE intent_id = ?1",
-                    [&intent.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(pending().await, 1);
         let outbox = store.claim_outbox("worker", base).await.unwrap().unwrap();
+        assert_eq!(outbox.intent_id.as_deref(), Some(intent.intent_id.as_str()));
         store
             .mark_outbox_processed(outbox.outbox_id, base + 1)
             .await.unwrap();
+        assert_eq!(pending().await, 0);
+        // Once the outbox work is processed, recovery requeues the intent.
         store.recover_reconciliation(base + 2).await.unwrap();
-        let count: i64 = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM cp_outbox WHERE intent_id = ?1",
-                    [&intent.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(pending().await, 1);
     }
 
     #[tokio::test]
     async fn attempt_ack_is_not_terminal_and_temporary_failure_retries() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store =
+            ControlPlaneStore::contract("attempt_ack_is_not_terminal_and_temporary_failure_retries").await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4247,16 +4400,11 @@ mod tests {
         store
             .complete_attempt(&attempt.attempt_id, "acknowledged", None)
             .await.unwrap();
-        let finished: Option<u64> = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT finished_at_ms FROM cp_attempts WHERE attempt_id = ?1",
-                    [&attempt.attempt_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert!(finished.is_none());
+        // "acknowledged" is not terminal: the same attempt stays claimable
+        // and the intent keeps converging instead of being blocked.
+        let reclaimed = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+        assert_eq!(reclaimed.attempt_id, attempt.attempt_id);
+        assert_eq!(reclaimed.state, "acknowledged");
         store
             .complete_attempt(
                 &attempt.attempt_id,
@@ -4264,32 +4412,33 @@ mod tests {
                 Some("temporary_execution"),
             )
             .await.unwrap();
-        let state: String = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT state FROM cp_intents WHERE intent_id = ?1",
-                    [&intent.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(state, "retrying");
-        let retries: i64 = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM cp_outbox WHERE intent_id = ?1 AND event_type = 'retry_intent'",
-                    [&intent.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(retries, 1);
+        let requeued = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
+        assert_eq!(requeued.state, "retrying");
+        assert_eq!(requeued.convergence_state, "degraded");
+        assert_eq!(requeued.retry_count, 1);
+        assert_eq!(requeued.failure_class.as_deref(), Some("temporary_execution"));
+        // The retry is durable outbox work: claim the original reconcile row
+        // first, then the retry row once its backoff makes it available.
+        let base = now_ms();
+        let first = store.claim_outbox("worker", base).await.unwrap().unwrap();
+        assert_eq!(first.event_type, "reconcile_intent");
+        store
+            .mark_outbox_processed(first.outbox_id, base + 1)
+            .await.unwrap();
+        let retry = store
+            .claim_outbox("worker", now_ms() + 1_500)
+            .await.unwrap().unwrap();
+        assert_eq!(retry.event_type, "retry_intent");
+        assert_eq!(retry.intent_id.as_deref(), Some(intent.intent_id.as_str()));
     }
 
     #[tokio::test]
     async fn node_registration_wakes_unprocessed_intents_after_prior_outbox_work() {
-        let store = ControlPlaneStore::in_memory().unwrap();
-        let intent = store
+        let store = ControlPlaneStore::contract(
+            "node_registration_wakes_unprocessed_intents_after_prior_outbox_work",
+        )
+        .await;
+        store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
                 stream_id: "orders".into(),
@@ -4303,22 +4452,28 @@ mod tests {
         store
             .mark_outbox_processed(outbox.outbox_id, timestamp + 1)
             .await.unwrap();
+        let pending = || async {
+            store
+                .operational_aggregates(now_ms())
+                .await
+                .unwrap()
+                .outbox_pending
+        };
+        assert_eq!(pending().await, 0);
+        // Re-registering the node requeues its still-unconverged intents.
         store.wake_node("node-a", timestamp + 2).await.unwrap();
-        let pending: i64 = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM cp_outbox WHERE intent_id = ?1 AND processed_at_ms IS NULL",
-                    [&intent.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(pending, 1);
+        assert_eq!(pending().await, 1);
+        // Waking again is idempotent while unprocessed work exists.
+        store.wake_node("node-a", timestamp + 3).await.unwrap();
+        assert_eq!(pending().await, 1);
+        // Waking an unknown node leaves the queue untouched.
+        store.wake_node("node-zzz", timestamp + 4).await.unwrap();
+        assert_eq!(pending().await, 1);
     }
 
     #[tokio::test]
     async fn configuration_intent_requires_matching_observed_version() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("configuration_intent_requires_matching_observed_version").await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4362,7 +4517,10 @@ mod tests {
 
     #[tokio::test]
     async fn permanent_configuration_failure_blocks_until_a_new_generation() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract(
+            "permanent_configuration_failure_blocks_until_a_new_generation",
+        )
+        .await;
         let first = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4386,16 +4544,19 @@ mod tests {
             blocked.failure_class.as_deref(),
             Some("permanent_execution")
         );
-        let retry_count: i64 = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM cp_outbox WHERE intent_id = ?1 AND event_type = 'retry_intent'",
-                    [&first.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(retry_count, 0);
+        // A permanent failure never schedules retry work.
+        let timestamp = now_ms();
+        let outbox = store.claim_outbox("worker", timestamp).await.unwrap().unwrap();
+        store
+            .mark_outbox_processed(outbox.outbox_id, timestamp + 1)
+            .await.unwrap();
+        assert_eq!(
+            store
+                .operational_aggregates(now_ms())
+                .await.unwrap()
+                .outbox_pending,
+            0
+        );
 
         let rollback = store
             .set_desired(DesiredMutation {
@@ -4415,7 +4576,7 @@ mod tests {
 
     #[tokio::test]
     async fn configuration_convergence_waits_for_affected_streams() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("configuration_convergence_waits_for_affected_streams").await;
         let stream = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4506,7 +4667,8 @@ mod tests {
 
     #[tokio::test]
     async fn expired_attempt_becomes_ambiguous_until_fresh_report() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store =
+            ControlPlaneStore::contract("expired_attempt_becomes_ambiguous_until_fresh_report").await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4525,50 +4687,36 @@ mod tests {
             .mark_attempt_dispatched(&attempt.attempt_id, 10)
             .await.unwrap();
         assert_eq!(store.expire_attempts(10).await.unwrap(), 1);
-        let state: (String, String) = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT a.state, i.convergence_state FROM cp_attempts a JOIN cp_intents i ON i.intent_id = a.intent_id WHERE a.attempt_id = ?1",
-                    [&attempt.attempt_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-            })
-            .unwrap();
-        assert_eq!(state, ("ambiguous".into(), "degraded".into()));
+        // Both the attempt and the intent degrade to ambiguous.
+        let ambiguous = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
+        assert_eq!(ambiguous.state, "converging");
+        assert_eq!(ambiguous.convergence_state, "degraded");
+        assert_eq!(ambiguous.failure_class.as_deref(), Some("ambiguous"));
+        let aggregates = store.operational_aggregates(now_ms()).await.unwrap();
+        assert!(aggregates.attempt_states.contains(&("ambiguous".into(), 1)));
         store
             .complete_attempt(&attempt.attempt_id, "ambiguous", Some("ambiguous"))
             .await.unwrap();
-        let state: (String, String) = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT i.state, i.convergence_state FROM cp_intents i WHERE i.intent_id = ?1",
-                    [&intent.intent_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-            })
-            .unwrap();
-        assert_eq!(state, ("converging".into(), "degraded".into()));
-        let pending_outbox: i64 = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM cp_outbox WHERE intent_id = ?1 AND processed_at_ms IS NULL",
-                    [&intent.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(pending_outbox, 0);
+        let still_degraded = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
+        assert_eq!(still_degraded.state, "converging");
+        assert_eq!(still_degraded.convergence_state, "degraded");
+        assert_eq!(
+            store
+                .operational_aggregates(now_ms())
+                .await.unwrap()
+                .outbox_pending,
+            0,
+            "an ambiguous intent is never auto-retried"
+        );
         store.wake_node("node-a", 11).await.unwrap();
-        let pending_outbox: i64 = store
-            .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM cp_outbox WHERE intent_id = ?1 AND processed_at_ms IS NULL",
-                    [&intent.intent_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(pending_outbox, 0);
+        assert_eq!(
+            store
+                .operational_aggregates(now_ms())
+                .await.unwrap()
+                .outbox_pending,
+            0,
+            "waking the node must not bypass the ambiguity fence"
+        );
         store
             .record_observed(ObservedMutation {
                 node_id: "node-a".into(),
@@ -4584,16 +4732,1235 @@ mod tests {
                 last_error_message: None,
             })
             .await.unwrap();
-        let pending_outbox: i64 = store
+        // A fresh report from the new session resolves the ambiguity and
+        // requeues reconciliation work.
+        assert_eq!(
+            store
+                .operational_aggregates(now_ms())
+                .await.unwrap()
+                .outbox_pending,
+            1
+        );
+    }
+
+    /// Desired and intent reads address what the mutation paths wrote:
+    /// point lookups miss unknown streams, and the intent list filters by
+    /// node while preserving the full record shape.
+    #[tokio::test]
+    async fn desired_and_intent_reads_round_trip() {
+        let store = ControlPlaneStore::contract("desired_and_intent_reads_round_trip").await;
+        let intent = store
+            .set_desired(DesiredMutation {
+                node_id: "node-a".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                config_version_id: Some("cfg-1".into()),
+                intent_type: Some("apply_configuration".into()),
+                payload_json: Some(r#"{"format":"json"}"#.into()),
+                actor: Some("operator".into()),
+                correlation_id: Some("corr-1".into()),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await.unwrap();
+        let desired = store.get_desired("node-a", "orders").await.unwrap().unwrap();
+        assert_eq!(desired.node_id, "node-a");
+        assert_eq!(desired.stream_id, "orders");
+        assert_eq!(desired.generation, 1);
+        assert_eq!(desired.desired_state, "running");
+        assert_eq!(desired.config_version_id.as_deref(), Some("cfg-1"));
+        assert_eq!(desired.action_id, None);
+        assert_eq!(desired.correlation_id.as_deref(), Some("corr-1"));
+        assert!(store.get_desired("node-a", "missing").await.unwrap().is_none());
+
+        store
+            .set_desired(DesiredMutation {
+                node_id: "node-b".into(),
+                stream_id: "orders".into(),
+                desired_state: "stopped".into(),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await.unwrap();
+        let all = store.list_intents(None).await.unwrap();
+        assert_eq!(all.len(), 2);
+        let node_a = store.list_intents(Some("node-a")).await.unwrap();
+        assert_eq!(node_a.len(), 1);
+        assert_eq!(node_a[0].intent_id, intent.intent_id);
+        assert_eq!(node_a[0].node_id, "node-a");
+        assert_eq!(node_a[0].generation, 1);
+        assert_eq!(node_a[0].state, "accepted");
+        assert_eq!(node_a[0].convergence_state, "pending");
+        assert_eq!(node_a[0].retry_count, 0);
+        assert_eq!(node_a[0].next_retry_at_ms, None);
+        assert_eq!(node_a[0].failure_class, None);
+        assert_eq!(node_a[0].superseded_by_intent_id, None);
+        assert_eq!(node_a[0].superseded_generation, None);
+        assert_eq!(node_a[0].observed_generation, None);
+        assert_eq!(node_a[0].observed_state, None);
+        assert!(store.list_intents(Some("node-zzz")).await.unwrap().is_empty());
+    }
+
+    /// The rollout orchestration surface: content-bearing creation seeds the
+    /// config version, updates move the rollout and its targets, recovery
+    /// returns only live rollouts, and listing is bounded but complete.
+    #[tokio::test]
+    async fn rollout_lifecycle_round_trips_and_recovers() {
+        let store = ControlPlaneStore::contract("rollout_lifecycle_round_trips_and_recovers").await;
+        let target = |rollout_id: &str, node: &str, ordinal: u32| RolloutTargetRecord {
+            rollout_id: rollout_id.into(),
+            node_id: node.into(),
+            ordinal,
+            state: "pending".into(),
+            attempt_id: None,
+            error: None,
+            observed_config_version: None,
+            updated_at_ms: 10,
+        };
+        store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "rollout-1".into(),
+                    config_version_id: "cfg-1".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 2,
+                    actor: Some("operator".into()),
+                    correlation_id: Some("corr-1".into()),
+                    created_at_ms: 10,
+                    updated_at_ms: 10,
+                },
+                vec![target("rollout-1", "node-a", 0), target("rollout-1", "node-b", 1)],
+                "{\"version\":1}",
+                Some("operator"),
+            )
+            .await.unwrap();
+        // The inline content is addressable as a config version.
+        assert_eq!(
+            store.get_config_version_content("cfg-1").await.unwrap().as_deref(),
+            Some("{\"version\":1}")
+        );
+        assert!(store
+            .get_config_version_content("cfg-missing")
+            .await.unwrap()
+            .is_none());
+        assert_eq!(
+            store.get_rollout("rollout-1").await.unwrap().unwrap(),
+            RolloutRecord {
+                rollout_id: "rollout-1".into(),
+                config_version_id: "cfg-1".into(),
+                state: "applying".into(),
+                batch_size: 1,
+                current_batch: 0,
+                total_targets: 2,
+                actor: Some("operator".into()),
+                correlation_id: Some("corr-1".into()),
+                created_at_ms: 10,
+                updated_at_ms: 10,
+            }
+        );
+        assert!(store.get_rollout("rollout-missing").await.unwrap().is_none());
+        let targets = store.list_rollout_targets("rollout-1").await.unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].node_id, "node-a");
+        assert_eq!(targets[1].node_id, "node-b");
+        assert_eq!(targets[0].state, "pending");
+
+        // Batch and per-target progress land durably.
+        store.update_rollout("rollout-1", "applying", 1, 50).await.unwrap();
+        store
+            .update_rollout_target(RolloutTargetUpdate {
+                rollout_id: "rollout-1".into(),
+                node_id: "node-a".into(),
+                state: "applied".into(),
+                attempt_id: Some("attempt-1".into()),
+                error: None,
+                observed_config_version: Some("cfg-1".into()),
+                updated_at_ms: 55,
+            })
+            .await.unwrap();
+        let updated = store.get_rollout("rollout-1").await.unwrap().unwrap();
+        assert_eq!(updated.current_batch, 1);
+        assert_eq!(updated.updated_at_ms, 50);
+        let targets = store.list_rollout_targets("rollout-1").await.unwrap();
+        assert_eq!(targets[0].state, "applied");
+        assert_eq!(targets[0].attempt_id.as_deref(), Some("attempt-1"));
+        assert_eq!(targets[0].observed_config_version.as_deref(), Some("cfg-1"));
+        assert_eq!(targets[1].state, "pending");
+
+        // A terminal rollout is excluded from recovery; a live one is not.
+        store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "rollout-2".into(),
+                    config_version_id: "cfg-2".into(),
+                    state: "converged".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 0,
+                    actor: None,
+                    correlation_id: None,
+                    created_at_ms: 20,
+                    updated_at_ms: 20,
+                },
+                Vec::new(),
+                "{}",
+                None,
+            )
+            .await.unwrap();
+        let recoverable = store.recover_rollouts().await.unwrap();
+        assert_eq!(recoverable.len(), 1);
+        assert_eq!(recoverable[0].rollout_id, "rollout-1");
+        let listed = store.list_rollouts().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].rollout_id, "rollout-2", "newest first");
+
+        // Plain creation reuses an already-seeded config version (the
+        // PostgreSQL rollout foreign key must be satisfiable).
+        store
+            .create_rollout(
+                RolloutRecord {
+                    rollout_id: "rollout-3".into(),
+                    config_version_id: "cfg-1".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 1,
+                    actor: None,
+                    correlation_id: None,
+                    created_at_ms: 30,
+                    updated_at_ms: 30,
+                },
+                vec![target("rollout-3", "node-c", 0)],
+            )
+            .await.unwrap();
+        assert!(store.get_rollout("rollout-3").await.unwrap().is_some());
+        assert_eq!(store.list_rollout_targets("rollout-3").await.unwrap().len(), 1);
+    }
+
+    /// Job version history and checkpoint artifacts round-trip, and
+    /// checkpoint retention reclaims only pending/failed artifacts.
+    #[tokio::test]
+    async fn job_versions_and_checkpoints_round_trip() {
+        let store = ControlPlaneStore::contract("job_versions_and_checkpoints_round_trip").await;
+        let version = |version: u64, plan: &str| JobVersionRecord {
+            job_id: "orders".into(),
+            version,
+            spec_json: format!("{{\"version\":{version}}}"),
+            plan_json: plan.into(),
+            created_at_ms: version,
+        };
+        store.upsert_job_version(version(1, "plan-1")).await.unwrap();
+        store.upsert_job_version(version(2, "plan-2")).await.unwrap();
+        // Re-upserting a version rewrites its plan.
+        store.upsert_job_version(version(2, "plan-2b")).await.unwrap();
+        let versions = store.list_job_versions("orders").await.unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version, 2, "newest version first");
+        assert_eq!(versions[0].plan_json, "plan-2b");
+        assert_eq!(versions[0].spec_json, "{\"version\":2}");
+        assert_eq!(versions[1].version, 1);
+        assert!(store.list_job_versions("missing").await.unwrap().is_empty());
+
+        let checkpoint = |checkpoint_id: &str,
+                          kind: &str,
+                          status: &str,
+                          created_at_ms: u64,
+                          updated_at_ms: u64| JobCheckpointRecord {
+            job_id: "orders".into(),
+            job_version: 2,
+            checkpoint_id: checkpoint_id.into(),
+            kind: kind.into(),
+            status: status.into(),
+            manifest_uri: Some(format!("file://{checkpoint_id}")),
+            format_version: 1,
+            created_at_ms,
+            updated_at_ms,
+        };
+        store
+            .upsert_job_checkpoint(checkpoint("cp-1", "savepoint", "pending", 10, 10))
+            .await.unwrap();
+        store
+            .upsert_job_checkpoint(checkpoint("cp-2", "snapshot", "completed", 20, 20))
+            .await.unwrap();
+        store
+            .upsert_job_checkpoint(checkpoint("cp-3", "savepoint", "failed", 5, 5))
+            .await.unwrap();
+        let checkpoints = store.list_job_checkpoints("orders").await.unwrap();
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|record| record.checkpoint_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cp-2", "cp-1", "cp-3"],
+            "newest created first"
+        );
+        assert_eq!(checkpoints[0].kind, "snapshot");
+        assert_eq!(checkpoints[0].manifest_uri.as_deref(), Some("file://cp-2"));
+        // A completed status re-arms the retention pin on an existing row.
+        store
+            .upsert_job_checkpoint(checkpoint("cp-1", "savepoint", "completed", 10, 30))
+            .await.unwrap();
+        // Retention reclaims only pending/failed artifacts past the cutoff.
+        assert_eq!(store.prune_job_checkpoint_records(15).await.unwrap(), 1);
+        let surviving = store.list_job_checkpoints("orders").await.unwrap();
+        assert_eq!(
+            surviving
+                .iter()
+                .map(|record| record.checkpoint_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cp-2", "cp-1"]
+        );
+        assert_eq!(surviving[1].status, "completed", "cp-1 was re-armed above");
+        // Explicit delete removes a specific artifact; missing ids are no-ops.
+        store.delete_job_checkpoint("orders", "cp-2").await.unwrap();
+        store.delete_job_checkpoint("orders", "cp-missing").await.unwrap();
+        let remaining = store.list_job_checkpoints("orders").await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].checkpoint_id, "cp-1");
+        assert!(store.list_job_checkpoints("missing").await.unwrap().is_empty());
+    }
+
+    /// Job observations apply as a compare-and-swap: a report conditioned on
+    /// a moved generation is rejected instead of rolling the Job back.
+    #[tokio::test]
+    async fn job_observation_update_is_conditioned_on_generation() {
+        let store =
+            ControlPlaneStore::contract("job_observation_update_is_conditioned_on_generation").await;
+        let job = JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: "{}".into(),
+            desired_state: "running".into(),
+            observed_state: "draft".into(),
+            convergence: "unknown".into(),
+            generation: 0,
+            node_ids: Vec::new(),
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        let stored = store.upsert_job(job.clone()).await.unwrap();
+        assert_eq!(stored.generation, 1);
+        let observed = store
+            .update_job_observation("orders", "running", "in_sync", 2, 1, Some("cp-obs"), None)
+            .await.unwrap().unwrap();
+        assert_eq!(observed.observed_state, "running");
+        assert_eq!(observed.convergence, "in_sync");
+        assert_eq!(observed.generation, 2);
+        assert_eq!(observed.checkpoint_id.as_deref(), Some("cp-obs"));
+        // A report conditioned on the superseded generation conflicts.
+        assert!(matches!(
+            store
+                .update_job_observation("orders", "failed", "degraded", 3, 1, None, Some("boom"))
+                .await,
+            Err(StorageError::GenerationConflict { .. })
+        ));
+        let untouched = store.get_job("orders").await.unwrap().unwrap();
+        assert_eq!(untouched.observed_state, "running");
+        assert_eq!(untouched.checkpoint_id.as_deref(), Some("cp-obs"));
+        // The report conditioned on the current generation applies and the
+        // checkpoint pointer survives a NULL carry.
+        let next = store
+            .update_job_observation("orders", "failed", "degraded", 3, 2, None, Some("boom"))
+            .await.unwrap().unwrap();
+        assert_eq!(next.observed_state, "failed");
+        assert_eq!(next.last_error.as_deref(), Some("boom"));
+        assert_eq!(next.checkpoint_id.as_deref(), Some("cp-obs"));
+        // Observing an unknown Job is a miss, not a conflict.
+        assert!(store
+            .update_job_observation("missing", "running", "in_sync", 1, 0, None, None)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Persisted operations round-trip and the node-filtered listing stays
+    /// bounded and ordered, while job-start recovery facts are addressable
+    /// per resource.
+    #[tokio::test]
+    async fn operations_round_trip_and_filter_by_node() {
+        let store = ControlPlaneStore::contract("operations_round_trip_and_filter_by_node").await;
+        let operation = |operation_id: &str, node_id: &str, updated_at_ms: u64| PersistedOperation {
+            operation_id: operation_id.into(),
+            node_id: node_id.into(),
+            resource_id: "orders".into(),
+            operation: "restart".into(),
+            state: "queued".into(),
+            created_at_ms: 1,
+            updated_at_ms,
+            operation_json: format!("{{\"id\":\"{operation_id}\"}}"),
+        };
+        store.upsert_operation(operation("op-1", "node-a", 1)).await.unwrap();
+        store.upsert_operation(operation("op-2", "node-b", 2)).await.unwrap();
+        store.upsert_operation(operation("op-3", "node-a", 3)).await.unwrap();
+        let loaded = store.get_operation("op-1").await.unwrap().unwrap();
+        assert_eq!(loaded.node_id, "node-a");
+        assert_eq!(loaded.operation, "restart");
+        assert_eq!(loaded.operation_json, r#"{"id":"op-1"}"#);
+        assert!(store.get_operation("op-missing").await.unwrap().is_none());
+        let all = store.list_operations(None).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].operation_id, "op-3", "newest first");
+        let node_a = store.list_operations(Some("node-a")).await.unwrap();
+        assert_eq!(
+            node_a
+                .iter()
+                .map(|record| record.operation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["op-3", "op-1"]
+        );
+        assert!(store.list_operations(Some("node-zzz")).await.unwrap().is_empty());
+        // Re-upserting updates the mutable columns only.
+        store
+            .upsert_operation(PersistedOperation {
+                operation_id: "op-1".into(),
+                node_id: "node-a".into(),
+                resource_id: "orders".into(),
+                operation: "restart".into(),
+                state: "succeeded".into(),
+                created_at_ms: 1,
+                updated_at_ms: 4,
+                operation_json: r#"{"id":"op-1","state":"succeeded"}"#.into(),
+            })
+            .await.unwrap();
+        let updated = store.get_operation("op-1").await.unwrap().unwrap();
+        assert_eq!(updated.state, "succeeded");
+        assert_eq!(updated.updated_at_ms, 4);
+        // Job-start recovery facts are addressable per resource.
+        store
+            .upsert_operation(PersistedOperation {
+                operation_id: "start-1".into(),
+                node_id: "node-a".into(),
+                resource_id: "orders".into(),
+                operation: "job_start".into(),
+                state: "succeeded".into(),
+                created_at_ms: 5,
+                updated_at_ms: 5,
+                operation_json: r#"{"operation":"job_start"}"#.into(),
+            })
+            .await.unwrap();
+        store
+            .upsert_operation(operation("start-2", "node-a", 6))
+            .await.unwrap();
+        let starts = store.list_job_start_operations("orders").await.unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].operation_id, "start-1");
+    }
+
+    /// The status surface reports every counter family: node and maintenance
+    /// states, intent/attempt/convergence groupings, failure classes, the
+    /// outbox queue, and the pending age.
+    #[tokio::test]
+    async fn operational_aggregates_expose_every_counter_family() {
+        let store =
+            ControlPlaneStore::contract("operational_aggregates_expose_every_counter_family").await;
+        let node = |node_id: &str, state: &str, maintenance: Option<&str>| NodeMutation {
+            node_id: node_id.into(),
+            version: "v1".into(),
+            state: state.into(),
+            capabilities_json: "[]".into(),
+            boot_id: Some("boot-1".into()),
+            report_seq: Some(1),
+            last_seen_at_ms: 10,
+            lease_expires_at_ms: 4_102_444_800_000,
+            maintenance_state: maintenance.map(str::to_owned),
+            maintenance_updated_at_ms: None,
+        };
+        store.upsert_node(node("node-a", "online", None)).await.unwrap();
+        store.upsert_node(node("node-b", "online", Some("draining"))).await.unwrap();
+        // Re-registering an existing node updates rather than duplicates.
+        store.upsert_node(node("node-a", "offline", None)).await.unwrap();
+        store
+            .set_desired(DesiredMutation {
+                node_id: "node-a".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await.unwrap();
+        let intent = store
+            .list_intents(Some("node-a"))
+            .await.unwrap()
+            .pop()
+            .unwrap();
+        store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+        let aggregates = store.operational_aggregates(now_ms()).await.unwrap();
+        let grouped = |pairs: &[(String, u64)]| {
+            let mut sorted = pairs.to_vec();
+            sorted.sort();
+            sorted
+        };
+        assert_eq!(
+            grouped(&aggregates.node_states),
+            vec![("offline".into(), 1), ("online".into(), 1)]
+        );
+        assert_eq!(
+            grouped(&aggregates.maintenance_states),
+            vec![("active".into(), 1), ("draining".into(), 1)]
+        );
+        assert_eq!(
+            grouped(&aggregates.intent_states),
+            vec![("accepted".into(), 1)]
+        );
+        assert_eq!(
+            grouped(&aggregates.convergence_states),
+            vec![("pending".into(), 1)]
+        );
+        assert_eq!(
+            grouped(&aggregates.attempt_states),
+            vec![("queued".into(), 1)]
+        );
+        assert_eq!(
+            grouped(&aggregates.failure_classes),
+            vec![("none".into(), 1)]
+        );
+        assert_eq!(aggregates.active_attempts, 1);
+        assert_eq!(aggregates.non_terminal_intents, 1);
+        assert_eq!(aggregates.outbox_pending, 1);
+        assert_eq!(aggregates.outbox_claimed, 0);
+        assert_eq!(aggregates.stale_nodes, 0);
+        assert!(
+            matches!(aggregates.oldest_pending_age_seconds, Some(age) if age <= 60),
+            "the pending age must be reported for queued work"
+        );
+        // Claiming the only row moves it into the claimed counter and gives
+        // the pending queue an age.
+        let outbox = store.claim_outbox("worker", now_ms()).await.unwrap().unwrap();
+        let claimed = store.operational_aggregates(now_ms()).await.unwrap();
+        assert_eq!(claimed.outbox_pending, 1);
+        assert_eq!(claimed.outbox_claimed, 1);
+        drop(outbox);
+    }
+
+    /// Maintenance transitions validate the requested state, require the
+    /// node to exist, and only audit actual transitions.
+    #[tokio::test]
+    async fn maintenance_transitions_reject_unknown_states_and_nodes() {
+        let store =
+            ControlPlaneStore::contract("maintenance_transitions_reject_unknown_states_and_nodes").await;
+        let mutation = |node_id: &str, state: &str| NodeMaintenanceMutation {
+            node_id: node_id.into(),
+            state: state.into(),
+            actor: Some("operator".into()),
+            correlation_id: None,
+        };
+        // An unsupported state is refused before touching the store.
+        assert!(!store.set_node_maintenance(mutation("node-a", "bogus"), 10).await.unwrap());
+        // An unknown node is a miss, not an error.
+        assert!(!store.set_node_maintenance(mutation("node-zzz", "draining"), 11).await.unwrap());
+        assert_eq!(store.get_node_maintenance("node-zzz").await.unwrap(), None);
+        store
+            .upsert_node(NodeMutation {
+                node_id: "node-a".into(),
+                version: "v1".into(),
+                state: "online".into(),
+                capabilities_json: "[]".into(),
+                boot_id: None,
+                report_seq: None,
+                last_seen_at_ms: 10,
+                lease_expires_at_ms: 1_000,
+                maintenance_state: None,
+                maintenance_updated_at_ms: None,
+            })
+            .await.unwrap();
+        assert!(store.set_node_maintenance(mutation("node-a", "draining"), 20).await.unwrap());
+        // Re-asserting the same state succeeds without a second audit event.
+        assert!(store.set_node_maintenance(mutation("node-a", "draining"), 21).await.unwrap());
+        assert_eq!(
+            store.get_node_maintenance("node-a").await.unwrap().as_deref(),
+            Some("draining")
+        );
+        let events = store.list_events(Some("node-a")).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "node_maintenance_changed")
+                .count(),
+            1
+        );
+        assert!(store.set_node_maintenance(mutation("node-a", "maintenance"), 22).await.unwrap());
+        assert_eq!(
+            store.get_node_maintenance("node-a").await.unwrap().as_deref(),
+            Some("maintenance")
+        );
+    }
+
+    /// Every mutating command family travels behind the write-fencing
+    /// envelope, so a stale leader is nack'd uniformly across the whole
+    /// surface: no mutation family may silently bypass the fence, and each
+    /// rejection leaves no durable side effect.
+    #[tokio::test]
+    async fn every_fenced_mutation_family_rejects_a_stale_leader() {
+        let store =
+            ControlPlaneStore::contract("every_fenced_mutation_family_rejects_a_stale_leader")
+                .await;
+        let actor = StorageActor::start(store.clone(), 64);
+        // A live lease row exists at epoch 1; this process carries a standby
+        // claim (0) that never entered the election.
+        assert_eq!(
+            store.try_acquire_hub_lease("hub-live", 3_600_000, 100).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 1 }
+        );
+        actor.leadership_epoch().store(0, Ordering::Release);
+
+        fn assert_stale<T: std::fmt::Debug>(result: Result<T, StorageError>) {
+            assert!(
+                matches!(
+                    result,
+                    Err(StorageError::StaleLeader {
+                        claimed_epoch: 0,
+                        current_epoch: 1
+                    })
+                ),
+                "expected every fenced mutation family to reject the stale claim, got {result:?}"
+            );
+        }
+
+        let job = JobRecord {
+            job_id: "orders".into(),
+            version: 1,
+            spec_json: "{}".into(),
+            desired_state: "running".into(),
+            observed_state: "draft".into(),
+            convergence: "unknown".into(),
+            generation: 1,
+            node_ids: Vec::new(),
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        let node = NodeMutation {
+            node_id: "node-a".into(),
+            version: "v1".into(),
+            state: "online".into(),
+            capabilities_json: "[]".into(),
+            boot_id: None,
+            report_seq: None,
+            last_seen_at_ms: 1,
+            lease_expires_at_ms: 2,
+            maintenance_state: None,
+            maintenance_updated_at_ms: None,
+        };
+        let upgrade = JobUpgradeRecord {
+            upgrade_id: "upgrade-1".into(),
+            job_id: "orders".into(),
+            from_version: 1,
+            to_version: 2,
+            phase: "saving_savepoint".into(),
+            savepoint_id: None,
+            target_spec_json: "{}".into(),
+            phase_deadline_at_ms: 100,
+            savepoint_retries: 0,
+            verify_timeout_ms: 0,
+            actor: None,
+            correlation_id: None,
+            last_error: None,
+            paused_from: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let rollout = RolloutRecord {
+            rollout_id: "rollout-1".into(),
+            config_version_id: "cfg-1".into(),
+            state: "applying".into(),
+            batch_size: 1,
+            current_batch: 0,
+            total_targets: 0,
+            actor: None,
+            correlation_id: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+
+        assert_stale(actor.upsert_job(job.clone()).await);
+        assert_stale(actor.update_job_with_expected_generation(job, 1).await);
+        assert_stale(
+            actor.upsert_job_version(JobVersionRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: "{}".into(),
+                plan_json: "plan".into(),
+                created_at_ms: 1,
+            })
+            .await,
+        );
+        assert_stale(
+            actor.update_job("orders", None, None, None, None, None, None).await,
+        );
+        assert_stale(
+            actor
+                .update_job_observation("orders", "running", "in_sync", 2, 1, None, None)
+                .await,
+        );
+        assert_stale(actor.update_job_desired_state("orders", "stopped", 1).await);
+        assert_stale(
+            actor
+                .upsert_job_checkpoint(JobCheckpointRecord {
+                    job_id: "orders".into(),
+                    job_version: 1,
+                    checkpoint_id: "cp-1".into(),
+                    kind: "savepoint".into(),
+                    status: "pending".into(),
+                    manifest_uri: None,
+                    format_version: 1,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                })
+                .await,
+        );
+        assert_stale(actor.delete_job_checkpoint("orders", "cp-1").await);
+        assert_stale(actor.upsert_node(node).await);
+        assert_stale(actor.reset_observed_cursors("node-a").await);
+        assert_stale(
+            actor
+                .set_desired(DesiredMutation {
+                    node_id: "node-a".into(),
+                    stream_id: "orders".into(),
+                    desired_state: "running".into(),
+                    ..Default::default()
+                })
+                .await,
+        );
+        assert_stale(actor.recover_reconciliation(10).await);
+        assert_stale(actor.wake_node("node-a", 10).await);
+        assert_stale(actor.prune_events(10).await);
+        assert_stale(actor.prune_operation_history(10, 10).await);
+        assert_stale(actor.prune_job_checkpoint_records(10).await);
+        assert_stale(actor.prune_audit_events(10, 10).await);
+        assert_stale(actor.prune_processed_outbox(10, 10).await);
+        assert_stale(actor.prune_terminal_attempts(10, 10).await);
+        assert_stale(actor.claim_attempt("intent-1").await);
+        assert_stale(actor.mark_attempt_dispatched("attempt-1", 10).await);
+        assert_stale(actor.expire_attempts(10).await);
+        assert_stale(actor.complete_attempt("attempt-1", "failed", None).await);
+        assert_stale(
+            actor
+                .record_observed(ObservedMutation {
+                    node_id: "node-a".into(),
+                    stream_id: "orders".into(),
+                    boot_id: None,
+                    report_seq: 1,
+                    observed_generation: None,
+                    observed_state: "running".into(),
+                    config_version_id: None,
+                    action_id: None,
+                    snapshot_json: "{}".into(),
+                    last_error_code: None,
+                    last_error_message: None,
+                })
+                .await,
+        );
+        assert_stale(actor.claim_outbox("worker", 10).await);
+        assert_stale(actor.mark_outbox_processed(1, 10).await);
+        assert_stale(
+            actor
+                .set_node_maintenance(
+                    NodeMaintenanceMutation {
+                        node_id: "node-a".into(),
+                        state: "draining".into(),
+                        actor: None,
+                        correlation_id: None,
+                    },
+                    10,
+                )
+                .await,
+        );
+        assert_stale(actor.record_audit(audit_row(99)).await);
+        assert_stale(actor.create_rollout(rollout.clone(), Vec::new()).await);
+        assert_stale(
+            actor
+                .create_rollout_with_content(rollout, Vec::new(), "{}", None)
+                .await,
+        );
+        assert_stale(actor.update_rollout("rollout-1", "converged", 1, 10).await);
+        assert_stale(
+            actor
+                .update_rollout_target(RolloutTargetUpdate {
+                    rollout_id: "rollout-1".into(),
+                    node_id: "node-a".into(),
+                    state: "applied".into(),
+                    attempt_id: None,
+                    error: None,
+                    observed_config_version: None,
+                    updated_at_ms: 10,
+                })
+                .await,
+        );
+        assert_stale(actor.recover_rollouts().await);
+        assert_stale(actor.upsert_job_upgrade(upgrade.clone()).await);
+        assert_stale(actor.transition_job_upgrade(upgrade, "saving_savepoint").await);
+        assert_stale(actor.recover_job_upgrades().await);
+        assert_stale(actor.prune_job_upgrades(10, 10).await);
+        assert_stale(
+            actor
+                .upsert_operation(PersistedOperation {
+                    operation_id: "op-1".into(),
+                    node_id: "node-a".into(),
+                    resource_id: "orders".into(),
+                    operation: "restart".into(),
+                    state: "queued".into(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    operation_json: "{}".into(),
+                })
+                .await,
+        );
+
+        // None of the rejected families produced a durable side effect.
+        assert!(store.list_jobs().await.unwrap().is_empty());
+        assert!(store.list_intents(None::<&str>).await.unwrap().is_empty());
+        assert!(store.list_rollouts().await.unwrap().is_empty());
+        assert!(store.list_operations(None::<&str>).await.unwrap().is_empty());
+    }
+
+    /// The actor carries the (unfenced) lease and retention surfaces through
+    /// the same FIFO: acquire, renew, lose, release, and event retention.
+    #[tokio::test]
+    async fn storage_actor_exposes_the_lease_and_retention_surfaces() {
+        let store = ControlPlaneStore::contract("storage_actor_exposes_the_lease_and_retention_surfaces").await;
+        let actor = StorageActor::start(store, 16);
+        assert_eq!(
+            actor.try_acquire_hub_lease("hub-a", 1_000, 100).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 1 }
+        );
+        assert_eq!(
+            actor.renew_hub_lease("hub-a", 1_000, 200).await.unwrap(),
+            HubLeaseRenew::Renewed { epoch: 1 }
+        );
+        assert_eq!(
+            actor.renew_hub_lease("hub-b", 1_000, 200).await.unwrap(),
+            HubLeaseRenew::Lost
+        );
+        assert!(!actor.release_hub_lease("hub-b", 300).await.unwrap());
+        assert!(actor.release_hub_lease("hub-a", 300).await.unwrap());
+        // Retention rides the same queue: one durable event in, pruned out.
+        actor
+            .set_desired(DesiredMutation {
+                node_id: "node-a".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(actor.list_events(Some("node-a")).await.unwrap().len(), 1);
+        assert_eq!(actor.prune_events(0).await.unwrap(), 1);
+        assert!(actor.list_events(None::<String>).await.unwrap().is_empty());
+    }
+
+    /// Dropping the last actor handle closes the command channel: the
+    /// spawned task observes it and runs to completion instead of leaking.
+    #[tokio::test]
+    async fn storage_actor_task_completes_after_the_last_handle_drops() {
+        let store =
+            ControlPlaneStore::contract("storage_actor_task_completes_after_the_last_handle_drops")
+                .await;
+        let actor = StorageActor::start(store, 8);
+        assert!(actor.list_jobs().await.unwrap().is_empty());
+        drop(actor);
+        // Yield a few scheduler turns so the actor task observes the closed
+        // channel and exits its receive loop.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// `postgres://` / `postgresql://` values dispatch to the PostgreSQL
+    /// backend (whose startup probe fails fast against an unreachable
+    /// endpoint) instead of being treated as SQLite file paths.
+    #[tokio::test]
+    async fn open_dispatches_postgres_urls_to_the_postgres_backend() {
+        assert!(
+            ControlPlaneStore::open("postgres://127.0.0.1:1/arkflow_test")
+                .await
+                .is_err()
+        );
+    }
+
+    /// A legacy on-disk schema (created before the newest columns existed)
+    /// is upgraded in place by `open`: every historical ALTER applies, and
+    /// the upgraded store serves the full contract.
+    #[tokio::test]
+    async fn sqlite_migrate_upgrades_a_legacy_schema_in_place() {
+        let path = std::env::temp_dir().join(format!(
+            "arkflow-legacy-schema-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE cp_intents (
+                        intent_id TEXT PRIMARY KEY, node_id TEXT NOT NULL,
+                        stream_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                        intent_type TEXT NOT NULL, desired_state TEXT,
+                        config_version_id TEXT, action_id TEXT, state TEXT NOT NULL,
+                        convergence_state TEXT NOT NULL,
+                        retry_count INTEGER NOT NULL DEFAULT 0,
+                        next_retry_at_ms INTEGER, last_failure_class TEXT,
+                        last_failure_code TEXT, last_failure_message TEXT,
+                        superseded_by_intent_id TEXT, created_at_ms INTEGER NOT NULL,
+                        updated_at_ms INTEGER NOT NULL, converged_at_ms INTEGER,
+                        actor TEXT, correlation_id TEXT
+                    );
+                    CREATE TABLE cp_nodes (
+                        node_id TEXT PRIMARY KEY, role TEXT NOT NULL DEFAULT 'compute',
+                        protocol_version TEXT NOT NULL DEFAULT 'v1',
+                        state TEXT NOT NULL DEFAULT 'offline',
+                        capabilities_json TEXT NOT NULL DEFAULT '[]', boot_id TEXT,
+                        last_report_seq INTEGER, last_seen_at_ms INTEGER NOT NULL DEFAULT 0,
+                        lease_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+                        created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+                    );
+                    CREATE TABLE cp_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT, node_id TEXT,
+                        stream_id TEXT, intent_id TEXT, attempt_id TEXT,
+                        event_type TEXT NOT NULL, outcome TEXT NOT NULL,
+                        failure_class TEXT, message TEXT, generation INTEGER,
+                        correlation_id TEXT, occurred_at_ms INTEGER NOT NULL
+                    );
+                    CREATE TABLE cp_job_checkpoints (
+                        job_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
+                        kind TEXT NOT NULL, status TEXT NOT NULL, manifest_uri TEXT,
+                        format_version INTEGER NOT NULL, created_at_ms INTEGER NOT NULL,
+                        updated_at_ms INTEGER NOT NULL, PRIMARY KEY (job_id, checkpoint_id)
+                    );
+                    "#,
+                )
+                .unwrap();
+        }
+        let store = ControlPlaneStore::open(path.to_str().unwrap()).await.unwrap();
+        fn has_column(store: &ControlPlaneStore, table: &str, column: &str) -> bool {
+            store
+                .with_connection(|connection| {
+                    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+                    let columns = statement
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(columns.iter().any(|name| name == column))
+                })
+                .unwrap()
+        }
+        assert!(has_column(&store, "cp_intents", "idempotency_key"));
+        assert!(has_column(&store, "cp_intents", "payload_json"));
+        assert!(has_column(&store, "cp_nodes", "node_version"));
+        assert!(has_column(&store, "cp_nodes", "maintenance_state"));
+        assert!(has_column(&store, "cp_nodes", "maintenance_updated_at_ms"));
+        assert!(has_column(&store, "cp_events", "actor"));
+        assert!(has_column(&store, "cp_job_checkpoints", "job_version"));
+        // The upgraded schema serves the contract end to end.
+        store
+            .set_desired(DesiredMutation {
+                node_id: "node-a".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                idempotency_key: Some("idem-1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_job_checkpoint(JobCheckpointRecord {
+                job_id: "orders".into(),
+                job_version: 1,
+                checkpoint_id: "cp-1".into(),
+                kind: "savepoint".into(),
+                status: "completed".into(),
+                manifest_uri: None,
+                format_version: 1,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.list_job_checkpoints("orders").await.unwrap().len(), 1);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The write fence surfaces lease-catalog errors instead of guessing a
+    /// passthrough, and tolerates an unpaired end (only the outermost fence
+    /// commits).
+    #[tokio::test]
+    async fn sqlite_write_fence_reports_catalog_errors_and_ignores_unpaired_ends() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
+            .with_connection(|connection| connection.execute_batch("DROP TABLE cp_hub_lease"))
+            .unwrap();
+        // A vanished lease catalog is an error: the write lock is rolled
+        // back and the failure reported.
+        assert!(store.begin_write_fence(0).await.is_err());
+
+        // An unpaired end with no fence held is a no-op, not a fault.
+        let bare = ControlPlaneStore::in_memory().unwrap();
+        bare.end_write_fence().await.unwrap();
+    }
+
+    /// A fence whose ambient transaction died between begin and commit must
+    /// fail the commit loudly instead of reporting success.
+    #[tokio::test]
+    async fn sqlite_write_fence_commit_failure_is_reported_loudly() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        assert_eq!(
+            store.try_acquire_hub_lease("hub-a", 1_000, 100).await.unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 1 }
+        );
+        assert_eq!(
+            store.begin_write_fence(1).await.unwrap(),
+            WriteFence::Held
+        );
+        // Kill the ambient transaction behind the fence's back (the
+        // I/O-level rollback it cannot observe).
+        store
+            .with_connection(|connection| connection.execute_batch("ROLLBACK"))
+            .unwrap();
+        assert!(store.end_write_fence().await.is_err());
+    }
+
+    /// A Job row with a corrupt `node_ids_json` fails the read instead of
+    /// fabricating a record.
+    #[tokio::test]
+    async fn sqlite_job_row_with_corrupt_node_ids_fails_the_read() {
+        let store = ControlPlaneStore::in_memory().unwrap();
+        store
             .with_connection(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM cp_outbox WHERE intent_id = ?1 AND processed_at_ms IS NULL",
-                    [&intent.intent_id],
-                    |row| row.get(0),
+                connection.execute(
+                    "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, updated_at_ms) VALUES ('bad', 1, '{}', 'stopped', 'draft', 'unknown', 1, 'not-json', 1)",
+                    [],
                 )
             })
             .unwrap();
-        assert_eq!(pending_outbox, 1);
+        assert!(store.get_job("bad").await.is_err());
+        assert!(store.list_jobs().await.is_err());
+    }
+
+    /// A `stale_generation` completion supersedes the intent (a lost race,
+    /// not a retryable fault); unknown attempts and intents are no-op misses.
+    #[tokio::test]
+    async fn stale_generation_attempt_supersedes_the_intent() {
+        let store =
+            ControlPlaneStore::contract("stale_generation_attempt_supersedes_the_intent").await;
+        let intent = store
+            .set_desired(DesiredMutation {
+                node_id: "node-a".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let attempt = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+        store
+            .complete_attempt(&attempt.attempt_id, "superseded", Some("stale_generation"))
+            .await
+            .unwrap();
+        let superseded = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
+        assert_eq!(superseded.state, "superseded");
+        assert_eq!(superseded.convergence_state, "degraded");
+        assert_eq!(
+            superseded.failure_class.as_deref(),
+            Some("stale_generation")
+        );
+        // Completing an unknown attempt changes nothing; claiming an
+        // unknown intent has nothing to claim.
+        store
+            .complete_attempt("attempt-missing", "failed", None)
+            .await
+            .unwrap();
+        assert!(store.claim_attempt("intent-missing").await.unwrap().is_none());
+    }
+
+    /// The desired-state CAS distinguishes a moved generation (conflict)
+    /// from an unknown Job (miss).
+    #[tokio::test]
+    async fn job_desired_state_update_conflicts_and_misses_are_distinct() {
+        let store =
+            ControlPlaneStore::contract("job_desired_state_update_conflicts_and_misses_are_distinct")
+                .await;
+        store
+            .upsert_job(JobRecord {
+                job_id: "orders".into(),
+                version: 1,
+                spec_json: "{}".into(),
+                desired_state: "stopped".into(),
+                observed_state: "stopped".into(),
+                convergence: "converged".into(),
+                generation: 0,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        // The upsert bumped the stored generation to 1: a write conditioned
+        // on the superseded generation 0 conflicts.
+        assert!(matches!(
+            store.update_job_desired_state("orders", "running", 0).await,
+            Err(StorageError::GenerationConflict { expected: 0, current: 1 })
+        ));
+        // An unknown Job is a miss, not a conflict.
+        assert!(store
+            .update_job_desired_state("missing", "running", 0)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Boot-less agents report seq 0 forever: their reports are never gated
+    /// by the sequence cursor (only a stable boot identity is fencible).
+    #[tokio::test]
+    async fn bootless_reports_are_never_gated_by_the_sequence_cursor() {
+        let store =
+            ControlPlaneStore::contract("bootless_reports_are_never_gated_by_the_sequence_cursor")
+                .await;
+        let report = |seq: u64, state: &str| ObservedMutation {
+            node_id: "node-a".into(),
+            stream_id: "orders".into(),
+            boot_id: None,
+            report_seq: seq,
+            observed_generation: None,
+            observed_state: state.into(),
+            config_version_id: None,
+            action_id: None,
+            snapshot_json: "{}".into(),
+            last_error_code: None,
+            last_error_message: None,
+        };
+        store.record_observed(report(0, "stopped")).await.unwrap();
+        // A second boot-less report at the same seq 0 must still land.
+        store.record_observed(report(0, "running")).await.unwrap();
+        let reports = store
+            .list_events(Some("node-a"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "observed_report")
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].outcome, "running", "newest first");
+    }
+
+    /// Rollout creation is keyed by identity: a duplicate rollout id (or a
+    /// duplicate target within one rollout) errors atomically instead of
+    /// silently merging histories.
+    #[tokio::test]
+    async fn rollout_identity_conflicts_are_atomic_errors() {
+        let store = ControlPlaneStore::contract("rollout_identity_conflicts_are_atomic_errors").await;
+        let target = |rollout_id: &str, node: &str| RolloutTargetRecord {
+            rollout_id: rollout_id.into(),
+            node_id: node.into(),
+            ordinal: 0,
+            state: "pending".into(),
+            attempt_id: None,
+            error: None,
+            observed_config_version: None,
+            updated_at_ms: 10,
+        };
+        store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "rollout-1".into(),
+                    config_version_id: "cfg-1".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 1,
+                    actor: None,
+                    correlation_id: None,
+                    created_at_ms: 10,
+                    updated_at_ms: 10,
+                },
+                vec![target("rollout-1", "node-a")],
+                "{}",
+                None,
+            )
+            .await
+            .unwrap();
+        // Re-creating the same rollout id through either entry point is an
+        // error; the config version already seeded survives.
+        assert!(
+            store
+                .create_rollout_with_content(
+                    RolloutRecord {
+                        rollout_id: "rollout-1".into(),
+                        config_version_id: "cfg-1".into(),
+                        state: "applying".into(),
+                        batch_size: 1,
+                        current_batch: 0,
+                        total_targets: 0,
+                        actor: None,
+                        correlation_id: None,
+                        created_at_ms: 20,
+                        updated_at_ms: 20,
+                    },
+                    Vec::new(),
+                    "{}",
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .create_rollout(
+                    RolloutRecord {
+                        rollout_id: "rollout-1".into(),
+                        config_version_id: "cfg-1".into(),
+                        state: "applying".into(),
+                        batch_size: 1,
+                        current_batch: 0,
+                        total_targets: 0,
+                        actor: None,
+                        correlation_id: None,
+                        created_at_ms: 30,
+                        updated_at_ms: 30,
+                    },
+                    Vec::new(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.list_rollout_targets("rollout-1").await.unwrap().len(),
+            1,
+            "the original rollout is untouched by the rejected recreations"
+        );
+        // A duplicate target node inside one content-bearing rollout is an
+        // error too (the primary key is (rollout_id, node_id)).
+        assert!(
+            store
+                .create_rollout_with_content(
+                    RolloutRecord {
+                        rollout_id: "rollout-2".into(),
+                        config_version_id: "cfg-1".into(),
+                        state: "applying".into(),
+                        batch_size: 1,
+                        current_batch: 0,
+                        total_targets: 2,
+                        actor: None,
+                        correlation_id: None,
+                        created_at_ms: 40,
+                        updated_at_ms: 40,
+                    },
+                    vec![target("rollout-2", "node-a"), target("rollout-2", "node-a")],
+                    "{}",
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(store.get_rollout("rollout-2").await.unwrap().is_none());
     }
 }
 
@@ -4603,7 +5970,7 @@ mod job_storage_tests {
 
     #[tokio::test]
     async fn job_records_survive_store_reopen() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("job_records_survive_store_reopen").await;
         let job = JobRecord {
             job_id: "orders".into(),
             version: 1,
@@ -4639,7 +6006,7 @@ mod job_storage_tests {
 
     #[tokio::test]
     async fn replacing_a_job_advances_its_generation() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("replacing_a_job_advances_its_generation").await;
         let original = JobRecord {
             job_id: "orders".into(),
             version: 1,
@@ -4678,7 +6045,7 @@ mod job_storage_tests {
 
     #[tokio::test]
     async fn desired_state_update_marks_job_as_reconciling() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("desired_state_update_marks_job_as_reconciling").await;
         store
             .upsert_job(JobRecord {
                 job_id: "orders".into(),
@@ -4705,7 +6072,7 @@ mod job_storage_tests {
 
     #[tokio::test]
     async fn operation_pruning_preserves_the_latest_job_start_recovery_fact() {
-        let store = ControlPlaneStore::in_memory().unwrap();
+        let store = ControlPlaneStore::contract("operation_pruning_preserves_the_latest_job_start_recovery_fact").await;
         store
             .upsert_operation(PersistedOperation {
                 operation_id: "job-start-1".into(),

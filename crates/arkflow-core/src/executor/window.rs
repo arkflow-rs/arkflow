@@ -4806,3 +4806,2263 @@ mod sliding_enumeration_tests {
         assert!(multi_value.validate().is_err());
     }
 }
+
+/// Coverage-focused tests for the branches the behavioural suites leave
+/// cold: aggregate-state normalization shapes, config validation and serde
+/// defaults, marker helpers, legacy state decoding, timestamp/key/value
+/// column conversions, and the acknowledgement/persistence failure paths.
+#[cfg(test)]
+mod coverage_gap_tests {
+    use super::*;
+    use datafusion::arrow::array::{
+        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt32Array,
+    };
+    use datafusion::arrow::ipc::writer::StreamWriter;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Ack recording both settlement kinds.
+    struct CountingSettlementAck {
+        acked: AtomicUsize,
+        aborted: AtomicUsize,
+    }
+
+    impl CountingSettlementAck {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                acked: AtomicUsize::new(0),
+                aborted: AtomicUsize::new(0),
+            })
+        }
+
+        fn acked(&self) -> usize {
+            self.acked.load(Ordering::Acquire)
+        }
+    }
+
+    #[async_trait]
+    impl Ack for CountingSettlementAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.acked.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        async fn abort(&self) -> Result<(), Error> {
+            self.aborted.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    /// Ack that fails exactly once, mirroring a transient source commit error.
+    struct FailOnceAck {
+        fail: AtomicBool,
+    }
+
+    #[async_trait]
+    impl Ack for FailOnceAck {
+        async fn ack(&self) -> Result<(), Error> {
+            if self.fail.swap(false, Ordering::AcqRel) {
+                Err(Error::Process("source acknowledgement failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Ack whose abort always fails (compensation-failure paths).
+    struct FailAbortAck;
+
+    #[async_trait]
+    impl Ack for FailAbortAck {
+        async fn ack(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn abort(&self) -> Result<(), Error> {
+            Err(Error::Process("abort failed (test)".into()))
+        }
+    }
+
+    /// Backend wrapper whose writes fail while the flag is set, so the
+    /// persistence error paths of every entry point can be exercised
+    /// deterministically.
+    struct FailingWritesBackend {
+        inner: Arc<dyn StateBackend>,
+        fail_writes: AtomicBool,
+    }
+
+    impl FailingWritesBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap()),
+                fail_writes: AtomicBool::new(false),
+            })
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.fail_writes.store(failing, Ordering::Release);
+        }
+    }
+
+    impl StateBackend for FailingWritesBackend {
+        fn format_version(&self) -> u32 {
+            self.inner.format_version()
+        }
+
+        fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            self.inner.get(namespace, key)
+        }
+
+        fn put_with_ttl(
+            &self,
+            namespace: &str,
+            key: &[u8],
+            value: &[u8],
+            ttl_ms: Option<u64>,
+            now_ms: u64,
+        ) -> Result<(), Error> {
+            if self.fail_writes.load(Ordering::Acquire) {
+                return Err(Error::Process("state write failed (test)".into()));
+            }
+            self.inner
+                .put_with_ttl(namespace, key, value, ttl_ms, now_ms)
+        }
+
+        fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+            self.inner.update_i64(namespace, key, delta)
+        }
+
+        fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+            self.inner.delete(namespace, key)
+        }
+
+        fn purge_expired(&self, now_ms: u64) -> Result<u64, Error> {
+            self.inner.purge_expired(now_ms)
+        }
+
+        fn scan(&self, namespace: &str) -> Result<Vec<crate::state::StateEntry>, Error> {
+            self.inner.scan(namespace)
+        }
+
+        fn snapshot_at(&self, now_ms: u64) -> Result<crate::state::StateSnapshot, Error> {
+            self.inner.snapshot_at(now_ms)
+        }
+
+        fn restore(&self, snapshot: &crate::state::StateSnapshot) -> Result<(), Error> {
+            self.inner.restore(snapshot)
+        }
+
+        fn metrics(&self) -> Result<crate::state::StateMetrics, Error> {
+            self.inner.metrics()
+        }
+
+        fn close(&self) -> Result<(), Error> {
+            self.inner.close()
+        }
+    }
+
+    fn mem_backend() -> Arc<dyn StateBackend> {
+        Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap())
+    }
+
+    fn tumbling_config(size_ms: i64) -> WindowOperatorConfig {
+        WindowOperatorConfig {
+            kind: WindowKind::Tumbling { size_ms },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec!["value".into()],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 0,
+            legacy_payload: false,
+        }
+    }
+
+    fn session_config(gap_ms: i64, allowed_lateness_ms: u64) -> WindowOperatorConfig {
+        WindowOperatorConfig {
+            kind: WindowKind::Session { gap_ms },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec!["value".into()],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms,
+            legacy_payload: false,
+        }
+    }
+
+    fn sliding_config(size_ms: i64, slide_ms: i64) -> WindowOperatorConfig {
+        WindowOperatorConfig {
+            kind: WindowKind::Sliding { size_ms, slide_ms },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec![],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 0,
+            legacy_payload: false,
+        }
+    }
+
+    fn legacy_config(kind: WindowKind, key_field: &str) -> WindowOperatorConfig {
+        WindowOperatorConfig {
+            kind,
+            timestamp_field: "__meta_timestamp".into(),
+            key_field: key_field.into(),
+            value_fields: vec![],
+            trigger: WindowTrigger::ProcessingTime,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 0,
+            legacy_payload: true,
+        }
+    }
+
+    /// Standard `(ts, key, value)` batch with an optional watermark column.
+    fn std_batch(rows: Vec<(i64, &str, i64)>, watermark: Option<i64>) -> MessageBatchRef {
+        flexible_batch(
+            Arc::new(Int64Array::from(rows.iter().map(|row| row.0).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.1.to_string()).collect::<Vec<_>>(),
+            )),
+            Some(Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            ))),
+            watermark,
+            Vec::new(),
+        )
+    }
+
+    /// Batch assembled from arbitrary column types plus optional markers.
+    #[allow(clippy::type_complexity)]
+    fn flexible_batch(
+        ts: ArrayRef,
+        key: ArrayRef,
+        value: Option<ArrayRef>,
+        watermark: Option<i64>,
+        extra: Vec<(&'static str, ArrayRef)>,
+    ) -> MessageBatchRef {
+        let rows = ts.len();
+        let mut fields = vec![
+            Field::new("ts", ts.data_type().clone(), true),
+            Field::new("key", key.data_type().clone(), true),
+        ];
+        let mut columns = vec![ts, key];
+        if let Some(value) = value {
+            fields.push(Field::new("value", value.data_type().clone(), true));
+            columns.push(value);
+        }
+        for (name, column) in extra {
+            fields.push(Field::new(name, column.data_type().clone(), true));
+            columns.push(column);
+        }
+        if let Some(watermark) = watermark {
+            fields.push(Field::new("__watermark_ms", DataType::Int64, false));
+            columns.push(Arc::new(Int64Array::from(vec![watermark; rows])));
+        }
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
+        ))
+    }
+
+    fn utf8(values: Vec<&str>) -> ArrayRef {
+        Arc::new(StringArray::from(values))
+    }
+
+    fn fired_single(result: ProcessResult) -> MessageBatchRef {
+        match result {
+            ProcessResult::Single(batch) => batch,
+            ProcessResult::SingleWithAck(batch, _) => batch,
+            _ => panic!("expected a fired window output"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Aggregate buffer arithmetic and state normalization
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn merge_combines_float_bounds_and_widens_kinds() {
+        let mut left = AggregateBuffer::default();
+        left.observe_float(2.5, NumericKind::Float64);
+        left.observe_float(1.5, NumericKind::Float64);
+        let mut right = AggregateBuffer::default();
+        right.observe_float(0.5, NumericKind::Float64);
+        right.observe_float(3.5, NumericKind::Float64);
+        left.merge(&right);
+        assert_eq!(left.count, 4);
+        assert_eq!(left.kind, NumericKind::Float64);
+        assert!((left.widened_min() - 0.5).abs() < 1e-9);
+        assert!((left.widened_max() - 3.5).abs() < 1e-9);
+        assert!((left.widened_sum() - 8.0).abs() < 1e-9);
+
+        let mut f32_pair = AggregateBuffer::default();
+        f32_pair.observe_float(1.0, NumericKind::Float32);
+        let mut f32_other = AggregateBuffer::default();
+        f32_other.observe_float(2.0, NumericKind::Float32);
+        f32_pair.merge(&f32_other);
+        assert_eq!(f32_pair.kind, NumericKind::Float32);
+
+        let mut widened = AggregateBuffer::default();
+        widened.observe_float(1.0, NumericKind::Float32);
+        let mut float64 = AggregateBuffer::default();
+        float64.observe_float(2.0, NumericKind::Float64);
+        widened.merge(&float64);
+        assert_eq!(widened.kind, NumericKind::Float64);
+    }
+
+    #[test]
+    fn observe_float_accepts_the_int64_kind_without_widening() {
+        let mut buffer = AggregateBuffer::default();
+        buffer.observe_float(1.5, NumericKind::Int64);
+        assert_eq!(buffer.kind, NumericKind::Int64);
+        assert_eq!(buffer.float_observations, 1);
+        assert_eq!(buffer.count, 1);
+        assert!((buffer.widened_sum() - 1.5).abs() < 1e-9);
+    }
+
+    fn decode_json(value: serde_json::Value) -> AggregateBuffer {
+        decode_buffer(&serde_json::to_vec(&value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn normalize_counters_repairs_every_legacy_payload_shape() {
+        // A zero-count payload zeroes drifted counters.
+        let zeroed = decode_json(serde_json::json!({
+            "count": 0, "kind": "int64", "sum_i64": 0, "sum_float": 0.0,
+            "min_i64": 0, "max_i64": 0, "int_observations": 2, "float_observations": 1
+        }));
+        assert_eq!(
+            (zeroed.int_observations, zeroed.float_observations),
+            (0, 0),
+            "a countless buffer has no observations"
+        );
+
+        // An Int64-kind payload attributes everything to the integer side.
+        let int_kind = decode_json(serde_json::json!({
+            "count": 3, "kind": "int64", "sum_i64": 6, "sum_float": 0.0,
+            "min_i64": 1, "max_i64": 2, "int_observations": 1
+        }));
+        assert_eq!((int_kind.int_observations, int_kind.float_observations), (3, 0));
+
+        // A float-kind payload that named float observations attributes the
+        // unnamed remainder to the integer side it accumulated.
+        let named = decode_json(serde_json::json!({
+            "count": 5, "kind": "float64", "sum_i64": 2, "sum_float": 3.0,
+            "min_i64": 2, "max_i64": 4, "min_float": 1.0, "max_float": 2.0,
+            "int_observations": 1, "float_observations": 1
+        }));
+        assert_eq!((named.int_observations, named.float_observations), (4, 1));
+
+        // Evidence on both sides without any named counters reserves one
+        // observation for the integer side.
+        let evidenced = decode_json(serde_json::json!({
+            "count": 4, "kind": "float64", "sum_i64": 3, "sum_float": 3.0,
+            "min_i64": 3, "max_i64": 3, "min_float": 1.0, "max_float": 2.0
+        }));
+        assert_eq!(
+            (evidenced.int_observations, evidenced.float_observations),
+            (1, 3)
+        );
+
+        // A single integer-evidenced observation stays integer-only, and the
+        // widened bounds report the integer side alone.
+        let single = decode_json(serde_json::json!({
+            "count": 1, "kind": "float64", "sum_i64": 3, "sum_float": 0.0,
+            "min_i64": 3, "max_i64": 3
+        }));
+        assert_eq!((single.int_observations, single.float_observations), (1, 0));
+        assert!((single.widened_min() - 3.0).abs() < 1e-9);
+        assert!((single.widened_max() - 3.0).abs() < 1e-9);
+        assert!((single.widened_sum() - 3.0).abs() < 1e-9);
+
+        // Over-named counters collapse back to a consistent integer split.
+        let over = decode_json(serde_json::json!({
+            "count": 2, "kind": "float64", "sum_i64": 0, "sum_float": 3.0,
+            "min_i64": 0, "max_i64": 0, "min_float": 1.0, "max_float": 2.0,
+            "int_observations": 2, "float_observations": 2
+        }));
+        assert_eq!((over.int_observations, over.float_observations), (2, 0));
+    }
+
+    #[test]
+    fn numeric_array_folds_values_into_the_requested_kind() {
+        let values = vec![
+            NumericValue::Int(3),
+            NumericValue::Float(2.5, NumericKind::Float64),
+        ];
+        let ints = numeric_array(&values, NumericKind::Int64).unwrap();
+        assert_eq!(
+            ints.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[3, 2]
+        );
+        let floats32 = numeric_array(&values, NumericKind::Float32).unwrap();
+        let floats32 = floats32.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(floats32.value(0), 3.0);
+        assert_eq!(floats32.value(1), 2.5);
+        let floats64 = numeric_array(&values, NumericKind::Float64).unwrap();
+        let floats64 = floats64.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(floats64.value(0), 3.0);
+        assert_eq!(floats64.value(1), 2.5);
+    }
+
+    // ------------------------------------------------------------------
+    // Config validation and serde defaults
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_blank_fields_and_degenerate_arithmetic() {
+        let mut config = tumbling_config(1_000);
+        config.timestamp_field = "  ".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("timestamp_field"),
+            "blank timestamp field"
+        );
+
+        let mut config = tumbling_config(1_000);
+        config.key_field = String::new();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("key_field"),
+            "blank key field"
+        );
+
+        let mut config = tumbling_config(1_000);
+        config.trigger_interval_ms = 0;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("trigger_interval_ms"),
+            "zero trigger interval"
+        );
+
+        let mut config = tumbling_config(1_000);
+        config.kind = WindowKind::Sliding {
+            size_ms: 5,
+            slide_ms: 10,
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("slide_ms must not exceed size_ms"),
+            "slide larger than size"
+        );
+
+        let config = tumbling_config(0);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("tumbling"),
+            "non-positive tumbling size"
+        );
+
+        let mut config = tumbling_config(1_000);
+        config.kind = WindowKind::Sliding {
+            size_ms: 0,
+            slide_ms: 0,
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sliding"),
+            "non-positive sliding arithmetic"
+        );
+
+        let mut config = tumbling_config(1_000);
+        config.kind = WindowKind::Session { gap_ms: -5 };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("session"),
+            "non-positive session gap"
+        );
+
+        // Well-formed variants of every kind stay accepted.
+        assert!(tumbling_config(1_000).validate().is_ok());
+        assert!(sliding_config(10_000, 5_000).validate().is_ok());
+        assert!(session_config(1_000, 0).validate().is_ok());
+    }
+
+    #[test]
+    fn serde_defaults_fill_the_optional_window_fields() {
+        // The kind is flattened with an internal tag: `kind` names the
+        // variant and the variant's fields sit beside it.
+        let config: WindowOperatorConfig = serde_json::from_str(
+            r#"{"kind":"tumbling","size_ms":1000,"timestamp_field":"ts","key_field":"k"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.trigger, WindowTrigger::Watermark);
+        assert_eq!(config.trigger_interval_ms, 5_000);
+        assert_eq!(config.watermark_field, "__watermark_ms");
+        assert!(config.value_fields.is_empty());
+        assert_eq!(config.allowed_lateness_ms, 0);
+        assert!(!config.legacy_payload);
+        // Round trip keeps the enriched shape.
+        let encoded = serde_json::to_string(&config).unwrap();
+        let reparsed: WindowOperatorConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(reparsed, config);
+    }
+
+    // ------------------------------------------------------------------
+    // Batch marker helpers and acknowledgement plumbing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn filter_window_batch_rejects_a_length_mismatch() {
+        let batch = std_batch(vec![(1, "a", 1)], None);
+        let Err(error) = filter_window_batch(&batch, &[]) else {
+            panic!("a length mismatch must fail");
+        };
+        assert!(error.to_string().contains("length differs"), "{error}");
+    }
+
+    #[test]
+    fn mark_late_session_batch_appends_replaces_and_validates() {
+        let batch = std_batch(vec![(1, "a", 1)], None);
+
+        // Fresh batch: the route marker is appended; without invalid rows the
+        // invalid marker stays absent.
+        let marked = mark_late_session_batch(batch.clone(), &[false]).unwrap();
+        assert!(
+            marked
+                .record_batch()
+                .column_by_name("__arkflow_late_event_route")
+                .is_some()
+        );
+        assert!(
+            marked
+                .record_batch()
+                .column_by_name("__arkflow_invalid_timestamp_route")
+                .is_none()
+        );
+
+        // An invalid row adds the second marker.
+        let marked = mark_late_session_batch(batch.clone(), &[true]).unwrap();
+        let invalid = marked
+            .record_batch()
+            .column_by_name("__arkflow_invalid_timestamp_route")
+            .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+            .unwrap();
+        assert!(invalid.value(0));
+
+        // Pre-existing marker columns are replaced in place instead of
+        // duplicated.
+        let premarked = flexible_batch(
+            Arc::new(Int64Array::from(vec![1])),
+            utf8(vec!["a"]),
+            None,
+            None,
+            vec![
+                (
+                    "__arkflow_late_event_route",
+                    Arc::new(BooleanArray::from(vec![false])),
+                ),
+                (
+                    "__arkflow_invalid_timestamp_route",
+                    Arc::new(BooleanArray::from(vec![false])),
+                ),
+            ],
+        );
+        let resealed = mark_late_session_batch(premarked, &[true]).unwrap();
+        assert_eq!(resealed.record_batch().num_columns(), 4);
+        let route = resealed
+            .record_batch()
+            .column_by_name("__arkflow_late_event_route")
+            .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+            .unwrap();
+        assert!(route.value(0));
+        let invalid = resealed
+            .record_batch()
+            .column_by_name("__arkflow_invalid_timestamp_route")
+            .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+            .unwrap();
+        assert!(invalid.value(0));
+
+        // A length mismatch is rejected.
+        let Err(error) = mark_late_session_batch(batch, &[true, false]) else {
+            panic!("a length mismatch must fail");
+        };
+        assert!(error.to_string().contains("length differs"), "{error}");
+    }
+
+    #[test]
+    fn append_late_session_output_wraps_every_process_result_variant() {
+        let late = (
+            std_batch(vec![(1, "a", 1)], None),
+            Arc::new(crate::input::NoopAck) as Arc<dyn Ack>,
+        );
+
+        // Single grows into a two-output acknowledgement group.
+        let wrapped = append_late_session_output(
+            ProcessResult::Single(std_batch(vec![(1, "a", 1)], None)),
+            Some(late.clone()),
+        );
+        assert!(matches!(
+            &wrapped,
+            ProcessResult::MultipleWithAck(outputs) if outputs.len() == 2
+        ));
+
+        let wrapped = append_late_session_output(
+            ProcessResult::Multiple(vec![std_batch(vec![(1, "a", 1)], None)]),
+            Some(late.clone()),
+        );
+        assert!(matches!(
+            &wrapped,
+            ProcessResult::MultipleWithAck(outputs) if outputs.len() == 2
+        ));
+
+        let wrapped = append_late_session_output(
+            ProcessResult::SingleWithAck(std_batch(vec![(1, "a", 1)], None), late.1.clone()),
+            Some(late.clone()),
+        );
+        assert!(matches!(
+            &wrapped,
+            ProcessResult::MultipleWithAck(outputs) if outputs.len() == 2
+        ));
+
+        let wrapped = append_late_session_output(
+            ProcessResult::MultipleWithAck(vec![late.clone()]),
+            Some(late.clone()),
+        );
+        assert!(matches!(
+            &wrapped,
+            ProcessResult::MultipleWithAck(outputs) if outputs.len() == 2
+        ));
+
+        // Deferred and None have no main-path output: the late branch is the
+        // only one.
+        let wrapped = append_late_session_output(ProcessResult::Deferred, Some(late.clone()));
+        assert!(matches!(
+            &wrapped,
+            ProcessResult::MultipleWithAck(outputs) if outputs.len() == 1
+        ));
+        let wrapped = append_late_session_output(ProcessResult::None, Some(late));
+        assert!(matches!(
+            &wrapped,
+            ProcessResult::MultipleWithAck(outputs) if outputs.len() == 1
+        ));
+
+        // Without a late output the result passes through untouched.
+        assert!(matches!(
+            append_late_session_output(ProcessResult::Deferred, None),
+            ProcessResult::Deferred
+        ));
+    }
+
+    #[tokio::test]
+    async fn compensate_window_acks_combines_error_reports() {
+        // A successful compensation keeps the primary error.
+        let error = compensate_window_acks(Error::Process("primary".into()), Vec::new()).await;
+        assert!(error.to_string().contains("primary"), "{error}");
+
+        // A failing compensation is reported alongside the primary error.
+        let error = compensate_window_acks(
+            Error::Process("primary".into()),
+            vec![Arc::new(FailAbortAck)],
+        )
+        .await;
+        let message = error.to_string();
+        assert!(message.contains("primary"), "{message}");
+        assert!(message.contains("compensation failed"), "{message}");
+    }
+
+    // ------------------------------------------------------------------
+    // Buffer state decoding: JSON legacy envelopes and pre-IPC Arrow streams
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn decode_buffer_rejects_unknown_payloads() {
+        assert!(decode_buffer(b"not-a-payload").is_err());
+    }
+
+    #[test]
+    fn decode_buffer_falls_back_to_the_legacy_json_envelope() {
+        // The typed V2 parse fails (required float fields are missing) while
+        // the legacy envelope that only demands `count` still migrates.
+        let migrated = decode_buffer(br#"{"count":1,"sum_i64":5}"#).unwrap();
+        assert_eq!(migrated.count, 1);
+        assert_eq!(migrated.sum_i64, 5);
+        assert_eq!(migrated.kind, NumericKind::Int64);
+
+        // A boolean is_float flag routes to the migration guard even when the
+        // rest of the payload cannot be parsed as legacy state.
+        assert!(decode_buffer(br#"{"is_float":true,"count":"not-a-number"}"#).is_err());
+    }
+
+    /// Serialize a one-row IPC stream with the pre-typed kernel's columns.
+    fn legacy_ipc_stream(columns: Vec<ArrayRef>) -> Vec<u8> {
+        let fields = columns
+            .iter()
+            .map(|column| Field::new("c", column.data_type().clone(), true))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let mut buffer = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut buffer, batch.schema().as_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        buffer
+    }
+
+    #[test]
+    fn decode_buffer_reads_pre_ipc_arrow_stream_state() {
+        let full = legacy_ipc_stream(vec![
+            Arc::new(UInt64Array::from(vec![3u64])),   // count
+            Arc::new(Int64Array::from(vec![6i64])),    // sum_i64
+            Arc::new(Int64Array::from(vec![0i64])),    // unused
+            Arc::new(Int64Array::from(vec![1i64])),    // min_i64
+            Arc::new(Int64Array::from(vec![3i64])),    // max_i64
+            Arc::new(BooleanArray::from(vec![false])), // is_float
+            Arc::new(Int64Array::from(vec![42i64])),   // session_end_ms
+        ]);
+        let decoded = decode_buffer(&full).unwrap();
+        assert_eq!(decoded.count, 3);
+        assert_eq!(decoded.sum_i64, 6);
+        assert_eq!(decoded.min_i64, 1);
+        assert_eq!(decoded.max_i64, 3);
+        assert_eq!(decoded.session_end_ms, 42);
+
+        // Without the optional flag columns the payload still migrates as an
+        // integer aggregate.
+        let short = legacy_ipc_stream(vec![
+            Arc::new(UInt64Array::from(vec![2u64])),
+            Arc::new(Int64Array::from(vec![9i64])),
+            Arc::new(Int64Array::from(vec![0i64])),
+            Arc::new(Int64Array::from(vec![4i64])),
+            Arc::new(Int64Array::from(vec![5i64])),
+        ]);
+        let decoded = decode_buffer(&short).unwrap();
+        assert_eq!(decoded.count, 2);
+        assert_eq!(decoded.sum_i64, 9);
+
+        // A float payload written with sentinel bounds is unrecoverable.
+        let float = legacy_ipc_stream(vec![
+            Arc::new(UInt64Array::from(vec![2u64])),
+            Arc::new(Int64Array::from(vec![0i64])),
+            Arc::new(Int64Array::from(vec![0i64])),
+            Arc::new(Int64Array::from(vec![i64::MIN])),
+            Arc::new(Int64Array::from(vec![i64::MAX])),
+            Arc::new(BooleanArray::from(vec![true])),
+        ]);
+        assert!(decode_buffer(&float).is_err());
+    }
+
+    #[test]
+    fn restore_buffers_rejects_truncated_state_keys() {
+        let backend = mem_backend();
+        backend
+            .put(
+                "corrupt-ns",
+                b"short",
+                &encode_buffer(&AggregateBuffer::default()).unwrap(),
+            )
+            .unwrap();
+        let op = ColumnarWindowOperator::new(tumbling_config(1_000), backend, "corrupt-ns");
+        let Err(error) = op.restore_buffers() else {
+            panic!("a truncated state key must fail the restore");
+        };
+        assert!(error.to_string().contains("corrupt window state key"), "{error}");
+    }
+
+    // ------------------------------------------------------------------
+    // Window arithmetic helpers
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn windows_for_handles_legacy_groups_and_extreme_sliding_inputs() {
+        let legacy_session = ColumnarWindowOperator::new(
+            legacy_config(WindowKind::Session { gap_ms: 500 }, "__arkflow_window_all"),
+            mem_backend(),
+            "legacy-session",
+        );
+        assert_eq!(legacy_session.windows_for(123), vec![(0, 500)]);
+
+        let legacy_tumbling = ColumnarWindowOperator::new(
+            legacy_config(WindowKind::Tumbling { size_ms: 300 }, "__arkflow_window_all"),
+            mem_backend(),
+            "legacy-tumbling",
+        );
+        assert_eq!(legacy_tumbling.windows_for(999), vec![(0, 300)]);
+
+        // Stepping back from the lowest aligned start underflows: the loop
+        // stops after the single representable membership.
+        let sliding = ColumnarWindowOperator::new(
+            sliding_config(4, 2),
+            mem_backend(),
+            "sliding-floor",
+        );
+        assert_eq!(sliding.windows_for(i64::MIN), vec![(i64::MIN, i64::MIN + 4)]);
+    }
+
+    #[test]
+    fn session_end_falls_back_to_start_plus_gap_for_upgraded_buffers() {
+        let upgraded = AggregateBuffer::default();
+        assert_eq!(
+            ColumnarWindowOperator::session_end(100, &upgraded, 50),
+            150,
+            "a pre-session-end buffer uses start + gap"
+        );
+        let extended = AggregateBuffer {
+            session_end_ms: 999,
+            ..Default::default()
+        };
+        assert_eq!(ColumnarWindowOperator::session_end(100, &extended, 50), 999);
+    }
+
+    // ------------------------------------------------------------------
+    // Timestamp / key / value column conversion battery
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn timestamp_columns_of_every_supported_type_assign_windows() {
+        let cases: Vec<(&str, ArrayRef)> = vec![
+            ("timestamp_second", Arc::new(TimestampSecondArray::from(vec![2_i64]))),
+            (
+                "timestamp_millisecond",
+                Arc::new(TimestampMillisecondArray::from(vec![3_000_i64])),
+            ),
+            (
+                "timestamp_microsecond",
+                Arc::new(TimestampMicrosecondArray::from(vec![4_000_000_i64])),
+            ),
+            (
+                "timestamp_nanosecond",
+                Arc::new(TimestampNanosecondArray::from(vec![5_000_000_000_i64])),
+            ),
+            ("date32", Arc::new(Date32Array::from(vec![0_i32]))),
+            ("date64", Arc::new(Date64Array::from(vec![6_000_i64]))),
+            ("int32", Arc::new(Int32Array::from(vec![7_000_i32]))),
+            ("uint32", Arc::new(UInt32Array::from(vec![8_000_u32]))),
+        ];
+        for (name, ts) in cases {
+            let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), name);
+            op.process(flexible_batch(
+                ts,
+                utf8(vec!["a"]),
+                Some(Arc::new(Int64Array::from(vec![1_i64]))),
+                None,
+                Vec::new(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let fired = op
+                .process(std_batch(vec![(20_000, "z", 0)], Some(10_000)))
+                .await
+                .unwrap();
+            let fired = fired_single(fired);
+            let starts = fired
+                .record_batch()
+                .column_by_name("window_start")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(starts.values(), &[0], "{name} assigns to [0, 10000)");
+            let counts = fired
+                .record_batch()
+                .column_by_name("count")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            assert_eq!(counts.values(), &[1], "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_timestamp_inputs_fail_with_actionable_errors() {
+        // Second-unit values that overflow milliseconds.
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "sec-of");
+        let result = op
+            .process(flexible_batch(
+                Arc::new(TimestampSecondArray::from(vec![i64::MAX])),
+                utf8(vec!["a"]),
+                None,
+                None,
+                Vec::new(),
+            ))
+            .await;
+        assert!(result.unwrap_err().to_string().contains("overflows"));
+
+        // Date32 days never overflow i64 milliseconds (i32::MAX days is well
+        // below i64::MAX ms): the extreme value assigns normally.
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "date-max");
+        let out = op
+            .process(flexible_batch(
+                Arc::new(Date32Array::from(vec![i32::MAX])),
+                utf8(vec!["a"]),
+                Some(Arc::new(Int64Array::from(vec![1_i64]))),
+                None,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::None));
+
+        // A timestamp column of an unsupported type.
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "ts-type");
+        let result = op
+            .process(flexible_batch(
+                utf8(vec!["2024-01-01"]),
+                utf8(vec!["a"]),
+                None,
+                None,
+                Vec::new(),
+            ))
+            .await;
+        assert!(result.unwrap_err().to_string().contains("unsupported type"));
+
+        // A missing timestamp column in event-time mode.
+        let batch = Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)])),
+                vec![utf8(vec!["a"])],
+            )
+            .unwrap(),
+        ));
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "ts-miss");
+        let result = op.process(batch).await;
+        assert!(result.unwrap_err().to_string().contains("is missing"));
+    }
+
+    #[tokio::test]
+    async fn integer_key_columns_are_cast_to_strings() {
+        for (name, key) in [
+            ("int64", Arc::new(Int64Array::from(vec![7_i64])) as ArrayRef),
+            ("int32", Arc::new(Int32Array::from(vec![3_i32])) as ArrayRef),
+        ] {
+            let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), name);
+            op.process(flexible_batch(
+                Arc::new(Int64Array::from(vec![1_000_i64])),
+                key,
+                Some(Arc::new(Int64Array::from(vec![1_i64]))),
+                None,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+            let fired = op
+                .process(std_batch(vec![(20_000, "z", 0)], Some(10_000)))
+                .await
+                .unwrap();
+            let fired = fired_single(fired);
+            let keys = fired
+                .record_batch()
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(keys.value(0), if name == "int64" { "7" } else { "3" });
+        }
+
+        // An unsupported key type and a missing key column both fail.
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "key-type");
+        let result = op
+            .process(flexible_batch(
+                Arc::new(Int64Array::from(vec![1_000_i64])),
+                Arc::new(Float64Array::from(vec![1.5])),
+                None,
+                None,
+                Vec::new(),
+            ))
+            .await;
+        assert!(result.unwrap_err().to_string().contains("unsupported type"));
+
+        let mut config = tumbling_config(10_000);
+        config.key_field = "nope".into();
+        let op = ColumnarWindowOperator::new(config, mem_backend(), "key-miss");
+        let result = op.process(std_batch(vec![(1_000, "a", 1)], None)).await;
+        assert!(result.unwrap_err().to_string().contains("key field"));
+    }
+
+    #[tokio::test]
+    async fn narrow_integer_value_columns_aggregate_through_a_cast() {
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "int-value");
+        op.process(flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000_i64, 2_000_i64])),
+            utf8(vec!["a", "a"]),
+            Some(Arc::new(Int32Array::from(vec![5_i32, 7_i32]))),
+            None,
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+        let fired = op
+            .process(std_batch(vec![(20_000, "z", 0)], Some(10_000)))
+            .await
+            .unwrap();
+        let fired = fired_single(fired);
+        let sums = fired
+            .record_batch()
+            .column_by_name("sum")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(sums.values(), &[12]);
+    }
+
+    #[tokio::test]
+    async fn a_missing_value_field_fails_the_batch() {
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "val-miss");
+        let result = op
+            .process(flexible_batch(
+                Arc::new(Int64Array::from(vec![1_000_i64])),
+                utf8(vec!["a"]),
+                None,
+                None,
+                Vec::new(),
+            ))
+            .await;
+        assert!(
+            result.unwrap_err().to_string().contains("value field"),
+            "the configured value column must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_watermark_columns_only_advance_the_frontier() {
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "wm");
+        op.process(std_batch(vec![(1_000, "a", 1)], Some(1_000)))
+            .await
+            .unwrap();
+        op.process(std_batch(vec![(2_000, "a", 1)], Some(2_000)))
+            .await
+            .unwrap();
+        // A stale watermark column never rewinds the frontier.
+        op.process(std_batch(vec![(3_000, "a", 1)], Some(500)))
+            .await
+            .unwrap();
+        assert_eq!(*op.watermark_ms.lock().unwrap(), Some(2_000));
+    }
+
+    // ------------------------------------------------------------------
+    // Session late-event routing / dropping / invalid rows
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn session_rows_with_null_timestamps_are_counted_and_dropped() {
+        let op = ColumnarWindowOperator::with_late_event_policy(
+            session_config(1_000, 0),
+            mem_backend(),
+            "session-null-ts",
+            LateEventPolicy::Update,
+            false,
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        op.process(std_batch(vec![(3_000, "b", 2)], Some(2_500)))
+            .await
+            .unwrap();
+
+        // A null timestamp can never reach a session deadline: it is counted
+        // as invalid and dropped (no route configured).
+        let out = op
+            .process(flexible_batch(
+                Arc::new(Int64Array::from(vec![Option::<i64>::None])),
+                utf8(vec!["a"]),
+                Some(Arc::new(Int64Array::from(vec![9_i64]))),
+                None,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::None));
+        assert_eq!(
+            op.late_event_row_counter().load(Ordering::Relaxed),
+            1,
+            "the invalid row is counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_session_late_rows_share_the_delivery_with_fired_windows() {
+        let op = ColumnarWindowOperator::with_late_event_policy(
+            session_config(1_000, 0),
+            mem_backend(),
+            "session-route",
+            LateEventPolicy::Route,
+            true,
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        // Watermark 2_500 fires session [100, 1100) and leaves [3000, 4000)
+        // open for key b.
+        op.process(std_batch(vec![(3_000, "b", 2)], Some(2_500)))
+            .await
+            .unwrap();
+
+        let ack = CountingSettlementAck::new();
+        let out = op
+            .process_with_ack(std_batch(vec![(100, "a", 9)], Some(4_000)), ack.clone())
+            .await
+            .unwrap();
+        // The late row is routed to the side output while the same delivery's
+        // watermark fires key b's session.
+        let ProcessResult::MultipleWithAck(outputs) = out else {
+            panic!("a routed session delivery combines window and late outputs");
+        };
+        assert_eq!(outputs.len(), 2);
+        assert!(
+            outputs[1]
+                .0
+                .record_batch()
+                .column_by_name("__arkflow_late_event_route")
+                .is_some(),
+            "the late branch carries the route marker"
+        );
+        assert_eq!(
+            op.late_event_row_counter().load(Ordering::Relaxed),
+            1,
+            "the routed row is counted"
+        );
+        for (_, output_ack) in outputs {
+            output_ack.ack().await.unwrap();
+        }
+        assert_eq!(ack.acked(), 1, "the source delivery settles once");
+    }
+
+    #[tokio::test]
+    async fn dropped_session_late_rows_settle_without_an_ack_flow() {
+        let op = ColumnarWindowOperator::with_late_event_policy(
+            session_config(1_000, 0),
+            mem_backend(),
+            "session-drop",
+            LateEventPolicy::Drop,
+            false,
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        op.process(std_batch(vec![(3_000, "b", 2)], Some(2_500)))
+            .await
+            .unwrap();
+
+        // Nothing new fires: the dropped late row yields no output at all.
+        let out = op
+            .process(std_batch(vec![(100, "a", 9)], None))
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::None));
+
+        // With a watermark that closes key b's session the aggregate fires
+        // through the no-ack path.
+        let out = op
+            .process(std_batch(vec![(100, "a", 9)], Some(4_000)))
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::Single(_)));
+    }
+
+    #[tokio::test]
+    async fn a_failing_dropped_late_ack_surfaces_the_error() {
+        let op = ColumnarWindowOperator::with_late_event_policy(
+            session_config(1_000, 0),
+            mem_backend(),
+            "session-drop-fail",
+            LateEventPolicy::Drop,
+            false,
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        op.process(std_batch(vec![(3_000, "b", 2)], Some(2_500)))
+            .await
+            .unwrap();
+
+        let failing = Arc::new(FailOnceAck {
+            fail: AtomicBool::new(true),
+        });
+        let result = op
+            .process_with_ack(std_batch(vec![(100, "a", 9)], None), failing)
+            .await;
+        assert!(
+            result.is_err(),
+            "a failing drop acknowledgement must surface, not be swallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accumulate_failure_after_late_rows_compensates_the_delivery() {
+        let op = ColumnarWindowOperator::with_late_event_policy(
+            session_config(1_000, 0),
+            mem_backend(),
+            "session-acc-fail",
+            LateEventPolicy::Drop,
+            false,
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        op.process(std_batch(vec![(3_000, "b", 2)], Some(2_500)))
+            .await
+            .unwrap();
+
+        // One late row (dropped) plus one accepted row whose value column is
+        // a string: the accumulate failure must compensate the whole split.
+        let bad = flexible_batch(
+            Arc::new(Int64Array::from(vec![100_i64, 5_000_i64])),
+            utf8(vec!["a", "b"]),
+            Some(utf8(vec!["x", "y"])),
+            None,
+            Vec::new(),
+        );
+        let result = op
+            .process_with_ack(bad, CountingSettlementAck::new())
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported numeric type")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Gate-marker consumption inside accumulate
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn excluded_window_ends_never_reopen_a_cleaned_membership() {
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "excl");
+        op.process(std_batch(vec![(5_000, "a", 1)], None))
+            .await
+            .unwrap();
+        // Fire and clean [0, 10000).
+        op.process(std_batch(vec![(21_000, "z", 0)], Some(20_000)))
+            .await
+            .unwrap();
+
+        // The gate marked the closed membership: the row must not re-open it.
+        let marked = flexible_batch(
+            Arc::new(Int64Array::from(vec![5_000_i64])),
+            utf8(vec!["a"]),
+            Some(Arc::new(Int64Array::from(vec![1_i64]))),
+            Some(20_000),
+            vec![(
+                "__arkflow_late_window_ends",
+                Arc::new(StringArray::from(vec![Some("10000")])),
+            )],
+        );
+        let out = op.process(marked).await.unwrap();
+        assert!(matches!(out, ProcessResult::None));
+        assert!(!op.buffers.lock().unwrap().contains_key(&(0, "a".to_string())));
+    }
+
+    #[tokio::test]
+    async fn targeted_late_updates_skip_only_their_marked_windows() {
+        let mut config = tumbling_config(1_000);
+        config.allowed_lateness_ms = 5_000;
+        let op = ColumnarWindowOperator::new(config, mem_backend(), "targeted");
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        // Fire [0, 1000) and retain it through the lateness deadline.
+        op.process(std_batch(vec![(2_000, "b", 0)], Some(1_000)))
+            .await
+            .unwrap();
+        // Past the deadline the retained buffer is cleaned up.
+        op.process(std_batch(vec![(9_000, "z", 0)], Some(7_000)))
+            .await
+            .unwrap();
+
+        // A targeted late update for the cleaned window must not fabricate a
+        // fresh aggregate.
+        let marked = flexible_batch(
+            Arc::new(Int64Array::from(vec![200_i64])),
+            utf8(vec!["a"]),
+            Some(Arc::new(Int64Array::from(vec![5_i64]))),
+            Some(7_000),
+            vec![
+                (
+                    "__arkflow_late_event_update",
+                    Arc::new(BooleanArray::from(vec![true])),
+                ),
+                (
+                    "__arkflow_late_window_updates",
+                    Arc::new(StringArray::from(vec![Some("1000")])),
+                ),
+            ],
+        );
+        let out = op.process(marked).await.unwrap();
+        assert!(matches!(out, ProcessResult::None));
+        assert!(!op.buffers.lock().unwrap().contains_key(&(0, "a".to_string())));
+    }
+
+    #[tokio::test]
+    async fn routed_marker_batches_are_acknowledged_and_skipped() {
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "route-pass");
+        let route_batch = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000_i64])),
+            utf8(vec!["a"]),
+            Some(Arc::new(Int64Array::from(vec![1_i64]))),
+            None,
+            vec![(
+                "__arkflow_late_event_route",
+                Arc::new(BooleanArray::from(vec![true])),
+            )],
+        );
+        let ack = CountingSettlementAck::new();
+        let out = op
+            .process_with_ack(route_batch.clone(), ack.clone())
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::None));
+        assert_eq!(ack.acked(), 1, "the routed delivery settles immediately");
+        assert!(op.buffers.lock().unwrap().is_empty());
+
+        // A failing acknowledgement surfaces after compensation.
+        let failing = Arc::new(FailOnceAck {
+            fail: AtomicBool::new(true),
+        });
+        assert!(op.process_with_ack(route_batch, failing).await.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Journal integration: re-keys, immediate commits, one-shot payloads
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn journaled_session_rekey_deletes_old_state_and_moves_pending_acks() {
+        let backend = mem_backend();
+        let journal = Arc::new(super::super::state_journal::StateJournal::new(backend.clone()));
+        let op = ColumnarWindowOperator::with_journal(
+            session_config(2_000, 0),
+            backend.clone(),
+            journal,
+            "rekey-ns",
+        );
+
+        let first = CountingSettlementAck::new();
+        let second = CountingSettlementAck::new();
+        op.process_with_ack(std_batch(vec![(100, "a", 1)], None), first.clone())
+            .await
+            .unwrap();
+        op.process_with_ack(std_batch(vec![(2_500, "a", 2)], None), second)
+            .await
+            .unwrap();
+        assert!(op.pending_acks.lock().unwrap().contains_key(&(100, "a".to_string())));
+        assert!(
+            op.pending_acks
+                .lock()
+                .unwrap()
+                .contains_key(&(2_500, "a".to_string()))
+        );
+
+        // The bridging row merges both sessions into [100, 4500).
+        op.process(std_batch(vec![(2_000, "a", 3)], None))
+            .await
+            .unwrap();
+        {
+            let pending = op.pending_acks.lock().unwrap();
+            assert!(
+                !pending.contains_key(&(2_500, "a".to_string())),
+                "the merged-away session's delivery moved to the merged key"
+            );
+            assert_eq!(
+                pending.get(&(100, "a".to_string())).map(Vec::len),
+                Some(2),
+                "both held deliveries live under the merged session"
+            );
+        }
+        assert!(
+            !op.window_txns
+                .lock()
+                .unwrap()
+                .contains_key(&(2_500, "a".to_string())),
+            "the obsolete transaction is discarded"
+        );
+
+        // The unacknowledged path commits immediately: the merged aggregate
+        // is durable and the old key's bytes are gone.
+        assert!(
+            backend
+                .get("rekey-ns", &ColumnarWindowOperator::state_key(2_500, "a"))
+                .unwrap()
+                .is_none()
+        );
+        let merged = backend
+            .get("rekey-ns", &ColumnarWindowOperator::state_key(100, "a"))
+            .unwrap()
+            .expect("the merged session is durable");
+        let merged = decode_buffer(&merged).unwrap();
+        assert_eq!(merged.count, 3);
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_deliveries_commit_their_window_transactions() {
+        let backend = mem_backend();
+        let journal = Arc::new(super::super::state_journal::StateJournal::new(backend.clone()));
+        let op =
+            ColumnarWindowOperator::with_journal(tumbling_config(1_000), backend.clone(), journal, "commit-ns");
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        // No acknowledgement flow gates the commit: the working buffer is
+        // durable immediately.
+        assert!(
+            backend
+                .get("commit-ns", &ColumnarWindowOperator::state_key(0, "a"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn journaled_legacy_flushes_its_one_shot_payload() {
+        let backend = mem_backend();
+        let journal = Arc::new(super::super::state_journal::StateJournal::new(backend.clone()));
+        let op = ColumnarWindowOperator::with_journal(
+            legacy_config(WindowKind::Tumbling { size_ms: 60_000 }, "__arkflow_window_all"),
+            backend.clone(),
+            journal,
+            "legacy-journal-ns",
+        );
+        let input = crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Utf8, false),
+                    Field::new("amount", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])),
+                    Arc::new(Int64Array::from(vec![3])),
+                ],
+            )
+            .unwrap(),
+        );
+        op.process_with_ack(
+            Arc::new(input),
+            Arc::new(crate::input::NoopAck) as Arc<dyn Ack>,
+        )
+        .await
+        .unwrap();
+
+        *op.last_processing_trigger_ms.lock().unwrap() =
+            Some(crate::state::now_ms() as i64 - 2_000);
+        let out = op.on_tick().await.unwrap();
+        let ProcessResult::SingleWithAck(flushed, ack) = out else {
+            panic!("the legacy buffer should flush");
+        };
+        ack.ack().await.unwrap();
+        assert_eq!(flushed.record_batch().num_rows(), 1);
+        // The one-shot buffer's state row is deleted with the commit.
+        assert!(
+            backend
+                .get("legacy-journal-ns", &ColumnarWindowOperator::state_key(0, "__all__"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fired_ack_exposes_held_markers_undo_and_abort() {
+        let backend = mem_backend();
+        let journal = Arc::new(super::super::state_journal::StateJournal::new(backend.clone()));
+        let op = ColumnarWindowOperator::with_journal(
+            tumbling_config(1_000),
+            backend,
+            journal,
+            "ack-surface-ns",
+        );
+        op.process_with_ack(
+            std_batch(vec![(100, "a", 10)], None),
+            Arc::new(crate::input::NoopAck),
+        )
+        .await
+        .unwrap();
+        let fired = op
+            .process_with_ack(
+                std_batch(vec![(2_000, "b", 0)], Some(1_000)),
+                Arc::new(crate::input::NoopAck),
+            )
+            .await
+            .unwrap();
+        let ProcessResult::SingleWithAck(_, ack) = fired else {
+            panic!("the window should fire with an acknowledgement");
+        };
+
+        // Held-marker plumbing forwards to the wrapped acknowledgement.
+        ack.mark_held();
+        ack.release_held();
+
+        ack.ack().await.unwrap();
+        // After a successful settlement the operation guard is released: the
+        // compensation entry points take the lock again instead of reusing it.
+        ack.undo().await.unwrap();
+        ack.abort().await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Trigger cadence and delivery settlement shapes
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn watermark_only_deliveries_settle_or_ride_the_fired_output() {
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "wm-only");
+        op.process(std_batch(vec![(5_000, "a", 1)], None))
+            .await
+            .unwrap();
+        // Fire [0, 10000) (retained through its deadline) and open
+        // [60000, 70000) for key b.
+        op.process(std_batch(vec![(61_000, "b", 2)], Some(60_000)))
+            .await
+            .unwrap();
+        // A far-later watermark fires b's window and reclaims every expired
+        // buffer, leaving only [90000, 100000) for key c.
+        op.process(std_batch(vec![(96_000, "c", 3)], Some(95_000)))
+            .await
+            .unwrap();
+
+        // A delivery whose only row targets the cleaned window: no row is
+        // admitted and nothing fires, so the source acknowledgement settles
+        // directly.
+        let ack = CountingSettlementAck::new();
+        let out = op
+            .process_with_ack(std_batch(vec![(5_000, "a", 1)], Some(95_000)), ack.clone())
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::Deferred));
+        assert_eq!(ack.acked(), 1, "the delivery settles immediately");
+
+        // The same shape with a watermark that closes key c's window rides
+        // the fired output's acknowledgement instead of settling eagerly.
+        let ack = CountingSettlementAck::new();
+        let out = op
+            .process_with_ack(std_batch(vec![(5_000, "a", 1)], Some(100_000)), ack.clone())
+            .await
+            .unwrap();
+        let ProcessResult::SingleWithAck(_, output_ack) = out else {
+            panic!("the still-open window should fire");
+        };
+        assert_eq!(ack.acked(), 0, "the delivery settles with the output");
+        output_ack.ack().await.unwrap();
+        assert_eq!(ack.acked(), 1);
+    }
+
+    #[tokio::test]
+    async fn processing_time_windows_flush_from_process_when_the_cadence_is_due() {
+        let mut config = tumbling_config(10_000);
+        config.trigger = WindowTrigger::ProcessingTime;
+        let op = ColumnarWindowOperator::new(config, mem_backend(), "pt-cadence");
+
+        // The first delivery starts the cadence without emitting.
+        let out = op
+            .process(std_batch(vec![(1_000, "a", 1)], None))
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::None));
+
+        // Inside the interval nothing fires.
+        let out = op
+            .process(std_batch(vec![(2_000, "a", 2)], None))
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::None));
+
+        // Past the interval the next delivery flushes everything it holds.
+        *op.last_processing_trigger_ms.lock().unwrap() =
+            Some(crate::state::now_ms() as i64 - 2_000);
+        let out = op
+            .process(std_batch(vec![(3_000, "a", 3)], None))
+            .await
+            .unwrap();
+        let fired = fired_single(out);
+        let counts = fired
+            .record_batch()
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(counts.values(), &[3]);
+    }
+
+    #[tokio::test]
+    async fn legacy_session_ticks_flush_only_after_the_activity_gap() {
+        let op = ColumnarWindowOperator::new(
+            legacy_config(WindowKind::Session { gap_ms: 1_000 }, "__arkflow_window_all"),
+            mem_backend(),
+            "legacy-session-tick",
+        );
+        let input = |amount: i64| {
+            Arc::new(crate::MessageBatch::new_arrow(
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Utf8, false),
+                        Field::new("amount", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["a"])),
+                        Arc::new(Int64Array::from(vec![amount])),
+                    ],
+                )
+                .unwrap(),
+            ))
+        };
+        op.process(input(3)).await.unwrap();
+
+        // An immediate tick is inside the activity gap: nothing is due.
+        let out = op.on_tick().await.unwrap();
+        assert!(matches!(out, ProcessResult::None));
+
+        // Once the gap passes the idle tick flushes the one-shot buffer.
+        *op.last_processing_activity_ms.lock().unwrap() =
+            Some(crate::state::now_ms() as i64 - 2_000);
+        let out = op.on_tick().await.unwrap();
+        let ProcessResult::SingleWithAck(flushed, _) = out else {
+            panic!("the legacy session buffer should flush after the gap");
+        };
+        assert_eq!(flushed.record_batch().num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_session_null_keys_settle_through_the_late_path() {
+        let op = ColumnarWindowOperator::new(
+            legacy_config(WindowKind::Session { gap_ms: 1_000 }, "key"),
+            mem_backend(),
+            "legacy-late-path",
+        );
+        let batch = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000_i64])),
+            Arc::new(StringArray::from(vec![Option::<&str>::None])),
+            None,
+            None,
+            Vec::new(),
+        );
+        let ack = CountingSettlementAck::new();
+        let out = op
+            .process_with_ack(batch, ack.clone() as Arc<dyn Ack>)
+            .await
+            .unwrap();
+        // A NULL key row can never join a keyed aggregate: it settles as a
+        // dropped invalid row and nothing flushes.
+        assert!(matches!(out, ProcessResult::Deferred));
+        assert!(ack.acked() >= 1, "the dropped branch settles");
+        assert_eq!(
+            op.late_event_row_counter().load(Ordering::Relaxed),
+            1,
+            "the NULL-key row is counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_fire_without_retained_payloads_fails_loudly() {
+        let op = ColumnarWindowOperator::new(
+            legacy_config(WindowKind::Tumbling { size_ms: 60_000 }, "__arkflow_window_all"),
+            mem_backend(),
+            "legacy-empty-fire",
+        );
+        // Force the lazy backend load first so the injected buffer survives.
+        op.restore_buffers().unwrap();
+        op.buffers.lock().unwrap().insert(
+            (0, "__all__".to_string()),
+            AggregateBuffer {
+                count: 3,
+                ..Default::default()
+            },
+        );
+        *op.last_processing_trigger_ms.lock().unwrap() =
+            Some(crate::state::now_ms() as i64 - 2_000);
+        let Err(error) = op.on_tick().await else {
+            panic!("a legacy buffer without retained payloads must fail");
+        };
+        assert!(
+            error.to_string().contains("unavailable"),
+            "{error}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Persistence failures surface from every entry point
+    // ------------------------------------------------------------------
+
+    /// A corrupted retained legacy payload makes every firing entry point
+    /// fail: the error must surface (and roll the runtime back) wherever the
+    /// fire is attempted from.
+    #[tokio::test]
+    async fn legacy_fire_errors_surface_from_every_entry_point() {
+        let mut config = legacy_config(WindowKind::Tumbling { size_ms: 60_000 }, "key");
+        config.trigger = WindowTrigger::Watermark;
+        config.timestamp_field = "ts".into();
+        let op = ColumnarWindowOperator::new(config, mem_backend(), "legacy-fire-err");
+        // Load eagerly so the injected corrupt buffer survives.
+        op.restore_buffers().unwrap();
+        op.buffers.lock().unwrap().insert(
+            (0, "__all__".to_string()),
+            AggregateBuffer {
+                count: 3,
+                legacy_batches: vec![b"garbage".to_vec()],
+                ..Default::default()
+            },
+        );
+
+        // A watermark-driven delivery fails its firing round.
+        let result = op
+            .process_with_ack(
+                flexible_batch(
+                    Arc::new(Int64Array::from(vec![61_000_i64])),
+                    utf8(vec!["a"]),
+                    None,
+                    Some(60_000),
+                    Vec::new(),
+                ),
+                Arc::new(crate::input::NoopAck),
+            )
+            .await;
+        assert!(result.is_err());
+
+        // The watermark entry point fails the same way.
+        assert!(op.on_watermark(60_000).await.is_err());
+        // So does the end-of-stream flush.
+        assert!(op.finish().await.is_err());
+
+        // And the late-row split path (a NULL key) surfaces the same error
+        // after compensating its acknowledgements.
+        let result = op
+            .process_with_ack(
+                flexible_batch(
+                    Arc::new(Int64Array::from(vec![1_000_i64])),
+                    Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                    None,
+                    Some(60_000),
+                    Vec::new(),
+                ),
+                Arc::new(crate::input::NoopAck),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// A processing-time operator that receives a late (NULL-key) row runs the
+    /// cadence threshold through the late split instead of the direct path.
+    #[tokio::test]
+    async fn processing_time_late_rows_run_the_cadence_threshold() {
+        let mut config = tumbling_config(10_000);
+        config.trigger = WindowTrigger::ProcessingTime;
+        let op = ColumnarWindowOperator::new(config, mem_backend(), "pt-late");
+        let mixed = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000_i64, 2_000_i64])),
+            Arc::new(StringArray::from(vec![Some("a"), None])),
+            Some(Arc::new(Int64Array::from(vec![1_i64, 5_i64]))),
+            None,
+            Vec::new(),
+        );
+        let ack = CountingSettlementAck::new();
+        let out = op
+            .process_with_ack(mixed, ack.clone() as Arc<dyn Ack>)
+            .await
+            .unwrap();
+        // The first delivery starts the cadence: nothing fires, the accepted
+        // row stays held and the NULL-key row is dropped and counted.
+        assert!(matches!(out, ProcessResult::Deferred));
+        assert_eq!(ack.acked(), 0, "the held window still owns the delivery");
+        assert_eq!(
+            op.late_event_row_counter().load(Ordering::Relaxed),
+            1,
+            "the NULL-key row is counted"
+        );
+        assert!(op.pending_acks.lock().unwrap().contains_key(&(0, "a".to_string())));
+    }
+
+    #[tokio::test]
+    async fn persistence_failures_surface_from_every_entry_point() {
+        let failing = FailingWritesBackend::new();
+
+        // finish()
+        let op = ColumnarWindowOperator::new(
+            tumbling_config(1_000),
+            failing.clone(),
+            "finish-fail",
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        failing.set_failing(true);
+        assert!(op.finish().await.is_err());
+
+        // on_watermark
+        failing.set_failing(false);
+        let op = ColumnarWindowOperator::new(
+            tumbling_config(1_000),
+            failing.clone(),
+            "watermark-fail",
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        failing.set_failing(true);
+        assert!(op.on_watermark(1_000).await.is_err());
+
+        // on_tick (processing-time cadence)
+        failing.set_failing(false);
+        let mut config = tumbling_config(1_000);
+        config.trigger = WindowTrigger::ProcessingTime;
+        let op = ColumnarWindowOperator::new(config, failing.clone(), "tick-fail");
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        *op.last_processing_trigger_ms.lock().unwrap() =
+            Some(crate::state::now_ms() as i64 - 2_000);
+        failing.set_failing(true);
+        assert!(op.on_tick().await.is_err());
+
+        // process with an acknowledgement flow
+        failing.set_failing(false);
+        let op = ColumnarWindowOperator::new(
+            tumbling_config(1_000),
+            failing.clone(),
+            "process-fail",
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        failing.set_failing(true);
+        assert!(
+            op.process_with_ack(
+                std_batch(vec![(2_000, "b", 0)], Some(1_000)),
+                Arc::new(crate::input::NoopAck),
+            )
+            .await
+            .is_err()
+        );
+
+        // the late-only session path
+        failing.set_failing(false);
+        let op = ColumnarWindowOperator::with_late_event_policy(
+            session_config(1_000, 0),
+            failing.clone(),
+            "late-only-fail",
+            LateEventPolicy::Drop,
+            false,
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        op.process(std_batch(vec![(3_000, "b", 2)], Some(2_500)))
+            .await
+            .unwrap();
+        failing.set_failing(true);
+        assert!(
+            op.process_with_ack(
+                std_batch(vec![(100, "a", 9)], None),
+                Arc::new(crate::input::NoopAck),
+            )
+            .await
+            .is_err()
+        );
+
+        // the accepted-row session path
+        failing.set_failing(false);
+        let op = ColumnarWindowOperator::with_late_event_policy(
+            session_config(1_000, 0),
+            failing.clone(),
+            "late-accepted-fail",
+            LateEventPolicy::Drop,
+            false,
+        );
+        op.process(std_batch(vec![(100, "a", 1)], None))
+            .await
+            .unwrap();
+        op.process(std_batch(vec![(3_000, "b", 2)], Some(2_500)))
+            .await
+            .unwrap();
+        failing.set_failing(true);
+        assert!(
+            op.process_with_ack(
+                std_batch(vec![(100, "a", 9), (5_000, "b", 1)], None),
+                Arc::new(crate::input::NoopAck),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_all_null_watermark_column_leaves_the_frontier_untouched() {
+        let op = ColumnarWindowOperator::new(
+            tumbling_config(10_000),
+            mem_backend(),
+            "null-watermark",
+        );
+        let batch = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000i64, 2_000i64])),
+            utf8(vec!["a", "b"]),
+            Some(Arc::new(Int64Array::from(vec![1i64, 2i64]))),
+            None,
+            vec![(
+                "__watermark_ms",
+                Arc::new(Int64Array::from(vec![None::<i64>, None::<i64>])) as ArrayRef,
+            )],
+        );
+        let out = op.process(batch).await.unwrap();
+        assert!(matches!(out, ProcessResult::None));
+        assert_eq!(
+            *op.watermark_ms.lock().unwrap(),
+            None,
+            "a null-only watermark column must not move the frontier"
+        );
+
+        // A watermark column of a non-Int64 type is ignored the same way.
+        let op = ColumnarWindowOperator::new(
+            tumbling_config(10_000),
+            mem_backend(),
+            "null-watermark-int32",
+        );
+        let batch = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000i64])),
+            utf8(vec!["a"]),
+            Some(Arc::new(Int64Array::from(vec![1i64]))),
+            None,
+            vec![(
+                "__watermark_ms",
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![500i32])) as ArrayRef,
+            )],
+        );
+        let out = op.process(batch).await.unwrap();
+        assert!(matches!(out, ProcessResult::None));
+        assert_eq!(
+            *op.watermark_ms.lock().unwrap(),
+            None,
+            "a non-Int64 watermark column must not move the frontier"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_timestamp_rows_are_skipped_inside_the_accumulator() {
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "null-ts");
+        // The tumbling/watermark path has no session gate and the key is
+        // present, so the NULL timestamp row survives into the accumulator
+        // and must be skipped there rather than failing the batch.
+        let batch = flexible_batch(
+            Arc::new(Int64Array::from(vec![None::<i64>, Some(1_000i64)])),
+            utf8(vec!["a", "a"]),
+            Some(Arc::new(Int64Array::from(vec![Some(1i64), Some(2i64)]))),
+            None,
+            Vec::new(),
+        );
+        let out = op.process(batch).await.unwrap();
+        assert!(matches!(out, ProcessResult::None));
+        let buffers = op.buffers.lock().unwrap();
+        let buffer = buffers
+            .get(&(0, "a".to_string()))
+            .expect("the timestamped row aggregated");
+        assert_eq!(buffer.count, 1);
+        assert_eq!(buffer.sum_i64, 2);
+    }
+
+    #[tokio::test]
+    async fn a_late_update_row_admits_its_unmarked_window_memberships() {
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "late-admit");
+        // The update marker names a window this row does NOT belong to: the
+        // row's own membership must still be admitted even though no buffer
+        // exists for it yet.
+        let batch = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000i64])),
+            utf8(vec!["a"]),
+            Some(Arc::new(Int64Array::from(vec![7i64]))),
+            Some(20_000),
+            vec![
+                (
+                    "__arkflow_late_event_update",
+                    Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+                ),
+                (
+                    "__arkflow_late_window_updates",
+                    Arc::new(StringArray::from(vec!["30000"])) as ArrayRef,
+                ),
+            ],
+        );
+        let out = op.process(batch).await.unwrap();
+        let fired = match out {
+            ProcessResult::Single(batch) => batch,
+            _ => panic!("the admitted membership must fire"),
+        };
+        let counts = fired
+            .record_batch()
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(counts.values(), &[1]);
+    }
+
+    #[tokio::test]
+    async fn a_route_marker_delivery_acknowledges_and_returns_nothing() {
+        let op = ColumnarWindowOperator::new(session_config(1_000, 0), mem_backend(), "route-ack");
+        let batch = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000i64])),
+            utf8(vec!["a"]),
+            None,
+            None,
+            vec![(
+                "__arkflow_late_event_route",
+                Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+            )],
+        );
+        let ack = CountingSettlementAck::new();
+        let out = op
+            .process_with_ack(batch, ack.clone() as Arc<dyn Ack>)
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::None));
+        assert_eq!(ack.acked(), 1, "the route delivery is acknowledged and skipped");
+
+        // Without an acknowledgement flow the marker batch simply passes.
+        let marker_only = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000i64])),
+            utf8(vec!["a"]),
+            None,
+            None,
+            vec![(
+                "__arkflow_late_event_route",
+                Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+            )],
+        );
+        let out = op.process(marker_only).await.unwrap();
+        assert!(matches!(out, ProcessResult::None));
+    }
+
+    #[tokio::test]
+    async fn legacy_tumbling_late_rows_take_the_legacy_cadence_arm() {
+        let op = ColumnarWindowOperator::new(
+            legacy_config(WindowKind::Tumbling { size_ms: 10_000 }, "key"),
+            mem_backend(),
+            "legacy-late",
+        );
+        // The NULL-key row drives the late split; the legacy tumbling trigger
+        // arm records the first processing-time activity without firing.
+        let batch = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000i64, 2_000i64])),
+            Arc::new(StringArray::from(vec![Some("a"), None])),
+            None,
+            None,
+            Vec::new(),
+        );
+        let ack = CountingSettlementAck::new();
+        let out = op
+            .process_with_ack(batch, ack.clone() as Arc<dyn Ack>)
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::Deferred));
+        assert!(
+            op.buffers.lock().unwrap().contains_key(&(0, "a".to_string())),
+            "the accepted row keyed the synthetic legacy group"
+        );
+    }
+
+    #[tokio::test]
+    async fn processing_time_late_rows_fire_once_the_cadence_elapses() {
+        let mut config = tumbling_config(10_000);
+        config.trigger = WindowTrigger::ProcessingTime;
+        config.trigger_interval_ms = 1;
+        let op = ColumnarWindowOperator::new(config, mem_backend(), "pt-late");
+        let delivery = |ts: i64| {
+            flexible_batch(
+                Arc::new(Int64Array::from(vec![ts, ts])),
+                Arc::new(StringArray::from(vec![Some("a"), None])),
+                Some(Arc::new(Int64Array::from(vec![1i64, 1i64]))),
+                None,
+                Vec::new(),
+            )
+        };
+        let ack = CountingSettlementAck::new();
+        let first = op
+            .process_with_ack(delivery(1_000), ack.clone() as Arc<dyn Ack>)
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, ProcessResult::Deferred),
+            "the first delivery starts the cadence"
+        );
+        // Tolerate instrumentation slowdown: the 1ms cadence has a 20ms
+        // margin before the second delivery.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let second = op
+            .process_with_ack(delivery(2_000), ack.clone() as Arc<dyn Ack>)
+            .await
+            .unwrap();
+        assert!(
+            matches!(second, ProcessResult::SingleWithAck(_, _)),
+            "the due cadence flushes the open window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_path_delivery_settles_a_dropped_empty_group() {
+        let op = ColumnarWindowOperator::with_late_event_policy(
+            session_config(10_000, 0),
+            mem_backend(),
+            "late-empty-drop",
+            LateEventPolicy::Drop,
+            false,
+        );
+        // First delivery: a NULL-value row opens an empty session window and
+        // parks its acknowledgement there (no watermark yet, nothing fires).
+        let first = flexible_batch(
+            Arc::new(Int64Array::from(vec![0i64])),
+            utf8(vec!["a"]),
+            Some(Arc::new(Int64Array::from(vec![None::<i64>]))),
+            None,
+            Vec::new(),
+        );
+        let ack1 = CountingSettlementAck::new();
+        assert!(matches!(
+            op.process_with_ack(first, ack1.clone() as Arc<dyn Ack>)
+                .await
+                .unwrap(),
+            ProcessResult::Deferred
+        ));
+        assert_eq!(ack1.acked(), 0);
+        // Second delivery: a NULL-key row drives the late split while the
+        // watermark makes the empty session window droppable; its parked
+        // acknowledgement must settle through the dropped-group path.
+        let second = flexible_batch(
+            Arc::new(Int64Array::from(vec![9_000i64])),
+            Arc::new(StringArray::from(vec![Option::<&str>::None])),
+            None,
+            Some(10_000),
+            Vec::new(),
+        );
+        let ack2 = CountingSettlementAck::new();
+        assert!(matches!(
+            op.process_with_ack(second, ack2.clone() as Arc<dyn Ack>)
+                .await
+                .unwrap(),
+            ProcessResult::Deferred
+        ));
+        assert_eq!(
+            ack1.acked(),
+            1,
+            "the dropped empty group settled its parked delivery"
+        );
+        assert!(
+            op.buffers.lock().unwrap().is_empty(),
+            "the empty session window was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_touchless_late_path_delivery_still_acknowledges_the_source() {
+        let op = ColumnarWindowOperator::new(tumbling_config(10_000), mem_backend(), "touchless");
+        // The NULL-key row drives the late split; the other row's window
+        // already ended behind the watermark with no retained buffer, so the
+        // admission guard skips it and the delivery touches no window at all.
+        let batch = flexible_batch(
+            Arc::new(Int64Array::from(vec![1_000i64, 5_000i64])),
+            Arc::new(StringArray::from(vec![Some("b"), None])),
+            Some(Arc::new(Int64Array::from(vec![1i64, 1i64]))),
+            Some(10_000),
+            Vec::new(),
+        );
+        let ack = CountingSettlementAck::new();
+        let out = op
+            .process_with_ack(batch, ack.clone() as Arc<dyn Ack>)
+            .await
+            .unwrap();
+        assert!(matches!(out, ProcessResult::Deferred));
+        assert_eq!(
+            ack.acked(),
+            1,
+            "a delivery that touches no window still settles"
+        );
+    }
+
+    #[test]
+    fn decode_buffer_rejects_unusable_and_empty_ipc_streams() {
+        // An IPC stream whose count column is not UInt64 cannot migrate.
+        let bad_count = legacy_ipc_stream(vec![
+            Arc::new(Int64Array::from(vec![1i64])),
+            Arc::new(Int64Array::from(vec![1i64])),
+        ]);
+        assert!(decode_buffer(&bad_count).is_err());
+        // A UInt64 count beside a non-Int64 sum column fails the same way.
+        let bad_sum = legacy_ipc_stream(vec![
+            Arc::new(UInt64Array::from(vec![1u64])),
+            Arc::new(UInt64Array::from(vec![1u64])),
+        ]);
+        assert!(decode_buffer(&bad_sum).is_err());
+        // A schema-only IPC stream carries no batch to migrate.
+        let empty = {
+            let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, true)]));
+            let mut buffer = Vec::new();
+            let mut writer = StreamWriter::try_new(&mut buffer, schema.as_ref()).unwrap();
+            writer.finish().unwrap();
+            buffer
+        };
+        assert!(decode_buffer(&empty).is_err());
+        // A stream truncated mid-batch fails the batch read.
+        let full = legacy_ipc_stream(vec![
+            Arc::new(UInt64Array::from(vec![1u64])),
+            Arc::new(Int64Array::from(vec![1i64])),
+            Arc::new(Int64Array::from(vec![0i64])),
+            Arc::new(Int64Array::from(vec![0i64])),
+            Arc::new(Int64Array::from(vec![0i64])),
+        ]);
+        let truncated = &full[..full.len() / 2];
+        assert!(decode_buffer(truncated).is_err());
+    }
+
+    #[tokio::test]
+    async fn coverage_doubles_expose_working_trait_defaults() {
+        let abort_ack = FailAbortAck;
+        abort_ack.ack().await.unwrap();
+        assert!(abort_ack.abort().await.is_err());
+
+        let backend = FailingWritesBackend::new();
+        assert_eq!(backend.format_version(), 1);
+        assert_eq!(backend.update_i64("ns", b"counter", 1).unwrap(), 1);
+        assert_eq!(backend.purge_expired(0).unwrap(), 0);
+        let _ = backend.scan("ns").unwrap();
+        let snapshot = backend.snapshot_at(0).unwrap();
+        assert!(snapshot.verify());
+        backend.restore(&backend.snapshot_at(0).unwrap()).unwrap();
+        let _ = backend.metrics().unwrap();
+        backend.close().unwrap();
+
+        let batch = Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+                "v",
+                DataType::Int64,
+                false,
+            )]))),
+        ));
+        assert_eq!(fired_single(ProcessResult::Single(batch.clone())).len(), 0);
+        assert_eq!(
+            fired_single(ProcessResult::SingleWithAck(
+                batch,
+                Arc::new(crate::input::NoopAck) as Arc<dyn Ack>
+            ))
+            .len(),
+            0
+        );
+    }
+}

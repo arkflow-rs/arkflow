@@ -1961,4 +1961,770 @@ mod tests {
             Some(b"2".to_vec())
         );
     }
+
+    /// The failure-injecting backend delegates every other surface to the
+    /// real backend; pin each delegation so the wrapper stays honest.
+    #[test]
+    fn failing_backend_delegates_every_surface() {
+        let inner = backend();
+        let failing = FailingBackend {
+            inner: inner.clone(),
+            fail_next: Mutex::new(false),
+        };
+        assert_eq!(failing.format_version(), inner.format_version());
+        failing.put_with_ttl("ns", b"k", b"1", None, 0).unwrap();
+        assert_eq!(failing.get("ns", b"k").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(failing.update_i64("ns", b"k", 1).unwrap(), 2);
+        assert!(failing.delete("ns", b"k").unwrap());
+        failing.put_with_ttl("ns", b"k", b"3", None, 0).unwrap();
+        assert_eq!(failing.purge_expired(0).unwrap(), 0);
+        assert_eq!(failing.scan("ns").unwrap().len(), 1);
+        let snapshot = failing.snapshot_at(0).unwrap();
+        failing.restore(&snapshot).unwrap();
+        let metrics = failing.metrics().unwrap();
+        assert!(metrics.keys >= 1);
+        failing.close().unwrap();
+    }
+
+    /// The undo spy's forward acknowledgement is exercised whenever the
+    /// wrapped delivery is acknowledged rather than compensated.
+    #[tokio::test]
+    async fn undo_order_spy_acknowledges_normally() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let spy = Arc::new(UndoOrderSpy {
+            journal: journal.clone(),
+            called: std::sync::atomic::AtomicBool::new(false),
+            state_at_source_undo: Mutex::new(None),
+        });
+        spy.ack().await.unwrap();
+        assert!(!spy.called.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn backend() -> Arc<dyn StateBackend> {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        std::mem::forget(dir);
+        backend
+    }
+
+    /// Backend wrapper with independently switchable failure injection for
+    /// `put_with_ttl` (fails after N successful puts) and `restore_entry`.
+    struct FlakyBackend {
+        inner: Arc<dyn StateBackend>,
+        fail_restore: AtomicBool,
+        successful_puts: AtomicUsize,
+        fail_put_after: AtomicUsize,
+    }
+
+    impl FlakyBackend {
+        fn new(inner: Arc<dyn StateBackend>) -> Self {
+            Self {
+                inner,
+                fail_restore: AtomicBool::new(false),
+                successful_puts: AtomicUsize::new(0),
+                fail_put_after: AtomicUsize::new(usize::MAX),
+            }
+        }
+    }
+
+    impl StateBackend for FlakyBackend {
+        fn format_version(&self) -> u32 {
+            self.inner.format_version()
+        }
+        fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            self.inner.get(namespace, key)
+        }
+        fn put_with_ttl(
+            &self,
+            namespace: &str,
+            key: &[u8],
+            value: &[u8],
+            ttl_ms: Option<u64>,
+            now_ms: u64,
+        ) -> Result<(), Error> {
+            let puts = self.successful_puts.fetch_add(1, Ordering::SeqCst) + 1;
+            if puts > self.fail_put_after.load(Ordering::SeqCst) {
+                return Err(Error::Process("injected put failure".into()));
+            }
+            self.inner.put_with_ttl(namespace, key, value, ttl_ms, now_ms)
+        }
+        fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+            self.inner.update_i64(namespace, key, delta)
+        }
+        fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+            self.inner.delete(namespace, key)
+        }
+        fn purge_expired(&self, now_ms: u64) -> Result<u64, Error> {
+            self.inner.purge_expired(now_ms)
+        }
+        fn scan(&self, namespace: &str) -> Result<Vec<crate::state::StateEntry>, Error> {
+            self.inner.scan(namespace)
+        }
+        fn snapshot_at(&self, now_ms: u64) -> Result<crate::state::StateSnapshot, Error> {
+            self.inner.snapshot_at(now_ms)
+        }
+        fn restore(&self, snapshot: &crate::state::StateSnapshot) -> Result<(), Error> {
+            self.inner.restore(snapshot)
+        }
+        fn metrics(&self) -> Result<crate::state::StateMetrics, Error> {
+            self.inner.metrics()
+        }
+        fn close(&self) -> Result<(), Error> {
+            self.inner.close()
+        }
+        fn restore_entry(
+            &self,
+            namespace: &str,
+            key: &[u8],
+            entry: Option<&crate::state::StateEntry>,
+        ) -> Result<(), Error> {
+            if self.fail_restore.load(Ordering::SeqCst) {
+                return Err(Error::Process("injected restore failure".into()));
+            }
+            self.inner.restore_entry(namespace, key, entry)
+        }
+    }
+
+    /// Plain acknowledgement recording every settlement kind.
+    struct RecordingAck {
+        acked: AtomicBool,
+        undone: AtomicBool,
+        aborted: AtomicBool,
+        held: AtomicBool,
+        released: AtomicBool,
+        fail: AtomicBool,
+    }
+
+    impl RecordingAck {
+        fn succeeding() -> Arc<Self> {
+            Arc::new(Self {
+                acked: AtomicBool::new(false),
+                undone: AtomicBool::new(false),
+                aborted: AtomicBool::new(false),
+                held: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                fail: AtomicBool::new(false),
+            })
+        }
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                acked: AtomicBool::new(false),
+                undone: AtomicBool::new(false),
+                aborted: AtomicBool::new(false),
+                held: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                fail: AtomicBool::new(true),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Ack for RecordingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(Error::Process("downstream ack failed".into()));
+            }
+            self.acked.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn undo(&self) -> Result<(), Error> {
+            self.undone.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            self.aborted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn mark_held(&self) {
+            self.held.store(true, Ordering::SeqCst);
+        }
+        fn release_held(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn flaky_backend_delegates_every_surface() {
+        let flaky = FlakyBackend::new(backend());
+        flaky.put_with_ttl("ns", b"k", b"1", None, 0).unwrap();
+        assert_eq!(flaky.format_version(), 1);
+        assert_eq!(flaky.get("ns", b"k").unwrap(), Some(b"1".to_vec()));
+        assert!(flaky.get_entry("ns", b"k").unwrap().is_some());
+        assert_eq!(flaky.update_i64("ns", b"k", 1).unwrap(), 2);
+        assert!(flaky.delete("ns", b"k").unwrap());
+        flaky.put_with_ttl("ns", b"k", b"3", None, 0).unwrap();
+        assert_eq!(flaky.purge_expired(0).unwrap(), 0);
+        assert_eq!(flaky.scan("ns").unwrap().len(), 1);
+        let snapshot = flaky.snapshot_at(0).unwrap();
+        flaky.restore(&snapshot).unwrap();
+        assert!(flaky.metrics().unwrap().keys >= 1);
+        flaky.close().unwrap();
+    }
+
+    #[test]
+    fn undo_snapshot_surfaces_a_failing_restoration() {
+        let flaky = Arc::new(FlakyBackend::new(backend()));
+        let journal = StateJournal::new(flaky.clone() as Arc<dyn StateBackend>);
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap();
+        journal.apply(txn).unwrap();
+        let rollback = journal.capture_applied(txn).unwrap();
+        journal.complete(txn);
+
+        flaky.fail_restore.store(true, Ordering::SeqCst);
+        let error = journal.undo_snapshot(&rollback).unwrap_err().to_string();
+        assert!(
+            error.contains("injected restore failure"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn overlay_applies_staged_puts_and_deletes() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"replaced", b"old").unwrap();
+        journal.backend().put("ns", b"gone", b"x").unwrap();
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"replaced", b"new".to_vec(), None)
+            .unwrap();
+        journal.delete(txn, "ns", b"gone").unwrap();
+        // Reads see the staged put and the staged delete, while the backend
+        // still holds the committed values.
+        assert_eq!(
+            journal.get("ns", b"replaced").unwrap(),
+            Some(b"new".to_vec())
+        );
+        assert!(journal.get("ns", b"gone").unwrap().is_none());
+        assert_eq!(
+            journal.backend().get("ns", b"replaced").unwrap(),
+            Some(b"old".to_vec())
+        );
+        assert_eq!(
+            journal.backend().get("ns", b"gone").unwrap(),
+            Some(b"x".to_vec())
+        );
+    }
+
+    #[test]
+    fn capture_applied_ignores_staged_transactions() {
+        let journal = StateJournal::new(backend());
+        let txn = journal.begin().unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
+        assert!(journal.capture_applied(txn).is_none());
+    }
+
+    #[test]
+    fn undo_snapshot_skipped_by_ownership_blocks_the_retry() {
+        let journal = StateJournal::new(backend());
+        let a = journal.begin().unwrap();
+        journal.update_i64(a, "ns", b"k", 1, None).unwrap();
+        journal.apply(a).unwrap();
+        let b = journal.begin().unwrap();
+        journal.update_i64(b, "ns", b"k", 1, None).unwrap();
+        journal.commit(b).unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"2".to_vec())
+        );
+
+        let rollback = journal.capture_applied(a).expect("applied transaction");
+        journal.complete(a);
+        // A sibling failure compensates the already-completed transaction:
+        // the restore is skipped because B's commit owns the key, so the
+        // skipped increment must not be replayed by a retried apply.
+        journal.undo_snapshot(&rollback).unwrap();
+        journal.restage_snapshot(&rollback).unwrap();
+        journal.apply(a).unwrap();
+        journal.complete(a);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"2".to_vec()),
+            "the retried increment must not double-count"
+        );
+        assert_eq!(journal.pending_transactions(), 0);
+    }
+
+    #[test]
+    fn restage_snapshot_is_idempotent_while_registered() {
+        let journal = StateJournal::new(backend());
+        let txn = journal.begin().unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
+        journal.apply(txn).unwrap();
+        let rollback = journal.capture_applied(txn).unwrap();
+        journal.complete(txn);
+        journal.restage_snapshot(&rollback).unwrap();
+        // A second restage of a still-registered transaction is a no-op.
+        journal.restage_snapshot(&rollback).unwrap();
+        assert_eq!(journal.pending_transactions(), 1);
+    }
+
+    #[test]
+    fn restage_snapshot_enforces_the_pending_and_byte_bounds() {
+        // Pending-transaction bound: one staged sibling blocks the restage.
+        let journal = StateJournal::with_limits(
+            backend(),
+            JournalLimits {
+                max_pending_transactions: 1,
+                max_staged_bytes: 1024,
+            },
+        );
+        let a = journal.begin().unwrap();
+        journal.put(a, "ns", b"k", b"v".to_vec(), None).unwrap();
+        journal.apply(a).unwrap();
+        let rollback = journal.capture_applied(a).unwrap();
+        journal.complete(a);
+        let b = journal.begin().unwrap();
+        journal.put(b, "ns", b"j", b"w".to_vec(), None).unwrap();
+        let error = journal.restage_snapshot(&rollback).unwrap_err().to_string();
+        assert!(error.contains("pending bound"), "{error}");
+
+        // Staged-byte bound: restaging would exceed the byte budget.
+        let journal = StateJournal::with_limits(
+            backend(),
+            JournalLimits {
+                max_pending_transactions: 4_096,
+                max_staged_bytes: 16,
+            },
+        );
+        let a = journal.begin().unwrap();
+        journal
+            .put(a, "ns", b"k", vec![0; 8], None)
+            .unwrap();
+        journal.apply(a).unwrap();
+        let rollback = journal.capture_applied(a).unwrap();
+        journal.complete(a);
+        let b = journal.begin().unwrap();
+        journal
+            .put(b, "ns", b"j", vec![0; 8], None)
+            .unwrap();
+        let error = journal.restage_snapshot(&rollback).unwrap_err().to_string();
+        assert!(error.contains("staging bound"), "{error}");
+    }
+
+    #[test]
+    fn put_compact_validates_staging_state_and_bounds() {
+        // Compaction replaces the previous snapshot for the same key.
+        let journal = StateJournal::new(backend());
+        let txn = journal.begin().unwrap();
+        journal
+            .put_compact(txn, "ns", b"k", b"x".to_vec(), None)
+            .unwrap();
+        journal
+            .put_compact(txn, "ns", b"k", b"yy".to_vec(), None)
+            .unwrap();
+        assert_eq!(journal.get("ns", b"k").unwrap(), Some(b"yy".to_vec()));
+        assert_eq!(
+            journal.staged_bytes(),
+            3,
+            "only the latest snapshot stays staged (key + value)"
+        );
+
+        // A completed transaction can no longer be compacted.
+        journal.commit(txn).unwrap();
+        let error = journal
+            .put_compact(txn, "ns", b"k", b"z".to_vec(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no longer staged"), "{error}");
+
+        // The staging-byte bound still applies to compaction.
+        let journal = StateJournal::with_limits(
+            backend(),
+            JournalLimits {
+                max_pending_transactions: 4_096,
+                max_staged_bytes: 8,
+            },
+        );
+        let txn = journal.begin().unwrap();
+        journal
+            .put_compact(txn, "ns", b"k", vec![0; 7], None)
+            .unwrap();
+        let error = journal
+            .put_compact(txn, "ns", b"k", vec![0; 9], None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("staging bound"), "{error}");
+    }
+
+    #[test]
+    fn update_i64_rejects_non_numeric_backend_state() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"k", b"not-a-number").unwrap();
+        let txn = journal.begin().unwrap();
+        assert!(journal.update_i64(txn, "ns", b"k", 1, None).is_err());
+    }
+
+    #[test]
+    fn staging_rejects_finalized_transactions() {
+        let journal = StateJournal::new(backend());
+        let txn = journal.begin().unwrap();
+        journal.commit(txn).unwrap();
+        let error = journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no longer staged"), "{error}");
+        assert!(journal.delete(txn, "ns", b"k").is_err());
+    }
+
+    #[test]
+    fn stale_delete_with_a_failing_rollback_reports_both_errors() {
+        let inner = backend();
+        let flaky = Arc::new(FlakyBackend::new(inner.clone()));
+        let journal = StateJournal::new(flaky.clone() as Arc<dyn StateBackend>);
+        // A stages a put (still on time) and a delete whose key a later
+        // transaction commits first, making the delete stale.
+        let a = journal.begin().unwrap();
+        journal
+            .put(a, "ns", b"owned", b"v".to_vec(), None)
+            .unwrap();
+        journal.delete(a, "ns", b"contested").unwrap();
+        let b = journal.begin().unwrap();
+        journal
+            .put(b, "ns", b"contested", b"fresh".to_vec(), None)
+            .unwrap();
+        journal.commit(b).unwrap();
+
+        flaky.fail_restore.store(true, Ordering::SeqCst);
+        // The stale delete refuses the apply and rolls the applied put back;
+        // the rollback itself fails, which must surface as a combined error.
+        let error = journal.apply(a).unwrap_err().to_string();
+        assert!(
+            error.contains("refused a stale mutation")
+                && error.contains("rollback also failed"),
+            "{error}"
+        );
+        assert_eq!(
+            inner.get("ns", b"contested").unwrap(),
+            Some(b"fresh".to_vec()),
+            "the newer commit survives"
+        );
+    }
+
+    #[test]
+    fn failed_apply_with_a_failing_rollback_reports_both_errors() {
+        let inner = backend();
+        let flaky = Arc::new(FlakyBackend::new(inner));
+        flaky.fail_put_after.store(1, Ordering::SeqCst);
+        flaky.fail_restore.store(true, Ordering::SeqCst);
+        let journal = StateJournal::new(flaky as Arc<dyn StateBackend>);
+        let txn = journal.begin().unwrap();
+        journal.put(txn, "ns", b"a", b"1".to_vec(), None).unwrap();
+        journal.put(txn, "ns", b"b", b"2".to_vec(), None).unwrap();
+        let error = journal.commit(txn).unwrap_err().to_string();
+        assert!(
+            error.contains("apply failed") && error.contains("rollback also failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_ack_undoes_the_applied_prefix_when_a_later_transaction_fails() {
+        let inner = backend();
+        let flaky = Arc::new(FlakyBackend::new(inner.clone()));
+        flaky.fail_put_after.store(1, Ordering::SeqCst);
+        let journal = Arc::new(StateJournal::new(flaky as Arc<dyn StateBackend>));
+        let first = journal.begin().unwrap();
+        journal
+            .put(first, "ns", b"first", b"1".to_vec(), None)
+            .unwrap();
+        let second = journal.begin().unwrap();
+        journal
+            .put(second, "ns", b"second", b"2".to_vec(), None)
+            .unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![first, second],
+            RecordingAck::succeeding(),
+        ));
+        let error = ack.ack().await.unwrap_err().to_string();
+        assert!(error.contains("injected put failure"), "{error}");
+        // The applied prefix was compensated and both transactions returned
+        // to the staged state.
+        assert!(inner.get("ns", b"first").unwrap().is_none());
+        assert!(inner.get("ns", b"second").unwrap().is_none());
+        assert_eq!(journal.pending_transactions(), 2);
+    }
+
+    #[tokio::test]
+    async fn group_ack_source_failure_with_a_failing_undo_reports_both_errors() {
+        let flaky = Arc::new(FlakyBackend::new(backend()));
+        flaky.fail_restore.store(true, Ordering::SeqCst);
+        let journal = Arc::new(StateJournal::new(flaky as Arc<dyn StateBackend>));
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![txn],
+            RecordingAck::failing(),
+        ));
+        let error = ack.ack().await.unwrap_err().to_string();
+        assert!(
+            error.contains("source acknowledgement failed")
+                && error.contains("state rollback also failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_ack_retry_after_success_keeps_the_previous_rollback_token() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let txn = journal.begin().unwrap();
+        journal.update_i64(txn, "ns", b"k", 1, None).unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![txn],
+            RecordingAck::succeeding(),
+        ));
+        ack.ack().await.unwrap();
+        // A retried composite acknowledgement must remain idempotent and
+        // must not discard the retained rollback token.
+        ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(journal.pending_transactions(), 0);
+    }
+
+    #[tokio::test]
+    async fn group_undo_surfaces_registered_and_completed_state_errors() {
+        // (a) A registered transaction whose undo fails surfaces the error
+        // without rewinding the source cursor.
+        let flaky = Arc::new(FlakyBackend::new(backend()));
+        flaky.fail_restore.store(true, Ordering::SeqCst);
+        let journal = Arc::new(StateJournal::new(flaky as Arc<dyn StateBackend>));
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap();
+        journal.apply(txn).unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![txn],
+            RecordingAck::succeeding(),
+        ));
+        let error = ack.undo().await.unwrap_err().to_string();
+        assert!(error.contains("injected restore failure"), "{error}");
+
+        // (b) A completed transaction's snapshot undo succeeds and restages
+        // the transaction for a retry.
+        let journal = Arc::new(StateJournal::new(backend()));
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![txn],
+            RecordingAck::succeeding(),
+        ));
+        ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+        ack.undo().await.unwrap();
+        assert!(
+            journal.backend().get("ns", b"k").unwrap().is_none(),
+            "the completed snapshot is compensated"
+        );
+        assert_eq!(journal.pending_transactions(), 1);
+    }
+
+    #[tokio::test]
+    async fn group_undo_surfaces_a_failing_completed_snapshot_restoration() {
+        let flaky = Arc::new(FlakyBackend::new(backend()));
+        let journal = Arc::new(StateJournal::new(flaky.clone() as Arc<dyn StateBackend>));
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![txn],
+            RecordingAck::succeeding(),
+        ));
+        ack.ack().await.unwrap();
+        // The completed transaction's snapshot undo fails: the error must
+        // surface without rewinding the source cursor.
+        flaky.fail_restore.store(true, Ordering::SeqCst);
+        let error = ack.undo().await.unwrap_err().to_string();
+        assert!(
+            error.contains("injected restore failure"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_undo_surfaces_a_restage_bound_failure() {
+        let journal = Arc::new(StateJournal::with_limits(
+            backend(),
+            JournalLimits {
+                max_pending_transactions: 1,
+                max_staged_bytes: 1024,
+            },
+        ));
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![txn],
+            RecordingAck::succeeding(),
+        ));
+        ack.ack().await.unwrap();
+        // A staged sibling exhausts the pending bound, so the undo's
+        // restage of the completed transaction fails and surfaces.
+        let sibling = journal.begin().unwrap();
+        journal
+            .put(sibling, "ns", b"j", b"w".to_vec(), None)
+            .unwrap();
+        let error = ack.undo().await.unwrap_err().to_string();
+        assert!(error.contains("pending bound"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn group_abort_settles_staged_and_completed_transactions() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        // Staged: the transaction is discarded without ever applying.
+        let staged = journal.begin().unwrap();
+        journal
+            .put(staged, "ns", b"staged", b"1".to_vec(), None)
+            .unwrap();
+        let inner = RecordingAck::succeeding();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![staged],
+            inner.clone(),
+        ));
+        ack.abort().await.unwrap();
+        assert!(inner.aborted.load(Ordering::SeqCst));
+        assert_eq!(journal.pending_transactions(), 0);
+        assert!(journal.backend().get("ns", b"staged").unwrap().is_none());
+
+        // Completed: the retained rollback snapshot is compensated.
+        let completed = journal.begin().unwrap();
+        journal
+            .put(completed, "ns", b"done", b"2".to_vec(), None)
+            .unwrap();
+        let inner = RecordingAck::succeeding();
+        let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![completed],
+            inner.clone(),
+        ));
+        ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"done").unwrap(),
+            Some(b"2".to_vec())
+        );
+        ack.abort().await.unwrap();
+        assert!(journal.backend().get("ns", b"done").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_on_ack_failure_with_a_failing_undo_reports_both_errors() {
+        let flaky = Arc::new(FlakyBackend::new(backend()));
+        flaky.fail_restore.store(true, Ordering::SeqCst);
+        let journal = Arc::new(StateJournal::new(flaky as Arc<dyn StateBackend>));
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap();
+        journal.apply(txn).unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            txn,
+            RecordingAck::failing(),
+        ));
+        let error = ack.ack().await.unwrap_err().to_string();
+        assert!(
+            error.contains("source acknowledgement failed")
+                && error.contains("state rollback also failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_and_release_hooks_delegate_to_the_wrapped_acknowledgement() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let single_inner = RecordingAck::succeeding();
+        let txn = journal.begin().unwrap();
+        let single: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
+            journal.clone(),
+            txn,
+            single_inner.clone(),
+        ));
+        single.mark_held();
+        single.release_held();
+        assert!(single_inner.held.load(Ordering::SeqCst));
+        assert!(single_inner.released.load(Ordering::SeqCst));
+
+        let group_inner = RecordingAck::succeeding();
+        let group_txn = journal.begin().unwrap();
+        let group: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
+            journal.clone(),
+            vec![group_txn],
+            group_inner.clone(),
+        ));
+        group.mark_held();
+        group.release_held();
+        assert!(group_inner.held.load(Ordering::SeqCst));
+        assert!(group_inner.released.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn commit_on_ack_undo_after_abort_is_a_noop() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let inner = RecordingAck::succeeding();
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap();
+        let ack: Arc<dyn Ack> =
+            Arc::new(CommitOnAck::new(journal.clone(), txn, inner.clone()));
+        ack.abort().await.unwrap();
+        // Neither registered nor carrying a completed rollback: a no-op undo
+        // that still rewinds the wrapped acknowledgement.
+        ack.undo().await.unwrap();
+        assert!(inner.undone.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn commit_on_ack_abort_compensates_a_completed_transaction() {
+        let journal = Arc::new(StateJournal::new(backend()));
+        let inner = RecordingAck::succeeding();
+        let txn = journal.begin().unwrap();
+        journal
+            .put(txn, "ns", b"k", b"v".to_vec(), None)
+            .unwrap();
+        let ack: Arc<dyn Ack> =
+            Arc::new(CommitOnAck::new(journal.clone(), txn, inner.clone()));
+        ack.ack().await.unwrap();
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+        ack.abort().await.unwrap();
+        assert!(inner.aborted.load(Ordering::SeqCst));
+        assert!(
+            journal.backend().get("ns", b"k").unwrap().is_none(),
+            "the retained rollback snapshot compensates the completed state"
+        );
+        assert_eq!(journal.pending_transactions(), 0);
+    }
 }

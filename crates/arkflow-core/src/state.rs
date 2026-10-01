@@ -1581,4 +1581,496 @@ mod tests {
         let counter = KeyedCounter::new(backend, "aggregate");
         assert_eq!(counter.get(b"same-key").unwrap(), Some(200));
     }
+    #[test]
+    fn in_memory_backend_round_trips_ttl_purge_and_counters() {
+        let backend = InMemoryStateBackend::new(1).unwrap();
+        let base = now_ms();
+        backend.put("ns", b"k", b"v").unwrap();
+        assert_eq!(backend.get("ns", b"k").unwrap().as_deref(), Some(b"v".as_slice()));
+        assert_eq!(
+            backend.get_entry("ns", b"k").unwrap().map(|e| e.value),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(backend.format_version(), 1);
+
+        // update_i64 creates and increments atomically.
+        assert_eq!(backend.update_i64("ns", b"c", 5).unwrap(), 5);
+        assert_eq!(backend.update_i64("ns", b"c", -2).unwrap(), 3);
+
+        // TTL entries disappear past their deadline, purge reclaims them.
+        backend
+            .put_with_ttl("ns", b"t", b"1", Some(1_000), base)
+            .unwrap();
+        assert_eq!(
+            backend.get("ns", b"t").unwrap().as_deref(),
+            Some(b"1".as_slice())
+        );
+        assert_eq!(backend.purge_expired(base + 1_000).unwrap(), 1);
+        assert_eq!(backend.get("ns", b"t").unwrap(), None);
+
+        // update_i64_with_ttl keeps a live entry readable while fresh.
+        assert_eq!(
+            backend
+                .update_i64_with_ttl("ns", b"tc", 7, Some(5_000))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            backend
+                .update_i64_with_ttl("ns", b"tc", 1, Some(5_000))
+                .unwrap(),
+            8
+        );
+
+        // scan is namespace-scoped (k, c, tc survive; t was purged above;
+        // r is restored after this point).
+        backend.put("other", b"k", b"x").unwrap();
+        assert_eq!(backend.scan("ns").unwrap().len(), 3);
+
+        // restore_entry replaces a single entry, including expiration.
+        backend
+            .restore_entry(
+                "ns",
+                b"r",
+                Some(&StateEntry {
+                    namespace: "ns".into(),
+                    key: b"r".to_vec(),
+                    value: b"restored".to_vec(),
+                    expires_at_ms: Some(base + 60_000),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.get("ns", b"r").unwrap().as_deref(),
+            Some(b"restored".as_slice())
+        );
+
+        // snapshot/restore round-trips the full live set.
+        let snapshot = backend.snapshot_at(base).unwrap();
+        assert!(snapshot.verify());
+        backend.delete("ns", b"k").unwrap();
+        backend.restore(&snapshot).unwrap();
+        assert_eq!(backend.get("ns", b"k").unwrap().as_deref(), Some(b"v".as_slice()));
+
+        // An incompatible snapshot is rejected wholesale.
+        let foreign = StateSnapshot::new(2, vec![]);
+        assert!(backend.restore(&foreign).is_err());
+
+        let metrics = backend.metrics().unwrap();
+        assert!(metrics.keys >= 1);
+        assert!(metrics.bytes >= 1);
+        backend.close().unwrap();
+    }
+
+    #[test]
+    fn constructors_reject_a_zero_format_version() {
+        assert!(InMemoryStateBackend::new(0).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = RedbStateBackend::open(dir.path(), 0).err().unwrap();
+        assert!(err.to_string().contains("format_version must be positive"));
+    }
+
+    /// A backend that overrides only the required methods exercises the trait's
+    /// default `get_entry` / `update_i64_with_ttl` / `restore_entry` bodies,
+    /// which durable third-party backends inherit.
+    type RawMap = BTreeMap<(String, Vec<u8>), Vec<u8>>;
+
+    struct RawMapBackend {
+        entries: std::sync::Mutex<RawMap>,
+    }
+
+    impl StateBackend for RawMapBackend {
+        fn format_version(&self) -> u32 {
+            1
+        }
+
+        fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .get(&(namespace.to_owned(), key.to_vec()))
+                .cloned())
+        }
+
+        fn put_with_ttl(
+            &self,
+            namespace: &str,
+            key: &[u8],
+            value: &[u8],
+            _ttl_ms: Option<u64>,
+            _now_ms: u64,
+        ) -> Result<(), Error> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert((namespace.to_owned(), key.to_vec()), value.to_vec());
+            Ok(())
+        }
+
+        fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+            let map_key = (namespace.to_owned(), key.to_vec());
+            let mut entries = self.entries.lock().unwrap();
+            let current = entries
+                .get(&map_key)
+                .and_then(|value| serde_json::from_slice::<i64>(value).ok())
+                .unwrap_or_default();
+            let next = current.saturating_add(delta);
+            entries.insert(map_key, serde_json::to_vec(&next)?);
+            Ok(next)
+        }
+
+        fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .remove(&(namespace.to_owned(), key.to_vec()))
+                .is_some())
+        }
+
+        fn purge_expired(&self, _now_ms: u64) -> Result<u64, Error> {
+            Ok(0)
+        }
+
+        fn scan(&self, namespace: &str) -> Result<Vec<StateEntry>, Error> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((entry_namespace, _), _)| entry_namespace == namespace)
+                .map(|((entry_namespace, key), value)| StateEntry {
+                    namespace: entry_namespace.clone(),
+                    key: key.clone(),
+                    value: value.clone(),
+                    expires_at_ms: None,
+                })
+                .collect())
+        }
+
+        fn snapshot_at(&self, _now_ms: u64) -> Result<StateSnapshot, Error> {
+            Ok(StateSnapshot::new(self.format_version(), self.scan("*")?))
+        }
+
+        fn restore(&self, snapshot: &StateSnapshot) -> Result<(), Error> {
+            if snapshot.format_version != self.format_version() {
+                return Err(Error::Config("incompatible".into()));
+            }
+            Ok(())
+        }
+
+        fn metrics(&self) -> Result<StateMetrics, Error> {
+            Ok(StateMetrics::default())
+        }
+
+        fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn minimal_backend_covers_the_trait_default_impls() {
+        let backend = RawMapBackend {
+            entries: std::sync::Mutex::new(BTreeMap::new()),
+        };
+        backend.put("ns", b"k", b"v").unwrap();
+
+        // Default `get_entry` wraps the plain value without TTL metadata.
+        let entry = backend.get_entry("ns", b"k").unwrap().unwrap();
+        assert_eq!(entry.value, b"v".to_vec());
+        assert_eq!(entry.expires_at_ms, None);
+        assert!(backend.get_entry("ns", b"missing").unwrap().is_none());
+
+        // Default `update_i64_with_ttl` ignores the TTL and delegates.
+        assert_eq!(
+            backend.update_i64_with_ttl("ns", b"c", 4, Some(60_000)).unwrap(),
+            4
+        );
+        assert_eq!(
+            backend.update_i64_with_ttl("ns", b"c", -1, None).unwrap(),
+            3
+        );
+
+        // Default `restore_entry` maps each entry shape onto put/delete.
+        backend
+            .restore_entry(
+                "ns",
+                b"r",
+                Some(&StateEntry {
+                    namespace: "ns".into(),
+                    key: b"r".to_vec(),
+                    value: b"restored".to_vec(),
+                    expires_at_ms: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(backend.get("ns", b"r").unwrap().as_deref(), Some(b"restored".as_slice()));
+
+        // An entry whose expiration has passed restores as a delete.
+        backend
+            .restore_entry(
+                "ns",
+                b"r",
+                Some(&StateEntry {
+                    namespace: "ns".into(),
+                    key: b"r".to_vec(),
+                    value: b"gone".to_vec(),
+                    expires_at_ms: Some(now_ms().saturating_sub(1)),
+                }),
+            )
+            .unwrap();
+        assert_eq!(backend.get("ns", b"r").unwrap(), None);
+
+        // `None` restores as a delete of whatever is stored.
+        backend.restore_entry("ns", b"k", None).unwrap();
+        assert_eq!(backend.get("ns", b"k").unwrap(), None);
+        assert_eq!(backend.snapshot().unwrap().format_version, 1);
+
+        // The raw backend's own surface: scan lists the surviving entry,
+        // the no-op purge reports zero, an incompatible snapshot restore
+        // fails, and metrics answer.
+        assert_eq!(backend.scan("ns").unwrap().len(), 1);
+        assert_eq!(backend.purge_expired(now_ms()).unwrap(), 0);
+        assert!(backend.restore(&StateSnapshot::new(2, vec![])).is_err());
+        assert!(backend.restore(&StateSnapshot::new(1, vec![])).is_ok());
+        assert_eq!(backend.metrics().unwrap().keys, 0);
+        backend.close().unwrap();
+    }
+
+    #[test]
+    fn redb_get_and_get_entry_lazily_delete_expired_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1).unwrap();
+        let base = now_ms().saturating_sub(10_000);
+        backend
+            .put_with_ttl("orders", b"a", b"1", Some(1_000), base)
+            .unwrap();
+
+        // An expired read hides the value and physically removes the row.
+        assert_eq!(backend.get("orders", b"a").unwrap(), None);
+        assert_eq!(backend.metrics().unwrap().keys, 0);
+
+        backend
+            .put_with_ttl("orders", b"a", b"2", Some(1_000), base)
+            .unwrap();
+        assert!(backend.get_entry("orders", b"a").is_ok());
+        assert_eq!(
+            backend.get_entry("orders", b"a").unwrap().map(|e| e.value),
+            None,
+            "the expired row must be hidden by get_entry too"
+        );
+        assert_eq!(backend.metrics().unwrap().keys, 0);
+
+        // A fresh key answers normally through both readers.
+        backend.put("orders", b"live", b"3").unwrap();
+        assert_eq!(
+            backend.get_entry("orders", b"live").unwrap().unwrap().value,
+            b"3".to_vec()
+        );
+    }
+
+    #[test]
+    fn redb_overwriting_an_expired_row_purges_it_without_a_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1).unwrap();
+        let base = now_ms().saturating_sub(10_000);
+        backend
+            .put_with_ttl("orders", b"a", b"1111", Some(1), base)
+            .unwrap();
+        // The previous row expired: the overwrite purges instead of counting
+        // a second physical row.
+        backend
+            .put_with_ttl("orders", b"a", b"2", None, base + 2)
+            .unwrap();
+        assert_eq!(backend.metrics().unwrap().keys, 1);
+        assert_eq!(backend.get("orders", b"a").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn redb_update_i64_on_an_expired_row_purges_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1).unwrap();
+        let base = now_ms().saturating_sub(10_000);
+        // The counter value expired, so the update starts from zero and the
+        // expired physical row is purged rather than overwritten.
+        backend
+            .put_with_ttl("aggregate", b"c", b"5", Some(1), base)
+            .unwrap();
+        assert_eq!(backend.update_i64("aggregate", b"c", 3).unwrap(), 3);
+        assert_eq!(backend.metrics().unwrap().keys, 1);
+        assert_eq!(
+            backend
+                .get_entry("aggregate", b"c")
+                .unwrap()
+                .unwrap()
+                .value,
+            b"3".to_vec()
+        );
+    }
+
+    #[test]
+    fn budget_scans_skip_the_written_row_and_expired_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1)
+            .unwrap()
+            .with_max_bytes(1_000);
+        let base = now_ms().saturating_sub(10_000);
+        backend.put("orders", b"keep", b"7").unwrap();
+        backend
+            .put_with_ttl("orders", b"dead", b"x", Some(1), base)
+            .unwrap();
+
+        // The put-path budget scan skips its own row and the expired row.
+        backend
+            .put_with_ttl("orders", b"fresh", b"y", None, base + 5)
+            .unwrap();
+        // The update-path budget scan does the same while replacing its row.
+        assert_eq!(backend.update_i64("orders", b"keep", 2).unwrap(), 9);
+        assert_eq!(backend.get("orders", b"fresh").unwrap().as_deref(), Some(b"y".as_slice()));
+    }
+
+    #[test]
+    fn restore_skips_snapshot_entries_that_are_already_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1).unwrap();
+        let base = now_ms();
+        let snapshot = StateSnapshot::new(
+            1,
+            vec![
+                StateEntry {
+                    namespace: "orders".into(),
+                    key: b"live".to_vec(),
+                    value: b"1".to_vec(),
+                    expires_at_ms: Some(base + 60_000),
+                },
+                StateEntry {
+                    namespace: "orders".into(),
+                    key: b"stale".to_vec(),
+                    value: b"2".to_vec(),
+                    expires_at_ms: Some(base),
+                },
+            ],
+        );
+        backend.restore(&snapshot).unwrap();
+        assert_eq!(backend.metrics().unwrap().keys, 1);
+        assert_eq!(backend.get("orders", b"live").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(backend.get("orders", b"stale").unwrap(), None);
+    }
+
+    #[test]
+    fn metrics_and_snapshots_hide_unpurged_expired_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1).unwrap();
+        let base = now_ms().saturating_sub(10_000);
+        backend
+            .put_with_ttl("orders", b"dead", b"zz", Some(1), base)
+            .unwrap();
+        let metrics = backend.metrics().unwrap();
+        assert_eq!(metrics.keys, 0);
+        assert_eq!(metrics.bytes, 0);
+        assert!(backend.snapshot_at(base + 5).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn root_accessor_exposes_the_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RedbStateBackend::open(dir.path(), 1).unwrap();
+        assert_eq!(backend.root(), dir.path());
+        backend.close().unwrap();
+    }
+
+    #[test]
+    fn key_encoding_and_parsing_helpers_reject_invalid_input() {
+        assert_eq!(hex_encode(&[0x00, 0xff]), "00ff");
+        assert_eq!(hex_decode("00ff").unwrap(), vec![0x00, 0xff]);
+        // Odd-length input cannot be hex.
+        assert!(hex_decode("abc").is_err());
+        // Non-hex digits are rejected per byte.
+        assert!(hex_decode("zz").is_err());
+        // A storage key without the namespace separator is invalid.
+        assert!(RedbStateBackend::parse_key("no-separator").is_err());
+        let (namespace, key) = RedbStateBackend::parse_key("ns\0ab").unwrap();
+        assert_eq!(namespace, "ns");
+        assert_eq!(key, vec![0xab]);
+    }
+
+    #[test]
+    fn in_memory_restore_entry_and_checksum_mismatch_paths() {
+        let backend = InMemoryStateBackend::new(1).unwrap();
+        let base = now_ms();
+        backend.put("ns", b"k", b"v").unwrap();
+
+        // Restoring an already-expired entry removes it.
+        backend
+            .restore_entry(
+                "ns",
+                b"k",
+                Some(&StateEntry {
+                    namespace: "ns".into(),
+                    key: b"k".to_vec(),
+                    value: b"gone".to_vec(),
+                    expires_at_ms: Some(base.saturating_sub(1)),
+                }),
+            )
+            .unwrap();
+        assert_eq!(backend.get("ns", b"k").unwrap(), None);
+
+        // Restoring `None` removes the stored entry.
+        backend.put("ns", b"k2", b"v2").unwrap();
+        backend.restore_entry("ns", b"k2", None).unwrap();
+        assert_eq!(backend.get("ns", b"k2").unwrap(), None);
+
+        // A corrupted checksum is rejected wholesale.
+        let mut snapshot = StateSnapshot::new(1, vec![StateEntry {
+            namespace: "ns".into(),
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            expires_at_ms: None,
+        }]);
+        snapshot.checksum = 0;
+        assert!(backend.restore(&snapshot).is_err());
+    }
+
+    #[test]
+    fn keyed_counter_surfaces_corrupt_stored_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: std::sync::Arc<dyn StateBackend> =
+            std::sync::Arc::new(RedbStateBackend::open(dir.path(), 1).unwrap());
+        // A value that is not a JSON i64 makes reads and updates fail loudly
+        // instead of fabricating a counter.
+        backend.put("aggregate", b"bad", b"not-a-number").unwrap();
+        let counter = KeyedCounter::new(backend.clone(), "aggregate");
+        assert!(counter.get(b"bad").is_err());
+        assert!(counter.add(b"bad", 1).is_err());
+    }
+
+    #[test]
+    fn in_memory_update_i64_on_a_corrupt_value_fails_loudly() {
+        let backend = InMemoryStateBackend::new(1).unwrap();
+        backend.put("ns", b"c", b"garbage").unwrap();
+        assert!(backend.update_i64("ns", b"c", 1).is_err());
+    }
+
+    #[test]
+    fn keyed_counter_and_window_accumulator_backends() {
+        let backend = std::sync::Arc::new(InMemoryStateBackend::new(1).unwrap());
+        let counter = KeyedCounter::new(backend.clone(), "counters");
+        assert_eq!(counter.get(b"x").unwrap(), None);
+        assert_eq!(counter.add(b"x", 4).unwrap(), 4);
+        assert_eq!(counter.get(b"x").unwrap(), Some(4));
+
+        // With a TTL the value is written through update_i64_with_ttl.
+        let ttl_counter = KeyedCounter::with_ttl(backend.clone(), "ttl", Some(60_000));
+        assert_eq!(ttl_counter.add(b"y", 2).unwrap(), 2);
+        assert_eq!(ttl_counter.get(b"y").unwrap(), Some(2));
+
+        // WindowAccumulator addresses state by (start, end, key).
+        let accumulator = WindowAccumulator::new(backend.clone(), "sum");
+        accumulator.add(b"K", 0, 1_000, 3).unwrap();
+        assert_eq!(accumulator.add(b"K", 0, 1_000, 2).unwrap(), 5);
+        assert!(accumulator.add(b"K", 1_000, 2_000, 1).unwrap() >= 1);
+    }
+
 }

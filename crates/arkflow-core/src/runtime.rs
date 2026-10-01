@@ -1572,6 +1572,29 @@ mod durability_tests {
         manager.wait_all().await.unwrap();
         manager.stop("orders").await.unwrap();
     }
+
+    fn one_row_batch() -> crate::MessageBatchRef {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// The dev-null output settles batches and closes directly; the streams
+    /// above never produce a row, so the helpers are pinned here.
+    #[tokio::test]
+    async fn devnull_output_settles_directly() {
+        let output = DevNullOutput;
+        output.connect().await.unwrap();
+        output.write(one_row_batch()).await.unwrap();
+        output.close().await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1731,6 +1754,34 @@ mod startup_failure_tests {
         assert_eq!(runtime.state, StreamState::Failed);
         assert!(runtime.handle.is_none());
     }
+
+    fn one_row_batch() -> crate::MessageBatchRef {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// The injected-failure helpers settle directly: the connect failure
+    /// above stops the graph before read/write ever run.
+    #[tokio::test]
+    async fn connect_failure_helpers_settle_directly() {
+        let input = ConnectFailureInput;
+        assert!(input.connect().await.is_err());
+        assert!(matches!(input.read().await, Err(Error::EOF)));
+        input.close().await.unwrap();
+
+        let output = ConnectFailureOutput;
+        output.connect().await.unwrap();
+        output.write(one_row_batch()).await.unwrap();
+        output.close().await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1839,6 +1890,47 @@ mod validation_lifecycle_tests {
         manager.start("orders").await.unwrap();
         manager.wait_all().await.unwrap();
         manager.stop("orders").await.unwrap();
+    }
+
+    fn one_row_batch() -> crate::MessageBatchRef {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// The eof/devnull helpers and builders settle directly. Both this module
+    /// and the durability module register the same builder names, so exactly
+    /// one module's builders win the race; the direct calls keep the other
+    /// module's helpers exercised regardless of test order.
+    #[tokio::test]
+    async fn eof_helpers_and_builders_settle_directly() {
+        let input = EofInput2;
+        input.connect().await.unwrap();
+        assert!(matches!(input.read().await, Err(Error::EOF)));
+        input.close().await.unwrap();
+
+        let output = DevNull2;
+        output.connect().await.unwrap();
+        output.write(one_row_batch()).await.unwrap();
+        output.close().await.unwrap();
+
+        let resource = crate::Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        };
+        EofInputBuilder2
+            .build(None, &None, None, &resource)
+            .unwrap();
+        DevNullBuilder2
+            .build(None, &None, None, &resource)
+            .unwrap();
     }
 }
 
@@ -1963,5 +2055,620 @@ mod race_tests {
             matches!(state, StreamState::Failed | StreamState::Stopped),
             "coherent terminal state expected, got {state:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
+    use crate::input::{Input, InputBuilder, InputConfig};
+    use crate::output::{Output, OutputBuilder, OutputConfig};
+    use crate::pipeline::PipelineConfig;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn stream_config() -> StreamConfig {
+        StreamConfig {
+            id: Some("orders".into()),
+            input: InputConfig {
+                input_type: "memory".into(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            pipeline: PipelineConfig {
+                thread_num: 1,
+                processors: vec![],
+            },
+            output: OutputConfig {
+                output_type: "stdout".into(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            error_output: None,
+            buffer: None,
+            durability: None,
+            state: None,
+            temporary: None,
+        }
+    }
+
+    fn engine_config(streams: Vec<StreamConfig>) -> EngineConfig {
+        EngineConfig {
+            streams,
+            jobs: Vec::new(),
+            logging: LoggingConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        }
+    }
+
+    /// An input that connects and immediately reaches end-of-stream.
+    struct EofInput;
+
+    #[async_trait::async_trait]
+    impl Input for EofInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(
+            &self,
+        ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+            Err(Error::EOF)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct EofInputBuilder;
+
+    impl InputBuilder for EofInputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(EofInput))
+        }
+    }
+
+    /// An output that discards every batch and records the settlements.
+    struct DevNullOutput {
+        wrote: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Output for DevNullOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: crate::MessageBatchRef) -> Result<(), Error> {
+            self.wrote.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct DevNullOutputBuilder;
+
+    impl OutputBuilder for DevNullOutputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(Arc::new(DevNullOutput {
+                wrote: Arc::new(AtomicBool::new(false)),
+            }))
+        }
+    }
+
+    fn eof_stream_config(id: &str) -> StreamConfig {
+        let mut config = stream_config();
+        config.id = Some(id.into());
+        config.input.input_type = "runtime-cov-eof-input".into();
+        config.output.output_type = "runtime-cov-devnull-output".into();
+        config
+    }
+
+    async fn force_state(manager: &RuntimeManager, id: &str, state: StreamState) {
+        let entry = manager.get(id).await.unwrap();
+        entry.lock().await.state = state;
+    }
+
+    async fn state_of(manager: &RuntimeManager, id: &str) -> StreamState {
+        manager.get(id).await.unwrap().lock().await.state
+    }
+
+    #[tokio::test]
+    async fn find_or_create_reuses_the_active_operation() {
+        let store = OperationStore::default();
+        let first = store.create("start", "stream", "orders", None).await;
+        store
+            .update(&first.id, OperationState::Running, 10, None)
+            .await;
+        let second = store.find_or_create("start", "stream", "orders", None).await;
+        assert_eq!(second.id, first.id, "an active operation is reused");
+        assert_eq!(second.state, OperationState::Running);
+        assert_eq!(store.get(&first.id).await.unwrap().id, first.id);
+        assert!(store.get("missing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_or_create_starts_fresh_after_the_active_operation_finishes() {
+        let store = OperationStore::default();
+        let first = store.create("start", "stream", "orders", None).await;
+        store
+            .update(&first.id, OperationState::Succeeded, 100, None)
+            .await;
+        let second = store.find_or_create("start", "stream", "orders", None).await;
+        assert_ne!(
+            second.id, first.id,
+            "a terminal operation is never reused"
+        );
+        assert_eq!(second.state, OperationState::Queued);
+    }
+
+    #[tokio::test]
+    async fn find_or_create_evicts_beyond_the_registry_bound() {
+        let store = OperationStore::default();
+        let mut created = Vec::new();
+        for index in 0..=(MAX_OPERATIONS + 4) {
+            let record = store
+                .find_or_create(
+                    "restart",
+                    "stream",
+                    format!("stream-{index}"),
+                    None,
+                )
+                .await;
+            created.push(record.id);
+        }
+        let records = store.list().await;
+        assert_eq!(records.len(), MAX_OPERATIONS, "the registry is bounded");
+        let mut missing = 0;
+        for id in &created {
+            if store.get(id).await.is_none() {
+                missing += 1;
+            }
+        }
+        assert_eq!(missing, 5, "the overflow was evicted");
+    }
+
+    #[tokio::test]
+    async fn operation_store_bounds_its_registered_records() {
+        let store = OperationStore::default();
+        let mut created = Vec::new();
+        for index in 0..=(MAX_OPERATIONS + 4) {
+            let record = store
+                .create("restart", "stream", format!("stream-{index}"), None)
+                .await;
+            created.push(record.id);
+        }
+        let records = store.list().await;
+        assert_eq!(records.len(), MAX_OPERATIONS, "the registry is bounded");
+        // The registry evicts by key order; exactly five of the created
+        // records were dropped and the rest remain retrievable.
+        let mut missing = 0;
+        for id in &created {
+            if store.get(id).await.is_none() {
+                missing += 1;
+            }
+        }
+        assert_eq!(missing, 5, "the overflow was evicted");
+    }
+
+    #[tokio::test]
+    async fn event_store_bounds_and_snapshots_its_events() {
+        let store = EventStore::default();
+        for index in 0..=(MAX_EVENTS + 1) {
+            store
+                .record(ControlEvent {
+                    occurred_at_ms: index as u64,
+                    event_type: format!("event-{index}"),
+                    stream_id: None,
+                    outcome: "ok".into(),
+                    message: None,
+                    operation_id: None,
+                    correlation_id: None,
+                    actor: None,
+                })
+                .await;
+        }
+        let events = store.snapshot().await;
+        assert_eq!(events.len(), MAX_EVENTS, "the event log is bounded");
+        assert_eq!(
+            events[0].event_type, "event-2",
+            "the two oldest events were dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_mutators_set_observed_state_on_entries() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("orders".into(), stream_config())
+            .await
+            .unwrap();
+        // Missing entries are tolerated.
+        manager.set_active_operation("ghost", None).await;
+        manager.set_last_completed_action("ghost", "action".into()).await;
+
+        manager
+            .set_active_operation("orders", Some("op-9".into()))
+            .await;
+        manager
+            .set_last_completed_action("orders", "action-1".into())
+            .await;
+        manager.set_observed_config_version("cfg-7".into()).await;
+        assert_eq!(manager.observed_config_version().await.as_deref(), Some("cfg-7"));
+
+        let entry = manager.get("orders").await.unwrap();
+        let runtime = entry.lock().await;
+        assert_eq!(runtime.active_operation_id.as_deref(), Some("op-9"));
+        assert_eq!(
+            runtime.last_completed_action_id.as_deref(),
+            Some("action-1")
+        );
+        assert_eq!(
+            runtime.observed_config_version.as_deref(),
+            Some("cfg-7"),
+            "the observed version propagates to every entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_rejects_a_runtime_that_is_transitioning_or_running() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("orders".into(), stream_config())
+            .await
+            .unwrap();
+        force_state(&manager, "orders", StreamState::Running).await;
+        let error = manager.start("orders").await.unwrap_err().to_string();
+        assert!(
+            error.contains("already transitioning or running"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_settles_a_stale_handle_and_reports_compile_failures() {
+        let manager = RuntimeManager::new();
+        let mut config = stream_config();
+        // A stream id longer than the Job id limit fails at compile time,
+        // before any component is built.
+        config.id = Some("o".repeat(200));
+        manager.register("broken".into(), config).await.unwrap();
+        {
+            let entry = manager.get("broken").await.unwrap();
+            let mut runtime = entry.lock().await;
+            runtime.state = StreamState::Stopped;
+            runtime.handle = Some(tokio::spawn(async { Ok(()) }));
+        }
+        let error = manager.start("broken").await.unwrap_err().to_string();
+        assert!(
+            error.contains("cannot map to a Job id"),
+            "{error}"
+        );
+        assert_eq!(
+            state_of(&manager, "broken").await,
+            StreamState::Failed,
+            "a compile failure marks the runtime Failed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_fails_when_the_wal_path_cannot_be_opened() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal_path = directory.path().join("wal");
+        std::fs::write(&wal_path, b"definitely-not-a-redb-file").unwrap();
+        let mut config = stream_config();
+        config.durability = Some(crate::wal::WalConfig::local(
+            true,
+            wal_path.to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::GroupCommit,
+        ));
+        let manager = RuntimeManager::new();
+        manager.register("orders".into(), config).await.unwrap();
+        assert!(manager.start("orders").await.is_err());
+        assert_eq!(
+            state_of(&manager, "orders").await,
+            StreamState::Failed,
+            "an unopenable WAL marks the runtime Failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_all_fails_fast_on_a_broken_stream() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("broken".into(), stream_config())
+            .await
+            .unwrap();
+        assert!(manager.start_all().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replace_config_restarts_a_changed_active_stream() {
+        let _ = crate::input::register_input_builder(
+            "runtime-cov-eof-input",
+            Arc::new(EofInputBuilder),
+        );
+        let _ = crate::output::register_output_builder(
+            "runtime-cov-devnull-output",
+            Arc::new(DevNullOutputBuilder),
+        );
+        let manager = RuntimeManager::new();
+        manager
+            .register("orders".into(), eof_stream_config("orders"))
+            .await
+            .unwrap();
+        force_state(&manager, "orders", StreamState::Running).await;
+
+        let mut changed = eof_stream_config("orders");
+        changed.pipeline.thread_num = 2;
+        let affected = manager
+            .replace_config(&engine_config(vec![changed]))
+            .await
+            .unwrap();
+        assert_eq!(affected, vec!["orders"]);
+        assert!(
+            manager.get("orders").await.is_some(),
+            "the changed stream is re-registered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replace_config_registers_and_starts_brand_new_streams() {
+        let _ = crate::input::register_input_builder(
+            "runtime-cov-eof-input",
+            Arc::new(EofInputBuilder),
+        );
+        let _ = crate::output::register_output_builder(
+            "runtime-cov-devnull-output",
+            Arc::new(DevNullOutputBuilder),
+        );
+        let manager = RuntimeManager::new();
+        let affected = manager
+            .replace_config(&engine_config(vec![eof_stream_config("fresh")]))
+            .await
+            .unwrap();
+        assert_eq!(affected, vec!["fresh"]);
+        assert!(manager.get("fresh").await.is_some());
+        manager.stop_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replace_config_reports_a_restoration_failure() {
+        let manager = RuntimeManager::new();
+        // A previously "running" stream whose old config is itself broken:
+        // reconciliation fails, and so does the restoration attempt.
+        let mut old_config = stream_config();
+        old_config.input.input_type = "missing-input-old".into();
+        manager
+            .register("orders".into(), old_config)
+            .await
+            .unwrap();
+        force_state(&manager, "orders", StreamState::Running).await;
+
+        let mut new_config = stream_config();
+        new_config.input.input_type = "missing-input-new".into();
+        let error = manager
+            .replace_config(&engine_config(vec![new_config]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Configuration apply failed")
+                && error.contains("restoration also failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_rejects_a_runtime_that_is_already_stopping() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("orders".into(), stream_config())
+            .await
+            .unwrap();
+        force_state(&manager, "orders", StreamState::Stopping).await;
+        let error = manager.stop("orders").await.unwrap_err().to_string();
+        assert!(error.contains("already stopping"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stop_marks_a_failed_task_failed() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("orders".into(), stream_config())
+            .await
+            .unwrap();
+        {
+            let entry = manager.get("orders").await.unwrap();
+            let mut runtime = entry.lock().await;
+            runtime.state = StreamState::Running;
+            runtime.handle = Some(tokio::spawn(async {
+                Err(Error::Process("task failed".into()))
+            }));
+        }
+        let error = manager.stop("orders").await.unwrap_err();
+        assert!(error.to_string().contains("task failed"));
+        assert_eq!(state_of(&manager, "orders").await, StreamState::Failed);
+    }
+
+    #[tokio::test]
+    async fn stop_all_surfaces_the_first_failure() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("bad".into(), stream_config())
+            .await
+            .unwrap();
+        manager
+            .register("ok".into(), {
+                let mut config = stream_config();
+                config.id = Some("ok".into());
+                config
+            })
+            .await
+            .unwrap();
+        {
+            let entry = manager.get("bad").await.unwrap();
+            let mut runtime = entry.lock().await;
+            runtime.state = StreamState::Running;
+            runtime.handle = Some(tokio::spawn(async {
+                Err(Error::Process("bad task".into()))
+            }));
+        }
+        force_state(&manager, "ok", StreamState::Created).await;
+        assert!(manager.stop_all().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_a_runtime_that_is_transitioning() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("orders".into(), stream_config())
+            .await
+            .unwrap();
+        force_state(&manager, "orders", StreamState::Starting).await;
+        let error = manager.restart("orders").await.unwrap_err().to_string();
+        assert!(error.contains("already transitioning"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn restart_without_a_handle_completes_the_cycle() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("orders".into(), stream_config())
+            .await
+            .unwrap();
+        force_state(&manager, "orders", StreamState::Running).await;
+        // No plugin registrations: the restart's internal start fails, but the
+        // stop half of the cycle completed (Stopped -> restart counter bumps).
+        assert!(manager.restart("orders").await.is_err());
+        let entry = manager.get("orders").await.unwrap();
+        let runtime = entry.lock().await;
+        assert_eq!(
+            runtime.metrics.restarts.load(Ordering::Relaxed),
+            1,
+            "the restart counter advances even when the start half fails"
+        );
+        assert!(runtime.handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_marks_a_failed_task_failed() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("orders".into(), stream_config())
+            .await
+            .unwrap();
+        {
+            let entry = manager.get("orders").await.unwrap();
+            let mut runtime = entry.lock().await;
+            runtime.state = StreamState::Running;
+            runtime.handle = Some(tokio::spawn(async {
+                Err(Error::Process("restart boom".into()))
+            }));
+        }
+        let error = manager.restart("orders").await.unwrap_err();
+        assert!(error.to_string().contains("restart boom"));
+        assert_eq!(state_of(&manager, "orders").await, StreamState::Failed);
+    }
+
+    #[tokio::test]
+    async fn wait_all_settles_every_task_and_surfaces_failures() {
+        let manager = RuntimeManager::new();
+        let config = |id: &str| {
+            let mut config = stream_config();
+            config.id = Some(id.into());
+            config
+        };
+        // "a-ok" is visited first: a completing task settles the entry to
+        // Stopped. "z-bad" then fails and wait_all returns the error.
+        manager.register("a-ok".into(), config("a-ok")).await.unwrap();
+        manager.register("z-bad".into(), config("z-bad")).await.unwrap();
+        {
+            let entry = manager.get("a-ok").await.unwrap();
+            let mut runtime = entry.lock().await;
+            runtime.state = StreamState::Running;
+            runtime.handle = Some(tokio::spawn(async { Ok(()) }));
+        }
+        {
+            let entry = manager.get("z-bad").await.unwrap();
+            let mut runtime = entry.lock().await;
+            runtime.state = StreamState::Running;
+            runtime.handle = Some(tokio::spawn(async {
+                Err(Error::Process("wait boom".into()))
+            }));
+        }
+        let error = manager.wait_all().await.unwrap_err();
+        assert!(error.to_string().contains("wait boom"));
+        assert_eq!(state_of(&manager, "a-ok").await, StreamState::Stopped);
+        assert_eq!(state_of(&manager, "z-bad").await, StreamState::Failed);
+    }
+
+    /// A task that ignores its cancellation token is aborted after the
+    /// shutdown timeout; the runtime reports the timeout as the lifecycle
+    /// error. Paused time makes the 30s timeout fire immediately.
+    #[tokio::test(start_paused = true)]
+    async fn stop_aborts_an_unresponsive_task_after_the_timeout() {
+        let manager = RuntimeManager::new();
+        manager
+            .register("orders".into(), stream_config())
+            .await
+            .unwrap();
+        {
+            let entry = manager.get("orders").await.unwrap();
+            let mut runtime = entry.lock().await;
+            runtime.state = StreamState::Running;
+            runtime.handle = Some(tokio::spawn(async {
+                std::future::pending::<()>().await;
+                unreachable!("the pending future never resolves");
+            }));
+        }
+        let error = manager.stop("orders").await.unwrap_err();
+        assert!(
+            matches!(error, Error::Timeout),
+            "expected a shutdown timeout, got {error}"
+        );
+        assert_eq!(state_of(&manager, "orders").await, StreamState::Failed);
+    }
+
+    /// The eof/devnull helpers settle directly: the reconciliation streams
+    /// above never produce a row, so write/close would otherwise stay dark.
+    #[tokio::test]
+    async fn eof_helpers_settle_directly() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        EofInput.connect().await.unwrap();
+        assert!(matches!(EofInput.read().await, Err(Error::EOF)));
+        EofInput.close().await.unwrap();
+
+        let batch = Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap(),
+        ));
+        DevNullOutput {
+            wrote: Arc::new(AtomicBool::new(false)),
+        }
+        .write(batch)
+        .await
+        .unwrap();
     }
 }

@@ -2435,6 +2435,1204 @@ mod tests {
         assert!(!active.bytes.is_empty(), "bytes restored");
     }
 
+    // ===== Coverage-gap tests (offline; in-memory object store only) =====
+
+    /// A minimal `ObjectStoreWalConfig` with overridable fields, so the
+    /// validation matrix below stays one statement per case.
+    fn osc_base() -> ObjectStoreWalConfig {
+        ObjectStoreWalConfig {
+            node_id: "cov-pod".into(),
+            stream_id: "cov".into(),
+            prefix: "arkflow/cov".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig {
+                max_entries: 1000,
+                max_bytes: 1024 * 1024,
+                flush_interval: std::time::Duration::from_secs(3600),
+            },
+            cursor: CursorFlushConfig {
+                max_entries: 1000,
+                interval: std::time::Duration::from_secs(3600),
+            },
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::None,
+            sync: SyncPolicy::GroupCommit,
+        }
+    }
+
+    fn inmemory_client() -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(InMemory::new())
+    }
+
+    /// `osc_base()`'s namespace: `{prefix}/{node_id}/{stream_id}`.
+    const COV_NS: &str = "arkflow/cov/cov-pod/cov";
+
+    /// Build a store over a fresh in-memory client using `osc_base` with the
+    /// given mutations applied.
+    fn build_cov_store(mutate: impl FnOnce(&mut ObjectStoreWalConfig)) -> Arc<S3Store> {
+        let mut osc = osc_base();
+        mutate(&mut osc);
+        S3Store::build_with_client(
+            &WalConfig::default(),
+            osc,
+            Runtime::new().unwrap(),
+            inmemory_client(),
+        )
+        .unwrap()
+    }
+
+    fn build_cov_store_err(
+        mutate: impl FnOnce(&mut ObjectStoreWalConfig),
+    ) -> Result<Arc<S3Store>, Error> {
+        let mut osc = osc_base();
+        mutate(&mut osc);
+        S3Store::build_with_client(
+            &WalConfig::default(),
+            osc,
+            Runtime::new().unwrap(),
+            inmemory_client(),
+        )
+    }
+
+    /// Build over a caller-provided (possibly pre-seeded) client.
+    fn build_cov_store_with(
+        client: Arc<dyn object_store::ObjectStore>,
+        mutate: impl FnOnce(&mut ObjectStoreWalConfig),
+    ) -> Arc<S3Store> {
+        let mut osc = osc_base();
+        mutate(&mut osc);
+        S3Store::build_with_client(&WalConfig::default(), osc, Runtime::new().unwrap(), client)
+            .unwrap()
+    }
+
+    /// An S3 block whose client construction fails deterministically offline
+    /// (`secret_access_key` without `access_key_id` → MissingAccessKeyId).
+    fn offline_unbuildable_s3() -> ObjectStoreS3Config {
+        ObjectStoreS3Config {
+            bucket: "unused".into(),
+            region: None,
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: Some("orphan-secret".into()),
+            allow_http: false,
+        }
+    }
+
+    /// `expect_err` needs `S3Store: Debug`; extract the error manually.
+    fn unwrap_err(result: Result<Arc<S3Store>, Error>, ctx: &str) -> Error {
+        match result {
+            Err(e) => e,
+            Ok(_) => panic!("{ctx}"),
+        }
+    }
+
+    /// PUT worker happy path: a submitted segment is uploaded and reported
+    /// through the completion callback (D4 path used by the worker pool).
+    #[test]
+    fn put_worker_uploads_segment_and_reports_completion() {
+        let client = inmemory_client();
+        let done = Arc::new(AtomicU64::new(0));
+        let done_cb = done.clone();
+        let worker = PutWorker::new(0, client.clone(), "cov-ns".into(), move |seq| {
+            done_cb.store(seq, Ordering::SeqCst);
+        });
+        let sender = worker.sender();
+        sender
+            .send(PendingSegment {
+                segment_index: 7,
+                first_seq: 1,
+                last_seq: 2,
+                bytes: vec![1, 2, 3],
+            })
+            .expect("worker queue has capacity");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while done.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "PUT worker never completed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 7);
+        // The object landed at the namespaced segment key.
+        let rt = Runtime::new().unwrap();
+        let meta = rt
+            .block_on(client.head(&ObjectPath::from("cov-ns/segments/00000007.wal")))
+            .expect("uploaded object exists");
+        assert_eq!(meta.size, 3);
+        // Dropping the sender stops the worker after it drains.
+        drop(sender);
+    }
+
+    /// PUT worker failure path: a failing client logs the error and keeps the
+    /// worker alive; the completion callback must NOT fire.
+    #[test]
+    fn put_worker_upload_failure_is_reported_not_fatal() {
+        let inner = inmemory_client();
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(FailPutStore {
+            inner,
+            fail_segments: true,
+        });
+        let done = Arc::new(AtomicU64::new(0));
+        let done_cb = done.clone();
+        let worker = PutWorker::new(1, client, "cov-ns".into(), move |seq| {
+            done_cb.store(seq, Ordering::SeqCst);
+        });
+        worker
+            .sender()
+            .send(PendingSegment {
+                segment_index: 1,
+                first_seq: 1,
+                last_seq: 1,
+                bytes: vec![9],
+            })
+            .expect("send");
+        // Give the worker time to attempt (and log) the failing upload.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(done.load(Ordering::SeqCst), 0, "failed PUT must not complete");
+    }
+
+    /// The worker pool caps at 8 workers and warns (task 3.3).
+    #[test]
+    fn parallel_put_workers_caps_at_eight() {
+        let pool = ParallelPutWorkers::spawn(9, inmemory_client(), "cov-ns".into(), |_seq| {});
+        assert_eq!(pool.len(), 8, "requested 9 workers must cap at 8");
+        assert!(!pool.is_single());
+    }
+
+    /// `submit` round-robins across workers and surfaces channel failures.
+    #[test]
+    fn parallel_put_submit_round_robin_and_error_branches() {
+        // Completion callback ORs a per-segment bit: round-robin makes the
+        // completion ORDER racy, so the assertion must be order-free.
+        let done = Arc::new(AtomicU64::new(0));
+        let done_cb = done.clone();
+        let pool = ParallelPutWorkers::spawn(2, inmemory_client(), "cov-ns".into(), move |seq| {
+            done_cb.fetch_or(1 << seq, Ordering::SeqCst);
+        });
+        // Empty pool: the guard branch reports "no PUT workers".
+        let empty = ParallelPutWorkers {
+            workers: Vec::new(),
+            next_worker: AtomicU64::new(0),
+        };
+        let err = empty
+            .submit(PendingSegment {
+                segment_index: 1,
+                first_seq: 1,
+                last_seq: 1,
+                bytes: vec![1],
+            })
+            .expect_err("an empty pool cannot submit");
+        assert!(err.to_string().contains("no PUT workers"));
+
+        // Disconnected worker: the send error branch.
+        let (tx, rx) = flume::bounded::<PendingSegment>(1);
+        drop(rx);
+        let disconnected = ParallelPutWorkers {
+            workers: vec![PutWorker {
+                sender: tx,
+                _handle: std::thread::spawn(|| {}),
+            }],
+            next_worker: AtomicU64::new(0),
+        };
+        let err = disconnected
+            .submit(PendingSegment {
+                segment_index: 1,
+                first_seq: 1,
+                last_seq: 1,
+                bytes: vec![1],
+            })
+            .expect_err("send on a disconnected channel must fail");
+        assert!(err.to_string().contains("PUT worker channel send"));
+
+        // Happy path: two submits land (round-robin over 2 workers).
+        for idx in 3..=4u64 {
+            pool.submit(PendingSegment {
+                segment_index: idx,
+                first_seq: 1,
+                last_seq: 1,
+                bytes: vec![idx as u8],
+            })
+            .expect("submit to live workers");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while done.load(Ordering::SeqCst) & 0b11000 != 0b11000 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workers never drained (flags {done:?})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Direct sender access: valid index Some, out-of-range None.
+        assert!(pool.worker_sender(1).is_some());
+        assert!(pool.worker_sender(9).is_none());
+        // shutdown() is a best-effort no-op today; it must not panic.
+        pool.shutdown();
+    }
+
+    /// `S3Store::build` rejects configs whose backend is not `object_store`.
+    #[test]
+    fn build_requires_object_store_backend() {
+        let err = unwrap_err(S3Store::build(&WalConfig::default()),
+            "default config has no object_store backend");
+        assert!(err.to_string().contains("requires `backend: object_store`"));
+    }
+
+    /// `S3Store::build` maps a client-construction failure (empty bucket)
+    /// offline — no network involved in `AmazonS3Builder::build`.
+    #[test]
+    fn build_maps_s3_client_init_failure() {
+        let mut osc = osc_base();
+        osc.s3 = offline_unbuildable_s3();
+        let cfg = WalConfig {
+            backend: Some(arkflow_core::wal::WalBackend::ObjectStore(osc)),
+            ..WalConfig::default()
+        };
+        let err = unwrap_err(
+            S3Store::build(&cfg),
+            "a secret key without an access key id cannot build a client",
+        );
+        assert!(
+            err.to_string().contains("S3 client init"),
+            "expected client-init error, got: {err}"
+        );
+    }
+
+    /// D8 guard reachable through the public builder too.
+    #[test]
+    fn wal_store_builder_reports_kind_and_build_errors() {
+        assert_eq!(S3WalStoreBuilder.kind(), "object_store");
+
+        let mut osc = osc_base();
+        osc.s3 = offline_unbuildable_s3();
+        let cfg = WalConfig {
+            backend: Some(arkflow_core::wal::WalBackend::ObjectStore(osc)),
+            ..WalConfig::default()
+        };
+        let err = match S3WalStoreBuilder.build(&cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("builder must surface the client-init failure"),
+        };
+        assert!(err.to_string().contains("S3 client init"));
+
+        // register() is idempotent-or-duplicate; both outcomes prove the call.
+        let _ = register();
+    }
+
+    /// D8: per-entry sync is rejected on the remote backend.
+    #[test]
+    fn build_rejects_per_entry_sync() {
+        let err = unwrap_err(
+            build_cov_store_err(|osc| osc.sync = SyncPolicy::PerEntry),
+            "per_entry is not viable remotely",
+        );
+        assert!(err.to_string().contains("per_entry"));
+    }
+
+    /// Segment validation: zero max_bytes / zero flush_interval.
+    #[test]
+    fn build_rejects_zero_max_bytes_and_zero_flush_interval() {
+        let err = unwrap_err(
+            build_cov_store_err(|osc| {
+                osc.segment.max_entries = 10;
+                osc.segment.max_bytes = 0;
+            }),
+            "zero max_bytes",
+        );
+        assert!(err.to_string().contains("max_bytes"));
+
+        let err = unwrap_err(
+            build_cov_store_err(|osc| {
+                osc.segment.max_entries = 10;
+                osc.segment.max_bytes = 1024;
+                osc.segment.flush_interval = std::time::Duration::ZERO;
+            }),
+            "zero flush interval",
+        );
+        assert!(err.to_string().contains("flush_interval"));
+    }
+
+    /// Compression level validation for lz4 (zstd covered above), plus a
+    /// valid lz4 build.
+    #[test]
+    fn compression_lz4_level_validation() {
+        for level in [0i32, 17] {
+            let err = unwrap_err(
+                build_cov_store_err(|osc| {
+                    osc.compression = arkflow_core::wal::config::CompressionConfig::Lz4 { level }
+                }),
+                "lz4 level out of range",
+            );
+            assert!(
+                err.to_string().contains("lz4"),
+                "expected lz4 error, got: {err}"
+            );
+        }
+        // Valid bounds build cleanly.
+        for level in [1i32, 16] {
+            let store = build_cov_store(|osc| {
+                osc.compression = arkflow_core::wal::config::CompressionConfig::Lz4 { level }
+            });
+            store.close().unwrap();
+        }
+        // zstd valid bound.
+        let store = build_cov_store(|osc| {
+            osc.compression = arkflow_core::wal::config::CompressionConfig::Zstd { level: 0 }
+        });
+        store.close().unwrap();
+    }
+
+    /// `build_s3_client` maps every optional field onto the builder. Client
+    /// construction is offline; no request is issued.
+    #[test]
+    fn build_s3_client_maps_every_configured_field() {
+        let cfg = ObjectStoreS3Config {
+            bucket: "b".into(),
+            region: Some("us-east-1".into()),
+            endpoint: Some("http://127.0.0.1:9000".into()),
+            access_key_id: Some("key".into()),
+            secret_access_key: Some("secret".into()),
+            allow_http: true,
+        };
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async { build_s3_client(&cfg).await })
+            .expect("fully-specified offline config builds");
+
+        // A secret key without an access key id is a construction error
+        // (offline, deterministic — no request is attempted).
+        let err = rt
+            .block_on(async { build_s3_client(&offline_unbuildable_s3()).await })
+            .expect_err("orphan secret key must fail client construction");
+        assert!(
+            err.to_lowercase().contains("access"),
+            "expected a credentials error, got: {err}"
+        );
+    }
+
+    /// The cursor interval trigger: `cursor_should_flush` fires on elapsed
+    /// time even below `max_entries` (D6).
+    #[test]
+    fn cursor_interval_triggers_a_flush_decision() {
+        let store = build_cov_store(|_| {});
+        // Fresh state: below both thresholds.
+        assert!(!store.cursor_should_flush());
+        // Age the last flush past the (1h) interval.
+        store
+            .cursor_last_flush_ms
+            .store(now_ms() - 7_200_000, Ordering::Release);
+        assert!(store.cursor_should_flush());
+        // max_entries threshold alone also triggers.
+        store
+            .cursor_last_flush_ms
+            .store(now_ms(), Ordering::Release);
+        store.cursor_pending.store(1000, Ordering::Release);
+        assert!(store.cursor_should_flush());
+        store.close().unwrap();
+    }
+
+    /// `probe_next_segment_index` picks max(seen)+1 and ignores non-wal
+    /// objects (startup naming, D4).
+    #[test]
+    fn probe_next_segment_index_picks_max_plus_one() {
+        let client = inmemory_client();
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            for key in [
+                "ns/segments/00000003.wal",
+                "ns/segments/00000010.wal",
+                "ns/segments/notes.txt",
+                "ns/segments/not-a-number.wal",
+            ] {
+                client
+                    .put(
+                        &ObjectPath::from(key),
+                        PutPayload::from(Bytes::from(vec![0u8])),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let next = probe_next_segment_index(&*client, "ns/segments").await.unwrap();
+            assert_eq!(next, 11, "max seen index is 10");
+        });
+    }
+
+    /// Recovery unions the manifest with LIST and skips non-`.wal` objects;
+    /// the highest seen seq seeds `next_seq_hint` (D5).
+    #[test]
+    fn recovery_skips_non_wal_objects_and_keeps_seq_monotonic() {
+        let client = inmemory_client();
+        let payload = sample_payload(None);
+        let mut seg_bytes = Vec::new();
+        super::super::segment::encode(&[(5u64, payload.clone())], &mut seg_bytes).unwrap();
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            client
+                .put(
+                    &ObjectPath::from(format!("{COV_NS}/segments/00000005.wal").as_str()),
+                    PutPayload::from(Bytes::from(seg_bytes.clone())),
+                )
+                .await
+                .unwrap();
+            client
+                .put(
+                    &ObjectPath::from(format!("{COV_NS}/segments/readme.txt").as_str()),
+                    PutPayload::from(Bytes::from("not a segment")),
+                )
+                .await
+                .unwrap();
+        });
+        let store = build_cov_store_with(client, |_| {});
+        assert_eq!(store.next_seq_hint(), 6, "max seq seen on store is 5");
+        let replayed: Vec<u64> = store
+            .read_after_cursor()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(replayed, vec![5]);
+        store.close().unwrap();
+    }
+
+    /// A manifest referencing a segment that no longer exists (truncated
+    /// between write and recovery, D7) is skipped silently.
+    #[test]
+    fn recovery_skips_manifest_segments_missing_on_the_store() {
+        let client = inmemory_client();
+        let mut manifest = Manifest::fresh("cov-pod".into(), "cov".into());
+        manifest.sealed_segments.push("00000009.wal".into());
+        manifest.sealed_segments.push("garbage".into());
+        let bytes = manifest.to_json().unwrap();
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            client
+                .put(
+                    &ObjectPath::from(format!("{COV_NS}/manifest.json").as_str()),
+                    PutPayload::from(Bytes::from(bytes)),
+                )
+                .await
+                .unwrap();
+        });
+        // Build succeeds: both referenced segments are absent → skipped.
+        let store = build_cov_store_with(client, |_| {});
+        assert_eq!(store.next_seq_hint(), 1, "no readable segments");
+        // read_after_cursor also skips the missing segments (NotFound).
+        assert!(store.read_after_cursor().unwrap().is_empty());
+        store.close().unwrap();
+    }
+
+    /// A generic (non-NotFound) GET failure while listing segments in
+    /// recovery is an error, not a skip.
+    #[test]
+    fn recovery_errors_when_segment_get_fails() {
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(FailGetStore::segments(
+            inmemory_client(),
+        ));
+        let payload = sample_payload(None);
+        let mut seg_bytes = Vec::new();
+        super::super::segment::encode(&[(1u64, payload)], &mut seg_bytes).unwrap();
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            client
+                .put(
+                    &ObjectPath::from(format!("{COV_NS}/segments/00000001.wal").as_str()),
+                    PutPayload::from(Bytes::from(seg_bytes)),
+                )
+                .await
+                .unwrap();
+        });
+        let result = S3Store::build_with_client(
+            &WalConfig::default(),
+            osc_base(),
+            Runtime::new().unwrap(),
+            client,
+        );
+        let err = unwrap_err(result, "segment GET failure must fail recovery");
+        assert!(
+            err.to_string().contains("S3 GET segment"),
+            "got: {err}"
+        );
+    }
+
+    /// A generic manifest GET failure fails recovery (not treated as fresh).
+    #[test]
+    fn recovery_errors_when_manifest_get_fails() {
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(FailGetStore::manifest(
+            inmemory_client(),
+        ));
+        let result = S3Store::build_with_client(
+            &WalConfig::default(),
+            osc_base(),
+            Runtime::new().unwrap(),
+            client,
+        );
+        let err = unwrap_err(result, "manifest GET failure must fail recovery");
+        assert!(
+            err.to_string().contains("S3 GET manifest"),
+            "got: {err}"
+        );
+    }
+
+    /// `read_manifest_with_etag` and `read_after_cursor` both surface a
+    /// manifest GET failure that starts after recovery (the first GET
+    /// succeeded, so the store built cleanly).
+    #[test]
+    fn read_paths_error_when_manifest_get_fails_after_recovery() {
+        let inner = inmemory_client();
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(FailGetStore::manifest_after(inner, 1));
+        let store = S3Store::build_with_client(
+            &WalConfig::default(),
+            osc_base(),
+            Runtime::new().unwrap(),
+            client,
+        )
+        .unwrap();
+        let inner_store = store.clone();
+        let err = store
+            .rt()
+            .block_on(async move { read_manifest_with_etag(&inner_store).await })
+            .expect_err("the post-recovery manifest GET must fail");
+        assert!(
+            err.to_string().contains("S3 GET manifest"),
+            "got: {err}"
+        );
+        let err = store
+            .read_after_cursor()
+            .expect_err("read_after_cursor must hit the same branch");
+        assert!(
+            err.to_string().contains("S3 GET manifest"),
+            "got: {err}"
+        );
+        // close()'s final flush fails on the same branch; it must not panic.
+        let _ = store.close();
+    }
+
+    /// `read_after_cursor` surfaces a segment GET failure.
+    #[test]
+    fn read_after_cursor_errors_when_segment_get_fails() {
+        let inner = inmemory_client();
+        let payload = sample_payload(None);
+        let mut seg_bytes = Vec::new();
+        super::super::segment::encode(&[(1u64, payload)], &mut seg_bytes).unwrap();
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            inner
+                .put(
+                    &ObjectPath::from(format!("{COV_NS}/segments/00000001.wal").as_str()),
+                    PutPayload::from(Bytes::from(seg_bytes)),
+                )
+                .await
+                .unwrap();
+        });
+        // Fail .wal GETs from the second call onwards: the first one is
+        // recovery's, the second is read_after_cursor's.
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(FailGetStore::segments_after(inner, 1));
+        let store = S3Store::build_with_client(
+            &WalConfig::default(),
+            osc_base(),
+            Runtime::new().unwrap(),
+            client,
+        )
+        .unwrap();
+        let err = store
+            .read_after_cursor()
+            .expect_err("segment GET failure must surface");
+        assert!(
+            err.to_string().contains("S3 GET segment"),
+            "got: {err}"
+        );
+        let _ = store.close();
+    }
+
+    /// `append_batch(&[])` is a no-op; `advance_cursor` past a poison clears
+    /// the rewind floor so advancement resumes.
+    #[test]
+    fn append_batch_empty_is_noop_and_reack_clears_the_rewind_floor() {
+        let store = build_cov_store(|_| {});
+        store.append_batch(vec![]).expect("empty batch is a no-op");
+
+        let payload = sample_payload(None);
+        store
+            .append_batch(vec![(1, payload.clone()), (2, payload.clone())])
+            .unwrap();
+        store.advance_cursor(2).unwrap();
+        // Poison at seq 2 (failed source commit), then re-ack through it.
+        store.rewind_cursor(1).unwrap();
+        assert_eq!(store.cursor(), 1);
+        store.advance_cursor(2).unwrap();
+        // The floor cleared: no clamp on the following flush.
+        assert_eq!(store.cursor(), 2);
+        store.close().unwrap();
+    }
+
+    /// A rewind whose corrective manifest flush fails fails closed (the
+    /// replay guarantee never silently degrades).
+    #[test]
+    fn rewind_corrective_flush_failure_is_reported() {
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(FailPutStore {
+            inner,
+            fail_segments: false,
+        });
+        let store = S3Store::build_with_client(
+            &WalConfig::default(),
+            osc_base(),
+            Runtime::new().unwrap(),
+            client,
+        )
+        .unwrap();
+        let payload = sample_payload(None);
+        store
+            .append_batch(vec![(1, payload.clone()), (2, payload)])
+            .unwrap();
+        store.advance_cursor(2).unwrap();
+        let err = store
+            .rewind_cursor(1)
+            .expect_err("corrective flush against a failing manifest must error");
+        assert!(
+            err.to_string().contains("manifest write failed"),
+            "the corrective flush failure must surface, got: {err}"
+        );
+    }
+
+    /// The background flusher seals and flushes on the interval (D4/D6):
+    /// entries buffered past `flush_interval` become durable with no
+    /// explicit seal trigger.
+    #[test]
+    fn flusher_seals_active_segment_on_interval() {
+        let client = inmemory_client();
+        let runtime = Runtime::new().unwrap();
+        let mut osc = osc_base();
+        osc.segment.flush_interval = std::time::Duration::from_millis(100);
+        osc.cursor.interval = std::time::Duration::from_millis(150);
+        osc.cursor.max_entries = 1_000_000;
+        let store =
+            S3Store::build_with_client(&WalConfig::default(), osc, runtime, client.clone())
+                .unwrap();
+        let payload = sample_payload(None);
+        store.append_batch(vec![(1, payload)]).unwrap();
+        // Wait for at least two flusher ticks (tolerates a slow CI machine).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let sealed = loop {
+            let active_entries = store.active.lock().unwrap().entries;
+            let listed = store
+                .rt()
+                .block_on(async {
+                    use futures::StreamExt;
+                    let mut n = 0u32;
+                    let mut stream =
+                        client.list(Some(&ObjectPath::from(format!("{COV_NS}/segments").as_str())));
+                    while let Some(item) = stream.next().await {
+                        item?;
+                        n += 1;
+                    }
+                    Ok::<u32, object_store::Error>(n)
+                })
+                .unwrap();
+            if active_entries == 0 && listed >= 1 {
+                break listed;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "flusher never sealed the active segment"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(sealed >= 1);
+        store.close().unwrap();
+    }
+
+    /// Sustained ETag contention then success: the writer retries, warns on
+    /// the 3rd+ attempt, and still lands the manifest.
+    #[test]
+    fn manifest_write_retries_through_sustained_contention() {
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(FlakyPreconditionStore {
+            inner,
+            fail_for_first: AtomicU64::new(3),
+        });
+        let runtime = Runtime::new().unwrap();
+        let store = S3Store::build_with_client(
+            &WalConfig::default(),
+            osc_base(),
+            runtime,
+            client,
+        )
+        .unwrap();
+        let inner_store = store.clone();
+        store
+            .rt()
+            .block_on(async move {
+                write_manifest_with_etag(&inner_store, |m| m.cursor = 5).await
+            })
+            .expect("retries converge after contention");
+        let inner_store = store.clone();
+        store.rt().block_on(async move {
+            let (m, _) = read_manifest_with_etag(&inner_store).await.unwrap();
+            assert_eq!(m.cursor, 5);
+        });
+        store.close().unwrap();
+    }
+
+    /// Backends without conditional PUT (`NotImplemented`) fall back to an
+    /// unconditional Overwrite and still land the manifest (with the
+    /// coordination-disabled warning).
+    #[test]
+    fn manifest_write_falls_back_to_overwrite_without_conditional_put() {
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(NotImplementedPutStore {
+            inner: inner.clone(),
+        });
+        let runtime = Runtime::new().unwrap();
+        let store = S3Store::build_with_client(
+            &WalConfig::default(),
+            osc_base(),
+            runtime,
+            client,
+        )
+        .unwrap();
+        let inner_store = store.clone();
+        store
+            .rt()
+            .block_on(async move { write_manifest_with_etag(&inner_store, |m| m.cursor = 9).await })
+            .expect("overwrite fallback lands the manifest");
+        // The fallback wrote through to the inner (real) store.
+        store.rt().block_on(async {
+            let (m, _) = read_manifest_with_etag(&store).await.unwrap();
+            assert_eq!(m.cursor, 9);
+        });
+        store.close().unwrap();
+    }
+
+    /// `read_manifest_with_etag` treats NotFound as fresh (covered by every
+    /// fresh-bucket test above); this drives its generic-error branch via the
+    /// flush path on a failing client.
+    #[test]
+    fn flush_manifest_fails_loudly_when_the_manifest_get_fails() {
+        let inner = inmemory_client();
+        // Seed a manifest so recovery's first GET succeeds; every later
+        // manifest GET fails (flush_manifest → read_manifest_with_etag).
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(FailGetStore::manifest_after(inner, 1));
+        let runtime = Runtime::new().unwrap();
+        let store = S3Store::build_with_client(
+            &WalConfig::default(),
+            osc_base(),
+            runtime,
+            client,
+        )
+        .unwrap();
+        let inner_store = store.clone();
+        let err = store
+            .rt()
+            .block_on(async move { flush_manifest(&inner_store).await })
+            .expect_err("flush must fail when the manifest cannot be read");
+        assert!(
+            err.to_string().contains("S3 GET manifest"),
+            "got: {err}"
+        );
+        let _ = store.close();
+    }
+
+    /// Dropping a store inside an async context defers the private-runtime
+    /// shutdown to a helper thread instead of panicking.
+    #[tokio::test]
+    async fn dropping_a_store_inside_an_async_context_is_safe() {
+        let store = build_cov_store(|_| {});
+        // First: a construction error inside an async context disposes the
+        // runtime through the same off-thread path.
+        let err = unwrap_err(
+            S3Store::build_with_client(
+                &WalConfig::default(),
+                {
+                    let mut osc = osc_base();
+                    osc.sync = SyncPolicy::PerEntry;
+                    osc
+                },
+                Runtime::new().unwrap(),
+                inmemory_client(),
+            ),
+            "per_entry rejected",
+        );
+        assert!(err.to_string().contains("per_entry"));
+        // Then: a successful store dropped without close() inside the runtime.
+        drop(store);
+        tokio::task::yield_now().await;
+    }
+
+    /// Test-only object store failing PUTs for segment objects (or every
+    /// conditional manifest PUT when `fail_segments` is false and the path is
+    /// the manifest of a `FlakyPreconditionStore` — kept separate below).
+    #[derive(Debug)]
+    struct FailPutStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        /// Fail every segment PUT (used for the PUT worker failure path).
+        fail_segments: bool,
+    }
+
+    impl std::fmt::Display for FailPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailPutStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for FailPutStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let is_segment = location.to_string().ends_with(".wal");
+            if self.fail_segments && is_segment {
+                return Err(object_store::Error::Generic {
+                    store: "FailPutStore",
+                    source: "injected segment PUT failure (test)".to_string().into(),
+                });
+            }
+            // Manifest writes are made to fail persistently (precondition)
+            // when this store is used for the rewind test.
+            if !self.fail_segments && location.to_string().ends_with("manifest.json") {
+                return Err(object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: "injected manifest PUT failure (test)".to_string().into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Test-only store injecting generic GET failures for the manifest
+    /// and/or segment objects, with optional "fail after N successes"
+    /// counters (recovery GETs succeed, later ones fail).
+    #[derive(Debug)]
+    struct FailGetStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        manifest_mode: FailMode,
+        segment_mode: FailMode,
+        manifest_count: AtomicU64,
+        segment_count: AtomicU64,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum FailMode {
+        Never,
+        Always,
+        After(u64),
+    }
+
+    impl FailGetStore {
+        fn manifest(inner: Arc<dyn object_store::ObjectStore>) -> Self {
+            Self {
+                inner,
+                manifest_mode: FailMode::Always,
+                segment_mode: FailMode::Never,
+                manifest_count: AtomicU64::new(0),
+                segment_count: AtomicU64::new(0),
+            }
+        }
+        fn segments(inner: Arc<dyn object_store::ObjectStore>) -> Self {
+            Self {
+                inner,
+                manifest_mode: FailMode::Never,
+                segment_mode: FailMode::Always,
+                manifest_count: AtomicU64::new(0),
+                segment_count: AtomicU64::new(0),
+            }
+        }
+        fn manifest_after(inner: Arc<dyn object_store::ObjectStore>, n: u64) -> Self {
+            Self {
+                manifest_mode: FailMode::After(n),
+                ..Self::manifest(inner)
+            }
+        }
+        fn segments_after(inner: Arc<dyn object_store::ObjectStore>, n: u64) -> Self {
+            Self {
+                segment_mode: FailMode::After(n),
+                ..Self::segments(inner)
+            }
+        }
+    }
+
+    fn fail_mode_allows(mode: FailMode, counter: &AtomicU64) -> Option<object_store::Error> {
+        let inject = |source: &str| object_store::Error::Generic {
+            store: "FailGetStore",
+            source: source.to_string().into(),
+        };
+        match mode {
+            FailMode::Never => None,
+            FailMode::Always => Some(inject("injected GET failure (test)")),
+            FailMode::After(n) => {
+                let seen = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                (seen > n).then(|| inject("injected GET failure after threshold (test)"))
+            }
+        }
+    }
+
+    impl std::fmt::Display for FailGetStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailGetStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for FailGetStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let path = location.to_string();
+            if path.ends_with("manifest.json") {
+                if let Some(e) = fail_mode_allows(self.manifest_mode, &self.manifest_count) {
+                    return Err(e);
+                }
+            } else if path.ends_with(".wal") {
+                if let Some(e) = fail_mode_allows(self.segment_mode, &self.segment_count) {
+                    return Err(e);
+                }
+            }
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Fails the first `fail_for_first` `put_opts` calls with `Precondition`,
+    /// then delegates to the inner store (sustained-contention path).
+    #[derive(Debug)]
+    struct FlakyPreconditionStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        fail_for_first: AtomicU64,
+    }
+
+    impl std::fmt::Display for FlakyPreconditionStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FlakyPreconditionStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for FlakyPreconditionStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.fail_for_first.load(Ordering::SeqCst) > 0 {
+                self.fail_for_first.fetch_sub(1, Ordering::SeqCst);
+                return Err(object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: "injected contention (test)".to_string().into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Rejects conditional PUTs with `NotImplemented`, accepts plain
+    /// overwrites (LocalFileSystem-shaped backend).
+    #[derive(Debug)]
+    struct NotImplementedPutStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+    }
+
+    impl std::fmt::Display for NotImplementedPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "NotImplementedPutStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for NotImplementedPutStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            match opts.mode {
+                PutMode::Overwrite => self.inner.put_opts(location, payload, opts).await,
+                _ => Err(object_store::Error::NotImplemented {
+                    operation: "put_opts (conditional)".to_string(),
+                    implementer: "NotImplementedPutStore (test)".to_string(),
+                }),
+            }
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
     /// T8: concurrent `apply_seal` of distinct segments converges — the
     /// chronologically-newest segment wins active, all older ones end up in
     /// `sealed_segments` exactly once. Exercises the numeric-index comparison

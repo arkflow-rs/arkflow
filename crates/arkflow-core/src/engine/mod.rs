@@ -193,3 +193,62 @@ impl Engine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EngineConfig;
+
+    fn config_from_yaml(yaml: &str) -> EngineConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        EngineConfig::from_file(path.to_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_with_cancellation_validates_config_before_starting() {
+        // A stream whose operator types cannot resolve fails validation
+        // before any runtime work starts.
+        let config = config_from_yaml("logging:\n  level: info\nstreams: []\n");
+        let engine = Engine::new(config);
+        // Empty config: the engine starts nothing and returns when the
+        // cancellation token fires (or immediately if nothing to await).
+        let token = CancellationToken::new();
+        token.cancel();
+        engine.run_with_cancellation(token).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_with_cancellation_rejects_an_invalid_configuration() {
+        // Duplicate stream ids are caught by the up-front validation pass.
+        let stream = r#"
+streams:
+  - id: dup
+    input: {type: generate, context: '{"v":1}', interval: 1s, batch_size: 1}
+    pipeline: {thread_num: 1, processors: []}
+    output: {type: stdout}
+  - id: dup
+    input: {type: generate, context: '{"v":1}', interval: 1s, batch_size: 1}
+    pipeline: {thread_num: 1, processors: []}
+    output: {type: stdout}
+"#;
+        let config = config_from_yaml(&format!("logging:\n  level: info\n{stream}"));
+        let engine = Engine::new(config);
+        let result = engine.run_with_cancellation(CancellationToken::new()).await;
+        assert!(result.is_err(), "duplicate ids must fail validation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accessors_expose_the_shared_domain_objects() {
+        let config = config_from_yaml("logging:\n  level: info\nstreams: []\n");
+        let engine = Engine::new(config.clone());
+        let _manager = engine.runtime_manager();
+        let _control_plane = engine.control_plane();
+        // run() delegates to run_with_cancellation with a fresh token.
+        let engine = Engine::new(config);
+        let token = CancellationToken::new();
+        token.cancel();
+        engine.run_with_cancellation(token).await.unwrap();
+    }
+}

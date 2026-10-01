@@ -5074,331 +5074,2028 @@ mod tests {
         assert!(DataPlaneTlsConfig::from_pem(cert, "", ca).is_err());
         assert!(DataPlaneTlsConfig::from_pem(cert, key, ca).is_ok());
     }
-}
 
-#[cfg(test)]
-mod pump_cancel_tests {
-    //! Pins the outbound pump's cancellation ("void write") semantics: a
-    //! branch whose receipt can never arrive is aborted on every exit path —
-    //! never falsely acked — and the exit flush precedes the abort sweep.
+    // ---------- codec / framing error-path coverage ----------
 
-    use super::*;
-    use crate::input::Ack;
-    use datafusion::arrow::array::{ArrayRef, Int64Array};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc as StdArc;
+    #[test]
+    fn credentials_debug_redacts_the_secret_and_empty_secrets_are_rejected() {
+        let credentials =
+            DataPlaneCredentials::new("node-a", "super-secret").expect("valid credentials");
+        let debug = format!("{credentials:?}");
+        assert!(debug.contains("node-a"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(!debug.contains("super-secret"), "{debug}");
 
-    struct SpyAck {
-        acked: AtomicBool,
-        aborted: AtomicBool,
+        let error = DataPlaneCredentials::new("node-a", "")
+            .expect_err("an empty shared secret must be rejected");
+        assert!(
+            error.to_string().contains("must not be empty"),
+            "{error}"
+        );
     }
 
-    impl SpyAck {
-        fn new() -> StdArc<Self> {
-            StdArc::new(Self {
-                acked: AtomicBool::new(false),
-                aborted: AtomicBool::new(false),
-            })
+    #[test]
+    fn server_ack_verification_rejects_identity_mismatch() {
+        let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+        let auth = credentials.session("node-b", "job-1", 3, quad_a_to_b());
+        let request = auth.client_handshake().unwrap();
+        let mut ack = auth.server_ack(&request, "node-b");
+        // A well-formed ack with the same identity verifies.
+        auth.verify_server_ack(&ack).expect("matching ack verifies");
+        // Any identity drift is a protocol error before the MAC check.
+        ack.job_id = "other-job".into();
+        let error = auth.verify_server_ack(&ack).unwrap_err();
+        assert!(
+            error.to_string().contains("identity mismatch"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn wire_signal_ignores_data_envelopes_and_default_encoder_matches_new() {
+        let batch = Arc::new(dictionary_batch(None));
+        let envelope = Envelope::Data(batch, Arc::new(crate::input::NoopAck));
+        assert!(WireSignal::from_envelope(&envelope).is_none());
+
+        // `DataEncoder::default` is the same encoder as `new`.
+        let sample = dictionary_batch(Some("default"));
+        let mut via_default = DataEncoder::default();
+        let mut via_new = DataEncoder::new();
+        let payload_default = via_default.encode(&sample, 1).expect("default encode");
+        let payload_new = via_new.encode(&sample, 1).expect("new encode");
+        let mut decoder = DataDecoder::new();
+        let (decoded, seq) = decoder.decode(&payload_default).expect("default decode");
+        assert_eq!(seq, 1);
+        assert_eq!(decoded.get_input_name(), Some("default".to_owned()));
+        // Both encoders emit byte-identical payloads for the same input.
+        assert_eq!(payload_default, payload_new);
+    }
+
+    /// Split a data payload at its meta block: returns the rewritten prefix
+    /// (with `has_schema` forced to the given value) and the cursor position
+    /// just after the original meta block.
+    fn rewrite_meta(payload: &[u8], has_schema: bool) -> (Vec<u8>, usize) {
+        let meta_len = u32::from_le_bytes(payload[0..4].try_into().expect("sliced")) as usize;
+        let mut meta: WireDataMeta =
+            serde_json::from_slice(&payload[4..4 + meta_len]).expect("meta");
+        meta.has_schema = has_schema;
+        let rewritten = serde_json::to_vec(&meta).expect("meta encode");
+        let mut out = Vec::new();
+        out.extend_from_slice(&(rewritten.len() as u32).to_le_bytes());
+        out.extend_from_slice(&rewritten);
+        (out, 4 + meta_len)
+    }
+
+    /// Re-encode a length-prefixed IPC piece from raw flatbuffer bytes.
+    fn craft_piece(flatbuf: &[u8]) -> Vec<u8> {
+        let mut piece = Vec::new();
+        let total = 8 + flatbuf.len();
+        piece.extend_from_slice(&(total as u32).to_le_bytes());
+        piece.extend_from_slice(&(flatbuf.len() as u32).to_le_bytes());
+        piece.extend_from_slice(flatbuf);
+        piece
+    }
+
+    #[test]
+    fn decoder_rejects_schema_id_mismatch_and_unparsable_schema() {
+        let mut encoder_a = DataEncoder::new();
+        let payload_a = encoder_a.encode(&dictionary_batch(None), 0).expect("encode A");
+        let mut decoder = DataDecoder::new();
+        decoder.decode(&payload_a).expect("learn schema A");
+
+        // A second schema encoded by a fresh encoder, with its schema piece
+        // stripped and the meta forced to `has_schema=false`, declares an id
+        // the decoder never learned.
+        let plain = int64_only_batch();
+        let mut encoder_b = DataEncoder::new();
+        let payload_b = encoder_b.encode(&plain, 1).expect("encode B");
+        let (mut corrupted, cursor) = rewrite_meta(&payload_b, false);
+        // Skip B's schema piece: parse and drop it.
+        let (_, after_schema) = read_piece(&payload_b, cursor).expect("schema piece");
+        corrupted.extend_from_slice(&payload_b[after_schema..]);
+        let error = decoder.decode(&corrupted).unwrap_err();
+        assert!(
+            error.to_string().contains("does not match declared id"),
+            "{error}"
+        );
+
+        // A schema-bearing frame whose schema flatbuffer is garbage fails to
+        // parse instead of panicking.
+        let (mut garbage, _) = rewrite_meta(&payload_b, true);
+        garbage.extend_from_slice(&craft_piece(&[0xde, 0xad, 0xbe, 0xef, 0xba, 0xad]));
+        let mut fresh_decoder = DataDecoder::new();
+        let error = fresh_decoder.decode(&garbage).unwrap_err();
+        assert!(
+            error.to_string().contains("schema decode failed"),
+            "{error}"
+        );
+    }
+
+    fn int64_only_batch() -> MessageBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("valid batch");
+        MessageBatch::new_arrow(batch)
+    }
+
+    #[test]
+    fn decoder_rejects_invalid_ipc_messages_and_stray_schema_messages() {
+        let mut encoder = DataEncoder::new();
+        let payload = encoder.encode(&dictionary_batch(None), 0).expect("encode");
+        let mut decoder = DataDecoder::new();
+        decoder.decode(&payload).expect("prime the schema cache");
+
+        // A payload whose trailing piece is not a valid IPC message.
+        let (mut garbage, _) = rewrite_meta(&payload, false);
+        garbage.extend_from_slice(&craft_piece(&[0x11, 0x22, 0x33, 0x44, 0x55]));
+        let error = decoder.decode(&garbage).unwrap_err();
+        assert!(
+            error.to_string().contains("IPC message invalid"),
+            "{error}"
+        );
+
+        // A schema message arriving without `has_schema` set is a protocol
+        // error: keep the original pieces (schema first) but claim no schema.
+        let (mut stray, _) = rewrite_meta(&payload, false);
+        stray.extend_from_slice(&payload[4 + meta_len_of(&payload)..]);
+        let error = decoder.decode(&stray).unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected schema message"),
+            "{error}"
+        );
+    }
+
+    fn meta_len_of(payload: &[u8]) -> usize {
+        u32::from_le_bytes(payload[0..4].try_into().expect("sliced")) as usize
+    }
+
+    #[test]
+    fn decoder_rejects_truncated_dictionary_and_record_batch_bodies() {
+        let mut encoder = DataEncoder::new();
+        let payload = encoder.encode(&dictionary_batch(None), 0).expect("encode");
+        let meta_len = meta_len_of(&payload);
+
+        // Collect (start, end, flatbuf_len) for every IPC piece after the
+        // meta block.
+        let mut pieces = Vec::new();
+        let mut cursor = 4 + meta_len;
+        while cursor < payload.len() {
+            let (piece, next) = read_piece(&payload, cursor).expect("piece");
+            pieces.push((cursor, next, piece.flatbuf_len));
+            cursor = next;
         }
-    }
+        // [schema, dictionary..., record batch]
+        assert!(
+            pieces.len() >= 3,
+            "expected schema, dictionary and batch pieces, got {}",
+            pieces.len()
+        );
 
-    #[async_trait::async_trait]
-    impl Ack for SpyAck {
-        async fn ack(&self) -> Result<(), Error> {
-            self.acked.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-        async fn abort(&self) -> Result<(), Error> {
-            self.aborted.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-    }
+        // Prime a decoder with the intact frame so the schema is cached.
+        let mut primed = DataDecoder::new();
+        primed.decode(&payload).expect("prime the schema cache");
 
-    fn int64_batch(values: Vec<i64>) -> crate::MessageBatchRef {
-        let schema = StdArc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
-        let columns: Vec<ArrayRef> = vec![StdArc::new(Int64Array::from(values))];
-        let batch =
-            datafusion::arrow::record_batch::RecordBatch::try_new(schema, columns)
-                .expect("batch");
-        StdArc::new(crate::MessageBatch::new_arrow(batch))
-    }
-
-    fn pump_config() -> NetworkManagerConfig {
-        NetworkManagerConfig::default()
-    }
-
-    async fn wait_for(flag: &AtomicBool, what: &str) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !flag.load(Ordering::SeqCst) {
+        // Corrupting the body of the dictionary piece (index 1) or the
+        // record batch piece (last) must fail the decode instead of yielding
+        // wrong data: Arrow validates offsets/lengths against the body.
+        // Truncating the body of the dictionary piece (index 1) or the record
+        // batch piece (last) past the IPC padding must fail the decode: the
+        // declared IPC body no longer fits inside the piece. (Mere byte
+        // corruption is NOT reliably detected — the IPC reader defers array
+        // validation — so the length contract is the enforced invariant.)
+        for index in [1, pieces.len() - 1] {
+            let (target_start, _target_end, _flatbuf_len) = pieces[index];
+            let mut rebuilt = Vec::new();
+            let mut meta: WireDataMeta =
+                serde_json::from_slice(&payload[4..4 + meta_len]).expect("meta");
+            meta.has_schema = false;
+            let meta_bytes = serde_json::to_vec(&meta).expect("meta encode");
+            rebuilt.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
+            rebuilt.extend_from_slice(&meta_bytes);
+            // Skip the schema piece (index 0): the primed decoder already
+            // cached it and a stray schema message is a different error.
+            for &(start, end, _) in pieces.iter().skip(1) {
+                let mut bytes = payload[start..end].to_vec();
+                if start == target_start && bytes.len() > 16 {
+                    let smaller = (bytes.len() - 16) as u32;
+                    bytes.truncate(smaller as usize);
+                    bytes[0..4].copy_from_slice(&smaller.to_le_bytes());
+                }
+                rebuilt.extend_from_slice(&bytes);
+            }
+            let error = primed.decode(&rebuilt).unwrap_err();
             assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
+                error.to_string().contains("decode failed")
+                    || error.to_string().contains("IPC body exceeds IPC piece"),
+                "piece {index}: {error}"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    #[test]
+    fn read_piece_rejects_flatbuf_exceeding_the_piece_length() {
+        // total = 12 but the flatbuf claims 100 bytes: structurally invalid.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&12u32.to_le_bytes());
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        let error = match read_piece(&bytes, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("a flatbuf longer than its piece must be rejected"),
+        };
+        assert!(
+            error.to_string().contains("flatbuf exceeds piece length"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
-    async fn failed_receipt_aborts_the_pending_branch() {
-        // A downstream processing failure mirrors back as a Failed receipt;
-        // the upstream aborts the branch without waiting for the barrier
-        // drain timeout.
-        let pending = PendingReceipts::new(64);
-        let spy = SpyAck::new();
-        let ack: StdArc<dyn Ack> = spy.clone();
-        let seq = pending.register(&ack, 2, None).expect("register");
-        let (failures_tx, failures_rx) = flume::unbounded::<Error>();
-        pending.apply(
-            ReceiptFrame {
-                kind: ReceiptKind::Failed,
-                seq,
-            },
-            &failures_tx,
-        );
-        wait_for(&spy.aborted, "branch abort on Failed receipt").await;
+    async fn read_frame_reports_truncated_payloads_and_idle_timeouts() {
+        let quad = quad_a_to_b();
+        let (mut client, mut server) = tokio::io::duplex(64);
+        // A header declaring 4 payload bytes, then the writer disappears.
+        let mut header = Vec::new();
+        FrameHeader {
+            quad,
+            len: 4,
+            kind: FrameKind::Signal,
+        }
+        .encode_into(&mut header);
+        client.write_all(&header).await.unwrap();
+        client.shutdown().await.unwrap();
+        let error = read_frame(&mut server).await.unwrap_err();
         assert!(
-            !spy.acked.load(Ordering::SeqCst),
-            "a Failed receipt must never acknowledge"
+            error.to_string().contains("closed while reading payload"),
+            "{error}"
         );
-        assert!(failures_rx.is_empty(), "no failure expected");
-        // The aborted sequence left the pending map: a duplicate Failed is a
-        // no-op, not an error.
-        pending.apply(
-            ReceiptFrame {
-                kind: ReceiptKind::Failed,
-                seq,
+
+        // A silent peer under a tiny idle timeout times out on the header.
+        let (_quiet_writer, quiet_reader) = tokio::io::duplex(8);
+        let error = read_frame_with_limits(
+            &mut { quiet_reader },
+            MAX_FRAME_LEN,
+            Some(std::time::Duration::from_millis(20)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("read idle timeout"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_frame_with_limit_rejects_oversized_payloads() {
+        let (mut client, _server) = tokio::io::duplex(64);
+        let error = write_frame_with_limit(
+            &mut client,
+            quad_a_to_b(),
+            FrameKind::Signal,
+            b"0123456789abcdef",
+            8,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the 8 limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn plaintext_transport_constructor_sets_fields() {
+        let transport = TcpEdgeTransport::plaintext("127.0.0.1:9000".parse().unwrap(), 3);
+        assert_eq!(transport.addr.port(), 9000);
+        assert_eq!(transport.max_attempts, 3);
+        assert!(transport.tls.is_none());
+    }
+
+    #[test]
+    fn tls_rejects_an_unparsable_fleet_ca() {
+        let (nodes, _ca) = generate_fleet_material();
+        let (cert, key) = &nodes[0];
+        // A syntactically valid PEM block whose DER payload is garbage: the
+        // CA store ends up empty and startup must fail explicitly.
+        let junk_ca = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let error = match DataPlaneTlsConfig::from_pem(cert, key, junk_ca) {
+            Err(error) => error,
+            Ok(_) => panic!("an unparsable fleet CA must be rejected"),
+        };
+        assert!(
+            error.to_string().contains("no parsable certificates"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn network_config_validation_rejects_invalid_limits() {
+        let invalid = |config: NetworkManagerConfig, what: &str| {
+            assert!(config.validate().is_err(), "{what} must be rejected");
+        };
+        invalid(
+            NetworkManagerConfig {
+                channel_capacity: 0,
+                ..Default::default()
             },
-            &failures_tx,
+            "a zero channel capacity",
         );
-        assert!(failures_rx.is_empty());
+        invalid(
+            NetworkManagerConfig {
+                max_frame_len: 0,
+                ..Default::default()
+            },
+            "a zero frame limit",
+        );
+        let error = NetworkManagerConfig {
+            max_frame_len: MAX_FRAME_LEN + 1,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("must not exceed"),
+            "{error}"
+        );
+        invalid(
+            NetworkManagerConfig {
+                read_idle_timeout: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            "a zero read idle timeout",
+        );
+        invalid(
+            NetworkManagerConfig {
+                reconnect_grace: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            "a zero reconnect grace",
+        );
+        invalid(
+            NetworkManagerConfig {
+                registration_grace: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            "a zero registration grace",
+        );
+        invalid(
+            NetworkManagerConfig {
+                handshake_replay_ttl: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            "a zero replay TTL",
+        );
+        let error = NetworkManagerConfig {
+            credentials: Some(DataPlaneCredentials::new("  ", "s").unwrap()),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("local_node must not be empty"),
+            "{error}"
+        );
+        assert!(NetworkManagerConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn trace_context_extraction_rejects_unparsable_values() {
+        assert!(extract_trace_context("garbage").is_none());
+        assert!(extract_trace_context("").is_none());
+        let valid = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        assert!(extract_trace_context(valid).is_some());
+    }
+
+    // ---------- pending receipt / ack lifecycle coverage ----------
+
+    /// An acknowledgement whose lifecycle calls always fail.
+    struct FailingLifecycleAck;
+
+    #[async_trait::async_trait]
+    impl crate::input::Ack for FailingLifecycleAck {
+        async fn ack(&self) -> Result<(), Error> {
+            Err(Error::Process("ack boom".into()))
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            Err(Error::Process("abort boom".into()))
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn wire_write_failure_aborts_the_registered_branch() {
-        let quad = Quad {
-            src_op: 1,
-            src_subtask: 0,
-            dst_op: 2,
-            dst_subtask: 0,
-        };
-        let pending = Arc::new(PendingReceipts::new(64));
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        // The reader is gone, so once the 64 KiB BufWriter overflows the
-        // write must hit the closed connection.
-        let (writer, _reader) = tokio::io::duplex(1024);
-        drop(_reader);
-        let (tx, rx) = flume::bounded::<Envelope>(1);
+    async fn failing_branch_lifecycles_surface_as_failures() {
+        let pending = PendingReceipts::new(64);
+        let (failures_tx, failures_rx) = flume::unbounded::<Error>();
 
-        // Large enough that the encoded frame cannot fit in the BufWriter.
-        let batch = int64_batch((0..50_000).collect());
-        let ack = SpyAck::new();
-        tx.send_async(Envelope::Data(batch, ack.clone()))
+        let seq = pending
+            .register(&(Arc::new(FailingLifecycleAck) as Arc<dyn crate::input::Ack>), 1, None)
+            .expect("register");
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Acked,
+                seq,
+            },
+            &failures_tx,
+        );
+        let failure = recv_within(&failures_rx, std::time::Duration::from_secs(5)).await;
+        assert!(
+            failure.contains("branch acknowledgement failed"),
+            "{failure}"
+        );
+
+        let seq = pending
+            .register(&(Arc::new(FailingLifecycleAck) as Arc<dyn crate::input::Ack>), 1, None)
+            .expect("register");
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Failed,
+                seq,
+            },
+            &failures_tx,
+        );
+        let failure = recv_within(&failures_rx, std::time::Duration::from_secs(5)).await;
+        assert!(failure.contains("branch abort failed"), "{failure}");
+    }
+
+    async fn recv_within(receiver: &flume::Receiver<Error>, budget: std::time::Duration) -> String {
+        tokio::time::timeout(budget, receiver.recv_async())
             .await
-            .expect("send");
-        drop(tx);
+            .expect("failure within timeout")
+            .expect("failure channel open")
+            .to_string()
+    }
 
+    #[tokio::test]
+    async fn remote_ack_abort_on_a_dead_outbox_reports_failure() {
+        let (outbox, _outbox_rx) = flume::unbounded::<(Quad, ReceiptFrame)>();
+        drop(_outbox_rx);
+        let (failures, _failure_rx) = flume::unbounded::<Error>();
+        let ack = RemoteAck {
+            outbox,
+            quad: quad_a_to_b(),
+            seq: 9,
+            failures,
+        };
+        let error = ack.abort().await.unwrap_err();
+        assert!(
+            error.to_string().contains("receipt channel closed"),
+            "{error}"
+        );
+    }
+
+    // ---------- session receipt routing coverage ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_receipt_forwarder_retries_until_a_live_writer_appears() {
+        let manager = NetworkManager::new(8);
+        let quad = quad_a_to_b();
+        let key = EdgeSessionKey::for_job("route-job", 1, quad);
+
+        // No writer installed yet: the forwarder parks and retries.
+        let queue = manager.session_receipt_route(&key);
+        queue
+            .send_async((
+                quad,
+                ReceiptFrame {
+                    kind: ReceiptKind::Acked,
+                    seq: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // A dead writer slot is retried past as well.
+        let (dead_tx, dead_rx) = flume::bounded::<(Quad, ReceiptFrame)>(1);
+        drop(dead_rx);
+        manager.set_session_receipt_writer(&key, Some(dead_tx));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // A live writer drains the queued receipt.
+        let (live_tx, live_rx) = flume::bounded::<(Quad, ReceiptFrame)>(1);
+        manager.set_session_receipt_writer(&key, Some(live_tx));
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), live_rx.recv_async())
+            .await
+            .expect("receipt forwarded within timeout")
+            .expect("writer channel open");
+        assert_eq!(received.1.seq, 0);
+
+        // Clearing an unknown key is a no-op; clearing routes cancels the
+        // forwarder task.
+        let (foreign_tx, _foreign_rx) = flume::bounded::<(Quad, ReceiptFrame)>(1);
+        manager.clear_session_receipt_writer_if_owned(
+            &EdgeSessionKey::for_job("other-job", 1, quad),
+            &foreign_tx,
+        );
+        manager.remove_session_receipt_route(&key);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn legacy_failure_receiver_is_process_wide() {
+        let manager = NetworkManager::new(8);
+        // Without credentials the per-Job receiver falls back to the shared
+        // process-wide channel.
+        let failures = manager.failure_receiver_for_job("legacy", 4);
+        manager.report_failure(Error::Process("legacy failure".into()));
+        let failure = failures.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            failure.to_string().contains("legacy failure"),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn tls_config_accessor_reflects_the_configuration() {
+        assert!(NetworkManager::new(8).tls_config().is_none());
+        let (nodes, ca) = generate_fleet_material();
+        let (cert, key) = &nodes[0];
+        let manager = NetworkManager::with_config(NetworkManagerConfig {
+            credentials: Some(
+                DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap(),
+            ),
+            tls: Some(DataPlaneTlsConfig::from_pem(cert, key, &ca).unwrap()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(manager.tls_config().is_some());
+    }
+
+    #[tokio::test]
+    async fn accept_stream_enforces_the_connection_limit() {
+        let manager = NetworkManager::with_config(NetworkManagerConfig {
+            max_connections: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let failures = manager.failure_receiver();
+        let (_c1, s1) = tokio::io::duplex(64);
+        manager.accept_stream(Box::new(s1));
+        let (_c2, s2) = tokio::io::duplex(64);
+        manager.accept_stream(Box::new(s2));
+        let failure = failures.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            failure.to_string().contains("accepted-connection limit 1 reached"),
+            "{failure}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eager_open_edge_connects_through_the_transport() {
+        let downstream = NetworkManager::new(8);
+        downstream.spawn();
+        let quad = quad_a_to_b();
+        let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+        downstream.register_inbound(quad, input_tx);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(server));
+        let transport = QueuedTransport::of(vec![Box::new(client)]);
+        let upstream = NetworkManager::new(8);
+        upstream.spawn();
+        let edge = upstream
+            .open_edge(&*transport, quad)
+            .await
+            .expect("eager edge opens over the queued transport");
+        edge.sender
+            .send_async(Envelope::Eos)
+            .await
+            .expect("edge accepts envelopes");
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    #[tokio::test]
+    async fn authenticated_edges_require_credentials() {
+        let manager = NetworkManager::new(8);
+        let transport: Arc<dyn EdgeTransport> = QueuedTransport::of(vec![]);
+        let error = match manager.open_edge_deferred_for_session(
+            transport.clone(),
+            quad_a_to_b(),
+            "node-b".into(),
+            "job".into(),
+            1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an unauthenticated manager must refuse a session edge"),
+        };
+        assert!(
+            error.to_string().contains("without data-plane credentials"),
+            "{error}"
+        );
+        let error = match manager.open_edge_deferred_for_job(
+            transport,
+            quad_a_to_b(),
+            "node-b".into(),
+            "job".into(),
+            1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an unauthenticated manager must refuse a job edge"),
+        };
+        assert!(
+            error.to_string().contains("without data-plane credentials"),
+            "{error}"
+        );
+    }
+
+    /// A transport whose `connect` blocks until the test releases a gate, so
+    /// a deferred edge's attach can be observed after job-session teardown.
+    struct GatedTransport {
+        gate: Arc<tokio::sync::Mutex<()>>,
+        stream: tokio::sync::Mutex<Option<Box<dyn RemoteStream>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EdgeTransport for GatedTransport {
+        async fn connect(&self, _quad: Quad) -> Result<Box<dyn RemoteStream>, Error> {
+            let _guard = self.gate.lock().await;
+            self.stream
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| Error::Process("gated transport exhausted".into()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_attach_after_job_removal_aborts_without_recreating_state() {
+        let downstream = authenticated_manager("node-b", "shuffle-secret");
+        let quad = quad_a_to_b();
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let _hold = gate.clone().lock_owned().await;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let transport = Arc::new(GatedTransport {
+            gate: gate.clone(),
+            stream: tokio::sync::Mutex::new(Some(Box::new(client))),
+        });
+        let _server_kept = server;
+        let edge = downstream
+            .open_edge_deferred_for_session(
+                transport.clone(),
+                quad,
+                "node-a".into(),
+                "late-attach-job".into(),
+                1,
+            )
+            .expect("deferred authenticated edge");
+        // Create session-scoped routing state for the job, then tear the job
+        // session down while the deferred connect is still parked.
+        let key = EdgeSessionKey::for_job("late-attach-job", 1, quad);
+        let _route = downstream.session_receipt_route(&key);
+        let failures = downstream.failure_receiver_for_job("late-attach-job", 1);
+        downstream.remove_job_session("late-attach-job", 1);
+        assert!(job_session_state_is_cleared(&downstream));
+        drop(_hold); // release the connect
+        // The edge fails closed: the sender errors once the aborted receiver
+        // is dropped by the attach path.
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
+            loop {
+                if edge
+                    .sender
+                    .send_async(Envelope::Eos)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("edge must fail closed after job removal");
+        // No failure may land in the recreated per-Job channel: the Job is
+        // gone and its state must not be resurrected.
+        if let Ok(Ok(failure)) = tokio::time::timeout(std::time::Duration::from_secs(2), failures.recv_async()).await {
+            panic!("unexpected late failure: {failure}");
+        }
+        downstream.shutdown();
+    }
+
+    fn job_session_state_is_cleared(manager: &NetworkManager) -> bool {
+        manager.inbound.read().unwrap().is_empty()
+            && manager.failure_channels.read().unwrap().is_empty()
+    }
+
+    // ---------- connection supervision coverage ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_replay_flush_failure_fails_the_edge_closed() {
+        let quad = quad_a_to_b();
+        let reconnect = NetworkManagerConfig {
+            reconnect_attempts: 2,
+            reconnect_grace: std::time::Duration::from_millis(200),
+            ..Default::default()
+        };
+        let upstream = NetworkManager::with_config(reconnect.clone()).unwrap();
+        let downstream = NetworkManager::with_config(reconnect).unwrap();
+        upstream.spawn();
+        downstream.spawn();
+        let failures = upstream.failure_receiver();
+
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        downstream.register_inbound(quad, input_tx);
+
+        let (client1, server1) = tokio::io::duplex(64 * 1024);
+        let kill1 = KillHandle::default();
+        let kill_state = kill1.0.clone();
+        downstream.accept_stream(Box::new(KillableStream {
+            inner: Box::new(server1),
+            state: kill_state,
+        }));
+        // The second connection dials into a stream whose peer is gone: the
+        // replay flush fails and the edge fails closed.
+        let (client2, server2) = tokio::io::duplex(64 * 1024);
+        drop(server2);
+        let transport = QueuedTransport::of(vec![Box::new(client1), Box::new(client2)]);
+        let edge = upstream.open_edge_deferred(transport, quad);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let branch = Arc::new(RecordingAck::default());
+        edge.sender
+            .send_async(Envelope::Data(
+                Arc::new(dictionary_batch(None)),
+                branch.clone(),
+            ))
+            .await
+            .unwrap();
+        let _ = next_envelope(&input_rx).await;
+        kill1.kill();
+
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
+            while !branch.aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the unreplayable branch must abort");
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+        assert!(
+            failure.contains("replay flush failed") || failure.contains("reconnect"),
+            "{failure}"
+        );
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    /// A stream whose reads never complete and whose writes always fail:
+    /// isolates the pump's flush-tick failure exit.
+    struct DeadWriteStream;
+
+    impl AsyncRead for DeadWriteStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for DeadWriteStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "dead write",
+            )))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "dead flush",
+            )))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pump_flush_tick_failure_fails_the_edge() {
+        let manager = NetworkManager::new(8);
+        manager.spawn();
+        let quad = quad_a_to_b();
+        let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+        manager.register_inbound(quad, input_tx);
+        // A plaintext (unauthenticated) edge: the pump has no handshake to
+        // write, so the first failure comes from the flush tick.
+        let edge = manager.open_edge_with_stream(Box::new(DeadWriteStream), quad);
+        let failures = manager.failure_receiver();
+        let _ = edge;
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+        assert!(
+            failure.contains("flush failed"),
+            "{failure}"
+        );
+        manager.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticated_handshake_flush_failure_fails_the_edge() {
+        let manager = authenticated_manager("node-a", "shuffle-secret");
+        manager.spawn();
+        let quad = quad_a_to_b();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        drop(server);
+        let failures = manager.failure_receiver_for_job("flush-job", 1);
+        let _edge = manager
+            .open_edge_with_stream_for_session(Box::new(client), quad, "node-b", "flush-job", 1)
+            .unwrap();
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+        assert!(
+            failure.contains("handshake flush failed"),
+            "{failure}"
+        );
+        manager.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pump_register_rejection_with_failing_abort_combines_errors() {
+        let quad = quad_a_to_b();
+        let config = NetworkManagerConfig {
+            max_pending_receipts: 1,
+            ..Default::default()
+        };
+        let pending = Arc::new(PendingReceipts::new(1));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (writer, _reader) = tokio::io::duplex(64 * 1024);
+        let (tx, rx) = flume::bounded::<Envelope>(4);
+        let first = Arc::new(RecordingAck::default());
+        tx.send_async(Envelope::Data(
+            Arc::new(dictionary_batch(None)),
+            first.clone(),
+        ))
+        .await
+        .unwrap();
+        tx.send_async(Envelope::Data(
+            Arc::new(dictionary_batch(None)),
+            Arc::new(FailingLifecycleAck),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
         let result = pump_edge(
             rx,
             writer,
             quad,
             pending,
             shutdown,
-            pump_config(),
+            config,
             None,
             false,
         )
         .await;
-
-        assert!(result.is_err(), "pump must fail on a wire write error");
-        wait_for(&ack.aborted, "branch abort on wire failure").await;
+        let error = result.unwrap_err();
         assert!(
-            !ack.acked.load(Ordering::SeqCst),
-            "a void write must never be acknowledged"
+            error
+                .to_string()
+                .contains("failed to abort batch rejected by pending receipt limit"),
+            "{error}"
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn shutdown_aborts_unreceipted_branches_after_flushing() {
-        let quad = Quad {
-            src_op: 1,
-            src_subtask: 0,
-            dst_op: 2,
-            dst_subtask: 0,
+    async fn receipt_channel_rejects_protocol_violations() {
+        let quad = quad_a_to_b();
+        let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+        let auth = credentials.session("node-b", "rcv-job", 1, quad);
+        let config = NetworkManagerConfig {
+            read_idle_timeout: std::time::Duration::from_secs(2),
+            ..Default::default()
         };
-        let pending = Arc::new(PendingReceipts::new(64));
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let (writer, mut reader) = tokio::io::duplex(128 * 1024);
-        let (tx, rx) = flume::bounded::<Envelope>(1);
 
-        // Larger than duplex + BufWriter capacity: the pump parks inside
-        // write_all after registering, so "registered" is observable.
-        let batch = int64_batch((0..50_000).collect());
-        let ack = SpyAck::new();
-        tx.send_async(Envelope::Data(batch, ack.clone()))
-            .await
-            .expect("send");
-        // Keep the sender alive for the whole test: with it dropped the pump
-        // would exit through the drained-channel path (which defers the
-        // abort sweep to the connection's receipt read loop), and this test
-        // drives `pump_edge` standalone, pinning the shutdown exit instead.
-
-        let pump = tokio::spawn(pump_edge(
-            rx,
-            writer,
-            quad,
-            pending.clone(),
-            shutdown.clone(),
-            pump_config(),
-            None,
-            false,
-        ));
-
-        // Deterministic readiness: the branch is registered before the frame
-        // is written, so a non-empty pending map proves registration happened.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        while pending.is_empty() {
+        // (a) A receipt before the handshake acknowledgement.
+        {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let receipt = serde_json::to_vec(&ReceiptFrame {
+                kind: ReceiptKind::Acked,
+                seq: 0,
+            })
+            .unwrap();
+            // Frames are written up front (the duplex buffers them) and the
+            // peer half stays alive until the harness settles, so the pump's
+            // own handshake write cannot race a dropped peer.
+            write_frame(&mut server, quad, FrameKind::Receipt, &receipt)
+                .await
+                .unwrap();
+            let (_pump, read) =
+                run_receipt_harness(Box::new(client), quad, Some(auth.clone()), config.clone()).await;
+            drop(server);
+            let error = read.unwrap_err();
             assert!(
-                tokio::time::Instant::now() < deadline,
-                "pump never registered the branch"
+                error
+                    .to_string()
+                    .contains("arrived before handshake acknowledgement"),
+                "{error}"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        // Consume the frame so the blocked write completes: the delivery is
-        // now on the wire, but no receipt will ever be sent back for it.
-        let (header, _payload) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut reader))
+        // (b) A malformed receipt after a valid acknowledgement.
+        {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let request = auth.client_handshake().unwrap();
+            let ack = auth.server_ack(&request, "node-b");
+            let ack_payload = serde_json::to_vec(&ack).unwrap();
+            write_frame(&mut server, quad, FrameKind::Handshake, &ack_payload)
                 .await
-                .expect("frame arrives")
-                .expect("frame decodes");
-        assert_eq!(header.kind, FrameKind::Data);
+                .unwrap();
+            write_frame(&mut server, quad, FrameKind::Receipt, b"not json")
+                .await
+                .unwrap();
+            let (_pump, read) =
+                run_receipt_harness(Box::new(client), quad, Some(auth.clone()), config.clone()).await;
+            drop(server);
+            let error = read.unwrap_err();
+            assert!(
+                error.to_string().contains("receipt frame malformed"),
+                "{error}"
+            );
+        }
 
-        shutdown.cancel();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), pump)
+        // (c) A data frame on the receipt channel.
+        {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let request = auth.client_handshake().unwrap();
+            let ack = auth.server_ack(&request, "node-b");
+            let ack_payload = serde_json::to_vec(&ack).unwrap();
+            write_frame(&mut server, quad, FrameKind::Handshake, &ack_payload)
+                .await
+                .unwrap();
+            write_frame(&mut server, quad, FrameKind::Data, b"stray")
+                .await
+                .unwrap();
+            let (_pump, read) =
+                run_receipt_harness(Box::new(client), quad, Some(auth), config).await;
+            drop(server);
+            let error = read.unwrap_err();
+            assert!(
+                error.to_string().contains("unexpected Data frame on a receipt channel"),
+                "{error}"
+            );
+        }
+    }
+
+    /// Drive `run_edge_connection` over a drained envelope channel and return
+    /// its (pump, read) results.
+    async fn run_receipt_harness(
+        client: Box<dyn RemoteStream>,
+        quad: Quad,
+        auth: Option<SessionAuth>,
+        config: NetworkManagerConfig,
+    ) -> (Result<(), Error>, Result<(), Error>) {
+        let (tx, rx) = flume::bounded::<Envelope>(1);
+        drop(tx);
+        let pending = Arc::new(PendingReceipts::new(64));
+        let (failures_tx, _failures_rx) = flume::unbounded::<Error>();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, run_edge_connection(
+            client,
+            quad,
+            rx,
+            pending,
+            config,
+            auth,
+            false,
+            failures_tx,
+            &shutdown,
+        ))
+        .await
+        .expect("connection harness settles within timeout")
+    }
+
+    // ---------- inbound serve-loop error coverage ----------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_handshake_and_quad_mismatch_fail_closed() {
+        let quad = quad_a_to_b();
+        let downstream = authenticated_manager("node-b", "shuffle-secret");
+        downstream.spawn();
+        let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "hs-job".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let failures = downstream.failure_receiver_for_job("hs-job", 1);
+
+        let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+        let auth = credentials.session("node-b", "hs-job", 1, quad);
+
+        // A second handshake frame on an authenticated connection.
+        let (mut client1, server1) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(server1));
+        let request = serde_json::to_vec(&auth.client_handshake().unwrap()).unwrap();
+        write_frame(&mut client1, quad, FrameKind::Handshake, &request)
             .await
-            .expect("pump exits after cancellation")
-            .expect("join");
-        assert!(result.is_ok(), "cancellation is a clean pump exit");
-
-        wait_for(&ack.aborted, "branch abort on shutdown").await;
+            .unwrap();
+        // Drain the server's acknowledgement before sending the duplicate.
+        let (_ack_header, _ack_payload) = read_frame(&mut client1).await.unwrap();
+        write_frame(&mut client1, quad, FrameKind::Handshake, &request)
+            .await
+            .unwrap();
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
         assert!(
-            !ack.acked.load(Ordering::SeqCst),
-            "an unacknowledged delivery must never complete"
+            failure.to_string().contains("duplicate remote edge handshake"),
+            "{failure}"
+        );
+
+        // A data frame for a different quad than the authenticated one.
+        let wrong_quad = Quad {
+            dst_subtask: quad.dst_subtask + 1,
+            ..quad
+        };
+        let (mut client2, server2) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(server2));
+        // A fresh handshake: the server's nonce cache rejects replayed ones.
+        let fresh_request = serde_json::to_vec(&auth.client_handshake().unwrap()).unwrap();
+        write_frame(&mut client2, quad, FrameKind::Handshake, &fresh_request)
+            .await
+            .unwrap();
+        let (_ack_header, _ack_payload) = read_frame(&mut client2).await.unwrap();
+        write_frame(
+            &mut client2,
+            wrong_quad,
+            FrameKind::Signal,
+            serde_json::to_vec(&WireSignal::Eos).unwrap().as_slice(),
+        )
+        .await
+        .unwrap();
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+        assert!(
+            failure.to_string().contains("does not match authenticated quad"),
+            "{failure}"
+        );
+        downstream.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inbound_protocol_violations_fail_the_connection() {
+        let quad = quad_a_to_b();
+        let config = NetworkManagerConfig {
+            registration_grace: std::time::Duration::from_millis(100),
+            reconnect_attempts: 0,
+            ..Default::default()
+        };
+        let manager = NetworkManager::with_config(config).unwrap();
+        manager.spawn();
+        let failures = manager.failure_receiver();
+
+        // An unregistered quad: the registration grace expires and the frame
+        // is rejected.
+        let (mut client1, server1) = tokio::io::duplex(64 * 1024);
+        manager.accept_stream(Box::new(server1));
+        write_frame(&mut client1, quad, FrameKind::Signal, b"{}")
+            .await
+            .unwrap();
+        let failure = recv_within(&failures, std::time::Duration::from_secs(5)).await;
+        assert!(
+            failure.to_string().contains("inbound frame for unregistered quad"),
+            "{failure}"
+        );
+
+        // Registered quads, garbage payloads: data and signal frames are
+        // rejected as decode failures, receipts are rejected outright. Each
+        // sub-case uses a fresh quad so a prior connection's cleanup cannot
+        // deregister the route mid-test.
+        let quad_b = Quad {
+            dst_op: quad.dst_op + 1,
+            ..quad
+        };
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        manager.register_inbound(quad_b, input_tx);
+
+        let (mut client2, server2) = tokio::io::duplex(64 * 1024);
+        manager.accept_stream(Box::new(server2));
+        write_frame(&mut client2, quad_b, FrameKind::Data, b"garbage")
+            .await
+            .unwrap();
+        let failure = recv_within(&failures, std::time::Duration::from_secs(5)).await;
+        assert!(
+            failure.to_string().contains("inbound data frame decode failed"),
+            "{failure}"
+        );
+
+        let quad_c = Quad {
+            dst_op: quad.dst_op + 2,
+            ..quad
+        };
+        let (input_tx3, _input_rx3) = flume::bounded::<Envelope>(8);
+        manager.register_inbound(quad_c, input_tx3);
+        let (mut client3, server3) = tokio::io::duplex(64 * 1024);
+        manager.accept_stream(Box::new(server3));
+        write_frame(&mut client3, quad_c, FrameKind::Signal, b"garbage")
+            .await
+            .unwrap();
+        let failure = recv_within(&failures, std::time::Duration::from_secs(5)).await;
+        assert!(
+            failure.to_string().contains("inbound signal frame malformed"),
+            "{failure}"
+        );
+
+        let quad_d = Quad {
+            dst_op: quad.dst_op + 3,
+            ..quad
+        };
+        let (input_tx4, _input_rx4) = flume::bounded::<Envelope>(8);
+        manager.register_inbound(quad_d, input_tx4);
+        let (mut client4, server4) = tokio::io::duplex(64 * 1024);
+        manager.accept_stream(Box::new(server4));
+        write_frame(
+            &mut client4,
+            quad_d,
+            FrameKind::Receipt,
+            serde_json::to_vec(&ReceiptFrame {
+                kind: ReceiptKind::Acked,
+                seq: 0,
+            })
+            .unwrap()
+            .as_slice(),
+        )
+        .await
+        .unwrap();
+        let failure = recv_within(&failures, std::time::Duration::from_secs(5)).await;
+        assert!(
+            failure
+                .to_string()
+                .contains("receipt frame on an inbound (downstream) connection"),
+            "{failure}"
+        );
+        drop(input_rx);
+        manager.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_chain_death_breaks_the_edge_and_reports_midstream_loss() {
+        let quad = quad_a_to_b();
+        let manager = NetworkManager::with_config(NetworkManagerConfig {
+            reconnect_attempts: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        manager.spawn();
+        let failures = manager.failure_receiver();
+
+        // The local chain vanishes: the serve loop's channel send fails and
+        // the connection ends reporting an upstream death without Eos.
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        manager.register_inbound(quad, input_tx);
+        drop(input_rx);
+        let mut encoder = DataEncoder::new();
+        let data_payload = encoder.encode(&dictionary_batch(None), 0).unwrap();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        manager.accept_stream(Box::new(server));
+        write_frame(&mut client, quad, FrameKind::Data, &data_payload)
+            .await
+            .unwrap();
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+        assert!(
+            failure.to_string().contains("ended without Eos"),
+            "{failure}"
+        );
+
+        // A non-Eos signal onto a dead local chain breaks cleanly too (an
+        // Eos would mark the quad complete and report nothing).
+        let (input_tx2, input_rx2) = flume::bounded::<Envelope>(8);
+        manager.register_inbound(quad, input_tx2);
+        drop(input_rx2);
+        let (mut client2, server2) = tokio::io::duplex(64 * 1024);
+        manager.accept_stream(Box::new(server2));
+        write_frame(
+            &mut client2,
+            quad,
+            FrameKind::Signal,
+            serde_json::to_vec(&WireSignal::Watermark(1)).unwrap().as_slice(),
+        )
+        .await
+        .unwrap();
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+        assert!(
+            failure.to_string().contains("ended without Eos"),
+            "{failure}"
+        );
+        manager.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deferred_loss_watcher_stops_at_shutdown_without_reporting() {
+        let quad = quad_a_to_b();
+        let manager = NetworkManager::with_config(NetworkManagerConfig {
+            reconnect_grace: std::time::Duration::from_millis(300),
+            ..Default::default()
+        })
+        .unwrap();
+        manager.spawn();
+        let failures = manager.failure_receiver();
+        let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+        manager.register_inbound(quad, input_tx);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        manager.accept_stream(Box::new(server));
+        write_frame(
+            &mut client,
+            quad,
+            FrameKind::Signal,
+            serde_json::to_vec(&WireSignal::Eos).unwrap().as_slice(),
+        )
+        .await
+        .unwrap();
+        client.shutdown().await.unwrap();
+        // The peer closed without Eos reaching any served quad? Eos was
+        // forwarded, so this close is clean; instead simulate a mid-stream
+        // death by registering a second quad that never sees Eos.
+        let quad2 = Quad {
+            dst_op: quad.dst_op + 1,
+            ..quad
+        };
+        let (input_tx2, _input_rx2) = flume::bounded::<Envelope>(8);
+        manager.register_inbound(quad2, input_tx2);
+        let (mut client2, server2) = tokio::io::duplex(64 * 1024);
+        manager.accept_stream(Box::new(server2));
+        let mut encoder = DataEncoder::new();
+        let data_payload = encoder.encode(&dictionary_batch(None), 0).unwrap();
+        write_frame(&mut client2, quad2, FrameKind::Data, &data_payload)
+            .await
+            .unwrap();
+        drop(client2);
+        // Shut the manager down inside the grace window: the deferred loss
+        // watcher must not report a failure afterwards.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        manager.shutdown();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(600), failures.recv_async())
+                .await
+                .is_err(),
+            "shutdown must suppress the deferred loss report"
         );
     }
 
     #[tokio::test]
-    async fn acked_receipt_completes_the_branch_and_clears_pending() {
-        let pending = Arc::new(PendingReceipts::new(64));
-        let spy = SpyAck::new();
-        let ack: StdArc<dyn Ack> = spy.clone();
-        let seq = pending.register(&ack, 1, None).expect("register within limits");
-        let (failures_tx, _failures_rx) = flume::bounded::<Error>(8);
-
-        pending.apply(ReceiptFrame { kind: ReceiptKind::Acked, seq }, &failures_tx);
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !spy.acked.load(Ordering::SeqCst) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "branch was never acknowledged"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+    async fn authorize_inbound_rejects_identity_drift() {
+        let quad = quad_a_to_b();
+        let downstream = authenticated_manager("node-b", "shuffle-secret");
+        let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+        let auth = credentials.session("node-b", "id-job", 1, quad);
+        let mut request = auth.client_handshake().unwrap();
+        // A protocol-version drift is rejected by the identity check before
+        // any MAC or registry work.
+        request.protocol_version = DATA_PLANE_PROTOCOL_VERSION + 1;
+        let payload = serde_json::to_vec(&request).unwrap();
+        let header = FrameHeader {
+            quad,
+            len: payload.len() as u32,
+            kind: FrameKind::Handshake,
+        };
+        let error = match downstream.authorize_inbound(header, &payload).await {
+            Err(error) => error,
+            Ok(_) => panic!("a drifted handshake identity must be rejected"),
+        };
         assert!(
-            pending.is_empty(),
-            "completed receipts leave no pending entries"
-        );
-        assert!(
-            !spy.aborted.load(Ordering::SeqCst),
-            "an acknowledged branch must not be aborted"
+            error.to_string().contains("protocol or identity mismatch"),
+            "{error}"
         );
     }
 
-    /// A drained channel is a clean exit where the connection survives: the
-    /// pump must leave registered branches alone so a late receipt arriving
-    /// through the (still running) receipt read loop acks them normally
-    /// instead of replaying already-delivered frames.
+    /// Authenticated transparent reconnect currently fails closed: the
+    /// reconnect path writes the session handshake twice on the new wire —
+    /// once by `replay_pending` and again by `pump_edge`'s startup handshake —
+    /// and the peer's duplicate-handshake guard tears the connection down.
+    /// The edge then exhausts its redial budget and fails closed (branches
+    /// abort, failure surfaces), which is the safe outcome; the double
+    /// handshake itself is a product defect this test pins observably.
     #[tokio::test(flavor = "multi_thread")]
-    async fn drained_channel_exit_keeps_pending_for_late_receipts() {
-        let quad = Quad {
-            src_op: 1,
-            src_subtask: 0,
-            dst_op: 2,
-            dst_subtask: 0,
+    async fn authenticated_reconnect_currently_fails_closed_after_handshake_duplication() {
+        let quad = quad_a_to_b();
+        let node_config = |node: &str| NetworkManagerConfig {
+            credentials: Some(DataPlaneCredentials::new(node, "shuffle-secret").unwrap()),
+            registration_grace: std::time::Duration::from_millis(100),
+            reconnect_grace: std::time::Duration::from_millis(800),
+            reconnect_attempts: 2,
+            ..Default::default()
         };
-        let pending = Arc::new(PendingReceipts::new(64));
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let (writer, mut reader) = tokio::io::duplex(128 * 1024);
-        let (tx, rx) = flume::bounded::<Envelope>(1);
+        let upstream = NetworkManager::with_config(node_config("node-a")).unwrap();
+        let downstream = NetworkManager::with_config(node_config("node-b")).unwrap();
+        upstream.spawn();
+        downstream.spawn();
+        let failures = upstream.failure_receiver_for_job("auth-rc-job", 2);
 
-        let batch = int64_batch((0..100).collect());
-        let ack = SpyAck::new();
-        tx.send_async(Envelope::Data(batch, ack.clone()))
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "auth-rc-job".into(),
+                    generation: 2,
+                },
+            )
+            .unwrap();
+
+        let (client1, server1) = tokio::io::duplex(64 * 1024);
+        let (client2, server2) = tokio::io::duplex(64 * 1024);
+        let kill1 = KillHandle::default();
+        let kill_state = kill1.0.clone();
+        downstream.accept_stream(Box::new(KillableStream {
+            inner: Box::new(server1),
+            state: kill_state,
+        }));
+        downstream.accept_stream(Box::new(server2));
+        let transport = QueuedTransport::of(vec![Box::new(client1), Box::new(client2)]);
+        let edge = upstream
+            .open_edge_deferred_for_session(
+                transport,
+                quad,
+                "node-b".into(),
+                "auth-rc-job".into(),
+                2,
+            )
+            .expect("deferred authenticated edge");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let branch = Arc::new(RecordingAck::default());
+        edge.sender
+            .send_async(Envelope::Data(
+                Arc::new(dictionary_batch(Some("auth-rc"))),
+                branch.clone(),
+            ))
             .await
-            .expect("send");
-        drop(tx);
+            .unwrap();
+        let delivered = next_envelope(&input_rx).await;
+        let Envelope::Data(_batch, _ack) = delivered else {
+            panic!("expected a data envelope");
+        };
+        kill1.kill();
 
-        let pending_for_pump = pending.clone();
-        let pump = tokio::spawn(pump_edge(
-            rx,
-            writer,
-            quad,
-            pending_for_pump,
-            shutdown,
-            pump_config(),
-            None,
-            false,
-        ));
-
-        // The pump registers the branch, writes the frame, then observes the
-        // sender drop and exits cleanly with the branch still registered.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), pump)
-            .await
-            .expect("pump exits after drain")
-            .expect("join");
-        assert!(result.is_ok(), "a drained channel is a clean pump exit");
+        // The redial budget exhausts and the edge fails closed.
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
+            while !branch.aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the unrecoverable branch must abort");
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
         assert!(
-            !pending.is_empty(),
-            "a drained exit must not abort registered branches"
+            failure.contains("reconnect"),
+            "expected the reconnect budget failure, got: {failure}"
         );
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    // ---------- remaining supervision / registry coverage ----------
+
+    /// A stream whose writes fail (reads keep working) after `kill` is set,
+    /// isolating the receipt writer's write-failure exit without tearing the
+    /// read half down at the same time.
+    struct WriteKillStream {
+        inner: Box<dyn RemoteStream>,
+        killed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AsyncRead for WriteKillStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for WriteKillStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self
+                .killed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "write killed",
+                )));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A stream whose writes always fail while flushes succeed, so the pump's
+    /// periodic flush tick cannot mask the per-frame write failure.
+    struct WriteFailStream;
+
+    impl AsyncRead for WriteFailStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for WriteFailStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "write failed",
+            )))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_transport_reports_failure_after_the_attempt_budget() {
+        // Bind, note the port, and drop the listener: the port is (in
+        // practice) unbound, so both attempts are refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let transport = TcpEdgeTransport::plaintext(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            2,
+        );
+        let error = match transport.connect(quad_a_to_b()).await {
+            Err(error) => error,
+            Ok(_) => panic!("an unbound peer must exhaust the attempt budget"),
+        };
         assert!(
-            !ack.aborted.load(Ordering::SeqCst),
-            "the branch must stay live for a late receipt"
+            error.to_string().contains("failed after 2 attempts"),
+            "{error}"
         );
+    }
 
-        // The frame did reach the wire: read it back and confirm the branch
-        // was registered before the frame was written (FIFO per quad).
-        let (header, _payload) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut reader))
-                .await
-                .expect("frame arrives")
-                .expect("frame decodes");
-        assert_eq!(header.kind, FrameKind::Data);
-        drop(reader);
-
-        // A late receipt through the still-registered pending map acks the
-        // delivery instead of replaying it. This map is fresh, so the single
-        // registration took sequence 0.
-        let (failures_tx, _failures_rx) = flume::bounded::<Error>(8);
+    #[tokio::test(flavor = "multi_thread")]
+    async fn receipt_routing_settles_partial_replicas_and_ignores_strays() {
+        let pending = PendingReceipts::new(64);
+        let (failures_tx, _failures_rx) = flume::unbounded::<Error>();
+        let first = Arc::new(RecordingAck::default());
+        // Two replicas: the first Acked receipt must not complete the branch.
+        let first_branch: Arc<dyn crate::input::Ack> = first.clone();
+        let seq = pending.register(&first_branch, 2, None).unwrap();
         pending.apply(
             ReceiptFrame {
                 kind: ReceiptKind::Acked,
-                seq: 0,
+                seq,
             },
             &failures_tx,
         );
-        wait_for(&ack.acked, "late receipt acks the drained branch").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
-            !ack.aborted.load(Ordering::SeqCst),
-            "an acknowledged branch must not be aborted"
+            !first.acked.load(std::sync::atomic::Ordering::SeqCst),
+            "one of two replicas must not complete the branch"
+        );
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Acked,
+                seq,
+            },
+            &failures_tx,
+        );
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
+            while !first.acked.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the second replica completes the branch");
+        // A duplicate receipt for the completed sequence is dropped.
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Acked,
+                seq,
+            },
+            &failures_tx,
+        );
+
+        // Double Held re-asserts only on the 0→1 transition; the release
+        // only forwards once every held replica reported back.
+        let second = Arc::new(RecordingAck::default());
+        let second_branch: Arc<dyn crate::input::Ack> = second.clone();
+        let seq = pending.register(&second_branch, 1, None).unwrap();
+        for _ in 0..2 {
+            pending.apply(
+                ReceiptFrame {
+                    kind: ReceiptKind::Held,
+                    seq,
+                },
+                &failures_tx,
+            );
+        }
+        assert!(second.held.load(std::sync::atomic::Ordering::SeqCst));
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Released,
+                seq,
+            },
+            &failures_tx,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !second.released.load(std::sync::atomic::Ordering::SeqCst),
+            "one of two held replicas must not release the branch"
+        );
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Released,
+                seq,
+            },
+            &failures_tx,
+        );
+        tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
+            while !second.released.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the last held replica releases the branch");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn receipt_forwarder_stops_on_manager_shutdown() {
+        let manager = NetworkManager::new(8);
+        let key = EdgeSessionKey::for_job("fwd-shutdown-job", 1, quad_a_to_b());
+        // No writer installed: the forwarder parks in its retry loop, then
+        // the manager's shutdown must retire it.
+        let queue = manager.session_receipt_route(&key);
+        queue
+            .send_async((
+                quad_a_to_b(),
+                ReceiptFrame {
+                    kind: ReceiptKind::Acked,
+                    seq: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        manager.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    fn raw_handshake(node: &str, job: &str, generation: u64, quad: Quad) -> (FrameHeader, Vec<u8>) {
+        let credentials =
+            DataPlaneCredentials::new(node, "shuffle-secret").expect("test credentials");
+        let auth = credentials.session("node-b", job, generation, quad);
+        let payload = serde_json::to_vec(&auth.client_handshake().unwrap()).unwrap();
+        let header = FrameHeader {
+            quad,
+            len: payload.len() as u32,
+            kind: FrameKind::Handshake,
+        };
+        (header, payload)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticated_protocol_violation_reports_through_the_job_channel() {
+        let quad = quad_a_to_b();
+        let upstream = authenticated_manager("node-a", "shuffle-secret");
+        let downstream = authenticated_manager("node-b", "shuffle-secret");
+        upstream.spawn();
+        downstream.spawn();
+        let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "job-pv".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let failures = downstream.failure_receiver_for_job("job-pv", 1);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(server));
+        let (_header, payload) = raw_handshake("node-a", "job-pv", 1, quad);
+        write_frame(&mut client, quad, FrameKind::Handshake, &payload)
+            .await
+            .unwrap();
+        let (_ack_header, _ack_payload) = read_frame(&mut client).await.unwrap();
+        // A malformed signal frame after authentication is a connection
+        // failure routed through the Job's registered failure channel.
+        write_frame(&mut client, quad, FrameKind::Signal, b"garbage")
+            .await
+            .unwrap();
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+        assert!(
+            failure.contains("inbound signal frame malformed"),
+            "{failure}"
+        );
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handshake_write_failure_releases_the_inbound_registration() {
+        let quad = quad_a_to_b();
+        let downstream = authenticated_manager("node-b", "shuffle-secret");
+        downstream.spawn();
+        let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "job-hw".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let failures = downstream.failure_receiver_for_job("job-hw", 1);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(server));
+        let (_header, payload) = raw_handshake("node-a", "job-hw", 1, quad);
+        write_frame(&mut client, quad, FrameKind::Handshake, &payload)
+            .await
+            .unwrap();
+        // The peer disappears before the acknowledgement can be written.
+        drop(client);
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+        assert!(
+            failure.contains("remote edge write failed") || failure.contains("handshake flush"),
+            "{failure}"
+        );
+        // The session's registration is released with the failed handshake.
+        assert!(downstream.inbound.read().unwrap().is_empty());
+        assert!(downstream.inbound_auth.read().unwrap().is_empty());
+        downstream.shutdown();
+    }
+
+    #[tokio::test]
+    async fn handshake_nonce_cache_overflow_rejects_new_handshakes() {
+        let quad = quad_a_to_b();
+        let config = NetworkManagerConfig {
+            credentials: Some(
+                DataPlaneCredentials::new("node-b", "shuffle-secret").expect("credentials"),
+            ),
+            max_connections: 1,
+            registration_grace: std::time::Duration::from_millis(100),
+            ..Default::default()
+        };
+        let downstream = NetworkManager::with_config(config).expect("valid config");
+        let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "job-nl".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        // Capacity is max_connections * 4: four distinct nonces fill it.
+        for _ in 0..4 {
+            let (header, payload) = raw_handshake("node-a", "job-nl", 1, quad);
+            downstream
+                .authorize_inbound(header, &payload)
+                .await
+                .expect("distinct nonces are accepted");
+        }
+        let (header, payload) = raw_handshake("node-a", "job-nl", 1, quad);
+        let error = match downstream.authorize_inbound(header, &payload).await {
+            Err(error) => error,
+            Ok(_) => panic!("the replay cache is bounded"),
+        };
+        assert!(
+            error.to_string().contains("replay cache is full"),
+            "{error}"
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_connection_error_after_job_removal_is_swallowed() {
+        let quad = quad_a_to_b();
+        let downstream = authenticated_manager("node-b", "shuffle-secret");
+        downstream.spawn();
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "job-late".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(server));
+        let (_header, payload) = raw_handshake("node-a", "job-late", 1, quad);
+        write_frame(&mut client, quad, FrameKind::Handshake, &payload)
+            .await
+            .unwrap();
+        let (_ack_header, _ack_payload) = read_frame(&mut client).await.unwrap();
+        let mut encoder = DataEncoder::new();
+        let data = encoder.encode(&dictionary_batch(None), 0).unwrap();
+        write_frame(&mut client, quad, FrameKind::Data, &data)
+            .await
+            .unwrap();
+        let _ = next_envelope(&input_rx).await;
+        // The Job is torn down, then the connection fails: reporting the
+        // error must not recreate the removed Job's state.
+        downstream.remove_job_session("job-late", 1);
+        write_frame(&mut client, quad, FrameKind::Signal, b"garbage")
+            .await
+            .unwrap();
+        let global_failures = downstream.failure_receiver();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                global_failures.recv_async()
+            )
+            .await
+            .is_err(),
+            "a late error after job removal must not surface globally"
+        );
+        assert!(
+            downstream.failure_channels.read().unwrap().is_empty(),
+            "the removed Job's failure channel must not be recreated"
+        );
+        downstream.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn receipt_write_failure_fails_the_serving_connection() {
+        let quad = quad_a_to_b();
+        let upstream = authenticated_manager("node-a", "shuffle-secret");
+        let downstream = authenticated_manager("node-b", "shuffle-secret");
+        upstream.spawn();
+        downstream.spawn();
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "job-rw".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let failures = downstream.failure_receiver_for_job("job-rw", 1);
+        let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(WriteKillStream {
+            inner: Box::new(server),
+            killed: killed.clone(),
+        }));
+        let edge = upstream
+            .open_edge_with_stream_for_session(Box::new(client), quad, "node-b", "job-rw", 1)
+            .unwrap();
+        let branch = Arc::new(RecordingAck::default());
+        edge.sender
+            .send_async(Envelope::Data(
+                Arc::new(dictionary_batch(Some("rw"))),
+                branch.clone(),
+            ))
+            .await
+            .unwrap();
+        let received = next_envelope(&input_rx).await;
+        let Envelope::Data(_, ack) = received else {
+            panic!("expected data");
+        };
+        killed.store(true, std::sync::atomic::Ordering::Release);
+        ack.ack().await.expect("the local chain acknowledges");
+        let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+        assert!(
+            failure.contains("receipt write failed") || failure.contains("receipt flush failed"),
+            "{failure}"
+        );
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deferred_session_loss_is_suppressed_when_the_upstream_reregisters() {
+        let quad = quad_a_to_b();
+        let downstream = NetworkManager::with_config(NetworkManagerConfig {
+            credentials: Some(
+                DataPlaneCredentials::new("node-b", "shuffle-secret").expect("credentials"),
+            ),
+            registration_grace: std::time::Duration::from_millis(100),
+            // A generous grace keeps the recovery window open even when the
+            // test binary runs under load.
+            reconnect_grace: std::time::Duration::from_secs(3),
+            ..Default::default()
+        })
+        .unwrap();
+        downstream.spawn();
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        downstream
+            .register_inbound_for_session(
+                quad,
+                input_tx,
+                PeerExpectation {
+                    source_node: "node-a".into(),
+                    job_id: "job-rl".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let failures = downstream.failure_receiver_for_job("job-rl", 1);
+
+        // First connection serves a delivery, then dies without Eos.
+        let upstream1 = authenticated_manager("node-a", "shuffle-secret");
+        upstream1.spawn();
+        let (client1, server1) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(server1));
+        let edge1 = upstream1
+            .open_edge_with_stream_for_session(Box::new(client1), quad, "node-b", "job-rl", 1)
+            .unwrap();
+        edge1
+            .sender
+            .send_async(Envelope::Data(
+                Arc::new(dictionary_batch(None)),
+                Arc::new(crate::input::NoopAck),
+            ))
+            .await
+            .unwrap();
+        let _ = next_envelope(&input_rx).await;
+        // Shut the first upstream down: its connection dies mid-stream (no
+        // Eos), which the downstream defers through the reconnect grace.
+        drop(edge1);
+        upstream1.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // A replacement registers the same session within the grace.
+        let upstream2 = authenticated_manager("node-a", "shuffle-secret");
+        upstream2.spawn();
+        let (client2, server2) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(server2));
+        let edge2 = upstream2
+            .open_edge_with_stream_for_session(Box::new(client2), quad, "node-b", "job-rl", 1)
+            .unwrap();
+        // A control signal re-registers the session (data frames from a fresh
+        // upstream restart at sequence zero and are dropped by the
+        // delivery-level dedup, which exists for same-upstream replays).
+        edge2
+            .sender
+            .send_async(Envelope::Barrier(CheckpointBarrier {
+                checkpoint_id: "c-rl".into(),
+                generation: 1,
+                trace_context: None,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_envelope(&input_rx).await,
+            Envelope::Barrier(_)
+        ));
+
+        // Past the grace the loss stays suppressed: the upstream recovered.
+        tokio::time::sleep(std::time::Duration::from_millis(3_400)).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                failures.recv_async()
+            )
+            .await
+            .is_err(),
+            "a recovered session must not report a loss"
+        );
+        upstream2.shutdown();
+        downstream.shutdown();
+    }
+
+    #[tokio::test]
+    async fn authorize_inbound_requires_configured_credentials() {
+        let manager = NetworkManager::new(8);
+        let (header, payload) = raw_handshake("node-a", "job-nc", 1, quad_a_to_b());
+        let error = match manager.authorize_inbound(header, &payload).await {
+            Err(error) => error,
+            Ok(_) => panic!("a plaintext manager cannot authorize handshakes"),
+        };
+        assert!(
+            error.to_string().contains("credentials are not configured"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pump_register_rejection_with_a_clean_abort_reports_the_limit() {
+        let quad = quad_a_to_b();
+        let config = NetworkManagerConfig {
+            max_pending_receipts: 1,
+            ..Default::default()
+        };
+        let pending = Arc::new(PendingReceipts::new(1));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (writer, _reader) = tokio::io::duplex(64 * 1024);
+        let (tx, rx) = flume::bounded::<Envelope>(4);
+        tx.send_async(Envelope::Data(
+            Arc::new(dictionary_batch(None)),
+            Arc::new(RecordingAck::default()),
+        ))
+        .await
+        .unwrap();
+        tx.send_async(Envelope::Data(
+            Arc::new(dictionary_batch(None)),
+            Arc::new(RecordingAck::default()),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        let error = pump_edge(
+            rx,
+            writer,
+            quad,
+            pending,
+            shutdown,
+            config,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("pending receipt limit 1 reached"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("failed to abort"),
+            "a clean abort must not decorate the limit error: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pump_data_write_failures_fail_the_edge() {
+        let quad = quad_a_to_b();
+        // A data frame larger than the pump's write buffer: it is handed to
+        // the stream directly, so a dead wire fails the edge on the spot.
+        let (tx, rx) = flume::bounded::<Envelope>(4);
+        tx.send_async(Envelope::Data(
+            Arc::new(MessageBatch::new_arrow(large_batch(4_000))),
+            Arc::new(RecordingAck::default()),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        let error = pump_edge(
+            rx,
+            Box::new(WriteFailStream),
+            quad,
+            Arc::new(PendingReceipts::new(64)),
+            tokio_util::sync::CancellationToken::new(),
+            NetworkManagerConfig::default(),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("data write failed"),
+            "{error}"
+        );
+    }
 }

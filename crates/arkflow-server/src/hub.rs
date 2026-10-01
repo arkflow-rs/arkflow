@@ -39,6 +39,8 @@ mod rollout;
 mod wire;
 
 #[cfg(test)]
+mod job_orchestration_tests;
+#[cfg(test)]
 mod session_report_tests;
 #[cfg(test)]
 mod tests;

@@ -1283,4 +1283,860 @@ mod tests {
             );
         }
     }
+    // ---- WalConfig::validate and accessor coverage ----
+
+    fn object_store_config(backend_patch: serde_json::Value) -> WalConfig {
+        let mut backend = serde_json::json!({
+            "type": "object_store",
+            "node_id": "node-1",
+            "stream_id": "stream-1",
+            "s3": {"bucket": "bucket-a"},
+        });
+        if let Some(patch) = backend_patch.as_object() {
+            for (key, value) in patch {
+                backend[key] = value.clone();
+            }
+        }
+        serde_json::from_value(serde_json::json!({"backend": backend})).unwrap()
+    }
+
+    #[test]
+    fn object_store_config_validation_rejects_each_forbidden_shape() {
+        let valid = object_store_config(serde_json::json!({}));
+        valid.validate().unwrap();
+
+        let empty_node = object_store_config(serde_json::json!({"node_id": "  "}));
+        let err = empty_node.validate().unwrap_err();
+        assert!(err.to_string().contains("node_id is required"));
+
+        let empty_stream = object_store_config(serde_json::json!({"stream_id": ""}));
+        let err = empty_stream.validate().unwrap_err();
+        assert!(err.to_string().contains("stream_id is required"));
+
+        let empty_bucket =
+            object_store_config(serde_json::json!({"s3": {"bucket": " "}}));
+        let err = empty_bucket.validate().unwrap_err();
+        assert!(err.to_string().contains("bucket is required"));
+
+        let per_entry =
+            object_store_config(serde_json::json!({"sync": "per_entry"}));
+        let err = per_entry.validate().unwrap_err();
+        assert!(err.to_string().contains("per_entry"));
+
+        let zero_workers =
+            object_store_config(serde_json::json!({"parallel_put": {"workers": 0}}));
+        let err = zero_workers.validate().unwrap_err();
+        assert!(err.to_string().contains("must be positive"));
+
+        let many_workers =
+            object_store_config(serde_json::json!({"parallel_put": {"workers": 9}}));
+        let err = many_workers.validate().unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+
+        let bad_zstd =
+            object_store_config(serde_json::json!({"compression": {"type": "zstd", "level": 23}}));
+        let err = bad_zstd.validate().unwrap_err();
+        assert!(err.to_string().contains("zstd.level"));
+
+        let bad_lz4 =
+            object_store_config(serde_json::json!({"compression": {"type": "lz4", "level": 0}}));
+        let err = bad_lz4.validate().unwrap_err();
+        assert!(err.to_string().contains("lz4.level"));
+
+        // In-range compression passes.
+        object_store_config(serde_json::json!({"compression": {"type": "zstd", "level": 3}}))
+            .validate()
+            .unwrap();
+        object_store_config(serde_json::json!({"compression": {"type": "lz4", "level": 4}}))
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn config_accessors_cover_local_and_object_store_shapes() {
+        let legacy = WalConfig::local(true, "/tmp/wal".into(), SyncPolicy::PerEntry);
+        assert!(legacy.validate().is_ok());
+        assert_eq!(legacy.local_path(), Some("/tmp/wal"));
+        assert_eq!(legacy.effective_sync(), &SyncPolicy::PerEntry);
+        assert_eq!(legacy.backend_kind(), "local");
+
+        let nested_local: WalConfig = serde_json::from_value(serde_json::json!({
+            "backend": {"type": "local", "path": "/tmp/nested", "sync": {"periodic": {"secs": 1, "nanos": 0}}}
+        }))
+        .unwrap();
+        assert_eq!(nested_local.local_path(), Some("/tmp/nested"));
+        assert!(matches!(
+            nested_local.effective_sync(),
+            SyncPolicy::Periodic(_)
+        ));
+        assert_eq!(nested_local.backend_kind(), "local");
+
+        let object = object_store_config(serde_json::json!({}));
+        assert_eq!(object.local_path(), None);
+        assert_eq!(object.backend_kind(), "object_store");
+        assert_eq!(object.effective_sync(), &SyncPolicy::default());
+    }
+
+    // ---- Wal acknowledgement / undo / recovery-path coverage ----
+
+    /// An in-memory store with scriptable failures; `kind() == "local"` keeps
+    /// store calls inline so no runtime shape is required beyond the test's.
+    struct ScriptedStore {
+        entries: StdMutex<BTreeMap<u64, Vec<u8>>>,
+        cursor: AtomicU64,
+        fail_append: bool,
+        fail_rewind: bool,
+        fail_mark_committed: bool,
+    }
+
+    impl crate::wal::store::WalStore for ScriptedStore {
+        fn kind(&self) -> &'static str {
+            "local"
+        }
+        fn append_batch(&self, entries: Vec<(u64, Vec<u8>)>) -> Result<(), Error> {
+            if self.fail_append {
+                return Err(Error::Process("scripted append failure".into()));
+            }
+            let mut map = self.entries.lock().unwrap();
+            for (seq, bytes) in entries {
+                map.insert(seq, bytes);
+            }
+            Ok(())
+        }
+        fn advance_cursor(&self, seq: u64) -> Result<(), Error> {
+            let mut current = self.cursor.load(Ordering::SeqCst);
+            while seq > current {
+                match self.cursor.compare_exchange(
+                    current,
+                    seq,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+            Ok(())
+        }
+        fn rewind_cursor(&self, seq: u64) -> Result<(), Error> {
+            if self.fail_rewind {
+                return Err(Error::Process("scripted rewind failure".into()));
+            }
+            self.cursor.store(seq, Ordering::SeqCst);
+            Ok(())
+        }
+        fn mark_committed(&self, _seq: u64) -> Result<(), Error> {
+            if self.fail_mark_committed {
+                return Err(Error::Process("scripted reclaim failure".into()));
+            }
+            Ok(())
+        }
+        fn read_after_cursor(&self) -> Result<Vec<(u64, crate::MessageBatchRef)>, Error> {
+            let cursor = self.cursor.load(Ordering::SeqCst);
+            let map = self.entries.lock().unwrap();
+            Ok(map
+                .iter()
+                .filter(|(seq, _)| **seq > cursor)
+                .map(|(seq, bytes)| (*seq, StdArc::new(deserialize(bytes).unwrap())))
+                .collect())
+        }
+        fn cursor(&self) -> u64 {
+            self.cursor.load(Ordering::SeqCst)
+        }
+        fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Source ack whose commit always fails.
+    struct FailingSourceAck;
+    #[async_trait::async_trait]
+    impl Ack for FailingSourceAck {
+        async fn ack(&self) -> Result<(), Error> {
+            Err(Error::Process("source commit failed".into()))
+        }
+    }
+
+    /// Source ack that fails the first `failures_left` commits and succeeds
+    /// afterwards: a transient source failure that a retry can clear.
+    struct FlakySourceAck {
+        failures_left: StdArc<AtomicU64>,
+    }
+    #[async_trait::async_trait]
+    impl Ack for FlakySourceAck {
+        async fn ack(&self) -> Result<(), Error> {
+            if self.failures_left.fetch_sub(1, Ordering::SeqCst) == 0 {
+                return Ok(());
+            }
+            Err(Error::Process("transient source commit failure".into()))
+        }
+    }
+
+    /// Source ack whose commit and abort both fail.
+    struct FailingAbortAck;
+    #[async_trait::async_trait]
+    impl Ack for FailingAbortAck {
+        async fn ack(&self) -> Result<(), Error> {
+            Err(Error::Process("source commit failed".into()))
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            Err(Error::Process("abort failed".into()))
+        }
+    }
+
+    /// Source ack whose abort jumps the WAL cursor past its sequence, so the
+    /// undo compensation observes a cursor that moved behind it mid-flight.
+    struct CursorJumpingAbortAck {
+        wal: StdMutex<Option<StdArc<Wal>>>,
+        seq: u64,
+    }
+    #[async_trait::async_trait]
+    impl Ack for CursorJumpingAbortAck {
+        async fn ack(&self) -> Result<(), Error> {
+            Err(Error::Process("source commit failed".into()))
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            let wal = self.wal.lock().unwrap().clone();
+            if let Some(wal) = wal {
+                advance_to(&wal, self.seq + 10).await;
+            }
+            Ok(())
+        }
+    }
+
+    /// Source ack that blocks inside `ack` until a gate channel fires; used to
+    /// hold a WAL acknowledgement in the in-flight state. `entered` is bumped
+    /// as soon as `ack` runs, which proves the WAL caller set `in_flight`.
+    struct GatedAck {
+        gate: StdMutex<Option<tokio::sync::mpsc::Receiver<()>>>,
+        entered: StdArc<AtomicU64>,
+    }
+    #[async_trait::async_trait]
+    impl Ack for GatedAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let mut receiver = self.gate.lock().unwrap().take();
+            if let Some(receiver) = receiver.as_mut() {
+                receiver.recv().await;
+            }
+            Ok(())
+        }
+    }
+
+    /// Source ack that records held/release marker calls.
+    struct HeldMarkerAck {
+        held: StdArc<AtomicU64>,
+        released: StdArc<AtomicU64>,
+    }
+    #[async_trait::async_trait]
+    impl Ack for HeldMarkerAck {
+        async fn ack(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        fn mark_held(&self) {
+            self.held.fetch_add(1, Ordering::SeqCst);
+        }
+        fn release_held(&self) {
+            self.released.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Poll the recovery read until it exposes `expected` entries.
+    async fn wait_for_replay_len(wal: &StdArc<Wal>, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while wal.read_after_cursor().await.unwrap().len() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replay never reached {expected} entries"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Poll an atomic counter until it reaches `expected`.
+    async fn wait_for_counter(counter: &StdArc<AtomicU64>, expected: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while counter.load(Ordering::SeqCst) != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "counter never reached {expected}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Drive the committed cursor to `target` through contiguous `advance`
+    /// steps (the frontier only moves over contiguous offsets from its seed).
+    async fn advance_to(wal: &StdArc<Wal>, target: u64) {
+        for seq in 1..=target {
+            wal.advance(seq).await.unwrap();
+        }
+    }
+
+    fn local_cfg(dir: &std::path::Path, policy: SyncPolicy) -> WalConfig {
+        WalConfig::local(true, dir.to_string_lossy().to_string(), policy)
+    }
+
+    /// Drive a failing-append WAL through the wrapper surface: cursor reads,
+    /// recovery reads, `advance` (including the notify branch), append error
+    /// propagation, and close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failing_append_store_covers_cursor_read_advance_and_close() {
+        let store: StdArc<dyn crate::wal::store::WalStore> = StdArc::new(ScriptedStore {
+            entries: StdMutex::new(BTreeMap::new()),
+            cursor: AtomicU64::new(0),
+            fail_append: true,
+            fail_rewind: false,
+            fail_mark_committed: false,
+        });
+        let config = WalConfig {
+            sync: SyncPolicy::PerEntry,
+            ..WalConfig::default()
+        };
+        let wal = Wal::open_with_store(&config, store, 1).unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 0);
+        assert!(wal.read_after_cursor().await.unwrap().is_empty());
+
+        // `advance` pushes the target past the current cursor and notifies
+        // (the frontier only moves over contiguous offsets from its seed).
+        advance_to(&wal, 5).await;
+        assert_eq!(wal.cursor().await.unwrap(), 5);
+        // A lower target is a no-op.
+        wal.advance(1).await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 5);
+
+        // Per-entry appends surface the store failure.
+        assert!(wal.append(&StdArc::new(sample_batch(None))).await.is_err());
+        wal.close().await.unwrap();
+    }
+
+    /// The `FailingAppendStore` mock's non-append surface is exercised
+    /// directly: cursor/advance/read/close all succeed without state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failing_append_store_trait_surface_is_reachable() {
+        let store = FailingAppendStore {
+            attempts: StdArc::new(AtomicU64::new(0)),
+        };
+        assert_eq!(store.cursor(), 0);
+        store.advance_cursor(1).unwrap();
+        assert!(store.read_after_cursor().unwrap().is_empty());
+        assert!(store.append_batch(vec![(1, vec![0u8])]).is_err());
+        store.close().unwrap();
+    }
+
+    /// The full acknowledgement failure contract: a failed source commit is
+    /// compensated (cursor rewind, entry stays replayable), later sequences
+    /// are fenced, and a retry of the lowest failed sequence clears the fence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_source_ack_compensates_and_fences_then_a_retry_clears_it() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 2);
+
+        // The source commit fails after the cursor was advanced: the cursor is
+        // compensated back to zero and both entries stay replayable.
+        let flaky = StdArc::new(FlakySourceAck {
+            failures_left: StdArc::new(AtomicU64::new(1)),
+        });
+        let failing: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, flaky));
+        let error = failing.ack().await.unwrap_err();
+        assert!(error.to_string().contains("transient source commit failure"));
+        assert_eq!(wal.cursor().await.unwrap(), 0);
+        assert_eq!(wal.read_after_cursor().await.unwrap().len(), 2);
+
+        // A later sequence must not overtake the failed one.
+        let later: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(NoopAck)));
+        let error = later.ack().await.unwrap_err();
+        assert!(error.to_string().contains("blocked by an earlier source failure"));
+
+        // Retrying the failed sequence clears the fence and completes: the
+        // retry runs the stored (now healthy) source acknowledgement.
+        let retry: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        retry.ack().await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+
+        // The later sequence now drains in order.
+        let drained: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(NoopAck)));
+        drained.ack().await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 2);
+        wal.close().await.unwrap();
+    }
+
+    /// Two concurrent acknowledgements of one sequence share the outcome: the
+    /// second caller returns through the "another caller completed it" path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_acks_of_one_sequence_share_the_outcome() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+
+        let (gate_tx, gate_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let entered = StdArc::new(AtomicU64::new(0));
+        let first: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(GatedAck {
+                gate: StdMutex::new(Some(gate_rx)),
+                entered: entered.clone(),
+            }),
+        ));
+        let first_task = tokio::spawn(async move { first.ack().await });
+
+        // The inner ack being entered proves the first caller holds the
+        // sequence in-flight; the second caller must park behind it.
+        wait_for_counter(&entered, 1).await;
+
+        let second: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        let second_task = tokio::spawn(async move { second.ack().await });
+        // Let the second caller register and park behind the in-flight one.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        gate_tx.send(()).await.unwrap();
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        wal.close().await.unwrap();
+    }
+
+    /// A close request gives a parked acknowledgement a bounded drain window
+    /// and then fails it, so recovery replays the unsettled delivery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_fails_a_parked_acknowledgement_after_the_drain_window() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        for expected in 1..=3 {
+            assert_eq!(
+                wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+                expected
+            );
+        }
+        wal.override_ack_drain_window_for_tests(Duration::from_millis(50));
+
+        // Sequence 3 cannot run while 1 and 2 are unacknowledged: it parks.
+        let parked: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 3, StdArc::new(NoopAck)));
+        let task = tokio::spawn(async move { parked.ack().await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        wal.close().await.unwrap();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("WAL closed while acknowledgement was pending")
+        );
+    }
+
+    /// Acknowledging a sequence the cursor already covers skips the cursor
+    /// bump (and therefore needs no compensation on failure).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acknowledging_a_covered_sequence_skips_the_cursor_bump() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        wal.advance(1).await.unwrap();
+
+        let calls = StdArc::new(StdMutex::new(Vec::new()));
+        let ack: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(RecordingAck {
+                sequence: 1,
+                calls: calls.clone(),
+            }),
+        ));
+        ack.ack().await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![1]);
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        wal.close().await.unwrap();
+    }
+
+    /// Undo of sequences that were never acknowledged: a future sequence is a
+    /// no-op, a sequence behind the cursor fails closed, and the sequence at
+    /// the cursor compensates the source ack and rewinds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undo_of_unregistered_sequences_spans_no_op_behind_and_at_the_cursor() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 2);
+
+        // Future sequence, cursor below it: nothing to undo.
+        WalAck::new(wal.clone(), 5, StdArc::new(NoopAck))
+            .undo()
+            .await
+            .unwrap();
+
+        // Behind a later cursor: refuse.
+        advance_to(&wal, 2).await;
+        let error = WalAck::new(wal.clone(), 1, StdArc::new(NoopAck))
+            .undo()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("behind a later cursor"));
+
+        // At the cursor: the wrapped source ack is undone and the cursor
+        // rewinds.
+        let undone = StdArc::new(AtomicU64::new(0));
+        struct UndoCountingAck {
+            undone: StdArc<AtomicU64>,
+        }
+        #[async_trait::async_trait]
+        impl Ack for UndoCountingAck {
+            async fn ack(&self) -> Result<(), Error> {
+                Ok(())
+            }
+            async fn undo(&self) -> Result<(), Error> {
+                self.undone.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        // The counting ack's own ack path is a plain success.
+        UndoCountingAck {
+            undone: undone.clone(),
+        }
+        .ack()
+        .await
+        .unwrap();
+        WalAck::new(wal.clone(), 2, StdArc::new(UndoCountingAck { undone: undone.clone() }))
+            .undo()
+            .await
+            .unwrap();
+        assert_eq!(undone.load(Ordering::SeqCst), 1);
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        wal.close().await.unwrap();
+    }
+
+    /// Undo of registered acknowledgements: a parked later delivery is simply
+    /// removed, an in-flight delivery is refused, and an entry stranded behind
+    /// a later cursor fails closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undo_of_registered_acknowledgements_removes_parks_or_rejects() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 2);
+
+        // Sequence 2 parks behind the unacknowledged 1.
+        let parked: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(NoopAck)));
+        let parked_task = tokio::spawn(async move { parked.ack().await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Undo removes the parked entry; the parked caller then observes the
+        // removal and completes successfully.
+        WalAck::new(wal.clone(), 2, StdArc::new(NoopAck))
+            .undo()
+            .await
+            .unwrap();
+        parked_task.await.unwrap().unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 0);
+
+        // An in-flight acknowledgement cannot be undone.
+        let (gate_tx, gate_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let entered = StdArc::new(AtomicU64::new(0));
+        let in_flight: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(GatedAck {
+                gate: StdMutex::new(Some(gate_rx)),
+                entered: entered.clone(),
+            }),
+        ));
+        let in_flight_task = tokio::spawn(async move { in_flight.ack().await });
+        // The inner ack being entered proves the WAL caller is in-flight.
+        wait_for_counter(&entered, 1).await;
+        let error = WalAck::new(wal.clone(), 1, StdArc::new(NoopAck))
+            .undo()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("in-flight"));
+        gate_tx.send(()).await.unwrap();
+        in_flight_task.await.unwrap().unwrap();
+
+        // A registered (failed) entry stranded behind a later cursor is
+        // refused: sequencing 2 fails, then the cursor advances past it.
+        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            2,
+            StdArc::new(FailingSourceAck),
+        ));
+        failing.ack().await.unwrap_err();
+        advance_to(&wal, 3).await;
+        let error = WalAck::new(wal.clone(), 2, StdArc::new(NoopAck))
+            .undo()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("behind a later cursor"));
+        wal.close().await.unwrap();
+    }
+
+    /// A scripted store drives the compensation matrix: a successful rewind
+    /// keeps the failed delivery replayable (and a later success reaches the
+    /// store's reclaim success path), while a failed rewind surfaces the
+    /// combined source-and-compensation error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scripted_store_drives_compensation_success_and_failure_paths() {
+        let config = WalConfig {
+            sync: SyncPolicy::PerEntry,
+            ..WalConfig::default()
+        };
+
+        // Rewind succeeds: the failed delivery stays replayable and a retry
+        // that succeeds reaches the store's reclaim success path.
+        let store: StdArc<dyn crate::wal::store::WalStore> = StdArc::new(ScriptedStore {
+            entries: StdMutex::new(BTreeMap::new()),
+            cursor: AtomicU64::new(0),
+            fail_append: false,
+            fail_rewind: false,
+            fail_mark_committed: false,
+        });
+        let wal = Wal::open_with_store(&config, store, 1).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(FlakySourceAck {
+                failures_left: StdArc::new(AtomicU64::new(1)),
+            }),
+        ));
+        failing.ack().await.unwrap_err();
+        assert_eq!(wal.cursor().await.unwrap(), 0);
+        assert_eq!(wal.read_after_cursor().await.unwrap().len(), 1);
+        let retry: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        retry.ack().await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        wal.close().await.unwrap();
+
+        // Rewind fails: the source error is combined with the compensation
+        // error so the caller sees that the cursor was left advanced.
+        let store: StdArc<dyn crate::wal::store::WalStore> = StdArc::new(ScriptedStore {
+            entries: StdMutex::new(BTreeMap::new()),
+            cursor: AtomicU64::new(0),
+            fail_append: false,
+            fail_rewind: true,
+            fail_mark_committed: false,
+        });
+        let wal = Wal::open_with_store(&config, store, 1).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(FailingSourceAck),
+        ));
+        let error = failing.ack().await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("source commit failed"), "{message}");
+        assert!(message.contains("cursor compensation failed"), "{message}");
+        assert_eq!(wal.cursor().await.unwrap(), 1, "the rewind failed");
+        wal.close().await.unwrap();
+    }
+
+    /// A failing source ack whose attempt never advanced the cursor returns
+    /// the raw source error: there is nothing to compensate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_ack_without_a_cursor_bump_returns_the_raw_error() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        advance_to(&wal, 1).await;
+
+        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(FailingSourceAck),
+        ));
+        let error = failing.ack().await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("source commit failed"), "{message}");
+        assert!(!message.contains("compensation"), "{message}");
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        wal.close().await.unwrap();
+    }
+
+    /// Undo after a failed source commit drives the retry path: the stored
+    /// source acknowledgement is aborted and the entry is discarded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undo_after_a_failed_ack_retries_the_source_abort() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(FailingSourceAck),
+        ));
+        failing.ack().await.unwrap_err();
+
+        // With the cursor moved back onto the failed sequence, the undo's
+        // abort path rewinds it to the previous sequence before discarding.
+        advance_to(&wal, 1).await;
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        WalAck::new(wal.clone(), 1, StdArc::new(NoopAck))
+            .undo()
+            .await
+            .unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 0);
+        // The entry is gone: a fresh acknowledgement runs normally.
+        let retry: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        retry.ack().await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        wal.close().await.unwrap();
+    }
+
+    /// An abort failure keeps the failed entry registered as a fence instead
+    /// of silently discarding an uncompensated source commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undo_after_a_failed_ack_whose_abort_fails_keeps_the_fence() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(FailingAbortAck),
+        ));
+        failing.ack().await.unwrap_err();
+
+        let error = WalAck::new(wal.clone(), 1, StdArc::new(NoopAck))
+            .undo()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("abort failed"));
+
+        // The fenced entry still blocks nothing: a later sequence continues to
+        // observe the earlier failure.
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 2);
+        let later: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(NoopAck)));
+        let error = later.ack().await.unwrap_err();
+        assert!(error.to_string().contains("blocked by an earlier source failure"));
+        wal.close().await.unwrap();
+    }
+
+    /// When the cursor moves behind a failed entry while its abort runs, the
+    /// undo refuses instead of rewinding onto foreign territory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undo_after_an_abort_that_moves_the_cursor_behind_fails_closed() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(CursorJumpingAbortAck {
+                wal: StdMutex::new(Some(wal.clone())),
+                seq: 1,
+            }),
+        ));
+        failing.ack().await.unwrap_err();
+
+        let error = WalAck::new(wal.clone(), 1, StdArc::new(NoopAck))
+            .undo()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("behind a later cursor"));
+        assert!(wal.cursor().await.unwrap() > 1);
+        wal.close().await.unwrap();
+    }
+
+    /// A reclamation failure is reported without failing the acknowledgement:
+    /// the source commit already succeeded, so at-least-once holds either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaim_failure_does_not_fail_the_acknowledgement() {
+        let store: StdArc<dyn crate::wal::store::WalStore> = StdArc::new(ScriptedStore {
+            entries: StdMutex::new(BTreeMap::new()),
+            cursor: AtomicU64::new(0),
+            fail_append: false,
+            fail_rewind: false,
+            fail_mark_committed: true,
+        });
+        let config = WalConfig {
+            sync: SyncPolicy::PerEntry,
+            ..WalConfig::default()
+        };
+        let wal = Wal::open_with_store(&config, store, 1).unwrap();
+        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        let ack: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        ack.ack().await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        wal.close().await.unwrap();
+    }
+
+    /// Reconciling checkpoint-covered sequences advances the cursor only over
+    /// the contiguous prefix, and is idempotent for duplicates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_covered_advances_only_contiguous_sequences() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        for expected in 1..=3 {
+            assert_eq!(
+                wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+                expected
+            );
+        }
+
+        // A gap (2 with cursor 0) does not advance anything.
+        wal.reconcile_covered(&[2]).await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 0);
+
+        // The contiguous prefix advances.
+        wal.reconcile_covered(&[1]).await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+
+        // Duplicates are deduplicated; the next contiguous step advances.
+        wal.reconcile_covered(&[2, 2]).await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 2);
+
+        // Already-covered sequences are a no-op.
+        wal.reconcile_covered(&[1, 2]).await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 2);
+        wal.close().await.unwrap();
+    }
+
+    /// The periodic policy flushes staged appends from the background flusher
+    /// without an explicit flush call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_policy_flushes_staged_appends_in_the_background() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(
+            &dir,
+            SyncPolicy::Periodic(Duration::from_millis(2)),
+        ))
+        .unwrap();
+        wal.append(&StdArc::new(sample_batch(None))).await.unwrap();
+        wait_for_replay_len(&wal, 1).await;
+        assert_eq!(wal.read_after_cursor().await.unwrap().len(), 1);
+        wal.close().await.unwrap();
+    }
+
+    /// `WalAck` forwards the held/release markers to the wrapped source ack.
+    #[test]
+    fn wal_ack_delegates_held_markers_to_the_inner_ack() {
+        let dir = tempdir();
+        let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
+        let held = StdArc::new(AtomicU64::new(0));
+        let released = StdArc::new(AtomicU64::new(0));
+        let ack = WalAck::new(
+            wal,
+            1,
+            StdArc::new(HeldMarkerAck {
+                held: held.clone(),
+                released: released.clone(),
+            }),
+        );
+        ack.mark_held();
+        assert_eq!(held.load(Ordering::SeqCst), 1);
+        ack.release_held();
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
 }

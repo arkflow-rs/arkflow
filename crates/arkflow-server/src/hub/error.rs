@@ -64,3 +64,100 @@ impl From<StorageError> for HubError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant lands in exactly one failure class: operators route on
+    /// these strings, so an unknown variant must not silently invent one.
+    #[test]
+    fn failure_class_partitions_the_error_surface() {
+        assert_eq!(HubError::Unauthorized.failure_class(), "authorization");
+        assert_eq!(
+            HubError::NodeUnavailable.failure_class(),
+            "node_unavailable"
+        );
+        assert_eq!(HubError::NotFound.failure_class(), "not_found");
+        // Both storage flavors aggregate into the repository class.
+        assert_eq!(
+            HubError::StorageUnavailable.failure_class(),
+            "repository"
+        );
+        assert_eq!(
+            HubError::Storage("backend exploded".into()).failure_class(),
+            "repository"
+        );
+        assert_eq!(
+            HubError::StaleLeader {
+                claimed: 3,
+                current: 4
+            }
+            .failure_class(),
+            "stale_leader"
+        );
+        assert_eq!(
+            HubError::OrchestrationInProgress.failure_class(),
+            "orchestration_in_progress"
+        );
+        assert_eq!(
+            HubError::OrchestrationPhaseConflict.failure_class(),
+            "orchestration_conflict"
+        );
+        // Everything else funnels into the shared invalid-request bucket.
+        assert_eq!(HubError::Capacity.failure_class(), "invalid");
+        assert_eq!(HubError::Invalid("bad input".into()).failure_class(), "invalid");
+        assert_eq!(
+            HubError::GenerationConflict {
+                expected: 1,
+                current: 2
+            }
+            .failure_class(),
+            "invalid"
+        );
+        assert_eq!(HubError::IdempotencyKeyReused.failure_class(), "invalid");
+    }
+
+    /// Storage errors translate losslessly where a stable Hub variant
+    /// exists, and collapse into the opaque storage class otherwise.
+    #[test]
+    fn storage_errors_translate_into_stable_hub_variants() {
+        assert!(matches!(
+            HubError::from(StorageError::GenerationConflict {
+                expected: 7,
+                current: 9
+            }),
+            HubError::GenerationConflict {
+                expected: 7,
+                current: 9
+            }
+        ));
+        assert!(matches!(
+            HubError::from(StorageError::IdempotencyKeyReused),
+            HubError::IdempotencyKeyReused
+        ));
+        assert!(matches!(
+            HubError::from(StorageError::ActorClosed),
+            HubError::StorageUnavailable
+        ));
+        assert!(matches!(
+            HubError::from(StorageError::StaleLeader {
+                claimed_epoch: 3,
+                current_epoch: 4
+            }),
+            HubError::StaleLeader {
+                claimed: 3,
+                current: 4
+            }
+        ));
+        // Backend-specific failures keep their message but lose their type.
+        assert!(matches!(
+            HubError::from(StorageError::Unsupported("pg-only path")),
+            HubError::Storage(_)
+        ));
+        assert!(matches!(
+            HubError::from(StorageError::Poisoned),
+            HubError::Storage(_)
+        ));
+    }
+}
