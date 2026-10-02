@@ -16,5 +16,5 @@
 
 ## 4. Docs and ship
 
-- [ ] 4.1 核对 NATS 组件文档页（`docs/docs/` 与 zh-Hans 对应页）：确认无与客户端校验行为矛盾的表述（如错误处理说明）；仅在存在矛盾时更新；PR 描述携带运维可见变化表（subject 校验、max-payload 预校验、connection_timeout 全握手）与告警收敛清单（#3/#75/#65/#66）+ rumqttc 残留说明
-- [ ] 4.2 提交、开 PR、CI 绿后落地；归档本变更（delta 同步进 `data-plane-observability` 与新建 `nats-io`）
+- [x] 4.1 核对 NATS 组件文档页（`docs/docs/` 与 zh-Hans 对应页）：确认无与客户端校验行为矛盾的表述（如错误处理说明）；仅在存在矛盾时更新；PR 描述携带运维可见变化表（subject 校验、max-payload 预校验、connection_timeout 全握手）与告警收敛清单（#3/#75/#65/#66）+ rumqttc 残留说明
+- [x] 4.2 提交、开 PR（#1298）、CI 绿后落地；归档本变更（delta 同步进 `data-plane-observability` 与新建 `nats-io`）
