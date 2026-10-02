@@ -350,6 +350,7 @@ impl Fleet {
                 empty_control_plane(),
                 NodeAgentConfig {
                     hub_url: hub_url.to_string(),
+                    hub_urls: vec![hub_url.to_string()],
                     api_prefix: "/api/v1".into(),
                     node_id: node_id.clone(),
                     node_token: String::new(),
@@ -387,6 +388,7 @@ impl Fleet {
             let cancel = agent.cancel.clone();
             let config = NodeAgentConfig {
                 hub_url: hub_url.clone(),
+                hub_urls: vec![hub_url.clone()],
                 api_prefix: "/api/v1".into(),
                 node_id: agent.node_id.clone(),
                 node_token: String::new(),

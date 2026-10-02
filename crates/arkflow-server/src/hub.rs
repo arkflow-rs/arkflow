@@ -281,6 +281,11 @@ impl Hub {
         self.storage.is_some()
     }
 
+    /// The durable-storage actor handle; `None` on the volatile Hub.
+    pub fn storage(&self) -> Option<&StorageActor> {
+        self.storage.as_ref()
+    }
+
     /// Startup diagnostics for the fail-open token defaults: an unset token
     /// means the corresponding route class accepts unauthenticated callers.
     pub fn operator_token_is_set(&self) -> bool {

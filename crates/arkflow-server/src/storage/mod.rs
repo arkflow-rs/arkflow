@@ -673,15 +673,20 @@ enum StorageCommand {
     },
     TryAcquireHubLease {
         holder: String,
+        advertise_url: Option<String>,
         ttl_ms: u64,
         now_ms: u64,
         response: oneshot::Sender<Result<HubLeaseAcquire, StorageError>>,
     },
     RenewHubLease {
         holder: String,
+        advertise_url: Option<String>,
         ttl_ms: u64,
         now_ms: u64,
         response: oneshot::Sender<Result<HubLeaseRenew, StorageError>>,
+    },
+    ReadHubLeaseSnapshot {
+        response: oneshot::Sender<Result<Option<HubLeaseSnapshot>, StorageError>>,
     },
     ReleaseHubLease {
         holder: String,
@@ -887,6 +892,9 @@ impl StorageCommand {
             Self::ReleaseHubLease { response, .. } => {
                 let _ = response.send(Err(error));
             }
+            Self::ReadHubLeaseSnapshot { response } => {
+                let _ = response.send(Err(error));
+            }
             Self::Fenced { command, .. } => command.nack(error),
         }
     }
@@ -898,6 +906,9 @@ pub struct HubLeaseSnapshot {
     pub holder: String,
     pub epoch: u64,
     pub expires_at_ms: u64,
+    /// Leader's advertised API base URL (hub-ha stage 3): written by
+    /// acquire/renew, mirrored by the standby 503 as the `leader_url` hint.
+    pub advertise_url: Option<String>,
 }
 
 /// Outcome of `try_acquire_hub_lease`: either the caller now holds the lease
@@ -1328,20 +1339,29 @@ async fn dispatch(store: &ControlPlaneStore, command: StorageCommand) {
                     }
                     StorageCommand::TryAcquireHubLease {
                         holder,
+                        advertise_url,
                         ttl_ms,
                         now_ms,
                         response,
                     } => {
-                        let _ =
-                            response.send(store.try_acquire_hub_lease(&holder, ttl_ms, now_ms).await);
+                        let _ = response.send(
+                            store
+                                .try_acquire_hub_lease(&holder, advertise_url.as_deref(), ttl_ms, now_ms)
+                                .await,
+                        );
                     }
                     StorageCommand::RenewHubLease {
                         holder,
+                        advertise_url,
                         ttl_ms,
                         now_ms,
                         response,
                     } => {
-                        let _ = response.send(store.renew_hub_lease(&holder, ttl_ms, now_ms).await);
+                        let _ = response.send(
+                            store
+                                .renew_hub_lease(&holder, advertise_url.as_deref(), ttl_ms, now_ms)
+                                .await,
+                        );
                     }
                     StorageCommand::ReleaseHubLease {
                         holder,
@@ -1349,6 +1369,9 @@ async fn dispatch(store: &ControlPlaneStore, command: StorageCommand) {
                         response,
                     } => {
                         let _ = response.send(store.release_hub_lease(&holder, now_ms).await);
+                    }
+                    StorageCommand::ReadHubLeaseSnapshot { response } => {
+                        let _ = response.send(store.hub_lease_snapshot().await);
                     }
                 }
 }
@@ -2220,6 +2243,7 @@ impl StorageActor {
     pub async fn try_acquire_hub_lease(
         &self,
         holder: impl Into<String>,
+        advertise_url: Option<String>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseAcquire, StorageError> {
@@ -2227,6 +2251,7 @@ impl StorageActor {
         self.sender
             .send(StorageCommand::TryAcquireHubLease {
                 holder: holder.into(),
+                advertise_url,
                 ttl_ms,
                 now_ms,
                 response,
@@ -2239,6 +2264,7 @@ impl StorageActor {
     pub async fn renew_hub_lease(
         &self,
         holder: impl Into<String>,
+        advertise_url: Option<String>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseRenew, StorageError> {
@@ -2246,10 +2272,22 @@ impl StorageActor {
         self.sender
             .send(StorageCommand::RenewHubLease {
                 holder: holder.into(),
+                advertise_url,
                 ttl_ms,
                 now_ms,
                 response,
             })
+            .await
+            .map_err(|_| StorageError::ActorClosed)?;
+        receiver.await.map_err(|_| StorageError::ActorClosed)?
+    }
+
+    /// Current lease row for the standby `leader_url` hint; `None` when the
+    /// table is empty (HA disabled). Read-only, exempt from write fencing.
+    pub async fn hub_lease_snapshot(&self) -> Result<Option<HubLeaseSnapshot>, StorageError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ReadHubLeaseSnapshot { response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -2460,16 +2498,20 @@ job_id: &str,
     async fn try_acquire_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseAcquire, StorageError>;
     async fn renew_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseRenew, StorageError>;
     async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError>;
+    /// Full lease row; `None` when no row exists (HA disabled).
+    async fn hub_lease_snapshot(&self) -> Result<Option<HubLeaseSnapshot>, StorageError>;
     /// Current lease epoch for write fencing. `None` = no lease row (HA
     /// disabled): fenced commands pass through unchanged.
     async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError>;
@@ -3093,31 +3135,41 @@ checkpoint_id: &str,
     async fn try_acquire_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseAcquire, StorageError> {
         match self {
             Self::Sqlite(backend) => {
-                StorageBackend::try_acquire_hub_lease(backend, holder, ttl_ms, now_ms).await
+                StorageBackend::try_acquire_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms)
+                    .await
             }
             Self::Postgres(backend) => {
-                StorageBackend::try_acquire_hub_lease(backend, holder, ttl_ms, now_ms).await
+                StorageBackend::try_acquire_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms)
+                    .await
             }
         }
     }
     async fn renew_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseRenew, StorageError> {
         match self {
             Self::Sqlite(backend) => {
-                StorageBackend::renew_hub_lease(backend, holder, ttl_ms, now_ms).await
+                StorageBackend::renew_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms).await
             }
             Self::Postgres(backend) => {
-                StorageBackend::renew_hub_lease(backend, holder, ttl_ms, now_ms).await
+                StorageBackend::renew_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms).await
             }
+        }
+    }
+    async fn hub_lease_snapshot(&self) -> Result<Option<HubLeaseSnapshot>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::hub_lease_snapshot(backend).await,
+            Self::Postgres(backend) => StorageBackend::hub_lease_snapshot(backend).await,
         }
     }
     async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
@@ -3280,7 +3332,7 @@ mod tests {
 
         // hub-a acquires (epoch 1) through the UNfenced lease operation.
         assert_eq!(
-            actor.try_acquire_hub_lease("hub-a", 1_000, 100).await.unwrap(),
+            actor.try_acquire_hub_lease("hub-a", None, 1_000, 100).await.unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
         assert_eq!(store.current_lease_epoch().await.unwrap(), Some(1));
@@ -3299,7 +3351,7 @@ mod tests {
         // Takeover by hub-b past expiry bumps the epoch to 2; hub-a's old
         // claim (still 1) is now stale — the exact zombie-leader window.
         assert_eq!(
-            actor.try_acquire_hub_lease("hub-b", 1_000, 2_000).await.unwrap(),
+            actor.try_acquire_hub_lease("hub-b", None, 1_000, 2_000).await.unwrap(),
             HubLeaseAcquire::Acquired { epoch: 2 }
         );
         // Restore hub-a's stale leader claim (it has not noticed yet).
@@ -3332,7 +3384,7 @@ mod tests {
         // Simulate a prior HA deployment: a lease row exists (epoch 1 —
         // a live holder's self-acquire stays idempotent).
         assert_eq!(
-            store.try_acquire_hub_lease("old-hub", 1_000, 100).await.unwrap(),
+            store.try_acquire_hub_lease("old-hub", None, 1_000, 100).await.unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
         assert_eq!(store.current_lease_epoch().await.unwrap(), Some(1));
@@ -3358,51 +3410,82 @@ mod tests {
     #[tokio::test]
     async fn hub_lease_acquire_renew_release_contract() {
         let store = ControlPlaneStore::contract("hub_lease_acquire_renew_release_contract").await;
-        // Fresh row: the first acquire is a takeover of the expired default.
+        assert_eq!(store.hub_lease_snapshot().await.unwrap(), None);
+        // Fresh row: the first acquire is a takeover of the expired default,
+        // and it persists the leader's advertised address.
         assert_eq!(
-            store.try_acquire_hub_lease("hub-a", 1_000, 100).await.unwrap(),
+            store
+                .try_acquire_hub_lease("hub-a", Some("http://leader-a:8080"), 1_000, 100)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
-        // Another live holder is refused and observes the current lease.
+        // Another live holder is refused and observes the current lease
+        // including the advertisement.
         assert_eq!(
-            store.try_acquire_hub_lease("hub-b", 1_000, 200).await.unwrap(),
+            store.try_acquire_hub_lease("hub-b", None, 1_000, 200).await.unwrap(),
             HubLeaseAcquire::HeldByOther(HubLeaseSnapshot {
                 holder: "hub-a".into(),
                 epoch: 1,
                 expires_at_ms: 1_100,
+                advertise_url: Some("http://leader-a:8080".into()),
             })
         );
-        // Holder renews; epoch is stable.
+        // Holder renews; epoch is stable and the row mirrors the renewal's
+        // (changed) advertisement.
         assert_eq!(
-            store.renew_hub_lease("hub-a", 1_000, 500).await.unwrap(),
+            store
+                .renew_hub_lease("hub-a", Some("http://leader-a:8081"), 1_000, 500)
+                .await
+                .unwrap(),
             HubLeaseRenew::Renewed { epoch: 1 }
+        );
+        assert_eq!(
+            store.hub_lease_snapshot().await.unwrap(),
+            Some(HubLeaseSnapshot {
+                holder: "hub-a".into(),
+                epoch: 1,
+                expires_at_ms: 1_500,
+                advertise_url: Some("http://leader-a:8081".into()),
+            })
         );
         // Non-holder renewal is Lost without touching the row.
         assert_eq!(
-            store.renew_hub_lease("hub-b", 1_000, 500).await.unwrap(),
+            store.renew_hub_lease("hub-b", None, 1_000, 500).await.unwrap(),
             HubLeaseRenew::Lost
         );
         // Past expiry the old holder can no longer renew.
         assert_eq!(
-            store.renew_hub_lease("hub-a", 1_000, 2_000).await.unwrap(),
+            store.renew_hub_lease("hub-a", None, 1_000, 2_000).await.unwrap(),
             HubLeaseRenew::Lost
         );
-        // Takeover after expiry bumps the epoch.
+        // Takeover after expiry bumps the epoch and rewrites the row to the
+        // taker's advertisement (here: none, which clears the column).
         assert_eq!(
-            store.try_acquire_hub_lease("hub-b", 1_000, 2_000).await.unwrap(),
+            store.try_acquire_hub_lease("hub-b", None, 1_000, 2_000).await.unwrap(),
             HubLeaseAcquire::Acquired { epoch: 2 }
+        );
+        assert_eq!(
+            store.hub_lease_snapshot().await.unwrap(),
+            Some(HubLeaseSnapshot {
+                holder: "hub-b".into(),
+                epoch: 2,
+                expires_at_ms: 3_000,
+                advertise_url: None,
+            })
         );
         // Self-acquire keeps the epoch and extends the TTL.
         assert_eq!(
-            store.try_acquire_hub_lease("hub-b", 2_000, 2_500).await.unwrap(),
+            store.try_acquire_hub_lease("hub-b", None, 2_000, 2_500).await.unwrap(),
             HubLeaseAcquire::Acquired { epoch: 2 }
         );
         assert_eq!(
-            store.try_acquire_hub_lease("hub-a", 1_000, 2_600).await.unwrap(),
+            store.try_acquire_hub_lease("hub-a", None, 1_000, 2_600).await.unwrap(),
             HubLeaseAcquire::HeldByOther(HubLeaseSnapshot {
                 holder: "hub-b".into(),
                 epoch: 2,
                 expires_at_ms: 4_500,
+                advertise_url: None,
             })
         );
         // Release expires immediately (and only for the holder); a second
@@ -3411,7 +3494,7 @@ mod tests {
         assert!(store.release_hub_lease("hub-b", 2_900).await.unwrap());
         assert!(!store.release_hub_lease("hub-b", 2_950).await.unwrap());
         assert_eq!(
-            store.try_acquire_hub_lease("hub-a", 1_000, 3_000).await.unwrap(),
+            store.try_acquire_hub_lease("hub-a", None, 1_000, 3_000).await.unwrap(),
             HubLeaseAcquire::Acquired { epoch: 3 }
         );
     }
@@ -5301,7 +5384,7 @@ mod tests {
         // A live lease row exists at epoch 1; this process carries a standby
         // claim (0) that never entered the election.
         assert_eq!(
-            store.try_acquire_hub_lease("hub-live", 3_600_000, 100).await.unwrap(),
+            store.try_acquire_hub_lease("hub-live", None, 3_600_000, 100).await.unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
         actor.leadership_epoch().store(0, Ordering::Release);
@@ -5388,7 +5471,9 @@ mod tests {
             .await,
         );
         assert_stale(
-            actor.update_job("orders", None, None, None, None, None, None).await,
+            actor
+                .update_job("orders", None, None, None, None, None, None)
+                .await,
         );
         assert_stale(
             actor
@@ -5523,15 +5608,15 @@ mod tests {
         let store = ControlPlaneStore::contract("storage_actor_exposes_the_lease_and_retention_surfaces").await;
         let actor = StorageActor::start(store, 16);
         assert_eq!(
-            actor.try_acquire_hub_lease("hub-a", 1_000, 100).await.unwrap(),
+            actor.try_acquire_hub_lease("hub-a", None, 1_000, 100).await.unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
         assert_eq!(
-            actor.renew_hub_lease("hub-a", 1_000, 200).await.unwrap(),
+            actor.renew_hub_lease("hub-a", None, 1_000, 200).await.unwrap(),
             HubLeaseRenew::Renewed { epoch: 1 }
         );
         assert_eq!(
-            actor.renew_hub_lease("hub-b", 1_000, 200).await.unwrap(),
+            actor.renew_hub_lease("hub-b", None, 1_000, 200).await.unwrap(),
             HubLeaseRenew::Lost
         );
         assert!(!actor.release_hub_lease("hub-b", 300).await.unwrap());
@@ -5711,7 +5796,7 @@ mod tests {
     async fn sqlite_write_fence_commit_failure_is_reported_loudly() {
         let store = ControlPlaneStore::in_memory().unwrap();
         assert_eq!(
-            store.try_acquire_hub_lease("hub-a", 1_000, 100).await.unwrap(),
+            store.try_acquire_hub_lease("hub-a", None, 1_000, 100).await.unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
         assert_eq!(

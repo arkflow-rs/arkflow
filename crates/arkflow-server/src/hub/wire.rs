@@ -102,6 +102,10 @@ pub struct NodeReport {
     pub boot_id: Option<String>,
     #[serde(default)]
     pub report_seq: u64,
+    /// Base URL of the Hub this report was sent to (hub-ha stage 3). Older
+    /// Agents omit the field.
+    #[serde(default)]
+    pub connected_hub: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

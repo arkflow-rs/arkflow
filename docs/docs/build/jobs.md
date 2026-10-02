@@ -155,8 +155,9 @@ Start from the maintained examples:
 ./target/release/arkflow --config examples/control_plane_node.yaml  # node-a; repeat with node-b
 ```
 
-Each node config sets `health_check.hub_url`, `node_id`, `node_token`, and
-`agent_lease_ttl_ms`; the node registers with the Hub and reports heartbeat
+Each node config sets `health_check.hub_urls` (a list — in an HA deployment
+list every Hub instance so the node can fail over to the elected leader),
+`node_id`, `node_token`, and `agent_lease_ttl_ms`; the node registers with the Hub and reports heartbeat
 and observation state. Nodes that will participate in a `split` placement
 (see [What scales](#what-scales--and-how)) additionally set
 `health_check.data_port` (enables the shuffle data-plane listener) and

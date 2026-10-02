@@ -254,6 +254,12 @@ pub fn validate_config(config: &EngineConfig) -> ConfigValidationReport {
             message: error.to_string(),
         });
     }
+    if let Err(error) = config.health_check.validate_hub_urls() {
+        errors.push(ConfigIssue {
+            path: "health_check.hub_urls".to_string(),
+            message: error.to_string(),
+        });
+    }
 
     for (index, stream) in config.streams.iter().enumerate() {
         // Kernel-equivalent validation: compile to a JobSpec, then dry-run

@@ -12,7 +12,7 @@ ArkFlow 提供一个可选的控制平面,用于把多个计算节点当作机�
 控制平面与健康检查共用同一个 HTTP 服务。通过 `health_check.address` 与
 `health_check.api_prefix` 配置绑定地址和带版本前缀的路径;可选的 `health_check.api_token`
 为生命周期命令以及配置读写启用 Bearer 认证。请将该监听保持在本地,或置于经过认证的反向代理之后。
-当 `health_check.hub_url` 缺省时,ArkFlow 以独立(standalone)模式运行,只提供兼容性健康路由。
+当 `health_check.hub_urls` 为空(或缺省)时,ArkFlow 以独立(standalone)模式运行,只提供兼容性健康路由;列表非空即启用 Agent 模式并支持多 Hub 故障转移(参见[部署](/zh-Hans/docs/operate/control-plane/deploy#agent-multi-hub-failover))。
 
 ## API 端点
 

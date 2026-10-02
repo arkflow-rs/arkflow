@@ -38,7 +38,12 @@ use url::Url;
 
 #[derive(Debug, Clone)]
 pub struct NodeAgentConfig {
+    /// Hub base URL of the active candidate. The failover loop clones the
+    /// config with a different `hub_url` per candidate (see `run`), so every
+    /// session-scoped call site reads the active address from here.
     pub hub_url: String,
+    /// Failover candidates in scan order; `hub_url` is always one of them.
+    pub hub_urls: Vec<String>,
     pub api_prefix: String,
     pub node_id: String,
     pub node_token: String,
@@ -1860,9 +1865,21 @@ impl JobComponentAdapter for RegistryJobAdapter {
     }
 }
 
+/// Trim trailing `/` and drop duplicates, preserving first-seen order.
+fn normalize_hub_urls(urls: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    urls.iter()
+        .map(|url| url.trim_end_matches('/'))
+        .filter(|url| !url.is_empty())
+        .filter(|url| seen.insert((*url).to_owned()))
+        .map(str::to_owned)
+        .collect()
+}
+
 impl NodeAgentConfig {
     pub fn from_engine(config: &arkflow_core::config::EngineConfig) -> Option<Self> {
-        let hub_url = config.health_check.hub_url.clone()?;
+        let hub_urls = normalize_hub_urls(&config.health_check.hub_urls);
+        let hub_url = hub_urls.first()?.clone();
         let node_id = config
             .health_check
             .node_id
@@ -1880,7 +1897,8 @@ impl NodeAgentConfig {
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
         Some(Self {
-            hub_url: hub_url.trim_end_matches('/').into(),
+            hub_url,
+            hub_urls,
             api_prefix: config.health_check.api_prefix.trim_end_matches('/').into(),
             node_id,
             node_token,
@@ -2085,8 +2103,10 @@ pub async fn run(
     config: NodeAgentConfig,
     cancellation: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = build_agent_client(&config.hub_url)?;
     let mut backoff = Duration::from_millis(250);
+    // Consecutive registration failures since the last success; a full cycle
+    // across every candidate is what escalates to the exponential backoff.
+    let mut failed_attempts: usize = 0;
     let mut completed_commands = CompletedCommandCache::new(1024);
     let mut job_runtime = JobRuntime::default();
     // Host resource gauges: sampled on an interval derived from the report
@@ -2177,6 +2197,20 @@ pub async fn run(
         }
     }
     let network_shuffle = job_runtime.data_plane.is_some();
+    // hub-ha stage 3 failover: the queue's front is the next candidate. A
+    // successful registration pins its address at the front; a standby 503
+    // rotates immediately; a standby's `leader_url` hint jumps the queue.
+    let mut candidates: std::collections::VecDeque<String> = if config.hub_urls.is_empty() {
+        std::iter::once(config.hub_url.clone()).collect()
+    } else {
+        config.hub_urls.iter().cloned().collect()
+    };
+    let failover_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut active_config = config.clone();
+    let mut client = build_agent_client(&active_config.hub_url)?;
+    // Reason token for the next switch's audit log, carried over from the
+    // failure that triggered the rotation.
+    let mut pending_reason: &'static str = "transport_error";
     loop {
         if cancellation.is_cancelled() {
             job_runtime.stop_all().await;
@@ -2185,30 +2219,90 @@ pub async fn run(
             }
             return Ok(());
         }
-        match register(&client, &config, data_address.clone()).await {
+        let Some(next) = candidates.front().cloned() else {
+            return Err("no hub candidate addresses configured".into());
+        };
+        if next != active_config.hub_url {
+            info!(
+                node_id = %config.node_id,
+                from = %active_config.hub_url,
+                to = %next,
+                reason = pending_reason,
+                "Switching control-plane Hub candidate"
+            );
+            client = build_agent_client(&next)?;
+            active_config.hub_url = next;
+            failover_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        match register(&client, &active_config, data_address.clone()).await {
             Ok(session) => {
-                info!(node_id = %config.node_id, hub = %config.hub_url, "Compute node registered with control-plane Hub");
+                info!(node_id = %config.node_id, hub = %active_config.hub_url, "Compute node registered with control-plane Hub");
                 backoff = Duration::from_millis(250);
+                failed_attempts = 0;
                 if let Err(error) = run_session(
                     &client,
                     &cp,
-                    &config,
+                    &active_config,
                     session,
                     cancellation.clone(),
                     &mut completed_commands,
                     job_runtime.clone(),
                     network_shuffle,
                     &resource_sampler,
+                    &failover_counter,
                 )
                 .await
                 {
                     warn!(node_id = %config.node_id, error = %error, "Hub Agent session ended; reconnecting");
                 }
+                // The winner stays at the front: reconnects prefer the Hub
+                // that last accepted a registration. Demotion or death of
+                // that Hub surfaces as a Standby/Transport failure below and
+                // rotates from there.
             }
-            Err(error) => {
-                warn!(node_id = %config.node_id, error = %error, "Hub Agent registration failed")
+            Err(RegisterFailure::Standby { leader_url }) => {
+                warn!(
+                    node_id = %config.node_id,
+                    hub = %active_config.hub_url,
+                    "Hub is a standby; advancing to the next candidate"
+                );
+                match leader_url {
+                    // A trusted standby hint points straight at the elected
+                    // leader — one probe instead of a full scan.
+                    Some(leader) => {
+                        pending_reason = "leader_hint";
+                        jump_to_candidate(&mut candidates, leader);
+                    }
+                    None => {
+                        pending_reason = "standby_advance";
+                        rotate_candidates(&mut candidates);
+                    }
+                }
+                failed_attempts += 1;
+            }
+            Err(RegisterFailure::Transport(message)) => {
+                warn!(
+                    node_id = %config.node_id,
+                    hub = %active_config.hub_url,
+                    error = %message,
+                    "Hub Agent registration failed"
+                );
+                pending_reason = "transport_error";
+                rotate_candidates(&mut candidates);
+                failed_attempts += 1;
             }
         }
+        // A full failed cycle across every candidate triggers the jittered
+        // exponential backoff; within a cycle candidates rotate after only a
+        // short fixed pause (a standby 503 must not burn the backoff).
+        let cycle_len = candidates.len().max(1);
+        let sleep_duration = if failed_attempts > 0 && failed_attempts.is_multiple_of(cycle_len) {
+            let current = backoff;
+            backoff = (backoff * 2).min(Duration::from_secs(10));
+            jittered_backoff(current)
+        } else {
+            Duration::from_millis(200)
+        };
         tokio::select! {
             _ = cancellation.cancelled() => {
                 job_runtime.stop_all().await;
@@ -2217,10 +2311,23 @@ pub async fn run(
                 }
                 return Ok(())
             },
-            _ = tokio::time::sleep(jittered_backoff(backoff)) => {}
+            _ = tokio::time::sleep(sleep_duration) => {}
         }
-        backoff = (backoff * 2).min(Duration::from_secs(10));
     }
+}
+
+/// Rotate the failover queue: the failed front candidate moves to the back.
+fn rotate_candidates(candidates: &mut std::collections::VecDeque<String>) {
+    if let Some(front) = candidates.pop_front() {
+        candidates.push_back(front);
+    }
+}
+
+/// Move `target` to the front of the failover queue (deduplicated), used for
+/// standby `leader_url` hints.
+fn jump_to_candidate(candidates: &mut std::collections::VecDeque<String>, target: String) {
+    candidates.retain(|candidate| candidate != &target);
+    candidates.push_front(target);
 }
 
 /// Whether an HTTP host is this machine: loopback addresses (the whole
@@ -2291,12 +2398,36 @@ async fn await_previous_teardown(
     }
 }
 
+/// Classified registration failure (hub-ha stage 3): the failover loop
+/// rotates candidates immediately on `Standby` but only escalates to the
+/// exponential backoff after a full failed cycle.
+enum RegisterFailure {
+    /// 503 `hub_standby`: the Hub is reachable but not the leader. Carries
+    /// the standby's `leader_url` hint when the shared lease row advertises
+    /// the elected leader's address.
+    Standby { leader_url: Option<String> },
+    /// Connection-level failure or a non-standby HTTP error.
+    Transport(String),
+}
+
+impl std::fmt::Display for RegisterFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Standby { leader_url } => match leader_url {
+                Some(leader) => write!(formatter, "hub is a standby (leader hint: {leader})"),
+                None => write!(formatter, "hub is a standby"),
+            },
+            Self::Transport(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
 async fn register(
     client: &Client,
     config: &NodeAgentConfig,
     data_address: Option<String>,
-) -> Result<RegisterResponse, reqwest::Error> {
-    client
+) -> Result<RegisterResponse, RegisterFailure> {
+    let response = client
         .post(format!(
             "{}{}{}",
             config.hub_url, config.api_prefix, "/agent/register"
@@ -2312,10 +2443,30 @@ async fn register(
             data_address,
         })
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(|error| RegisterFailure::Transport(error.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            let problem: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|error| RegisterFailure::Transport(error.to_string()))?;
+            if problem["code"] == "hub_standby" {
+                let leader_url = problem["details"]["leader_url"]
+                    .as_str()
+                    .map(str::to_owned);
+                return Err(RegisterFailure::Standby { leader_url });
+            }
+        }
+        return Err(RegisterFailure::Transport(format!(
+            "HTTP {status}: registration rejected"
+        )));
+    }
+    response
         .json()
         .await
+        .map_err(|error| RegisterFailure::Transport(error.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2329,6 +2480,7 @@ async fn run_session(
     job_runtime: JobRuntime,
     network_shuffle: bool,
     resource_sampler: &ResourceSampler,
+    failover_counter: &std::sync::atomic::AtomicU64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth = AgentAuth {
         node_id: config.node_id.clone(),
@@ -2370,7 +2522,7 @@ async fn run_session(
                 }
             },
             _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await?; }
-            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq, &job_runtime, network_shuffle, resource_sampler).await).await?; }
+            _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &report(cp, &auth, &config.boot_id, report_seq, &job_runtime, network_shuffle, resource_sampler, &config.hub_url, failover_counter.load(std::sync::atomic::Ordering::Relaxed)).await).await?; }
             _ = poll.tick() => {
                 let finished = job_runtime.take_finished().await;
                 for (index, (job_id, generation, outcome)) in finished.iter().enumerate() {
@@ -2433,6 +2585,7 @@ async fn run_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn report(
     cp: &ControlPlane,
     auth: &AgentAuth,
@@ -2445,6 +2598,8 @@ async fn report(
     job_runtime: &JobRuntime,
     network_shuffle: bool,
     resource_sampler: &ResourceSampler,
+    connected_hub: &str,
+    hub_failovers: u64,
 ) -> NodeReport {
     let streams = cp.runtime_manager().snapshots().await;
     let configuration_version = cp
@@ -2482,6 +2637,9 @@ async fn report(
             .count() as f64,
     );
     metrics.extend(job_runtime.metrics().await);
+    // hub-ha stage 3 observability: which Hub this report targets and how
+    // many candidate switches the process has performed.
+    metrics.insert("hub_failovers".into(), hub_failovers as f64);
     // Host resource gauges ride the same map; a missing or stale sample is
     // simply omitted (observability must never block reporting).
     if let Some(snapshot) = resource_sampler.fresh(now_ms()) {
@@ -2514,6 +2672,7 @@ async fn report(
             .collect(),
         boot_id: Some(boot_id.into()),
         report_seq,
+        connected_hub: Some(connected_hub.into()),
     }
 }
 
@@ -3733,7 +3892,7 @@ mod tests {
     #[test]
     fn agent_mode_requires_hub_and_stable_identity() {
         let health = HealthCheckConfig {
-            hub_url: Some("http://hub".into()),
+            hub_urls: vec!["http://hub".into()],
             node_id: Some("node-a".into()),
             ..Default::default()
         };
@@ -3760,7 +3919,7 @@ mod tests {
         assert!(shuffle.contains(&"network_shuffle".to_string()));
 
         let mut health = HealthCheckConfig {
-            hub_url: Some("http://hub".into()),
+            hub_urls: vec!["http://hub".into()],
             node_id: Some("node-a".into()),
             ..Default::default()
         };
@@ -3955,6 +4114,7 @@ mod tests {
         };
         let config = NodeAgentConfig {
             hub_url: "http://hub".into(),
+            hub_urls: vec!["http://hub".into()],
             api_prefix: "/api/v1".into(),
             node_id: "node-a".into(),
             data_host: None,
@@ -6367,6 +6527,7 @@ mod tests {
     fn test_node_config(hub_url: &str) -> NodeAgentConfig {
         NodeAgentConfig {
             hub_url: hub_url.into(),
+            hub_urls: vec![hub_url.into()],
             api_prefix: "/api/v1".into(),
             node_id: "node-a".into(),
             node_token: "token".into(),
@@ -6868,6 +7029,7 @@ mod tests {
             cp.clone(),
             NodeAgentConfig {
                 hub_url: hub_url.clone(),
+                hub_urls: vec![hub_url.clone()],
                 api_prefix: "/api/v1".into(),
                 node_id: "node-a".into(),
                 node_token: String::new(),
@@ -6959,7 +7121,8 @@ mod tests {
             let task = tokio::spawn(run(
                 empty_control_plane(),
                 NodeAgentConfig {
-                    hub_url,
+                    hub_url: hub_url.clone(),
+                    hub_urls: vec![hub_url],
                     api_prefix: "/api/v1".into(),
                     node_id: node_id.into(),
                     node_token: "data-plane-secret".into(),
@@ -7069,6 +7232,7 @@ mod tests {
             empty_control_plane(),
             NodeAgentConfig {
                 hub_url: "http://127.0.0.1:1".into(),
+                hub_urls: vec!["http://127.0.0.1:1".into()],
                 api_prefix: "/api/v1".into(),
                 node_id: "node-offline".into(),
                 node_token: String::new(),
@@ -7837,6 +8001,7 @@ mod tests {
             empty_control_plane(),
             NodeAgentConfig {
                 hub_url: "http://127.0.0.1:1".into(),
+                hub_urls: vec!["http://127.0.0.1:1".into()],
                 api_prefix: "/api/v1".into(),
                 node_id: "node-dp-early".into(),
                 node_token: "data-plane-secret".into(),
@@ -7864,6 +8029,7 @@ mod tests {
             empty_control_plane(),
             NodeAgentConfig {
                 hub_url: hub_url.clone(),
+                hub_urls: vec![hub_url.clone()],
                 api_prefix: "/api/v1".into(),
                 node_id: "node-a".into(),
                 node_token: String::new(),
@@ -7969,6 +8135,7 @@ mod tests {
     fn fast_session_config(hub_url: &str) -> NodeAgentConfig {
         NodeAgentConfig {
             hub_url: hub_url.into(),
+            hub_urls: vec![hub_url.into()],
             api_prefix: "/api/v1".into(),
             node_id: "node-a".into(),
             node_token: "token".into(),
@@ -7979,6 +8146,304 @@ mod tests {
             data_port: None,
             data_host: None,
         }
+    }
+
+    /// A leader stub for the hub-ha failover tests: completes registration,
+    /// accepts reports (recorded for assertions), and returns empty command
+    /// batches so the session stays alive.
+    struct FailoverLeader {
+        registrations: std::sync::Mutex<Vec<serde_json::Value>>,
+        reports: std::sync::Mutex<Vec<serde_json::Value>>,
+        /// When set, heartbeats answer 500 so the session ends and the
+        /// failover loop's reconnect preference becomes observable.
+        fail_heartbeats: std::sync::atomic::AtomicBool,
+    }
+
+    async fn failover_leader_server()
+    -> (
+        String,
+        std::sync::Arc<FailoverLeader>,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::extract::State;
+        let leader = std::sync::Arc::new(FailoverLeader {
+            registrations: std::sync::Mutex::new(Vec::new()),
+            reports: std::sync::Mutex::new(Vec::new()),
+            fail_heartbeats: std::sync::atomic::AtomicBool::new(false),
+        });
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/agent/register",
+                axum::routing::post(
+                    |State(leader): State<std::sync::Arc<FailoverLeader>>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        leader.registrations.lock().unwrap().push(body);
+                        axum::Json(serde_json::json!({
+                            "node_id": "node-a",
+                            "session_token": "failover-session",
+                            "session_ttl_ms": 3_600_000,
+                            "lease_ttl_ms": 15_000,
+                            "poll_interval_ms": 50,
+                            "protocol_version": "v1",
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/agent/report",
+                axum::routing::post(
+                    |State(leader): State<std::sync::Arc<FailoverLeader>>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        leader.reports.lock().unwrap().push(body);
+                        axum::http::StatusCode::OK
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/agent/heartbeat",
+                axum::routing::post(
+                    |State(leader): State<std::sync::Arc<FailoverLeader>>| async move {
+                        if leader
+                            .fail_heartbeats
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            axum::http::StatusCode::OK
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/agent/commands",
+                axum::routing::get(|| async { axum::Json(Vec::<AgentCommand>::new()) }),
+            )
+            .fallback(|| async { axum::http::StatusCode::OK })
+            .with_state(leader.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let shutdown = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await;
+        });
+        (format!("http://{address}"), leader, cancellation, task)
+    }
+
+    /// A standby stub: every request gets the 503 `hub_standby` problem,
+    /// optionally carrying the `leader_url` hint, and a hit counter for
+    /// asserting the candidate order.
+    async fn standby_server(
+        leader_hint: Option<String>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_in_route = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            let hint = leader_hint.clone();
+            let hits = hits_in_route.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let details = hint
+                    .as_deref()
+                    .map(|leader| serde_json::json!({ "leader_url": leader }));
+                axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({
+                        "code": "hub_standby",
+                        "message": "This Hub instance is a standby",
+                        "details": details,
+                    })),
+                ))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let shutdown = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await;
+        });
+        (format!("http://{address}"), hits, cancellation, task)
+    }
+
+    /// hub-ha stage 3: a standby 503 rotates to the next configured
+    /// candidate immediately, and the winner's reports name the connected
+    /// Hub and the failover count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn standby_503_fails_over_to_next_candidate() {
+        let (leader_url, leader, leader_cancel, leader_task) = failover_leader_server().await;
+        let (standby_url, standby_hits, standby_cancel, standby_task) =
+            standby_server(None).await;
+
+        let cancel = CancellationToken::new();
+        let mut config = test_node_config(&standby_url);
+        config.hub_urls = vec![standby_url.clone(), leader_url.clone()];
+        config.heartbeat_interval = Duration::from_millis(50);
+        config.report_interval = Duration::from_millis(50);
+        config.poll_interval = Duration::from_millis(50);
+        let agent = tokio::spawn(run(empty_control_plane(), config, cancel.clone()));
+
+        wait_for(Duration::from_secs(10), || {
+            let leader = leader.clone();
+            async move { !leader.registrations.lock().unwrap().is_empty() }
+        })
+        .await;
+        assert!(
+            standby_hits.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the standby must have been tried first"
+        );
+        wait_for(Duration::from_secs(10), || {
+            let leader = leader.clone();
+            let leader_url = leader_url.clone();
+            async move {
+                leader.reports.lock().unwrap().iter().any(|report| {
+                    report["connected_hub"].as_str() == Some(leader_url.as_str())
+                        && report["metrics"]["hub_failovers"].as_f64().is_some_and(|count| count >= 1.0)
+                })
+            }
+        })
+        .await;
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), agent).await;
+        standby_cancel.cancel();
+        leader_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), standby_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), leader_task).await;
+    }
+
+    /// Pure queue semantics: rotation moves the failed front to the back; a
+    /// hint target jumps to the front, deduplicated.
+    #[test]
+    fn candidate_queue_rotation_preserves_order_and_hint_jumps() {
+        let mut candidates: std::collections::VecDeque<String> = ["a", "b", "c"]
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+
+        rotate_candidates(&mut candidates);
+        assert_eq!(candidates.front().unwrap(), "b");
+        rotate_candidates(&mut candidates);
+        assert_eq!(candidates.front().unwrap(), "c");
+
+        // A known target deduplicates instead of growing the queue.
+        jump_to_candidate(&mut candidates, "a".into());
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates.front().unwrap(), "a");
+
+        // An out-of-list target is inserted at the front.
+        jump_to_candidate(&mut candidates, "leader-x".into());
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(candidates.front().unwrap(), "leader-x");
+    }
+
+    /// Reconnects prefer the candidate that last accepted a registration:
+    /// after a session ends (heartbeat 500), the Agent re-registers against
+    /// the same leader without touching the standby again, and the boot
+    /// identity stays stable across the switch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_prefers_the_candidate_that_last_accepted_registration() {
+        let (leader_url, leader, leader_cancel, leader_task) = failover_leader_server().await;
+        let (standby_url, standby_hits, standby_cancel, standby_task) =
+            standby_server(None).await;
+
+        let cancel = CancellationToken::new();
+        let mut config = test_node_config(&standby_url);
+        config.hub_urls = vec![standby_url.clone(), leader_url.clone()];
+        config.boot_id = "boot-pinning".into();
+        config.heartbeat_interval = Duration::from_millis(50);
+        config.report_interval = Duration::from_millis(50);
+        config.poll_interval = Duration::from_millis(50);
+        let agent = tokio::spawn(run(empty_control_plane(), config, cancel.clone()));
+
+        // Phase 1: the standby is tried first, then the leader registers.
+        wait_for(Duration::from_secs(10), || {
+            let leader = leader.clone();
+            async move { !leader.registrations.lock().unwrap().is_empty() }
+        })
+        .await;
+        assert_eq!(
+            standby_hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly one standby hit before the leader registered"
+        );
+
+        // Phase 2: kill the session via heartbeats; the reconnect must go
+        // straight back to the pinned leader.
+        leader
+            .fail_heartbeats
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        wait_for(Duration::from_secs(10), || {
+            let leader = leader.clone();
+            async move { leader.registrations.lock().unwrap().len() >= 2 }
+        })
+        .await;
+        leader
+            .fail_heartbeats
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            standby_hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the reconnect hit the pinned leader, not the standby"
+        );
+
+        // Session continuity across the switch: same boot identity and node.
+        let registrations = leader.registrations.lock().unwrap().clone();
+        for registration in &registrations {
+            assert_eq!(registration["boot_id"].as_str(), Some("boot-pinning"));
+            assert_eq!(registration["node_id"].as_str(), Some("node-a"));
+        }
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), agent).await;
+        standby_cancel.cancel();
+        leader_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), standby_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), leader_task).await;
+    }
+
+    /// A standby's `leader_url` hint jumps the queue even when the leader is
+    /// not part of the configured candidate list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn standby_leader_hint_jumps_to_the_advertised_leader() {
+        let (leader_url, leader, leader_cancel, leader_task) = failover_leader_server().await;
+        let (standby_url, standby_hits, standby_cancel, standby_task) =
+            standby_server(Some(leader_url.clone())).await;
+
+        let cancel = CancellationToken::new();
+        let mut config = test_node_config(&standby_url);
+        config.hub_urls = vec![standby_url.clone()];
+        config.heartbeat_interval = Duration::from_millis(50);
+        config.report_interval = Duration::from_millis(50);
+        config.poll_interval = Duration::from_millis(50);
+        let agent = tokio::spawn(run(empty_control_plane(), config, cancel.clone()));
+
+        wait_for(Duration::from_secs(10), || {
+            let leader = leader.clone();
+            async move { !leader.registrations.lock().unwrap().is_empty() }
+        })
+        .await;
+        assert!(
+            standby_hits.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the standby must have been tried first"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), agent).await;
+        standby_cancel.cancel();
+        leader_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), standby_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), leader_task).await;
     }
 
     fn stub_session() -> crate::hub::RegisterResponse {
@@ -8026,6 +8491,7 @@ mod tests {
                 runtime,
                 false,
                 &sampler,
+                &std::sync::atomic::AtomicU64::new(0),
             ),
         )
         .await
@@ -8076,6 +8542,7 @@ mod tests {
                 runtime,
                 false,
                 &sampler,
+                &std::sync::atomic::AtomicU64::new(0),
             )
             .await
         });
@@ -8124,6 +8591,7 @@ mod tests {
                 runtime.clone(),
                 false,
                 &sampler,
+                &std::sync::atomic::AtomicU64::new(0),
             ),
         )
         .await
@@ -8194,6 +8662,7 @@ mod tests {
                 runtime,
                 false,
                 &sampler,
+                &std::sync::atomic::AtomicU64::new(0),
             )
             .await
         });
@@ -8466,6 +8935,7 @@ mod tests {
             empty_control_plane(),
             NodeAgentConfig {
                 hub_url: "http://127.0.0.1:1".into(),
+                hub_urls: vec!["http://127.0.0.1:1".into()],
                 api_prefix: "/api/v1".into(),
                 node_id: "node-dp-nosecret".into(),
                 node_token: String::new(),

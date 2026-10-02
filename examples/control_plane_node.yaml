@@ -2,7 +2,7 @@ logging:
   level: info
 health_check:
   enabled: false
-  hub_url: "http://127.0.0.1:8080"
+  hub_urls: ["http://127.0.0.1:8080"]
   api_prefix: "/api/v1"
   node_id: "node-a"
   node_token: "replace-with-node-token"

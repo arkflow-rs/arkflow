@@ -4,7 +4,7 @@
 
 Job resource requests (per-task cpu/memory), placement accounting with feasibility gating, effective-headroom ranking, and dedicated bounded-runtime execution for declared CPU jobs.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Job SHALL declare optional per-task resource requests
 

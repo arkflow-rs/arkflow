@@ -242,6 +242,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: hub_url.clone(),
+            hub_urls: vec![hub_url.clone()],
             api_prefix: "/api/v1".into(),
             node_id: "node-a".into(),
             node_token: String::new(),
@@ -258,6 +259,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: hub_url.clone(),
+            hub_urls: vec![hub_url.clone()],
             api_prefix: "/api/v1".into(),
             node_id: "node-b".into(),
             node_token: String::new(),
@@ -378,7 +380,8 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     let mut restarted_a = tokio::spawn(agent::run(
         empty_control_plane(),
         NodeAgentConfig {
-            hub_url,
+            hub_url: hub_url.clone(),
+            hub_urls: vec![hub_url],
             api_prefix: "/api/v1".into(),
             node_id: "node-a".into(),
             node_token: String::new(),
@@ -520,6 +523,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: hub_url.clone(),
+            hub_urls: vec![hub_url.clone()],
             api_prefix: "/api/v1".into(),
             node_id: "node-a".into(),
             node_token: data_plane_secret.clone(),
@@ -536,6 +540,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: hub_url.clone(),
+            hub_urls: vec![hub_url.clone()],
             api_prefix: "/api/v1".into(),
             node_id: "node-b".into(),
             node_token: data_plane_secret,

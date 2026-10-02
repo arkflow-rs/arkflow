@@ -107,7 +107,7 @@ jobs:
 ./target/release/arkflow --config examples/control_plane_node.yaml  # node-a; repeat with node-b
 ```
 
-每个节点配置设置 `health_check.hub_url`、`node_id`、`node_token` 与 `agent_lease_ttl_ms`;节点向 Hub 注册并上报心跳与观测状态。将要参与 `split` 放置的节点(见[哪些场景能扩展,以及如何扩展](#what-scales--and-how))还要设置 `health_check.data_port`(启用 shuffle 数据面监听)与 `health_check.data_host`(对等节点可路由的地址),节点会以此宣告其 `network_shuffle` 能力。
+每个节点配置设置 `health_check.hub_urls`(列表——HA 部署中列出全部 Hub 实例,节点即可故障转移到当选 leader)、`node_id`、`node_token` 与 `agent_lease_ttl_ms`;节点向 Hub 注册并上报心跳与观测状态。将要参与 `split` 放置的节点(见[哪些场景能扩展,以及如何扩展](#what-scales--and-how))还要设置 `health_check.data_port`(启用 shuffle 数据面监听)与 `health_check.data_host`(对等节点可路由的地址),节点会以此宣告其 `network_shuffle` 能力。
 
 ### 提交流程
 

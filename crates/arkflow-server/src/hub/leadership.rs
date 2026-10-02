@@ -18,6 +18,10 @@ pub struct HubHaConfig {
     pub lease_ttl_ms: u64,
     /// Explicit holder identity. Defaults to a per-process unique id.
     pub holder_id: Option<String>,
+    /// API base URL the leader advertises to Agents (hub-ha stage 3).
+    /// Persisted with the lease row and echoed by standbys as the
+    /// `leader_url` hint in their 503 problem body.
+    pub advertise_url: Option<String>,
 }
 
 impl Default for HubHaConfig {
@@ -26,6 +30,7 @@ impl Default for HubHaConfig {
             enabled: false,
             lease_ttl_ms: 15_000,
             holder_id: None,
+            advertise_url: None,
         }
     }
 }
@@ -245,7 +250,10 @@ impl Hub {
         let current = self.leadership.read().await.clone();
         match current {
             Leadership::Leader { epoch, .. } => {
-                match storage.renew_hub_lease(&holder, ttl, now).await {
+                match storage
+                    .renew_hub_lease(&holder, self.ha.advertise_url.clone(), ttl, now)
+                    .await
+                {
                     Ok(crate::storage::HubLeaseRenew::Renewed { epoch: renewed }) => {
                         if renewed != epoch {
                             // Impossible unless the row was tampered with;
@@ -275,7 +283,10 @@ impl Hub {
                 }
             }
             Leadership::Standby { .. } => {
-                match storage.try_acquire_hub_lease(&holder, ttl, now).await {
+                match storage
+                    .try_acquire_hub_lease(&holder, self.ha.advertise_url.clone(), ttl, now)
+                    .await
+                {
                     Ok(crate::storage::HubLeaseAcquire::Acquired { epoch }) => {
                         // Publish the fencing claim before the promotion's
                         // recovery writes: they are fenced commands and must

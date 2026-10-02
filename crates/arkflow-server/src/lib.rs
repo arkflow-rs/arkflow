@@ -562,12 +562,31 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
                     if allowlist.iter().any(|allowed| allowed == path) {
                         return next.run(request).await;
                     }
-                    problem(
+                    // hub-ha stage 3: point Agents straight at the elected
+                    // leader when the shared lease row carries its advertised
+                    // address. Any read failure or missing advertisement
+                    // degrades to the plain standby problem body.
+                    let leader_url = async {
+                        let storage = hub.storage()?;
+                        let snapshot = storage.hub_lease_snapshot().await.ok()??;
+                        let advertise = snapshot.advertise_url?;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_millis() as u64)
+                            .unwrap_or_default();
+                        (snapshot.expires_at_ms > now).then_some(advertise)
+                    }
+                    .await;
+                    let details = leader_url.map(|leader| {
+                        serde_json::json!({ "leader_url": leader })
+                    });
+                    problem_with_details(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "hub_standby",
                         "This Hub instance is a standby and does not hold the control-plane \
                          lease; retry against the elected leader"
                             .into(),
+                        details,
                     )
                 }
             },
@@ -5591,7 +5610,8 @@ mod tests {
             config_versions: Vec::new(),
             job_tasks: Default::default(),
             boot_id: Some(session.session_token.clone()),
-            report_seq: 1,
+            connected_hub: None,
+        report_seq: 1,
         })
         .await
         .unwrap();
@@ -8644,6 +8664,67 @@ mod tests {
         let (status, body) = get_json(&app, "/api/v1/nodes", "operator").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["code"], "hub_standby");
+    }
+
+    /// hub-ha stage 3: a standby's 503 points Agents at the elected leader
+    /// when the shared lease row carries its advertised address, and stays
+    /// byte-compatible with the pre-hint body when it does not.
+    #[tokio::test]
+    async fn standby_503_carries_leader_hint_from_the_shared_lease_row() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // A leader elsewhere holds the lease and advertises its API base URL.
+        let advertised = storage::ControlPlaneStore::in_memory().unwrap();
+        let actor = storage::StorageActor::start(advertised, 8);
+        assert!(matches!(
+            actor
+                .try_acquire_hub_lease(
+                    "hub-leader",
+                    Some("http://hub-leader:8080".into()),
+                    60_000,
+                    now
+                )
+                .await
+                .unwrap(),
+            storage::HubLeaseAcquire::Acquired { .. }
+        ));
+        let standby = hub::Hub::with_storage(storage_hub_config(), actor).with_ha(hub::HubHaConfig {
+            enabled: true,
+            lease_ttl_ms: 1_000,
+            ..hub::HubHaConfig::default()
+        });
+        standby.enter_election().await;
+        let app = hub_router(standby, &ServerConfig::default());
+        let (status, body) = get_json(&app, "/api/v1/nodes", "operator").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "hub_standby");
+        assert_eq!(body["details"]["leader_url"], "http://hub-leader:8080");
+
+        // A lease row without an advertisement keeps the body identical to
+        // the pre-hint standby response: no `leader_url`, no `details`.
+        let quiet = storage::ControlPlaneStore::in_memory().unwrap();
+        let actor = storage::StorageActor::start(quiet, 8);
+        assert!(matches!(
+            actor
+                .try_acquire_hub_lease("quiet-leader", None, 60_000, now)
+                .await
+                .unwrap(),
+            storage::HubLeaseAcquire::Acquired { .. }
+        ));
+        let standby = hub::Hub::with_storage(storage_hub_config(), actor).with_ha(hub::HubHaConfig {
+            enabled: true,
+            lease_ttl_ms: 1_000,
+            ..hub::HubHaConfig::default()
+        });
+        standby.enter_election().await;
+        let app = hub_router(standby, &ServerConfig::default());
+        let (status, body) = get_json(&app, "/api/v1/nodes", "operator").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "hub_standby");
+        assert!(body["details"].is_null(), "no hint without advertisement");
     }
 
     #[tokio::test]
