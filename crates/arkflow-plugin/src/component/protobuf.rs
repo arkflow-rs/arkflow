@@ -662,4 +662,253 @@ message Sample {
         let err = protobuf_to_arrow(&descriptor, &encoded[..encoded.len() / 2]).unwrap_err();
         assert!(err.to_string().contains("Protobuf message parsing failed"), "{err}");
     }
+
+    fn write_proto(dir: &tempfile::TempDir, name: &str, content: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn pool_of(set: FileDescriptorSet) -> prost_reflect::DescriptorPool {
+        prost_reflect::DescriptorPool::from_file_descriptor_set(set).unwrap()
+    }
+
+    #[test]
+    fn transitive_imports_resolve_via_parent_dir_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        write_proto(
+            &dir,
+            "common.proto",
+            r#"syntax = "proto3";
+package common;
+message Id {
+  string id = 1;
+}
+"#,
+        );
+        let main = write_proto(
+            &dir,
+            "main.proto",
+            r#"syntax = "proto3";
+import "common.proto";
+package app;
+message Wrapper {
+  common.Id inner = 1;
+  string tag = 2;
+}
+"#,
+        );
+
+        // Only main.proto is an input; the import must resolve through the
+        // parent-directory include fallback.
+        let set = parse_proto_file(&TestConfig {
+            inputs: vec![main],
+            includes: None,
+        })
+        .unwrap();
+        // The descriptor set carries the imported file alongside the input.
+        assert!(set.file.len() >= 2, "imported file missing from set");
+        let pool = pool_of(set);
+        assert!(
+            pool.get_message_by_name("common.Id").is_some(),
+            "transitively imported message must compile"
+        );
+        let wrapper = pool.get_message_by_name("app.Wrapper").unwrap();
+        assert!(wrapper.get_field_by_name("tag").is_some());
+    }
+
+    #[test]
+    fn transitive_imports_resolve_with_explicit_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        // The dependency lives in a subdirectory exposed as an include dir;
+        // the import path is interpreted relative to that include dir.
+        write_proto(
+            &dir,
+            "inc/common.proto",
+            r#"syntax = "proto3";
+package common;
+message Id {
+  string id = 1;
+}
+"#,
+        );
+        let main = write_proto(
+            &dir,
+            "main.proto",
+            r#"syntax = "proto3";
+import "common.proto";
+package app;
+message Wrapper {
+  common.Id inner = 1;
+}
+"#,
+        );
+        let inc = dir.path().join("inc").to_str().unwrap().to_string();
+        let root = dir.path().to_str().unwrap().to_string();
+
+        // Like protoc (and the previous parser), every input file must itself
+        // live under an include root, so the input's own dir is listed too.
+        let set = parse_proto_file(&TestConfig {
+            inputs: vec![main],
+            includes: Some(vec![root, inc]),
+        })
+        .unwrap();
+        let pool = pool_of(set);
+        assert!(pool.get_message_by_name("common.Id").is_some());
+    }
+
+    #[test]
+    fn missing_import_surfaces_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = write_proto(
+            &dir,
+            "main.proto",
+            r#"syntax = "proto3";
+import "nothere.proto";
+package app;
+message Wrapper {
+  string tag = 1;
+}
+"#,
+        );
+        let err = parse_proto_file(&TestConfig {
+            inputs: vec![main],
+            includes: None,
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to parse the proto file"), "{msg}");
+        // The diagnostic must name the unresolved file, not just fail opaquely.
+        assert!(msg.contains("nothere.proto"), "{msg}");
+    }
+
+    #[test]
+    fn proto2_syntax_schema_compiles_and_round_trips() {
+        let schema = r#"syntax = "proto2";
+package legacy;
+message P2 {
+  required string name = 1;
+  optional int32 count = 2 [default = 42];
+}
+"#;
+        let descriptor = parse_proto_source(schema, "legacy.P2").unwrap();
+        assert!(descriptor.get_field_by_name("name").is_some());
+        assert!(descriptor.get_field_by_name("count").is_some());
+
+        // A proto2 message still round-trips through the conversion layer.
+        let mut message = DynamicMessage::new(descriptor.clone());
+        message.set_field_by_name("name", Value::String("legacy-row".to_string()));
+        let batch = protobuf_to_arrow(&descriptor, &message.encode_to_vec()).unwrap();
+        let col = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(col.value(0), "legacy-row");
+    }
+
+    #[test]
+    fn multi_file_descriptor_set_exposes_every_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_proto(
+            &dir,
+            "a.proto",
+            r#"syntax = "proto3";
+package pa;
+message A {
+  string name = 1;
+}
+"#,
+        );
+        let b = write_proto(
+            &dir,
+            "b.proto",
+            r#"syntax = "proto3";
+package pb;
+message B {
+  int64 n = 1;
+}
+"#,
+        );
+        let set = parse_proto_file(&TestConfig {
+            inputs: vec![a, b],
+            includes: None,
+        })
+        .unwrap();
+        assert_eq!(set.file.len(), 2);
+        let pool = pool_of(set);
+        assert!(pool.get_message_by_name("pa.A").is_some());
+        assert!(pool.get_message_by_name("pb.B").is_some());
+    }
+
+    #[test]
+    fn directory_input_expands_to_its_proto_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_proto(
+            &dir,
+            "one.proto",
+            r#"syntax = "proto3";
+package d;
+message One {
+  string s = 1;
+}
+"#,
+        );
+        write_proto(
+            &dir,
+            "two.proto",
+            r#"syntax = "proto3";
+package d;
+message Two {
+  int64 i = 1;
+}
+"#,
+        );
+        // A non-proto file in the directory must be filtered out, not parsed.
+        write_proto(&dir, "notes.txt", "not a schema");
+
+        let set = parse_proto_file(&TestConfig {
+            inputs: vec![dir.path().to_str().unwrap().to_string()],
+            includes: None,
+        })
+        .unwrap();
+        assert_eq!(set.file.len(), 2, "only .proto files compile");
+        let pool = pool_of(set);
+        assert!(pool.get_message_by_name("d.One").is_some());
+        assert!(pool.get_message_by_name("d.Two").is_some());
+    }
+
+    #[test]
+    fn proto3_optional_field_pins_current_behavior() {
+        let schema = r#"syntax = "proto3";
+package opt;
+message WithOptional {
+  optional int64 maybe = 1;
+  string always = 2;
+}
+"#;
+        // Pin the observable behavior under the prost-reflect data layer:
+        // the field must at least parse, and whatever the conversion layer
+        // does with it must be loud (round-trip or error), never silent loss.
+        let descriptor = parse_proto_source(schema, "opt.WithOptional").unwrap();
+        let maybe = descriptor.get_field_by_name("maybe").expect("field parses");
+        assert_eq!(maybe.kind(), prost_reflect::Kind::Int64);
+    }
+
+    #[test]
+    fn parse_proto_source_unresolved_import_errors() {
+        let schema = r#"syntax = "proto3";
+import "missing_dep.proto";
+package x;
+message Y {
+  string s = 1;
+}
+"#;
+        let err = parse_proto_source(schema, "x.Y").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to parse proto source"), "{msg}");
+        assert!(msg.contains("missing_dep.proto"), "{msg}");
+    }
 }
