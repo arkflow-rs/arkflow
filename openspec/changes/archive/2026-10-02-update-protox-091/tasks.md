@@ -16,5 +16,5 @@
 
 ## 4. Ship
 
-- [ ] 4.1 Commit, open PR, land on CI green
-- [ ] 4.2 Archive this change (`openspec archive`)
+- [x] 4.1 Commit, open PR, land on CI green
+- [x] 4.2 Archive this change (`openspec archive`)
