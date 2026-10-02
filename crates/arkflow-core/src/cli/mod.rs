@@ -859,4 +859,19 @@ mod tests {
         shutdown_otel_tracing();
     }
 
+    /// The happy path through the chained exporter config: a valid endpoint
+    /// yields a layer (endpoint/protocol/service_name all reach the builder),
+    /// and the shutdown path runs with a provider installed.
+    #[test]
+    fn otel_layer_builds_for_a_valid_endpoint() {
+        let config = crate::config::TracingConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
+            service_name: "arkflow-coverage".to_string(),
+        };
+        let layer = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
+        assert!(layer.is_some(), "valid config must yield the otel layer");
+        shutdown_otel_tracing();
+    }
+
 }
