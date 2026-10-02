@@ -191,7 +191,7 @@ fn build_mysql_insert(
     output_config: &SqlOutputConfig,
     columns: &[String],
     rows: Vec<Vec<SqlValue>>,
-) -> QueryBuilder<'static, sqlx::MySql> {
+) -> QueryBuilder<sqlx::MySql> {
     let mut query_builder = QueryBuilder::<sqlx::MySql>::new(format!(
         "INSERT INTO {} ({})",
         output_config.table_name,
@@ -225,7 +225,7 @@ fn build_postgres_insert(
     output_config: &SqlOutputConfig,
     columns: &[String],
     rows: Vec<Vec<SqlValue>>,
-) -> QueryBuilder<'static, sqlx::Postgres> {
+) -> QueryBuilder<sqlx::Postgres> {
     let mut query_builder = QueryBuilder::<sqlx::Postgres>::new(format!(
         "INSERT INTO {} ({})",
         output_config.table_name,
@@ -815,7 +815,7 @@ mod tests {
         let sql = build_postgres_insert(&postgres_config(false, None), &columns(), rows())
             .build()
             .sql()
-            .to_string();
+            .as_str().to_string();
         assert!(sql.starts_with("INSERT INTO events (\"id\", \"name\")"),);
         assert!(!sql.contains("ON CONFLICT"));
     }
@@ -826,7 +826,7 @@ mod tests {
             build_postgres_insert(&postgres_config(true, Some(vec!["id"])), &columns(), rows())
                 .build()
                 .sql()
-                .to_string();
+                .as_str().to_string();
         assert!(sql.contains("ON CONFLICT (\"id\") DO UPDATE SET"));
         assert!(sql.contains("\"name\" = EXCLUDED.\"name\""));
         // key columns are not assigned in the update set
@@ -845,7 +845,7 @@ mod tests {
         let sql = build_mysql_insert(&config, &columns(), rows())
             .build()
             .sql()
-            .to_string();
+            .as_str().to_string();
         assert!(sql.contains("INSERT INTO events (`id`, `name`)"));
         assert!(sql.contains(" ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"));
         assert!(!sql.contains("`id` = VALUES"));
@@ -862,7 +862,7 @@ mod tests {
         )
         .build()
         .sql()
-        .to_string();
+        .as_str().to_string();
         assert!(sql.contains("ON CONFLICT (\"id\", \"name\") DO UPDATE SET"));
         assert!(sql.contains("\"id\" = EXCLUDED.\"id\""));
         assert!(sql.contains("\"name\" = EXCLUDED.\"name\""));

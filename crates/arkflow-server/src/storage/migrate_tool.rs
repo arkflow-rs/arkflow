@@ -116,9 +116,11 @@ fn sqlite_count_rows(source: &SqliteBackend, table: &str) -> Result<usize, Stora
 }
 
 async fn pg_count(pool: &sqlx::PgPool, table: &str) -> Result<usize, StorageError> {
-    let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-        .fetch_one(pool)
-        .await?;
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {table}"
+    )))
+    .fetch_one(pool)
+    .await?;
     Ok(count as usize)
 }
 
@@ -136,7 +138,7 @@ async fn pg_insert_chunk(
             "INSERT INTO {table} ({column_list}) VALUES ({}) ON CONFLICT DO NOTHING",
             placeholders.join(", ")
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for value in values {
             query = match value {
                 PgVal::Null => query.bind(Option::<String>::None),
@@ -199,9 +201,9 @@ pub async fn migrate_sqlite_to_postgres(
     }
 
     for (table, column) in IDENTITY_COLUMNS {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT setval(pg_get_serial_sequence('{table}', '{column}'), COALESCE((SELECT MAX({column}) FROM {table}), 0) + 1, false)"
-        ))
+        )))
         .execute(pool)
         .await?;
     }

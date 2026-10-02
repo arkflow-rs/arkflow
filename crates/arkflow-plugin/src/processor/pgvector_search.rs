@@ -37,7 +37,7 @@ use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("pgvector_search", Arc::new(PgVectorSearchProcessorBuilder))?;
@@ -187,7 +187,7 @@ impl PgVectorSearchProcessor {
     }
 
     async fn search_row(&self, sql: &str, vector_text: String) -> Result<String, Error> {
-        let rows: Vec<(String, Option<String>, f64)> = sqlx::query_as(sql)
+        let rows: Vec<(String, Option<String>, f64)> = sqlx::query_as(AssertSqlSafe(sql))
             .bind(vector_text)
             .fetch_all(&self.pool)
             .await

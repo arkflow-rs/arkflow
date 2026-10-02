@@ -73,7 +73,7 @@ dashmap = "6.1"
 mongodb = { version = "3.2", default-features = false, features = ["rustls-tls", "compat-3-0-0"] }
 
 # Sql
-sqlx = { version = "0.8.6", default-features = false, features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
+sqlx = { version = "0.9", default-features = false, features = ["mysql", "postgres", "runtime-tokio", "tls-native-tls"] }
 rusqlite = "0.37"
 
 tempfile = "3.24.0"
