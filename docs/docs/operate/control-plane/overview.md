@@ -16,9 +16,11 @@ The control plane shares the same HTTP server as the health checks. Configure
 its bind address and versioned prefix with `health_check.address` and
 `health_check.api_prefix`; an optional `health_check.api_token` enables Bearer
 authentication for lifecycle commands and configuration reads/writes. Keep the
-listener local or behind an authenticated reverse proxy. When `health_check.hub_url`
-is absent, ArkFlow runs in standalone mode and only the compatibility health
-routes are served.
+listener local or behind an authenticated reverse proxy. When `health_check.hub_urls`
+is empty (or absent), ArkFlow runs in standalone mode and only the
+compatibility health routes are served; a non-empty list enables Agent mode
+with multi-Hub failover (see
+[deployment](deploy.md#agent-multi-hub-failover)).
 
 ## API endpoints
 

@@ -161,9 +161,15 @@ pub struct HealthCheckConfig {
     /// Explicit browser origins allowed to call the control API. Empty denies cross-origin calls.
     #[serde(default)]
     pub cors_origins: Vec<String>,
-    /// Hub URL for compute-node Agent mode. When absent, standalone mode is used.
+    /// Hub addresses for compute-node Agent mode, tried in order as failover
+    /// candidates (see hub-ha stage 3). Empty keeps standalone mode.
     #[serde(default)]
-    pub hub_url: Option<String>,
+    pub hub_urls: Vec<String>,
+    /// Sentinel for the removed single-address key: any present occurrence
+    /// fails deserialization with a migration hint instead of being silently
+    /// ignored (a dropped key would start the process in standalone mode).
+    #[serde(default, skip_serializing)]
+    pub hub_url: DeprecatedHubUrl,
     /// Stable identity used when this process reports to a Hub.
     #[serde(default)]
     pub node_id: Option<String>,
@@ -191,10 +197,50 @@ pub struct HealthCheckConfig {
     pub observability: ObservabilityConfig,
 }
 
+/// Placeholder type for the removed `health_check.hub_url` key. Its
+/// `Deserialize` impl always fails with a migration hint so a renamed-away
+/// key can never be silently ignored by serde's unknown-field tolerance.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeprecatedHubUrl;
+
+impl<'de> Deserialize<'de> for DeprecatedHubUrl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+        Err(serde::de::Error::custom(
+            "`health_check.hub_url` was renamed and made a list; write `hub_urls: [\"http://hub:8080\"]`",
+        ))
+    }
+}
+
+impl HealthCheckConfig {
+    /// Every Agent-mode Hub address must be an absolute http(s) base URL the
+    /// reqwest client can target (scheme + non-empty host).
+    pub fn validate_hub_urls(&self) -> Result<(), Error> {
+        for (index, url) in self.hub_urls.iter().enumerate() {
+            let rest = url
+                .strip_prefix("http://")
+                .or_else(|| url.strip_prefix("https://"))
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "health_check.hub_urls[{index}] must start with http:// or https://: {url:?}"
+                    ))
+                })?;
+            if rest.trim().is_empty() || rest.trim_matches('/').is_empty() {
+                return Err(Error::Config(format!(
+                    "health_check.hub_urls[{index}] is missing a host: {url:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EngineConfig {
-    /// Streams configuration
+pub struct EngineConfig {    /// Streams configuration
     #[serde(default)]
     pub streams: Vec<StreamConfig>,
     /// Local Jobs declared directly in config (executed by the unified
@@ -352,7 +398,8 @@ impl Default for HealthCheckConfig {
             api_prefix: default_api_prefix(),
             api_token: None,
             cors_origins: Vec::new(),
-            hub_url: None,
+            hub_urls: Vec::new(),
+            hub_url: DeprecatedHubUrl,
             node_id: None,
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
@@ -506,6 +553,63 @@ mod tests {
     }
 
     #[test]
+    fn test_hub_urls_parses_as_list_and_defaults_empty() {
+        let config: EngineConfig = serde_json::from_str(
+            r#"{"health_check": {"hub_urls": ["http://hub-a:8080", "http://hub-b:8080/"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.health_check.hub_urls,
+            vec!["http://hub-a:8080", "http://hub-b:8080/"]
+        );
+
+        let config: EngineConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.health_check.hub_urls.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_hub_url_key_fails_loudly() {
+        let error = serde_json::from_str::<EngineConfig>(
+            r#"{"health_check": {"hub_url": "http://127.0.0.1:8080"}}"#,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("hub_urls"),
+            "error must carry the migration hint: {message}"
+        );
+
+        // Any legacy form fails the same way, not just strings.
+        let error = serde_json::from_str::<EngineConfig>(r#"{"health_check": {"hub_url": null}}"#)
+            .unwrap_err();
+        assert!(error.to_string().contains("hub_urls"));
+    }
+
+    #[test]
+    fn test_hub_url_sentinel_is_not_serialized() {
+        let serialized = serde_json::to_string(&HealthCheckConfig::default()).unwrap();
+        assert!(!serialized.contains("hub_url\""), "serialized = {serialized}");
+    }
+
+    #[test]
+    fn test_validate_hub_urls() {
+        let mut config = HealthCheckConfig::default();
+        assert!(config.validate_hub_urls().is_ok());
+
+        config.hub_urls = vec!["http://hub-a:8080".into(), "https://hub-b".into()];
+        assert!(config.validate_hub_urls().is_ok());
+
+        config.hub_urls = vec!["hub-a:8080".into()];
+        assert!(config.validate_hub_urls().is_err());
+
+        config.hub_urls = vec!["http://".into()];
+        assert!(config.validate_hub_urls().is_err());
+
+        config.hub_urls = vec!["http://///".into()];
+        assert!(config.validate_hub_urls().is_err());
+    }
+
+    #[test]
     fn test_health_check_config_serialization() {
         let config = HealthCheckConfig {
             enabled: false,
@@ -516,7 +620,8 @@ mod tests {
             api_prefix: "/api/v1".to_string(),
             api_token: Some("test-token".to_string()),
             cors_origins: Vec::new(),
-            hub_url: None,
+            hub_urls: Vec::new(),
+            hub_url: DeprecatedHubUrl,
             node_id: None,
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),

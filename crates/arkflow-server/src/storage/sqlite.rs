@@ -1544,6 +1544,7 @@ impl SqliteBackend {
     pub fn try_acquire_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseAcquire, StorageError> {
@@ -1566,11 +1567,12 @@ impl SqliteBackend {
             )?;
             if current.0 == holder {
                 transaction.execute(
-                    "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2 \
-                     WHERE id = 1 AND holder = ?3",
+                    "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2, \
+                     advertise_url = ?3 WHERE id = 1 AND holder = ?4",
                     rusqlite::params![
                         (now_ms + ttl_ms) as i64,
                         now_ms as i64,
+                        advertise_url,
                         holder
                     ],
                 )?;
@@ -1581,11 +1583,12 @@ impl SqliteBackend {
             if current.2 <= now_ms as i64 {
                 let updated = transaction.execute(
                     "UPDATE cp_hub_lease SET holder = ?1, epoch = epoch + 1, expires_at_ms = ?2, \
-                     updated_at_ms = ?3 WHERE id = 1 AND expires_at_ms <= ?4",
+                     updated_at_ms = ?3, advertise_url = ?4 WHERE id = 1 AND expires_at_ms <= ?5",
                     rusqlite::params![
                         holder,
                         (now_ms + ttl_ms) as i64,
                         now_ms as i64,
+                        advertise_url,
                         now_ms as i64
                     ],
                 )?;
@@ -1596,13 +1599,14 @@ impl SqliteBackend {
                 }
             }
             let snapshot = transaction.query_row(
-                "SELECT holder, epoch, expires_at_ms FROM cp_hub_lease WHERE id = 1",
+                "SELECT holder, epoch, expires_at_ms, advertise_url FROM cp_hub_lease WHERE id = 1",
                 [],
                 |row| {
                     Ok(HubLeaseSnapshot {
                         holder: row.get(0)?,
                         epoch: row.get::<_, i64>(1)?.max(0) as u64,
                         expires_at_ms: row.get::<_, i64>(2)?.max(0) as u64,
+                        advertise_url: row.get(3)?,
                     })
                 },
             )?;
@@ -1614,6 +1618,7 @@ impl SqliteBackend {
     pub fn renew_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseRenew, StorageError> {
@@ -1629,13 +1634,41 @@ impl SqliteBackend {
                 return Ok(HubLeaseRenew::Lost);
             };
             transaction.execute(
-                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2 \
-                 WHERE id = 1 AND holder = ?3 AND expires_at_ms > ?4",
-                rusqlite::params![(now_ms + ttl_ms) as i64, now_ms as i64, holder, now_ms as i64],
+                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2, \
+                 advertise_url = ?3 WHERE id = 1 AND holder = ?4 AND expires_at_ms > ?5",
+                rusqlite::params![
+                    (now_ms + ttl_ms) as i64,
+                    now_ms as i64,
+                    advertise_url,
+                    holder,
+                    now_ms as i64
+                ],
             )?;
             Ok(HubLeaseRenew::Renewed {
                 epoch: epoch.max(0) as u64,
             })
+        })
+    }
+
+    /// Full lease row for the standby `leader_url` hint; `None` when the
+    /// table has no row (HA disabled).
+    pub fn hub_lease_snapshot(&self) -> Result<Option<HubLeaseSnapshot>, StorageError> {
+        self.with_connection(|connection| {
+            use rusqlite::OptionalExtension;
+            connection
+                .query_row(
+                    "SELECT holder, epoch, expires_at_ms, advertise_url FROM cp_hub_lease WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok(HubLeaseSnapshot {
+                            holder: row.get(0)?,
+                            epoch: row.get::<_, i64>(1)?.max(0) as u64,
+                            expires_at_ms: row.get::<_, i64>(2)?.max(0) as u64,
+                            advertise_url: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
         })
     }
 
@@ -2372,7 +2405,8 @@ impl SqliteBackend {
                 holder TEXT NOT NULL DEFAULT '',
                 epoch INTEGER NOT NULL DEFAULT 0,
                 expires_at_ms INTEGER NOT NULL DEFAULT 0,
-                updated_at_ms INTEGER NOT NULL DEFAULT 0
+                updated_at_ms INTEGER NOT NULL DEFAULT 0,
+                advertise_url TEXT
             );
 
             CREATE INDEX IF NOT EXISTS cp_intents_due
@@ -2462,6 +2496,13 @@ impl SqliteBackend {
                 "ALTER TABLE cp_job_checkpoints ADD COLUMN job_version INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
+        }
+        let lease_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(cp_hub_lease)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !lease_columns.iter().any(|name| name == "advertise_url") {
+            connection.execute("ALTER TABLE cp_hub_lease ADD COLUMN advertise_url TEXT", [])?;
         }
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS cp_intents_idempotency ON cp_intents(node_id, stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
@@ -2722,21 +2763,26 @@ node_id: Option<&str>,
     async fn try_acquire_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseAcquire, StorageError> {
-        self.try_acquire_hub_lease(holder, ttl_ms, now_ms)
+        self.try_acquire_hub_lease(holder, advertise_url, ttl_ms, now_ms)
     }
     async fn renew_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseRenew, StorageError> {
-        self.renew_hub_lease(holder, ttl_ms, now_ms)
+        self.renew_hub_lease(holder, advertise_url, ttl_ms, now_ms)
     }
     async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
         self.release_hub_lease(holder, now_ms)
+    }
+    async fn hub_lease_snapshot(&self) -> Result<Option<HubLeaseSnapshot>, StorageError> {
+        self.hub_lease_snapshot()
     }
     async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
         self.current_lease_epoch()

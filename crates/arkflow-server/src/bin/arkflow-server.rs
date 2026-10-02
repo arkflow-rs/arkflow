@@ -43,6 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .filter(|ttl| *ttl >= 1_000)
             .unwrap_or(15_000),
         holder_id: std::env::var("ARKFLOW_HUB_HA_HOLDER_ID").ok(),
+        advertise_url: std::env::var("ARKFLOW_HUB_HA_ADVERTISE_URL")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
     };
     bootstrap::validate_ha_config(&ha, &config).map_err(|message| {
         eprintln!("{message}");

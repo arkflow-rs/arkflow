@@ -647,8 +647,10 @@ const PG_DDL: &str = r#"
                 holder TEXT NOT NULL DEFAULT '',
                 epoch BIGINT NOT NULL DEFAULT 0,
                 expires_at_ms BIGINT NOT NULL DEFAULT 0,
-                updated_at_ms BIGINT NOT NULL DEFAULT 0
+                updated_at_ms BIGINT NOT NULL DEFAULT 0,
+                advertise_url TEXT
             );
+            ALTER TABLE cp_hub_lease ADD COLUMN IF NOT EXISTS advertise_url TEXT;
 
             CREATE INDEX IF NOT EXISTS cp_intents_due
                 ON cp_intents(state, next_retry_at_ms);
@@ -1042,34 +1044,74 @@ mod tests {
         let run = format!("pg-hub-{}", now_ms());
         let now = now_ms();
         let ttl = 60_000u64;
-        let acquired = storage.try_acquire_hub_lease(&run, ttl, now).await.unwrap();
+        let acquired = storage
+            .try_acquire_hub_lease(&run, Some("http://leader-a:8080".into()), ttl, now)
+            .await
+            .unwrap();
         assert!(matches!(acquired, HubLeaseAcquire::Acquired { .. }), "{acquired:?}");
         let HubLeaseAcquire::Acquired { epoch } = acquired else { unreachable!() };
         assert_eq!(
-            storage.try_acquire_hub_lease("pg-other", ttl, now + 1).await.unwrap(),
+            storage
+                .try_acquire_hub_lease("pg-other", Some("http://leader-b:8080".into()), ttl, now + 1)
+                .await
+                .unwrap(),
             HubLeaseAcquire::HeldByOther(HubLeaseSnapshot {
                 holder: run.clone(),
                 epoch,
                 expires_at_ms: now + ttl,
+                advertise_url: Some("http://leader-a:8080".into()),
             })
         );
+        // Renewal mirrors the caller's current advertisement, epoch unchanged.
         assert_eq!(
-            storage.renew_hub_lease(&run, ttl, now + 2).await.unwrap(),
+            storage
+                .renew_hub_lease(&run, Some("http://leader-a:8081".into()), ttl, now + 2)
+                .await
+                .unwrap(),
             HubLeaseRenew::Renewed { epoch }
         );
         assert_eq!(
-            storage.renew_hub_lease("pg-other", ttl, now + 2).await.unwrap(),
+            storage.hub_lease_snapshot().await.unwrap(),
+            Some(HubLeaseSnapshot {
+                holder: run.clone(),
+                epoch,
+                expires_at_ms: now + 2 + ttl,
+                advertise_url: Some("http://leader-a:8081".into()),
+            })
+        );
+        assert_eq!(
+            storage
+                .renew_hub_lease("pg-other", None, ttl, now + 2)
+                .await
+                .unwrap(),
             HubLeaseRenew::Lost
         );
         assert_eq!(
-            storage.try_acquire_hub_lease(&run, ttl, now + 3).await.unwrap(),
+            storage
+                .try_acquire_hub_lease(&run, Some("http://leader-a:8081".into()), ttl, now + 3)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch }
         );
+        // A leader that stops advertising clears the column (row mirrors the
+        // current holder's value), so standbys stop hinting a stale address.
         assert!(storage.release_hub_lease(&run, now + 4).await.unwrap());
         assert!(!storage.release_hub_lease(&run, now + 5).await.unwrap());
         assert_eq!(
-            storage.try_acquire_hub_lease("pg-other", ttl, now + 6).await.unwrap(),
+            storage
+                .try_acquire_hub_lease("pg-other", None, ttl, now + 6)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: epoch + 1 }
+        );
+        assert_eq!(
+            storage.hub_lease_snapshot().await.unwrap(),
+            Some(HubLeaseSnapshot {
+                holder: "pg-other".into(),
+                epoch: epoch + 1,
+                expires_at_ms: now + 6 + ttl,
+                advertise_url: None,
+            })
         );
         assert!(storage.release_hub_lease("pg-other", now + 7).await.unwrap());
     }

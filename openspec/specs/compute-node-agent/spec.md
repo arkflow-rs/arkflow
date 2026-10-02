@@ -5,11 +5,16 @@ TBD - created by archiving change make-control-plane-hub. Update Purpose after a
 ## Requirements
 ### Requirement: Compute node registration
 
-The ArkFlow compute process SHALL support Agent mode with configured `hub_url`,
+The ArkFlow compute process SHALL support Agent mode with a candidate list of
+Hub addresses declared as the `hub_urls` YAML sequence (empty or absent keeps
+standalone mode), trimmed of trailing `/` and deduplicated in order, plus a
 stable `node_id`, node credentials, and protocol version, and SHALL register
-before declaring its control-plane session ready. The Hub SHALL issue the
-per-session credential from a cryptographically secure random source so a
-session token is not enumerable or predictable.
+before declaring its control-plane session ready. The legacy `hub_url` key
+SHALL be rejected at parse time with an error carrying the rename and
+list-form migration hint. Registration SHALL be attempted against candidates
+in order, advancing when a candidate is unreachable or returns a standby 503.
+The Hub SHALL issue the per-session credential from a cryptographically secure
+random source so a session token is not enumerable or predictable.
 
 #### Scenario: Agent starts
 
@@ -27,6 +32,13 @@ session token is not enumerable or predictable.
 - **WHEN** registration or heartbeat cannot reach the Hub
 - **THEN** the node keeps its local data-plane runtime policy, retries with
   bounded backoff, and exposes the disconnected state locally
+
+#### Scenario: Registration against a standby advances to the next candidate
+
+- **WHEN** the active candidate returns 503 with the `hub_standby` error code
+- **THEN** no session is created on that Hub and the Agent attempts
+  registration against the next candidate without waiting out the full
+  reconnect backoff
 
 ### Requirement: Node heartbeat and report
 
@@ -71,7 +83,7 @@ The Agent SHALL poll for commands addressed to its node, validate expiry and ide
 
 ### Requirement: Reconnect and graceful shutdown
 
-The Agent SHALL re-register after session loss and SHALL stop its polling loops gracefully without interrupting WAL shutdown semantics. Reconnection backoff SHALL incorporate random jitter so simultaneous session loss across the fleet does not produce synchronized re-registration bursts at the Hub.
+The Agent SHALL re-register after session loss and SHALL stop its polling loops gracefully without interrupting WAL shutdown semantics. Reconnection backoff SHALL incorporate random jitter so simultaneous session loss across the fleet does not produce synchronized re-registration bursts at the Hub. Re-registration SHALL rotate across the configured candidate list: a standby 503 advances to the next candidate immediately (bounded only by a short fixed pause), while a full failed cycle across all candidates is what triggers the jittered exponential backoff; the candidate that last accepted a registration SHALL be preferred (scanned first) on subsequent reconnects.
 
 #### Scenario: Reconnect after Hub restart
 
@@ -92,6 +104,16 @@ The Agent SHALL re-register after session loss and SHALL stop its polling loops 
 
 - **WHEN** many Agents lose their sessions at the same moment, for example after a Hub restart
 - **THEN** each Agent's retry delay is randomized within the bounded backoff window, desynchronizing re-registration attempts
+
+#### Scenario: Leader loss rotates to another Hub
+
+- **WHEN** the connected Hub stops serving (process death or demotion to standby) while another configured Hub holds the lease
+- **THEN** the Agent re-registers against the new leader within a bounded window (lease TTL plus one candidate scan), keeps its boot identity, and resumes heartbeat, report, and polling loops
+
+#### Scenario: Standby advance does not consume the full backoff
+
+- **WHEN** registration fails with the `hub_standby` error code and another candidate exists
+- **THEN** the next candidate is attempted after only a short fixed pause, and the jittered exponential backoff is reserved for a complete failed cycle
 
 ### Requirement: Agent liveness is independent of command execution
 
@@ -181,3 +203,12 @@ The Agent SHALL sample host resource gauges (CPU usage, memory used/total/availa
 
 - **WHEN** resource gauges are merged into a report
 - **THEN** only the four fixed keys are added, with scalar values and no per-Job, per-Stream, or per-core cardinality
+
+### Requirement: Agent SHALL report hub failover observability
+
+The Agent SHALL include in its periodic report the currently connected Hub base address and a cumulative hub-failover counter, and SHALL log every candidate switch with its reason (`standby_advance`, `transport_error`, or `leader_hint`) and the from/to addresses.
+
+#### Scenario: Failover is visible in reports and logs
+
+- **WHEN** the Agent switches its active Hub address
+- **THEN** a log line records the switch reason with the from/to addresses, and subsequent reports carry the new connected Hub address and the incremented failover counter

@@ -70,6 +70,7 @@ async fn agent_resource_gauges_reach_the_hub_metrics_export() {
         empty_control_plane(),
         NodeAgentConfig {
             hub_url: format!("http://{address}"),
+            hub_urls: vec![format!("http://{address}")],
             api_prefix: "/api/v1".into(),
             node_id: "node-a".into(),
             node_token: String::new(),

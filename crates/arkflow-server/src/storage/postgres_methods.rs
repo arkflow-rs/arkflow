@@ -2019,6 +2019,7 @@ impl StorageBackend for PostgresBackend {
     async fn try_acquire_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseAcquire, StorageError> {
@@ -2046,28 +2047,29 @@ impl StorageBackend for PostgresBackend {
             };
             if current_holder == holder {
                 connection.execute(
-                    "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2 WHERE id = 1 AND holder = ?3",
-                    binds![now_ms + ttl_ms, now_ms, holder],
+                    "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2, advertise_url = ?3 WHERE id = 1 AND holder = ?4",
+                    binds![now_ms + ttl_ms, now_ms, advertise_url, holder],
                 ).await?;
                 return Ok(HubLeaseAcquire::Acquired { epoch });
             }
             if expires_at_ms <= now_ms {
                 let updated = connection.execute(
-                    "UPDATE cp_hub_lease SET holder = ?1, epoch = epoch + 1, expires_at_ms = ?2, updated_at_ms = ?3 WHERE id = 1 AND expires_at_ms <= ?4",
-                    binds![holder, now_ms + ttl_ms, now_ms, now_ms],
+                    "UPDATE cp_hub_lease SET holder = ?1, epoch = epoch + 1, expires_at_ms = ?2, updated_at_ms = ?3, advertise_url = ?4 WHERE id = 1 AND expires_at_ms <= ?5",
+                    binds![holder, now_ms + ttl_ms, now_ms, advertise_url, now_ms],
                 ).await?;
                 if updated == 1 {
                     return Ok(HubLeaseAcquire::Acquired { epoch: epoch + 1 });
                 }
             }
             let snapshot = connection.query_row(
-                "SELECT holder, epoch, expires_at_ms FROM cp_hub_lease WHERE id = 1",
+                "SELECT holder, epoch, expires_at_ms, advertise_url FROM cp_hub_lease WHERE id = 1",
                 binds![],
                 |row| {
                     Ok(HubLeaseSnapshot {
                         holder: row.get(0)?,
                         epoch: row.get(1)?,
                         expires_at_ms: row.get(2)?,
+                        advertise_url: row.get(3)?,
                     })
                 },
             ).await.optional()?;
@@ -2082,14 +2084,15 @@ impl StorageBackend for PostgresBackend {
     async fn renew_hub_lease(
         &self,
         holder: &str,
+        advertise_url: Option<&str>,
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<HubLeaseRenew, StorageError> {
         {
             let mut connection = self.lease().await?;
             let updated = connection.execute(
-                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2 WHERE id = 1 AND holder = ?3 AND expires_at_ms > ?4",
-                binds![now_ms + ttl_ms, now_ms, holder, now_ms],
+                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2, advertise_url = ?3 WHERE id = 1 AND holder = ?4 AND expires_at_ms > ?5",
+                binds![now_ms + ttl_ms, now_ms, advertise_url, holder, now_ms],
             ).await?;
             if updated == 1 {
                 let epoch = connection.query_row(
@@ -2113,6 +2116,24 @@ impl StorageBackend for PostgresBackend {
             ).await?;
             Ok(updated == 1)
         }
+    }
+    async fn hub_lease_snapshot(&self) -> Result<Option<HubLeaseSnapshot>, StorageError> {
+        let mut connection = self.lease().await?;
+        Ok(connection
+            .query_row(
+                "SELECT holder, epoch, expires_at_ms, advertise_url FROM cp_hub_lease WHERE id = 1",
+                binds![],
+                |row| {
+                    Ok(HubLeaseSnapshot {
+                        holder: row.get(0)?,
+                        epoch: row.get(1)?,
+                        expires_at_ms: row.get(2)?,
+                        advertise_url: row.get(3)?,
+                    })
+                },
+            )
+            .await
+            .optional()?)
     }
     async fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError> {
         // Take a FOR SHARE lock on the lease row and hold the transaction

@@ -4,7 +4,7 @@ sidebar_position: 2
 
 # 控制平面部署
 
-以 `cargo run -p arkflow-server --bin arkflow-server` 运行 Hub,并用 `health_check.hub_url`、`node_id` 与
+以 `cargo run -p arkflow-server --bin arkflow-server` 运行 Hub,并用 `health_check.hub_urls`、`node_id` 与
 `node_token` 启动每个计算节点。然后用 `cd console && npm ci && npm run build` 构建控制台,
 并通过受保护的反向代理提供 `console/dist`。开发用 Vite 服务器把 `/api` 与 `/metrics` 代理到
 `127.0.0.1:8080`;生产环境应保持同源路径,仅在 API 前缀不同时才设置 `VITE_API_BASE`。
@@ -32,7 +32,7 @@ arkflow-server migrate --from sqlite:/var/lib/arkflow/hub.sqlite \
 
 ### TLS
 
-**控制面。**同时设置 `ARKFLOW_HUB_TLS_CERT` 与 `ARKFLOW_HUB_TLS_KEY`(PEM 文件路径),Hub 即以 TLS 承载全部请求——路由、认证与 readiness 语义不变。只配置其一会拒绝启动。Agent 用 `https://` 的 `hub_url` 访问 TLS Hub,无需额外配置。未同时配置时保持明文监听,行为与之前逐字节一致。
+**控制面。**同时设置 `ARKFLOW_HUB_TLS_CERT` 与 `ARKFLOW_HUB_TLS_KEY`(PEM 文件路径),Hub 即以 TLS 承载全部请求——路由、认证与 readiness 语义不变。只配置其一会拒绝启动。Agent 用 `hub_urls` 中的 `https://` 条目访问 TLS Hub,无需额外配置。未同时配置时保持明文监听,行为与之前逐字节一致。
 
 **数据面(跨节点 shuffle)。**同时设置 `ARKFLOW_DATA_PLANE_TLS_CERT`、`ARKFLOW_DATA_PLANE_TLS_KEY`、`ARKFLOW_DATA_PLANE_TLS_CA`(节点证书、私钥、舰队 CA)后,所有跨节点连接运行 mTLS:任何帧(包括 HMAC 会话握手)交换之前,双方都必须出示锚定舰队 CA 的证书。节点证书须含 SAN `DNS:arkflow-data-plane`(固定校验名;节点身份仍由 HMAC 握手证明)。部分配置会被忽略并告警。生成舰队 CA 与节点证书的 openssl 示例:
 
@@ -58,17 +58,39 @@ openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
 | `ARKFLOW_HUB_HA_ENABLED` | 是 | 设为 `true` 加入选主。默认关闭;关闭的 Hub 就是普通单实例。 |
 | `ARKFLOW_HUB_STORAGE` | 是 | 多实例 HA 必须是 PostgreSQL URL(SQLite 仅用于开发与测试,会记录警告)。 |
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | 否 | 租约时长,默认 `15000`。续约周期为 TTL/3;故障接管窗口以 TTL 加一个探测周期为界。最小 1000。 |
+| `ARKFLOW_HUB_HA_ADVERTISE_URL` | 否 | leader 向 Agent 广播的 API 基址(例如 `http://hub-a:8080`)。随租约行持久化,standby 的 503 会以 `leader_url` 提示回显,Agent 可直达当选 leader。必须是带主机的绝对 `http(s)://` URL。请在每个可能当选的实例上设置。 |
 | `ARKFLOW_HUB_HA_HOLDER_ID` | 否 | 显式持有者标识;缺省为 `host:pid:boot-ms`。必须每个 Hub 进程唯一:两个 Hub 共用同一 holder id 会互相续约、同时充当 leader——除非命名方案能保证唯一,否则保持未设置。 |
 
 行为:
 
 - **leader** 每 TTL/3 续约一次,并运行全部周期任务(节点扫描、reconciliation、保留清理)。优雅关停时立即释放租约,standby 无需等 TTL 过期即可接管。
-- **standby** 只服务 `/health`、`/readiness`、`/liveness` 与 metrics 导出;其余 operator 与 agent 路由一律返回 `503 hub_standby`,readiness 报告未就绪并携带角色。请在实例前置负载均衡或 VIP,把流量路由到 `/readiness` 健康的那个后端——Agent 保持单一 `hub_url`,会向当选实例重新注册。
+- **standby** 只服务 `/health`、`/readiness`、`/liveness` 与 metrics 导出;其余 operator 与 agent 路由一律返回 `503 hub_standby`(leader 配置了广播地址时,响应携带 `leader_url` 提示),readiness 报告未就绪并携带角色。为 operator 与 Console 流量前置负载均衡或 VIP 仍有意义;Agent 不需要——见下方「Agent 多 Hub 故障转移」。
 - 接管时,晋升的 standby 在开始服务前**先从持久库重载控制面视图(作业、版本、checkpoint、操作、rollout)**并清空节点注册表;Agent 通过既有重连循环重新注册。leader 丢失租约(续约失败或存储不可达)时立即让位并停止派发。
 
 运维假设:时钟需 NTP 对齐(TTL 应远大于偏移),故障接管窗口以租约 TTL 加一个探测周期为界(默认约 15s + 5s)。每次接管都可通过围栏 epoch 观测(`/api/v1/system` 报告 `ha.role` 与 `ha.epoch`;readiness 携带相同字段;转换以 `hub.leadership` 事件进入事件流)。
 
 **存储级写围栏。** 每条控制面写都被包进一个围栏信封:携带持有者的租约 epoch,并在写入实际执行时对照租约行复查。接管推进 epoch 后,旧 leader 仍在途的写不会落库,而是以显式的 `stale leader` 错误被拒绝;operator/agent HTTP 路由把该拒绝呈现为 `503`、problem code 为 `stale_leader`——应向当选 leader 重试。HA 关闭(未设置 `ARKFLOW_HUB_HA_ENABLED`)时写入不加围栏,与单实例模式完全一致。
+
+### Agent 多 Hub 故障转移 {#agent-multi-hub-failover}
+
+Agent 自行发现并跟随当选 leader,无需负载均衡器。在 `hub_urls` 中配置全部候选 Hub 地址(列表;`health_check.hub_url` 在本版本已改名并列表化——仍声明旧键的配置会在校验时报错并附迁移指引):
+
+```yaml validate=full
+health_check:
+  hub_urls: ["http://hub-a:8080", "http://hub-b:8080"]
+  node_id: node-a
+  node_token: replace-with-node-token
+```
+
+故障转移语义:
+
+- 候选按序尝试;最近一次接受注册的地址被固定(pin)为后续重连的首选。
+- `503 hub_standby` 意味着「可达但非 leader」:Agent 立即轮换到下一候选,不消耗指数退避。只有全部候选完整失败一圈后才应用(带抖动的)指数退避。
+- 每个 Hub 设置 `ARKFLOW_HUB_HA_ADVERTISE_URL` 后,standby 的 503 携带 `leader_url` 提示,Agent 一次探测直达当选 leader,而非整圈扫描。提示目标可信(来自已配置的 Hub);若不可达,Agent 回落到配置列表。
+- 切换不打扰数据面:本地 Stream/Job 与 shuffle 监听继续运行,Agent 以稳定 `boot_id` 重新注册,补投递暂存的作业观测并重放缓存的命令结果。
+- 可观测性:每份报告携带所连 Hub(`connected_hub`)与累计 `hub_failovers` 指标;每次切换记录原因(`standby_advance` / 传输失败 / `leader_hint`)与 from→to 地址。
+
+单条目的 `hub_urls` 与原先单地址配置行为完全一致——包括有界、带抖动的重连退避。
 
 ### OIDC JWT 联邦
 

@@ -52,7 +52,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 
 Runs an HTTP server with `/health`, `/readiness`, and `/liveness` endpoints
 (useful for Kubernetes). The same server also hosts the optional control-plane
-API and the Hub agent when `hub_url` is set (see
+API and the Hub agent when `hub_urls` is set (see
 [Control plane](../operate/control-plane/overview.md)).
 
 | Field | Type | Required | Default | Description |
@@ -65,7 +65,7 @@ API and the Hub agent when `hub_url` is set (see
 | `api_prefix` | string | no | `/api/v1` | Prefix for the versioned control-plane API. |
 | `api_token` | string | no | — | Optional Bearer token protecting control-plane operations and configuration. |
 | `cors_origins` | array&lt;string&gt; | no | `[]` | Browser origins allowed to call the control API. Empty denies cross-origin calls. |
-| `hub_url` | string | no | — | Hub URL for compute-node agent mode. Absent ⇒ standalone mode. |
+| `hub_urls` | array&lt;string&gt; | no | `[]` | Hub addresses for compute-node agent mode, tried in order as failover candidates (see [Agent multi-Hub failover](../operate/control-plane/deploy.md#agent-multi-hub-failover)). Empty ⇒ standalone mode. **Breaking change:** replaces the former single-string `hub_url` field; a config that still declares `hub_url` fails validation with a migration hint — rewrite `hub_url: "http://hub:8080"` as `hub_urls: ["http://hub:8080"]`. |
 | `node_id` | string | no | — | Stable identity this process reports to its Hub. |
 | `node_token` | string | no | — | Shared node registration credential. Never included in reports. |
 | `agent_lease_ttl_ms` | integer | no | `15000` | Lease duration (ms) a compute node advertises to its Hub. |

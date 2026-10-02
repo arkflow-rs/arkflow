@@ -58,9 +58,9 @@ Hub 故障时数据面行为：
 - 非 leader Hub 进入 standby 模式
 
 ### 阶段 3：完整 HA
-- 自动故障检测与选主
-- Agent 自动发现新 leader
-- 零数据丢失保证（同步复制）
+- 自动故障检测与选主（阶段 2 已落地）
+- Agent 自动发现新 leader —— 已落地（`add-agent-multi-hub-discovery`：`hub_urls` 候选列表轮换 + 租约行携带 `advertise_url` + standby 503 的 `leader_url` 提示）
+- 零数据丢失保证（同步复制）—— 未做，属存储层后续工作（见该 change 的 Non-goals）
 
 ## 6. 决策记录
 

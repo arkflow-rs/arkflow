@@ -5,7 +5,7 @@ sidebar_position: 2
 # Control plane deployment
 
 Run `cargo run -p arkflow-server --bin arkflow-server` as the Hub and start each compute node
-with `health_check.hub_url`, `node_id`, and `node_token`. Then build the console with
+with `health_check.hub_urls`, `node_id`, and `node_token`. Then build the console with
 `cd console && npm ci && npm run build`, and serve
 `console/dist` from a protected reverse proxy. The development Vite server
 proxies `/api` and `/metrics` to `127.0.0.1:8080`; production should preserve
@@ -54,8 +54,8 @@ PostgreSQL deployments never need the tool — startup DDL creates the schema.
 **Control plane.** Set both `ARKFLOW_HUB_TLS_CERT` and `ARKFLOW_HUB_TLS_KEY`
 (PEM file paths) and the Hub serves every request over TLS — routes, auth,
 and readiness semantics are unchanged. Only one of the two fails startup.
-Agents reach a TLS Hub with an `https://` `hub_url` and no extra
-configuration. Without both variables the Hub binds plaintext exactly as
+ Agents reach a TLS Hub with an `https://` entry in `hub_urls` and no
+extra configuration. Without both variables the Hub binds plaintext exactly as
 before.
 
 **Data plane (cross-node shuffle).** Set `ARKFLOW_DATA_PLANE_TLS_CERT`,
@@ -94,6 +94,7 @@ instance pointed at the same database:
 | `ARKFLOW_HUB_HA_ENABLED` | yes | Set `true` to join the election. Off by default; a disabled Hub is a plain single instance. |
 | `ARKFLOW_HUB_STORAGE` | yes | Must be a PostgreSQL URL for multi-instance HA (SQLite works for development and testing only and logs a warning). |
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | no | Lease lifetime, default `15000`. Renewal runs at TTL/3; the failover window is bounded by the TTL plus one probe. Minimum 1000. |
+| `ARKFLOW_HUB_HA_ADVERTISE_URL` | no | API base URL the leader advertises to Agents (for example `http://hub-a:8080`). Persisted with the lease row and echoed by standbys as the `leader_url` hint so Agents jump straight to the elected leader. Must be an absolute `http(s)://` URL with a host. Set it on every instance that may lead. |
 | `ARKFLOW_HUB_HA_HOLDER_ID` | no | Explicit holder identity; defaults to `host:pid:boot-ms`. Must be unique per Hub process: two Hubs sharing one holder id would renew each other's lease and both act as leader — leave it unset unless you have a naming scheme that guarantees uniqueness. |
 
 Behavior:
@@ -103,11 +104,11 @@ Behavior:
   the lease immediately so a standby can take over without waiting out the
   TTL.
 - A **standby** serves only `/health`, `/readiness`, `/liveness`, and the
-  metrics export; every operator and agent route answers `503 hub_standby`.
-  Its readiness reports not-ready with the role. Put a load balancer or VIP
-  in front of the instances and route to the backend whose `/readiness` is
-  healthy — Agents keep their single `hub_url` and re-register with whichever
-  instance leads.
+  metrics export; every operator and agent route answers `503 hub_standby`
+  (carrying a `leader_url` hint when the leader advertises one). Its readiness
+  reports not-ready with the role. A load balancer or VIP in front of the
+  instances remains useful for operator and console traffic; Agents do not
+  need it — see Agent multi-Hub failover below.
 - On takeover the promoted standby **reloads the durable control-plane view
   (jobs, versions, checkpoints, operations, rollouts) before serving** and
   clears the node registry; Agents re-register through their existing
@@ -129,6 +130,44 @@ routes surface that rejection as `503` with problem code `stale_leader` —
 retry against the elected leader. With HA disabled
 (`ARKFLOW_HUB_HA_ENABLED` unset) writes run unfenced, exactly as in
 single-instance mode.
+
+### Agent multi-Hub failover
+
+Agents discover and follow the elected leader on their own — no load balancer
+required. Configure every candidate Hub address in `hub_urls` (a list;
+`health_check.hub_url` was renamed and made a list in this release — a config
+that still declares the old key fails validation with a migration hint):
+
+```yaml validate=full
+health_check:
+  hub_urls: ["http://hub-a:8080", "http://hub-b:8080"]
+  node_id: node-a
+  node_token: replace-with-node-token
+```
+
+Failover semantics:
+
+- Candidates are tried in order; the address that last accepted a
+  registration is pinned as the preferred candidate for later reconnects.
+- A `503 hub_standby` answer means "reachable but not the leader": the Agent
+  advances to the next candidate immediately, without burning the exponential
+  backoff. Only a full failed cycle across every candidate applies the
+  (jittered) exponential backoff.
+- When each Hub sets `ARKFLOW_HUB_HA_ADVERTISE_URL`, a standby's 503 carries a
+  `leader_url` hint and the Agent jumps straight to the elected leader — one
+  probe instead of a full scan. The hint target is trusted because it comes
+  from an already-configured Hub; if it is unreachable the Agent falls back to
+  the configured list.
+- Switching never disturbs the data plane: local Streams/Jobs and the shuffle
+  listener keep running, the Agent re-registers with its stable `boot_id`,
+  re-delivers parked job observations, and replays cached command results.
+- Observability: each report carries the connected Hub
+  (`connected_hub`) and a cumulative `hub_failovers` metric; every switch logs
+  the reason (`standby_advance` / transport failure / `leader_hint`) and the
+  from/to addresses.
+
+A single-entry `hub_urls` list behaves exactly like the former single-address
+configuration — including the bounded, jittered reconnect backoff.
 
 ### OIDC JWT federation
 

@@ -47,7 +47,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 
 ## `health_check`
 
-运行一个带有 `/health`、`/readiness` 与 `/liveness` 端点的 HTTP 服务器(对 Kubernetes 有用)。当设置了 `hub_url` 时,同一服务器还承载可选的控制平面 API 与 Hub Agent(参见[控制平面](/zh-Hans/docs/operate/control-plane/overview))。
+运行一个带有 `/health`、`/readiness` 与 `/liveness` 端点的 HTTP 服务器(对 Kubernetes 有用)。当设置了 `hub_urls` 时,同一服务器还承载可选的控制平面 API 与 Hub Agent(参见[控制平面](/zh-Hans/docs/operate/control-plane/overview))。
 
 | 字段 | 类型 | 必填 | 默认值 | 描述 |
 |-------|------|----------|---------|-------------|
@@ -59,7 +59,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 | `api_prefix` | string | 否 | `/api/v1` | 带版本的控制平面 API 前缀。 |
 | `api_token` | string | 否 | — | 保护控制平面操作与配置的可选 Bearer 令牌。 |
 | `cors_origins` | array&lt;string&gt; | 否 | `[]` | 允许调用控制 API 的浏览器来源。为空则拒绝跨域调用。 |
-| `hub_url` | string | 否 | — | 计算节点 Agent 模式使用的 Hub URL。缺省即为独立(standalone)模式。 |
+| `hub_urls` | array&lt;string&gt; | 否 | `[]` | 计算节点 Agent 模式使用的 Hub 地址列表,按序作为故障转移候选(参见 [Agent 多 Hub 故障转移](/zh-Hans/docs/operate/control-plane/deploy#agent-multi-hub-failover))。空列表即为独立(standalone)模式。**破坏性变更:** 取代原先单字符串的 `hub_url` 字段;仍声明 `hub_url` 的配置会在校验时报错并附迁移指引——把 `hub_url: "http://hub:8080"` 改写为 `hub_urls: ["http://hub:8080"]`。 |
 | `node_id` | string | 否 | — | 本进程向其 Hub 上报的稳定身份。 |
 | `node_token` | string | 否 | — | 共享的节点注册凭据。绝不会包含在报告中。 |
 | `agent_lease_ttl_ms` | integer | 否 | `15000` | 计算节点向其 Hub 通告的租约时长(毫秒)。 |

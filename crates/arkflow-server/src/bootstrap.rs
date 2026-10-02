@@ -70,6 +70,15 @@ pub fn validate_ha_config(ha: &HubHaConfig, config: &ServerConfig) -> Result<(),
     if !ha.enabled {
         return Ok(());
     }
+    if let Some(url) = ha.advertise_url.as_deref() {
+        let parsed = url::Url::parse(url)
+            .map_err(|error| format!("ARKFLOW_HUB_HA_ADVERTISE_URL is not a valid URL ({url}): {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(format!(
+                "ARKFLOW_HUB_HA_ADVERTISE_URL must be an absolute http(s) URL with a host: {url}"
+            ));
+        }
+    }
     if config.hub_storage.is_none() {
         return Err(
             "ARKFLOW_HUB_HA_ENABLED requires ARKFLOW_HUB_STORAGE (use a PostgreSQL URL for multi-instance HA)"

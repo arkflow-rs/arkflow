@@ -2,6 +2,8 @@
 
 Define the console UI localization system: locale resolution and persistence, the translation dictionary contract, and Intl formatting that follows the selected locale.
 
+## Requirements
+
 ### Requirement: Locale 解析与持久化
 
 Console SHALL 在启动时按以下优先级解析界面 locale：`localStorage` 中 `arkflow.console.locale` 的已存合法值（`zh` 或 `en`）优先；未设置时按 `navigator.language` 解析——以 `zh` 前缀开头的语言标签解析为 `zh`，其余解析为 `en`；解析失败兜底 `en`。存储中的非法值 MUST 视为未设置。用户手动选择 SHALL 持久化到 `localStorage` 并在后续会话中生效。
