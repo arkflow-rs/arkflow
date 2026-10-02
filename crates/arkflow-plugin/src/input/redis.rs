@@ -600,6 +600,103 @@ pub fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redis::aio::AsyncPushSender;
+    use redis::Value;
+
+    #[tokio::test]
+    async fn cluster_push_forwarder_delivers_message_payload() {
+        let (sender, receiver) = flume::unbounded();
+        let forwarder = ClusterPushForwarder {
+            sender,
+            codec: None,
+            input_name: Some("redis-in".into()),
+        };
+
+        assert!(
+            forwarder
+                .send(PushInfo {
+                    kind: PushKind::Message,
+                    data: vec![
+                        Value::BulkString(b"events".to_vec()),
+                        Value::BulkString(b"payload".to_vec()),
+                    ],
+                })
+                .is_ok(),
+            "push handling never signals connection loss"
+        );
+
+        let delivery = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv_async())
+            .await
+            .expect("delivery arrives")
+            .expect("channel stays open");
+        let Delivery::Data(batch, _ack) = delivery else {
+            panic!("no-codec push decode cannot fail");
+        };
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.get_input_name(), Some("redis-in".to_string()));
+    }
+
+    #[test]
+    fn cluster_push_forwarder_skips_malformed_push_data() {
+        // A push message with fewer than two parts, or parts that fail to
+        // parse (Nil is not string-convertible), is skipped without
+        // signalling connection loss: SendError must only mean "connection
+        // gone", so a malformed push must never drop the cluster connection.
+        let (sender, receiver) = flume::unbounded();
+        let forwarder = ClusterPushForwarder {
+            sender,
+            codec: None,
+            input_name: None,
+        };
+
+        let malformed = [
+            PushInfo {
+                kind: PushKind::Message,
+                data: vec![Value::BulkString(b"events".to_vec())],
+            },
+            PushInfo {
+                kind: PushKind::Message,
+                data: vec![Value::Nil, Value::BulkString(b"payload".to_vec())],
+            },
+            PushInfo {
+                kind: PushKind::Message,
+                data: vec![Value::BulkString(b"events".to_vec()), Value::Nil],
+            },
+        ];
+        for push in malformed {
+            assert!(
+                forwarder.send(push).is_ok(),
+                "malformed push is skipped, not a connection error"
+            );
+        }
+        assert!(receiver.try_recv().is_err(), "nothing is delivered");
+    }
+
+    #[test]
+    fn cluster_push_forwarder_ignores_non_message_kinds() {
+        let (sender, receiver) = flume::unbounded();
+        let forwarder = ClusterPushForwarder {
+            sender,
+            codec: None,
+            input_name: None,
+        };
+
+        for kind in [PushKind::PUnsubscribe, PushKind::SUnsubscribe] {
+            assert!(
+                forwarder
+                    .send(PushInfo {
+                        kind,
+                        data: vec![
+                            Value::BulkString(b"events".to_vec()),
+                            Value::BulkString(b"ignored".to_vec()),
+                        ],
+                    })
+                    .is_ok(),
+                "non-message kinds are a no-op"
+            );
+        }
+        assert!(receiver.try_recv().is_err(), "nothing is delivered");
+    }
 
     #[test]
     fn temporary_error_classification() {
