@@ -52,7 +52,9 @@ lazy_static = "1.4"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
-jsonwebtoken = "9"
+# rust_crypto keeps the ring backend from v9 (arkflow-core's TLS stack also
+# uses ring); v10+ cannot auto-pick a provider when none/both features are set.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 opentelemetry = "0.28"
 opentelemetry-otlp = { version = "0.28", features = ["http-json", "reqwest-client"] }
 opentelemetry_sdk = "0.28"
@@ -67,7 +69,6 @@ hmac = "0.12"
 base64 = "0.22"
 sha2 = "0.10"
 rand = "0.9"
-governor = "0.6"
 dashmap = "6.1"
 mongodb = { version = "3.2", default-features = false, features = ["rustls-tls", "compat-3-0-0"] }
 
