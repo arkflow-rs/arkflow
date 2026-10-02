@@ -107,6 +107,76 @@ fn is_temporary_redis_error<E: std::fmt::Display>(err: &E) -> bool {
     true
 }
 
+/// Forwards cluster pub/sub pushes into the input channel. redis 1.x takes
+/// push delivery through the `AsyncPushSender` trait instead of a closure;
+/// `SendError` carries no payload (it only signals connection loss), so a
+/// push message that fails to parse is logged and skipped rather than
+/// propagated.
+struct ClusterPushForwarder {
+    sender: Sender<Delivery>,
+    codec: Option<Arc<dyn Codec>>,
+    input_name: Option<String>,
+}
+
+impl redis::aio::AsyncPushSender for ClusterPushForwarder {
+    fn send(&self, msg: PushInfo) -> Result<(), redis::aio::SendError> {
+        match msg.kind {
+            PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
+                if msg.data.len() < 2 {
+                    return Ok(());
+                }
+                let mut iter = msg.data.into_iter();
+                let _channel = match iter.next() {
+                    Some(v) => match String::from_redis_value(v) {
+                        Ok(channel) => channel,
+                        Err(error) => {
+                            error!("redis cluster push channel failed to parse: {}", error);
+                            return Ok(());
+                        }
+                    },
+                    None => return Ok(()),
+                };
+                let message: Vec<u8> = match iter.next() {
+                    Some(v) => match Vec::from_redis_value(v) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            error!("redis cluster push message failed to parse: {}", error);
+                            return Ok(());
+                        }
+                    },
+                    None => return Ok(()),
+                };
+
+                // The push callback is sync; decode off it so the
+                // delivery entering the channel is already
+                // finished (cancellation-safe read contract).
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        let sender_cb = Sender::clone(&self.sender);
+                        let codec_cb = self.codec.clone();
+                        let input_name_cb = self.input_name.clone();
+                        handle.spawn(async move {
+                            let delivery = crate::input::codec_helper::decode_delivery(
+                                &message,
+                                &codec_cb,
+                                input_name_cb,
+                                Arc::new(NoopAck),
+                            )
+                            .await;
+                            if let Err(e) = sender_cb.send_async(delivery).await {
+                                error!("{}", e);
+                            }
+                        });
+                    }
+                    Err(e) => error!("no async runtime for redis push decode: {}", e),
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 impl RedisInput {
     /// Create a new Redis input component
     fn new(
@@ -152,56 +222,11 @@ impl RedisInput {
         let client_builder = ClusterClientBuilder::new(urls);
 
         let client_builder = match config_type {
-            Type::Subscribe { .. } => {
-                let sender_clone = Sender::clone(&self.sender);
-                let codec_clone = self.codec.clone();
-                let input_name_clone = self.input_name.clone();
-                client_builder.push_sender(move |msg: PushInfo| {
-                    match msg.kind {
-                        PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
-                            if msg.data.len() < 2 {
-                                return Ok(());
-                            }
-                            let mut iter = msg.data.into_iter();
-                            let _channel: String = match iter.next() {
-                                Some(v) => FromRedisValue::from_owned_redis_value(v)?,
-                                None => return Ok(()),
-                            };
-                            let message: Vec<u8> = match iter.next() {
-                                Some(v) => FromRedisValue::from_owned_redis_value(v)?,
-                                None => return Ok(()),
-                            };
-
-                            // The push callback is sync; decode off it so the
-                            // delivery entering the channel is already
-                            // finished (cancellation-safe read contract).
-                            match tokio::runtime::Handle::try_current() {
-                                Ok(handle) => {
-                                    let sender_cb = Sender::clone(&sender_clone);
-                                    let codec_cb = codec_clone.clone();
-                                    let input_name_cb = input_name_clone.clone();
-                                    handle.spawn(async move {
-                                        let delivery = crate::input::codec_helper::decode_delivery(
-                                            &message,
-                                            &codec_cb,
-                                            input_name_cb,
-                                            Arc::new(NoopAck),
-                                        )
-                                        .await;
-                                        if let Err(e) = sender_cb.send_async(delivery).await {
-                                            error!("{}", e);
-                                        }
-                                    });
-                                }
-                                Err(e) => error!("no async runtime for redis push decode: {}", e),
-                            }
-                        }
-                        _ => {}
-                    };
-
-                    Ok(()) as RedisResult<()>
-                })
-            }
+            Type::Subscribe { .. } => client_builder.push_sender(ClusterPushForwarder {
+                sender: Sender::clone(&self.sender),
+                codec: self.codec.clone(),
+                input_name: self.input_name.clone(),
+            }),
             Type::List { .. } => client_builder,
         };
 
