@@ -1,7 +1,7 @@
 //! Keyed state backend contracts and the initial embedded `redb` backend.
 
 use crate::Error;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -438,8 +438,15 @@ impl RedbStateBackend {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)
             .map_err(|error| Error::Process(format!("create state directory: {error}")))?;
-        let db = Database::create(root.join("state.redb"))
-            .map_err(|error| Error::Process(format!("open state database: {error}")))?;
+        let db_path = root.join("state.redb");
+        let db = Database::create(&db_path).map_err(|error| {
+            Error::Process(format!(
+                "open state database {}: {error}. If this file was created by an older ArkFlow \
+                 (redb 2 file format, unsupported since the redb 4 upgrade), remove it and \
+                 restart; keyed state restarts cold",
+                db_path.display()
+            ))
+        })?;
         let backend = Self {
             db,
             root,
@@ -2071,6 +2078,23 @@ mod tests {
         accumulator.add(b"K", 0, 1_000, 3).unwrap();
         assert_eq!(accumulator.add(b"K", 0, 1_000, 2).unwrap(), 5);
         assert!(accumulator.add(b"K", 1_000, 2_000, 1).unwrap() >= 1);
+    }
+
+    #[test]
+    fn open_failure_names_the_file_and_leaves_it_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        std::fs::write(&db_path, b"not a redb database").unwrap();
+        let before = std::fs::read(&db_path).unwrap();
+
+        let err = RedbStateBackend::open(dir.path(), 1)
+            .err()
+            .expect("open must fail loudly");
+        let msg = err.to_string();
+        assert!(msg.contains("open state database"), "{msg}");
+        assert!(msg.contains(db_path.to_str().unwrap()), "{msg}");
+        assert!(msg.contains("remove it and restart"), "{msg}");
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
     }
 
 }
