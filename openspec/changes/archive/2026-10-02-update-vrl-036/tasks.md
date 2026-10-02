@@ -17,4 +17,4 @@
 ## 4. Ship
 
 - [x] 4.1 Commit on a `deps/stage4-vrl-036` branch, open PR, land on CI green
-- [ ] 4.2 Archive this change (`openspec archive`)
+- [x] 4.2 Archive this change (`openspec archive`)
