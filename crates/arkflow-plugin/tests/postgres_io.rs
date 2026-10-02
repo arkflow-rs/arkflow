@@ -98,7 +98,7 @@ async fn try_connect(uri: &str, case: &str) -> Option<PgConnection> {
 }
 
 async fn exec(admin: &mut PgConnection, sql: &str) {
-    sqlx::query(sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .execute(admin)
         .await
         .unwrap_or_else(|e| panic!("admin statement failed ({sql}): {e}"));
@@ -211,8 +211,10 @@ fn query_vector_batch(vectors: Vec<Vec<f32>>) -> MessageBatchRef {
 }
 
 async fn count(admin: &mut PgConnection, table: &str) -> i64 {
-    let (count,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
-        .fetch_one(admin)
+    let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {table}"
+    )))
+    .fetch_one(admin)
         .await
         .unwrap();
     count
@@ -259,8 +261,8 @@ async fn sql_output_pg_write_upsert_and_readback() {
         ]))
         .await
         .expect("write");
-    let rows: Vec<(i64, String, f64, bool, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT id, name, score, active, note FROM {table} ORDER BY id"
+    let rows: Vec<(i64, String, f64, bool, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        format!("SELECT id, name, score, active, note FROM {table} ORDER BY id"),
     ))
     .fetch_all(&mut admin)
     .await
@@ -279,7 +281,9 @@ async fn sql_output_pg_write_upsert_and_readback() {
         .expect("upsert write");
     assert_eq!(count(&mut admin, &table).await, 2, "upsert must not duplicate");
     let (name, note): (String, Option<String>) =
-        sqlx::query_as(&format!("SELECT name, note FROM {table} WHERE id = 1"))
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT name, note FROM {table} WHERE id = 1"
+        )))
             .fetch_one(&mut admin)
             .await
             .unwrap();
@@ -435,9 +439,9 @@ async fn pgvector_output_roundtrip_and_upsert() {
     ]);
     output.write(batch.clone()).await.expect("write vectors");
 
-    let rows: Vec<(i64, String, String)> = sqlx::query_as(&format!(
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT doc_id, embedding::text, payload::text FROM {table} ORDER BY doc_id"
-    ))
+    )))
     .fetch_all(&mut admin)
     .await
     .unwrap();
@@ -501,9 +505,9 @@ async fn pgvector_search_processor_returns_nearest_neighbors() {
     )
     .await;
     for (id, vector, text) in [(1i64, "[1.0,0.0]", "near"), (2, "[0.9,0.1]", "also near"), (3, "[0.0,1.0]", "far")] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {table} (id, embedding, payload) VALUES ($1, $2::vector, $3::jsonb)"
-        ))
+        )))
         .bind(id)
         .bind(vector)
         .bind(serde_json::json!({"text": text}).to_string())

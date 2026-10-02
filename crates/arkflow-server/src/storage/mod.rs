@@ -2579,10 +2579,12 @@ pub(crate) async fn contract_database_url(label: &str) -> String {
     let db = format!("ct_{suffix}_{sequence}");
     let mut admin = sqlx::PgConnection::connect(&base).await.unwrap();
     // FORCE drops concurrent connections from a previously aborted run.
-    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
-        .execute(&mut admin)
-        .await;
-    sqlx::query(&format!("CREATE DATABASE {db}"))
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {db} WITH (FORCE)"
+    )))
+    .execute(&mut admin)
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
         .execute(&mut admin)
         .await
         .unwrap();

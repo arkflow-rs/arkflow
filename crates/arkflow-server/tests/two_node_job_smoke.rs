@@ -295,6 +295,11 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
     .await
     .unwrap();
 
+    // Both assignments have started. Reconcile dispatch is at-least-once:
+    // under a loaded runner a retry can land before the first success
+    // report arrives, legitimately producing a third Succeeded job_start
+    // (the Agent executes redelivered job_start commands idempotently), so
+    // count with >= — an exact == never settles on a triple dispatch.
     wait_until(|| {
         let hub = hub.clone();
         let job_id = job_id.clone();
@@ -308,7 +313,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
                         && operation.state == HubOperationState::Succeeded
                 })
                 .count()
-                == 2
+                >= 2
         }
     })
     .await;
@@ -587,7 +592,9 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     .unwrap();
 
     // Both assignments start: the split placement dispatched, meaning the
-    // data-plane capability validation passed for both nodes.
+    // data-plane capability validation passed for both nodes. See the
+    // dispatch note in the restart test: >=, not an exact count, because a
+    // benign at-least-once retry can add a third Succeeded job_start.
     wait_until(|| {
         let hub = hub.clone();
         let job_id = job_id.clone();
@@ -601,7 +608,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
                         && operation.state == HubOperationState::Succeeded
                 })
                 .count()
-                == 2
+                >= 2
         }
     })
     .await;

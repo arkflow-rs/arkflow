@@ -189,7 +189,7 @@ impl Output for PgVectorOutput {
 /// Builds the parameterized INSERT (with the optional upsert clause).
 /// Returned as a `QueryBuilder` so tests can assert the generated SQL
 /// text via `.build().sql()`.
-fn build_insert(config: &PgVectorOutputConfig, rows: &[PointRow]) -> QueryBuilder<'static, sqlx::Postgres> {
+fn build_insert(config: &PgVectorOutputConfig, rows: &[PointRow]) -> QueryBuilder<sqlx::Postgres> {
     let mut columns: Vec<String> = Vec::with_capacity(3);
     if config.id_field.is_some() {
         columns.push(config.id_field.clone().unwrap());
@@ -604,7 +604,7 @@ mod tests {
             &[row_of(1, "[1.0,2.0]", r#"{"text":"a"}"#), row_of(2, "[3.0,4.0]", r#"{"text":"b"}"#)],
         )
         .sql()
-        .to_string();
+        .as_str().to_string();
         assert_eq!(
             sql,
             "INSERT INTO \"documents\" (\"doc_id\", \"embedding\", \"payload\") VALUES ($1, $2::vector, $3::jsonb), ($4, $5::vector, $6::jsonb) ON CONFLICT (\"doc_id\") DO UPDATE SET \"embedding\" = EXCLUDED.\"embedding\", \"payload\" = EXCLUDED.\"payload\""
@@ -619,7 +619,7 @@ mod tests {
             vector: "[1.0,2.0]".to_string(),
             payload: Some(r#"{"text":"a"}"#.to_string()),
         }];
-        let sql = build_insert(&config, &rows).sql().to_string();
+        let sql = build_insert(&config, &rows).sql().as_str().to_string();
         assert_eq!(
             sql,
             "INSERT INTO \"documents\" (\"embedding\", \"payload\") VALUES ($1::vector, $2::jsonb)"
@@ -634,7 +634,7 @@ mod tests {
             vector: "[1.0,2.0]".to_string(),
             payload: None,
         }];
-        let sql = build_insert(&config, &rows).sql().to_string();
+        let sql = build_insert(&config, &rows).sql().as_str().to_string();
         assert_eq!(
             sql,
             "INSERT INTO \"documents\" (\"doc_id\", \"embedding\") VALUES ($1, $2::vector) ON CONFLICT (\"doc_id\") DO UPDATE SET \"embedding\" = EXCLUDED.\"embedding\""
@@ -653,7 +653,7 @@ mod tests {
             vector: "[1.0,2.0]".to_string(),
             payload: None,
         }];
-        let sql = build_insert(&config, &rows).sql().to_string();
+        let sql = build_insert(&config, &rows).sql().as_str().to_string();
         assert!(sql.contains(r#"INSERT INTO "odd""table""#), "{sql}");
         assert!(sql.contains(r#""em""bedding""#), "{sql}");
         // The conflict target escapes quotes like every other identifier.
@@ -676,7 +676,7 @@ mod tests {
             .collect();
         let mut statement_binds = Vec::new();
         for chunk in rows.chunks(rows_per_chunk) {
-            let sql = build_insert(&config, chunk).sql().to_string();
+            let sql = build_insert(&config, chunk).sql().as_str().to_string();
             let placeholders = sql.matches('$').count();
             statement_binds.push(placeholders);
             assert!(

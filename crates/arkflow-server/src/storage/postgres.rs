@@ -10,7 +10,7 @@ use super::*;
 use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions, PgRow};
 use sqlx::postgres::PgQueryResult;
 use sqlx::Arguments;
-use sqlx::{Postgres, Row as SqlxRow};
+use sqlx::{AssertSqlSafe, Postgres, Row as SqlxRow};
 use std::time::Duration;
 
 /// Runtime SQLite-dialect to PostgreSQL-dialect SQL rewrite: `?N` -> `$N`,
@@ -331,7 +331,7 @@ impl PgConn {
     pub async fn execute(&mut self, sql: &str, vals: &[PgVal]) -> Result<u64, StorageError> {
         let args = push_arguments(vals);
         let result: PgQueryResult =
-            sqlx::query_with(&q(sql), args).execute(&mut *self.connection).await?;
+            sqlx::query_with(AssertSqlSafe(q(sql)), args).execute(&mut *self.connection).await?;
         Ok(result.rows_affected())
     }
 
@@ -342,7 +342,7 @@ impl PgConn {
         map: impl Fn(&Row<'_>) -> Result<T, StorageError>,
     ) -> RowResult<T> {
         let args = push_arguments(vals);
-        match sqlx::query_with(&q(sql), args).fetch_one(&mut *self.connection).await {
+        match sqlx::query_with(AssertSqlSafe(q(sql)), args).fetch_one(&mut *self.connection).await {
             Ok(row) => match map(&Row(&row)) {
                 Ok(value) => RowResult(Ok(Some(value))),
                 Err(error) => RowResult(Err(error)),
@@ -359,7 +359,7 @@ impl PgConn {
         map: impl Fn(&Row<'_>) -> Result<T, StorageError>,
     ) -> Result<Vec<T>, StorageError> {
         let args = push_arguments(vals);
-        let rows = sqlx::query_with(&q(sql), args)
+        let rows = sqlx::query_with(AssertSqlSafe(q(sql)), args)
             .fetch_all(&mut *self.connection)
             .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -718,7 +718,7 @@ impl PgTx {
     pub async fn execute(&mut self, sql: &str, vals: &[PgVal]) -> Result<u64, StorageError> {
         let args = push_arguments(vals);
         let result: PgQueryResult =
-            sqlx::query_with(&q(sql), args).execute(&mut *self.transaction).await?;
+            sqlx::query_with(AssertSqlSafe(q(sql)), args).execute(&mut *self.transaction).await?;
         Ok(result.rows_affected())
     }
 
@@ -729,7 +729,7 @@ impl PgTx {
         map: impl Fn(&Row<'_>) -> Result<T, StorageError>,
     ) -> RowResult<T> {
         let args = push_arguments(vals);
-        match sqlx::query_with(&q(sql), args).fetch_one(&mut *self.transaction).await {
+        match sqlx::query_with(AssertSqlSafe(q(sql)), args).fetch_one(&mut *self.transaction).await {
             Ok(row) => match map(&Row(&row)) {
                 Ok(value) => RowResult(Ok(Some(value))),
                 Err(error) => RowResult(Err(error)),
@@ -746,7 +746,7 @@ impl PgTx {
         map: impl Fn(&Row<'_>) -> Result<T, StorageError>,
     ) -> Result<Vec<T>, StorageError> {
         let args = push_arguments(vals);
-        let rows = sqlx::query_with(&q(sql), args)
+        let rows = sqlx::query_with(AssertSqlSafe(q(sql)), args)
             .fetch_all(&mut *self.transaction)
             .await?;
         let mut out = Vec::with_capacity(rows.len());
