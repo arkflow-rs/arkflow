@@ -46,7 +46,6 @@ tower = "0.5"
 tower-http = { version = "0.7.0", features = ["cors", "trace"] }
 base64 = "0.22"
 subtle = { workspace = true }
-governor = { workspace = true, features = ["std"] }
 colored = { workspace = true }
 flume = { workspace = true }
 dashmap = { workspace = true }
