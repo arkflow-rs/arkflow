@@ -653,6 +653,14 @@ mod tests {
         VrlProcessorBuilder.build(None, &config, &test_resource())
     }
 
+    fn build_processor_with_timezone(
+        statement: &str,
+        timezone: &str,
+    ) -> Result<Arc<dyn Processor>, Error> {
+        let config = Some(json!({ "statement": statement, "timezone": timezone }));
+        VrlProcessorBuilder.build(None, &config, &test_resource())
+    }
+
     #[tokio::test]
     async fn test_string_roundtrip_stays_utf8() -> Result<(), Error> {
         let processor = build_processor(".")?;
@@ -818,6 +826,25 @@ mod tests {
         assert!(
             result.is_err(),
             "an invalid VRL statement must be rejected at build time"
+        );
+    }
+
+    #[test]
+    fn test_removed_function_surfaces_compile_diagnostic() {
+        // A function that no longer exists in the linked vrl stdlib (e.g.
+        // removed upstream by an upgrade — truncate_timestamp was removed
+        // by 0.36) must fail through the same Config path as any invalid
+        // source, with the VRL diagnostic surfacing to the operator. This
+        // pins the delta-spec scenario for upgrade-drift: the program does
+        // not build, it does not fail at runtime.
+        let err = build_processor("no_such_function_xyz(.message)")
+            .err()
+            .expect("an undefined function must fail at build time");
+        let message = format!("{err}");
+        assert!(
+            message.contains("Failed to compile VRL statement")
+                && message.contains("undefined function"),
+            "must surface the VRL compiler diagnostic naming the function, got: {message}"
         );
     }
 
@@ -1081,6 +1108,119 @@ mod tests {
         assert!(
             message.contains("exceeds i64::MAX"),
             "overflow must fail loudly, got: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_timezone_changes_evaluation_result() -> Result<(), Error> {
+        // The configured timezone must flow into the evaluation context.
+        // get_timezone_name() reads it directly, so a broken TimeZone
+        // plumbing (e.g. a vrl upgrade silently freezing every program on
+        // the builder default) fails here while all other tests stay
+        // green.
+        async fn evaluate_tz_name(tz: &str) -> Result<String, Error> {
+            let processor =
+                build_processor_with_timezone(".tz, err = get_timezone_name()\n.", tz)?;
+            let schema = Arc::new(Schema::new(vec![Field::new("message", DataType::Utf8, true)]));
+            let arr = Arc::new(StringArray::from(vec![Some("hello")]));
+            let rb = RecordBatch::try_new(schema, vec![arr])
+                .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+            match processor
+                .process(Arc::new(MessageBatch::new_arrow(rb)))
+                .await?
+            {
+                ProcessResult::Single(b) => {
+                    let col = b
+                        .column_by_name("tz")
+                        .expect("timezone name column")
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("Utf8 timezone name");
+                    Ok(col.value(0).to_string())
+                }
+                _ => panic!("expected single result"),
+            }
+        }
+
+        assert_eq!(evaluate_tz_name("UTC").await?, "UTC");
+        assert_eq!(evaluate_tz_name("Asia/Shanghai").await?, "Asia/Shanghai");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_source_meta_columns_survive_passthrough() -> Result<(), Error> {
+        // Real batches carry __meta_ columns; the VRL processor must not
+        // drop or rename them. VRL has no unsigned integer concept, so the
+        // pinned contract is: names and values survive; integer metas come
+        // back as Int64 (downstream consumers already cast
+        // __meta_partition back to UInt32 where needed).
+        let processor = build_processor(".")?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("__meta_source", DataType::Utf8, true),
+            Field::new("__meta_partition", DataType::UInt32, true),
+            Field::new("__meta_offset", DataType::Int64, true),
+            Field::new("message", DataType::Utf8, true),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("kafka-a")])),
+                Arc::new(UInt32Array::from(vec![Some(3u32)])),
+                Arc::new(Int64Array::from(vec![Some(42i64)])),
+                Arc::new(StringArray::from(vec![Some("hello")])),
+            ],
+        )
+        .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+
+        let result = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?;
+        let ProcessResult::Single(b) = result else {
+            panic!("expected single result")
+        };
+        let source = b
+            .column_by_name("__meta_source")
+            .expect("__meta_source survives VRL")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 __meta_source");
+        assert_eq!(source.value(0), "kafka-a");
+        let partition = b
+            .column_by_name("__meta_partition")
+            .expect("__meta_partition survives VRL")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("VRL integers are Int64 on output");
+        assert_eq!(partition.value(0), 3);
+        let offset = b
+            .column_by_name("__meta_offset")
+            .expect("__meta_offset survives VRL")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 __meta_offset");
+        assert_eq!(offset.value(0), 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nested_object_field_errors_loudly() -> Result<(), Error> {
+        // The spec pins loud failure for non-row top-level results; the
+        // same guarantee must hold for a nested object produced as a FIELD
+        // value — it must not silently coerce to a string or drop rows.
+        let processor = build_processor(".geo = {\"city\": \"shanghai\"}\n.")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("message", DataType::Utf8, true)]));
+        let arr = Arc::new(StringArray::from(vec![Some("hello")]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let err = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await
+            .expect_err("nested object field must fail loudly");
+        let message = format!("{err}");
+        assert!(
+            message.contains("nested") && message.contains("geo"),
+            "error must name the nested field, got: {message}"
         );
         Ok(())
     }
