@@ -71,7 +71,7 @@ openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
 
 **存储级写围栏。** 每条控制面写都被包进一个围栏信封:携带持有者的租约 epoch,并在写入实际执行时对照租约行复查。接管推进 epoch 后,旧 leader 仍在途的写不会落库,而是以显式的 `stale leader` 错误被拒绝;operator/agent HTTP 路由把该拒绝呈现为 `503`、problem code 为 `stale_leader`——应向当选 leader 重试。HA 关闭(未设置 `ARKFLOW_HUB_HA_ENABLED`)时写入不加围栏,与单实例模式完全一致。
 
-### Agent 多 Hub 故障转移
+### Agent 多 Hub 故障转移 {#agent-multi-hub-failover}
 
 Agent 自行发现并跟随当选 leader,无需负载均衡器。在 `hub_urls` 中配置全部候选 Hub 地址(列表;`health_check.hub_url` 在本版本已改名并列表化——仍声明旧键的配置会在校验时报错并附迁移指引):
 
