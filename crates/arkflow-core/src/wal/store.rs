@@ -33,7 +33,7 @@ use std::sync::{Arc, RwLock};
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::wal::WalConfig;
 use crate::{Error, MessageBatch, MessageBatchRef};
@@ -284,8 +284,14 @@ impl RedbStore {
         std::fs::create_dir_all(path)
             .map_err(|e| Error::Process(format!("Failed to create WAL directory: {}", e)))?;
         let db_path = path.join("wal.redb");
-        let db = Database::create(&db_path)
-            .map_err(|e| Error::Process(format!("Failed to open WAL database: {}", e)))?;
+        let db = Database::create(&db_path).map_err(|e| {
+            Error::Process(format!(
+                "Failed to open WAL database {}: {e}. If this file was created by an older \
+                 ArkFlow (redb 2 file format, unsupported since the redb 4 upgrade), remove it \
+                 and restart; WAL entries re-source on recovery",
+                db_path.display()
+            ))
+        })?;
         Ok(Self { db })
     }
 
@@ -713,5 +719,26 @@ mod tests {
             vec![4, 5],
             "the floor entry stays replayable for a cursor compensation"
         );
+    }
+
+    #[test]
+    fn open_failure_names_the_file_and_leaves_it_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal.redb");
+        // A non-redb file stands in for a legacy/unopenable database: the
+        // open must fail loudly with the path and the remedy hint.
+        std::fs::write(&db_path, b"not a redb database").unwrap();
+        let before = std::fs::read(&db_path).unwrap();
+
+        let err = RedbStore::open(dir.path())
+            .err()
+            .expect("open must fail loudly");
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to open WAL database"), "{msg}");
+        assert!(msg.contains(db_path.to_str().unwrap()), "{msg}");
+        assert!(msg.contains("remove it and restart"), "{msg}");
+
+        // Fail-loud means no destructive recovery: the file is unchanged.
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
     }
 }
