@@ -458,7 +458,8 @@ where
         )
         .build();
     let tracer = provider.tracer("arkflow");
-    let _ = opentelemetry::global::set_tracer_provider(provider.clone());
+    // otel 0.33: set_tracer_provider returns () (first setter wins silently).
+    opentelemetry::global::set_tracer_provider(provider.clone());
     // Keep a handle so graceful shutdown can flush buffered spans (see
     // [`shutdown_otel_tracing`]); the global provider itself holds a clone.
     let _ = OTEL_PROVIDER.set(provider);

@@ -82,7 +82,7 @@ mongodb = { workspace = true }
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 
 # NATS
-async-nats = "0.46"
+async-nats = "0.50"
 
 # Pulsar
 pulsar = "6.6"

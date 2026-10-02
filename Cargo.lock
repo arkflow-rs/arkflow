@@ -353,7 +353,7 @@ dependencies = [
  "redis",
  "reqwest 0.13.5",
  "rumqttc",
- "rustls-native-certs 0.8.4",
+ "rustls-native-certs",
  "rustls-pemfile",
  "sasl2-sys",
  "serde",
@@ -867,9 +867,9 @@ dependencies = [
 
 [[package]]
 name = "async-nats"
-version = "0.46.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df5af9ebfb0a14481d3eaf6101e6391261e4f30d25b26a7635ade8a39482ded0"
+checksum = "d83a251fa1a4c9d0fe6e816b7acd60549e473e08d14f27a1d992c2675abff05f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -877,20 +877,19 @@ dependencies = [
  "memchr",
  "nkeys",
  "nuid",
- "once_cell",
  "pin-project",
  "portable-atomic",
- "rand 0.8.8",
+ "rand 0.10.3",
  "regex",
  "ring",
- "rustls-native-certs 0.7.3",
+ "rustls-native-certs",
  "rustls-pki-types",
- "rustls-webpki 0.102.8",
+ "rustls-webpki 0.103.15",
  "serde",
  "serde_json",
  "serde_nanos",
  "serde_repr",
- "thiserror 1.0.69",
+ "thiserror 2.0.21",
  "time",
  "tokio",
  "tokio-rustls",
@@ -1238,7 +1237,7 @@ dependencies = [
  "hyper-util",
  "pin-project-lite",
  "rustls",
- "rustls-native-certs 0.8.4",
+ "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
@@ -1814,7 +1813,7 @@ dependencies = [
  "pin-project-lite",
  "rand 0.9.5",
  "rustls",
- "rustls-native-certs 0.8.4",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_derive",
@@ -5100,7 +5099,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
- "rustls-native-certs 0.8.4",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -6429,10 +6428,10 @@ dependencies = [
  "libc",
  "log",
  "openssl",
- "openssl-probe 0.2.1",
+ "openssl-probe",
  "openssl-sys",
  "schannel",
- "security-framework 3.7.0",
+ "security-framework",
  "security-framework-sys",
  "tempfile",
 ]
@@ -6930,12 +6929,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "openssl-probe"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "openssl-probe"
@@ -7702,9 +7695,9 @@ dependencies = [
 
 [[package]]
 name = "prometheus"
-version = "0.13.4"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
+checksum = "3ca5326d8d0b950a9acd87e6a3f94745394f62e4dae1b1ee22b2bc0c394af43a"
 dependencies = [
  "cfg-if",
  "fnv",
@@ -7712,7 +7705,7 @@ dependencies = [
  "memchr",
  "parking_lot",
  "protobuf",
- "thiserror 1.0.69",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -7860,9 +7853,23 @@ dependencies = [
 
 [[package]]
 name = "protobuf"
-version = "2.28.0"
+version = "3.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
+checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
+dependencies = [
+ "once_cell",
+ "protobuf-support",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protobuf-support"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
+dependencies = [
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "protox"
@@ -8514,7 +8521,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
- "rustls-native-certs 0.8.4",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -8691,7 +8698,7 @@ dependencies = [
  "flume",
  "futures-util",
  "log",
- "rustls-native-certs 0.8.4",
+ "rustls-native-certs",
  "rustls-pemfile",
  "rustls-webpki 0.102.8",
  "thiserror 2.0.21",
@@ -8789,27 +8796,14 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5bfb394eeed242e909609f56089eecfe5fda225042e8b171791b9c95f5931e5"
-dependencies = [
- "openssl-probe 0.1.6",
- "rustls-pemfile",
- "rustls-pki-types",
- "schannel",
- "security-framework 2.11.1",
-]
-
-[[package]]
-name = "rustls-native-certs"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
 dependencies = [
- "openssl-probe 0.2.1",
+ "openssl-probe",
  "rustls-pki-types",
  "schannel",
- "security-framework 3.7.0",
+ "security-framework",
 ]
 
 [[package]]
@@ -8843,10 +8837,10 @@ dependencies = [
  "log",
  "once_cell",
  "rustls",
- "rustls-native-certs 0.8.4",
+ "rustls-native-certs",
  "rustls-platform-verifier-android",
  "rustls-webpki 0.103.15",
- "security-framework 3.7.0",
+ "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
  "windows-sys 0.61.2",
@@ -9051,19 +9045,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
 dependencies = [
  "zeroize",
-]
-
-[[package]]
-name = "security-framework"
-version = "2.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
-dependencies = [
- "bitflags 2.13.2",
- "core-foundation 0.9.4",
- "core-foundation-sys",
- "libc",
- "security-framework-sys",
 ]
 
 [[package]]

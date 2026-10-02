@@ -43,7 +43,7 @@ fn family(
     output.set_field_type(metric_type);
     for (labels, value) in series {
         let mut metric = Metric::default();
-        metric.set_label(label_pairs(&labels).into());
+        metric.set_label(label_pairs(&labels));
         match metric_type {
             MetricType::COUNTER => {
                 let mut counter = Counter::default();
