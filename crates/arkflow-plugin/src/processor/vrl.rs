@@ -830,6 +830,25 @@ mod tests {
     }
 
     #[test]
+    fn test_removed_function_surfaces_compile_diagnostic() {
+        // A function that no longer exists in the linked vrl stdlib (e.g.
+        // removed upstream by an upgrade — truncate_timestamp was removed
+        // by 0.36) must fail through the same Config path as any invalid
+        // source, with the VRL diagnostic surfacing to the operator. This
+        // pins the delta-spec scenario for upgrade-drift: the program does
+        // not build, it does not fail at runtime.
+        let err = build_processor("no_such_function_xyz(.message)")
+            .err()
+            .expect("an undefined function must fail at build time");
+        let message = format!("{err}");
+        assert!(
+            message.contains("Failed to compile VRL statement")
+                && message.contains("undefined function"),
+            "must surface the VRL compiler diagnostic naming the function, got: {message}"
+        );
+    }
+
+    #[test]
     fn test_timezone_config_accepted() {
         let config = Some(json!({ "statement": ".x = 1", "timezone": "Asia/Shanghai" }));
         let result = VrlProcessorBuilder.build(None, &config, &test_resource());
