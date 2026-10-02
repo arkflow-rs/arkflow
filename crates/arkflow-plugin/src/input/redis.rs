@@ -222,11 +222,17 @@ impl RedisInput {
         let client_builder = ClusterClientBuilder::new(urls);
 
         let client_builder = match config_type {
-            Type::Subscribe { .. } => client_builder.push_sender(ClusterPushForwarder {
-                sender: Sender::clone(&self.sender),
-                codec: self.codec.clone(),
-                input_name: self.input_name.clone(),
-            }),
+            // Cluster pub/sub delivery requires RESP3 in redis 1.x: push
+            // messages arrive as RESP3 push frames, and SUBSCRIBE on a
+            // RESP2 cluster connection is rejected outright
+            // ("RESP3 is required for this command").
+            Type::Subscribe { .. } => client_builder
+                .use_protocol(redis::ProtocolVersion::RESP3)
+                .push_sender(ClusterPushForwarder {
+                    sender: Sender::clone(&self.sender),
+                    codec: self.codec.clone(),
+                    input_name: self.input_name.clone(),
+                }),
             Type::List { .. } => client_builder,
         };
 
