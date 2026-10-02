@@ -5225,10 +5225,16 @@ async fn trace_context_round_trips_to_a_remote_parent() {
     let child = tracing::info_span!("barrier-child-7354");
     {
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-        let _guard = child.enter();
+        // Mirror the production call site (task.rs `barrier_span`): the remote
+        // parent is set on the not-yet-entered span — tracing-opentelemetry
+        // 0.34 only materializes the export parent from set_parent before the
+        // span's own guard is active.
         let remote = super::remote::extract_trace_context(&trace_context);
         assert!(remote.is_some(), "extract must parse a captured value");
-        child.set_parent(remote.unwrap());
+        child
+            .set_parent(remote.unwrap())
+            .expect("set_parent on a fresh span");
+        let _guard = child.enter();
     }
     drop(root);
     drop(child);

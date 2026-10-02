@@ -8899,17 +8899,20 @@ mod tests {
             .expect("each attempt settles")
             .unwrap();
             match outcome.state {
-                HubOperationState::TimedOut => {
-                    assert!(
-                        outcome
-                            .error
-                            .as_deref()
-                            .is_some_and(|error| error.contains("deadline")),
-                        "{:?}",
-                        outcome.error
-                    );
+                HubOperationState::TimedOut
+                    if outcome.error.as_deref().is_some_and(|e| e.contains("deadline")) =>
+                {
                     saw_deadline = true;
                     break;
+                }
+                // On a loaded runner the 1ms deadline can lapse before the
+                // precheck (`command_expired` guard) settles the attempt
+                // through the pre-execution expiry branch; that attempt is a
+                // retryable miss, not the branch under test.
+                HubOperationState::TimedOut
+                    if outcome.error.as_deref() == Some("Command expired before execution") =>
+                {
+                    continue;
                 }
                 HubOperationState::Succeeded => continue,
                 other => panic!("unexpected intermediate state {other:?}"),

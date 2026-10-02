@@ -436,11 +436,8 @@ where
     use opentelemetry_otlp::WithExportConfig;
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_export_config(opentelemetry_otlp::ExportConfig {
-            endpoint: Some(config.endpoint.clone()),
-            protocol: opentelemetry_otlp::Protocol::HttpJson,
-            ..opentelemetry_otlp::ExportConfig::default()
-        })
+        .with_endpoint(config.endpoint.clone())
+        .with_protocol(opentelemetry_otlp::Protocol::HttpJson)
         .build();
     let exporter = match exporter {
         Ok(exporter) => exporter,
@@ -845,18 +842,35 @@ mod tests {
         }
     }
 
-    /// With tracing enabled but no OTLP http client compiled into this crate,
-    /// the exporter build fails and the failure is isolated: the data plane
-    /// keeps a `None` layer instead of losing its console logging.
+    /// An invalid OTLP endpoint makes the exporter build fail and the failure
+    /// is isolated: the data plane keeps a `None` layer instead of losing its
+    /// console logging. (otlp 0.33 rejects syntactically invalid endpoints
+    /// eagerly at build; a merely unreachable endpoint no longer fails here —
+    /// that surfaces at export time instead.)
     #[test]
     fn otel_layer_isolates_exporter_build_failures() {
         let config = crate::config::TracingConfig {
             enabled: true,
-            endpoint: "http://127.0.0.1:1/v1/traces".to_string(),
+            endpoint: "not a valid url".to_string(),
             service_name: "arkflow-coverage".to_string(),
         };
         let layer = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
         assert!(layer.is_none());
+        shutdown_otel_tracing();
+    }
+
+    /// The happy path through the chained exporter config: a valid endpoint
+    /// yields a layer (endpoint/protocol/service_name all reach the builder),
+    /// and the shutdown path runs with a provider installed.
+    #[test]
+    fn otel_layer_builds_for_a_valid_endpoint() {
+        let config = crate::config::TracingConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
+            service_name: "arkflow-coverage".to_string(),
+        };
+        let layer = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
+        assert!(layer.is_some(), "valid config must yield the otel layer");
         shutdown_otel_tracing();
     }
 

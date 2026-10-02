@@ -1580,7 +1580,10 @@ fn barrier_span(chain: &Chain, barrier: &crate::checkpoint::CheckpointBarrier) -
     if let Some(trace_context) = &barrier.trace_context {
         if let Some(remote_context) = super::remote::extract_trace_context(trace_context) {
             use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-            span.set_parent(remote_context);
+            // Telemetry-only: a failed parent link never affects the barrier.
+            if let Err(e) = span.set_parent(remote_context) {
+                tracing::debug!("barrier span remote parent not applied: {e}");
+            }
         }
     }
     span
