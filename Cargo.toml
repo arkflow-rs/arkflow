@@ -45,8 +45,9 @@ arrow-json = "58.4"
 arrow-pyarrow = "58.4"
 prost-reflect = "0.16.3"
 prost-types = "0.14.3"
-protobuf-parse = "3.7.2"
-protobuf = "3.7.2"
+# Pure-Rust .proto compiler from the prost-reflect author; output feeds
+# prost-reflect directly (replaces the old rust-protobuf parser + byte bridge).
+protox = "0.9.1"
 toml = "0.9"
 lazy_static = "1.4"
 axum = "0.8"

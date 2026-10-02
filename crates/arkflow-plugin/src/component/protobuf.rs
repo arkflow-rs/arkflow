@@ -38,7 +38,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use prost_reflect::prost::Message;
 use prost_reflect::prost_types::FileDescriptorSet;
 use prost_reflect::{DynamicMessage, MessageDescriptor, Value};
-use protobuf::Message as ProtobufMessage;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io};
@@ -104,37 +103,15 @@ pub fn parse_proto_file<T: ProtobufConfig>(config: &T) -> Result<FileDescriptorS
         return Err(Error::Config("No proto files found in the specified paths. Please ensure the paths contain valid .proto files".to_string()));
     }
 
-    // Parse the proto file using the protobuf_parse library
-    let file_descriptor_protos = protobuf_parse::Parser::new()
-        .pure()
-        .inputs(proto_inputs)
-        .includes(proto_includes)
-        .parse_and_typecheck()
-        .map_err(|e| Error::Config(format!("Failed to parse the proto file: {:#}", e)))?
-        .file_descriptors;
+    // Compile the proto files with the pure-Rust protox compiler, which
+    // yields prost_types descriptors directly.
+    let file_descriptor_set = protox::compile(proto_inputs, proto_includes)
+        .map_err(|e| Error::Config(format!("Failed to parse the proto file: {}", e)))?;
 
-    if file_descriptor_protos.is_empty() {
+    if file_descriptor_set.file.is_empty() {
         return Err(Error::Config(
             "Parsing the proto file does not yield any descriptors".to_string(),
         ));
-    }
-
-    // Convert FileDescriptorProto to FileDescriptorSet
-    let mut file_descriptor_set = FileDescriptorSet { file: Vec::new() };
-
-    for proto in file_descriptor_protos {
-        // Convert the protobuf library's FileDescriptorProto to a prost_types FileDescriptorProto
-        let proto_bytes = proto.write_to_bytes().map_err(|e| {
-            Error::Config(format!("Failed to serialize FileDescriptorProto: {}", e))
-        })?;
-
-        let prost_proto =
-            prost_reflect::prost_types::FileDescriptorProto::decode(proto_bytes.as_slice())
-                .map_err(|e| {
-                    Error::Config(format!("Failed to convert FileDescriptorProto: {}", e))
-                })?;
-
-        file_descriptor_set.file.push(prost_proto);
     }
 
     Ok(file_descriptor_set)
@@ -150,36 +127,8 @@ pub fn parse_proto_source(schema: &str, message_type: &str) -> Result<MessageDes
     fs::write(&proto_path, schema)
         .map_err(|e| Error::Config(format!("Failed to write proto source: {}", e)))?;
 
-    let proto_input = proto_path
-        .to_str()
-        .ok_or_else(|| Error::Config("Invalid temp proto path".to_string()))?
-        .to_string();
-    let include_dir = dir
-        .path()
-        .to_str()
-        .ok_or_else(|| Error::Config("Invalid temp include path".to_string()))?
-        .to_string();
-
-    let file_descriptor_protos = protobuf_parse::Parser::new()
-        .pure()
-        .inputs(&[proto_input])
-        .includes(&[include_dir])
-        .parse_and_typecheck()
-        .map_err(|e| Error::Config(format!("Failed to parse proto source: {}", e)))?
-        .file_descriptors;
-
-    let mut file_descriptor_set = FileDescriptorSet { file: Vec::new() };
-    for proto in file_descriptor_protos {
-        let proto_bytes = proto.write_to_bytes().map_err(|e| {
-            Error::Config(format!("Failed to serialize FileDescriptorProto: {}", e))
-        })?;
-        let prost_proto =
-            prost_reflect::prost_types::FileDescriptorProto::decode(proto_bytes.as_slice())
-                .map_err(|e| {
-                    Error::Config(format!("Failed to convert FileDescriptorProto: {}", e))
-                })?;
-        file_descriptor_set.file.push(prost_proto);
-    }
+    let file_descriptor_set = protox::compile([proto_path], [dir.path()])
+        .map_err(|e| Error::Config(format!("Failed to parse proto source: {}", e)))?;
 
     let pool = prost_reflect::DescriptorPool::from_file_descriptor_set(file_descriptor_set)
         .map_err(|e| Error::Config(format!("Failed to create descriptor pool: {}", e)))?;
