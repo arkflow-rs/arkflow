@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install helm
-        uses: azure/setup-helm@fe7b79cd5ee7eacf1fdf3144f6b1bcfb5afbaa1f # v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: v3.16.4
 
@@ -93,7 +93,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install helm
-        uses: azure/setup-helm@fe7b79cd5ee7eacf1fdf3144f6b1bcfb5afbaa1f # v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: v3.16.4
 
