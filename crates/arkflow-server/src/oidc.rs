@@ -233,13 +233,62 @@ impl OidcAuthenticator {
             fetched_at: Instant::now(),
         })
     }
+
+    /// Whole-table periodic refresh so a provider key rotation revokes the
+    /// known kids it removed (the lazy unknown-kid path never sees an
+    /// already-cached kid). A failed refresh retains the previous table —
+    /// an IdP outage must not take the Hub down — and logs for operators.
+    /// The single-flight flag is shared with the lazy path so the two can
+    /// never fetch concurrently.
+    fn spawn_periodic_refresh(self: &Arc<Self>, interval: Duration) {
+        if interval.is_zero() {
+            return;
+        }
+        let authenticator = self.clone();
+        // Detached by design: the loop runs for the process lifetime.
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first interval tick fires immediately; the cache is empty
+            // and the first authenticate() lazily fetches, so skip it.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if authenticator
+                    .refreshing
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::Acquire,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    let _release = RefreshRelease {
+                        refreshing: &authenticator.refreshing,
+                        done: &authenticator.refresh_done,
+                    };
+                    match authenticator.fetch_keys().await {
+                        Some(fetched) => {
+                            *authenticator.cache.lock().await = Some(fetched);
+                        }
+                        None => {
+                            tracing::warn!(
+                                "periodic JWKS refresh failed; retaining the previous key set"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// Federation facade: the JWT authenticator plus optional browser
 /// authorization-code login (client credentials + discovery) and the
 /// in-memory session table backing the `arkflow_session` cookie.
 pub struct OidcFederation {
-    authenticator: OidcAuthenticator,
+    authenticator: Arc<OidcAuthenticator>,
     login: Option<OidcLoginClient>,
     sessions: Arc<std::sync::Mutex<HashMap<String, (OperatorPrincipal, Instant)>>>,
     http: reqwest::Client,
@@ -265,7 +314,14 @@ pub struct OidcSettings {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub redirect_uri: Option<String>,
+    /// Periodic whole-table JWKS refresh cadence; absent = default (1h),
+    /// zero disables the background refresher.
+    pub jwks_refresh_interval: Option<Duration>,
 }
+
+/// Default JWKS periodic refresh cadence: bounded staleness for key
+/// rotation and kid revocation without meaningful IdP load.
+const DEFAULT_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 
@@ -288,6 +344,10 @@ impl OidcFederation {
             client_id: non_empty("ARKFLOW_OIDC_CLIENT_ID"),
             client_secret: non_empty("ARKFLOW_OIDC_CLIENT_SECRET"),
             redirect_uri: non_empty("ARKFLOW_OIDC_REDIRECT_URI"),
+            jwks_refresh_interval: std::env::var("ARKFLOW_OIDC_JWKS_REFRESH_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|millis| Duration::from_millis(millis.max(1_000))),
         };
         Self::from_settings(settings).await
     }
@@ -305,8 +365,18 @@ impl OidcFederation {
         });
         let role_claim = settings.role_claim.clone().unwrap_or_else(|| "roles".to_string());
         let scopes_claim = settings.scopes_claim.clone().unwrap_or_else(|| "scopes".to_string());
-        let authenticator =
-            OidcAuthenticator::new(issuer.clone(), settings.audience.clone(), jwks_url, role_claim, scopes_claim);
+        let authenticator = Arc::new(OidcAuthenticator::new(
+            issuer.clone(),
+            settings.audience.clone(),
+            jwks_url,
+            role_claim,
+            scopes_claim,
+        ));
+        authenticator.spawn_periodic_refresh(
+            settings
+                .jwks_refresh_interval
+                .unwrap_or(DEFAULT_JWKS_REFRESH_INTERVAL),
+        );
 
         let login = match (
             settings.client_id.as_deref().filter(|v| !v.trim().is_empty()),
@@ -361,13 +431,23 @@ impl OidcFederation {
         });
         let role_claim = settings.role_claim.clone().unwrap_or_else(|| "roles".to_string());
         let scopes_claim = settings.scopes_claim.clone().unwrap_or_else(|| "scopes".to_string());
-        let authenticator = OidcAuthenticator::new(
+        let authenticator = Arc::new(OidcAuthenticator::new(
             issuer,
             settings.audience.clone(),
             jwks_url,
             role_claim,
             scopes_claim,
-        );
+        ));
+        // Blocking construction may run outside a runtime (tests, sync
+        // startup): only the background refresher needs one, and its
+        // absence downgrades to the lazy unknown-kid refresh only.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            authenticator.spawn_periodic_refresh(
+                settings
+                    .jwks_refresh_interval
+                    .unwrap_or(DEFAULT_JWKS_REFRESH_INTERVAL),
+            );
+        }
         Some(Arc::new(Self {
             authenticator,
             login: None,
@@ -1378,5 +1458,37 @@ mod tests {
         }
         let principal = auth.authenticate(&token).await.expect("known kid validates");
         assert_eq!(principal.id, "u10");
+    }
+
+    /// Spec: a periodic whole-table refresh revokes kids the provider rotated
+    /// away; without it a once-known kid stays valid for the process
+    /// lifetime. The mock rotates to a different kid after the first fetch.
+    #[tokio::test]
+    async fn periodic_refresh_revokes_rotated_away_kids() {
+        let mock = MockJwks::spawn(jwks_body(&[TEST_KID]));
+        let auth = std::sync::Arc::new(authenticator(format!("http://{}/jwks", mock.addr)));
+        auth.spawn_periodic_refresh(std::time::Duration::from_millis(100));
+        let old_token = mint(claims("u1", serde_json::json!(["viewer"]), 600), Some(TEST_KID));
+        assert!(
+            auth.authenticate(&old_token).await.is_some(),
+            "the initially served kid validates"
+        );
+
+        // Rotate the provider table: the old kid disappears entirely.
+        mock.set_body(jwks_body(&["test-key-2"]));
+        // Wait for at least one PERIODIC fetch on top of the initial lazy one.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mock.fetch_count() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "periodic refresh must keep fetching"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            auth.authenticate(&old_token).await.is_none(),
+            "a kid the provider rotated away must be revoked after the periodic refresh"
+        );
     }
 }

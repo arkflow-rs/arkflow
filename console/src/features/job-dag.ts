@@ -99,14 +99,14 @@ export function edgeIssue(
   edges: Edge[],
   connection: { source: string | null; target: string | null },
 ): string | undefined {
-  if (!connection.source || !connection.target) return 'Both endpoints are required'
-  if (connection.source === connection.target) return 'A node cannot connect to itself'
+  if (!connection.source || !connection.target) return 'dag.edge.endpoints'
+  if (connection.source === connection.target) return 'dag.edge.self'
   const source = nodes.find((node) => node.id === connection.source)?.data
   const target = nodes.find((node) => node.id === connection.target)?.data
-  if (source?.kind === 'sink') return 'A sink cannot have outgoing edges'
-  if (target?.kind === 'source') return 'A source cannot have incoming edges'
+  if (source?.kind === 'sink') return 'dag.edge.sinkOut'
+  if (target?.kind === 'source') return 'dag.edge.sourceIn'
   if (edges.some((edge) => edge.source === connection.source && edge.target === connection.target))
-    return 'Duplicate edges are not allowed'
+    return 'dag.edge.duplicate'
   const adjacency = new Map<string, string[]>()
   for (const edge of edges) adjacency.set(edge.source, [...(adjacency.get(edge.source) ?? []), edge.target])
   adjacency.set(connection.source, [...(adjacency.get(connection.source) ?? []), connection.target])
@@ -121,7 +121,7 @@ export function edgeIssue(
     stack.delete(id)
     return false
   }
-  if ([...adjacency.keys()].some(visit)) return 'This connection would create a cycle'
+  if ([...adjacency.keys()].some(visit)) return 'dag.edge.cycle'
   return undefined
 }
 

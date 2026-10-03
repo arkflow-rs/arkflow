@@ -10,7 +10,7 @@ Kubernetes 安装推荐使用 [Helm Chart](../helm.md) 的 `control-plane` 模�
 `127.0.0.1:8080`;生产环境应保持同源路径,仅在 API 前缀不同时才设置 `VITE_API_BASE`。
 仅当 ArkFlow 监听器配置了运维凭据时,才在受控的构建环境中设置 `VITE_API_TOKEN`。
 兼容凭据可以是原始令牌(admin),也可以是 `principal|role|secret`,例如
-`readonly|viewer|viewer-secret`;viewer 凭据可以读取资源与审计历史,但不能变更 Stream、节点或灰度发布。
+`readonly|viewer|viewer-secret`;viewer 凭据可以读取资源与审计历史,但不能变更 Stream、节点或灰度发布。包含 `|` 但解析失败的值(未知角色、空字段、字段数错误)会在启动期以脱敏报错拒绝,而不会静默降级为 admin 凭据。
 
 ### 存储后端
 
@@ -101,6 +101,7 @@ health_check:
 | `ARKFLOW_OIDC_ISSUER` | 是 | 令牌签发方,必须与令牌的 `iss` claim 一致。 |
 | `ARKFLOW_OIDC_AUDIENCE` | 是 | Hub 期望的 `aud` claim。 |
 | `ARKFLOW_OIDC_JWKS_URL` | 否 | JWKS 端点;缺省为 `{issuer}/.well-known/jwks.json`。 |
+| `ARKFLOW_OIDC_JWKS_REFRESH_MS` | 否 | JWKS 周期性整表刷新间隔(毫秒,默认 3600000,最小 1000)。刷新会吊销 IdP 已轮换移除的签名密钥;刷新失败时保留旧密钥集并记录告警。 |
 | `ARKFLOW_OIDC_ROLE_CLAIM` | 否 | 携带角色的 claim;缺省为 `roles`。 |
 | `ARKFLOW_OIDC_SCOPES_CLAIM` | 否 | 携带资源 scope 的 claim;缺省为 `scopes`。 |
 | `ARKFLOW_OIDC_CLIENT_ID` | 登录流 | 浏览器授权码流的 OAuth2 client id。 |

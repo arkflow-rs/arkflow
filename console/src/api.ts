@@ -303,17 +303,48 @@ export function formatTime(value?: number): string {
 
 const base = import.meta.env.VITE_API_BASE ?? '/api/v1'
 const token = import.meta.env.VITE_API_TOKEN
+
+/** Default per-request budget: a connection black hole must fail the call
+ * (with a readable message) instead of freezing the UI forever. */
+const REQUEST_TIMEOUT_MS = 30_000
+
+/** Timeout signal merged with any caller-provided signal. Feature-detected:
+ * older runtimes (and jsdom) may lack `AbortSignal.any`/`timeout`, where the
+ * caller's signal (if any) applies and the budget is simply absent. */
+function requestSignal(init?: RequestInit): AbortSignal | undefined {
+  if (typeof AbortSignal.timeout !== 'function') return init?.signal ?? undefined
+  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  const caller = init?.signal ?? undefined
+  if (!caller) return timeout
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any([caller, timeout])
+  return caller
+}
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const correlationId = `console-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  const response = await fetch(`${base}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Correlation-ID': correlationId,
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(init?.headers ?? {}),
-    },
-  })
+  const signal = requestSignal(init)
+  let response: Response
+  try {
+    response = await fetch(`${base}${path}`, {
+      ...init,
+      signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Correlation-ID': correlationId,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(init?.headers ?? {}),
+      },
+    })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      throw Object.assign(new Error(translate(currentLocale(), 'api.requestTimeout')), {
+        code: 'request_timeout',
+        correlation_id: correlationId,
+        status: 0,
+      })
+    }
+    throw error
+  }
   if (!response.ok) {
     if (response.status === 401 && !token) {
       void redirectToOidcLogin()
@@ -484,6 +515,11 @@ export function streamEvents(
 ): AbortController {
   const controller = new AbortController()
   const path = `/events/stream${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`
+  // Exponential backoff with a cap: a Hub outage must not become a
+  // reconnect storm, and one clean reconnect resets the ladder.
+  const SSE_BACKOFF_FLOOR_MS = 1_000
+  const SSE_BACKOFF_MAX_MS = 30_000
+  let backoffMs = SSE_BACKOFF_FLOOR_MS
   void (async () => {
     let lastEventId: string | undefined
     while (!controller.signal.aborted) {
@@ -500,6 +536,7 @@ export function streamEvents(
           throw new Error(translate(currentLocale(), 'api.sseConnectionFailed', { status: response.status }))
         }
         onState?.('connected')
+        backoffMs = SSE_BACKOFF_FLOOR_MS
         const reader = response.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
@@ -535,7 +572,10 @@ export function streamEvents(
       } catch {
         if (!controller.signal.aborted) onState?.('disconnected')
       }
-      if (!controller.signal.aborted) await new Promise((resolve) => window.setTimeout(resolve, 1000))
+      if (!controller.signal.aborted) {
+        await new Promise((resolve) => window.setTimeout(resolve, backoffMs))
+        backoffMs = Math.min(backoffMs * 2, SSE_BACKOFF_MAX_MS)
+      }
     }
   })()
   return controller

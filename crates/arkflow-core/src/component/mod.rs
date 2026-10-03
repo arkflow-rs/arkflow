@@ -380,7 +380,7 @@ pub fn build_config_schema() -> serde_json::Value {
             },
             "health_check": {
                 "type": "object",
-                "description": "Health check HTTP server configuration.",
+                "description": "Health check HTTP server, control-plane API, agent registration, data-plane, and process observability configuration.",
                 "additionalProperties": false,
                 "properties": {
                     "enabled": {"type": "boolean", "default": true},
@@ -390,7 +390,70 @@ pub fn build_config_schema() -> serde_json::Value {
                     "liveness_path": {"type": "string", "default": "/liveness"},
                     "api_prefix": {"type": "string", "default": "/api/v1"},
                     "api_token": {"type": "string", "writeOnly": true},
-                    "cors_origins": {"type": "array", "items": {"type": "string"}, "default": []}
+                    "cors_origins": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "hub_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                        "description": "Hub addresses for compute-node Agent mode, tried in order as failover candidates. Empty keeps standalone mode."
+                    },
+                    "hub_url": {
+                        "type": "string",
+                        "deprecated": true,
+                        "description": "Removed single-address key; any occurrence fails with a migration hint. Use hub_urls."
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "Stable identity used when this process reports to a Hub."
+                    },
+                    "node_token": {
+                        "type": "string",
+                        "writeOnly": true,
+                        "description": "Shared node registration credential. Never included in reports."
+                    },
+                    "agent_lease_ttl_ms": {
+                        "type": "integer",
+                        "format": "uint64",
+                        "default": 15000,
+                        "description": "Lease duration advertised by a compute node to its Hub."
+                    },
+                    "agent_session_ttl_ms": {
+                        "type": "integer",
+                        "format": "uint64",
+                        "default": 3600000,
+                        "description": "Lifetime of a Hub-issued agent session credential."
+                    },
+                    "data_port": {
+                        "type": "integer",
+                        "format": "uint16",
+                        "description": "Data-plane listen port for cross-node shuffle. Absent keeps the node colocated-only."
+                    },
+                    "data_host": {
+                        "type": "string",
+                        "description": "Routable host advertised to peers for the data plane (for example the node's LAN IP)."
+                    },
+                    "observability": {
+                        "type": "object",
+                        "description": "Process-level observability export (metrics, readiness, liveness); available even when the control-plane API server is disabled.",
+                        "additionalProperties": false,
+                        "properties": {
+                            "enabled": {"type": "boolean", "default": true},
+                            "address": {"type": "string", "default": "127.0.0.1:8081"},
+                            "metrics_path": {"type": "string", "default": "/metrics"},
+                            "ready_path": {"type": "string", "default": "/ready"},
+                            "live_path": {"type": "string", "default": "/live"},
+                            "tracing": {
+                                "type": "object",
+                                "description": "OTel trace export (disabled by default).",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "enabled": {"type": "boolean", "default": false},
+                                    "endpoint": {"type": "string", "default": "http://127.0.0.1:4318/v1/traces"},
+                                    "service_name": {"type": "string", "default": "arkflow"}
+                                }
+                            }
+                        }
+                    }
                 }
             },
             "streams": {
@@ -504,8 +567,7 @@ pub fn build_config_schema() -> serde_json::Value {
                         "thread_num": {
                             "type": "integer",
                             "minimum": 1,
-                            "default": 1,
-                            "description": "Number of processor worker threads."
+                            "description": "Number of processor worker threads. Defaults to the number of CPU cores when omitted."
                         },
                         "processors": {
                             "type": "array",

@@ -42,17 +42,45 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
     // Source operator: the stream's input config rides along in `config` so
     // the registry adapter can rebuild it verbatim (type + codec + settings).
     let source_operator_id = "source".to_string();
+    // Preserve `pipeline.thread_num` as bounded chain-level processor
+    // worker concurrency (the legacy Stream contract) without changing
+    // the source partition topology: the value rides the source config
+    // and the graph builder copies it onto the source chain.
+    //
+    // A window buffer makes the chain single-parallelism (keyed state and
+    // the window operator's internal ordering need one worker). An
+    // explicitly configured thread_num above one is rejected here: the
+    // graph always clamped it to 1, so the setting never took effect and
+    // silently ignoring it hides a misconfiguration. The DEFAULT thread
+    // num (CPU count) is not an explicit choice and compiles to 1 exactly
+    // as the old clamp behaved.
+    let window_buffered = stream.buffer.as_ref().is_some_and(|buffer| {
+        matches!(
+            buffer.buffer_type.as_str(),
+            "tumbling_window" | "session_window"
+        )
+    });
+    let requested_parallelism = stream.pipeline.thread_num.max(1);
+    let chain_parallelism = if window_buffered && requested_parallelism > 1 {
+        if requested_parallelism == crate::pipeline::default_thread_num() {
+            1
+        } else {
+            return Err(Error::Config(format!(
+                "stream '{stream_id}' uses a window buffer, so its processor chain runs \
+                 single-threaded; pipeline.thread_num is {requested_parallelism} — set it to \
+                 1 or remove it"
+            )));
+        }
+    } else {
+        requested_parallelism
+    };
     operators.push(OperatorSpec {
         id: source_operator_id.clone(),
         kind: OperatorKind::Source,
         stateful: false,
         key_field: None,
-        // Preserve `pipeline.thread_num` as bounded chain-level processor
-        // worker concurrency (the legacy Stream contract) without changing
-        // the source partition topology: the value rides the source config
-        // and the graph builder copies it onto the source chain.
         config: json!({
-            "__arkflow_processor_parallelism": stream.pipeline.thread_num.max(1),
+            "__arkflow_processor_parallelism": chain_parallelism,
         }),
     });
     sources.push(SourceSpec {

@@ -82,7 +82,14 @@ impl ControlPlane {
             started_at: Instant::now(),
             health,
             configuration: Arc::new(RwLock::new(config)),
-            version_store: ConfigVersionStore::new(".arkflow/config-history"),
+            // Overridable so deployments can keep version history on a
+            // persistent volume; default unchanged.
+            version_store: ConfigVersionStore::new(
+                std::env::var("ARKFLOW_CONFIG_HISTORY_DIR")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| ".arkflow/config-history".into()),
+            ),
             node_id: Arc::from("local-node"),
             api_token,
             draft: Arc::new(RwLock::new(None)),
@@ -407,7 +414,23 @@ impl ControlPlane {
             .version_store
             .save_with_parent(candidate, parent)
             .map_err(|error| Error::Config(error.to_string()))?;
-        let affected = self.runtime_manager.replace_config(&config).await?;
+        let affected = match self.runtime_manager.replace_config(&config).await {
+            Ok(affected) => affected,
+            Err(error) => {
+                // Retract the never-active version so the history only
+                // contains rollback points that really ran. Best-effort: a
+                // failed delete leaves a stale record (harmless for
+                // diffing) and is logged.
+                if let Err(delete_error) = self.version_store.delete_version(&version.id) {
+                    tracing::warn!(
+                        version = %version.id,
+                        %delete_error,
+                        "failed to retract the never-applied configuration version"
+                    );
+                }
+                return Err(error);
+            }
+        };
         *self.configuration.write().await = config;
         Ok(serde_json::json!({"version": version, "affected_streams": affected}))
     }
@@ -428,7 +451,21 @@ impl ControlPlane {
             .version_store
             .save_with_parent(&candidate, Some(id.to_string()))
             .map_err(|error| Error::Config(error.to_string()))?;
-        let affected = self.runtime_manager.replace_config(&config).await?;
+        let affected = match self.runtime_manager.replace_config(&config).await {
+            Ok(affected) => affected,
+            Err(error) => {
+                // Same retraction rule as apply: a rollback that failed to
+                // become active must not linger as a rollback point.
+                if let Err(delete_error) = self.version_store.delete_version(&version.id) {
+                    tracing::warn!(
+                        version = %version.id,
+                        %delete_error,
+                        "failed to retract the never-applied rollback version"
+                    );
+                }
+                return Err(error);
+            }
+        };
         *self.configuration.write().await = config;
         Ok(
             serde_json::json!({"rollback_from": id, "version": version, "affected_streams": affected}),
@@ -454,4 +491,208 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod retraction_tests {
+    use super::*;
+    use crate::config::HealthCheckConfig;
+    use crate::input::{Input, InputBuilder};
+    use crate::output::{Output, OutputBuilder};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Succeeds for the validation dry-build, fails for the real build: a
+    /// component error that only surfaces after validation, which is the
+    /// retraction path's trigger (validation and replace each build once).
+    struct SecondBuildFailsInput;
+    static BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+    #[async_trait::async_trait]
+    impl Input for SecondBuildFailsInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error>
+        {
+            std::future::pending().await
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct SecondBuildFailsInputBuilder;
+
+    impl InputBuilder for SecondBuildFailsInputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            if BUILDS.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Arc::new(SecondBuildFailsInput))
+            } else {
+                Err(Error::Config("second build fails".into()))
+            }
+        }
+    }
+
+    struct DevNullOutput;
+
+    #[async_trait::async_trait]
+    impl Output for DevNullOutput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn write(&self, _msg: crate::MessageBatchRef) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct DevNullOutputBuilder;
+
+    impl OutputBuilder for DevNullOutputBuilder {
+        fn build(
+            &self,
+            _name: Option<&String>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Ok(Arc::new(DevNullOutput))
+        }
+    }
+
+    fn engine() -> crate::engine::Engine {
+        crate::engine::Engine::new(EngineConfig {
+            streams: vec![],
+            jobs: Vec::new(),
+            logging: crate::config::LoggingConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        })
+    }
+
+    fn stream_candidate() -> crate::configuration::ConfigCandidate {
+        crate::configuration::ConfigCandidate {
+            format: crate::configuration::ConfigFormat::Json,
+            content: serde_json::json!({
+                "streams": [{
+                    "id": "orders",
+                    "input": {"type": "cp-retraction-input"},
+                    "pipeline": {"thread_num": 1, "processors": []},
+                    "output": {"type": "cp-retraction-output"}
+                }]
+            })
+            .to_string(),
+            content_verbatim: None,
+        }
+    }
+
+    /// Spec: a version whose runtime application fails is retracted, so the
+    /// history only contains versions that were actually active.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_apply_retracts_the_never_active_version() {
+        let _ = crate::input::register_input_builder(
+            "cp-retraction-input",
+            Arc::new(SecondBuildFailsInputBuilder),
+        );
+        let _ = crate::output::register_output_builder(
+            "cp-retraction-output",
+            Arc::new(DevNullOutputBuilder),
+        );
+        BUILDS.store(0, Ordering::SeqCst);
+        let engine = engine();
+        let control_plane = engine.control_plane();
+
+        let error = control_plane
+            .apply_configuration(&stream_candidate())
+            .await
+            .expect_err("the real build fails after validation");
+        assert!(
+            error.to_string().contains("second build fails"),
+            "{error}"
+        );
+        let versions = control_plane.version_store().list().unwrap();
+        assert!(
+            versions.is_empty(),
+            "the never-applied version must be retracted: {versions:?}"
+        );
+    }
+
+    /// Spec: a successful apply keeps its version (the retraction is not
+    /// over-eager), and `ARKFLOW_CONFIG_HISTORY_DIR` redirects the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_apply_keeps_version_and_env_dir_redirects() {
+        // A build that never fails: reuse the same builder fresh counter.
+        struct AlwaysOkInput;
+        #[async_trait::async_trait]
+        impl Input for AlwaysOkInput {
+            async fn connect(&self) -> Result<(), Error> {
+                Ok(())
+            }
+            async fn read(
+                &self,
+            ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+                std::future::pending().await
+            }
+            async fn close(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        struct AlwaysOkInputBuilder;
+        impl InputBuilder for AlwaysOkInputBuilder {
+            fn build(
+                &self,
+                _name: Option<&String>,
+                _config: &Option<serde_json::Value>,
+                _codec: Option<Arc<dyn crate::codec::Codec>>,
+                _resource: &crate::Resource,
+            ) -> Result<Arc<dyn Input>, Error> {
+                Ok(Arc::new(AlwaysOkInput))
+            }
+        }
+        let _ = crate::input::register_input_builder(
+            "cp-retraction-always-ok-input",
+            Arc::new(AlwaysOkInputBuilder),
+        );
+        let _ = crate::output::register_output_builder(
+            "cp-retraction-output",
+            Arc::new(DevNullOutputBuilder),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        // SAFETY: process-global for the duration of the assertion; sibling
+        // tests only use the default when the variable is absent.
+        std::env::set_var(
+            "ARKFLOW_CONFIG_HISTORY_DIR",
+            directory.path().as_os_str(),
+        );
+        let engine = engine();
+        let control_plane = engine.control_plane();
+        let candidate = crate::configuration::ConfigCandidate {
+            format: crate::configuration::ConfigFormat::Json,
+            content: serde_json::json!({
+                "streams": [{
+                    "id": "orders",
+                    "input": {"type": "cp-retraction-always-ok-input"},
+                    "pipeline": {"thread_num": 1, "processors": []},
+                    "output": {"type": "cp-retraction-output"}
+                }]
+            })
+            .to_string(),
+            content_verbatim: None,
+        };
+        let applied = control_plane.apply_configuration(&candidate).await;
+        std::env::remove_var("ARKFLOW_CONFIG_HISTORY_DIR");
+        applied.expect("apply succeeds");
+        let versions = control_plane.version_store().list().unwrap();
+        assert_eq!(versions.len(), 1, "the applied version is retained");
+        let entries = std::fs::read_dir(directory.path()).unwrap().count();
+        assert_eq!(entries, 1, "the version lives under the env-provided dir");
+    }
 }

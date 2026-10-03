@@ -7,9 +7,37 @@ use crate::control_plane::ControlPlane;
 use crate::executor::stream_adapter::StreamJobAdapter;
 use crate::runtime::RuntimeManager;
 use std::error::Error;
-use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+
+/// Installs the OS signal watchers that cancel the engine's token. Unix gets
+/// SIGINT + SIGTERM; Windows only offers Ctrl+C. The core crate must compile
+/// on both, so the unix-only stream API stays behind a cfg.
+fn spawn_signal_watchers(token: CancellationToken) {
+    let token_clone = token.clone();
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("Failed to set signal handler");
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Failed to set signal handler");
+        tokio::select! {
+            _ = sigint.recv() => info!("Received SIGINT, exiting..."),
+            _ = sigterm.recv() => info!("Received SIGTERM, exiting..."),
+            _ = token_clone.cancelled() => info!("Cancellation requested, exiting..."),
+        }
+        token_clone.cancel();
+    });
+    #[cfg(windows)]
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("Received Ctrl+C, exiting..."),
+            _ = token_clone.cancelled() => info!("Cancellation requested, exiting..."),
+        }
+        token_clone.cancel();
+    });
+}
 
 /// The stream-processing engine. HTTP transport is intentionally owned by
 /// `arkflow-server`; this type only manages the runtime domain.
@@ -148,17 +176,7 @@ impl Engine {
         self.control_plane.health().set_ready(true);
         self.control_plane.health().set_running(true);
 
-        let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set signal handler");
-        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set signal handler");
-        let token_clone = token.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = sigint.recv() => info!("Received SIGINT, exiting..."),
-                _ = sigterm.recv() => info!("Received SIGTERM, exiting..."),
-                _ = token_clone.cancelled() => info!("Cancellation requested, exiting..."),
-            }
-            token_clone.cancel();
-        });
+        spawn_signal_watchers(token.clone());
 
         tokio::select! {
             _ = token.cancelled() => {}

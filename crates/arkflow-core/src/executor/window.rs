@@ -369,7 +369,20 @@ pub struct WindowOperatorConfig {
     /// schema rather than the columnar aggregate metadata.
     #[serde(default)]
     pub legacy_payload: bool,
+    /// Bound on the number of live `(window_start, key)` aggregate entries.
+    /// When the bound is reached the oldest-window entries are evicted (their
+    /// aggregates are lost, announced by a throttled warn) instead of growing
+    /// without limit under a stalled watermark or high key cardinality.
+    #[serde(default = "default_max_buffered_keys")]
+    pub max_buffered_keys: usize,
 }
+
+fn default_max_buffered_keys() -> usize {
+    65_536
+}
+
+/// Minimum spacing between two `max_buffered_keys` eviction warn lines.
+const WINDOW_EVICTION_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl WindowOperatorConfig {
     /// Validate the arithmetic and schema contract before an operator enters
@@ -387,6 +400,11 @@ impl WindowOperatorConfig {
         if self.trigger_interval_ms == 0 {
             return Err(Error::Config(
                 "window trigger_interval_ms must be positive".into(),
+            ));
+        }
+        if self.max_buffered_keys == 0 {
+            return Err(Error::Config(
+                "window max_buffered_keys must be positive".into(),
             ));
         }
         if self.value_fields.len() > 1 {
@@ -506,6 +524,10 @@ pub struct ColumnarWindowOperator {
     /// second input must not mutate the same window until the first result's
     /// source acknowledgement has either committed or been compensated.
     operation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Throttled observability for `max_buffered_keys` evictions: the first
+    /// eviction warns immediately, later lines are rate-limited and carry the
+    /// suppressed count (mirrors the join operator's `EvictionThrottle`).
+    eviction_log: Mutex<(Option<std::time::Instant>, u64)>,
 }
 
 /// Raw state key -> prior backend bytes (None = key absent): the undo image
@@ -767,6 +789,7 @@ impl ColumnarWindowOperator {
             loaded: Arc::new(Mutex::new(false)),
             persist_undo: Arc::new(Mutex::new(BTreeMap::new())),
             operation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            eviction_log: Mutex::new((None, 0)),
         }
     }
 
@@ -835,6 +858,71 @@ impl ColumnarWindowOperator {
                 journal.rollback(txn);
             }
         }
+    }
+
+    /// Enforce the `max_buffered_keys` entry bound: evict whole buffers,
+    /// oldest `window_start` first. Evicted aggregates are LOST (announced by
+    /// a throttled warn) — strictly better than an out-of-memory kill under a
+    /// stalled watermark or extreme key cardinality. Entries that still hold
+    /// pending acknowledgements are skipped: dropping them would strand
+    /// delivery acknowledgements and freeze the checkpoint frontier.
+    /// Journaled cleanup rides the existing stale-key sweep in
+    /// `persist_buffers_for_fired` (an evicted key is no longer "current").
+    /// Returns the evicted keys so the caller can drop them from its
+    /// touched-key set instead of staging fresh transactions for them.
+    fn evict_overflowed_buffers(
+        &self,
+        buffers: &mut BTreeMap<(i64, String), AggregateBuffer>,
+    ) -> BTreeSet<(i64, String)> {
+        let cap = self.config.max_buffered_keys;
+        if buffers.len() <= cap {
+            return BTreeSet::new();
+        }
+        let protected = self
+            .pending_acks
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut evicted_keys = BTreeSet::new();
+        while buffers.len() > cap {
+            let Some(victim) = buffers
+                .keys()
+                .find(|key| !protected.contains(*key))
+                .cloned()
+            else {
+                break;
+            };
+            buffers.remove(&victim);
+            self.rollback_window_txn(&victim);
+            evicted_keys.insert(victim);
+        }
+        if evicted_keys.is_empty() {
+            return evicted_keys;
+        }
+        let mut log = self.eviction_log.lock().unwrap();
+        let suppressed = log.1 + evicted_keys.len() as u64;
+        let now = std::time::Instant::now();
+        if log
+            .0
+            .is_none_or(|last| now.duration_since(last) >= WINDOW_EVICTION_LOG_INTERVAL)
+        {
+            log.0 = Some(now);
+            log.1 = 0;
+            drop(log);
+            tracing::warn!(
+                namespace = %self.namespace,
+                evicted = evicted_keys.len(),
+                suppressed = suppressed,
+                depth = buffers.len(),
+                cap = cap,
+                "window aggregate buffer exceeded max_buffered_keys; oldest-window aggregates were dropped"
+            );
+        } else {
+            log.1 = suppressed;
+        }
+        evicted_keys
     }
 
     /// All windows containing one event time. Tumbling yields one;
@@ -1412,6 +1500,7 @@ impl ColumnarWindowOperator {
                 }
             }
         }
+        let evicted_keys = self.evict_overflowed_buffers(&mut buffers);
         drop(buffers);
         if !session_rekeys.is_empty() {
             let mut pending = self.pending_acks.lock().unwrap();
@@ -1427,7 +1516,10 @@ impl ColumnarWindowOperator {
                 self.rollback_window_txn(&old_key);
             }
         }
-        let touched = touched.into_iter().collect::<Vec<_>>();
+        let touched = touched
+            .into_iter()
+            .filter(|key| !evicted_keys.contains(key))
+            .collect::<Vec<_>>();
         // A journal transaction represents a dirty working buffer. Create it
         // at the mutation boundary so persistence does not manufacture a new
         // never-fire transaction for every already committed emitted window
@@ -2938,6 +3030,117 @@ mod tests {
         ))
     }
 
+    fn eviction_config(max_buffered_keys: usize) -> WindowOperatorConfig {
+        WindowOperatorConfig {
+            kind: WindowKind::Tumbling { size_ms: 1_000 },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec!["value".into()],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 0,
+            legacy_payload: false,
+            max_buffered_keys,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_buffered_keys() {
+        let error = eviction_config(0).validate().unwrap_err().to_string();
+        assert!(error.contains("max_buffered_keys"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn window_evicts_oldest_windows_over_entry_cap() {
+        let backend = Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let op = ColumnarWindowOperator::new(eviction_config(2), backend, "eviction-test");
+        // Four distinct windows (no watermark: nothing fires or cleans up).
+        op.process(batch(vec![(100, "a", 1), (1_100, "b", 2)], None))
+            .await
+            .unwrap();
+        op.process(batch(vec![(2_100, "c", 3), (3_100, "d", 4)], None))
+            .await
+            .unwrap();
+        let buffers = op.buffers.lock().unwrap();
+        assert_eq!(
+            buffers.len(),
+            2,
+            "the entry cap must hold after four distinct windows"
+        );
+        let starts = buffers.keys().map(|(start, _)| *start).collect::<Vec<_>>();
+        assert_eq!(starts, vec![2_000, 3_000], "eviction is oldest-window first");
+    }
+
+    #[tokio::test]
+    async fn window_within_entry_cap_keeps_all_windows() {
+        let backend = Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let op = ColumnarWindowOperator::new(eviction_config(4), backend, "no-eviction-test");
+        op.process(batch(vec![(100, "a", 1), (1_100, "b", 2)], None))
+            .await
+            .unwrap();
+        op.process(batch(vec![(2_100, "c", 3), (3_100, "d", 4)], None))
+            .await
+            .unwrap();
+        assert_eq!(op.buffers.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn evicted_window_does_not_emit_on_later_watermark() {
+        let backend = Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let op = ColumnarWindowOperator::new(eviction_config(2), backend, "evicted-emit-test");
+        // Windows [0,1000) for "a" and [1000,2000) for "b"; inserting the
+        // third window evicts the oldest ("a") before any watermark fired.
+        op.process(batch(vec![(100, "a", 1), (1_100, "b", 2)], None))
+            .await
+            .unwrap();
+        op.process(batch(vec![(2_500, "c", 0)], None))
+            .await
+            .unwrap();
+        assert!(!op
+            .buffers
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(start, key)| *start == 0 && key == "a"));
+        // A watermark past the first two windows fires only the survivors.
+        let result = op
+            .process(batch(vec![(2_500, "c", 0)], Some(2_100)))
+            .await
+            .unwrap();
+        let key_column = |output: &crate::MessageBatchRef| {
+            output
+                .record_batch()
+                .column_by_name("key")
+                .map(|column| {
+                    (0..column.len())
+                        .map(|row| {
+                            column
+                                .as_any()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                                .unwrap()
+                                .value(row)
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let emitted: Vec<String> = match result {
+            crate::ProcessResult::Single(output)
+            | crate::ProcessResult::SingleWithAck(output, _) => key_column(&output),
+            crate::ProcessResult::Multiple(outputs) => {
+                outputs.iter().flat_map(key_column).collect()
+            }
+            crate::ProcessResult::MultipleWithAck(outputs) => outputs
+                .iter()
+                .flat_map(|(output, _)| key_column(output))
+                .collect(),
+            _ => Vec::new(),
+        };
+        assert_eq!(emitted, vec!["b"], "the evicted window is gone for good");
+    }
+
     fn operator(trigger: WindowTrigger, backend: Arc<dyn StateBackend>) -> ColumnarWindowOperator {
         ColumnarWindowOperator::new(
             WindowOperatorConfig {
@@ -2950,6 +3153,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 0,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend,
             "window-test",
@@ -3159,6 +3363,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 0,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend,
             "sliding-test",
@@ -3213,6 +3418,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 0,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend,
             "session-test",
@@ -3276,6 +3482,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 10_000,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend,
             "session-bridge-update-test",
@@ -3355,6 +3562,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 10_000,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend,
             "session-eos-correction-test",
@@ -3572,6 +3780,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 0,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend,
             "session-expiry-test",
@@ -3611,6 +3820,7 @@ mod tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms: 0,
             legacy_payload: false,
+            max_buffered_keys: default_max_buffered_keys(),
         };
         let op = ColumnarWindowOperator::new(config, backend, "float-test");
         let fields = vec![
@@ -3708,6 +3918,7 @@ mod tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms: 0,
             legacy_payload: false,
+            max_buffered_keys: default_max_buffered_keys(),
         };
         let op = ColumnarWindowOperator::new(config, backend, "float32-test");
         let record = RecordBatch::try_new(
@@ -3774,6 +3985,7 @@ mod tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms: 0,
             legacy_payload: false,
+            max_buffered_keys: default_max_buffered_keys(),
         };
         let op = ColumnarWindowOperator::new(config, backend, "unsupported-test");
         let record = RecordBatch::try_new(
@@ -3850,6 +4062,7 @@ mod tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms: 5_000,
             legacy_payload: false,
+            max_buffered_keys: default_max_buffered_keys(),
         };
         let op = ColumnarWindowOperator::new(config, backend, "late-update-test");
         // Initial window [0,1000) with one row of value 10.
@@ -3949,6 +4162,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 0,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend.clone(),
             journal.clone(),
@@ -4021,6 +4235,7 @@ mod tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms: 5_000,
             legacy_payload: false,
+            max_buffered_keys: default_max_buffered_keys(),
         };
         let op = ColumnarWindowOperator::new(config, backend, "deadline-test");
         op.process(batch(vec![(100, "a", 1)], None)).await.unwrap();
@@ -4061,6 +4276,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 5_000,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend.clone(),
             journal,
@@ -4117,6 +4333,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 0,
                 legacy_payload: true,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend,
             "legacy-payload-test",
@@ -4239,6 +4456,7 @@ mod tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 0,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend.clone(),
             journal.clone(),
@@ -4458,6 +4676,7 @@ mod sliding_enumeration_tests {
                 watermark_field: "__watermark_ms".into(),
                 allowed_lateness_ms: 0,
                 legacy_payload: false,
+                max_buffered_keys: default_max_buffered_keys(),
             },
             backend,
             "sliding-enum-test",
@@ -4770,6 +4989,7 @@ mod sliding_enumeration_tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms: 0,
             legacy_payload,
+            max_buffered_keys: default_max_buffered_keys(),
         }
     }
 
@@ -4977,6 +5197,7 @@ mod coverage_gap_tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms: 0,
             legacy_payload: false,
+            max_buffered_keys: default_max_buffered_keys(),
         }
     }
 
@@ -4991,6 +5212,7 @@ mod coverage_gap_tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms,
             legacy_payload: false,
+            max_buffered_keys: default_max_buffered_keys(),
         }
     }
 
@@ -5005,6 +5227,7 @@ mod coverage_gap_tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms: 0,
             legacy_payload: false,
+            max_buffered_keys: default_max_buffered_keys(),
         }
     }
 
@@ -5019,6 +5242,7 @@ mod coverage_gap_tests {
             watermark_field: "__watermark_ms".into(),
             allowed_lateness_ms: 0,
             legacy_payload: true,
+            max_buffered_keys: default_max_buffered_keys(),
         }
     }
 

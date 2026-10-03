@@ -30,8 +30,9 @@ streams:
       backend: embedded_kv
       durability: ephemeral
 
+      # NOTE: a window buffer keeps this processor chain single-threaded;
+      # pipeline.thread_num is intentionally not set here.
     pipeline:
-      thread_num: 4
       processors:
         - type: json_to_arrow
         - type: sql
