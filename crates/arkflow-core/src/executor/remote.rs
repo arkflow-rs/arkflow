@@ -1522,6 +1522,12 @@ impl PendingReceipts {
     fn abort_all(&self) {
         let mut map = self.map.lock().expect("pending receipts lock");
         let drained: BTreeMap<u64, PendingBatch> = std::mem::take(&mut *map);
+        // The whole table is gone; zero the byte accounting so the budget
+        // cannot outlive the entries it was charging for (every caller drops
+        // or replaces this instance right after, but the invariant should
+        // not depend on instance death).
+        self.pending_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         for (_, pending) in drained {
             let branch = pending.branch;
             tokio::spawn(async move {

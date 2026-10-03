@@ -169,8 +169,13 @@ export function Configuration({
   const orderedVersions = (Array.isArray(versions) ? [...versions] : []).sort(
     (a, b) => b.created_at_ms - a.created_at_ms || (a.id < b.id ? 1 : -1),
   )
-  const predecessorOf = (id: string): string | undefined =>
-    orderedVersions[orderedVersions.findIndex((version) => version.id === id) + 1]?.id
+  const predecessorOf = (id: string): string | undefined => {
+    const index = orderedVersions.findIndex((version) => version.id === id)
+    // Not found (-1) has no predecessor — falling through would index [0]
+    // and diff against the NEWEST version.
+    if (index < 0) return undefined
+    return orderedVersions[index + 1]?.id
+  }
   const compare = async (id: string) => {
     const to = predecessorOf(id)
     if (!to) return

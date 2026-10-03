@@ -1500,7 +1500,6 @@ impl ColumnarWindowOperator {
                 }
             }
         }
-        let evicted_keys = self.evict_overflowed_buffers(&mut buffers);
         drop(buffers);
         if !session_rekeys.is_empty() {
             let mut pending = self.pending_acks.lock().unwrap();
@@ -1516,6 +1515,15 @@ impl ColumnarWindowOperator {
                 self.rollback_window_txn(&old_key);
             }
         }
+        // Evict AFTER the session re-key above: a merged session's
+        // acknowledgements move to the merged key here, so the eviction sees
+        // them under the merged key and can never strand them on an evicted
+        // buffer (stranded acknowledgements freeze the checkpoint frontier —
+        // the barrier drain waits for them forever).
+        let evicted_keys = {
+            let mut buffers = self.buffers.lock().unwrap();
+            self.evict_overflowed_buffers(&mut buffers)
+        };
         let touched = touched
             .into_iter()
             .filter(|key| !evicted_keys.contains(key))
@@ -3139,6 +3147,45 @@ mod tests {
             _ => Vec::new(),
         };
         assert_eq!(emitted, vec!["b"], "the evicted window is gone for good");
+    }
+
+    /// Regression (CR on fix-review-p2-remainder): the entry-cap eviction
+    /// runs AFTER the session re-key. A merged session's acknowledgements
+    /// move to the merged key first, so the eviction sees them under the
+    /// merged key and can never strand them on an evicted buffer — stranded
+    /// acknowledgements freeze the checkpoint frontier forever.
+    #[tokio::test]
+    async fn session_merge_under_entry_cap_never_strands_acknowledgements() {
+        let mut config = eviction_config(1);
+        config.kind = WindowKind::Session { gap_ms: 1_000 };
+        let backend = Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let op = ColumnarWindowOperator::new(config, backend, "eviction-rekey-test");
+        // One open session for "a" starting at 100, holding an
+        // acknowledgement under its current key.
+        op.process(batch(vec![(100, "a", 1)], None)).await.unwrap();
+        op.pending_acks
+            .lock()
+            .unwrap()
+            .insert((100, "a".into()), vec![Arc::new(crate::input::NoopAck)]);
+        // An earlier event merges the session (re-key 100 → 50) while the
+        // new key for "b" pushes the entry count over the cap of one.
+        op.process(batch(vec![(50, "a", 2), (5_000, "b", 3)], None))
+            .await
+            .unwrap();
+        let buffers = op.buffers.lock().unwrap();
+        let pending = op.pending_acks.lock().unwrap();
+        let stranded: Vec<_> = pending
+            .keys()
+            .filter(|key| !buffers.contains_key(key))
+            .collect();
+        assert!(
+            stranded.is_empty(),
+            "every acknowledged key must still have a buffer (stranded: {stranded:?})"
+        );
+        assert!(
+            buffers.contains_key(&(50, "a".to_string())),
+            "the merged session with in-flight acknowledgements survives eviction"
+        );
     }
 
     fn operator(trigger: WindowTrigger, backend: Arc<dyn StateBackend>) -> ColumnarWindowOperator {
