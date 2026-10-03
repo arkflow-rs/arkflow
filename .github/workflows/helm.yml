@@ -1,0 +1,117 @@
+name: Helm chart
+
+# Gates for the official arkflow chart (deploy/charts/arkflow): lint, mode
+# surface assertions, byte-for-byte config rendering, and engine validation
+# of the rendered config documents. On release tags the chart is published
+# as an OCI artifact to ghcr.io alongside the engine image.
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ 'v*.*.*' ]
+    paths:
+      - "deploy/charts/**"
+      - ".github/workflows/helm.yml"
+      - "crates/arkflow-core/src/config.rs"
+      - "crates/arkflow-core/src/secret.rs"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "deploy/charts/**"
+      - ".github/workflows/helm.yml"
+      - "crates/arkflow-core/src/config.rs"
+      - "crates/arkflow-core/src/secret.rs"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install helm
+        uses: azure/setup-helm@fe7b79cd5ee7eacf1fdf3144f6b1bcfb5afbaa1f # v4
+        with:
+          version: v3.16.4
+
+      - name: Lint and render assertions
+        run: ./deploy/charts/assert-renders.sh
+
+      - name: Install system dependencies (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler clang libssl-dev pkg-config
+          echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo build arkflow
+        run: cargo build -p arkflow
+
+      - name: Validate rendered configs through the engine
+        run: |
+          set -eu
+          mkdir -p /tmp/valcheck
+          for mode in std agent; do
+            if [ "$mode" = "std" ]; then
+              helm template assert-std deploy/charts/arkflow > /tmp/render.yaml
+            else
+              helm template assert-agent deploy/charts/arkflow -f deploy/charts/arkflow/values-agent.yaml > /tmp/render.yaml
+            fi
+            python3 - "$mode" <<'EOF'
+            import re, sys
+            mode = sys.argv[1]
+            rendered = open("/tmp/render.yaml").read()
+            block = re.search(r"  config\.yaml: \|\n((?:    .*\n|\n)+?)\n?---", rendered)
+            assert block, f"{mode}: config.yaml block not found"
+            doc = "".join(l[4:] if l.startswith("    ") else "" for l in block.group(1).splitlines(keepends=True))
+            open(f"/tmp/valcheck/{mode}.yaml", "w").write(doc)
+            EOF
+            ./target/debug/arkflow --config "/tmp/valcheck/$mode.yaml" --validate
+            echo "$mode: engine validation OK"
+          done
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install helm
+        uses: azure/setup-helm@fe7b79cd5ee7eacf1fdf3144f6b1bcfb5afbaa1f # v4
+        with:
+          version: v3.16.4
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package and push chart as OCI artifact
+        run: |
+          chart_version="$(grep -m1 '^version:' deploy/charts/arkflow/Chart.yaml | cut -d' ' -f2 | tr -d '"')"
+          echo "Publishing chart version ${chart_version} (appVersion tracks the engine tag)"
+          helm package deploy/charts/arkflow
+          helm push "arkflow-${chart_version}.tgz" oci://${{ github.repository_owner }}/charts
+
+      - name: Verify published chart
+        run: |
+          chart_version="$(grep -m1 '^version:' deploy/charts/arkflow/Chart.yaml | cut -d' ' -f2 | tr -d '"')"
+          helm show chart oci://${{ github.repository_owner }}/charts/arkflow --version "${chart_version}"

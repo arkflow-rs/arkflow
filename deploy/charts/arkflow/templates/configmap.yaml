@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "arkflow.fullname" . }}
+  labels:
+    {{- include "arkflow.labels" . | nindent 4 }}
+data:
+  # Rendered byte-for-byte from values.config; the engine expands ${env:VAR}
+  # references at load time, so secret values never appear here.
+  config.yaml: |
+{{ .Values.config | indent 4 }}

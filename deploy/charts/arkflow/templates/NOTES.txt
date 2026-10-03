@@ -1,0 +1,38 @@
+ArkFlow engine installed in '{{ .Values.mode }}' mode.
+
+{{- if eq .Values.mode "agent" }}
+
+Agent node identity defaults to the pod name (ARKFLOW_NODE_ID from the
+downward API) when your config does not set health_check.node_id.
+Supply the registration credential as an env Secret:
+
+    env:
+      - name: ARKFLOW_NODE_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: <your-secret>
+            key: node_token
+
+The data-plane shuffle port ({{ .Values.agent.dataPort }}) is exposed through
+a headless Service; the engine refuses to serve the data plane without fleet
+credentials, so configure the credential material before relying on split
+placement (see docs/operate/tls-matrix).
+{{- else }}
+
+Standalone mode runs exactly ONE replica (update strategy Recreate) so the
+same sources are never consumed twice. Scale-out belongs to the control-plane
+deployment, not this release.
+{{- end }}
+
+WARNING: kubelet probes cannot reach a loopback listener. Your config must
+set health_check.address to a pod-reachable bind such as "0.0.0.0:8080".
+
+Verify the installation:
+
+    kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+    kubectl logs deploy/{{ include "arkflow.fullname" . }}
+
+Validate the rendered config against the engine schema:
+
+    kubectl get cm {{ include "arkflow.fullname" . }} -o jsonpath='{.data.config\.yaml}' \
+      | docker run --rm -i ghcr.io/arkflow-rs/arkflow --validate /dev/stdin

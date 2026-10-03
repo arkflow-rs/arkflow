@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "arkflow.fullname" . }}
+  labels:
+    {{- include "arkflow.labels" . | nindent 4 }}
+spec:
+  {{- if eq .Values.mode "agent" }}
+  # Headless: peer nodes resolve this pod directly for cross-node shuffle.
+  clusterIP: None
+  {{- else }}
+  type: {{ .Values.service.type }}
+  {{- end }}
+  selector:
+    {{- include "arkflow.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+    {{- if eq .Values.mode "agent" }}
+    - name: data
+      port: {{ .Values.agent.dataPort }}
+      targetPort: data
+      protocol: TCP
+    {{- end }}
