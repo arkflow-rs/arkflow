@@ -71,12 +71,10 @@ assert_contains "$TMP/cpuser.yaml" "name: my-fleet" "cp-user: hub references use
 assert_contains "$TMP/cpuser.yaml" "key: tk" "cp-user: user secret key"
 
 echo "== config rendered byte-for-byte =="
-python3 - "$TMP/std.yaml" <<'EOF'
-import sys, re
-rendered = open(sys.argv[1]).read()
-block = re.search(r"  config\.yaml: \|\n((?:    .*\n|\n)+?)\n?---", rendered)
-assert block, "config.yaml block not found"
-doc = "".join(line[4:] if line.startswith("    ") else "" for line in block.group(1).splitlines(keepends=True))
+python3 "$(dirname "$0")/extract-config.py" "$TMP/std.yaml" "$TMP/std-config.yaml"
+python3 - "$TMP/std-config.yaml" <<'EOF'
+import re, sys
+doc = open(sys.argv[1]).read()
 expected = open("deploy/charts/arkflow/values.yaml").read()
 m = re.search(r"^config: \|\n((?:  .*\n|\n)+?)^\S", expected, re.M)
 assert m, "config value not found in values.yaml"

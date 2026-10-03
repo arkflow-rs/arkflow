@@ -68,15 +68,7 @@ jobs:
               agent) helm template assert-agent deploy/charts/arkflow -f deploy/charts/arkflow/values-agent.yaml > /tmp/render.yaml ;;
               cp)   helm template arkflow deploy/charts/arkflow -f deploy/charts/arkflow/values-controlplane.yaml > /tmp/render.yaml ;;
             esac
-            python3 - "$mode" <<'EOF'
-            import re, sys
-            mode = sys.argv[1]
-            rendered = open("/tmp/render.yaml").read()
-            block = re.search(r"  config\.yaml: \|\n((?:    .*\n|\n)+?)\n?---", rendered)
-            assert block, f"{mode}: config.yaml block not found"
-            doc = "".join(l[4:] if l.startswith("    ") else "" for l in block.group(1).splitlines(keepends=True))
-            open(f"/tmp/valcheck/{mode}.yaml", "w").write(doc)
-            EOF
+            python3 deploy/charts/extract-config.py /tmp/render.yaml "/tmp/valcheck/$mode.yaml"
             ./target/debug/arkflow --config "/tmp/valcheck/$mode.yaml" --validate
             echo "$mode: engine validation OK"
           done
