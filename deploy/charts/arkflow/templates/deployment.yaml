@@ -13,10 +13,12 @@ spec:
   replicas: {{ ternary .Values.controlPlane.agent.replicas (include "arkflow.replicas" .) (eq .Values.mode "control-plane") | int }}
   strategy:
     type: Recreate
+  # Selector intentionally stays on the original two labels: Deployment
+  # selectors are immutable, and releases installed before the component
+  # label existed must remain upgradable.
   selector:
     matchLabels:
       {{- include "arkflow.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: engine
   template:
     metadata:
       annotations:

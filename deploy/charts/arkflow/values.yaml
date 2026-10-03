@@ -153,6 +153,10 @@ controlPlane:
   # http://<release-name>-hub:8080 (see values-controlplane.yaml).
   agent:
     enabled: false
+    # Multiple agents are legitimate for Hub-assigned jobs (each pod is a
+    # distinct compute node). WARNING: any LOCAL `streams:` in `config`
+    # run independently on every replica — keep local streams out of the
+    # config (or pin replicas: 1) unless they are partition-assigned.
     replicas: 1
 
 serviceAccount:
