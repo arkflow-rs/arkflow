@@ -43,10 +43,10 @@ jobs:
       - name: Lint and render assertions
         run: ./deploy/charts/assert-renders.sh
 
-      - name: Install system dependencies (protoc)
+      - name: Install system dependencies (protoc, libcurl for rdkafka)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler clang libssl-dev pkg-config
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libcurl4-openssl-dev clang libssl-dev pkg-config
           echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
 
       - name: Install Rust toolchain
