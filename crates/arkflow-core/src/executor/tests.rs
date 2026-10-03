@@ -3884,14 +3884,19 @@ fn window_stream_config(id: &str, thread_num: u32) -> crate::stream::StreamConfi
 /// being silently clamped (the setting never took effect).
 #[test]
 fn window_stream_with_explicit_thread_num_above_one_is_rejected() {
+    // The compiler treats a thread_num equal to the machine's CPU-count
+    // DEFAULT as "not an explicit choice" (the old silent clamp). Pick a
+    // value no runner's CPU count can equal so the rejection path is
+    // deterministic on every machine.
+    let explicit = crate::pipeline::default_thread_num().saturating_add(7);
     let error = crate::executor::stream_compiler::compile_stream(
-        &window_stream_config("windowed", 4),
+        &window_stream_config("windowed", explicit),
         0,
     )
     .unwrap_err()
     .to_string();
     assert!(
-        error.contains("single-threaded") && error.contains("thread_num is 4"),
+        error.contains("single-threaded") && error.contains(&format!("thread_num is {explicit}")),
         "{error}"
     );
 }
