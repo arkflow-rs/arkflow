@@ -4,7 +4,7 @@
 TBD - created by archiving change add-control-plane. Update Purpose after archive.
 ## Requirements
 ### Requirement: Stable Stream identity
-Each configured Stream SHALL have a stable unique ID for runtime commands, API resources, metrics, and events. Legacy configurations without IDs SHALL receive deterministic `stream-<index>` IDs and a migration warning.
+Each configured Stream SHALL have a stable unique ID for runtime commands, API resources, metrics, and events. Legacy configurations without IDs SHALL receive deterministic `stream-<index>` IDs and a migration warning. The runtime registry SHALL assign stream indices from a monotonically increasing counter (never reusing an index after de-registration), so that two concurrently active Streams can never share a derived job ID, state namespace prefix, or checkpoint directory — even after `replace_config` removes and re-registers entries.
 
 #### Scenario: Duplicate IDs are rejected
 - **WHEN** a candidate configuration contains two Streams with the same ID
@@ -13,6 +13,11 @@ Each configured Stream SHALL have a stable unique ID for runtime commands, API r
 #### Scenario: Legacy configuration is loaded
 - **WHEN** a configuration contains Streams without IDs
 - **THEN** the Engine assigns deterministic IDs and emits a migration warning
+
+#### Scenario: De-registration and re-registration never reuse an index
+
+- **WHEN** a Stream is de-registered (via `replace_config`) and a new or surviving Stream is subsequently registered
+- **THEN** the new registration receives a strictly greater index than every previously assigned index, and its derived job ID / state namespace prefix cannot collide with any concurrently active Stream
 
 ### Requirement: Per-Stream lifecycle supervision
 The runtime manager SHALL track each Stream independently with state, a per-Stream cancellation mechanism, and a supervised task handle. Startup failures SHALL be reported before readiness, and shutdown timeouts SHALL leave the Stream in a recoverable terminal or failed state rather than permanently stopping lifecycle commands in `Stopping` or `Restarting`.
@@ -34,19 +39,20 @@ The runtime manager SHALL track each Stream independently with state, a per-Stre
 - **THEN** the manager aborts it, records the timeout, and transitions the entry to a recoverable `failed` or `stopped` state
 
 ### Requirement: Stream start, stop, and restart
-The system SHALL provide authenticated-or-local control operations to start, stop, and restart one Stream, and SHALL serialize conflicting operations for the same Stream. A runtime SHALL become `running` only after graph construction and required resource connections succeed.
+The runtime manager SHALL support starting, stopping, and restarting individual Streams with correct lifecycle semantics: start launches a fresh supervised task; stop requests shutdown and awaits the task; restart stops then starts with one cancellation cycle. A `stop` request issued while a `restart` is in progress SHALL NOT produce an inconsistent state where `stop` reports success while the Stream is left Running.
 
-#### Scenario: Stop one Stream
-- **WHEN** a client requests stop for a running Stream
-- **THEN** only that Stream transitions through stopping to stopped and its existing close path releases resources
+#### Scenario: Concurrent stop during restart does not leave a Running stream
 
-#### Scenario: Restart a Stream
-- **WHEN** a client requests restart for a configured Stream
-- **THEN** the old task is stopped, all input/WAL/temporary resources are closed, a fresh Stream is built from its configuration, and the state becomes running only after startup succeeds
+- **WHEN** a `restart` is initiated and a concurrent `stop` arrives during the restart's stop phase
+- **THEN** the `stop` completes without error (the restart's internal stop fulfils the stop intent), and the final state reflects the last-initiated intent — the `stop` never silently resurrects a stopped Stream into Running
 
-#### Scenario: Concurrent restart
-- **WHEN** a second lifecycle command arrives while the same Stream is starting, stopping, or restarting
-- **THEN** the API rejects it as a conflicting operation without creating a second task
+#### Scenario: Stop and restart are individually correct
+
+- **WHEN** `stop` is called on a Running Stream (no concurrent restart)
+- **THEN** the Stream transitions to Stopped and its task has exited
+
+- **WHEN** `restart` is called on a Running Stream (no concurrent stop)
+- **THEN** the Stream's previous task exits, a fresh task launches, and restart metrics increment
 
 ### Requirement: Runtime metrics and recent errors
 The runtime manager SHALL expose non-blocking counters and gauges for Stream state, input/output activity, processing errors, connector errors, restarts, and recent error events.
