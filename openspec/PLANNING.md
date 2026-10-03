@@ -392,6 +392,23 @@ v1 评审整改全部归档、`changes/` 清空后的系统性探索。以下为
 
 推荐逻辑：0-2 在 1-2 个月内把项目从「内核先进」推进到「能进企业生产」；3-4 打开差异化叙事。方向②打下的 CDC/Schema/EOS 底座恰是方向①「给 AI 供可靠数据」的叙事衔接点——两条线是承接而非切换。
 
+### 7.5 Kubernetes 交付分层与 operator 触发条件（2026-10-03 写死）
+
+Kubernetes 交付面按三层推进，**operator 的触发条件在此写死，未触发前不写一行 operator 代码**：
+
+| 层 | 交付物 | 状态 |
+| --- | --- | --- |
+| 1 | engine-only Helm chart（`mode: standalone \| agent`）：透传式 config、\${env:} 密钥、单副本 Recreate、数据面端口 + headless Service、OCI 发布 `ghcr.io/arkflow-rs/charts/arkflow` | ✅ `add-helm-chart` 归档（issue #1225 已回复） |
+| 2 | Hub/Console 容器化（`arkflow-server`/`arkflow-console` 镜像）+ 伞形 chart（`mode: control-plane`：Hub + Console + 共享凭据 + 可选 chart 内 agent，SQLite-on-PVC 默认 / Postgres 可选） | ✅ `add-control-plane-chart` |
+| 3 | 瘦适配 operator：CRD → Hub API **纯翻译层** | ⏸ 触发条件未满足，见下 |
+
+**operator 触发条件（写死）**：出现**真实的 GitOps/CRD 需求信号**——例如 issue 跟踪里有用户明确要求以 `kubectl apply`/ArgoCD/Flux 管理 ArkFlow 工作负载，或企业部署提出 CRD 集成。信号出现前不立项。
+
+**触发后仍不可违反的设计红线**（已写入两份提案的 Non-goal，未来立项时复制进 spec）：
+- operator **永不做调度/放置决策**——Hub 是唯一 reconciliation 大脑（`control-plane-reconciliation` spec 的 generation/Intent/Attempt/Convergence 语义不容第二处实现）；
+- 明确拒绝 Strimzi 式全功能 operator（双大脑反模式）；形态仅限「watch CR → 调 Hub API → status 写回」的翻译层；
+- 若未来引入 kube-rs 依赖，须独立立项评估依赖面。
+
 ### 7.4 本次探索同步修复的文档缺口
 
 - `docs/docs/configuration/1-top-level.md` 补 `jobs` 字段与 JobSpec 文档（此前零覆盖）；
