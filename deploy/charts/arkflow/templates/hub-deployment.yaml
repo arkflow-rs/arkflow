@@ -1,0 +1,92 @@
+{{- if eq .Values.mode "control-plane" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "arkflow.hubName" . }}
+  labels:
+    {{- include "arkflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: hub
+spec:
+  # Single replica: SQLite/PVC is ReadWriteOnce, and Hub HA requires
+  # Postgres leases; never two Hubs against one store.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "arkflow.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: hub
+  template:
+    metadata:
+      labels:
+        {{- include "arkflow.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: hub
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "arkflow.serviceAccountName" . }}
+      containers:
+        - name: hub
+          image: {{ .Values.controlPlane.hub.image.repository }}:{{ default .Chart.AppVersion .Values.controlPlane.hub.image.tag }}
+          imagePullPolicy: {{ .Values.controlPlane.hub.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # ARKFLOW_HUB_ADDRESS=0.0.0.0:8080 is baked into the image.
+            - name: ARKFLOW_NODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arkflow.nodeTokenSecretName" . }}
+                  key: {{ include "arkflow.nodeTokenSecretKey" . }}
+            {{- with .Values.controlPlane.hub.storage.postgresURL }}
+            - name: ARKFLOW_HUB_STORAGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if and (not .Values.controlPlane.hub.storage.postgresURL) (include "arkflow.persistenceEnabled" . | eq "true") }}
+            - name: ARKFLOW_HUB_STORAGE
+              value: {{ .Values.controlPlane.hub.storage.sqlitePath | quote }}
+            {{- end }}
+            {{- if .Values.controlPlane.hub.operatorToken.existingSecret }}
+            - name: ARKFLOW_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.controlPlane.hub.operatorToken.existingSecret }}
+                  key: {{ .Values.controlPlane.hub.operatorToken.existingSecretKey }}
+            {{- end }}
+            {{- if .Values.controlPlane.hub.ha.enabled }}
+            - name: ARKFLOW_HUB_HA_ENABLED
+              value: "true"
+            {{- end }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.controlPlane.hub.resources | nindent 12 }}
+          {{- if and (not .Values.controlPlane.hub.storage.postgresURL) (include "arkflow.persistenceEnabled" . | eq "true") }}
+          volumeMounts:
+            - name: hub-data
+              mountPath: /var/lib/arkflow
+          {{- end }}
+      {{- if and (not .Values.controlPlane.hub.storage.postgresURL) (include "arkflow.persistenceEnabled" . | eq "true") }}
+      volumes:
+        - name: hub-data
+          persistentVolumeClaim:
+            claimName: {{ include "arkflow.fullname" . }}-data
+      {{- end }}
+{{- end }}

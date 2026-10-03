@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.7
+
+# Hub (arkflow-server) image: same cargo-chef staging as docker/Dockerfile,
+# but only the arkflow-server crate is cooked and copied.
+
+FROM rust:1.97-slim AS chef
+RUN cargo install cargo-chef --locked
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang perl libfindbin-libs-perl make cmake gcc libssl-dev pkg-config \
+    build-essential libsqlite3-dev protobuf-compiler python3 python3-dev \
+    libcurl4-openssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p arkflow-server
+
+COPY . .
+RUN cargo build --release -p arkflow-server
+
+FROM debian:bookworm-slim AS arkflow-server
+
+WORKDIR /app
+
+# Mirror the engine runtime dependency set: the Hub links arkflow-core
+# (libsqlite3, PyO3), and the safe superset avoids missing-.so failures.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsqlite3-0 python3 python3-dev ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/arkflow-server /app/arkflow-server
+
+# The Hub is env-driven; bind all interfaces by default so kubelet probes
+# and in-cluster agents reach it without extra configuration.
+ENV ARKFLOW_HUB_ADDRESS=0.0.0.0:8080
+ENV RUST_LOG=info
+
+EXPOSE 8080
+
+CMD ["/app/arkflow-server"]

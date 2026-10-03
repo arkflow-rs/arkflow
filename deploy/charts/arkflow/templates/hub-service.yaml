@@ -1,0 +1,19 @@
+{{- if eq .Values.mode "control-plane" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "arkflow.hubName" . }}
+  labels:
+    {{- include "arkflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: hub
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "arkflow.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: hub
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+{{- end }}

@@ -1,0 +1,5 @@
+.DS_Store
+*.tgz
+README.md*
+values-agent.yaml
+values-controlplane.yaml

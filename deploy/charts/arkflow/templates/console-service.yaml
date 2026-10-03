@@ -1,0 +1,19 @@
+{{- if eq .Values.mode "control-plane" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "arkflow.consoleName" . }}
+  labels:
+    {{- include "arkflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: console
+spec:
+  type: {{ .Values.controlPlane.console.service.type }}
+  selector:
+    {{- include "arkflow.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: console
+  ports:
+    - name: http
+      port: {{ .Values.controlPlane.console.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

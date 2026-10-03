@@ -1,0 +1,165 @@
+# Default values for the arkflow engine chart.
+#
+# Two install modes:
+#   mode: standalone  — one self-contained pipeline instance (default)
+#   mode: agent       — engine joining an existing control-plane Hub
+#                       (requires config to set health_check.hub_urls)
+#
+# The engine configuration document is PASS-THROUGH: `config` below is
+# rendered verbatim into a ConfigMap and mounted read-only at
+# /app/etc/config.yaml. Do not decompose engine fields into values here;
+# `arkflow --validate` stays the authority on config validity.
+#
+# IMPORTANT: health_check.address defaults to 127.0.0.1:8080 inside the
+# engine, which kubelet probes cannot reach. Bind a pod-reachable address
+# (as the default below does) or probes will fail.
+
+mode: standalone
+
+image:
+  repository: ghcr.io/arkflow-rs/arkflow
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Full engine configuration document (YAML string), rendered byte-for-byte
+# into the ConfigMap. Secrets must be referenced with ${env:VAR} expansion
+# and supplied via `env` below — never inlined here.
+config: |
+  health_check:
+    address: "0.0.0.0:8080"
+
+# Extra environment variables on the workload. Use secretKeyRef entries to
+# feed ${env:...} references inside `config`. In agent mode, ARKFLOW_NODE_ID
+# (pod name) and ARKFLOW_NODE_TOKEN are managed by the chart — do not
+# override them here.
+env: []
+  # - name: MY_SOURCE_PASSWORD
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: my-secret
+  #       key: password
+
+service:
+  type: ClusterIP
+  # HTTP observability port (health_check listener). The container port is
+  # derived from the port in `health_check.address`; keep them consistent.
+  port: 8080
+
+# Agent-mode settings (ignored in standalone mode).
+agent:
+  # Data-plane listen port for cross-node shuffle. The engine refuses to
+  # serve the data plane without credentials, so also configure the fleet
+  # credential material via env/config (see docs/operate/tls-matrix).
+  dataPort: 9090
+
+probes:
+  liveness:
+    path: /health
+  readiness:
+    path: /readiness
+
+resources: {}
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # limits:
+  #   cpu: 500m
+  #   memory: 512Mi
+
+podAnnotations: {}
+podSecurityContext: {}
+  # runAsNonRoot: true
+securityContext: {}
+  # allowPrivilegeEscalation: false
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Standalone mode runs EXACTLY ONE replica: the engine is stateful and a
+# second instance would consume the same sources twice. Updates use the
+# Recreate strategy so old and new pods never run concurrently.
+# Setting allowMultipleReplicas to true acknowledges duplicate consumption
+# and is UNSUPPORTED for partition-unaware sources.
+unsafe:
+  allowMultipleReplicas: false
+  # Only honored when allowMultipleReplicas is true.
+  replicas: 1
+
+# Optional persistent volume for WAL / state store (disabled by default in
+# standalone/agent; in control-plane mode the Hub SQLite store defaults it
+# ON unless a Postgres URL is configured).
+persistence:
+  enabled: false
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+  # Mount path inside the engine container; point engine WAL/state paths
+  # here. The Hub always mounts its volume at /var/lib/arkflow.
+  mountPath: /app/data
+
+# Control-plane settings (only rendered with mode: control-plane).
+controlPlane:
+  # Shared node credential feeding ARKFLOW_NODE_TOKEN on the Hub and the
+  # in-chart agent. Generated into a Secret (kept across upgrades) unless
+  # existingSecret is set.
+  nodeToken:
+    existingSecret: ""
+    existingSecretKey: node_token
+
+  hub:
+    image:
+      repository: ghcr.io/arkflow-rs/arkflow-server
+      pullPolicy: IfNotPresent
+      tag: ""
+    storage:
+      # Empty = SQLite on the persistence PVC (default). A postgres:// URL
+      # (env ${env:...} references allowed) switches the Hub to Postgres and
+      # disables the PVC; HA additionally requires Postgres leases.
+      postgresURL: ""
+      sqlitePath: /var/lib/arkflow/hub.sqlite
+      # Hub PVC switch (independent of the engine-mode persistence value):
+      # true by default for SQLite durability, forced off by postgresURL.
+      persistenceEnabled: true
+    # Optional operator API token (ARKFLOW_OPERATOR_TOKEN) from an existing
+    # Secret; unset keeps the Hub open to in-cluster callers only.
+    operatorToken:
+      existingSecret: ""
+      existingSecretKey: operator_token
+    ha:
+      enabled: false
+    resources: {}
+
+  console:
+    image:
+      repository: ghcr.io/arkflow-rs/arkflow-console
+      pullPolicy: IfNotPresent
+      tag: ""
+    replicaCount: 1
+    service:
+      type: ClusterIP
+      port: 80
+    resources: {}
+
+  # Optional in-chart agent joining the in-chart Hub. When enabled, set
+  # `config` to an engine document whose health_check.hub_urls points at
+  # http://<release-name>-hub:8080 (see values-controlplane.yaml).
+  agent:
+    enabled: false
+    # Multiple agents are legitimate for Hub-assigned jobs (each pod is a
+    # distinct compute node). WARNING: any LOCAL `streams:` in `config`
+    # run independently on every replica — keep local streams out of the
+    # config (or pin replicas: 1) unless they are partition-assigned.
+    replicas: 1
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""

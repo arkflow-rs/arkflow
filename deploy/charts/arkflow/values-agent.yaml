@@ -1,0 +1,18 @@
+# Example agent-mode values: an engine joining an existing control-plane Hub.
+#
+#   helm install my-node oci://ghcr.io/arkflow-rs/charts/arkflow \
+#     --values values-agent.yaml \
+#     --set-json 'env[0]={"name":"ARKFLOW_NODE_TOKEN","valueFrom":{"secretKeyRef":{"name":"arkflow-fleet","key":"node_token"}}}'
+mode: agent
+
+agent:
+  dataPort: 9090
+
+config: |
+  health_check:
+    address: "0.0.0.0:8080"
+    hub_urls: ["http://arkflow-hub:8080"]
+    # node_id is omitted on purpose: it defaults to the pod name via the
+    # downward API (ARKFLOW_NODE_ID). Set it here to pin a stable identity.
+    # node_token: "${env:ARKFLOW_NODE_TOKEN}"
+  streams: []

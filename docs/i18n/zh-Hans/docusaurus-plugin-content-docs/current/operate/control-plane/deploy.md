@@ -4,7 +4,7 @@ sidebar_position: 2
 
 # 控制平面部署
 
-以 `cargo run -p arkflow-server --bin arkflow-server` 运行 Hub,并用 `health_check.hub_urls`、`node_id` 与
+Kubernetes 安装推荐使用 [Helm Chart](../helm.md) 的 `control-plane` 模式——它渲染 Hub、Console 与可选的 chart 内 agent,并生成共享节点凭据。无集群时,再以 `cargo run -p arkflow-server --bin arkflow-server` 运行 Hub,并用 `health_check.hub_urls`、`node_id` 与
 `node_token` 启动每个计算节点。然后用 `cd console && npm ci && npm run build` 构建控制台,
 并通过受保护的反向代理提供 `console/dist`。开发用 Vite 服务器把 `/api` 与 `/metrics` 代理到
 `127.0.0.1:8080`;生产环境应保持同源路径,仅在 API 前缀不同时才设置 `VITE_API_BASE`。

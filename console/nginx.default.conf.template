@@ -1,0 +1,12 @@
+# Rendered by nginx's envsubst entrypoint on container start.
+# ARKFLOW_HUB_UPSTREAM selects the Hub address behind the same-origin
+# proxy; the default preserves the previous hard-coded behavior.
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+  index index.html;
+  location / { try_files $uri /index.html; }
+  # Put the API behind the same protected origin in deployment.
+  location /api/ { proxy_pass ${ARKFLOW_HUB_UPSTREAM}; proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+  location /metrics { proxy_pass ${ARKFLOW_HUB_UPSTREAM}/metrics; proxy_set_header Host $host; }
+}

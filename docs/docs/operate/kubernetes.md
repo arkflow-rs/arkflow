@@ -6,6 +6,11 @@ description: ArkFlow documentation page.
 
 This document describes how to deploy ArkFlow in a Kubernetes cluster.
 
+For most installations the [Helm chart](./helm.md) is the recommended path —
+it renders the manifests below with safe defaults already wired in. Use this
+page when you need to understand or hand-manage the individual objects the
+chart generates.
+
 ## Prerequisites
 
 - Kubernetes cluster (version >= 1.27)

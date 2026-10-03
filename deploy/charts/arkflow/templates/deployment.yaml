@@ -1,0 +1,120 @@
+{{- if or (ne .Values.mode "control-plane") .Values.controlPlane.agent.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "arkflow.workloadName" . }}
+  labels:
+    {{- include "arkflow.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.unsafe.allowMultipleReplicas }}
+  # The engine is stateful: two instances consume the same sources twice.
+  # Recreate guarantees old and new pods never run concurrently on updates.
+  {{- end }}
+  replicas: {{ ternary .Values.controlPlane.agent.replicas (include "arkflow.replicas" .) (eq .Values.mode "control-plane") | int }}
+  strategy:
+    type: Recreate
+  # Selector intentionally stays on the original two labels: Deployment
+  # selectors are immutable, and releases installed before the component
+  # label existed must remain upgradable.
+  selector:
+    matchLabels:
+      {{- include "arkflow.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll pods when the pass-through config document changes.
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "arkflow.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: engine
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "arkflow.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: arkflow
+          image: {{ include "arkflow.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/app/etc/config.yaml"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            {{- if include "arkflow.agentEnabled" . | eq "true" }}
+            - name: data
+              containerPort: {{ .Values.agent.dataPort }}
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- if include "arkflow.agentEnabled" . | eq "true" }}
+            {{- if eq .Values.mode "control-plane" }}
+            # In-chart agent: shared generated (or user) node credential.
+            - name: ARKFLOW_NODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arkflow.nodeTokenSecretName" . }}
+                  key: {{ include "arkflow.nodeTokenSecretKey" . }}
+            {{- end }}
+            # Engine-native fallback (see NodeAgentConfig::from_engine):
+            # pod name is the node identity when config sets no node_id.
+            - name: ARKFLOW_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /app/etc
+              readOnly: true
+            {{- if and (ne .Values.mode "control-plane") .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "arkflow.workloadName" . }}
+        {{- if and (ne .Values.mode "control-plane") .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "arkflow.fullname" . }}-data
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

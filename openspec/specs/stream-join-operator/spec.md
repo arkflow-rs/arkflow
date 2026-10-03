@@ -3,9 +3,7 @@
 ## Purpose
 
 统一执行内核的 keyed interval join 算子：双输入侧别、相等键匹配、事件时间窗口界、有界状态与重放恢复语义。
-
 ## Requirements
-
 ### Requirement: Join 算子 SHALL 以声明的生产者区分两侧
 
 Join 算子所在链 SHALL 恰好持有两条入边。侧别 SHALL 由 `left_from`/`right_from`(上游算子 id)在图构建期解析为通道索引——通道顺序是内核内部细节,用户以生产者身份声明侧别而非位置;省略时回退 0/1。每个声明的生产者 SHALL 恰好贡献一个通道(即该上游算子喂入本链的子任务数为 1);上游并行度 > 1 的侧 SHALL 在图构建期以指明「将上游算子 parallelism 设为 1」的错误拒绝,而非运行期失败。链路循环 SHALL 为含 join 算子的链的每个数据批次追加 `__meta_input_index`(UInt32)列;join 算子 SHALL 依据该列路由批次到对应侧缓冲,缺失该列或索引既非左也非右即失败(运行期校验保留为纵深防御)。
@@ -126,3 +124,18 @@ Job DAG 中的 Join 算子 SHALL 要求恰好两条入边(多不可路由、少�
 
 - **WHEN** `join_type` 声明为四个合法枚举值之外的值
 - **THEN** 配置反序列化或校验以指明合法取值的错误失败
+
+### Requirement: Join buffer 的无名批次丢弃 SHALL 可观测
+
+join buffer 收到不带 `input_name` 的批次时（数据流契约断裂——`multiple_inputs` 设置的名被中间构造路径丢失），SHALL 以 warn 级日志记录（明示"下游 join 数据将不完整"）并递增丢弃计数器，而非仅 trace 级静默 `continue`。核心 `MessageBatch` 的派生构造方法（列过滤、二进制追加）SHALL 保留原批次的 `input_name`。
+
+#### Scenario: 列过滤后 input_name 保留
+
+- **WHEN** 一个带 `input_name` 的批次经过 `filter_columns`（或 `new_binary_with_origin`）产出新批次
+- **THEN** 新批次的 `input_name` 与原批次一致，下游 join buffer 照常注册数据
+
+#### Scenario: 无名批次的丢弃有 warn 与计数
+
+- **WHEN** join buffer 收到一个不带 `input_name` 的批次（契约断裂路径）
+- **THEN** 该批次仍被跳过（不 crash），但产生 warn 级日志（"下游 join 数据将不完整"）且丢弃计数器递增——开发期与测试中可断言
+

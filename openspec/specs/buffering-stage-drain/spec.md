@@ -3,12 +3,10 @@
 ## Purpose
 
 在消息被消费与被下发之间持有消息的组件（batch processor、memory buffer）的排空与失败路径契约：合并失败不丢已持有消息、EOS 与空闲超时排空、flush 与 close 语义分离。注意：统一内核下 stream 配置的 `buffer: {type: memory}` 编译为 no-op（有界通道已提供缓冲），本契约适用于通过插件注册表直接使用这些组件的场景；batch processor 的排空语义为生产路径。
-
 ## Requirements
-
 ### Requirement: 缓冲组件失败路径 SHALL NOT 丢弃已持有的消息
 
-在消息被消费（从输入侧取出）与被下发（交给下游）之间持有消息的组件，其内部合并/转换失败时 SHALL 保留已持有的消息与其 ack 待重试，不得丢弃：memory buffer 的 `read()` 侧合并（`concat_batches`）失败时队列内容 SHALL 原样保留并返回错误，后续 `read()` SHALL 能重新尝试同一批消息；batch processor 的 `flush()` 合并失败时缓冲 SHALL 保留已积累的消息。
+在消息被消费（从输入侧取出）与被下发（交给下游）之间持有消息的组件，其内部合并/转换失败时 SHALL 保留已持有的消息与其 ack 待重试，不得丢弃：memory buffer 的 `read()` 侧合并（`concat_batches`）失败时队列内容 SHALL 原样保留并返回错误，后续 `read()` SHALL 能重新尝试同一批消息；batch processor 的 `flush()` 合并失败时缓冲 SHALL 保留已积累的消息；window buffer 家族（tumbling/sliding/session 共用的 `process_window`）合并或归一失败时，已取出的各 input 队列 SHALL 原样放回（ack 不 settle 也不 abort，随队列保留待重试）并返回错误。
 
 #### Scenario: memory buffer 合并失败后队列保持可重试
 
@@ -19,6 +17,11 @@
 
 - **WHEN** batch processor 触发 flush 且批次合并失败
 - **THEN** 已积累在缓冲中的消息不被清除，错误向上传播，后续处理可再次尝试合并
+
+#### Scenario: window buffer 合并失败队列与 ack 保留
+
+- **WHEN** window buffer 各 input 队列持有消息且合并（含归一）失败
+- **THEN** 已取出的队列内容原样放回（条数、顺序与待结算 ack 不变），`read()` 返回错误，后续 `read()` 可重新处理同一批消息
 
 ### Requirement: 缓冲数据 SHALL 在 EOS 与空闲超时排空
 
@@ -52,3 +55,26 @@ batch processor SHALL 在上游有界源到达 EOS 时通过 `finish()` 排空�
 
 - **WHEN** `close()` 被调用时队列中仍有未读消息
 - **THEN** 后续 `read()` 先返回余量消息，队列清空后返回结束标志（None）
+
+### Requirement: window buffer 跨 input 异构 schema SHALL 归一合并
+window buffer 汇集多个 input 的批次时，各 input schema 不完全一致（缺列）SHALL 归一到并集 schema（缺失列以 null 填充）后合并产出，不得因 schema 不一致直接失败；同名同列类型冲突 SHALL 返回指明列名与两个类型的错误（走失败保留路径，不丢数据）。
+
+#### Scenario: 缺列归一合并
+- **WHEN** input A 的批次含列 `id`/`value`，input B 的批次含列 `id`（缺 `value`）
+- **THEN** 产出并集 schema（`id`/`value`）的批次，B 的行 `value` 为 null，合并不报错
+
+#### Scenario: 类型冲突报错不丢数据
+- **WHEN** 两个 input 的同名列类型不同（如 Utf8 与 Int64）
+- **THEN** 返回含列名与两个类型的错误，队列与 ack 按失败保留路径原样放回
+
+### Requirement: window buffer 读者 SHALL 被关闭与写入可靠唤醒
+window buffer 的读者等待 SHALL 同时监听唤醒通知与关闭 token（`select`），`close()`/`flush()` 触发时即使唤醒通知与检查之间存在竞态、即使队列为空，读者 SHALL 在有限时间内被 token 唤醒并按 close 语义（排空余量后结束）返回，MUST NOT 因错过最后一次唤醒通知而永久挂起。
+
+#### Scenario: close 时空队列读者不挂起
+- **WHEN** 读者正在等待新消息、队列为空且唤醒通知恰在读者检查后触发，随后 `close()` 被调用
+- **THEN** 读者被关闭 token 唤醒并在有限时间内返回结束，不永久阻塞
+
+#### Scenario: 正常数据路径唤醒不受影响
+- **WHEN** 读者等待期间上游写入消息
+- **THEN** 读者按既有节奏被唤醒并处理消息
+

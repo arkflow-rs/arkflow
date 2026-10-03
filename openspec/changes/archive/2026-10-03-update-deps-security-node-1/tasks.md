@@ -12,5 +12,5 @@
 
 ## 3. Docs and ship
 
-- [ ] 3.1 PR 描述携带：告警收敛表（35 条 → 预计关闭 ~31 条）、两个 critical 的落点版本、4 个滞留包的原因与 revisit 条件、npm 11 绕行说明
-- [ ] 3.2 提交、开 PR、CI 绿后落地；归档本变更（delta 同步进 `documentation-quality-gates` 与 `control-console`）
+- [x] 3.1 PR 描述携带：告警收敛表（35 条 → 预计关闭 ~31 条）、两个 critical 的落点版本、4 个滞留包的原因与 revisit 条件、npm 11 绕行说明
+- [x] 3.2 提交、开 PR、CI 绿后落地；归档本变更（delta 同步进 `documentation-quality-gates` 与 `control-console`）

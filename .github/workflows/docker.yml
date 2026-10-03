@@ -30,6 +30,28 @@ jobs:
       # This is used to complete the identity challenge
       # with sigstore/fulcio when running outside of PRs.
       id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Engine image (existing artifact) — no suffix.
+          - suffix: ""
+            dockerfile: docker/Dockerfile
+            context: .
+            rust: true
+          # Hub (arkflow-server) image.
+          - suffix: "-server"
+            dockerfile: docker/Dockerfile.server
+            context: .
+            rust: true
+          # Console image (Vite build + nginx same-origin proxy).
+          - suffix: "-console"
+            dockerfile: console/Dockerfile
+            context: ./console
+            rust: false
+    env:
+      # Per-image name: ghcr.io/<org>/<repo>[-server|-console]
+      IMAGE_NAME: ${{ github.repository }}${{ matrix.suffix }}
 
     steps:
       - name: Checkout repository
@@ -41,6 +63,7 @@ jobs:
       # (BuildKit cache and image layers need the room), then add swap on the
       # large /mnt volume so the LTO link can page instead of dying.
       - name: Free disk space
+        if: matrix.rust
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
@@ -49,6 +72,7 @@ jobs:
           df -h /
 
       - name: Add swap for the release LTO link
+        if: matrix.rust
         run: |
           sudo fallocate -l 10G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
@@ -94,8 +118,8 @@ jobs:
         id: build-and-push
         uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
         with:
-          file: docker/Dockerfile
-          context: .
+          file: ${{ matrix.dockerfile }}
+          context: ${{ matrix.context }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

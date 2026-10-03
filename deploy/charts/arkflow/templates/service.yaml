@@ -1,0 +1,29 @@
+{{- if or (ne .Values.mode "control-plane") .Values.controlPlane.agent.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "arkflow.workloadName" . }}
+  labels:
+    {{- include "arkflow.labels" . | nindent 4 }}
+spec:
+  {{- if include "arkflow.agentEnabled" . | eq "true" }}
+  # Headless: peer nodes resolve this pod directly for cross-node shuffle.
+  clusterIP: None
+  {{- else }}
+  type: {{ .Values.service.type }}
+  {{- end }}
+  selector:
+    {{- include "arkflow.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: engine
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+    {{- if include "arkflow.agentEnabled" . | eq "true" }}
+    - name: data
+      port: {{ .Values.agent.dataPort }}
+      targetPort: data
+      protocol: TCP
+    {{- end }}
+{{- end }}

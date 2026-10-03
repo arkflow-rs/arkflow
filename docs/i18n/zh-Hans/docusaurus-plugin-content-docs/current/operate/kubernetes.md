@@ -6,6 +6,10 @@ description: ArkFlow 文档页面。
 
 本文介绍如何在 Kubernetes 集群中部署 ArkFlow。
 
+对大多数安装而言,[Helm Chart](./helm.md) 是推荐路径——它以内置的安全
+默认值渲染下文的清单。当你需要理解或手工管理 Chart 生成的各个对象时,
+再使用本页。
+
 ## 前提条件
 
 - Kubernetes 集群(版本 >= 1.27)

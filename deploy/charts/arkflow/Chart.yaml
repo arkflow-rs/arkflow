@@ -1,0 +1,15 @@
+apiVersion: v2
+name: arkflow
+description: High-performance Rust stream processing engine (Tokio + Apache Arrow/DataFusion)
+type: application
+# Chart version: bumps independently of the engine release.
+version: 0.1.0
+# appVersion tracks the engine release tag published to ghcr.io.
+appVersion: "0.5.0"
+home: https://arkflow-rs.com
+sources:
+  - https://github.com/arkflow-rs/arkflow
+icon: https://raw.githubusercontent.com/arkflow-rs/arkflow/main/docs/static/img/logo.svg
+maintainers:
+  - name: arkflow-rs
+    url: https://github.com/arkflow-rs

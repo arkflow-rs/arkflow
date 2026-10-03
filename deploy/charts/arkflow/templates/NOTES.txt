@@ -1,0 +1,61 @@
+ArkFlow engine installed in '{{ .Values.mode }}' mode.
+
+{{- if eq .Values.mode "control-plane" }}
+
+Control plane rendered:
+  Hub:     {{ include "arkflow.hubName" . }} (SQLite on PVC by default;
+           single replica, Recreate)
+  Console: {{ include "arkflow.consoleName" . }} — same-origin proxy at
+           http://{{ include "arkflow.consoleName" . }}:{{ .Values.controlPlane.console.service.port }}
+  Node credential: Secret {{ include "arkflow.nodeTokenSecretName" . }}
+           (helm.sh/resource-policy=keep — it SURVIVES helm uninstall;
+           delete it manually only when you are certain no state depends
+           on the fleet identity).
+{{- if .Values.controlPlane.agent.enabled }}
+  Agent:   {{ include "arkflow.workloadName" . }} joining the in-chart Hub.
+{{- end }}
+{{- if .Values.controlPlane.hub.storage.postgresURL }}
+  Storage: Postgres (PVC not rendered). Hub HA additionally requires the
+           lease election envs — set controlPlane.hub.ha.enabled and the
+           advertise URL when running multiple Hub replicas.
+{{- else }}
+  Storage: SQLite at {{ .Values.controlPlane.hub.storage.sqlitePath }} on the
+           PVC. Move to Postgres with `arkflow-server migrate` (stop the Hub
+           first), then set controlPlane.hub.storage.postgresURL.
+{{- end }}
+
+Verify:
+
+    kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+    kubectl logs deploy/{{ include "arkflow.hubName" . }}
+{{- else if eq .Values.mode "agent" }}
+
+Agent node identity defaults to the pod name (ARKFLOW_NODE_ID from the
+downward API) when your config does not set health_check.node_id.
+Supply the registration credential as an env Secret:
+
+    env:
+      - name: ARKFLOW_NODE_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: <your-secret>
+            key: node_token
+
+The data-plane shuffle port ({{ .Values.agent.dataPort }}) is exposed through
+a headless Service; the engine refuses to serve the data plane without fleet
+credentials, so configure the credential material before relying on split
+placement (see docs/operate/tls-matrix).
+{{- else }}
+
+Standalone mode runs exactly ONE replica (update strategy Recreate) so the
+same sources are never consumed twice. Scale-out belongs to the control-plane
+deployment, not this release.
+{{- end }}
+
+WARNING: kubelet probes cannot reach a loopback listener. Your config must
+set health_check.address to a pod-reachable bind such as "0.0.0.0:8080".
+
+Validate the rendered config against the engine schema:
+
+    kubectl get cm {{ include "arkflow.workloadName" . }} -o jsonpath='{.data.config\.yaml}' \
+      | docker run --rm -i ghcr.io/arkflow-rs/arkflow --validate /dev/stdin
