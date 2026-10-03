@@ -4,7 +4,7 @@ sidebar_position: 2
 
 # Control plane deployment
 
-Run `cargo run -p arkflow-server --bin arkflow-server` as the Hub and start each compute node
+For Kubernetes installations the [Helm chart](../helm.md) in `control-plane` mode is the recommended path — it renders the Hub, Console, and an optional in-chart agent with a generated shared node credential. Without a cluster, run `cargo run -p arkflow-server --bin arkflow-server` as the Hub and start each compute node
 with `health_check.hub_urls`, `node_id`, and `node_token`. Then build the console with
 `cd console && npm ci && npm run build`, and serve
 `console/dist` from a protected reverse proxy. The development Vite server

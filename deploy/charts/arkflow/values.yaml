@@ -92,15 +92,68 @@ unsafe:
   # Only honored when allowMultipleReplicas is true.
   replicas: 1
 
-# Optional persistent volume for WAL / state store (disabled by default).
+# Optional persistent volume for WAL / state store (disabled by default in
+# standalone/agent; in control-plane mode the Hub SQLite store defaults it
+# ON unless a Postgres URL is configured).
 persistence:
   enabled: false
   storageClass: ""
   accessModes:
     - ReadWriteOnce
   size: 1Gi
-  # Mount path inside the container; point engine WAL/state paths here.
+  # Mount path inside the engine container; point engine WAL/state paths
+  # here. The Hub always mounts its volume at /var/lib/arkflow.
   mountPath: /app/data
+
+# Control-plane settings (only rendered with mode: control-plane).
+controlPlane:
+  # Shared node credential feeding ARKFLOW_NODE_TOKEN on the Hub and the
+  # in-chart agent. Generated into a Secret (kept across upgrades) unless
+  # existingSecret is set.
+  nodeToken:
+    existingSecret: ""
+    existingSecretKey: node_token
+
+  hub:
+    image:
+      repository: ghcr.io/arkflow-rs/arkflow-server
+      pullPolicy: IfNotPresent
+      tag: ""
+    storage:
+      # Empty = SQLite on the persistence PVC (default). A postgres:// URL
+      # (env ${env:...} references allowed) switches the Hub to Postgres and
+      # disables the PVC; HA additionally requires Postgres leases.
+      postgresURL: ""
+      sqlitePath: /var/lib/arkflow/hub.sqlite
+      # Hub PVC switch (independent of the engine-mode persistence value):
+      # true by default for SQLite durability, forced off by postgresURL.
+      persistenceEnabled: true
+    # Optional operator API token (ARKFLOW_OPERATOR_TOKEN) from an existing
+    # Secret; unset keeps the Hub open to in-cluster callers only.
+    operatorToken:
+      existingSecret: ""
+      existingSecretKey: operator_token
+    ha:
+      enabled: false
+    resources: {}
+
+  console:
+    image:
+      repository: ghcr.io/arkflow-rs/arkflow-console
+      pullPolicy: IfNotPresent
+      tag: ""
+    replicaCount: 1
+    service:
+      type: ClusterIP
+      port: 80
+    resources: {}
+
+  # Optional in-chart agent joining the in-chart Hub. When enabled, set
+  # `config` to an engine document whose health_check.hub_urls points at
+  # http://<release-name>-hub:8080 (see values-controlplane.yaml).
+  agent:
+    enabled: false
+    replicas: 1
 
 serviceAccount:
   create: true

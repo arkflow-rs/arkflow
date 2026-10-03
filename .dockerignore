@@ -7,3 +7,6 @@
 /openspec
 **/*.md
 **/tests
+node_modules
+.tmp-bin
+tmp-render

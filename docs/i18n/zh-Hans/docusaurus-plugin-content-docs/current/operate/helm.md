@@ -24,6 +24,7 @@ Chart 的 `version` 独立演进;`appVersion` 跟随引擎发布标签,因此
 |---|---|---|
 | `standalone`(默认) | 单副本 Deployment(`Recreate`)、ClusterIP Service(HTTP) | 自包含流水线 |
 | `agent` | 相同工作负载 + 数据面端口、headless Service | 接入控制面 Hub |
+| `control-plane` | Hub + Console + 共享凭据(+ 可选的 chart 内 agent) | 一个 release 装下分布式运行时 |
 
 ## 透传式配置
 
@@ -109,8 +110,57 @@ env:
   拒绝服务数据面——依赖 split placement 前先阅读
   [TLS 矩阵](./tls-matrix.md)。
 
+## 控制面模式
+
+`mode: control-plane` 在一个 release 中渲染完整的分布式运行时:Hub
+(`arkflow-server` 镜像)、Console(同源 nginx 反代后的静态 UI)、共享节点凭据
+Secret,以及可选的接入 chart 内 Hub 的 agent。
+
+```yaml validate=foreign reason="Helm values file"
+mode: control-plane
+
+controlPlane:
+  # nodeToken unset => the chart generates and KEEPS a Secret across
+  # upgrades and uninstalls (delete it manually when certain).
+  hub:
+    storage:
+      # Default: SQLite on the persistence PVC. A postgres:// URL switches
+      # the Hub to Postgres (HA prerequisite) and skips the PVC.
+      sqlitePath: /var/lib/arkflow/hub.sqlite
+  console:
+    service:
+      type: ClusterIP
+  agent:
+    enabled: true
+    replicas: 1
+
+config: |
+  health_check:
+    address: "0.0.0.0:8080"
+    hub_urls: ["http://<release-name>-hub:8080"]
+```
+
+存储与可用性契约:
+
+- **默认**:SQLite 位于 `controlPlane.hub.storage.sqlitePath`,落在持久化
+  PVC 上;Hub Deployment 单副本、`Recreate` 更新(绝不让两个 Hub 同时面对
+  一个存储)。
+- **Postgres**:设置 `controlPlane.hub.storage.postgresURL`(允许 env
+  `${env:...}` 引用)即跳过 PVC;Hub HA 租约选举还需要
+  `controlPlane.hub.ha.enabled` 与 Postgres 存储。
+- **后端之间的迁移**保持为手动的 `arkflow-server migrate` 操作(先停 Hub)
+  ——见[控制面部署](./control-plane/deploy.md)。
+
+共享节点凭据同时供给 Hub 与 chart 内 agent 的 `ARKFLOW_NODE_TOKEN`;默认由
+chart 在首次安装时生成进 Secret(`helm.sh/resource-policy: keep`),除非
+`controlPlane.nodeToken.existingSecret` 指向你自己的 Secret。
+
+Console 在容器启动时从 `ARKFLOW_HUB_UPSTREAM` 解析反代目标——chart 将其设为
+chart 内 Hub Service;镜像默认值(`http://arkflow-hub:8080`)保持 chart 之外
+独立运行 Console 的行为不变。
+
 ## 路线图
 
-本 Chart 是 Kubernetes 故事的第一层交付物:控制面(Hub + Console)的伞形
-Chart 随后到来;CRD/operator 被明确推迟,直到出现真实的 GitOps 需求信号
-——并且即使构建,它也只做 CR 到 Hub API 的翻译,永不做调度决策。
+本 Chart 是 Kubernetes 的交付面:standalone/agent 引擎安装,以及上文的控制面
+伞形安装。CRD/operator 被明确推迟,直到出现真实的 GitOps 需求信号——并且即使
+构建,它也只做 CR 到 Hub API 的翻译,永不做调度决策。

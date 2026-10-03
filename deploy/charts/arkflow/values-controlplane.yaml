@@ -1,0 +1,35 @@
+# Example control-plane values: Hub + Console, SQLite on PVC, and an
+# in-chart agent joining the in-chart Hub.
+#
+#   helm install arkflow oci://ghcr.io/arkflow-rs/charts/arkflow \
+#     --values values-controlplane.yaml
+#
+# The release name matters: the agent's config must point hub_urls at the
+# in-chart Hub service http://<release-name>-hub:8080.
+mode: control-plane
+
+controlPlane:
+  # nodeToken: leave unset to let the chart generate and keep a Secret.
+  hub:
+    storage:
+      # Default: SQLite on the persistence PVC. For Postgres (also the HA
+      # prerequisite) set a URL and the PVC is skipped:
+      # postgresURL: "postgres://user:${env:PG_PASSWORD}@pg:5432/arkflow"
+      sqlitePath: /var/lib/arkflow/hub.sqlite
+  console:
+    service:
+      type: ClusterIP
+  agent:
+    enabled: true
+    replicas: 1
+
+persistence:
+  size: 5Gi
+
+# Engine config for the in-chart agent. node_id defaults to the pod name;
+# ARKFLOW_NODE_TOKEN is injected by the chart from the shared Secret.
+config: |
+  health_check:
+    address: "0.0.0.0:8080"
+    hub_urls: ["http://arkflow-hub:8080"]
+  streams: []

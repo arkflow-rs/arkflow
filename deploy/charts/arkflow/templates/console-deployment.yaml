@@ -1,0 +1,51 @@
+{{- if eq .Values.mode "control-plane" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "arkflow.consoleName" . }}
+  labels:
+    {{- include "arkflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: console
+spec:
+  replicas: {{ .Values.controlPlane.console.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "arkflow.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: console
+  template:
+    metadata:
+      labels:
+        {{- include "arkflow.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: console
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: console
+          image: {{ .Values.controlPlane.console.image.repository }}:{{ default .Chart.AppVersion .Values.controlPlane.console.image.tag }}
+          imagePullPolicy: {{ .Values.controlPlane.console.image.pullPolicy }}
+          env:
+            # Same-origin proxy target: the in-chart Hub Service.
+            - name: ARKFLOW_HUB_UPSTREAM
+              value: {{ printf "http://%s:8080" (include "arkflow.hubName" .) | quote }}
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.controlPlane.console.resources | nindent 12 }}
+{{- end }}

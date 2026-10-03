@@ -1,7 +1,8 @@
+{{- if or (ne .Values.mode "control-plane") .Values.controlPlane.agent.enabled -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "arkflow.fullname" . }}
+  name: {{ include "arkflow.workloadName" . }}
   labels:
     {{- include "arkflow.labels" . | nindent 4 }}
 spec:
@@ -9,12 +10,13 @@ spec:
   # The engine is stateful: two instances consume the same sources twice.
   # Recreate guarantees old and new pods never run concurrently on updates.
   {{- end }}
-  replicas: {{ include "arkflow.replicas" . }}
+  replicas: {{ ternary .Values.controlPlane.agent.replicas (include "arkflow.replicas" .) (eq .Values.mode "control-plane") | int }}
   strategy:
     type: Recreate
   selector:
     matchLabels:
       {{- include "arkflow.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: engine
   template:
     metadata:
       annotations:
@@ -25,6 +27,7 @@ spec:
         {{- end }}
       labels:
         {{- include "arkflow.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: engine
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -42,13 +45,21 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
-            {{- if eq .Values.mode "agent" }}
+            {{- if include "arkflow.agentEnabled" . | eq "true" }}
             - name: data
               containerPort: {{ .Values.agent.dataPort }}
               protocol: TCP
             {{- end }}
           env:
-            {{- if eq .Values.mode "agent" }}
+            {{- if include "arkflow.agentEnabled" . | eq "true" }}
+            {{- if eq .Values.mode "control-plane" }}
+            # In-chart agent: shared generated (or user) node credential.
+            - name: ARKFLOW_NODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arkflow.nodeTokenSecretName" . }}
+                  key: {{ include "arkflow.nodeTokenSecretKey" . }}
+            {{- end }}
             # Engine-native fallback (see NodeAgentConfig::from_engine):
             # pod name is the node identity when config sets no node_id.
             - name: ARKFLOW_NODE_ID
@@ -79,15 +90,15 @@ spec:
             - name: config
               mountPath: /app/etc
               readOnly: true
-            {{- if .Values.persistence.enabled }}
+            {{- if and (ne .Values.mode "control-plane") .Values.persistence.enabled }}
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
             {{- end }}
       volumes:
         - name: config
           configMap:
-            name: {{ include "arkflow.fullname" . }}
-        {{- if .Values.persistence.enabled }}
+            name: {{ include "arkflow.workloadName" . }}
+        {{- if and (ne .Values.mode "control-plane") .Values.persistence.enabled }}
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "arkflow.fullname" . }}-data
@@ -104,3 +115,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}

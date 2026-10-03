@@ -62,12 +62,12 @@ jobs:
         run: |
           set -eu
           mkdir -p /tmp/valcheck
-          for mode in std agent; do
-            if [ "$mode" = "std" ]; then
-              helm template assert-std deploy/charts/arkflow > /tmp/render.yaml
-            else
-              helm template assert-agent deploy/charts/arkflow -f deploy/charts/arkflow/values-agent.yaml > /tmp/render.yaml
-            fi
+          for mode in std agent cp; do
+            case "$mode" in
+              std)  helm template assert-std deploy/charts/arkflow > /tmp/render.yaml ;;
+              agent) helm template assert-agent deploy/charts/arkflow -f deploy/charts/arkflow/values-agent.yaml > /tmp/render.yaml ;;
+              cp)   helm template arkflow deploy/charts/arkflow -f deploy/charts/arkflow/values-controlplane.yaml > /tmp/render.yaml ;;
+            esac
             python3 - "$mode" <<'EOF'
             import re, sys
             mode = sys.argv[1]

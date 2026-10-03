@@ -10,7 +10,7 @@ With `mode: control-plane`, the chart SHALL render a Hub Deployment and Service 
 
 #### Scenario: Existing modes unchanged
 - **WHEN** `helm template` renders standalone and agent modes
-- **THEN** the output contains no Hub, Console, or control-plane resources, identical to the pre-control-plane renders
+- **THEN** the output contains no Hub, Console, or control-plane resources, and differs from the pre-control-plane renders only by the added `app.kubernetes.io/component: engine` selector label
 
 ### Requirement: Configurable console upstream
 

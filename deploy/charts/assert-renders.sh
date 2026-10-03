@@ -37,6 +37,39 @@ helm template assert-multi "$CHART" --set unsafe.allowMultipleReplicas=true --se
   > "$TMP/multi.yaml"
 assert_contains "$TMP/multi.yaml" "replicas: 3" "unsafe: honored when opted in"
 
+echo "== control-plane render =="
+helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" > "$TMP/cp.yaml"
+assert_contains "$TMP/cp.yaml" "name: arkflow-hub" "cp: hub deployment+service"
+assert_contains "$TMP/cp.yaml" "name: arkflow-console" "cp: console deployment+service"
+assert_contains "$TMP/cp.yaml" "kind: PersistentVolumeClaim" "cp: default SQLite PVC"
+assert_contains "$TMP/cp.yaml" "value: \"/var/lib/arkflow/hub.sqlite\"" "cp: sqlite storage env"
+assert_contains "$TMP/cp.yaml" "helm.sh/resource-policy: keep" "cp: kept node-token secret"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_HUB_UPSTREAM" "cp: console upstream env"
+assert_contains "$TMP/cp.yaml" "value: \"http://arkflow-hub:8080\"" "cp: console targets in-chart hub"
+assert_contains "$TMP/cp.yaml" "name: arkflow-agent" "cp: in-chart agent workload"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_NODE_TOKEN" "cp: shared credential env"
+assert_contains "$TMP/cp.yaml" "clusterIP: None" "cp: agent headless service"
+
+echo "== control-plane with postgres disables PVC =="
+helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" \
+  --set controlPlane.hub.storage.postgresURL="postgres://u:p@db:5432/hub" > "$TMP/cppg.yaml"
+assert_not_contains "$TMP/cppg.yaml" "kind: PersistentVolumeClaim" "cp-pg: no PVC"
+assert_contains "$TMP/cppg.yaml" "value: \"postgres://u:p@db:5432/hub\"" "cp-pg: postgres storage env"
+assert_contains "$TMP/cppg.yaml" "type: Recreate" "cp-pg: hub still Recreate single replica"
+
+echo "== control-plane without agent renders no engine workload =="
+helm template arkflow "$CHART" --set mode=control-plane > "$TMP/cpnoagent.yaml"
+assert_not_contains "$TMP/cpnoagent.yaml" "kind: ConfigMap" "cp-noagent: no engine configmap"
+assert_not_contains "$TMP/cpnoagent.yaml" "app.kubernetes.io/component: engine" "cp-noagent: no engine workload"
+assert_contains "$TMP/cpnoagent.yaml" "kind: Secret" "cp-noagent: node token secret still rendered"
+
+echo "== user-supplied node credential =="
+helm template arkflow "$CHART" --set mode=control-plane \
+  --set controlPlane.nodeToken.existingSecret=my-fleet --set controlPlane.nodeToken.existingSecretKey=tk > "$TMP/cpuser.yaml"
+assert_not_contains "$TMP/cpuser.yaml" "node-token" "cp-user: no generated secret"
+assert_contains "$TMP/cpuser.yaml" "name: my-fleet" "cp-user: hub references user secret"
+assert_contains "$TMP/cpuser.yaml" "key: tk" "cp-user: user secret key"
+
 echo "== config rendered byte-for-byte =="
 python3 - "$TMP/std.yaml" <<'EOF'
 import sys, re

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec docker run --rm -v "$PWD:/work" -w /work alpine/helm:3.16.4 "$@"
