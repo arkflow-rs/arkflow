@@ -5234,6 +5234,19 @@ mod task_loop_tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
+    // ---------- source loop: structured input-channel closure ----------
+
+    /// A closed input channel surfaces as the dedicated `Error`
+    /// variant — downstream control flow matches the type, never the
+    /// message string.
+    #[tokio::test]
+    async fn closed_input_channel_maps_to_the_dedicated_variant() {
+        let (sender, receiver) = flume::unbounded::<Envelope>();
+        drop(sender);
+        let (_, result) = recv_envelope(0, receiver).await;
+        assert!(matches!(result, Err(Error::InputChannelClosed)));
+    }
+
     // ---------- source loop: cancellation during reconnect backoff ----------
 
     /// Cancelling the chain while a failed reconnect sleeps in its backoff

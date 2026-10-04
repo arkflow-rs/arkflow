@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: Window aggregation buffer entry bound
-窗口算子的 keyed 聚合缓冲（以 (window, key) 为条目）SHALL 有可配置的条目上限（`max_buffered_keys`，默认 65536）。达到上限时系统 SHALL 按最老 window-start 优先驱逐整条聚合缓冲直至回到上限内，并 MUST 以节流告警（含驱逐条目数、当前深度、上限）显式声明被驱逐窗口的数据丢失。上限检查 MUST 位于所有窗口族（tumbling/sliding/session）共用的缓冲插入路径。
+窗口算子的 keyed 聚合缓冲（以 (window, key) 为条目）SHALL 有可配置的条目上限（`max_buffered_keys`，默认 65536）。达到上限时系统 SHALL 按最老 window-start 优先驱逐整条聚合缓冲直至回到上限内，并 MUST 以节流告警（含驱逐条目数、当前深度、上限）显式声明被驱逐窗口的数据丢失。上限检查 MUST 位于所有窗口族（tumbling/sliding/session）共用的缓冲插入路径。持有未决确认（pending acknowledgement）或当前批次成员身份的条目 MUST NOT 被驱逐（驱逐它们会搁浅确认、冻结 checkpoint 前沿）；当全部条目受保护时，缓冲 MAY 暂时超上限，超出量以单个批次的插入量为界。
 
 #### Scenario: 高基数 key 触发驱逐并告警
 - **WHEN** 某窗口的 distinct key 数使缓冲条目总数超过 `max_buffered_keys`

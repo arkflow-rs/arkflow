@@ -399,6 +399,16 @@ authentication) are also redialed while budget remains — the replay cannot
 succeed, so they consume the budget and the edge fails closed once it is
 exhausted.
 
+Two bounds keep that machinery honest under stress. The replay cache is
+bounded by both an entry cap and an approximate byte budget (256 MiB by
+default, estimated from the Arrow batch memory of the unreceipted frames): a
+send whose replay registration exceeds either bound fails through the normal
+send-failure path instead of growing the cache without limit. And the
+receipt-reader idle budget is tiered: an idle connection is declared dead
+after 30 seconds without inbound frames, but a connection with batches still
+awaiting receipts gets a 10-minute budget, so a slow downstream withholding
+receipts under backpressure is never mistaken for a dead peer.
+
 Acknowledgement mirrors across remote edges: a source ack completes only after
 **all** downstream copies acknowledge, and a downstream processing failure
 sends a `Failed` receipt that aborts the upstream fan-out branch immediately

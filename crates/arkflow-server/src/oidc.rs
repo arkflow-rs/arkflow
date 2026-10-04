@@ -1489,4 +1489,36 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
+
+    /// Spec: a FAILED periodic refresh retains the previous key set — a
+    /// provider outage must not take the Hub's cached kids down with it.
+    /// The mock answers 200 with a body no JWKS parser accepts.
+    #[tokio::test]
+    async fn failed_periodic_refresh_retains_the_previous_key_set() {
+        let mock = MockJwks::spawn(jwks_body(&[TEST_KID]));
+        let auth = std::sync::Arc::new(authenticator(format!("http://{}/jwks", mock.addr)));
+        let token = mint(claims("u1", serde_json::json!(["viewer"]), 600), Some(TEST_KID));
+        assert!(
+            auth.authenticate(&token).await.is_some(),
+            "the initially served kid validates"
+        );
+        let fetches_before = mock.fetch_count();
+        // Break the endpoint so every periodic fetch fails to parse.
+        mock.set_body("not-a-jwks-document".to_string());
+        auth.spawn_periodic_refresh(std::time::Duration::from_millis(50));
+        // Wait for at least one refresh attempt (outcome-gated by the
+        // assertion below; the count check only proves attempts happened).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mock.fetch_count() <= fetches_before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the periodic refresher never attempted a fetch"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            auth.authenticate(&token).await.is_some(),
+            "a failed periodic refresh must retain the previously cached key set"
+        );
+    }
 }
