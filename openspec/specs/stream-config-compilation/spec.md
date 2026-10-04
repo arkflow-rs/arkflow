@@ -42,7 +42,12 @@ temporary tables→processor config passthrough.
 SHALL compile to window operators in processing-time mode; `join` buffers SHALL
 fail compilation with a migration message pointing at the Job DAG join
 operator (a real entry point with exactly two inbound edges) instead of any
-workaround.
+workaround. A window buffer compiles its chain to single processor parallelism:
+an explicitly configured `pipeline.thread_num` above one SHALL fail compilation
+with a message naming the stream and the fix, while the DEFAULT thread_num
+(CPU count) is not an explicit choice and SHALL compile to single parallelism
+exactly as the previous silent clamp behaved. The compiler MUST NOT silently
+ignore or clamp an explicitly configured `thread_num` on such a chain.
 
 #### Scenario: Tumbling buffer becomes operator
 
@@ -58,6 +63,16 @@ workaround.
 
 - **WHEN** a StreamConfig declares a tumbling or session window with a legacy `join` field
 - **THEN** compilation fails with the same guidance as a plain `join` buffer rejection
+
+#### Scenario: Explicit thread_num above one on a window stream rejected
+
+- **WHEN** a StreamConfig declares a window buffer and explicitly sets `pipeline.thread_num` to a value above one that differs from the default CPU-count value
+- **THEN** compilation fails with a message naming the stream, the configured value, and the fix (set 1 or remove the field) instead of silently clamping
+
+#### Scenario: Default thread_num on a window stream stays valid
+
+- **WHEN** a StreamConfig declares a window buffer and leaves `pipeline.thread_num` at its default (CPU count)
+- **THEN** compilation succeeds and the window chain runs single-parallelism, matching the previous clamped behavior
 
 
 ### Requirement: Local jobs field
