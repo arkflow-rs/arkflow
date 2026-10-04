@@ -356,7 +356,13 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
       if (response.status === 401 && !token) {
         void redirectToOidcLogin()
       }
-      const errorBody = (await response.json().catch(() => ({}))) as Partial<ApiError>
+      // A stalled error-body read rejects with the shared TimeoutError —
+      // it must surface as request_timeout, not be flattened into an empty
+      // body that reports a generic request_failed.
+      const errorBody = (await response.json().catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'TimeoutError') throw error
+        return {}
+      })) as Partial<ApiError>
       throw Object.assign(
         new Error(
           errorBody.message ?? translate(currentLocale(), 'api.requestFailed', { status: response.status }),
@@ -541,34 +547,32 @@ export function streamEvents(
     let lastEventId: string | undefined
     while (!controller.signal.aborted) {
       let deliveredAnyEvent = false
+      // Per-attempt abort: the connect deadline cancels a black-holed fetch
+      // (a bare Promise.race would let it dangle until the caller's
+      // cleanup), and the outer controller forwards cancellation through
+      // the WHOLE attempt including body reads. `timedOut` distinguishes
+      // the deadline firing from outer cleanup inside the catch.
+      const attempt = new AbortController()
+      let timedOut = false
+      const forwardAbort = () => attempt.abort()
+      controller.signal.addEventListener('abort', forwardAbort)
       try {
-        // Bound only the CONNECTION phase: a pending connect (black-holed
-        // Hub) must fall into the catch/backoff path instead of parking
-        // until the caller's cleanup aborts the controller. Once headers
-        // arrive the timer is cleared — the event stream itself may stay
-        // open indefinitely.
-        let connectTimer: number | undefined
-        const connectDeadline = new Promise<never>((_, reject) => {
-          connectTimer = window.setTimeout(
-            () => reject(new DOMException('sse connect timeout', 'TimeoutError')),
-            REQUEST_TIMEOUT_MS,
-          )
-        })
+        const connectTimer = window.setTimeout(() => {
+          timedOut = true
+          attempt.abort()
+        }, REQUEST_TIMEOUT_MS)
         let response: Response
         try {
-          response = await Promise.race([
-            fetch(`${base}${path}`, {
-              headers: {
-                Accept: 'text/event-stream',
-                ...(token ? { Authorization: `Bearer ${token}` } : {}),
-                ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
-              },
-              signal: controller.signal,
-            }),
-            connectDeadline,
-          ])
+          response = await fetch(`${base}${path}`, {
+            headers: {
+              Accept: 'text/event-stream',
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
+            },
+            signal: attempt.signal,
+          })
         } finally {
-          if (connectTimer !== undefined) window.clearTimeout(connectTimer)
+          window.clearTimeout(connectTimer)
         }
         if (!response.ok || !response.body) {
           throw new Error(translate(currentLocale(), 'api.sseConnectionFailed', { status: response.status }))
@@ -592,7 +596,7 @@ export function streamEvents(
           data = ''
           eventType = 'message'
         }
-        while (!controller.signal.aborted) {
+        while (!attempt.signal.aborted) {
           const next = await reader.read()
           if (next.done) break
           buffer += decoder.decode(next.value, { stream: true })
@@ -608,15 +612,21 @@ export function streamEvents(
           }
         }
       } catch {
+        // Covers both real failures and the connect-deadline abort; outer
+        // cleanup (controller aborted) reports nothing and exits the loop.
         if (!controller.signal.aborted) onState?.('disconnected')
+      } finally {
+        controller.signal.removeEventListener('abort', forwardAbort)
       }
       if (!controller.signal.aborted) {
+        // Reset the ladder BEFORE the sleep when this connection actually
+        // delivered an event (a healthy stream that drops reconnects after
+        // the floor delay, not a stale multiplier); a connect-then-close
+        // Hub with no frames keeps backing off instead of retrying every
+        // second.
+        if (deliveredAnyEvent) backoffMs = SSE_BACKOFF_FLOOR_MS
         await new Promise((resolve) => window.setTimeout(resolve, backoffMs))
-        // Reset the ladder only once the connection actually DELIVERED an
-        // event: a Hub that accepts the connection but closes before any
-        // frame is still unhealthy and must keep backing off, instead of
-        // reconnecting once per second forever.
-        backoffMs = deliveredAnyEvent ? SSE_BACKOFF_FLOOR_MS : Math.min(backoffMs * 2, SSE_BACKOFF_MAX_MS)
+        backoffMs = Math.min(backoffMs * 2, SSE_BACKOFF_MAX_MS)
       }
     }
   })()

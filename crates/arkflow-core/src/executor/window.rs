@@ -928,21 +928,16 @@ impl ColumnarWindowOperator {
         evicted_keys
     }
 
-    /// `protected` = pending acknowledgements plus the caller's extra
-    /// protected keys (current-batch memberships / re-key targets).
-    fn eviction_protection(
-        &self,
-        extra: &BTreeSet<(i64, String)>,
-    ) -> BTreeSet<(i64, String)> {
-        let mut protected = self
-            .pending_acks
+    /// The pending-acknowledgement half of the eviction protection. Callers
+    /// merge in their own live keys (current-batch memberships / re-key
+    /// targets) on top.
+    fn pending_protection(&self) -> BTreeSet<(i64, String)> {
+        self.pending_acks
             .lock()
             .unwrap()
             .keys()
             .cloned()
-            .collect::<BTreeSet<_>>();
-        protected.extend(extra.iter().cloned());
-        protected
+            .collect::<BTreeSet<_>>()
     }
 
     /// All windows containing one event time. Tumbling yields one;
@@ -1295,6 +1290,11 @@ impl ColumnarWindowOperator {
         let mut touched = BTreeSet::new();
         let mut session_rekeys = Vec::new();
         let mut evicted_inline: BTreeSet<(i64, String)> = BTreeSet::new();
+        // Pending-acknowledgement half of the eviction protection, built on
+        // the first over-cap trigger only: it cannot change mid-batch (the
+        // session re-key runs after the loop), and cloning it per membership
+        // would make a degraded sliding batch quadratic.
+        let mut protection_base: Option<BTreeSet<(i64, String)>> = None;
         let mut legacy_rows = BTreeMap::<(i64, String), Vec<usize>>::new();
         for row in 0..batch.len() {
             let (Some(event_time), Some(key)) = (&timestamps[row], &keys[row]) else {
@@ -1506,7 +1506,10 @@ impl ColumnarWindowOperator {
                 // bounded at validate time (pathological sliding ratios are
                 // rejected).
                 if buffers.len() > self.config.max_buffered_keys {
-                    let protection = self.eviction_protection(&touched);
+                    let base = protection_base
+                        .get_or_insert_with(|| self.pending_protection());
+                    let mut protection = base.clone();
+                    protection.extend(touched.iter().cloned());
                     evicted_inline.extend(self.evict_overflowed_buffers(&mut buffers, &protection));
                 }
             }
@@ -1560,7 +1563,10 @@ impl ColumnarWindowOperator {
         {
             let mut buffers = self.buffers.lock().unwrap();
             if buffers.len() > self.config.max_buffered_keys {
-                let protection = self.eviction_protection(&touched);
+                let base = protection_base
+                    .get_or_insert_with(|| self.pending_protection());
+                let mut protection = base.clone();
+                protection.extend(touched.iter().cloned());
                 evicted_keys.extend(self.evict_overflowed_buffers(&mut buffers, &protection));
             }
         }
