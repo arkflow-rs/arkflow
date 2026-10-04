@@ -3132,6 +3132,29 @@ mod tests {
         assert_eq!(starts, vec![2_000, 3_000], "eviction is oldest-window first");
     }
 
+    /// The eviction warn is throttled: the first overflow logs immediately,
+    /// later overflows inside `WINDOW_EVICTION_LOG_INTERVAL` are suppressed
+    /// and only counted (the suppressed total rides the next warn line).
+    #[tokio::test]
+    async fn window_eviction_warn_is_throttled_with_suppressed_count() {
+        let backend = Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+        let op = ColumnarWindowOperator::new(eviction_config(1), backend, "eviction-throttle-test");
+        // First overflow warns immediately and opens the throttle window.
+        op.process(batch(vec![(100, "a", 1)], None)).await.unwrap();
+        op.process(batch(vec![(1_100, "b", 2)], None)).await.unwrap();
+        {
+            let log = op.eviction_log.lock().unwrap();
+            assert!(log.0.is_some(), "the first eviction warns immediately");
+            assert_eq!(log.1, 0, "nothing is suppressed before the interval opens");
+        }
+        // Further evictions inside the interval are suppressed and counted.
+        op.process(batch(vec![(2_100, "c", 3)], None)).await.unwrap();
+        op.process(batch(vec![(3_100, "d", 4)], None)).await.unwrap();
+        let log = op.eviction_log.lock().unwrap();
+        assert_eq!(log.1, 2, "evictions inside the interval accumulate silently");
+        assert!(log.0.is_some());
+    }
+
     #[tokio::test]
     async fn window_within_entry_cap_keeps_all_windows() {
         let backend = Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
