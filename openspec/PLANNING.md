@@ -546,8 +546,10 @@ S3 WAL 异步路径必崩（tokio 嵌套 runtime panic，实测复现）｜租�
 2. **批次 B 组件可用性**：租约 epoch、Pulsar output/input、multiple_inputs、HTTP bind、console token 链。
 3. **批次 C API 面收缩**（v1.0 semver 前一次性）：~685 pub item 修剪、`Option<&String>`、删 Pipeline/dead variants、HealthCheckConfig 改名。
 4. **批次 D P2 高优**：内核无界缓冲/超时、RuntimeManager 两并发缺陷、认证中间件化+401 矩阵测试、Error Boundary、文档脱节批。
-5. **批次 E 发布工程**：发 0.6 释放积压、release 自动化、CHANGELOG/SECURITY.md/版本策略、CI clippy/fmt、插件层契约合规测试框架（把取消安全变成 CI 门禁）。
+5. **批次 E 发布工程** ✅ 2026-10-04 已落地（`release-engineering-batch-e`；~~发 0.6 释放积压~~ 维护者决策作废——积压随 v1.0 一次性释放）：release.yml（tag 校验 + linux/macOS 四平台二进制 + GitHub Release + crate `publish --dry-run` 校验）、rust.yml fmt/clippy 门禁、CHANGELOG.md/SECURITY.md、reference/versioning.md 版本策略与升级指南（en/zh）、cli.md `arkflow-server` 章节、distributed-jobs 运营上限（en/zh）；插件层契约合规测试框架已随 P1-5 提前落地。
 
 ### 9.4 发布路径判断
 
 批次 A+B 完成前不建议宣传 at-least-once 以外的可靠性语义；批次 A-E 全部完成即可打 v1.0（当前瓶颈是插件层与内核的质量断层，不是版本号或流程）。
+
+> **发版决策（2026-10-04，维护者确认）**：不先发 0.6 中间版，v0.5.0 以来的全部积压随 v1.0 一次性释放。批次 E 中「发 0.6」一项作废，其余子项（release 自动化、CHANGELOG/SECURITY.md/版本策略、CI clippy/fmt 门禁、`arkflow-server` CLI 与 MAX_NODES 用户文档）不变；发布顺序变为：批次 E（除 0.6）→ 批次 C → 直接打 v1.0。

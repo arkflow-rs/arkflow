@@ -100,6 +100,41 @@ arkflow schema > arkflow.schema.json
 | `--config <FILE>`(默认) | 校验配置,随后启动引擎并阻塞直至关闭。 |
 | 缺少 `--config` 且无子命令 | 错误:`missing --config <FILE> (or run a subcommand: components, schema)`。 |
 
+## `arkflow-server`
+
+`arkflow-server` 二进制运行控制面 Hub。它没有命令行标志;全部启动配置来自环境变量,外加用于存储 schema 迁移的单一 `migrate` 子命令。
+
+### 启动环境变量
+
+| 环境变量 | 默认值 | 说明 |
+|----------|---------|-------------|
+| `ARKFLOW_HUB_ADDRESS` | `127.0.0.1:8080` | Hub API 监听地址。 |
+| `ARKFLOW_OPERATOR_TOKEN` | — | 供人工/管理员访问 API 的 operator token。支持 `role\|token` 凭据格式;参见 [Hub 认证](../operate/control-plane/overview.md)。 |
+| `ARKFLOW_NODE_TOKEN` | — | Agent 向 Hub 认证使用的共享 token。 |
+| `ARKFLOW_HUB_INSECURE_LOCAL` | 关 | 设为 `1`/`true`/`yes` 以放宽校验,仅限本地开发。 |
+| `ARKFLOW_HUB_STORAGE` | — | 存储后端描述:SQLite 路径或 PostgreSQL URL。启用 HA 时必须设置。 |
+| `ARKFLOW_HUB_TLS_CERT` / `ARKFLOW_HUB_TLS_KEY` | — | Hub 监听器的 TLS 证书与私钥路径。 |
+| `ARKFLOW_HUB_HA_ENABLED` | 关 | 设为 `1`/`true`/`yes` 启用基于租约的 HA。要求设置 `ARKFLOW_HUB_STORAGE`;多实例 HA 使用 PostgreSQL URL(SQLite 路径仅记录一条仅供开发的警告)。 |
+| `ARKFLOW_HUB_HA_LEASE_TTL_MS` | `15000` | 租约 TTL(毫秒);低于 1000 会被拒绝。 |
+| `ARKFLOW_HUB_HA_HOLDER_ID` | — | 显式租约持有者身份;缺省时由主机名、PID 与启动时间自动生成。 |
+| `ARKFLOW_HUB_HA_ADVERTISE_URL` | — | 带主机的绝对 `http(s)://` URL,Agent 通过它访问该 Hub 实例(多 Hub 发现)。 |
+
+### `migrate` 子命令
+
+将 Hub 存储数据库从 SQLite 迁移到 PostgreSQL——把单实例 Hub(SQLite)迁移到多实例 HA(PostgreSQL)时走这条路。
+
+```bash
+arkflow-server migrate --from sqlite:<path> --to postgres://<url>
+```
+
+成功时打印逐表行数报告(`<table>: <rows> rows` ... `migration complete: <n> rows total`)并以 `0` 退出。
+
+| 退出码 | 行为 |
+|-----------|----------|
+| `0` | 迁移完成。 |
+| `2` | 用法错误:缺少 `--from`/`--to`,或 `--from` 不以 `sqlite:` 开头,或 `--to` 不以 `postgres://`/`postgresql://` 开头。 |
+| 非零 | 迁移失败;错误打印到 stderr。 |
+
 ## 相关页面
 
 - [组件清单](./component-inventory.md) — 由 CLI 读取的同一注册表生成。

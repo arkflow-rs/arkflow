@@ -60,6 +60,7 @@ const sidebars: SidebarsConfig = {
     {type: 'category', label: 'Reference', items: [
       'reference/cli', 'reference/api', 'reference/configuration', 'reference/ide-schema',
       'reference/component-inventory', 'reference/examples', 'reference/compatibility',
+      'reference/versioning',
     ]},
     {type: 'category', label: 'Develop', link: {type: 'doc', id: 'develop/index'}, items: [
       'develop/kernel', 'develop/plugins', 'develop/s3-wal-performance',

@@ -27,6 +27,62 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
+  fmt:
+    name: Rustfmt (check)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # Formatting needs no protoc or cargo build: rustfmt parses sources
+      # directly, so this job fails in well under a minute and never waits
+      # behind a cold dependency build.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy (deny warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install system dependencies (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+
+      - name: Set PROTOC Environment Variable
+        run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      # The toolchain line above installs clippy but running it is the gate:
+      # warnings are deny-by-default so a lint regression blocks the PR the
+      # same way a test failure does (this is the "lint before finishing"
+      # contract from AGENTS.md, now enforced by CI instead of convention).
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   build-and-test:
     name: Build and Test (fast)
     runs-on: ubuntu-latest

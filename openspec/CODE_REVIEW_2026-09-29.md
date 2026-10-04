@@ -73,10 +73,10 @@
 
 ## 流程与发布工程（第一轮评估结论，v1.0 前置）
 
-1. 版本严重滞后：Cargo.toml 仍 0.5.0，最后 tag v0.5.0（2025-10-19），此后全部演进未发版 → 先发 0.6 释放积压。
-2. 无 release 自动化（二进制产物/GitHub Release/crate publish 全无；唯一通道 docker tag push）；CI 缺 clippy/fmt/覆盖率/多平台（rust.yml 装了组件但没跑）。
-3. 无 CHANGELOG、无 SECURITY.md、无产品版本策略/升级指南（compatibility.md 只讲文档快照）。
-4. `arkflow-server` CLI（含 migrate）未进 CLI 参考文档；MAX_NODES=256 与长稳结论只在内部 PLANNING 未进用户文档。
+1. 版本严重滞后：Cargo.toml 仍 0.5.0，最后 tag v0.5.0（2025-10-19），此后全部演进未发版 → ~~先发 0.6 释放积压~~（2026-10-04 维护者决策：**不发 0.6**，积压随 v1.0 一次性释放，见 PLANNING §9.4）。
+2. ~~无 release 自动化（二进制产物/GitHub Release/crate publish 全无；唯一通道 docker tag push）；CI 缺 clippy/fmt/覆盖率/多平台（rust.yml 装了组件但没跑）~~ ✅ 2026-10-04 已修复（`release-engineering-batch-e`——release.yml：tag 校验 + 四平台二进制矩阵 + GitHub Release 产物 + crate `publish --dry-run` 校验；rust.yml 新增 fmt/clippy `-D warnings` 门禁；覆盖率此前已有 coverage.yml）。
+3. ~~无 CHANGELOG、无 SECURITY.md、无产品版本策略/升级指南（compatibility.md 只讲文档快照）~~ ✅ 2026-10-04 已修复（`release-engineering-batch-e`——根目录 CHANGELOG.md（Unreleased 汇总 v0.5.0 以来演进）+ SECURITY.md（私密报告渠道 + 支持版本表）+ docs reference/versioning.md（en/zh））。
+4. ~~`arkflow-server` CLI（含 migrate）未进 CLI 参考文档；MAX_NODES=256 与长稳结论只在内部 PLANNING 未进用户文档~~ ✅ 2026-10-04 已修复（`release-engineering-batch-e`——cli.md 补 `arkflow-server` 启动环境变量与 migrate 契约（en/zh）；distributed-jobs.md 补运营上限小节（256 上限 + 长稳实测证据，en/zh））。
 5. **新增：插件层契约合规测试框架**——在真实 select 取消下跑每个 input 的 read（把取消安全从注释契约变成 CI 门禁），否则 P1-5 类缺陷会回归。
 
 ## 建议修复批次（合计约 3-5 周）
@@ -85,4 +85,4 @@
 - **批次 B（组件可用性）**：P1-2、P1-7、P1-8、P1-10、P1-11、P1-12。
 - **批次 C（API 面收缩，v1.0 semver 前一次性）**：P3 第一条全部。
 - **批次 D（P2 高优）**：内核无界缓冲/超时批、RuntimeManager 两缺陷、input_name、认证中间件化+矩阵测试、Error Boundary、文档脱节批。
-- **批次 E（发布工程）**：上节 1-4。
+- **批次 E（发布工程）** ✅ 2026-10-04 已全部落地（除「发 0.6」作废外，`release-engineering-batch-e`：release 自动化 + CI fmt/clippy 门禁 + CHANGELOG/SECURITY.md/版本策略 + server CLI 与 MAX_NODES 文档；契约合规测试框架已随 P1-5 提前落地）。

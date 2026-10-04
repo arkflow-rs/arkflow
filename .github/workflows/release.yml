@@ -1,0 +1,210 @@
+# Release pipeline: a pushed v* tag builds multi-platform release binaries and
+# attaches them to a GitHub Release. Crate packaging is validated with
+# `cargo publish --dry-run` (never a real publish — crates.io credentials and
+# timing stay with the maintainer). Manual dispatch runs the same build matrix
+# without creating a Release, so the pipeline can be exercised between tags.
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Release builds are LTO + codegen-units=1: keep artifacts lean and link
+  # times bounded in CI the same way coverage.yml does.
+  CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+
+permissions:
+  contents: write
+
+jobs:
+  verify-tag:
+    name: Verify tag matches workspace version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # A tag must match the workspace version exactly, otherwise the built
+      # binaries would report a different version than the Release they ship
+      # in. Fail early with an actionable message before any platform spends
+      # 20+ minutes building.
+      - name: Compare tag with Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME#v}"
+          WORKSPACE_VERSION="$(awk -F'"' '/^\[workspace.package\]/{in_pkg=1} in_pkg && /^version *=/{print $2; exit}' Cargo.toml)"
+          echo "tag: ${TAG_NAME}, workspace: ${WORKSPACE_VERSION}"
+          if [ "${TAG_NAME}" != "${WORKSPACE_VERSION}" ]; then
+            echo "::error::Tag v${TAG_NAME} does not match workspace version ${WORKSPACE_VERSION}. Bump [workspace.package] version in Cargo.toml (and crate refs), commit, then re-tag."
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify-tag
+    # Manual dispatch skips the tag check but still builds, letting the matrix
+    # be validated between releases.
+    if: ${{ !cancelled() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # GitHub-hosted arm64 runner; native build avoids a cross toolchain
+          # (PyO3/protoc/native deps), swap to a cross/QEMU setup only if this
+          # runner tier becomes unavailable.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies (protoc, Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+
+      - name: Set PROTOC Environment Variable (Linux)
+        if: runner.os == 'Linux'
+        run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf
+          echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      # Release profile is LTO + codegen-units=1 (slow but that is what ships);
+      # build every binary the archive carries: the engine and the Hub server.
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} -p arkflow -p arkflow-server
+
+      - name: Package archive
+        run: |
+          WORKSPACE_VERSION="$(awk -F'"' '/^\[workspace.package\]/{in_pkg=1} in_pkg && /^version *=/{print $2; exit}' Cargo.toml)"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # workflow_dispatch runs on a branch ref with no tag; name the
+            # archive after the workspace version so a smoke artifact is
+            # distinguishable from a real tagged one.
+            VERSION="${WORKSPACE_VERSION}-dev"
+          fi
+          PKG="arkflow-${VERSION}-${{ matrix.target }}"
+          STAGE="$(mktemp -d)"
+          mkdir -p "${STAGE}/${PKG}"
+          cp target/${{ matrix.target }}/release/arkflow "${STAGE}/${PKG}/"
+          cp target/${{ matrix.target }}/release/arkflow-server "${STAGE}/${PKG}/"
+          cp LICENSE README.md "${STAGE}/${PKG}/"
+          tar -czf "${PKG}.tar.gz" -C "${STAGE}" "${PKG}"
+          shasum -a 256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          echo "PKG_NAME=${PKG}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: |
+            *.tar.gz
+            *.sha256
+          retention-days: 14
+
+  crates-dry-run:
+    name: Crate packaging check (publish --dry-run)
+    needs: verify-tag
+    if: ${{ !cancelled() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+
+      - name: Set PROTOC Environment Variable
+        run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      # Dependency order matters even for --dry-run: crates.io resolution of a
+      # later crate needs its path-dep siblings packaged. No CARGO_REGISTRY_TOKEN
+      # is configured on purpose — a real publish is a maintainer action.
+      - name: cargo publish --dry-run (dependency order)
+        run: |
+          set -e
+          for crate in arkflow-core arkflow-plugin arkflow arkflow-server; do
+            echo "=== dry-run: ${crate} ==="
+            cargo publish -p "${crate}" --dry-run
+          done
+
+  release:
+    name: Create GitHub Release
+    needs: [ verify-tag, build, crates-dry-run ]
+    if: startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success' && needs.crates-dry-run.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find dist -type f | sort
+
+      # Preinstalled gh CLI keeps the supply chain to first-party actions;
+      # --generate-notes seeds the body from merged PRs and works for both
+      # annotated and lightweight tags (a maintainer can edit afterwards).
+      - name: Create release with artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag \
+            dist/*.tar.gz dist/*.sha256
