@@ -441,8 +441,7 @@ fn fuses_linear_processor_chain_into_one_chain() {
     assert_eq!(fused.processors.len(), 3);
 }
 
-#[test]
-fn stateful_operator_breaks_the_chain() {
+fn stateful_operator_job() -> JobSpec {
     let mut job = spec(
         vec![
             map_operator("a"),
@@ -467,6 +466,12 @@ fn stateful_operator_breaks_the_chain() {
         max_pending_transactions: None,
         max_bytes: None,
     });
+    job
+}
+
+#[test]
+fn stateful_operator_breaks_the_chain() {
+    let job = stateful_operator_job();
     let plan = JobPlan::compile(job).unwrap();
     let adapter = Adapter {
         input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
@@ -492,6 +497,60 @@ fn stateful_operator(id: &str) -> OperatorSpec {
         key_field: Some("key".into()),
         config: serde_json::json!({}),
     }
+}
+
+#[test]
+fn explicit_parallelism_on_stateful_chain_is_rejected() {
+    let mut job = stateful_operator_job();
+    job.sources[0].config =
+        serde_json::json!({"__arkflow_processor_parallelism": 2});
+    let plan = JobPlan::compile(job).unwrap();
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn crate::state::StateBackend> =
+        Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+    let error = match ExecutionGraphBuilder::default()
+        .with_state(backend)
+        .build(&plan, &adapter, &resource())
+    {
+        Ok(_) => panic!("the explicit parallelism override must be rejected"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("processor parallelism 1"),
+        "the explicit override must be rejected, not silently ignored: {error}"
+    );
+}
+
+#[test]
+fn unconfigured_stateful_chain_keeps_default_parallelism() {
+    let job = stateful_operator_job();
+    let plan = JobPlan::compile(job).unwrap();
+    let adapter = Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn crate::state::StateBackend> =
+        Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+    let graph = ExecutionGraphBuilder::default()
+        .with_state(backend)
+        .build(&plan, &adapter, &resource())
+        .unwrap();
+    let stateful_chain = graph
+        .chains
+        .iter()
+        .find(|chain| chain.task_ids.iter().any(|id| id == "agg-0"))
+        .unwrap();
+    assert_eq!(
+        stateful_chain.processor_parallelism, 1,
+        "no override configured: the default stays one"
+    );
 }
 
 // ---------- end-to-end kernel tests ----------
@@ -3741,30 +3800,8 @@ async fn configured_thread_num_runs_ordered_concurrent_processors() {
 /// its all-partition subscription.
 #[test]
 fn thread_num_does_not_change_source_partition_topology() {
-    let stream = crate::stream::StreamConfig {
-        id: Some("concurrent".into()),
-        input: crate::input::InputConfig {
-            input_type: "vec".into(),
-            name: None,
-            codec: None,
-            config: None,
-        },
-        pipeline: crate::pipeline::PipelineConfig {
-            thread_num: 8,
-            processors: vec![],
-        },
-        output: crate::output::OutputConfig {
-            output_type: "collect".into(),
-            name: None,
-            codec: None,
-            config: None,
-        },
-        error_output: None,
-        buffer: None,
-        durability: None,
-        state: None,
-        temporary: None,
-    };
+    let mut stream = window_stream_config("concurrent", 8);
+    stream.buffer = None;
     let spec = crate::executor::stream_compiler::compile_stream(&stream, 0).unwrap();
     let concurrency = spec
         .sources
@@ -3795,6 +3832,97 @@ fn thread_num_does_not_change_source_partition_topology() {
         .filter(|task| task.operator_id == "source")
         .count();
     assert_eq!(source_tasks, 1, "the source stays a single task");
+}
+
+/// A stream with a tumbling-window buffer and the given pipeline thread_num.
+fn window_stream_config(id: &str, thread_num: u32) -> crate::stream::StreamConfig {
+    crate::stream::StreamConfig {
+        id: Some(id.into()),
+        input: crate::input::InputConfig {
+            input_type: "vec".into(),
+            name: None,
+            codec: None,
+            config: None,
+        },
+        pipeline: crate::pipeline::PipelineConfig {
+            thread_num,
+            processors: vec![],
+        },
+        output: crate::output::OutputConfig {
+            output_type: "collect".into(),
+            name: None,
+            codec: None,
+            config: None,
+        },
+        error_output: None,
+        buffer: Some(crate::buffer::BufferConfig {
+            buffer_type: "tumbling_window".into(),
+            name: None,
+            config: Some(serde_json::json!({
+                "interval": "1s",
+                "key_field": "key",
+                "timestamp_field": "ts",
+            })),
+        }),
+        durability: None,
+        state: Some(crate::job::StateSpec {
+            backend: "embedded_kv".into(),
+            durability: crate::job::StateDurability::Ephemeral,
+            root: None,
+            namespace: None,
+            ttl_ms: None,
+            format_version: 1,
+            max_pending_transactions: None,
+            max_bytes: None,
+        }),
+        temporary: None,
+    }
+}
+
+/// Spec: a window-buffered stream is single-parallelism; an explicitly
+/// configured thread_num above one is rejected at compile time instead of
+/// being silently clamped (the setting never took effect).
+#[test]
+fn window_stream_with_explicit_thread_num_above_one_is_rejected() {
+    // The compiler treats a thread_num equal to the machine's CPU-count
+    // DEFAULT as "not an explicit choice" (the old silent clamp). Pick a
+    // value no runner's CPU count can equal so the rejection path is
+    // deterministic on every machine.
+    let explicit = crate::pipeline::default_thread_num().saturating_add(7);
+    let error = crate::executor::stream_compiler::compile_stream(
+        &window_stream_config("windowed", explicit),
+        0,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("single-threaded") && error.contains(&format!("thread_num is {explicit}")),
+        "{error}"
+    );
+}
+
+/// Spec: the DEFAULT thread_num (CPU count) on a window stream is not an
+/// explicit choice — it compiles to single parallelism exactly as the old
+/// silent clamp behaved, and stays valid.
+#[test]
+fn window_stream_with_default_thread_num_compiles_single_parallelism() {
+    let stream = window_stream_config("windowed-default", crate::pipeline::default_thread_num());
+    let spec = crate::executor::stream_compiler::compile_stream(&stream, 0).unwrap();
+    // The parallelism key rides the source OPERATOR's config.
+    let concurrency = spec
+        .operators
+        .iter()
+        .find_map(|operator| {
+            operator
+                .config
+                .get("__arkflow_processor_parallelism")
+                .and_then(serde_json::Value::as_u64)
+        });
+    assert_eq!(
+        concurrency,
+        Some(1),
+        "the default thread_num compiles to the single-parallelism the clamp always used"
+    );
 }
 
 // ---------- ended-chain checkpoint exemption (repair-kernel-review-defects) ----------

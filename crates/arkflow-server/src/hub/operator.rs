@@ -12,13 +12,18 @@ impl Hub {
             if !expected.trim().is_empty() {
                 {
                     let supplied = supplied?;
-                    let (id, role, secret, scopes) = parse_operator_credential(expected);
-                    if bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
-                        return Some(OperatorPrincipal {
-                            id: id.to_owned(),
-                            roles: vec![role],
-                            scopes,
-                        });
+                    // A malformed structured credential (contains '|' but
+                    // fails to parse) is unmatchable by design; it must
+                    // never silently authenticate as Admin. Fall through to
+                    // the OIDC path below.
+                    if let Some((id, role, secret, scopes)) = parse_operator_credential(expected) {
+                        if bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
+                            return Some(OperatorPrincipal {
+                                id: id.to_owned(),
+                                roles: vec![role],
+                                scopes,
+                            });
+                        }
                     }
                     // A bearer that is not the static credential falls
                     // through to OIDC below (JWTs never ct_eq-match).

@@ -1244,8 +1244,21 @@ impl ExecutionGraphBuilder {
                 },
                 // Stateful and window operators own a mutable state epoch.
                 // Keep their chain single-threaded so a worker pool cannot
-                // interleave state updates or cross a checkpoint cut.
+                // interleave state updates or cross a checkpoint cut. An
+                // explicitly configured parallelism above one is rejected
+                // instead of silently ignored: the join operator takes its
+                // two side locks in either order (AB-BA), which is safe only
+                // because the whole chain runs on one worker.
                 processor_parallelism: if has_stateful_processor || has_join {
+                    if processor_parallelism.is_some_and(|value| value > 1) {
+                        return Err(Error::Config(format!(
+                            "chain starting at operator '{}' contains a join or stateful \
+                             operator and must run with processor parallelism 1; remove the \
+                             '__arkflow_processor_parallelism' override or move it to a chain \
+                             without stateful operators",
+                            first.operator_id
+                        )));
+                    }
                     1
                 } else {
                     processor_parallelism.unwrap_or(1)

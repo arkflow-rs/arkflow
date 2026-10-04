@@ -778,6 +778,72 @@ pub async fn read_frame_with_limits(
     Ok((header, payload))
 }
 
+/// Outcome of a tiered receipt-channel read: a full frame, or a
+/// dead-peer-idle timeout that raced a pending-batch registration and may be
+/// retried under the long budget without corrupting the byte stream.
+enum TieredFrame {
+    Frame((FrameHeader, Vec<u8>)),
+    /// The short (empty-pending) budget elapsed with zero bytes consumed,
+    /// and a registration appeared during the wait — restart the read; the
+    /// next pass uses the receipt-wait budget.
+    RacedIdleRestart,
+}
+
+/// Receipt-channel frame read with a two-level idle budget: a connection
+/// that still awaits receipts belongs to a (possibly slow) live downstream
+/// and gets the long budget; an idle one keeps fast dead-peer discovery.
+/// Zero bytes are consumed on the restart path, so retrying is framing-safe;
+/// after the first byte the frame always completes under the long budget.
+async fn read_receipt_frame(
+    reader: &mut (impl AsyncRead + Unpin),
+    max_frame_len: u32,
+    short_idle: std::time::Duration,
+    receipt_wait: std::time::Duration,
+    pending: &PendingReceipts,
+) -> Result<TieredFrame, Error> {
+    let had_pending = !pending.is_empty();
+    let budget = if had_pending {
+        receipt_wait
+    } else {
+        short_idle
+    };
+    let mut header_bytes = vec![0u8; FRAME_HEADER_LEN];
+    match timeout(budget, reader.read(&mut header_bytes[..1])).await {
+        Err(_) => {
+            if !had_pending && !pending.is_empty() {
+                return Ok(TieredFrame::RacedIdleRestart);
+            }
+            return Err(Error::Process(
+                "remote edge closed while reading header: read idle timeout".into(),
+            ));
+        }
+        Ok(Err(error)) => {
+            return Err(Error::Process(format!(
+                "remote edge closed while reading header: {error}"
+            )));
+        }
+        Ok(Ok(0)) => {
+            return Err(Error::Process(
+                "remote edge closed while reading header: early eof".into(),
+            ));
+        }
+        Ok(Ok(_)) => {}
+    }
+    read_exact_with_idle(reader, &mut header_bytes[1..], Some(receipt_wait))
+        .await
+        .map_err(|error| {
+            Error::Process(format!("remote edge closed while reading header: {error}"))
+        })?;
+    let header = FrameHeader::decode_with_max(&header_bytes, max_frame_len)?;
+    let mut payload = vec![0u8; header.len as usize];
+    read_exact_with_idle(reader, &mut payload, Some(receipt_wait))
+        .await
+        .map_err(|error| {
+            Error::Process(format!("remote edge closed while reading payload: {error}"))
+        })?;
+    Ok(TieredFrame::Frame((header, payload)))
+}
+
 async fn read_exact_with_idle(
     reader: &mut (impl AsyncRead + Unpin),
     buffer: &mut [u8],
@@ -1089,6 +1155,15 @@ pub struct NetworkManagerConfig {
     pub max_failure_queue: usize,
     pub max_frame_len: u32,
     pub read_idle_timeout: std::time::Duration,
+    /// Receipt-read idle budget while batches still await receipts. A slow
+    /// downstream withholds receipts for in-flight work; the short
+    /// `read_idle_timeout` is for dead-peer discovery on otherwise idle
+    /// connections and must not tear down a busy one.
+    pub receipt_wait_timeout: std::time::Duration,
+    /// Approximate byte budget for retained replay batches. Rejection takes
+    /// the existing send-failure path; the bound is an order-of-magnitude
+    /// guard, not an exact quota.
+    pub max_pending_bytes: u64,
     /// Bounded transparent reconnect: how many times an upstream edge
     /// redials the peer after a stream failure before failing the edge
     /// closed. 0 disables reconnect and preserves the immediate fail-closed
@@ -1118,6 +1193,8 @@ impl Default for NetworkManagerConfig {
             max_failure_queue: 1024,
             max_frame_len: MAX_FRAME_LEN,
             read_idle_timeout: std::time::Duration::from_secs(30),
+            receipt_wait_timeout: std::time::Duration::from_secs(10 * 60),
+            max_pending_bytes: 256 * 1024 * 1024,
             reconnect_attempts: 5,
             reconnect_grace: std::time::Duration::from_secs(10),
             registration_grace: std::time::Duration::from_secs(10),
@@ -1137,6 +1214,8 @@ impl NetworkManagerConfig {
             || self.max_failure_queue == 0
             || self.max_frame_len == 0
             || self.read_idle_timeout.is_zero()
+            || self.receipt_wait_timeout.is_zero()
+            || self.max_pending_bytes == 0
             || self.reconnect_grace.is_zero()
             || self.registration_grace.is_zero()
             || self.handshake_replay_ttl.is_zero()
@@ -1208,8 +1287,10 @@ impl crate::input::Ack for RemoteAck {
 
     fn mark_held(&self) {
         // Synchronous by trait contract (called from the Aligner's sync
-        // context).  A full failure queue must apply backpressure here rather
-        // than dropping the only signal that can cancel the affected Job.
+        // context).  A full failure queue must not block a tokio worker: a
+        // full queue means the drain side has already stalled, and the edge
+        // is torn down by the stalled read loop regardless.  Escalate
+        // non-blockingly and let the connection teardown carry the signal.
         if self
             .outbox
             .try_send((
@@ -1220,11 +1301,19 @@ impl crate::input::Ack for RemoteAck {
                 },
             ))
             .is_err()
+            && self
+                .failures
+                .try_send(Error::Process(format!(
+                    "remote edge receipt queue overflow for quad {:?}",
+                    self.quad
+                )))
+                .is_err()
         {
-            let _ = self.failures.send(Error::Process(format!(
-                "remote edge receipt queue overflow for quad {:?}",
-                self.quad
-            )));
+            tracing::error!(
+                quad = ?self.quad,
+                seq = self.seq,
+                "remote edge receipt queue and failure queue both full; dropping the overflow signal"
+            );
         }
     }
 
@@ -1239,11 +1328,19 @@ impl crate::input::Ack for RemoteAck {
                 },
             ))
             .is_err()
+            && self
+                .failures
+                .try_send(Error::Process(format!(
+                    "remote edge receipt queue overflow for quad {:?}",
+                    self.quad
+                )))
+                .is_err()
         {
-            let _ = self.failures.send(Error::Process(format!(
-                "remote edge receipt queue overflow for quad {:?}",
-                self.quad
-            )));
+            tracing::error!(
+                quad = ?self.quad,
+                seq = self.seq,
+                "remote edge receipt queue and failure queue both full; dropping the overflow signal"
+            );
         }
     }
 }
@@ -1255,6 +1352,9 @@ struct PendingBatch {
     /// completes; entries leave the map on completion, so an acknowledged
     /// frame never replays.
     replay: Option<crate::MessageBatchRef>,
+    /// Approximate Arrow memory of `replay`, accounted against the byte
+    /// budget while this entry lives in the map.
+    bytes: u64,
     remaining_replicas: usize,
     held_replicas: usize,
 }
@@ -1264,15 +1364,24 @@ struct PendingBatch {
 struct PendingReceipts {
     map: std::sync::Mutex<BTreeMap<u64, PendingBatch>>,
     next_seq: std::sync::atomic::AtomicU64,
+    pending_bytes: std::sync::atomic::AtomicU64,
     max_entries: usize,
+    max_pending_bytes: u64,
 }
 
 impl PendingReceipts {
+    #[cfg(test)]
     fn new(max_entries: usize) -> Self {
+        Self::with_byte_budget(max_entries, u64::MAX)
+    }
+
+    fn with_byte_budget(max_entries: usize, max_pending_bytes: u64) -> Self {
         Self {
             map: std::sync::Mutex::new(BTreeMap::new()),
             next_seq: std::sync::atomic::AtomicU64::new(0),
+            pending_bytes: std::sync::atomic::AtomicU64::new(0),
             max_entries,
+            max_pending_bytes,
         }
     }
 
@@ -1282,6 +1391,12 @@ impl PendingReceipts {
         replicas: usize,
         replay: Option<crate::MessageBatchRef>,
     ) -> Result<u64, Error> {
+        // Approximate Arrow memory (buffers + validity), an order-of-magnitude
+        // guard against a handful of huge retained batches blowing the heap.
+        let bytes = replay
+            .as_ref()
+            .map(|batch| batch.record_batch().get_array_memory_size() as u64)
+            .unwrap_or(0);
         let mut map = self.map.lock().expect("pending receipts lock");
         if map.len() >= self.max_entries {
             return Err(Error::Process(format!(
@@ -1289,19 +1404,37 @@ impl PendingReceipts {
                 self.max_entries
             )));
         }
+        let retained = self
+            .pending_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if retained.saturating_add(bytes) > self.max_pending_bytes {
+            return Err(Error::Process(format!(
+                "remote edge pending replay byte budget {} reached ({} bytes retained)",
+                self.max_pending_bytes, retained
+            )));
+        }
         let seq = self
             .next_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         map.insert(
             seq,
             PendingBatch {
                 branch: branch.clone(),
                 replay,
+                bytes,
                 remaining_replicas: replicas,
                 held_replicas: 0,
             },
         );
         Ok(seq)
+    }
+
+    /// Release a completed entry's byte accounting back to the budget.
+    fn release_bytes(&self, bytes: u64) {
+        self.pending_bytes
+            .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn is_empty(&self) -> bool {
@@ -1334,7 +1467,9 @@ impl PendingReceipts {
             ReceiptKind::Acked => {
                 pending.remaining_replicas = pending.remaining_replicas.saturating_sub(1);
                 if pending.remaining_replicas == 0 {
-                    let PendingBatch { branch, .. } = map.remove(&receipt.seq).expect("checked");
+                    let PendingBatch { branch, bytes, .. } =
+                        map.remove(&receipt.seq).expect("checked");
+                    self.release_bytes(bytes);
                     // Acknowledge off the read loop: a durable commit can
                     // block, and the connection must keep draining.
                     let failures = failures.clone();
@@ -1365,7 +1500,9 @@ impl PendingReceipts {
                 }
             }
             ReceiptKind::Failed => {
-                let PendingBatch { branch, .. } = map.remove(&receipt.seq).expect("checked");
+                let PendingBatch { branch, bytes, .. } =
+                    map.remove(&receipt.seq).expect("checked");
+                self.release_bytes(bytes);
                 // Abort off the read loop: branch compensation may block on
                 // journal/WAL undo, and the connection must keep draining.
                 let failures = failures.clone();
@@ -1385,6 +1522,12 @@ impl PendingReceipts {
     fn abort_all(&self) {
         let mut map = self.map.lock().expect("pending receipts lock");
         let drained: BTreeMap<u64, PendingBatch> = std::mem::take(&mut *map);
+        // The whole table is gone; zero the byte accounting so the budget
+        // cannot outlive the entries it was charging for (every caller drops
+        // or replaces this instance right after, but the invariant should
+        // not depend on instance death).
+        self.pending_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         for (_, pending) in drained {
             let branch = pending.branch;
             tokio::spawn(async move {
@@ -2113,7 +2256,10 @@ impl NetworkManager {
     ) -> RemoteEdge {
         let (sender, receiver) =
             flume::bounded::<super::envelope::Envelope>(self.config.channel_capacity);
-        let pending = Arc::new(PendingReceipts::new(self.config.max_pending_receipts));
+        let pending = Arc::new(PendingReceipts::with_byte_budget(
+                self.config.max_pending_receipts,
+                self.config.max_pending_bytes,
+            ));
         let session_key = auth
             .as_ref()
             .map(SessionAuth::edge_key)
@@ -2152,7 +2298,10 @@ impl NetworkManager {
     ) -> RemoteEdge {
         let (sender, receiver) =
             flume::bounded::<super::envelope::Envelope>(self.config.channel_capacity);
-        let pending = Arc::new(PendingReceipts::new(self.config.max_pending_receipts));
+        let pending = Arc::new(PendingReceipts::with_byte_budget(
+                self.config.max_pending_receipts,
+                self.config.max_pending_bytes,
+            ));
         self.outbound
             .write()
             .expect("outbound registry lock")
@@ -3071,39 +3220,56 @@ async fn run_edge_connection(
         loop {
             tokio::select! {
                 _ = cancelled.cancelled() => break,
-                frame = read_frame_with_limits(&mut reader, config.max_frame_len, Some(config.read_idle_timeout)) => match frame {
-                    Ok((header, payload)) if first_frame && receipt_auth.is_some() => {
-                        first_frame = false;
-                        let Some(auth) = receipt_auth.as_ref() else { unreachable!() };
-                        let result = if header.kind == FrameKind::Handshake && header.quad == auth.quad {
-                            serde_json::from_slice::<HandshakePayload>(&payload)
-                                .map_err(|error| Error::Process(format!("remote edge handshake acknowledgement malformed: {error}")))
-                                .and_then(|payload| auth.verify_server_ack(&payload))
+                frame = read_receipt_frame(
+                    &mut reader,
+                    config.max_frame_len,
+                    config.read_idle_timeout,
+                    config.receipt_wait_timeout,
+                    &receipt_pending,
+                ) => match frame {
+                    Ok(TieredFrame::RacedIdleRestart) => {
+                        // A pending registration raced the dead-peer timer;
+                        // the next iteration reads under the receipt-wait
+                        // budget.
+                        continue;
+                    }
+                    Ok(TieredFrame::Frame((header, payload))) => {
+                        if first_frame && receipt_auth.is_some() {
+                            first_frame = false;
+                            let Some(auth) = receipt_auth.as_ref() else {
+                                unreachable!()
+                            };
+                            let result = if header.kind == FrameKind::Handshake
+                                && header.quad == auth.quad
+                            {
+                                serde_json::from_slice::<HandshakePayload>(&payload)
+                                    .map_err(|error| Error::Process(format!("remote edge handshake acknowledgement malformed: {error}")))
+                                    .and_then(|payload| auth.verify_server_ack(&payload))
+                            } else {
+                                Err(Error::Process("remote edge receipt arrived before handshake acknowledgement".into()))
+                            };
+                            if let Err(error) = result {
+                                failure = Some(error);
+                                break;
+                            }
+                        } else if header.kind == FrameKind::Receipt {
+                            first_frame = false;
+                            if let Ok(receipt) = serde_json::from_slice::<ReceiptFrame>(&payload)
+                            {
+                                receipt_pending.apply(receipt, &receipt_failures);
+                            } else {
+                                failure = Some(Error::Process(
+                                    "remote edge receipt frame malformed".into(),
+                                ));
+                                break;
+                            }
                         } else {
-                            Err(Error::Process("remote edge receipt arrived before handshake acknowledgement".into()))
-                        };
-                        if let Err(error) = result {
-                            failure = Some(error);
+                            failure = Some(Error::Process(format!(
+                                "unexpected {:?} frame on a receipt channel",
+                                header.kind
+                            )));
                             break;
                         }
-                    }
-                    Ok((header, payload)) if header.kind == FrameKind::Receipt => {
-                        first_frame = false;
-                        if let Ok(receipt) = serde_json::from_slice::<ReceiptFrame>(&payload) {
-                            receipt_pending.apply(receipt, &receipt_failures);
-                        } else {
-                            failure = Some(Error::Process(
-                                "remote edge receipt frame malformed".into(),
-                            ));
-                            break;
-                        }
-                    }
-                    Ok((header, _)) => {
-                        failure = Some(Error::Process(format!(
-                            "unexpected {:?} frame on a receipt channel",
-                            header.kind
-                        )));
-                        break;
                     }
                     Err(error) => {
                         // A normal outbound close drops the writer half after
@@ -4210,6 +4376,142 @@ mod tests {
             failure.to_string().contains("pending receipt limit"),
             "{failure}"
         );
+
+        upstream.shutdown();
+        downstream.shutdown();
+    }
+
+    /// Spec: pending replay is bounded by an approximate byte budget: a
+    /// registration that would exceed the budget is rejected, and a
+    /// completed acknowledgement releases its accounting back to the budget.
+    #[tokio::test]
+    async fn pending_replay_byte_budget_rejects_and_releases() {
+        struct NoopAck;
+        #[async_trait::async_trait]
+        impl crate::input::Ack for NoopAck {
+            async fn ack(&self) -> Result<(), Error> {
+                Ok(())
+            }
+            async fn abort(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let batch = dictionary_batch(None);
+        let batch_bytes = batch.record_batch().get_array_memory_size() as u64;
+        let pending = PendingReceipts::with_byte_budget(64, batch_bytes);
+        let branch = Arc::new(NoopAck) as Arc<dyn crate::input::Ack>;
+        let (failures_tx, _failures_rx) = flume::unbounded::<Error>();
+
+        let first = pending
+            .register(&branch, 1, Some(Arc::new(batch)))
+            .expect("a single batch fits the budget");
+        let error = pending
+            .register(&branch, 1, Some(Arc::new(dictionary_batch(None))))
+            .expect_err("the second batch exceeds the budget");
+        assert!(
+            error.to_string().contains("byte budget"),
+            "{error}"
+        );
+        // Completing the first entry releases its bytes; a new registration
+        // of the same size fits again.
+        pending.apply(
+            ReceiptFrame {
+                kind: ReceiptKind::Acked,
+                seq: first,
+            },
+            &failures_tx,
+        );
+        // The ack runs on a spawned task; the map entry and its byte
+        // accounting are released synchronously before that task runs.
+        pending
+            .register(&branch, 1, Some(Arc::new(dictionary_batch(None))))
+            .expect("released bytes are available to new registrations");
+    }
+
+    /// Spec: a receipt-overflow escalation with BOTH queues full must not
+    /// synchronously block the calling (potentially tokio-worker) thread.
+    #[test]
+    fn receipt_overflow_escalation_does_not_block() {
+        let (outbox_tx, _outbox_rx) = flume::bounded::<(Quad, ReceiptFrame)>(1);
+        let (failures_tx, _failures_rx) = flume::bounded::<Error>(1);
+        // Fill both queues so both try_send paths fail.
+        outbox_tx
+            .send((
+                quad_a_to_b(),
+                ReceiptFrame {
+                    kind: ReceiptKind::Acked,
+                    seq: 0,
+                },
+            ))
+            .unwrap();
+        failures_tx.send(Error::Process("filler".into())).unwrap();
+        let ack = RemoteAck {
+            outbox: outbox_tx,
+            quad: quad_a_to_b(),
+            seq: 7,
+            failures: failures_tx,
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            crate::input::Ack::mark_held(&ack);
+            crate::input::Ack::release_held(&ack);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("mark_held/release_held must not block on full queues");
+        worker.join().expect("escalation thread finishes");
+    }
+
+    /// Spec: a connection with receipts still pending is a (possibly slow)
+    /// live downstream — the short dead-peer idle timeout must not tear it
+    /// down; only the long receipt-wait budget may.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn receipt_wait_budget_keeps_a_busy_connection_alive() {
+        let quad = quad_a_to_b();
+        let upstream_config = NetworkManagerConfig {
+            channel_capacity: 8,
+            read_idle_timeout: std::time::Duration::from_millis(200),
+            receipt_wait_timeout: std::time::Duration::from_secs(60),
+            reconnect_attempts: 0,
+            ..NetworkManagerConfig::default()
+        };
+        let upstream = NetworkManager::with_config(upstream_config).unwrap();
+        let downstream = NetworkManager::new(8);
+        upstream.spawn();
+        downstream.spawn();
+
+        let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+        downstream.register_inbound(quad, input_tx);
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        downstream.accept_stream(Box::new(server_side));
+        let edge = upstream.open_edge_with_stream(Box::new(client_side), quad);
+        let failures = upstream.failure_receiver();
+
+        // One delivered-but-unacknowledged envelope keeps a receipt pending.
+        edge.sender
+            .send_async(Envelope::Data(
+                Arc::new(dictionary_batch(None)),
+                Arc::new(RecordingAck::default()),
+            ))
+            .await
+            .unwrap();
+        let _ = next_envelope(&input_rx).await;
+
+        // Well past the 200ms dead-peer timeout, with the receipt still
+        // outstanding, the edge must remain usable.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        if let Ok(failure) = failures.try_recv() {
+            panic!("a busy edge must survive the dead-peer idle timeout: {failure}");
+        }
+        edge.sender
+            .send_async(Envelope::Data(
+                Arc::new(dictionary_batch(None)),
+                Arc::new(RecordingAck::default()),
+            ))
+            .await
+            .expect("the connection is still alive");
+        let _ = next_envelope(&input_rx).await;
 
         upstream.shutdown();
         downstream.shutdown();

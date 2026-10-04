@@ -157,6 +157,14 @@ pub struct Hub {
     /// back to node-id order until the next ranked placement, which is a
     /// legal re-placement (state restores per task attempt).
     placement_order: Arc<RwLock<BTreeMap<String, Vec<String>>>>,
+    /// Compiled `JobPlan` cache keyed by the job spec's content hash.
+    /// Reconcile ticks recompute declared allocations fleet-wide; without
+    /// the cache every tick re-parses and re-compiles every job's spec.
+    /// Spec change ⇒ hash change ⇒ guaranteed miss; bounded by a full
+    /// clear (placement needs no LRU precision).
+    plan_cache: Arc<
+        std::sync::Mutex<std::collections::HashMap<u64, Option<Arc<arkflow_core::job::JobPlan>>>>,
+    >,
     /// Per-node assignment fingerprint (sorted task-id set hash) of every
     /// dispatched job_start, keyed (job, node, generation). The dispatch-skip
     /// requires a matching fingerprint so a Succeeded start can never keep
@@ -242,6 +250,7 @@ impl Hub {
             job_versions: Arc::new(RwLock::new(BTreeMap::new())),
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
+            plan_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),
             command_metrics: Arc::new(CommandMetrics::default()),
             ha: HubHaConfig::default(),
@@ -300,6 +309,32 @@ impl Hub {
             .node_token
             .as_deref()
             .is_some_and(|token| !token.trim().is_empty())
+    }
+
+    /// A structured operator credential that fails to parse must stop
+    /// startup: at request time it is unmatchable by design (never Admin),
+    /// so the operator needs the configuration error surfaced here instead
+    /// of debugging a credential that never authenticates. The message is
+    /// redacted to a prefix — the full value is a secret.
+    pub fn validate_operator_credentials(&self) -> Result<(), String> {
+        if let Some(expected) = self.config.operator_token.as_deref() {
+            if !expected.trim().is_empty()
+                && expected.contains('|')
+                && parse_operator_credential(expected).is_none()
+            {
+                // No credential characters are echoed: the value is a
+                // secret, and even a short one (fully covered by any
+                // prefix) must not leak into logs.
+                return Err(format!(
+                    "operator credential ({} chars) looks structured \
+                     (id|role|secret[|scopes]) but fails to parse; fix the role name \
+                     (admin|operator|viewer) or the field count, or remove all '|' for \
+                     a plain static token",
+                    expected.chars().count()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Seconds this Hub process has been serving.

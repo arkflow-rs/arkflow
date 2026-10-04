@@ -936,13 +936,121 @@ pub struct StorageActor {
     leadership_epoch: Arc<AtomicU64>,
 }
 
+/// Current queue depth of the process's storage actor (buffered commands
+/// plus the one in flight), exported as `arkflow_storage_queue_depth`.
+pub(crate) static STORAGE_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+
+fn update_storage_queue_depth(probe: &mpsc::Sender<StorageCommand>) {
+    let depth = probe.max_capacity().saturating_sub(probe.capacity());
+    STORAGE_QUEUE_DEPTH.store(depth as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl StorageCommand {
+    /// Stable, low-cardinality command name for dispatch tracing.
+    fn label(&self) -> &'static str {
+        match self {
+            StorageCommand::ClaimAttempt { .. } => "claim_attempt",
+            StorageCommand::ClaimOutbox { .. } => "claim_outbox",
+            StorageCommand::CompleteAttempt { .. } => "complete_attempt",
+            StorageCommand::CreateRollout { .. } => "create_rollout",
+            StorageCommand::CreateRolloutWithContent { .. } => "create_rollout_with_content",
+            StorageCommand::DeleteJobCheckpoint { .. } => "delete_job_checkpoint",
+            StorageCommand::ExpireAttempts { .. } => "expire_attempts",
+            StorageCommand::Fenced { .. } => "fenced",
+            StorageCommand::GetConfigVersionContent { .. } => "get_config_version_content",
+            StorageCommand::GetDesired { .. } => "get_desired",
+            StorageCommand::GetIntent { .. } => "get_intent",
+            StorageCommand::GetJob { .. } => "get_job",
+            StorageCommand::GetJobUpgrade { .. } => "get_job_upgrade",
+            StorageCommand::GetNodeMaintenance { .. } => "get_node_maintenance",
+            StorageCommand::GetOperation { .. } => "get_operation",
+            StorageCommand::GetRollout { .. } => "get_rollout",
+            StorageCommand::ListAudit { .. } => "list_audit",
+            StorageCommand::ListEvents { .. } => "list_events",
+            StorageCommand::ListIntents { .. } => "list_intents",
+            StorageCommand::ListJobCheckpoints { .. } => "list_job_checkpoints",
+            StorageCommand::ListJobStartOperations { .. } => "list_job_start_operations",
+            StorageCommand::ListJobUpgrades { .. } => "list_job_upgrades",
+            StorageCommand::ListJobVersions { .. } => "list_job_versions",
+            StorageCommand::ListJobs { .. } => "list_jobs",
+            StorageCommand::ListOperations { .. } => "list_operations",
+            StorageCommand::ListRolloutTargets { .. } => "list_rollout_targets",
+            StorageCommand::ListRollouts { .. } => "list_rollouts",
+            StorageCommand::MarkAttemptDispatched { .. } => "mark_attempt_dispatched",
+            StorageCommand::MarkOutboxProcessed { .. } => "mark_outbox_processed",
+            StorageCommand::OperationalAggregates { .. } => "operational_aggregates",
+            StorageCommand::PruneAuditEvents { .. } => "prune_audit_events",
+            StorageCommand::PruneEvents { .. } => "prune_events",
+            StorageCommand::PruneJobCheckpointRecords { .. } => "prune_job_checkpoint_records",
+            StorageCommand::PruneJobUpgrades { .. } => "prune_job_upgrades",
+            StorageCommand::PruneOperationHistory { .. } => "prune_operation_history",
+            StorageCommand::PruneProcessedOutbox { .. } => "prune_processed_outbox",
+            StorageCommand::PruneTerminalAttempts { .. } => "prune_terminal_attempts",
+            StorageCommand::ReadHubLeaseSnapshot { .. } => "read_hub_lease_snapshot",
+            StorageCommand::RecordAudit { .. } => "record_audit",
+            StorageCommand::RecordObserved { .. } => "record_observed",
+            StorageCommand::RecoverJobUpgrades { .. } => "recover_job_upgrades",
+            StorageCommand::RecoverReconciliation { .. } => "recover_reconciliation",
+            StorageCommand::RecoverRollouts { .. } => "recover_rollouts",
+            StorageCommand::ReleaseHubLease { .. } => "release_hub_lease",
+            StorageCommand::RenewHubLease { .. } => "renew_hub_lease",
+            StorageCommand::ResetObservedCursors { .. } => "reset_observed_cursors",
+            StorageCommand::SetDesired { .. } => "set_desired",
+            StorageCommand::SetNodeMaintenance { .. } => "set_node_maintenance",
+            StorageCommand::TransitionJobUpgrade { .. } => "transition_job_upgrade",
+            StorageCommand::TryAcquireHubLease { .. } => "try_acquire_hub_lease",
+            StorageCommand::UpdateJob { .. } => "update_job",
+            StorageCommand::UpdateJobDesiredState { .. } => "update_job_desired_state",
+            StorageCommand::UpdateJobObservation { .. } => "update_job_observation",
+            StorageCommand::UpdateJobWithExpectedGeneration { .. } => "update_job_with_expected_generation",
+            StorageCommand::UpdateRollout { .. } => "update_rollout",
+            StorageCommand::UpdateRolloutTarget { .. } => "update_rollout_target",
+            StorageCommand::UpsertJob { .. } => "upsert_job",
+            StorageCommand::UpsertJobCheckpoint { .. } => "upsert_job_checkpoint",
+            StorageCommand::UpsertJobUpgrade { .. } => "upsert_job_upgrade",
+            StorageCommand::UpsertJobVersion { .. } => "upsert_job_version",
+            StorageCommand::UpsertNode { .. } => "upsert_node",
+            StorageCommand::UpsertOperation { .. } => "upsert_operation",
+            StorageCommand::WakeNode { .. } => "wake_node",
+
+        }
+    }
+}
+
 impl StorageActor {
     pub fn start(store: ControlPlaneStore, capacity: usize) -> Self {
         let (sender, mut receiver) = mpsc::channel(capacity.max(1));
         let leadership_epoch = Arc::new(AtomicU64::new(UNFENCED));
+        // A sender clone probes the queue depth without instrumenting every
+        // call site; the gauge lags by at most one dispatch.
+        let depth_probe = sender.clone();
+        let runtime = tokio::runtime::Handle::current();
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
-                dispatch(&store, command).await;
+                update_storage_queue_depth(&depth_probe);
+                let label = command.label();
+                let started = std::time::Instant::now();
+                // The SQLite backend's methods are synchronous rusqlite
+                // calls (busy_timeout can block for seconds); running them
+                // on the async driver would park a tokio worker and
+                // head-of-line block the whole actor. Drive the unchanged
+                // dispatch future from the blocking pool instead — FIFO
+                // execution and the Postgres (true-async) path are
+                // unaffected.
+                let store = store.clone();
+                let runtime = runtime.clone();
+                let outcome =
+                    tokio::task::spawn_blocking(move || runtime.block_on(dispatch(&store, command)))
+                        .await;
+                if let Err(error) = outcome {
+                    tracing::error!(%error, "storage actor command panicked");
+                }
+                tracing::debug!(
+                    command = label,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "storage command dispatched"
+                );
+                update_storage_queue_depth(&depth_probe);
             }
         });
         Self {

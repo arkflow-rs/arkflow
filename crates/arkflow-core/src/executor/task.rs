@@ -557,21 +557,26 @@ async fn run_source_chain(
                         }
                     }
                 }
-                let positions = match source.current_positions().await {
-                    Ok(positions) => positions,
-                    Err(error) => {
-                        // Fail the round closed: seeding the frontier with an
-                        // empty vec would seal stale (or first-round empty)
-                        // positions while the reported error races the report
-                        // drain and can be lost. The barrier is consumed but
-                        // not sealed and not forwarded, like the drain
-                        // timeout, so no cut can persist positions this chain
-                        // cannot vouch for.
-                        if let Some(reporter) = &hook.failure_reporter {
-                            let _ = reporter.send(error);
-                        }
-                        continue;
+                let positions = tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return shutdown_source_chain(chain, hook).await;
                     }
+                    positions = source.current_positions() => match positions {
+                        Ok(positions) => positions,
+                        Err(error) => {
+                            // Fail the round closed: seeding the frontier with an
+                            // empty vec would seal stale (or first-round empty)
+                            // positions while the reported error races the report
+                            // drain and can be lost. The barrier is consumed but
+                            // not sealed and not forwarded, like the drain
+                            // timeout, so no cut can persist positions this chain
+                            // cannot vouch for.
+                            if let Some(reporter) = &hook.failure_reporter {
+                                let _ = reporter.send(error);
+                            }
+                            continue;
+                        }
+                    },
                 };
                 let (watermark_ms, watermark_partitions) = hook
                     .event_time_gate
@@ -597,12 +602,25 @@ async fn run_source_chain(
                 // yields this source loop and does not block the async
                 // runtime's worker threads.
                 let state = match hook.state.clone() {
-                    Some(backend) => super::barrier::snapshot_state(backend).await,
+                    Some(backend) => tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            return shutdown_source_chain(chain, hook).await;
+                        }
+                        state = super::barrier::snapshot_state(backend) => state,
+                    },
                     None => Ok(crate::state::StateSnapshot::new(1, Vec::new())),
                 };
                 match state {
                     Ok(state) => {
-                        send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
+                        tokio::select! {
+                            _ = cancellation.cancelled() => {
+                                return shutdown_source_chain(chain, hook).await;
+                            }
+                            result = send_downstream(
+                                chain,
+                                Envelope::Barrier(barrier.clone()),
+                            ) => result?,
+                        }
                         if let Some(reporter) = &hook.reporter {
                             let task_id = hook
                                 .task_id
@@ -625,7 +643,15 @@ async fn run_source_chain(
                         if let Some(reporter) = &hook.failure_reporter {
                             let _ = reporter.send(error);
                         }
-                        send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
+                        tokio::select! {
+                            _ = cancellation.cancelled() => {
+                                return shutdown_source_chain(chain, hook).await;
+                            }
+                            result = send_downstream(
+                                chain,
+                                Envelope::Barrier(barrier.clone()),
+                            ) => result?,
+                        }
                     }
                 }
                 continue;
@@ -1409,7 +1435,7 @@ async fn run_interior_chain_loop(
         };
         let envelope = match read {
             Ok(envelope) => envelope,
-            Err(Error::Process(message)) if message == "input channel closed" => {
+            Err(Error::InputChannelClosed) => {
                 // Producer dropped its sender: end-of-stream for this channel.
                 // Treat closure as an explicit EOS so processors flush and
                 // downstream sinks observe the same terminal ordering as a
@@ -2555,7 +2581,7 @@ async fn recv_envelope(
         Ok(envelope) => (index, Ok(envelope)),
         // A closed channel is end-of-stream when the producer finished; only
         // a mid-flight cancellation surfaces it as an error via the caller.
-        Err(_) => (index, Err(Error::Process("input channel closed".into()))),
+        Err(_) => (index, Err(Error::InputChannelClosed)),
     }
 }
 
@@ -4929,6 +4955,26 @@ mod task_loop_tests {
         seen: Arc<AtomicUsize>,
     }
 
+    /// A source whose `current_positions` never resolves: the barrier branch
+    /// parks inside the positions await until cancellation.
+    struct ParkingPositionsSource;
+
+    #[async_trait]
+    impl crate::input::Input for ParkingPositionsSource {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn Ack>), Error> {
+            std::future::pending().await
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn current_positions(&self) -> Result<Vec<crate::checkpoint::SourcePosition>, Error> {
+            std::future::pending().await
+        }
+    }
+
     #[async_trait]
     impl Processor for RetainAckProcessor {
         async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
@@ -5156,6 +5202,36 @@ mod task_loop_tests {
         token.cancel();
         let result = settle(task).await;
         assert!(result.is_ok(), "an aborted round must not fail the chain: {result:?}");
+    }
+
+    // ---------- source loop: cancellation inside the barrier branch ----------
+
+    /// A barrier branch parked on `current_positions` (or the snapshot and
+    /// barrier-delivery awaits that follow it) must observe the Job's
+    /// cancellation token and take the clean shutdown path instead of
+    /// parking the branch forever.
+    #[tokio::test]
+    async fn cancellation_during_barrier_positions_wait_unblocks_the_chain() {
+        let mut chain = Chain::for_pool_test(1, vec![]);
+        chain.task_ids = vec!["src".into()];
+        chain.source = Some(Arc::new(ParkingPositionsSource));
+        let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
+        let hook = CheckpointHook {
+            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_chain(chain, hook, token.clone()));
+        barrier_tx
+            .send_async(barrier("c-1", 1))
+            .await
+            .expect("barrier queued");
+        // Let the branch park inside the positions await, then cancel: the
+        // chain must settle through the shutdown path, not hang.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        token.cancel();
+        let result = settle(task).await;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     // ---------- source loop: cancellation during reconnect backoff ----------
