@@ -569,6 +569,34 @@ mod retraction_tests {
         }
     }
 
+    /// Serializes the two tests that touch the process-global
+    /// `ARKFLOW_CONFIG_HISTORY_DIR` (and restores it via RAII): a parallel
+    /// sibling constructing a ControlPlane while the override is active
+    /// would silently redirect its version history into the temp dir.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvOverride<'a> {
+        _guard: std::sync::MutexGuard<'a, ()>,
+    }
+
+    impl Drop for EnvOverride<'_> {
+        fn drop(&mut self) {
+            std::env::remove_var("ARKFLOW_CONFIG_HISTORY_DIR");
+        }
+    }
+
+    fn override_history_dir(directory: &tempfile::TempDir) -> EnvOverride<'static> {
+        // Take the lock BEFORE publishing the variable so a sibling test
+        // holding it cannot observe the override mid-flight; Drop clears
+        // the variable even on panic.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        std::env::set_var(
+            "ARKFLOW_CONFIG_HISTORY_DIR",
+            directory.path().as_os_str(),
+        );
+        EnvOverride { _guard }
+    }
+
     fn engine() -> crate::engine::Engine {
         crate::engine::Engine::new(EngineConfig {
             streams: vec![],
@@ -597,7 +625,9 @@ mod retraction_tests {
     /// Spec: a version whose runtime application fails is retracted, so the
     /// history only contains versions that were actually active.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the cross-await hold IS the serialization
     async fn failed_apply_retracts_the_never_active_version() {
+        let _serialization = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let _ = crate::input::register_input_builder(
             "cp-retraction-input",
             Arc::new(SecondBuildFailsInputBuilder),
@@ -666,12 +696,7 @@ mod retraction_tests {
             Arc::new(DevNullOutputBuilder),
         );
         let directory = tempfile::tempdir().unwrap();
-        // SAFETY: process-global for the duration of the assertion; sibling
-        // tests only use the default when the variable is absent.
-        std::env::set_var(
-            "ARKFLOW_CONFIG_HISTORY_DIR",
-            directory.path().as_os_str(),
-        );
+        let _env = override_history_dir(&directory);
         let engine = engine();
         let control_plane = engine.control_plane();
         let candidate = crate::configuration::ConfigCandidate {
@@ -687,9 +712,10 @@ mod retraction_tests {
             .to_string(),
             content_verbatim: None,
         };
-        let applied = control_plane.apply_configuration(&candidate).await;
-        std::env::remove_var("ARKFLOW_CONFIG_HISTORY_DIR");
-        applied.expect("apply succeeds");
+        control_plane
+            .apply_configuration(&candidate)
+            .await
+            .expect("apply succeeds");
         let versions = control_plane.version_store().list().unwrap();
         assert_eq!(versions.len(), 1, "the applied version is retained");
         let entries = std::fs::read_dir(directory.path()).unwrap().count();

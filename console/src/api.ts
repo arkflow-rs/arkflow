@@ -323,6 +323,15 @@ function requestSignal(init?: RequestInit): AbortSignal | undefined {
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const correlationId = `console-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const signal = requestSignal(init)
+  // The timeout signal covers the FULL exchange: fetch resolves on headers,
+  // and a stalled body rejects `response.json()` with the same
+  // TimeoutError, so every read stays inside the translated window.
+  const timeoutError = () =>
+    Object.assign(new Error(translate(currentLocale(), 'api.requestTimeout')), {
+      code: 'request_timeout',
+      correlation_id: correlationId,
+      status: 0,
+    })
   let response: Response
   try {
     response = await fetch(`${base}${path}`, {
@@ -337,31 +346,39 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'TimeoutError') {
-      throw Object.assign(new Error(translate(currentLocale(), 'api.requestTimeout')), {
-        code: 'request_timeout',
-        correlation_id: correlationId,
-        status: 0,
-      })
+      throw timeoutError()
     }
     throw error
   }
-  if (!response.ok) {
-    if (response.status === 401 && !token) {
-      void redirectToOidcLogin()
+  let body: unknown
+  try {
+    if (!response.ok) {
+      if (response.status === 401 && !token) {
+        void redirectToOidcLogin()
+      }
+      const errorBody = (await response.json().catch(() => ({}))) as Partial<ApiError>
+      throw Object.assign(
+        new Error(
+          errorBody.message ?? translate(currentLocale(), 'api.requestFailed', { status: response.status }),
+        ),
+        {
+          code: errorBody.code ?? 'request_failed',
+          field: errorBody.field,
+          stream_id: errorBody.stream_id,
+          correlation_id:
+            errorBody.correlation_id ?? response.headers.get('x-correlation-id') ?? correlationId,
+          status: response.status,
+        },
+      )
     }
-    const body = (await response.json().catch(() => ({}))) as Partial<ApiError>
-    throw Object.assign(
-      new Error(body.message ?? translate(currentLocale(), 'api.requestFailed', { status: response.status })),
-      {
-        code: body.code ?? 'request_failed',
-        field: body.field,
-        stream_id: body.stream_id,
-        correlation_id: body.correlation_id ?? response.headers.get('x-correlation-id') ?? correlationId,
-        status: response.status,
-      },
-    )
+    body = response.status === 204 ? undefined : await response.json()
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      throw timeoutError()
+    }
+    throw error
   }
-  return response.status === 204 ? (undefined as T) : ((await response.json()) as T)
+  return body as T
 }
 export const api = {
   system: () => request<SystemResource>('/system'),
@@ -523,20 +540,40 @@ export function streamEvents(
   void (async () => {
     let lastEventId: string | undefined
     while (!controller.signal.aborted) {
+      let deliveredAnyEvent = false
       try {
-        const response = await fetch(`${base}${path}`, {
-          headers: {
-            Accept: 'text/event-stream',
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-            ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
-          },
-          signal: controller.signal,
+        // Bound only the CONNECTION phase: a pending connect (black-holed
+        // Hub) must fall into the catch/backoff path instead of parking
+        // until the caller's cleanup aborts the controller. Once headers
+        // arrive the timer is cleared — the event stream itself may stay
+        // open indefinitely.
+        let connectTimer: number | undefined
+        const connectDeadline = new Promise<never>((_, reject) => {
+          connectTimer = window.setTimeout(
+            () => reject(new DOMException('sse connect timeout', 'TimeoutError')),
+            REQUEST_TIMEOUT_MS,
+          )
         })
+        let response: Response
+        try {
+          response = await Promise.race([
+            fetch(`${base}${path}`, {
+              headers: {
+                Accept: 'text/event-stream',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
+              },
+              signal: controller.signal,
+            }),
+            connectDeadline,
+          ])
+        } finally {
+          if (connectTimer !== undefined) window.clearTimeout(connectTimer)
+        }
         if (!response.ok || !response.body) {
           throw new Error(translate(currentLocale(), 'api.sseConnectionFailed', { status: response.status }))
         }
         onState?.('connected')
-        backoffMs = SSE_BACKOFF_FLOOR_MS
         const reader = response.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
@@ -547,6 +584,7 @@ export function streamEvents(
           if (eventType !== 'resync') {
             try {
               onEvent(JSON.parse(data) as ControlEvent)
+              deliveredAnyEvent = true
             } catch {
               /* bounded server payload; ignore malformed frames */
             }
@@ -574,7 +612,12 @@ export function streamEvents(
       }
       if (!controller.signal.aborted) {
         await new Promise((resolve) => window.setTimeout(resolve, backoffMs))
-        backoffMs = Math.min(backoffMs * 2, SSE_BACKOFF_MAX_MS)
+        // Reset the ladder only once the connection actually DELIVERED an
+        // event: a Hub that accepts the connection but closes before any
+        // frame is still unhealthy and must keep backing off, instead of
+        // reconnecting once per second forever.
+        backoffMs =
+          deliveredAnyEvent ? SSE_BACKOFF_FLOOR_MS : Math.min(backoffMs * 2, SSE_BACKOFF_MAX_MS)
       }
     }
   })()

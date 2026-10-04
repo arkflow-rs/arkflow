@@ -870,21 +870,24 @@ impl ColumnarWindowOperator {
     /// `persist_buffers_for_fired` (an evicted key is no longer "current").
     /// Returns the evicted keys so the caller can drop them from its
     /// touched-key set instead of staging fresh transactions for them.
+    /// Core eviction: drop whole buffers oldest-window-first until at or
+    /// under the cap, skipping every key in `protected` (pending
+    /// acknowledgements, current-batch memberships, and session re-key
+    /// targets — evicting any of those either strands an acknowledgement on
+    /// a missing buffer or drops the very aggregate this batch is building).
+    /// When protection covers everything the eviction is best-effort and
+    /// the map may stay over cap; that overshoot is bounded by one batch's
+    /// insertions and beats the alternatives (stranding or dropping the
+    /// live batch).
     fn evict_overflowed_buffers(
         &self,
         buffers: &mut BTreeMap<(i64, String), AggregateBuffer>,
+        protected: &BTreeSet<(i64, String)>,
     ) -> BTreeSet<(i64, String)> {
         let cap = self.config.max_buffered_keys;
         if buffers.len() <= cap {
             return BTreeSet::new();
         }
-        let protected = self
-            .pending_acks
-            .lock()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
         let mut evicted_keys = BTreeSet::new();
         while buffers.len() > cap {
             let Some(victim) = buffers
@@ -923,6 +926,23 @@ impl ColumnarWindowOperator {
             log.1 = suppressed;
         }
         evicted_keys
+    }
+
+    /// `protected` = pending acknowledgements plus the caller's extra
+    /// protected keys (current-batch memberships / re-key targets).
+    fn eviction_protection(
+        &self,
+        extra: &BTreeSet<(i64, String)>,
+    ) -> BTreeSet<(i64, String)> {
+        let mut protected = self
+            .pending_acks
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        protected.extend(extra.iter().cloned());
+        protected
     }
 
     /// All windows containing one event time. Tumbling yields one;
@@ -1274,6 +1294,7 @@ impl ColumnarWindowOperator {
         let current_watermark = *self.watermark_ms.lock().unwrap();
         let mut touched = BTreeSet::new();
         let mut session_rekeys = Vec::new();
+        let mut evicted_inline: BTreeSet<(i64, String)> = BTreeSet::new();
         let mut legacy_rows = BTreeMap::<(i64, String), Vec<usize>>::new();
         for row in 0..batch.len() {
             let (Some(event_time), Some(key)) = (&timestamps[row], &keys[row]) else {
@@ -1475,6 +1496,19 @@ impl ColumnarWindowOperator {
                 } else {
                     entry.observe_i64(1);
                 }
+                // Enforce the entry cap DURING accumulation (after this
+                // membership's mutation): a wide sliding batch can create
+                // millions of memberships inside one call, and deferring
+                // eviction to the end would let that transient blow past the
+                // cap (and the heap) before it runs. `touched` already
+                // contains this membership, so the current batch is never
+                // its own victim. The per-row membership fan-out itself is
+                // bounded at validate time (pathological sliding ratios are
+                // rejected).
+                if buffers.len() > self.config.max_buffered_keys {
+                    let protection = self.eviction_protection(&touched);
+                    evicted_inline.extend(self.evict_overflowed_buffers(&mut buffers, &protection));
+                }
             }
         }
         if self.config.legacy_payload && !touched.is_empty() {
@@ -1519,14 +1553,26 @@ impl ColumnarWindowOperator {
         // acknowledgements move to the merged key here, so the eviction sees
         // them under the merged key and can never strand them on an evicted
         // buffer (stranded acknowledgements freeze the checkpoint frontier —
-        // the barrier drain waits for them forever).
-        let evicted_keys = {
+        // the barrier drain waits for them forever). The current batch's
+        // memberships are protected too: evicting one would acknowledge the
+        // delivery while dropping the aggregate it just built.
+        let mut evicted_keys = evicted_inline;
+        {
             let mut buffers = self.buffers.lock().unwrap();
-            self.evict_overflowed_buffers(&mut buffers)
-        };
+            if buffers.len() > self.config.max_buffered_keys {
+                let protection = self.eviction_protection(&touched);
+                evicted_keys.extend(self.evict_overflowed_buffers(&mut buffers, &protection));
+            }
+        }
+        // A key evicted mid-batch can be re-created by a later row; only
+        // keys with no surviving buffer drop out of `touched` (their
+        // acknowledgements must not be held for an aggregate that no longer
+        // exists).
+        let survivors: BTreeSet<(i64, String)> =
+            self.buffers.lock().unwrap().keys().cloned().collect();
         let touched = touched
             .into_iter()
-            .filter(|key| !evicted_keys.contains(key))
+            .filter(|key| !evicted_keys.contains(key) || survivors.contains(key))
             .collect::<Vec<_>>();
         // A journal transaction represents a dirty working buffer. Create it
         // at the mutation boundary so persistence does not manufacture a new

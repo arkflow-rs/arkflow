@@ -206,6 +206,12 @@ impl Hub {
         spec_json.hash(&mut hasher);
         let key = hasher.finish();
         let mut cache = self.plan_cache.lock().expect("plan cache lock");
+        // Look up before any capacity reset: clearing first would discard
+        // entries that are about to be hits, forcing a recompile of exactly
+        // the plans the cache exists to keep.
+        if let Some(plan) = cache.get(&key) {
+            return plan.clone();
+        }
         if cache.len() >= 1024 {
             cache.clear();
         }

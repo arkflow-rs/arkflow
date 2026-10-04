@@ -1476,19 +1476,17 @@ mod tests {
 
         // Rotate the provider table: the old kid disappears entirely.
         mock.set_body(jwks_body(&["test-key-2"]));
-        // Wait for at least one PERIODIC fetch on top of the initial lazy one.
+        // Wait for the OUTCOME, not the fetch count: the mock counts a fetch
+        // before the refresher stores the parsed table, so a count-based
+        // gate races the cache swap and flakes. The refresh cadence is
+        // 100ms, so a 5s deadline holds even on a loaded runner.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while mock.fetch_count() < 2 {
+        while auth.authenticate(&old_token).await.is_some() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "periodic refresh must keep fetching"
+                "the periodic refresh must revoke the rotated-away kid"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-
-        assert!(
-            auth.authenticate(&old_token).await.is_none(),
-            "a kid the provider rotated away must be revoked after the periodic refresh"
-        );
     }
 }

@@ -322,9 +322,11 @@ impl Hub {
                 && expected.contains('|')
                 && parse_operator_credential(expected).is_none()
             {
-                let redacted: String = expected.chars().take(8).collect();
+                // No credential characters are echoed: the value is a
+                // secret, and even a short one (fully covered by any
+                // prefix) must not leak into logs.
                 return Err(format!(
-                    "operator credential '{redacted}…' ({} chars) looks structured \
+                    "operator credential ({} chars) looks structured \
                      (id|role|secret[|scopes]) but fails to parse; fix the role name \
                      (admin|operator|viewer) or the field count, or remove all '|' for \
                      a plain static token",
