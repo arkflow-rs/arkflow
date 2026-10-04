@@ -2057,7 +2057,7 @@ impl NetworkManager {
     /// Injects an accepted stream (server side). The TCP listener task calls
     /// this per `TcpStream`; tests inject duplex halves.
     pub fn accept_stream(&self, stream: Box<dyn RemoteStream>) {
-        let current = self.active_connections.fetch_update(
+        let current = self.active_connections.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Relaxed,
             |count| (count < self.config.max_connections).then_some(count + 1),

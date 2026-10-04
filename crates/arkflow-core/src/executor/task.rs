@@ -5640,9 +5640,15 @@ mod task_loop_tests {
         )))
         .await
         .unwrap_err();
+        // The same fatal ack failure races to be observed first through one of
+        // two surfaces: the chain loop's failure arm ("ack failed") or the
+        // control fence noticing the pool's failure flag. Scheduler order
+        // decides, so both are valid proofs that the failure surfaced.
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("ack failed"),
-            "the fatal failure must propagate through the failure arm: {error}"
+            message.contains("ack failed")
+                || message.contains("worker pool failed before control fence"),
+            "the fatal failure must surface: {error}"
         );
         assert!(probe.aborts.load(Ordering::SeqCst) >= 1);
     }
