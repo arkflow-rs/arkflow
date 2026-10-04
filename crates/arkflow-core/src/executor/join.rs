@@ -22,10 +22,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
-use datafusion::arrow::array::{
-    new_null_array, ArrayRef, Int64Array, StringArray, UInt32Array,
-};
 use datafusion::arrow::array::Array as _;
+use datafusion::arrow::array::{new_null_array, ArrayRef, Int64Array, StringArray, UInt32Array};
 use datafusion::arrow::compute::interleave;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -134,7 +132,9 @@ impl JoinOperatorConfig {
             ));
         }
         if self.ttl_ms < 0 {
-            return Err(Error::Config("join operator ttl_ms must be non-negative".into()));
+            return Err(Error::Config(
+                "join operator ttl_ms must be non-negative".into(),
+            ));
         }
         if self.max_per_key == 0 {
             return Err(Error::Config(
@@ -202,7 +202,9 @@ impl SideBuffer {
     /// still match. Returns the evicted rows with their keys so outer forms
     /// can emit the never-matched ones.
     fn evict(&mut self, watermark_ms: i64, window_ms: i64, ttl_ms: i64) -> Vec<MatchedRow> {
-        let bound = watermark_ms.saturating_sub(window_ms).saturating_sub(ttl_ms);
+        let bound = watermark_ms
+            .saturating_sub(window_ms)
+            .saturating_sub(ttl_ms);
         let mut evicted = Vec::new();
         for (key, queue) in self.by_key.iter_mut() {
             while queue.front().is_some_and(|row| row.timestamp_ms < bound) {
@@ -363,10 +365,7 @@ impl JoinOperator {
     /// feeding the join from more than one subtask is rejected here, at
     /// graph-build time, instead of failing on the first untagged batch at
     /// runtime.
-    pub fn with_input_producers(
-        mut self,
-        producers: &[String],
-    ) -> Result<Self, Error> {
+    pub fn with_input_producers(mut self, producers: &[String]) -> Result<Self, Error> {
         let resolve = |declared: &Option<String>,
                        fallback: usize,
                        side: &str|
@@ -433,7 +432,9 @@ impl JoinOperator {
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                Error::Config(format!("join key column '{column}' must be a string column"))
+                Error::Config(format!(
+                    "join key column '{column}' must be a string column"
+                ))
             })?;
         if values.is_null(row) {
             return Err(Error::Config(format!(
@@ -459,7 +460,9 @@ impl JoinOperator {
             .as_any()
             .downcast_ref::<UInt32Array>()
             .ok_or_else(|| {
-                Error::Config(format!("column '{META_INPUT_INDEX}' must be a UInt32 column"))
+                Error::Config(format!(
+                    "column '{META_INPUT_INDEX}' must be a UInt32 column"
+                ))
             })?;
         if values.is_null(row) {
             return Err(Error::Config(format!(
@@ -512,7 +515,11 @@ impl JoinOperator {
         )))
     }
 
-    fn remember_schema(side: &mut SideBuffer, batch: &MessageBatch, label: &str) -> Result<(), Error> {
+    fn remember_schema(
+        side: &mut SideBuffer,
+        batch: &MessageBatch,
+        label: &str,
+    ) -> Result<(), Error> {
         let schema = batch.record_batch().schema();
         if let Some(seen) = &side.schema {
             if !seen.fields().iter().eq(schema.fields().iter()) {
@@ -539,17 +546,22 @@ impl JoinOperator {
             let arrays: Vec<&dyn datafusion::arrow::array::Array> = rows
                 .iter()
                 .map(|matched| {
-                    matched.row.batch.record_batch().column(index) as &dyn datafusion::arrow::array::Array
+                    matched.row.batch.record_batch().column(index)
+                        as &dyn datafusion::arrow::array::Array
                 })
                 .collect();
-            let indices: Vec<(usize, usize)> =
-                rows.iter().map(|matched| (0usize, matched.row.row)).collect();
+            let indices: Vec<(usize, usize)> = rows
+                .iter()
+                .map(|matched| (0usize, matched.row.row))
+                .collect();
             let array = interleave(&arrays, &indices)
                 .map_err(|error| Error::Process(format!("join gather failed: {error}")))?;
             columns.push(array);
         }
         columns.push(Arc::new(StringArray::from(
-            rows.iter().map(|matched| matched.key.as_str()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|matched| matched.key.as_str())
+                .collect::<Vec<_>>(),
         )));
         let mut fields: Vec<Field> = schema
             .fields()
@@ -574,14 +586,9 @@ impl JoinOperator {
         join_type: JoinType,
     ) -> Result<MessageBatch, Error> {
         let this_batch = Self::gather(rows, this_schema)?;
-        let join_key = this_batch
-            .column(this_batch.num_columns() - 1)
-            .clone();
-        let this_block = block_from_batch(
-            &this_batch,
-            side.prefix(),
-            join_type.nullable_side(side),
-        );
+        let join_key = this_batch.column(this_batch.num_columns() - 1).clone();
+        let this_block =
+            block_from_batch(&this_batch, side.prefix(), join_type.nullable_side(side));
         let opposite_block = null_block(
             opposite_schema,
             side.opposite().prefix(),
@@ -703,10 +710,13 @@ impl JoinOperator {
             Side::Left => self.config.left_key.clone(),
             Side::Right => self.config.right_key.clone(),
         };
-        let (this_label, other_label) = (side.label(), match side {
-            Side::Left => "right",
-            Side::Right => "left",
-        });
+        let (this_label, other_label) = (
+            side.label(),
+            match side {
+                Side::Left => "right",
+                Side::Right => "left",
+            },
+        );
         let mut this_side = match side {
             Side::Left => self.left.lock(),
             Side::Right => self.right.lock(),
@@ -1020,7 +1030,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(keys.iter().map(|k| Some(*k)).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    keys.iter().map(|k| Some(*k)).collect::<Vec<_>>(),
+                )),
                 Arc::new(Int64Array::from(timestamps.to_vec())),
                 Arc::new(UInt32Array::from(vec![side; keys.len()])),
             ],
@@ -1075,7 +1087,9 @@ mod tests {
         let join = JoinOperator::new(config()).unwrap();
         join.process(side_batch(0, &["a"], &[100])).await.unwrap();
         assert!(matches!(
-            join.process(side_batch(1, &["a"], &[20_000])).await.unwrap(),
+            join.process(side_batch(1, &["a"], &[20_000]))
+                .await
+                .unwrap(),
             ProcessResult::None
         ));
     }
@@ -1108,7 +1122,9 @@ mod tests {
         let mut cfg = config();
         cfg.max_per_key = 1;
         let join = JoinOperator::new(cfg).unwrap();
-        join.process(side_batch(0, &["a", "a"], &[100, 200])).await.unwrap();
+        join.process(side_batch(0, &["a", "a"], &[100, 200]))
+            .await
+            .unwrap();
         // The first row was evicted; only the second can match.
         let output = join.process(side_batch(1, &["a"], &[200])).await.unwrap();
         let ProcessResult::Single(batch) = output else {
@@ -1438,7 +1454,9 @@ mod tests {
         let mut cfg = outer_config(JoinType::LeftOuter);
         cfg.max_per_key = 1;
         let join = JoinOperator::new(cfg).unwrap();
-        join.process(side_batch(0, &["a", "b"], &[100, 200])).await.unwrap();
+        join.process(side_batch(0, &["a", "b"], &[100, 200]))
+            .await
+            .unwrap();
         // Both rows evict while the right schema is unknown: the pending
         // queue is bounded by max_per_key, so the older row ("a") drops.
         assert!(matches!(
@@ -1456,9 +1474,7 @@ mod tests {
     /// Recovery replays inputs into a fresh operator instance; feeding the
     /// same ordered sequence twice must reproduce identical emissions
     /// (matched pairs and unmatched rows alike).
-    async fn run_outer_sequence(
-        join: &JoinOperator,
-    ) -> Vec<(String, Option<String>)> {
+    async fn run_outer_sequence(join: &JoinOperator) -> Vec<(String, Option<String>)> {
         let mut seen = Vec::new();
         let mut record = |result: ProcessResult| match result {
             ProcessResult::None => {}
@@ -1490,8 +1506,16 @@ mod tests {
         };
         // Deliver both sides exactly as the chain loop would; the unmatched
         // keys rely on key-ordered eviction after the watermark passes.
-        record(join.process(side_batch(1, &["z", "a"], &[100, 120])).await.unwrap());
-        record(join.process(side_batch(0, &["a", "b", "c"], &[100, 6_000, 6_050])).await.unwrap());
+        record(
+            join.process(side_batch(1, &["z", "a"], &[100, 120]))
+                .await
+                .unwrap(),
+        );
+        record(
+            join.process(side_batch(0, &["a", "b", "c"], &[100, 6_000, 6_050]))
+                .await
+                .unwrap(),
+        );
         record(join.on_watermark(11_200).await.unwrap());
         seen
     }
@@ -1524,18 +1548,12 @@ mod tests {
         cfg.right_from = Some("other".into());
         let error = match JoinOperator::new(cfg.clone())
             .unwrap()
-            .with_input_producers(&[
-                "gen".to_string(),
-                "gen".to_string(),
-                "other".to_string(),
-            ]) {
+            .with_input_producers(&["gen".to_string(), "gen".to_string(), "other".to_string()])
+        {
             Err(error) => error,
             Ok(_) => panic!("expected a build-time rejection for a multi-subtask side"),
         };
-        assert!(
-            error.to_string().contains("2 subtasks"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("2 subtasks"), "{error}");
 
         // Undeclared sides fall back positionally but still reject a
         // producer that feeds the join from several subtasks.
@@ -1546,10 +1564,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("expected a build-time rejection for an undeclared side"),
         };
-        assert!(
-            error.to_string().contains("parallelism to 1"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("parallelism to 1"), "{error}");
     }
 
     #[test]
@@ -1565,10 +1580,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("expected a build-time rejection for a shared channel"),
         };
-        assert!(
-            error.to_string().contains("same input channel"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("same input channel"), "{error}");
     }
 
     // ---------- validation coverage ----------
@@ -1699,10 +1711,7 @@ mod tests {
         // A null key value is rejected.
         let join = JoinOperator::new(config()).unwrap();
         let error = join.process(key_batch(0, None)).await.unwrap_err();
-        assert!(
-            error.to_string().contains("is null at row 0"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("is null at row 0"), "{error}");
     }
 
     #[tokio::test]
@@ -1750,16 +1759,16 @@ mod tests {
         ));
         let error = join.process(batch).await.unwrap_err();
         assert!(
-            error.to_string().contains(&format!("'{META_INPUT_INDEX}' is null")),
+            error
+                .to_string()
+                .contains(&format!("'{META_INPUT_INDEX}' is null")),
             "{error}"
         );
     }
 
     #[tokio::test]
     async fn timestamp_columns_support_arrow_temporal_types_and_reject_others() {
-        use datafusion::arrow::array::{
-            TimestampMillisecondArray, TimestampNanosecondArray,
-        };
+        use datafusion::arrow::array::{TimestampMillisecondArray, TimestampNanosecondArray};
 
         // TimestampMillisecondArray values pass through unchanged.
         let join = JoinOperator::new(config()).unwrap();
@@ -1767,15 +1776,16 @@ mod tests {
             0,
             Field::new("key", DataType::Utf8, false),
             Arc::new(StringArray::from(vec!["a"])),
-            Field::new("ts", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, None), true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
             Arc::new(TimestampMillisecondArray::from(vec![Some(5_000)])),
         ))
         .await
         .unwrap();
-        let output = join
-            .process(side_batch(1, &["a"], &[5_000]))
-            .await
-            .unwrap();
+        let output = join.process(side_batch(1, &["a"], &[5_000])).await.unwrap();
         assert!(matches!(output, ProcessResult::Single(_)));
 
         // TimestampMillisecondArray nulls are rejected.
@@ -1785,7 +1795,11 @@ mod tests {
                 0,
                 Field::new("key", DataType::Utf8, false),
                 Arc::new(StringArray::from(vec!["a"])),
-                Field::new("ts", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, None), true),
+                Field::new(
+                    "ts",
+                    DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, None),
+                    true,
+                ),
                 Arc::new(TimestampMillisecondArray::from(vec![None::<i64>])),
             ))
             .await
@@ -1798,16 +1812,17 @@ mod tests {
             0,
             Field::new("key", DataType::Utf8, false),
             Arc::new(StringArray::from(vec!["a"])),
-            Field::new("ts", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None), true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+                true,
+            ),
             Arc::new(TimestampNanosecondArray::from(vec![Some(2_000_000_000)])),
         ))
         .await
         .unwrap();
         // 2s in nanoseconds matches a right row at 2_000ms.
-        let output = join
-            .process(side_batch(1, &["a"], &[2_000]))
-            .await
-            .unwrap();
+        let output = join.process(side_batch(1, &["a"], &[2_000])).await.unwrap();
         assert!(matches!(output, ProcessResult::Single(_)));
 
         // TimestampNanosecondArray nulls are rejected.
@@ -1817,7 +1832,11 @@ mod tests {
                 0,
                 Field::new("key", DataType::Utf8, false),
                 Arc::new(StringArray::from(vec!["a"])),
-                Field::new("ts", DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None), true),
+                Field::new(
+                    "ts",
+                    DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+                    true,
+                ),
                 Arc::new(TimestampNanosecondArray::from(vec![None::<i64>])),
             ))
             .await
@@ -1927,7 +1946,8 @@ mod tests {
         cfg.join_type = JoinType::RightOuter;
         cfg.max_per_key = 1;
         let join = JoinOperator::new(cfg).unwrap();
-        join.process(side_batch(1, &["a", "b"], &[100, 200])).await
+        join.process(side_batch(1, &["a", "b"], &[100, 200]))
+            .await
             .unwrap();
         // Both right rows evict with no left schema: "a" overflows the
         // bounded pending queue and drops.

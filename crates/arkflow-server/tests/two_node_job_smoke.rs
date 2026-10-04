@@ -46,7 +46,7 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
     JobSpec {
         resources: Default::default(),
         rebalance: None,
-rescale: false,
+        rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
         id,
         version: JobVersion(1),
@@ -470,11 +470,11 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     // Reshape into a two-task split job: generate source → drop sink, with
     // the edge crossing the network.
     spec.placement = arkflow_core::job::PlacementStrategy::Split;
-    spec.operators.retain(|operator| {
-        operator.id == "source-a" || operator.id == "sink-a"
-    });
+    spec.operators
+        .retain(|operator| operator.id == "source-a" || operator.id == "sink-a");
     spec.edges.retain(|edge| edge.id == "edge-a");
-    spec.sources.retain(|source| source.operator_id == "source-a");
+    spec.sources
+        .retain(|source| source.operator_id == "source-a");
     spec.sinks.retain(|sink| sink.operator_id == "sink-a");
 
     let hub = Hub::new(HubConfig {
@@ -625,12 +625,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
                 .find(|(node, _)| node == "node-b")
                 .and_then(|(_, jobs)| jobs.get(&job_id))
                 .cloned()
-                .is_some_and(|snapshot| {
-                    snapshot
-                        .chains
-                        .values()
-                        .any(|chain| chain.batches_in > 0)
-                })
+                .is_some_and(|snapshot| snapshot.chains.values().any(|chain| chain.batches_in > 0))
         }
     })
     .await;

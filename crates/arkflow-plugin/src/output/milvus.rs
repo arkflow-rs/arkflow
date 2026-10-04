@@ -125,7 +125,8 @@ impl Output for MilvusOutput {
         if rows == 0 {
             return Ok(());
         }
-        let vectors = crate::vector_util::extract_vectors("milvus output", &msg, &self.config.vector_field)?;
+        let vectors =
+            crate::vector_util::extract_vectors("milvus output", &msg, &self.config.vector_field)?;
         let ids = extract_ids(&msg, &self.config.id_field)?;
         let payloads = extract_payloads(&msg, &self.config)?;
 
@@ -133,7 +134,10 @@ impl Output for MilvusOutput {
             .map(|row| {
                 let mut object = Map::new();
                 if let Some(Some(id)) = ids.as_ref().map(|ids| ids.get(row)) {
-                    object.insert(self.config.id_field.clone().expect("ids imply id_field"), id.clone());
+                    object.insert(
+                        self.config.id_field.clone().expect("ids imply id_field"),
+                        id.clone(),
+                    );
                 }
                 object.insert(self.config.vector_field.clone(), json!(vectors[row]));
                 if let Some(payload) = payloads.as_ref().and_then(|payloads| payloads.get(row)) {
@@ -178,7 +182,12 @@ impl MilvusOutput {
 
         let mut attempt = 0u32;
         loop {
-            match request.try_clone().expect("request body is JSON").send().await {
+            match request
+                .try_clone()
+                .expect("request body is JSON")
+                .send()
+                .await
+            {
                 Ok(response) => {
                     let status = response.status();
                     let body = response
@@ -332,16 +341,26 @@ fn extract_payloads(
         return Ok(Some(vec![json!({}); batch.num_rows()]));
     }
 
-    let filtered = batch
-        .filter_columns(&payload_columns.iter().cloned().collect::<std::collections::HashSet<_>>())?;
+    let filtered = batch.filter_columns(
+        &payload_columns
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>(),
+    )?;
     let mut buffer = Vec::new();
     let mut writer = LineDelimitedWriter::new(&mut buffer);
-    writer
-        .write(&filtered)
-        .map_err(|e| Error::Process(format!("milvus output: payload serialization failed: {}", e)))?;
-    writer
-        .finish()
-        .map_err(|e| Error::Process(format!("milvus output: payload serialization failed: {}", e)))?;
+    writer.write(&filtered).map_err(|e| {
+        Error::Process(format!(
+            "milvus output: payload serialization failed: {}",
+            e
+        ))
+    })?;
+    writer.finish().map_err(|e| {
+        Error::Process(format!(
+            "milvus output: payload serialization failed: {}",
+            e
+        ))
+    })?;
     let text = String::from_utf8(buffer)
         .map_err(|e| Error::Process(format!("milvus output: payload is not UTF-8: {}", e)))?;
     text.lines()
@@ -353,10 +372,7 @@ fn extract_payloads(
         .map(Some)
 }
 
-fn find_column<'a>(
-    batch: &'a MessageBatchRef,
-    field: &str,
-) -> Result<&'a Arc<dyn Array>, Error> {
+fn find_column<'a>(batch: &'a MessageBatchRef, field: &str) -> Result<&'a Arc<dyn Array>, Error> {
     batch
         .schema()
         .fields()
@@ -401,7 +417,9 @@ impl OutputBuilder for MilvusOutputBuilder {
         let is_loopback = reqwest::Url::parse(&format!("{}/", config.url.trim_end_matches('/')))
             .ok()
             .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-            .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]")
+            .map(|host| {
+                host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+            })
             .unwrap_or(false);
         let mut builder = Client::builder().timeout(Duration::from_millis(config.timeout_ms));
         if is_loopback {
@@ -419,8 +437,8 @@ mod tests {
     use super::*;
     use crate::vector_util::test_support::MockApi as MockMilvus;
     use arkflow_core::MessageBatch;
-    use datafusion::arrow::array::{FixedSizeListArray, Float32Array};
     use datafusion::arrow::array::{ArrayRef, StringArray};
+    use datafusion::arrow::array::{FixedSizeListArray, Float32Array};
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
@@ -442,10 +460,19 @@ mod tests {
         let dim = 2i32;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let flat = Float32Array::from(vec![1.5f32, 2.0, -3.0, 4.25]);
-        let vectors = Arc::new(FixedSizeListArray::new(item_field, dim, Arc::new(flat), None));
+        let vectors = Arc::new(FixedSizeListArray::new(
+            item_field,
+            dim,
+            Arc::new(flat),
+            None,
+        ));
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Int64, false),
-            Field::new("embedding", DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim), true),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
             Field::new("text", DataType::Utf8, true),
         ]));
         let columns: Vec<ArrayRef> = vec![
@@ -474,7 +501,8 @@ mod tests {
 
     #[tokio::test]
     async fn upserts_rows_with_vector_payload_and_id() {
-        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":{"upsertCount":2}}"#.to_string()));
+        let mock =
+            MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":{"upsertCount":2}}"#.to_string()));
         let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         output.write(sample_batch()).await.unwrap();
 
@@ -483,7 +511,10 @@ mod tests {
             head.starts_with("POST /v2/vectordb/entities/upsert "),
             "{head}"
         );
-        assert!(head.contains("authorization: Bearer root:Milvus-pw"), "{head}");
+        assert!(
+            head.contains("authorization: Bearer root:Milvus-pw"),
+            "{head}"
+        );
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["collectionName"], "docs");
         let data = parsed["data"].as_array().unwrap();
@@ -503,10 +534,18 @@ mod tests {
         // id_field must fail at build time instead of sending id-less rows.
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let error = MilvusOutputBuilder
-            .build(None, &Some(base_config(addr, serde_json::json!({"id_field": ""}))), None, &test_resource())
+            .build(
+                None,
+                &Some(base_config(addr, serde_json::json!({"id_field": ""}))),
+                None,
+                &test_resource(),
+            )
             .err()
             .expect("missing id_field must be rejected");
-        assert!(error.to_string().contains("'id_field' is required"), "{error}");
+        assert!(
+            error.to_string().contains("'id_field' is required"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -528,7 +567,10 @@ mod tests {
     #[tokio::test]
     async fn http_200_with_nonzero_code_fails() {
         let mock = MockMilvus::spawn(|_body| {
-            (200, r#"{"code":100,"message":"collection not found"}"#.to_string())
+            (
+                200,
+                r#"{"code":100,"message":"collection not found"}"#.to_string(),
+            )
         });
         let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         let err = output.write(sample_batch()).await.unwrap_err().to_string();
@@ -569,7 +611,10 @@ mod tests {
         }));
         output.write(sample_batch()).await.unwrap();
         let (head, _) = mock.last_request();
-        assert!(!head.to_ascii_lowercase().contains("authorization:"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("authorization:"),
+            "{head}"
+        );
     }
 
     #[tokio::test]
@@ -637,7 +682,10 @@ mod tests {
                 (200, r#"{"code":0,"data":{"upsertCount":1}}"#.to_string())
             }
         });
-        let output = build_output(base_config(mock.addr(), serde_json::json!({"retry_count": 2})));
+        let output = build_output(base_config(
+            mock.addr(),
+            serde_json::json!({"retry_count": 2}),
+        ));
         output.write(sample_batch()).await.unwrap();
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
@@ -654,19 +702,19 @@ mod tests {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             (400, r#"{"message":"bad request"}"#.to_string())
         });
-        let output = build_output(base_config(mock.addr(), serde_json::json!({"retry_count": 3})));
-        let err = output
-            .write(sample_batch())
-            .await
-            .unwrap_err()
-            .to_string();
+        let output = build_output(base_config(
+            mock.addr(),
+            serde_json::json!({"retry_count": 3}),
+        ));
+        let err = output.write(sample_batch()).await.unwrap_err().to_string();
         assert!(err.contains("400"), "{err}");
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn large_batches_are_split_into_bounded_requests() {
-        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":{"upsertCount":1}}"#.to_string()));
+        let mock =
+            MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":{"upsertCount":1}}"#.to_string()));
         let output = build_output(base_config(mock.addr(), serde_json::json!({})));
         output.write(sample_batch_rows(2500)).await.unwrap();
 
@@ -679,7 +727,11 @@ mod tests {
                 parsed["data"].as_array().unwrap().len()
             })
             .collect();
-        assert_eq!(sizes, vec![1000, 1000, 500], "slices must preserve row order");
+        assert_eq!(
+            sizes,
+            vec![1000, 1000, 500],
+            "slices must preserve row order"
+        );
     }
 
     /// Builds a batch with `rows` rows: an id column, a 2-dim vector column,
@@ -688,7 +740,11 @@ mod tests {
         use datafusion::arrow::array::{FixedSizeListArray, Float32Array, Int64Array};
         use datafusion::arrow::datatypes::{DataType, Field as F};
         let ids = Int64Array::from((0..rows as i64).collect::<Vec<_>>());
-        let flat = Float32Array::from((0..rows as i64).flat_map(|i| vec![i as f32, 1.0]).collect::<Vec<_>>());
+        let flat = Float32Array::from(
+            (0..rows as i64)
+                .flat_map(|i| vec![i as f32, 1.0])
+                .collect::<Vec<_>>(),
+        );
         let item_field = Arc::new(F::new("item", DataType::Float32, true));
         let vectors = FixedSizeListArray::new(item_field, 2, Arc::new(flat), None);
         let texts = StringArray::from(vec!["t"; rows]);
@@ -701,8 +757,11 @@ mod tests {
             ),
             F::new("text", DataType::Utf8, false),
         ]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(vectors), Arc::new(texts)])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(vectors), Arc::new(texts)],
+        )
+        .unwrap();
         Arc::new(MessageBatch::new_arrow(batch))
     }
 
@@ -712,7 +771,12 @@ mod tests {
         let dim = 2i32;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let flat = Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0]);
-        let vectors = Arc::new(FixedSizeListArray::new(item_field, dim, Arc::new(flat), None));
+        let vectors = Arc::new(FixedSizeListArray::new(
+            item_field,
+            dim,
+            Arc::new(flat),
+            None,
+        ));
         let schema = Arc::new(Schema::new(vec![
             Field::new(name, id_type, true),
             Field::new(
@@ -748,7 +812,10 @@ mod tests {
         ));
         output.write(sample_batch()).await.unwrap();
         let (head, _) = mock.last_request();
-        assert!(head.to_ascii_lowercase().contains("x-trace-id: abc123"), "{head}");
+        assert!(
+            head.to_ascii_lowercase().contains("x-trace-id: abc123"),
+            "{head}"
+        );
     }
 
     #[tokio::test]
@@ -766,7 +833,10 @@ mod tests {
     async fn int32_and_utf8_id_columns_are_supported() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
 
-        let int32 = build_output(base_config(mock.addr(), serde_json::json!({"id_field": "doc_id"})));
+        let int32 = build_output(base_config(
+            mock.addr(),
+            serde_json::json!({"id_field": "doc_id"}),
+        ));
         int32
             .write(vector_batch_with_id(
                 "doc_id",
@@ -779,7 +849,10 @@ mod tests {
         assert_eq!(body["data"][0]["doc_id"], 7);
         assert_eq!(body["data"][1]["doc_id"], 8);
 
-        let utf8 = build_output(base_config(mock.addr(), serde_json::json!({"id_field": "doc_id"})));
+        let utf8 = build_output(base_config(
+            mock.addr(),
+            serde_json::json!({"id_field": "doc_id"}),
+        ));
         utf8.write(vector_batch_with_id(
             "doc_id",
             Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
@@ -791,7 +864,10 @@ mod tests {
         assert_eq!(body["data"][0]["doc_id"], "a");
         assert_eq!(body["data"][1]["doc_id"], "b");
 
-        let large = build_output(base_config(mock.addr(), serde_json::json!({"id_field": "doc_id"})));
+        let large = build_output(base_config(
+            mock.addr(),
+            serde_json::json!({"id_field": "doc_id"}),
+        ));
         large
             .write(vector_batch_with_id(
                 "doc_id",
@@ -811,7 +887,10 @@ mod tests {
         let error = output
             .write(vector_batch_with_id(
                 "doc_id",
-                Arc::new(datafusion::arrow::array::Int64Array::from(vec![Some(1), None])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    Some(1),
+                    None,
+                ])),
                 DataType::Int64,
             ))
             .await
@@ -824,7 +903,10 @@ mod tests {
     async fn missing_and_unsupported_id_columns_error() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
         // Missing column.
-        let output = build_output(base_config(mock.addr(), serde_json::json!({"id_field": "nope"})));
+        let output = build_output(base_config(
+            mock.addr(),
+            serde_json::json!({"id_field": "nope"}),
+        ));
         let error = output.write(sample_batch()).await.unwrap_err().to_string();
         assert!(error.contains("column 'nope' not found"), "{error}");
 
@@ -839,10 +921,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("must be Int64/Int32 or Utf8"),
-            "{error}"
-        );
+        assert!(error.contains("must be Int64/Int32 or Utf8"), "{error}");
     }
 
     #[tokio::test]

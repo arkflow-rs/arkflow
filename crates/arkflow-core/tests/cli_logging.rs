@@ -30,31 +30,30 @@ fn logging_initializes_from_config_for_each_format_and_writer() {
 
     let base = "logging:\n  level: {level}\n  format: {format}\n  file_path: {file}\nstreams: []\n";
     let mut yaml = base
-    .replace("{level}", "debug")
-    .replace("{format}", "plain")
-    .replace("{file}", &file_str);
+        .replace("{level}", "debug")
+        .replace("{format}", "plain")
+        .replace("{file}", &file_str);
     let config = config_from_yaml(&yaml);
     init_logging(&config);
 
     yaml = base
-    .replace("{level}", "trace")
-    .replace("{format}", "json")
-    .replace("{file}", &file_str);
+        .replace("{level}", "trace")
+        .replace("{format}", "json")
+        .replace("{file}", &file_str);
     init_logging(&config_from_yaml(&yaml));
 
     yaml = base
-    .replace("{level}", "warn")
-    .replace("{format}", "json")
-    .replace("{file}", "");
+        .replace("{level}", "warn")
+        .replace("{format}", "json")
+        .replace("{file}", "");
     init_logging(&config_from_yaml(&yaml));
 
     yaml = base
-    .replace("{level}", "bogus-level-falls-back-to-info")
-    .replace("{format}", "plain")
-    .replace("{file}", "");
+        .replace("{level}", "bogus-level-falls-back-to-info")
+        .replace("{format}", "plain")
+        .replace("{file}", "");
     init_logging(&config_from_yaml(&yaml));
 
     // The file writer created the parent directory.
     assert!(dir.path().join("logs").exists());
 }
-

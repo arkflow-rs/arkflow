@@ -90,10 +90,8 @@ fn batches_in_total(exposition: &str, job: &str) -> u64 {
 
 /// Drive the engine future one step; a premature exit fails the test with
 /// the engine's own result instead of leaving a confusing empty registry.
-async fn drive_engine<F: std::future::Future>(
-    engine_fut: &mut std::pin::Pin<&mut F>,
-    phase: &str,
-) where
+async fn drive_engine<F: std::future::Future>(engine_fut: &mut std::pin::Pin<&mut F>, phase: &str)
+where
     F::Output: std::fmt::Debug,
 {
     use std::task::Poll;

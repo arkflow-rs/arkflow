@@ -342,8 +342,7 @@ mod tests {
             .mount(&server)
             .await;
         let mut config = base_config(format!("{}/auth", server.uri()));
-        config["auth"] =
-            serde_json::json!({"Basic": {"username": "user", "password": "pass"}});
+        config["auth"] = serde_json::json!({"Basic": {"username": "user", "password": "pass"}});
         let output = build(config)?;
         output.connect().await?;
         output.write(batch()).await?;
@@ -373,7 +372,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/hdr"))
             .and(wiremock::matchers::header("X-Custom", "1"))
-            .and(wiremock::matchers::header("Content-Type", "application/json"))
+            .and(wiremock::matchers::header(
+                "Content-Type",
+                "application/json",
+            ))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -432,13 +434,10 @@ mod tests {
             .await;
         let output = build(base_config(format!("{}/down", server.uri())))?;
         output.connect().await?;
-        let err = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            output.write(batch()),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), output.write(batch()))
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(err.to_string().contains("503"), "{err}");
         Ok(())
     }
@@ -448,11 +447,8 @@ mod tests {
         // Port 1 refuses connections immediately.
         let output = build(base_config("http://127.0.0.1:1/sink".into()))?;
         output.connect().await?;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            output.write(batch()),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), output.write(batch())).await;
         match result {
             Err(_elapsed) => panic!("write must not hang on a refused connection"),
             Ok(Err(err)) => assert!(matches!(err, Error::Connection(_)), "{err}"),

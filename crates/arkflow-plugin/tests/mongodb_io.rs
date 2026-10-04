@@ -27,13 +27,13 @@ use futures::StreamExt;
 use mongodb::bson::{doc, Document};
 use mongodb::Client;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort};
+use testcontainers::{core::IntoContainerPort, ContainerAsync, GenericImage, ImageExt};
 
 const MONGO_HOST_PORT: u16 = 27017;
 const MONGO_URI: &str = "mongodb://127.0.0.1:27017";
@@ -132,7 +132,9 @@ fn sweep_leftover_servers() {
         return;
     }
     for id in String::from_utf8_lossy(&listing.stdout).split_whitespace() {
-        let _ = std::process::Command::new("docker").args(["rm", "-f", id]).output();
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
     }
 }
 
@@ -198,7 +200,9 @@ async fn wait_for_server() {
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
         let ready = async {
-            let client = Client::with_uri_str(MONGO_URI).await.map_err(|e| e.to_string())?;
+            let client = Client::with_uri_str(MONGO_URI)
+                .await
+                .map_err(|e| e.to_string())?;
             client
                 .database("admin")
                 .run_command(doc! { "ping": 1 })
@@ -239,8 +243,16 @@ fn typed_batch() -> MessageBatchRef {
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", datafusion::arrow::datatypes::DataType::Utf8, true),
         Field::new("count", datafusion::arrow::datatypes::DataType::Int64, true),
-        Field::new("score", datafusion::arrow::datatypes::DataType::Float64, true),
-        Field::new("active", datafusion::arrow::datatypes::DataType::Boolean, true),
+        Field::new(
+            "score",
+            datafusion::arrow::datatypes::DataType::Float64,
+            true,
+        ),
+        Field::new(
+            "active",
+            datafusion::arrow::datatypes::DataType::Boolean,
+            true,
+        ),
     ]));
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![Some("Ada"), Some("Bob")])),

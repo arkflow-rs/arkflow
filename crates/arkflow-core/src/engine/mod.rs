@@ -19,9 +19,8 @@ fn spawn_signal_watchers(token: CancellationToken) {
     tokio::spawn(async move {
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .expect("Failed to set signal handler");
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to set signal handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to set signal handler");
         tokio::select! {
             _ = sigint.recv() => info!("Received SIGINT, exiting..."),
             _ = sigterm.recv() => info!("Received SIGTERM, exiting..."),

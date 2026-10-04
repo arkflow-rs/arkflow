@@ -145,7 +145,8 @@ impl SqliteBackend {
                 Ok(WriteFence::Passthrough)
             }
             Some(current) if (current.max(0) as u64) == claimed_epoch => {
-                self.fence_depth.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.fence_depth
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(WriteFence::Held)
             }
             Some(current) => {
@@ -167,7 +168,8 @@ impl SqliteBackend {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         if self.fence_depth.load(std::sync::atomic::Ordering::SeqCst) != 1 {
             // Nested fence or an unpaired end: only the outermost commit.
-            self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.fence_depth
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(());
         }
         // Decrement ONLY after a successful commit so `fence_depth` stays
@@ -178,13 +180,15 @@ impl SqliteBackend {
         // running in the wrong transaction mode.
         match connection.execute_batch("COMMIT") {
             Ok(()) => {
-                self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.fence_depth
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }
             Err(error) => {
                 let cleanup = connection.execute_batch("ROLLBACK");
                 if cleanup.is_ok() {
-                    self.fence_depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    self.fence_depth
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 Err(error.into())
             }
@@ -1507,10 +1511,7 @@ impl SqliteBackend {
         })
     }
 
-    pub fn list_job_upgrades(
-        &self,
-        job_id: &str,
-    ) -> Result<Vec<JobUpgradeRecord>, StorageError> {
+    pub fn list_job_upgrades(&self, job_id: &str) -> Result<Vec<JobUpgradeRecord>, StorageError> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
                 "SELECT upgrade_id, job_id, from_version, to_version, phase, savepoint_id, target_spec_json, phase_deadline_at_ms, savepoint_retries, verify_timeout_ms, actor, correlation_id, last_error, paused_from, created_at_ms, updated_at_ms FROM cp_job_upgrades WHERE job_id = ?1 ORDER BY created_at_ms DESC, upgrade_id DESC LIMIT 256",
@@ -1532,7 +1533,8 @@ impl SqliteBackend {
             t = TERMINAL_JOB_UPGRADE_PHASES_SQL
         );
         self.immediate_transaction(|transaction| {
-            let removed = transaction.execute(sql.as_str(), rusqlite::params![older_than_ms, max_retained])?;
+            let removed = transaction
+                .execute(sql.as_str(), rusqlite::params![older_than_ms, max_retained])?;
             Ok(removed)
         })
     }
@@ -1698,7 +1700,6 @@ impl SqliteBackend {
         })
         .map(|epoch| epoch.map(|value| value.max(0) as u64))
     }
-
 
     pub fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError> {
         self.immediate_transaction(|transaction| {
@@ -2550,33 +2551,33 @@ impl StorageBackend for SqliteBackend {
         self.reset_observed_cursors(node_id)
     }
     async fn set_node_maintenance(
-&self,
-mutation: NodeMaintenanceMutation,
-now_ms: u64,
-) -> Result<bool, StorageError> {
+        &self,
+        mutation: NodeMaintenanceMutation,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
         self.set_node_maintenance(mutation, now_ms)
     }
     async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError> {
         self.get_node_maintenance(node_id)
     }
     async fn operational_aggregates(
-&self,
-now_ms: u64,
-) -> Result<OperationalAggregates, StorageError> {
+        &self,
+        now_ms: u64,
+    ) -> Result<OperationalAggregates, StorageError> {
         self.operational_aggregates(now_ms)
     }
     async fn claim_outbox(
-&self,
-worker_id: &str,
-now_ms: u64,
-) -> Result<Option<OutboxRecord>, StorageError> {
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<OutboxRecord>, StorageError> {
         self.claim_outbox(worker_id, now_ms)
     }
     async fn get_desired(
-&self,
-node_id: &str,
-stream_id: &str,
-) -> Result<Option<DesiredRecord>, StorageError> {
+        &self,
+        node_id: &str,
+        stream_id: &str,
+    ) -> Result<Option<DesiredRecord>, StorageError> {
         self.get_desired(node_id, stream_id)
     }
     async fn get_intent(&self, intent_id: &str) -> Result<Option<IntentRecord>, StorageError> {
@@ -2598,52 +2599,55 @@ stream_id: &str,
         self.prune_events(retain)
     }
     async fn prune_operation_history(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError> {
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
         self.prune_operation_history(older_than_ms, max_retained)
     }
-    async fn prune_job_checkpoint_records(&self, older_than_ms: i64) -> Result<usize, StorageError> {
+    async fn prune_job_checkpoint_records(
+        &self,
+        older_than_ms: i64,
+    ) -> Result<usize, StorageError> {
         self.prune_job_checkpoint_records(older_than_ms)
     }
     async fn prune_audit_events(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError> {
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
         self.prune_audit_events(older_than_ms, max_retained)
     }
     async fn prune_processed_outbox(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError> {
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
         self.prune_processed_outbox(older_than_ms, max_retained)
     }
     async fn prune_terminal_attempts(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError> {
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
         self.prune_terminal_attempts(older_than_ms, max_retained)
     }
     async fn claim_attempt(&self, intent_id: &str) -> Result<Option<AttemptRecord>, StorageError> {
         self.claim_attempt(intent_id)
     }
     async fn complete_attempt(
-&self,
-attempt_id: &str,
-state: &str,
-failure_class: Option<&str>,
-) -> Result<(), StorageError> {
+        &self,
+        attempt_id: &str,
+        state: &str,
+        failure_class: Option<&str>,
+    ) -> Result<(), StorageError> {
         self.complete_attempt(attempt_id, state, failure_class)
     }
     async fn mark_attempt_dispatched(
-&self,
-attempt_id: &str,
-expires_at_ms: u64,
-) -> Result<(), StorageError> {
+        &self,
+        attempt_id: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), StorageError> {
         self.mark_attempt_dispatched(attempt_id, expires_at_ms)
     }
     async fn expire_attempts(&self, now_ms: u64) -> Result<usize, StorageError> {
@@ -2658,50 +2662,53 @@ expires_at_ms: u64,
     async fn record_audit(&self, record: AuditRecord) -> Result<i64, StorageError> {
         self.record_audit(record)
     }
-    async fn list_audit(&self, resource_id: Option<&str>) -> Result<Vec<AuditRecord>, StorageError> {
+    async fn list_audit(
+        &self,
+        resource_id: Option<&str>,
+    ) -> Result<Vec<AuditRecord>, StorageError> {
         self.list_audit(resource_id)
     }
     async fn create_rollout(
-&self,
-rollout: RolloutRecord,
-targets: Vec<RolloutTargetRecord>,
-) -> Result<(), StorageError> {
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+    ) -> Result<(), StorageError> {
         self.create_rollout(rollout, targets)
     }
     async fn create_rollout_with_content(
-&self,
-rollout: RolloutRecord,
-targets: Vec<RolloutTargetRecord>,
-content: &str,
-created_by: Option<&str>,
-) -> Result<(), StorageError> {
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+        content: &str,
+        created_by: Option<&str>,
+    ) -> Result<(), StorageError> {
         self.create_rollout_with_content(rollout, targets, content, created_by)
     }
     async fn get_rollout(&self, rollout_id: &str) -> Result<Option<RolloutRecord>, StorageError> {
         self.get_rollout(rollout_id)
     }
     async fn list_rollout_targets(
-&self,
-rollout_id: &str,
-) -> Result<Vec<RolloutTargetRecord>, StorageError> {
+        &self,
+        rollout_id: &str,
+    ) -> Result<Vec<RolloutTargetRecord>, StorageError> {
         self.list_rollout_targets(rollout_id)
     }
     async fn update_rollout(
-&self,
-rollout_id: &str,
-state: &str,
-current_batch: u32,
-updated_at_ms: u64,
-) -> Result<(), StorageError> {
+        &self,
+        rollout_id: &str,
+        state: &str,
+        current_batch: u32,
+        updated_at_ms: u64,
+    ) -> Result<(), StorageError> {
         self.update_rollout(rollout_id, state, current_batch, updated_at_ms)
     }
     async fn update_rollout_target(&self, update: RolloutTargetUpdate) -> Result<(), StorageError> {
         self.update_rollout_target(update)
     }
     async fn get_config_version_content(
-&self,
-config_version_id: &str,
-) -> Result<Option<String>, StorageError> {
+        &self,
+        config_version_id: &str,
+    ) -> Result<Option<String>, StorageError> {
         self.get_config_version_content(config_version_id)
     }
     async fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
@@ -2743,15 +2750,15 @@ config_version_id: &str,
         self.upsert_operation(operation)
     }
     async fn get_operation(
-&self,
-operation_id: &str,
-) -> Result<Option<PersistedOperation>, StorageError> {
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<PersistedOperation>, StorageError> {
         self.get_operation(operation_id)
     }
     async fn list_operations(
-&self,
-node_id: Option<&str>,
-) -> Result<Vec<PersistedOperation>, StorageError> {
+        &self,
+        node_id: Option<&str>,
+    ) -> Result<Vec<PersistedOperation>, StorageError> {
         self.list_operations(node_id)
     }
     async fn list_job_start_operations(
@@ -2797,10 +2804,10 @@ node_id: Option<&str>,
         self.upsert_job(job)
     }
     async fn update_job_with_expected_generation(
-&self,
-job: JobRecord,
-expected_generation: u64,
-) -> Result<JobRecord, StorageError> {
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
         self.update_job_with_expected_generation(job, expected_generation)
     }
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError> {
@@ -2816,51 +2823,67 @@ expected_generation: u64,
         self.list_jobs()
     }
     async fn update_job(
-&self,
-job_id: &str,
-desired_state: Option<&str>,
-observed_state: Option<&str>,
-convergence: Option<&str>,
-generation: Option<u64>,
-checkpoint_id: Option<&str>,
-last_error: Option<&str>,
-) -> Result<Option<JobRecord>, StorageError> {
-        self.update_job(job_id, desired_state, observed_state, convergence, generation, checkpoint_id, last_error)
+        &self,
+        job_id: &str,
+        desired_state: Option<&str>,
+        observed_state: Option<&str>,
+        convergence: Option<&str>,
+        generation: Option<u64>,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.update_job(
+            job_id,
+            desired_state,
+            observed_state,
+            convergence,
+            generation,
+            checkpoint_id,
+            last_error,
+        )
     }
     async fn update_job_observation(
-&self,
-job_id: &str,
-observed_state: &str,
-convergence: &str,
-generation: u64,
-expected_generation: u64,
-checkpoint_id: Option<&str>,
-last_error: Option<&str>,
-) -> Result<Option<JobRecord>, StorageError> {
-        self.update_job_observation(job_id, observed_state, convergence, generation, expected_generation, checkpoint_id, last_error)
+        &self,
+        job_id: &str,
+        observed_state: &str,
+        convergence: &str,
+        generation: u64,
+        expected_generation: u64,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.update_job_observation(
+            job_id,
+            observed_state,
+            convergence,
+            generation,
+            expected_generation,
+            checkpoint_id,
+            last_error,
+        )
     }
     async fn update_job_desired_state(
-&self,
-job_id: &str,
-desired_state: &str,
-expected_generation: u64,
-) -> Result<Option<JobRecord>, StorageError> {
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError> {
         self.update_job_desired_state(job_id, desired_state, expected_generation)
     }
     async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
         self.upsert_job_checkpoint(record)
     }
     async fn list_job_checkpoints(
-&self,
-job_id: &str,
-) -> Result<Vec<JobCheckpointRecord>, StorageError> {
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<JobCheckpointRecord>, StorageError> {
         self.list_job_checkpoints(job_id)
     }
     async fn delete_job_checkpoint(
-&self,
-job_id: &str,
-checkpoint_id: &str,
-) -> Result<(), StorageError> {
+        &self,
+        job_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<(), StorageError> {
         self.delete_job_checkpoint(job_id, checkpoint_id)
     }
 }

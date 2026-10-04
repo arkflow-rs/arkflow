@@ -1,16 +1,16 @@
- /*
-  *    Licensed under the Apache License, Version 2.0 (the "License");
-  *    you may not use this file except in compliance with the License.
-  *    You may obtain a copy of the License at
-  *
-  *        http://www.apache.org/licenses/LICENSE-2.0
-  *
-  *    Unless required by applicable law or agreed to in writing, software
-  *    distributed under the License is distributed on an "AS IS" BASIS,
-  *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  *    See the License for the specific language governing permissions and
-  *    limitations under the License.
-  */
+/*
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
 
 //! Integration tests for the SQL output (`sql`) and the pgvector components
 //! (`pgvector` output, `pgvector_search` processor) against real PostgreSQL
@@ -31,8 +31,7 @@ use arkflow_core::output::{Output, OutputConfig};
 use arkflow_core::processor::ProcessorConfig;
 use arkflow_core::{MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
-    StringArray,
+    ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array, StringArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -49,9 +48,8 @@ fn pg_uri() -> String {
 }
 
 fn pgvector_uri() -> String {
-    std::env::var("ARKFLOW_TEST_PGVECTOR_URI").unwrap_or_else(|_| {
-        "postgres://arkflow:arkflow@localhost:5434/arkflow_test".to_string()
-    })
+    std::env::var("ARKFLOW_TEST_PGVECTOR_URI")
+        .unwrap_or_else(|_| "postgres://arkflow:arkflow@localhost:5434/arkflow_test".to_string())
 }
 
 static INIT: Once = Once::new();
@@ -211,12 +209,11 @@ fn query_vector_batch(vectors: Vec<Vec<f32>>) -> MessageBatchRef {
 }
 
 async fn count(admin: &mut PgConnection, table: &str) -> i64 {
-    let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT COUNT(*) FROM {table}"
-    )))
-    .fetch_one(admin)
-        .await
-        .unwrap();
+    let (count,): (i64,) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(admin)
+            .await
+            .unwrap();
     count
 }
 
@@ -279,14 +276,17 @@ async fn sql_output_pg_write_upsert_and_readback() {
         .write(events_batch(vec![(1, "alpha2", 9.5, false, Some("upd"))]))
         .await
         .expect("upsert write");
-    assert_eq!(count(&mut admin, &table).await, 2, "upsert must not duplicate");
-    let (name, note): (String, Option<String>) =
-        sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT name, note FROM {table} WHERE id = 1"
-        )))
-            .fetch_one(&mut admin)
-            .await
-            .unwrap();
+    assert_eq!(
+        count(&mut admin, &table).await,
+        2,
+        "upsert must not duplicate"
+    );
+    let (name, note): (String, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT name, note FROM {table} WHERE id = 1"
+    )))
+    .fetch_one(&mut admin)
+    .await
+    .unwrap();
     assert_eq!(name, "alpha2");
     assert_eq!(note.as_deref(), Some("upd"));
 
@@ -377,7 +377,10 @@ async fn sql_output_pg_batch_rolls_back_on_failure() {
             "upsert_keys": ["absent_key"]
         }),
     );
-    upsert_output.connect().await.expect("connect upsert output");
+    upsert_output
+        .connect()
+        .await
+        .expect("connect upsert output");
     let err = upsert_output
         .write(events_batch(vec![(4, "delta", 1.0, true, None)]))
         .await
@@ -433,10 +436,7 @@ async fn pgvector_output_roundtrip_and_upsert() {
     );
     output.connect().await.expect("connect pgvector output");
 
-    let batch = vector_doc_batch(vec![
-        (10, [1.5, 2.0], "hello"),
-        (20, [-3.0, 4.25], "world"),
-    ]);
+    let batch = vector_doc_batch(vec![(10, [1.5, 2.0], "hello"), (20, [-3.0, 4.25], "world")]);
     output.write(batch.clone()).await.expect("write vectors");
 
     let rows: Vec<(i64, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -450,7 +450,10 @@ async fn pgvector_output_roundtrip_and_upsert() {
     assert_eq!(rows[0].1, "[1.5,2]", "vector text must round-trip");
     assert_eq!(rows[1].1, "[-3,4.25]");
     let payload: serde_json::Value = serde_json::from_str(&rows[0].2).unwrap();
-    assert_eq!(payload["text"], "hello", "payload must pack the text column");
+    assert_eq!(
+        payload["text"], "hello",
+        "payload must pack the text column"
+    );
 
     // Upsert: writing the same ids again overwrites, never duplicates.
     output.write(batch).await.expect("rewrite same ids");
@@ -504,7 +507,11 @@ async fn pgvector_search_processor_returns_nearest_neighbors() {
         ),
     )
     .await;
-    for (id, vector, text) in [(1i64, "[1.0,0.0]", "near"), (2, "[0.9,0.1]", "also near"), (3, "[0.0,1.0]", "far")] {
+    for (id, vector, text) in [
+        (1i64, "[1.0,0.0]", "near"),
+        (2, "[0.9,0.1]", "also near"),
+        (3, "[0.0,1.0]", "far"),
+    ] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {table} (id, embedding, payload) VALUES ($1, $2::vector, $3::jsonb)"
         )))
@@ -603,7 +610,10 @@ async fn pgvector_search_processor_returns_nearest_neighbors() {
     assert!(msg.contains("query failed"), "{msg}");
 
     processor.close().await.expect("close processor");
-    no_payload.close().await.expect("close payload-less processor");
+    no_payload
+        .close()
+        .await
+        .expect("close payload-less processor");
     failing.close().await.expect("close failing processor");
     exec(&mut admin, &format!("DROP TABLE IF EXISTS {table}")).await;
 }

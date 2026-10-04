@@ -49,9 +49,7 @@ impl Cli {
             Ok(ParseOutcome::Run) => Ok(()),
             Ok(ParseOutcome::Exit(code)) => process::exit(code),
             // clap errors (bad flags) keep clap's own usage output + exit 2.
-            Err(e) if e.is::<clap::Error>() => {
-                e.downcast_ref::<clap::Error>().unwrap().exit()
-            }
+            Err(e) if e.is::<clap::Error>() => e.downcast_ref::<clap::Error>().unwrap().exit(),
             Err(e) => Err(e),
         }
     }
@@ -400,12 +398,8 @@ pub fn init_logging(config: &EngineConfig) {
                 .pretty()
                 .with_filter(level_filter)
                 .boxed(),
-            (None, LogFormat::JSON) => {
-                fmt::layer().json().with_filter(level_filter).boxed()
-            }
-            (None, LogFormat::PLAIN) => {
-                fmt::layer().pretty().with_filter(level_filter).boxed()
-            }
+            (None, LogFormat::JSON) => fmt::layer().json().with_filter(level_filter).boxed(),
+            (None, LogFormat::PLAIN) => fmt::layer().pretty().with_filter(level_filter).boxed(),
         };
 
     let otel_layer = build_otel_layer(&config.health_check.observability.tracing)
@@ -661,7 +655,7 @@ mod tests {
     fn registered_components_render_in_list_and_details() {
         // Unique type names keep the process-global registry idempotent.
         {
-            use crate::component::{ComponentMetadata, ComponentKind};
+            use crate::component::{ComponentKind, ComponentMetadata};
             let metadata = ComponentMetadata {
                 name: "cli-test-fake".into(),
                 description: "fake component for cli tests".into(),
@@ -671,10 +665,7 @@ mod tests {
             };
             // Ignore the "already registered" error on re-runs in the same
             // process: the important part is that listing finds it.
-            let _ = crate::component::register_component_metadata(
-                ComponentKind::Input,
-                metadata,
-            );
+            let _ = crate::component::register_component_metadata(ComponentKind::Input, metadata);
 
             print_component_list(Some(ComponentKind::Input));
             print_component_list(None);
@@ -682,19 +673,15 @@ mod tests {
 
             print_component_details(ComponentKind::Input, "cli-test-fake", "text").unwrap();
             print_component_details(ComponentKind::Input, "cli-test-fake", "json").unwrap();
-            print_component_details(
-                ComponentKind::Input,
-                "cli-test-fake",
-                "unknown-format",
-            )
-            .unwrap();
+            print_component_details(ComponentKind::Input, "cli-test-fake", "unknown-format")
+                .unwrap();
         }
     }
 
     #[test]
     fn components_show_subcommand_round_trip() {
         {
-            use crate::component::{ComponentMetadata, ComponentKind};
+            use crate::component::{ComponentKind, ComponentMetadata};
             let metadata = ComponentMetadata {
                 name: "cli-show-fake".into(),
                 description: "fake component for the show subcommand".into(),
@@ -702,16 +689,11 @@ mod tests {
                 config_schema: serde_json::json!({"type": "object"}),
                 config_example: None,
             };
-            let _ = crate::component::register_component_metadata(
-                ComponentKind::Buffer,
-                metadata,
-            );
+            let _ = crate::component::register_component_metadata(ComponentKind::Buffer, metadata);
             let mut cli = Cli::default();
             assert_eq!(
-                cli.parse_from(argv(&[
-                    "components", "show", "buffer", "cli-show-fake"
-                ]))
-                .unwrap(),
+                cli.parse_from(argv(&["components", "show", "buffer", "cli-show-fake"]))
+                    .unwrap(),
                 ParseOutcome::Exit(0)
             );
             assert_eq!(
@@ -732,8 +714,7 @@ mod tests {
     #[test]
     fn otel_layer_is_absent_when_tracing_is_disabled() {
         let config = crate::config::TracingConfig::default();
-        let layer =
-            build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
+        let layer = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
         assert!(layer.is_none());
     }
 
@@ -797,7 +778,7 @@ mod tests {
     fn components_list_renders_multiple_kinds_and_filters_the_json_export() {
         // Unique type names keep the process-global registry idempotent.
         {
-            use crate::component::{ComponentMetadata, ComponentKind};
+            use crate::component::{ComponentKind, ComponentMetadata};
             for (kind, name) in [
                 (ComponentKind::Codec, "cli-coverage-codec"),
                 (ComponentKind::Temporary, "cli-coverage-temp"),
@@ -824,7 +805,7 @@ mod tests {
     #[test]
     fn unknown_type_for_a_populated_kind_lists_available_types() {
         {
-            use crate::component::{ComponentMetadata, ComponentKind};
+            use crate::component::{ComponentKind, ComponentMetadata};
             let _ = crate::component::register_component_metadata(
                 ComponentKind::Temporary,
                 ComponentMetadata {
@@ -835,8 +816,9 @@ mod tests {
                     config_example: None,
                 },
             );
-            let err = print_component_details(ComponentKind::Temporary, "definitely-missing", "text")
-                .unwrap_err();
+            let err =
+                print_component_details(ComponentKind::Temporary, "definitely-missing", "text")
+                    .unwrap_err();
             let message = err.to_string();
             assert!(message.contains("Available temporary types:"), "{message}");
             assert!(message.contains("cli-hint-temp"), "{message}");
@@ -874,5 +856,4 @@ mod tests {
         assert!(layer.is_some(), "valid config must yield the otel layer");
         shutdown_otel_tracing();
     }
-
 }

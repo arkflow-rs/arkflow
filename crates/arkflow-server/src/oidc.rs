@@ -87,7 +87,13 @@ impl OidcAuthenticator {
     /// `Some` only when both `ARKFLOW_OIDC_ISSUER` and
     /// `ARKFLOW_OIDC_AUDIENCE` are set — an unconfigured Hub behaves
     /// exactly as before.
-    pub fn new(issuer: String, audience: String, jwks_url: String, role_claim: String, scopes_claim: String) -> Self {
+    pub fn new(
+        issuer: String,
+        audience: String,
+        jwks_url: String,
+        role_claim: String,
+        scopes_claim: String,
+    ) -> Self {
         Self {
             issuer,
             audience,
@@ -201,7 +207,9 @@ impl OidcAuthenticator {
                 notified.await;
             }
             let cache = self.cache.lock().await;
-            cache.as_ref().and_then(|cached| cached.keys.get(kid).cloned())
+            cache
+                .as_ref()
+                .and_then(|cached| cached.keys.get(kid).cloned())
         }
     }
 
@@ -360,11 +368,18 @@ impl OidcFederation {
             return None;
         }
         let issuer = settings.issuer.trim_end_matches('/').to_string();
-        let jwks_url = settings.jwks_url.clone().unwrap_or_else(|| {
-            format!("{issuer}/.well-known/jwks.json")
-        });
-        let role_claim = settings.role_claim.clone().unwrap_or_else(|| "roles".to_string());
-        let scopes_claim = settings.scopes_claim.clone().unwrap_or_else(|| "scopes".to_string());
+        let jwks_url = settings
+            .jwks_url
+            .clone()
+            .unwrap_or_else(|| format!("{issuer}/.well-known/jwks.json"));
+        let role_claim = settings
+            .role_claim
+            .clone()
+            .unwrap_or_else(|| "roles".to_string());
+        let scopes_claim = settings
+            .scopes_claim
+            .clone()
+            .unwrap_or_else(|| "scopes".to_string());
         let authenticator = Arc::new(OidcAuthenticator::new(
             issuer.clone(),
             settings.audience.clone(),
@@ -379,9 +394,18 @@ impl OidcFederation {
         );
 
         let login = match (
-            settings.client_id.as_deref().filter(|v| !v.trim().is_empty()),
-            settings.client_secret.as_deref().filter(|v| !v.trim().is_empty()),
-            settings.redirect_uri.as_deref().filter(|v| !v.trim().is_empty()),
+            settings
+                .client_id
+                .as_deref()
+                .filter(|v| !v.trim().is_empty()),
+            settings
+                .client_secret
+                .as_deref()
+                .filter(|v| !v.trim().is_empty()),
+            settings
+                .redirect_uri
+                .as_deref()
+                .filter(|v| !v.trim().is_empty()),
         ) {
             (Some(client_id), Some(client_secret), Some(redirect_uri)) => {
                 match discover_endpoints(&issuer).await {
@@ -426,11 +450,18 @@ impl OidcFederation {
             return None;
         }
         let issuer = settings.issuer.trim_end_matches('/').to_string();
-        let jwks_url = settings.jwks_url.clone().unwrap_or_else(|| {
-            format!("{issuer}/.well-known/jwks.json")
-        });
-        let role_claim = settings.role_claim.clone().unwrap_or_else(|| "roles".to_string());
-        let scopes_claim = settings.scopes_claim.clone().unwrap_or_else(|| "scopes".to_string());
+        let jwks_url = settings
+            .jwks_url
+            .clone()
+            .unwrap_or_else(|| format!("{issuer}/.well-known/jwks.json"));
+        let role_claim = settings
+            .role_claim
+            .clone()
+            .unwrap_or_else(|| "roles".to_string());
+        let scopes_claim = settings
+            .scopes_claim
+            .clone()
+            .unwrap_or_else(|| "scopes".to_string());
         let authenticator = Arc::new(OidcAuthenticator::new(
             issuer,
             settings.audience.clone(),
@@ -465,12 +496,7 @@ impl OidcFederation {
 
     /// The IdP redirect for starting a login: random state, PKCE S256
     /// challenge, nonce, authorization endpoint, code flow, openid scope.
-    pub fn authorization_redirect(
-        &self,
-        state: &str,
-        code_challenge: &str,
-        nonce: &str,
-    ) -> String {
+    pub fn authorization_redirect(&self, state: &str, code_challenge: &str, nonce: &str) -> String {
         let login = self.login.as_ref().expect("login enabled");
         format!(
             "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}\
@@ -538,7 +564,9 @@ impl OidcFederation {
             return None;
         }
         let body: Value = response.json().await.ok()?;
-        body.get("id_token").and_then(Value::as_str).map(str::to_string)
+        body.get("id_token")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// Creates an 8-hour session for the principal and returns the random
@@ -559,7 +587,9 @@ impl OidcFederation {
     pub fn resolve_session(&self, session_id: &str) -> Option<OperatorPrincipal> {
         let mut sessions = self.sessions.lock().unwrap();
         sessions.retain(|_, (_, created)| created.elapsed() < SESSION_TTL);
-        sessions.get(session_id).map(|(principal, _)| principal.clone())
+        sessions
+            .get(session_id)
+            .map(|(principal, _)| principal.clone())
     }
 
     /// Deletes a session (logout).
@@ -613,7 +643,9 @@ fn urlencode(value: &str) -> String {
 }
 
 fn non_empty(var: &str) -> Option<String> {
-    std::env::var(var).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(var)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Maps the configured role claim to the highest matching role: a user in
@@ -673,8 +705,8 @@ mod tests {
     use super::*;
     use axum::extract::State;
     use axum::http::HeaderMap;
-    use serde_json::json;
     use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json;
 
     const TEST_EC_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgFKaU4QngGKYHGH+b\nFq3SU0eDMNlPgd3sNKkgaiFo2OahRANCAAS/UI48yy85lD5Gl6/4kIkN4hZj4vzV\nAUhlVj77ptTqegrClIS4WkTACFVD7+/VGnXDGvVdxPRIx6G9ZMJ6YPZg\n-----END PRIVATE KEY-----";
     const TEST_EC_WRONG_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgXdW84DyTHfX0zZ+y\nlSPXGHNeMSHmBFz1hX6WE/kyWRShRANCAASYmpicaPNUmsulnnZVid0Goz14cWwO\nQR9rJt0zomK913pFKVCY64fHIn88VwmJMv/HADRjdbK7KDgXlbKsGxS9\n-----END PRIVATE KEY-----";
@@ -821,11 +853,17 @@ mod tests {
     async fn multiple_roles_take_highest_privilege() {
         let mock = MockJwks::spawn(jwks_body(&[TEST_KID]));
         let auth = authenticator(format!("http://{}/jwks", mock.addr));
-        let token = mint(claims("u2", json!(["viewer", "operator"]), 600), Some(TEST_KID));
+        let token = mint(
+            claims("u2", json!(["viewer", "operator"]), 600),
+            Some(TEST_KID),
+        );
         let principal = auth.authenticate(&token).await.unwrap();
         assert_eq!(principal.roles, vec![OperatorRole::Operator]);
 
-        let token = mint(claims("u3", json!(["viewer", "admin", "operator"]), 600), Some(TEST_KID));
+        let token = mint(
+            claims("u3", json!(["viewer", "admin", "operator"]), 600),
+            Some(TEST_KID),
+        );
         let principal = auth.authenticate(&token).await.unwrap();
         assert_eq!(principal.roles, vec![OperatorRole::Admin]);
     }
@@ -903,7 +941,10 @@ mod tests {
         let token = mint(claims("u11", json!(["viewer"]), 600), Some(TEST_KID));
         let cancelled =
             tokio::time::timeout(Duration::from_millis(50), auth.authenticate(&token)).await;
-        assert!(cancelled.is_err(), "the request must still be in-flight when cancelled");
+        assert!(
+            cancelled.is_err(),
+            "the request must still be in-flight when cancelled"
+        );
         let principal = tokio::time::timeout(Duration::from_secs(5), auth.authenticate(&token))
             .await
             .expect("must not hang on a stranded refresh flag")
@@ -921,12 +962,13 @@ mod tests {
         let token = mint(claims("u9", json!(["viewer"]), 600), Some(TEST_KID));
         let auth = std::sync::Arc::new(auth);
         let auth_b = auth.clone();
-        let (winner, loser) = tokio::join!(
-            auth.authenticate(&token),
-            auth_b.authenticate(&token),
-        );
-        winner.as_ref().expect("the winner validates after its fetch");
-        loser.as_ref().expect("the loser must await the refresh and validate too");
+        let (winner, loser) = tokio::join!(auth.authenticate(&token), auth_b.authenticate(&token),);
+        winner
+            .as_ref()
+            .expect("the winner validates after its fetch");
+        loser
+            .as_ref()
+            .expect("the loser must await the refresh and validate too");
         assert_eq!(mock.fetch_count(), 1, "concurrent misses share one refresh");
     }
 
@@ -935,7 +977,10 @@ mod tests {
         let mock = MockJwks::spawn(jwks_body(&[])); // empty at first
         let auth = authenticator(format!("http://{}/jwks", mock.addr));
         let token = mint(claims("u8", json!(["viewer"]), 600), Some(TEST_KID));
-        assert!(auth.authenticate(&token).await.is_none(), "kid not published yet");
+        assert!(
+            auth.authenticate(&token).await.is_none(),
+            "kid not published yet"
+        );
         assert_eq!(mock.fetch_count(), 1);
 
         // IdP publishes the key; the next attempt refetches and succeeds.
@@ -1039,10 +1084,14 @@ mod tests {
                             let _ = stream.read_exact(&mut body_bytes);
                         }
                         let body = String::from_utf8_lossy(&body_bytes).to_string();
-                        request_log.lock().unwrap().push((head.clone(), body.clone()));
+                        request_log
+                            .lock()
+                            .unwrap()
+                            .push((head.clone(), body.clone()));
 
                         let path = head.split(' ').nth(1).unwrap_or("/").to_string();
-                        let response_body = if path.starts_with("/.well-known/openid-configuration") {
+                        let response_body = if path.starts_with("/.well-known/openid-configuration")
+                        {
                             format!(
                                 r#"{{"authorization_endpoint":"http://{addr}/authorize","token_endpoint":"http://{addr}/token"}}"#
                             )
@@ -1053,13 +1102,8 @@ mod tests {
                             // this provider (the Hub validates it). The
                             // nonce from the authorization request
                             // round-trips through the token request form.
-                            let nonce = nonce_slot
-                                .lock()
-                                .unwrap()
-                                .clone()
-                                .unwrap_or_default();
-                            let mut token_claims =
-                                claims("console-user", json!(["viewer"]), 600);
+                            let nonce = nonce_slot.lock().unwrap().clone().unwrap_or_default();
+                            let mut token_claims = claims("console-user", json!(["viewer"]), 600);
                             token_claims["iss"] = json!(base);
                             if !nonce.is_empty() {
                                 token_claims["nonce"] = json!(nonce);
@@ -1091,9 +1135,9 @@ mod tests {
     #[tokio::test]
     async fn full_login_flow_creates_session_that_authorizes() {
         use crate::api_contract::OperatorAction;
-        use axum::extract::State;
         use crate::hub::Hub;
         use crate::hub::HubConfig;
+        use axum::extract::State;
         use std::collections::HashMap as StdMap;
 
         let idp = MockIdp::spawn();
@@ -1158,7 +1202,10 @@ mod tests {
         query.insert("code".to_string(), code.to_string());
         // The IdP echoes back only the state segment (what the authorize URL
         // carried), not the whole cookie value.
-        query.insert("state".to_string(), state.split('.').next().unwrap().to_string());
+        query.insert(
+            "state".to_string(),
+            state.split('.').next().unwrap().to_string(),
+        );
         let response = crate::hub_oidc_callback(
             State(hub.clone()),
             axum::extract::Query(query),
@@ -1190,7 +1237,10 @@ mod tests {
             .operator_can(Some(&format!("session:{session_id}")), OperatorAction::Read)
             .await;
         let mutate_ok = hub
-            .operator_can(Some(&format!("session:{session_id}")), OperatorAction::Operate)
+            .operator_can(
+                Some(&format!("session:{session_id}")),
+                OperatorAction::Operate,
+            )
             .await;
         assert!(read_ok, "viewer session must read");
         assert!(!mutate_ok, "viewer session must not mutate");
@@ -1198,7 +1248,9 @@ mod tests {
         // 4. the token endpoint received the code exchange.
         let requests = idp.requests.lock().unwrap();
         assert!(
-            requests.iter().any(|(head, _)| head.starts_with("POST /token ")),
+            requests
+                .iter()
+                .any(|(head, _)| head.starts_with("POST /token ")),
             "code exchange must hit the token endpoint"
         );
     }
@@ -1267,9 +1319,16 @@ mod tests {
         );
         let mut query = std::collections::HashMap::new();
         query.insert("code".to_string(), "auth-code-2".to_string());
-        query.insert("state".to_string(), state.split('.').next().unwrap().to_string());
-        let callback = crate::hub_oidc_callback(State(hub.clone()), axum::extract::Query(query), callback_headers)
-            .await;
+        query.insert(
+            "state".to_string(),
+            state.split('.').next().unwrap().to_string(),
+        );
+        let callback = crate::hub_oidc_callback(
+            State(hub.clone()),
+            axum::extract::Query(query),
+            callback_headers,
+        )
+        .await;
         let session_cookie = callback
             .headers()
             .get(axum::http::header::SET_COOKIE)
@@ -1302,9 +1361,9 @@ mod tests {
 
     #[tokio::test]
     async fn state_mismatch_rejects_without_session() {
-        use axum::extract::State;
         use crate::hub::Hub;
         use crate::hub::HubConfig;
+        use axum::extract::State;
         use std::collections::HashMap as StdMap;
 
         let idp = MockIdp::spawn();
@@ -1432,7 +1491,10 @@ mod tests {
             },
             Some(TEST_KID),
         );
-        assert_eq!(OidcFederation::nonce_claim(&token).as_deref(), Some("nonce-abc-123"));
+        assert_eq!(
+            OidcFederation::nonce_claim(&token).as_deref(),
+            Some("nonce-abc-123")
+        );
 
         let without_nonce = mint(claims("u9", json!(["viewer"]), 600), Some(TEST_KID));
         assert_eq!(OidcFederation::nonce_claim(&without_nonce), None);
@@ -1450,13 +1512,19 @@ mod tests {
         let mut handles = Vec::new();
         for index in 0..4 {
             let auth = auth.clone();
-            let bogus = mint(claims("ghost", json!(["viewer"]), 600), Some(&format!("kid-{index}")));
+            let bogus = mint(
+                claims("ghost", json!(["viewer"]), 600),
+                Some(&format!("kid-{index}")),
+            );
             handles.push(tokio::spawn(async move { auth.authenticate(&bogus).await }));
         }
         for handle in handles {
             assert!(handle.await.unwrap().is_none(), "unknown kids must fail");
         }
-        let principal = auth.authenticate(&token).await.expect("known kid validates");
+        let principal = auth
+            .authenticate(&token)
+            .await
+            .expect("known kid validates");
         assert_eq!(principal.id, "u10");
     }
 
@@ -1468,7 +1536,10 @@ mod tests {
         let mock = MockJwks::spawn(jwks_body(&[TEST_KID]));
         let auth = std::sync::Arc::new(authenticator(format!("http://{}/jwks", mock.addr)));
         auth.spawn_periodic_refresh(std::time::Duration::from_millis(100));
-        let old_token = mint(claims("u1", serde_json::json!(["viewer"]), 600), Some(TEST_KID));
+        let old_token = mint(
+            claims("u1", serde_json::json!(["viewer"]), 600),
+            Some(TEST_KID),
+        );
         assert!(
             auth.authenticate(&old_token).await.is_some(),
             "the initially served kid validates"
@@ -1497,7 +1568,10 @@ mod tests {
     async fn failed_periodic_refresh_retains_the_previous_key_set() {
         let mock = MockJwks::spawn(jwks_body(&[TEST_KID]));
         let auth = std::sync::Arc::new(authenticator(format!("http://{}/jwks", mock.addr)));
-        let token = mint(claims("u1", serde_json::json!(["viewer"]), 600), Some(TEST_KID));
+        let token = mint(
+            claims("u1", serde_json::json!(["viewer"]), 600),
+            Some(TEST_KID),
+        );
         assert!(
             auth.authenticate(&token).await.is_some(),
             "the initially served kid validates"

@@ -68,8 +68,7 @@ fn committed_docs_artifacts_match_the_registry() {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("target directory is creatable");
             }
-            std::fs::write(path, content)
-                .unwrap_or_else(|e| panic!("cannot write {label}: {e}"));
+            std::fs::write(path, content).unwrap_or_else(|e| panic!("cannot write {label}: {e}"));
             println!("regenerated {}", path.display());
         }
         return;

@@ -1187,10 +1187,7 @@ mod tests {
         value["start_from_latest"] = serde_json::json!(true);
         let input = input_with(value);
         let config = input.build_client_config().unwrap();
-        assert_eq!(
-            config.get("auto.offset.reset"),
-            Some("latest")
-        );
+        assert_eq!(config.get("auto.offset.reset"), Some("latest"));
 
         let input = input_with(base_config());
         let config = input.build_client_config().unwrap();
@@ -1243,11 +1240,7 @@ mod tests {
         assert_eq!(applicable.len(), 2);
 
         // Explicit partition mode: only the assigned partition survives.
-        *input
-            .assigned_partition
-            .try_write()
-            .expect("write guard")
-        = Some(3);
+        *input.assigned_partition.try_write().expect("write guard") = Some(3);
         let applicable = input.applicable_positions(&positions).unwrap();
         assert_eq!(applicable.len(), 1);
         assert_eq!(applicable[0].partition, 3);
@@ -1281,12 +1274,8 @@ mod tests {
             .expect("billing assigned");
         assert_eq!(billing.offset(), rdkafka::Offset::Beginning);
 
-        let assignment = KafkaInput::merged_restore_assignment(
-            &["orders".to_string()],
-            2,
-            &[],
-            true,
-        );
+        let assignment =
+            KafkaInput::merged_restore_assignment(&["orders".to_string()], 2, &[], true);
         let elements = assignment.elements();
         assert_eq!(elements[0].offset(), rdkafka::Offset::End);
     }
@@ -1304,7 +1293,6 @@ mod tests {
         let input = input_with(base_config());
         assert!(input.txn_metadata.is_none());
     }
-
 
     /// Header metadata mapping: duplicate keys keep every value (positional
     /// suffix) and binary values are lossy-decoded instead of dropped.
@@ -2088,16 +2076,16 @@ mod tests {
         // Canceled: reconnectable before the code extraction.
         assert!(KafkaInput::retryable_receive_error(&KafkaError::Canceled));
         // ConsumerQueueClose carries a code like the other two variants.
-        assert!(KafkaInput::retryable_receive_error(&KafkaError::ConsumerQueueClose(
-            RDKafkaErrorCode::AllBrokersDown,
-        )));
-        assert!(!KafkaInput::retryable_receive_error(&KafkaError::ConsumerQueueClose(
-            RDKafkaErrorCode::Authentication,
-        )));
+        assert!(KafkaInput::retryable_receive_error(
+            &KafkaError::ConsumerQueueClose(RDKafkaErrorCode::AllBrokersDown,)
+        ));
+        assert!(!KafkaInput::retryable_receive_error(
+            &KafkaError::ConsumerQueueClose(RDKafkaErrorCode::Authentication,)
+        ));
         // An error shape without an embedded code is never retryable.
-        assert!(!KafkaInput::retryable_receive_error(&KafkaError::MessageProduction(
-            RDKafkaErrorCode::QueueFull,
-        )));
+        assert!(!KafkaInput::retryable_receive_error(
+            &KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull,)
+        ));
         // Admin-op errors carry no consumer code either.
         assert!(!KafkaInput::retryable_receive_error(&KafkaError::AdminOp(
             RDKafkaErrorCode::Authentication,
@@ -2112,12 +2100,12 @@ mod tests {
 
         // Before connect: watermark reports the missing consumer.
         let err = input.watermark_partitions().await.unwrap_err();
-        assert!(
-            err.to_string().contains("not connected"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("not connected"), "got: {err}");
 
-        input.connect().await.expect("subscribe-mode connect is offline");
+        input
+            .connect()
+            .await
+            .expect("subscribe-mode connect is offline");
         // The group assignment is still empty (no broker) — the partition
         // list comes back empty rather than erroring.
         let partitions = input.watermark_partitions().await.unwrap();
@@ -2177,69 +2165,59 @@ mod tests {
             "start_from_latest": false,
         }));
         // Zero offset: nothing to acknowledge.
-        assert!(
-            input
-                .ack_for_position(&SourcePosition {
-                    topic: Some("orders".into()),
-                    partition: 0,
-                    offset: 0,
-                })
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(input
+            .ack_for_position(&SourcePosition {
+                topic: Some("orders".into()),
+                partition: 0,
+                offset: 0,
+            })
+            .await
+            .unwrap()
+            .is_none());
         // A topic this input is not subscribed to is not ours to ack.
-        assert!(
-            input
-                .ack_for_position(&SourcePosition {
-                    topic: Some("other".into()),
-                    partition: 0,
-                    offset: 7,
-                })
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(input
+            .ack_for_position(&SourcePosition {
+                topic: Some("other".into()),
+                partition: 0,
+                offset: 7,
+            })
+            .await
+            .unwrap()
+            .is_none());
         // Explicit-partition mode declines other partitions.
         input.assign_partition(1).unwrap();
-        assert!(
-            input
-                .ack_for_position(&SourcePosition {
-                    topic: Some("orders".into()),
-                    partition: 5,
-                    offset: 7,
-                })
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(input
+            .ack_for_position(&SourcePosition {
+                topic: Some("orders".into()),
+                partition: 5,
+                offset: 7,
+            })
+            .await
+            .unwrap()
+            .is_none());
         // Matching topic+partition: an ack comes back anchored at the
         // record offset (checkpoint positions are exclusive).
-        assert!(
-            input
-                .ack_for_position(&SourcePosition {
-                    topic: Some("orders".into()),
-                    partition: 1,
-                    offset: 9,
-                })
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(input
+            .ack_for_position(&SourcePosition {
+                topic: Some("orders".into()),
+                partition: 1,
+                offset: 9,
+            })
+            .await
+            .unwrap()
+            .is_some());
         // A position without a topic is filtered by the configured-topic
         // guard above (which requires Some(topic)); it declines instead of
         // reaching the missing-topic error.
-        assert!(
-            input
-                .ack_for_position(&SourcePosition {
-                    topic: None,
-                    partition: 1,
-                    offset: 9,
-                })
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(input
+            .ack_for_position(&SourcePosition {
+                topic: None,
+                partition: 1,
+                offset: 9,
+            })
+            .await
+            .unwrap()
+            .is_none());
         // An offset that does not fit i64 cannot become a record offset.
         let err = match input
             .ack_for_position(&SourcePosition {
@@ -2252,10 +2230,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("an out-of-i64 offset cannot yield an ack"),
         };
-        assert!(
-            err.to_string().contains("exceeds i64"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("exceeds i64"), "got: {err}");
     }
 
     /// restore_positions before connect is a hard error; an empty
@@ -2264,10 +2239,7 @@ mod tests {
     async fn restore_positions_requires_connect_and_accepts_empty_checkpoints() {
         let input = input_with(base_config());
         let err = input.restore_positions(&[]).await.unwrap_err();
-        assert!(
-            err.to_string().contains("before connect"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("before connect"), "got: {err}");
 
         // Subscription mode: empty applicable set → no seeks, frontier seeded.
         input.connect().await.unwrap();

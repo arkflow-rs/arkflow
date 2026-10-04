@@ -826,17 +826,9 @@ mod tests {
         value["transactional_id"] = serde_json::json!("txn-1");
         let config = serde_json::from_value::<KafkaOutputConfig>(value).unwrap();
         let client_config = KafkaOutput::build_client_config(&config).unwrap();
-        assert_eq!(
-            client_config.get("transactional.id"),
-            Some("txn-1")
-        );
-        assert_eq!(
-            client_config.get("enable.idempotence"),
-            Some("true")
-        );
+        assert_eq!(client_config.get("transactional.id"), Some("txn-1"));
+        assert_eq!(client_config.get("enable.idempotence"), Some("true"));
     }
-
-
 
     fn resource() -> Resource {
         Resource {
@@ -1177,7 +1169,10 @@ mod tests {
                     "init_transactions",
                     producer.clone().init_transactions(zero),
                 ),
-                ("commit_transaction", producer.clone().commit_transaction(zero)),
+                (
+                    "commit_transaction",
+                    producer.clone().commit_transaction(zero),
+                ),
                 ("abort_transaction", producer.abort_transaction(zero)),
             ] {
                 let flags = match &result {
@@ -1240,7 +1235,10 @@ mod tests {
             .iter()
             .map(|(_, values)| {
                 Arc::new(StringArray::from(
-                    values.iter().map(|v| v.map(|s| s.to_string())).collect::<Vec<_>>(),
+                    values
+                        .iter()
+                        .map(|v| v.map(|s| s.to_string()))
+                        .collect::<Vec<_>>(),
                 )) as ArrayRef
             })
             .collect::<Vec<_>>();
@@ -1292,7 +1290,10 @@ mod tests {
                 &resource(),
             )
             .unwrap();
-        output.connect().await.expect("producer creation is offline");
+        output
+            .connect()
+            .await
+            .expect("producer creation is offline");
         output.close().await.expect("empty flush terminates");
         // A second close (no producer) is a no-op.
         output.close().await.unwrap();
@@ -1310,10 +1311,7 @@ mod tests {
         )
         .unwrap();
         let err = output.write(binary_field_batch(1)).await.unwrap_err();
-        assert!(
-            err.to_string().contains("not initialized"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("not initialized"), "got: {err}");
     }
 
     /// The non-transactional write path, offline: records are enqueued
@@ -1399,10 +1397,7 @@ mod tests {
         output.connect().await.unwrap();
         let batch = utf8_batch(&[("device_topic", vec![Some("a"), Some("b")])]);
         let err = output.write(batch).await.unwrap_err();
-        assert!(
-            err.to_string().contains("has no topic"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("has no topic"), "got: {err}");
     }
 
     /// write_batch's non-transactional path aggregates per-message failures
@@ -1434,10 +1429,7 @@ mod tests {
             .write_batch(&[binary_field_batch(1), binary_field_batch(1)])
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("value_field"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("value_field"), "got: {err}");
     }
 
     /// The transactional path fails fast offline: begin_transaction on a
@@ -1488,10 +1480,7 @@ mod tests {
             .write_batch(&[binary_field_batch(1)])
             .await
             .expect_err("no producer");
-        assert!(
-            err.to_string().contains("not initialized"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("not initialized"), "got: {err}");
     }
 
     /// The periodic flush loop runs while the output lives and stops on
@@ -1537,7 +1526,9 @@ mod tests {
             )
             .err()
             .expect("offset_commit_group requires exactly_once");
-        assert!(err.to_string().contains("offset_commit_group requires exactly_once"));
+        assert!(err
+            .to_string()
+            .contains("offset_commit_group requires exactly_once"));
     }
 
     /// Batches without position metadata contribute nothing (covered=false).
@@ -1554,14 +1545,22 @@ mod tests {
     /// named error, not a silent skip.
     #[test]
     fn l3_rejects_wrongly_typed_position_columns() {
-        use datafusion::arrow::array::{Int64Array, UInt64Array};
         use arkflow_core::meta_columns;
+        use datafusion::arrow::array::{Int64Array, UInt64Array};
         use datafusion::arrow::datatypes::{Field, Schema};
         let batch = {
             let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
                 Arc::new(Schema::new(vec![
-                    Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::Int64, false),
-                    Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::UInt64, false),
+                    Field::new(
+                        meta_columns::PARTITION,
+                        datafusion::arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
+                    Field::new(
+                        meta_columns::OFFSET,
+                        datafusion::arrow::datatypes::DataType::UInt64,
+                        false,
+                    ),
                 ])),
                 vec![
                     Arc::new(Int64Array::from(vec![0])),
@@ -1580,8 +1579,16 @@ mod tests {
         let batch = {
             let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
                 Arc::new(Schema::new(vec![
-                    Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::UInt32, false),
-                    Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::Utf8, false),
+                    Field::new(
+                        meta_columns::PARTITION,
+                        datafusion::arrow::datatypes::DataType::UInt32,
+                        false,
+                    ),
+                    Field::new(
+                        meta_columns::OFFSET,
+                        datafusion::arrow::datatypes::DataType::Utf8,
+                        false,
+                    ),
                 ])),
                 vec![
                     Arc::new(datafusion::arrow::array::UInt32Array::from(vec![0u32])),
@@ -1592,10 +1599,7 @@ mod tests {
             Arc::new(MessageBatch::new_arrow(rb))
         };
         let err = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap_err();
-        assert!(
-            err.to_string().contains(meta_columns::OFFSET),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains(meta_columns::OFFSET), "got: {err}");
     }
 
     /// Null position cells are skipped (they carry no committable position).
@@ -1606,8 +1610,16 @@ mod tests {
         use datafusion::arrow::datatypes::{Field, Schema};
         let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::UInt32, true),
-                Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::UInt64, true),
+                Field::new(
+                    meta_columns::PARTITION,
+                    datafusion::arrow::datatypes::DataType::UInt32,
+                    true,
+                ),
+                Field::new(
+                    meta_columns::OFFSET,
+                    datafusion::arrow::datatypes::DataType::UInt64,
+                    true,
+                ),
             ])),
             vec![
                 Arc::new(UInt32Array::from(vec![Some(0u32), None])),
@@ -1631,8 +1643,16 @@ mod tests {
         use datafusion::arrow::datatypes::{Field, Schema};
         let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::UInt32, false),
-                Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::UInt64, false),
+                Field::new(
+                    meta_columns::PARTITION,
+                    datafusion::arrow::datatypes::DataType::UInt32,
+                    false,
+                ),
+                Field::new(
+                    meta_columns::OFFSET,
+                    datafusion::arrow::datatypes::DataType::UInt64,
+                    false,
+                ),
             ])),
             vec![
                 Arc::new(UInt32Array::from(vec![0u32])),
@@ -1642,10 +1662,7 @@ mod tests {
         .unwrap();
         let batch = Arc::new(MessageBatch::new_arrow(rb));
         let err = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap_err();
-        assert!(
-            err.to_string().contains("overflow"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("overflow"), "got: {err}");
     }
 
     /// Duplicate rows for one partition fold to the max next-offset; a
@@ -1660,8 +1677,16 @@ mod tests {
         let build = |partitions: Vec<u32>, offsets: Vec<u64>| {
             let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
                 Arc::new(Schema::new(vec![
-                    Field::new(meta_columns::PARTITION, datafusion::arrow::datatypes::DataType::UInt32, false),
-                    Field::new(meta_columns::OFFSET, datafusion::arrow::datatypes::DataType::UInt64, false),
+                    Field::new(
+                        meta_columns::PARTITION,
+                        datafusion::arrow::datatypes::DataType::UInt32,
+                        false,
+                    ),
+                    Field::new(
+                        meta_columns::OFFSET,
+                        datafusion::arrow::datatypes::DataType::UInt64,
+                        false,
+                    ),
                 ])),
                 vec![
                     Arc::new(UInt32Array::from(partitions)),
@@ -1675,11 +1700,9 @@ mod tests {
         // Two rows on partition 2: the max next-offset must be present.
         // (rdkafka's add appends one element per call, so the list carries
         // both the initial 11 and the folded 31 — observed behavior.)
-        let (offsets, covered) = transactional_offsets_for_batches(
-            &[build(vec![2, 2], vec![10, 30])],
-            Some("orders"),
-        )
-        .unwrap();
+        let (offsets, covered) =
+            transactional_offsets_for_batches(&[build(vec![2, 2], vec![10, 30])], Some("orders"))
+                .unwrap();
         assert!(covered);
         let committed: Vec<rdkafka::Offset> =
             offsets.elements().iter().map(|e| e.offset()).collect();
@@ -1690,11 +1713,9 @@ mod tests {
 
         // u32::MAX as a partition becomes i32 -1 — rdkafka's sentinel for
         // "all partitions" — and is accepted as-is.
-        let (offsets, covered) = transactional_offsets_for_batches(
-            &[build(vec![u32::MAX], vec![1])],
-            Some("orders"),
-        )
-        .unwrap();
+        let (offsets, covered) =
+            transactional_offsets_for_batches(&[build(vec![u32::MAX], vec![1])], Some("orders"))
+                .unwrap();
         assert!(covered);
         assert_eq!(offsets.elements()[0].partition(), -1);
 
@@ -1754,10 +1775,7 @@ mod tests {
             Err(e) => panic!("the security block is consistent, build must pass: {e}"),
         };
         match output.connect().await {
-            Err(e) => assert!(
-                e.to_string().contains("cannot be created"),
-                "got: {e}"
-            ),
+            Err(e) => assert!(e.to_string().contains("cannot be created"), "got: {e}"),
             Ok(()) => panic!("a garbage CA PEM must fail producer creation"),
         }
     }
@@ -1784,6 +1802,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), inner.flush())
             .await
             .expect("a cancelled future resolves promptly")
-            // The outcome is logged either way; flush itself never errors.
+        // The outcome is logged either way; flush itself never errors.
     }
 }

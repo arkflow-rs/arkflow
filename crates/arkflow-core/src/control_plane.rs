@@ -513,8 +513,9 @@ mod retraction_tests {
         async fn connect(&self) -> Result<(), Error> {
             Ok(())
         }
-        async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error>
-        {
+        async fn read(
+            &self,
+        ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
             std::future::pending().await
         }
         async fn close(&self) -> Result<(), Error> {
@@ -590,10 +591,7 @@ mod retraction_tests {
         // holding it cannot observe the override mid-flight; Drop clears
         // the variable even on panic.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        std::env::set_var(
-            "ARKFLOW_CONFIG_HISTORY_DIR",
-            directory.path().as_os_str(),
-        );
+        std::env::set_var("ARKFLOW_CONFIG_HISTORY_DIR", directory.path().as_os_str());
         EnvOverride { _guard }
     }
 
@@ -644,10 +642,7 @@ mod retraction_tests {
             .apply_configuration(&stream_candidate())
             .await
             .expect_err("the real build fails after validation");
-        assert!(
-            error.to_string().contains("second build fails"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("second build fails"), "{error}");
         let versions = control_plane.version_store().list().unwrap();
         assert!(
             versions.is_empty(),

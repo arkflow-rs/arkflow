@@ -226,13 +226,7 @@ pub(crate) mod contract {
     impl ClaimThenDecodeInput {
         pub fn pair(codec: Option<Arc<dyn Codec>>) -> (flume::Sender<Vec<u8>>, Arc<Self>) {
             let (sender, receiver) = flume::bounded(8);
-            (
-                sender,
-                Arc::new(Self {
-                    receiver,
-                    codec,
-                }),
-            )
+            (sender, Arc::new(Self { receiver, codec }))
         }
     }
 
@@ -247,11 +241,7 @@ pub(crate) mod contract {
         }
 
         async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
-            let payload = self
-                .receiver
-                .recv_async()
-                .await
-                .map_err(|_| Error::EOF)?;
+            let payload = self.receiver.recv_async().await.map_err(|_| Error::EOF)?;
             // Side effect (claim) happened above; this await is where a
             // dropped read future loses the delivery.
             let mut batch = apply_codec_to_payload(&payload, &self.codec).await?;

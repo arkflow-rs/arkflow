@@ -2299,8 +2299,7 @@ mod coverage_tests {
     /// without the base job's stateful aggregate.
     fn stateless_job() -> JobSpec {
         let mut job = base_job();
-        job.operators
-            .retain(|operator| operator.id != "aggregate");
+        job.operators.retain(|operator| operator.id != "aggregate");
         job.edges.clear();
         job.edges.push(EdgeSpec {
             id: "source-sink".into(),
@@ -2531,10 +2530,7 @@ mod coverage_tests {
         let mut job = base_job();
         job.sources.clear();
         let error = job.validate().unwrap_err().to_string();
-        assert!(
-            error.contains("at least one executable source"),
-            "{error}"
-        );
+        assert!(error.contains("at least one executable source"), "{error}");
 
         let mut job = base_job();
         job.sinks.clear();
@@ -2853,10 +2849,7 @@ mod coverage_tests {
             .validate_side_edge_assignments(&assignments)
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("duplicate task assignment"),
-            "{error}"
-        );
+        assert!(error.contains("duplicate task assignment"), "{error}");
     }
 
     #[test]
@@ -2992,10 +2985,7 @@ mod coverage_tests {
         let error = task_for_key(&plan, "ghost-operator", b"customer-1")
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("no task owns key group"),
-            "{error}"
-        );
+        assert!(error.contains("no task owns key group"), "{error}");
     }
 
     #[test]
@@ -3011,7 +3001,10 @@ mod coverage_tests {
         };
         let mut controller = TaskAttemptController::new(attempt);
         assert!(controller.is_stale(1));
-        assert!(controller.start(1).is_err(), "a stale generation is refused");
+        assert!(
+            controller.start(1).is_err(),
+            "a stale generation is refused"
+        );
         controller.start(2).unwrap();
         assert_eq!(controller.attempt().state, TaskAttemptState::Running);
         assert!(

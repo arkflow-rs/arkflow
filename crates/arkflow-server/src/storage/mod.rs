@@ -5,9 +5,9 @@ pub mod postgres;
 pub mod sqlite;
 
 use async_trait::async_trait;
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -271,7 +271,6 @@ pub struct JobObservationRecord {
     pub snapshot_json: String,
     pub observed_at_ms: u64,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct RolloutTargetUpdate {
@@ -692,14 +691,14 @@ enum StorageCommand {
         holder: String,
         now_ms: u64,
         response: oneshot::Sender<Result<bool, StorageError>>,
-    },    /// Write-fencing envelope: execute the inner command only when the
+    },
+    /// Write-fencing envelope: execute the inner command only when the
     /// caller's claimed lease epoch (captured at send time) still matches
     /// the lease row's current epoch at execution time.
     Fenced {
         claimed_epoch: u64,
         command: Box<StorageCommand>,
     },
-
 }
 
 impl StorageCommand {
@@ -1002,7 +1001,9 @@ impl StorageCommand {
             StorageCommand::UpdateJob { .. } => "update_job",
             StorageCommand::UpdateJobDesiredState { .. } => "update_job_desired_state",
             StorageCommand::UpdateJobObservation { .. } => "update_job_observation",
-            StorageCommand::UpdateJobWithExpectedGeneration { .. } => "update_job_with_expected_generation",
+            StorageCommand::UpdateJobWithExpectedGeneration { .. } => {
+                "update_job_with_expected_generation"
+            }
             StorageCommand::UpdateRollout { .. } => "update_rollout",
             StorageCommand::UpdateRolloutTarget { .. } => "update_rollout_target",
             StorageCommand::UpsertJob { .. } => "upsert_job",
@@ -1012,7 +1013,6 @@ impl StorageCommand {
             StorageCommand::UpsertNode { .. } => "upsert_node",
             StorageCommand::UpsertOperation { .. } => "upsert_operation",
             StorageCommand::WakeNode { .. } => "wake_node",
-
         }
     }
 }
@@ -1039,9 +1039,10 @@ impl StorageActor {
                 // unaffected.
                 let store = store.clone();
                 let runtime = runtime.clone();
-                let outcome =
-                    tokio::task::spawn_blocking(move || runtime.block_on(dispatch(&store, command)))
-                        .await;
+                let outcome = tokio::task::spawn_blocking(move || {
+                    runtime.block_on(dispatch(&store, command))
+                })
+                .await;
                 if let Err(error) = outcome {
                     tracing::error!(%error, "storage actor command panicked");
                 }
@@ -1095,397 +1096,413 @@ async fn dispatch(store: &ControlPlaneStore, command: StorageCommand) {
                 Err(error) => inner.nack(error),
             }
         }
-                    StorageCommand::UpsertJob { job, response } => {
-                        let _ = response.send(store.upsert_job(job).await);
-                    }
-                    StorageCommand::UpdateJobWithExpectedGeneration {
-                        job,
-                        expected_generation,
-                        response,
-                    } => {
-                        let _ = response.send(
-                            store.update_job_with_expected_generation(job, expected_generation).await,
-                        );
-                    }
-                    StorageCommand::GetJob { job_id, response } => {
-                        let _ = response.send(store.get_job(&job_id).await);
-                    }
-                    StorageCommand::ListJobs { response } => {
-                        let _ = response.send(store.list_jobs().await);
-                    }
-                    StorageCommand::UpsertJobVersion { record, response } => {
-                        let _ = response.send(store.upsert_job_version(record).await);
-                    }
-                    StorageCommand::ListJobVersions { job_id, response } => {
-                        let _ = response.send(store.list_job_versions(&job_id).await);
-                    }
-                    StorageCommand::UpdateJob {
-                        job_id,
-                        desired_state,
-                        observed_state,
-                        convergence,
+        StorageCommand::UpsertJob { job, response } => {
+            let _ = response.send(store.upsert_job(job).await);
+        }
+        StorageCommand::UpdateJobWithExpectedGeneration {
+            job,
+            expected_generation,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .update_job_with_expected_generation(job, expected_generation)
+                    .await,
+            );
+        }
+        StorageCommand::GetJob { job_id, response } => {
+            let _ = response.send(store.get_job(&job_id).await);
+        }
+        StorageCommand::ListJobs { response } => {
+            let _ = response.send(store.list_jobs().await);
+        }
+        StorageCommand::UpsertJobVersion { record, response } => {
+            let _ = response.send(store.upsert_job_version(record).await);
+        }
+        StorageCommand::ListJobVersions { job_id, response } => {
+            let _ = response.send(store.list_job_versions(&job_id).await);
+        }
+        StorageCommand::UpdateJob {
+            job_id,
+            desired_state,
+            observed_state,
+            convergence,
+            generation,
+            checkpoint_id,
+            last_error,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .update_job(
+                        &job_id,
+                        desired_state.as_deref(),
+                        observed_state.as_deref(),
+                        convergence.as_deref(),
                         generation,
-                        checkpoint_id,
-                        last_error,
-                        response,
-                    } => {
-                        let _ = response.send(store.update_job(
-                            &job_id,
-                            desired_state.as_deref(),
-                            observed_state.as_deref(),
-                            convergence.as_deref(),
-                            generation,
-                            checkpoint_id.as_deref(),
-                            last_error.as_deref(),
-                        ).await);
-                    }
-                    StorageCommand::UpdateJobObservation {
-                        job_id,
-                        observed_state,
-                        convergence,
+                        checkpoint_id.as_deref(),
+                        last_error.as_deref(),
+                    )
+                    .await,
+            );
+        }
+        StorageCommand::UpdateJobObservation {
+            job_id,
+            observed_state,
+            convergence,
+            generation,
+            expected_generation,
+            checkpoint_id,
+            last_error,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .update_job_observation(
+                        &job_id,
+                        &observed_state,
+                        &convergence,
                         generation,
                         expected_generation,
-                        checkpoint_id,
-                        last_error,
-                        response,
-                    } => {
-                        let _ = response.send(store.update_job_observation(
-                            &job_id,
-                            &observed_state,
-                            &convergence,
-                            generation,
-                            expected_generation,
-                            checkpoint_id.as_deref(),
-                            last_error.as_deref(),
-                        ).await);
-                    }
-                    StorageCommand::UpdateJobDesiredState {
-                        job_id,
-                        desired_state,
-                        expected_generation,
-                        response,
-                    } => {
-                        let _ = response.send(store.update_job_desired_state(
-                            &job_id,
-                            &desired_state,
-                            expected_generation,
-                        ).await);
-                    }
-                    StorageCommand::UpsertJobCheckpoint { record, response } => {
-                        let _ = response.send(store.upsert_job_checkpoint(record).await);
-                    }
-                    StorageCommand::ListJobCheckpoints { job_id, response } => {
-                        let _ = response.send(store.list_job_checkpoints(&job_id).await);
-                    }
-                    StorageCommand::DeleteJobCheckpoint {
-                        job_id,
-                        checkpoint_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.delete_job_checkpoint(&job_id, &checkpoint_id).await);
-                    }
-                    StorageCommand::UpsertNode { mutation, response } => {
-                        let _ = response.send(store.upsert_node(mutation).await);
-                    }
-                    StorageCommand::ResetObservedCursors { node_id, response } => {
-                        let _ = response.send(store.reset_observed_cursors(&node_id).await);
-                    }
-                    StorageCommand::SetDesired { mutation, response } => {
-                        let _ = response.send(store.set_desired(mutation).await);
-                    }
-                    StorageCommand::GetDesired {
-                        node_id,
-                        stream_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.get_desired(&node_id, &stream_id).await);
-                    }
-                    StorageCommand::GetIntent {
-                        intent_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.get_intent(&intent_id).await);
-                    }
-                    StorageCommand::ListIntents { node_id, response } => {
-                        let _ = response.send(store.list_intents(node_id.as_deref()).await);
-                    }
-                    StorageCommand::RecoverReconciliation { now_ms, response } => {
-                        let _ = response.send(store.recover_reconciliation(now_ms).await);
-                    }
-                    StorageCommand::WakeNode {
-                        node_id,
-                        now_ms,
-                        response,
-                    } => {
-                        let _ = response.send(store.wake_node(&node_id, now_ms).await);
-                    }
-                    StorageCommand::ListEvents { node_id, response } => {
-                        let _ = response.send(store.list_events(node_id.as_deref()).await);
-                    }
-                    StorageCommand::PruneEvents { retain, response } => {
-                        let _ = response.send(store.prune_events(retain).await);
-                    }
-                    StorageCommand::PruneOperationHistory {
-                        older_than_ms,
-                        max_retained,
-                        response,
-                    } => {
-                        let _ = response
-                            .send(store.prune_operation_history(older_than_ms, max_retained).await);
-                    }
-                    StorageCommand::PruneJobCheckpointRecords {
-                        older_than_ms,
-                        response,
-                    } => {
-                        let _ = response.send(store.prune_job_checkpoint_records(older_than_ms).await);
-                    }
-                    StorageCommand::PruneAuditEvents {
-                        older_than_ms,
-                        max_retained,
-                        response,
-                    } => {
-                        let _ =
-                            response.send(store.prune_audit_events(older_than_ms, max_retained).await);
-                    }
-                    StorageCommand::PruneProcessedOutbox {
-                        older_than_ms,
-                        max_retained,
-                        response,
-                    } => {
-                        let _ = response
-                            .send(store.prune_processed_outbox(older_than_ms, max_retained).await);
-                    }
-                    StorageCommand::PruneTerminalAttempts {
-                        older_than_ms,
-                        max_retained,
-                        response,
-                    } => {
-                        let _ = response
-                            .send(store.prune_terminal_attempts(older_than_ms, max_retained).await);
-                    }
-                    StorageCommand::ClaimAttempt {
-                        intent_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.claim_attempt(&intent_id).await);
-                    }
-                    StorageCommand::MarkAttemptDispatched {
-                        attempt_id,
-                        expires_at_ms,
-                        response,
-                    } => {
-                        let _ = response
-                            .send(store.mark_attempt_dispatched(&attempt_id, expires_at_ms).await);
-                    }
-                    StorageCommand::ExpireAttempts { now_ms, response } => {
-                        let _ = response.send(store.expire_attempts(now_ms).await);
-                    }
-                    StorageCommand::CompleteAttempt {
-                        attempt_id,
-                        state,
-                        failure_class,
-                        response,
-                    } => {
-                        let _ = response.send(store.complete_attempt(
-                            &attempt_id,
-                            &state,
-                            failure_class.as_deref(),
-                        ).await);
-                    }
-                    StorageCommand::RecordObserved { mutation, response } => {
-                        let _ = response.send(store.record_observed(mutation).await);
-                    }
-                    StorageCommand::ClaimOutbox {
-                        worker_id,
-                        now_ms,
-                        response,
-                    } => {
-                        let _ = response.send(store.claim_outbox(&worker_id, now_ms).await);
-                    }
-                    StorageCommand::MarkOutboxProcessed {
-                        outbox_id,
-                        now_ms,
-                        response,
-                    } => {
-                        let _ = response.send(store.mark_outbox_processed(outbox_id, now_ms).await);
-                    }
-                    StorageCommand::SetNodeMaintenance {
-                        mutation,
-                        now_ms,
-                        response,
-                    } => {
-                        let _ = response.send(store.set_node_maintenance(mutation, now_ms).await);
-                    }
-                    StorageCommand::GetNodeMaintenance { node_id, response } => {
-                        let _ = response.send(store.get_node_maintenance(&node_id).await);
-                    }
-                    StorageCommand::OperationalAggregates { now_ms, response } => {
-                        let _ = response.send(store.operational_aggregates(now_ms).await);
-                    }
-                    StorageCommand::RecordAudit { record, response } => {
-                        let _ = response.send(store.record_audit(record).await);
-                    }
-                    StorageCommand::ListAudit {
-                        resource_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.list_audit(resource_id.as_deref()).await);
-                    }
-                    StorageCommand::CreateRollout {
-                        rollout,
-                        targets,
-                        response,
-                    } => {
-                        let _ = response.send(store.create_rollout(rollout, targets).await);
-                    }
-                    StorageCommand::CreateRolloutWithContent {
-                        rollout,
-                        targets,
-                        content,
-                        created_by,
-                        response,
-                    } => {
-                        let _ = response.send(store.create_rollout_with_content(
-                            rollout,
-                            targets,
-                            &content,
-                            created_by.as_deref(),
-                        ).await);
-                    }
-                    StorageCommand::GetRollout {
-                        rollout_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.get_rollout(&rollout_id).await);
-                    }
-                    StorageCommand::ListRolloutTargets {
-                        rollout_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.list_rollout_targets(&rollout_id).await);
-                    }
-                    StorageCommand::UpdateRollout {
-                        rollout_id,
-                        state,
-                        current_batch,
-                        updated_at_ms,
-                        response,
-                    } => {
-                        let _ = response.send(store.update_rollout(
-                            &rollout_id,
-                            &state,
-                            current_batch,
-                            updated_at_ms,
-                        ).await);
-                    }
-                    StorageCommand::UpdateRolloutTarget { update, response } => {
-                        let _ = response.send(store.update_rollout_target(update).await);
-                    }
-                    StorageCommand::GetConfigVersionContent {
-                        config_version_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.get_config_version_content(&config_version_id).await);
-                    }
-                    StorageCommand::RecoverRollouts { response } => {
-                        let _ = response.send(store.recover_rollouts().await);
-                    }
-                    StorageCommand::ListRollouts { response } => {
-                        let _ = response.send(store.list_rollouts().await);
-                    }
-                    StorageCommand::UpsertJobUpgrade { record, response } => {
-                        let _ = response.send(store.upsert_job_upgrade(record).await);
-                    }
-                    StorageCommand::TransitionJobUpgrade {
-                        record,
-                        expected_phase,
-                        response,
-                    } => {
-                        let _ = response
-                            .send(store.transition_job_upgrade(record, &expected_phase).await);
-                    }
-                    StorageCommand::GetJobUpgrade {
-                        upgrade_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.get_job_upgrade(&upgrade_id).await);
-                    }
-                    StorageCommand::RecoverJobUpgrades { response } => {
-                        let _ = response.send(store.recover_job_upgrades().await);
-                    }
-                    StorageCommand::ListJobUpgrades { job_id, response } => {
-                        let _ = response.send(store.list_job_upgrades(&job_id).await);
-                    }
-                    StorageCommand::PruneJobUpgrades {
-                        older_than_ms,
-                        max_retained,
-                        response,
-                    } => {
-                        let _ = response
-                            .send(store.prune_job_upgrades(older_than_ms, max_retained).await);
-                    }
-                    StorageCommand::UpsertOperation {
-                        operation,
-                        response,
-                    } => {
-                        let _ = response.send(store.upsert_operation(operation).await);
-                    }
-                    StorageCommand::GetOperation {
-                        operation_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.get_operation(&operation_id).await);
-                    }
-                    StorageCommand::ListOperations { node_id, response } => {
-                        let _ = response.send(store.list_operations(node_id.as_deref()).await);
-                    }
-                    StorageCommand::ListJobStartOperations {
-                        resource_id,
-                        response,
-                    } => {
-                        let _ = response.send(store.list_job_start_operations(&resource_id).await);
-                    }
-                    StorageCommand::TryAcquireHubLease {
-                        holder,
-                        advertise_url,
-                        ttl_ms,
-                        now_ms,
-                        response,
-                    } => {
-                        let _ = response.send(
-                            store
-                                .try_acquire_hub_lease(&holder, advertise_url.as_deref(), ttl_ms, now_ms)
-                                .await,
-                        );
-                    }
-                    StorageCommand::RenewHubLease {
-                        holder,
-                        advertise_url,
-                        ttl_ms,
-                        now_ms,
-                        response,
-                    } => {
-                        let _ = response.send(
-                            store
-                                .renew_hub_lease(&holder, advertise_url.as_deref(), ttl_ms, now_ms)
-                                .await,
-                        );
-                    }
-                    StorageCommand::ReleaseHubLease {
-                        holder,
-                        now_ms,
-                        response,
-                    } => {
-                        let _ = response.send(store.release_hub_lease(&holder, now_ms).await);
-                    }
-                    StorageCommand::ReadHubLeaseSnapshot { response } => {
-                        let _ = response.send(store.hub_lease_snapshot().await);
-                    }
-                }
+                        checkpoint_id.as_deref(),
+                        last_error.as_deref(),
+                    )
+                    .await,
+            );
+        }
+        StorageCommand::UpdateJobDesiredState {
+            job_id,
+            desired_state,
+            expected_generation,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .update_job_desired_state(&job_id, &desired_state, expected_generation)
+                    .await,
+            );
+        }
+        StorageCommand::UpsertJobCheckpoint { record, response } => {
+            let _ = response.send(store.upsert_job_checkpoint(record).await);
+        }
+        StorageCommand::ListJobCheckpoints { job_id, response } => {
+            let _ = response.send(store.list_job_checkpoints(&job_id).await);
+        }
+        StorageCommand::DeleteJobCheckpoint {
+            job_id,
+            checkpoint_id,
+            response,
+        } => {
+            let _ = response.send(store.delete_job_checkpoint(&job_id, &checkpoint_id).await);
+        }
+        StorageCommand::UpsertNode { mutation, response } => {
+            let _ = response.send(store.upsert_node(mutation).await);
+        }
+        StorageCommand::ResetObservedCursors { node_id, response } => {
+            let _ = response.send(store.reset_observed_cursors(&node_id).await);
+        }
+        StorageCommand::SetDesired { mutation, response } => {
+            let _ = response.send(store.set_desired(mutation).await);
+        }
+        StorageCommand::GetDesired {
+            node_id,
+            stream_id,
+            response,
+        } => {
+            let _ = response.send(store.get_desired(&node_id, &stream_id).await);
+        }
+        StorageCommand::GetIntent {
+            intent_id,
+            response,
+        } => {
+            let _ = response.send(store.get_intent(&intent_id).await);
+        }
+        StorageCommand::ListIntents { node_id, response } => {
+            let _ = response.send(store.list_intents(node_id.as_deref()).await);
+        }
+        StorageCommand::RecoverReconciliation { now_ms, response } => {
+            let _ = response.send(store.recover_reconciliation(now_ms).await);
+        }
+        StorageCommand::WakeNode {
+            node_id,
+            now_ms,
+            response,
+        } => {
+            let _ = response.send(store.wake_node(&node_id, now_ms).await);
+        }
+        StorageCommand::ListEvents { node_id, response } => {
+            let _ = response.send(store.list_events(node_id.as_deref()).await);
+        }
+        StorageCommand::PruneEvents { retain, response } => {
+            let _ = response.send(store.prune_events(retain).await);
+        }
+        StorageCommand::PruneOperationHistory {
+            older_than_ms,
+            max_retained,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .prune_operation_history(older_than_ms, max_retained)
+                    .await,
+            );
+        }
+        StorageCommand::PruneJobCheckpointRecords {
+            older_than_ms,
+            response,
+        } => {
+            let _ = response.send(store.prune_job_checkpoint_records(older_than_ms).await);
+        }
+        StorageCommand::PruneAuditEvents {
+            older_than_ms,
+            max_retained,
+            response,
+        } => {
+            let _ = response.send(store.prune_audit_events(older_than_ms, max_retained).await);
+        }
+        StorageCommand::PruneProcessedOutbox {
+            older_than_ms,
+            max_retained,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .prune_processed_outbox(older_than_ms, max_retained)
+                    .await,
+            );
+        }
+        StorageCommand::PruneTerminalAttempts {
+            older_than_ms,
+            max_retained,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .prune_terminal_attempts(older_than_ms, max_retained)
+                    .await,
+            );
+        }
+        StorageCommand::ClaimAttempt {
+            intent_id,
+            response,
+        } => {
+            let _ = response.send(store.claim_attempt(&intent_id).await);
+        }
+        StorageCommand::MarkAttemptDispatched {
+            attempt_id,
+            expires_at_ms,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .mark_attempt_dispatched(&attempt_id, expires_at_ms)
+                    .await,
+            );
+        }
+        StorageCommand::ExpireAttempts { now_ms, response } => {
+            let _ = response.send(store.expire_attempts(now_ms).await);
+        }
+        StorageCommand::CompleteAttempt {
+            attempt_id,
+            state,
+            failure_class,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .complete_attempt(&attempt_id, &state, failure_class.as_deref())
+                    .await,
+            );
+        }
+        StorageCommand::RecordObserved { mutation, response } => {
+            let _ = response.send(store.record_observed(mutation).await);
+        }
+        StorageCommand::ClaimOutbox {
+            worker_id,
+            now_ms,
+            response,
+        } => {
+            let _ = response.send(store.claim_outbox(&worker_id, now_ms).await);
+        }
+        StorageCommand::MarkOutboxProcessed {
+            outbox_id,
+            now_ms,
+            response,
+        } => {
+            let _ = response.send(store.mark_outbox_processed(outbox_id, now_ms).await);
+        }
+        StorageCommand::SetNodeMaintenance {
+            mutation,
+            now_ms,
+            response,
+        } => {
+            let _ = response.send(store.set_node_maintenance(mutation, now_ms).await);
+        }
+        StorageCommand::GetNodeMaintenance { node_id, response } => {
+            let _ = response.send(store.get_node_maintenance(&node_id).await);
+        }
+        StorageCommand::OperationalAggregates { now_ms, response } => {
+            let _ = response.send(store.operational_aggregates(now_ms).await);
+        }
+        StorageCommand::RecordAudit { record, response } => {
+            let _ = response.send(store.record_audit(record).await);
+        }
+        StorageCommand::ListAudit {
+            resource_id,
+            response,
+        } => {
+            let _ = response.send(store.list_audit(resource_id.as_deref()).await);
+        }
+        StorageCommand::CreateRollout {
+            rollout,
+            targets,
+            response,
+        } => {
+            let _ = response.send(store.create_rollout(rollout, targets).await);
+        }
+        StorageCommand::CreateRolloutWithContent {
+            rollout,
+            targets,
+            content,
+            created_by,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .create_rollout_with_content(rollout, targets, &content, created_by.as_deref())
+                    .await,
+            );
+        }
+        StorageCommand::GetRollout {
+            rollout_id,
+            response,
+        } => {
+            let _ = response.send(store.get_rollout(&rollout_id).await);
+        }
+        StorageCommand::ListRolloutTargets {
+            rollout_id,
+            response,
+        } => {
+            let _ = response.send(store.list_rollout_targets(&rollout_id).await);
+        }
+        StorageCommand::UpdateRollout {
+            rollout_id,
+            state,
+            current_batch,
+            updated_at_ms,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .update_rollout(&rollout_id, &state, current_batch, updated_at_ms)
+                    .await,
+            );
+        }
+        StorageCommand::UpdateRolloutTarget { update, response } => {
+            let _ = response.send(store.update_rollout_target(update).await);
+        }
+        StorageCommand::GetConfigVersionContent {
+            config_version_id,
+            response,
+        } => {
+            let _ = response.send(store.get_config_version_content(&config_version_id).await);
+        }
+        StorageCommand::RecoverRollouts { response } => {
+            let _ = response.send(store.recover_rollouts().await);
+        }
+        StorageCommand::ListRollouts { response } => {
+            let _ = response.send(store.list_rollouts().await);
+        }
+        StorageCommand::UpsertJobUpgrade { record, response } => {
+            let _ = response.send(store.upsert_job_upgrade(record).await);
+        }
+        StorageCommand::TransitionJobUpgrade {
+            record,
+            expected_phase,
+            response,
+        } => {
+            let _ = response.send(store.transition_job_upgrade(record, &expected_phase).await);
+        }
+        StorageCommand::GetJobUpgrade {
+            upgrade_id,
+            response,
+        } => {
+            let _ = response.send(store.get_job_upgrade(&upgrade_id).await);
+        }
+        StorageCommand::RecoverJobUpgrades { response } => {
+            let _ = response.send(store.recover_job_upgrades().await);
+        }
+        StorageCommand::ListJobUpgrades { job_id, response } => {
+            let _ = response.send(store.list_job_upgrades(&job_id).await);
+        }
+        StorageCommand::PruneJobUpgrades {
+            older_than_ms,
+            max_retained,
+            response,
+        } => {
+            let _ = response.send(store.prune_job_upgrades(older_than_ms, max_retained).await);
+        }
+        StorageCommand::UpsertOperation {
+            operation,
+            response,
+        } => {
+            let _ = response.send(store.upsert_operation(operation).await);
+        }
+        StorageCommand::GetOperation {
+            operation_id,
+            response,
+        } => {
+            let _ = response.send(store.get_operation(&operation_id).await);
+        }
+        StorageCommand::ListOperations { node_id, response } => {
+            let _ = response.send(store.list_operations(node_id.as_deref()).await);
+        }
+        StorageCommand::ListJobStartOperations {
+            resource_id,
+            response,
+        } => {
+            let _ = response.send(store.list_job_start_operations(&resource_id).await);
+        }
+        StorageCommand::TryAcquireHubLease {
+            holder,
+            advertise_url,
+            ttl_ms,
+            now_ms,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .try_acquire_hub_lease(&holder, advertise_url.as_deref(), ttl_ms, now_ms)
+                    .await,
+            );
+        }
+        StorageCommand::RenewHubLease {
+            holder,
+            advertise_url,
+            ttl_ms,
+            now_ms,
+            response,
+        } => {
+            let _ = response.send(
+                store
+                    .renew_hub_lease(&holder, advertise_url.as_deref(), ttl_ms, now_ms)
+                    .await,
+            );
+        }
+        StorageCommand::ReleaseHubLease {
+            holder,
+            now_ms,
+            response,
+        } => {
+            let _ = response.send(store.release_hub_lease(&holder, now_ms).await);
+        }
+        StorageCommand::ReadHubLeaseSnapshot { response } => {
+            let _ = response.send(store.hub_lease_snapshot().await);
+        }
+    }
 }
 
 impl StorageActor {
-
     /// The current leadership claim, for the election loop to keep in sync
     /// (lease epoch while leader, 0 on losing/never-holding the lease).
     pub fn leadership_epoch(&self) -> Arc<AtomicU64> {
@@ -1499,7 +1516,9 @@ impl StorageActor {
         &self,
         command: StorageCommand,
     ) -> Result<(), mpsc::error::SendError<StorageCommand>> {
-        let claimed_epoch = self.leadership_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let claimed_epoch = self
+            .leadership_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
         if claimed_epoch == UNFENCED {
             // HA disabled: fencing must not depend on the absence of a
             // lease row — a leftover row from an earlier HA deployment
@@ -1529,12 +1548,12 @@ impl StorageActor {
     ) -> Result<JobRecord, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::UpdateJobWithExpectedGeneration {
-                job,
-                expected_generation,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            job,
+            expected_generation,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1598,17 +1617,17 @@ impl StorageActor {
     ) -> Result<Option<JobRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::UpdateJob {
-                job_id: job_id.into(),
-                desired_state,
-                observed_state,
-                convergence,
-                generation,
-                checkpoint_id,
-                last_error,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            job_id: job_id.into(),
+            desired_state,
+            observed_state,
+            convergence,
+            generation,
+            checkpoint_id,
+            last_error,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1625,17 +1644,17 @@ impl StorageActor {
     ) -> Result<Option<JobRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::UpdateJobObservation {
-                job_id: job_id.into(),
-                observed_state: observed_state.into(),
-                convergence: convergence.into(),
-                generation,
-                expected_generation,
-                checkpoint_id,
-                last_error,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            job_id: job_id.into(),
+            observed_state: observed_state.into(),
+            convergence: convergence.into(),
+            generation,
+            expected_generation,
+            checkpoint_id,
+            last_error,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1647,13 +1666,13 @@ impl StorageActor {
     ) -> Result<Option<JobRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::UpdateJobDesiredState {
-                job_id: job_id.into(),
-                desired_state: desired_state.into(),
-                expected_generation,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            job_id: job_id.into(),
+            desired_state: desired_state.into(),
+            expected_generation,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1690,12 +1709,12 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::DeleteJobCheckpoint {
-                job_id: job_id.into(),
-                checkpoint_id: checkpoint_id.into(),
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            job_id: job_id.into(),
+            checkpoint_id: checkpoint_id.into(),
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1724,11 +1743,11 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::ResetObservedCursors {
-                node_id: node_id.into(),
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            node_id: node_id.into(),
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1739,12 +1758,12 @@ impl StorageActor {
     ) -> Result<Option<OutboxRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::ClaimOutbox {
-                worker_id: worker_id.into(),
-                now_ms,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            worker_id: worker_id.into(),
+            now_ms,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1810,12 +1829,12 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::WakeNode {
-                node_id: node_id.into(),
-                now_ms,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            node_id: node_id.into(),
+            now_ms,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1853,12 +1872,12 @@ impl StorageActor {
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::PruneOperationHistory {
-                older_than_ms,
-                max_retained,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            older_than_ms,
+            max_retained,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1871,11 +1890,11 @@ impl StorageActor {
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::PruneJobCheckpointRecords {
-                older_than_ms,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            older_than_ms,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1886,12 +1905,12 @@ impl StorageActor {
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::PruneAuditEvents {
-                older_than_ms,
-                max_retained,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            older_than_ms,
+            max_retained,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1905,12 +1924,12 @@ impl StorageActor {
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::PruneProcessedOutbox {
-                older_than_ms,
-                max_retained,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            older_than_ms,
+            max_retained,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1924,12 +1943,12 @@ impl StorageActor {
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::PruneTerminalAttempts {
-                older_than_ms,
-                max_retained,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            older_than_ms,
+            max_retained,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1939,11 +1958,11 @@ impl StorageActor {
     ) -> Result<Option<AttemptRecord>, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::ClaimAttempt {
-                intent_id: intent_id.into(),
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            intent_id: intent_id.into(),
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1962,12 +1981,12 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::MarkAttemptDispatched {
-                attempt_id: attempt_id.into(),
-                expires_at_ms,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            attempt_id: attempt_id.into(),
+            expires_at_ms,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -1987,13 +2006,13 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::CompleteAttempt {
-                attempt_id: attempt_id.into(),
-                state: state.into(),
-                failure_class,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            attempt_id: attempt_id.into(),
+            state: state.into(),
+            failure_class,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -2004,12 +2023,12 @@ impl StorageActor {
     ) -> Result<bool, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::SetNodeMaintenance {
-                mutation,
-                now_ms,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            mutation,
+            now_ms,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -2047,12 +2066,12 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::MarkOutboxProcessed {
-                outbox_id,
-                now_ms,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            outbox_id,
+            now_ms,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -2086,12 +2105,12 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::CreateRollout {
-                rollout,
-                targets,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            rollout,
+            targets,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -2104,14 +2123,14 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::CreateRolloutWithContent {
-                rollout,
-                targets,
-                content: content.into(),
-                created_by,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            rollout,
+            targets,
+            content: content.into(),
+            created_by,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -2154,14 +2173,14 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::UpdateRollout {
-                rollout_id: rollout_id.into(),
-                state: state.into(),
-                current_batch,
-                updated_at_ms,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            rollout_id: rollout_id.into(),
+            state: state.into(),
+            current_batch,
+            updated_at_ms,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -2210,10 +2229,7 @@ impl StorageActor {
 
     pub async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
-        self.send_fenced(StorageCommand::UpsertJobUpgrade {
-                record,
-                response,
-            })
+        self.send_fenced(StorageCommand::UpsertJobUpgrade { record, response })
             .await
             .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
@@ -2226,12 +2242,12 @@ impl StorageActor {
     ) -> Result<bool, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::TransitionJobUpgrade {
-                record,
-                expected_phase: expected_phase.into(),
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            record,
+            expected_phase: expected_phase.into(),
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -2280,12 +2296,12 @@ impl StorageActor {
     ) -> Result<usize, StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::PruneJobUpgrades {
-                older_than_ms,
-                max_retained,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            older_than_ms,
+            max_retained,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -2295,11 +2311,11 @@ impl StorageActor {
     ) -> Result<(), StorageError> {
         let (response, receiver) = oneshot::channel();
         self.send_fenced(StorageCommand::UpsertOperation {
-                operation,
-                response,
-            })
-            .await
-            .map_err(|_| StorageError::ActorClosed)?;
+            operation,
+            response,
+        })
+        .await
+        .map_err(|_| StorageError::ActorClosed)?;
         receiver.await.map_err(|_| StorageError::ActorClosed)?
     }
 
@@ -2427,25 +2443,25 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn upsert_node(&self, mutation: NodeMutation) -> Result<(), StorageError>;
     async fn reset_observed_cursors(&self, node_id: &str) -> Result<(), StorageError>;
     async fn set_node_maintenance(
-&self,
-mutation: NodeMaintenanceMutation,
-now_ms: u64,
-) -> Result<bool, StorageError>;
+        &self,
+        mutation: NodeMaintenanceMutation,
+        now_ms: u64,
+    ) -> Result<bool, StorageError>;
     async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError>;
     async fn operational_aggregates(
-&self,
-now_ms: u64,
-) -> Result<OperationalAggregates, StorageError>;
+        &self,
+        now_ms: u64,
+    ) -> Result<OperationalAggregates, StorageError>;
     async fn claim_outbox(
-&self,
-worker_id: &str,
-now_ms: u64,
-) -> Result<Option<OutboxRecord>, StorageError>;
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<OutboxRecord>, StorageError>;
     async fn get_desired(
-&self,
-node_id: &str,
-stream_id: &str,
-) -> Result<Option<DesiredRecord>, StorageError>;
+        &self,
+        node_id: &str,
+        stream_id: &str,
+    ) -> Result<Option<DesiredRecord>, StorageError>;
     async fn get_intent(&self, intent_id: &str) -> Result<Option<IntentRecord>, StorageError>;
     async fn list_intents(&self, node_id: Option<&str>) -> Result<Vec<IntentRecord>, StorageError>;
     async fn recover_reconciliation(&self, now_ms: u64) -> Result<(), StorageError>;
@@ -2453,72 +2469,74 @@ stream_id: &str,
     async fn list_events(&self, node_id: Option<&str>) -> Result<Vec<StoredEvent>, StorageError>;
     async fn prune_events(&self, retain: usize) -> Result<usize, StorageError>;
     async fn prune_operation_history(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError>;
-    async fn prune_job_checkpoint_records(&self, older_than_ms: i64) -> Result<usize, StorageError>;
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError>;
+    async fn prune_job_checkpoint_records(&self, older_than_ms: i64)
+        -> Result<usize, StorageError>;
     async fn prune_audit_events(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError>;
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError>;
     async fn prune_processed_outbox(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError>;
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError>;
     async fn prune_terminal_attempts(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError>;
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError>;
     async fn claim_attempt(&self, intent_id: &str) -> Result<Option<AttemptRecord>, StorageError>;
     async fn complete_attempt(
-&self,
-attempt_id: &str,
-state: &str,
-failure_class: Option<&str>,
-) -> Result<(), StorageError>;
+        &self,
+        attempt_id: &str,
+        state: &str,
+        failure_class: Option<&str>,
+    ) -> Result<(), StorageError>;
     async fn mark_attempt_dispatched(
-&self,
-attempt_id: &str,
-expires_at_ms: u64,
-) -> Result<(), StorageError>;
+        &self,
+        attempt_id: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), StorageError>;
     async fn expire_attempts(&self, now_ms: u64) -> Result<usize, StorageError>;
     async fn record_observed(&self, mutation: ObservedMutation) -> Result<(), StorageError>;
     async fn mark_outbox_processed(&self, outbox_id: i64, now_ms: u64) -> Result<(), StorageError>;
     async fn record_audit(&self, record: AuditRecord) -> Result<i64, StorageError>;
-    async fn list_audit(&self, resource_id: Option<&str>) -> Result<Vec<AuditRecord>, StorageError>;
+    async fn list_audit(&self, resource_id: Option<&str>)
+        -> Result<Vec<AuditRecord>, StorageError>;
     async fn create_rollout(
-&self,
-rollout: RolloutRecord,
-targets: Vec<RolloutTargetRecord>,
-) -> Result<(), StorageError>;
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+    ) -> Result<(), StorageError>;
     async fn create_rollout_with_content(
-&self,
-rollout: RolloutRecord,
-targets: Vec<RolloutTargetRecord>,
-content: &str,
-created_by: Option<&str>,
-) -> Result<(), StorageError>;
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+        content: &str,
+        created_by: Option<&str>,
+    ) -> Result<(), StorageError>;
     async fn get_rollout(&self, rollout_id: &str) -> Result<Option<RolloutRecord>, StorageError>;
     async fn list_rollout_targets(
-&self,
-rollout_id: &str,
-) -> Result<Vec<RolloutTargetRecord>, StorageError>;
+        &self,
+        rollout_id: &str,
+    ) -> Result<Vec<RolloutTargetRecord>, StorageError>;
     async fn update_rollout(
-&self,
-rollout_id: &str,
-state: &str,
-current_batch: u32,
-updated_at_ms: u64,
-) -> Result<(), StorageError>;
+        &self,
+        rollout_id: &str,
+        state: &str,
+        current_batch: u32,
+        updated_at_ms: u64,
+    ) -> Result<(), StorageError>;
     async fn update_rollout_target(&self, update: RolloutTargetUpdate) -> Result<(), StorageError>;
     async fn get_config_version_content(
-&self,
-config_version_id: &str,
-) -> Result<Option<String>, StorageError>;
+        &self,
+        config_version_id: &str,
+    ) -> Result<Option<String>, StorageError>;
     async fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
     async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError>;
@@ -2544,60 +2562,60 @@ config_version_id: &str,
     ) -> Result<usize, StorageError>;
     async fn upsert_operation(&self, operation: PersistedOperation) -> Result<(), StorageError>;
     async fn get_operation(
-&self,
-operation_id: &str,
-) -> Result<Option<PersistedOperation>, StorageError>;
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<PersistedOperation>, StorageError>;
     async fn list_operations(
-&self,
-node_id: Option<&str>,
-) -> Result<Vec<PersistedOperation>, StorageError>;
+        &self,
+        node_id: Option<&str>,
+    ) -> Result<Vec<PersistedOperation>, StorageError>;
     async fn list_job_start_operations(
-&self,
-resource_id: &str,
-) -> Result<Vec<PersistedOperation>, StorageError>;
+        &self,
+        resource_id: &str,
+    ) -> Result<Vec<PersistedOperation>, StorageError>;
     async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError>;
     async fn update_job_with_expected_generation(
-&self,
-mut job: JobRecord,
-expected_generation: u64,
-) -> Result<JobRecord, StorageError>;
+        &self,
+        mut job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError>;
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError>;
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError>;
     async fn list_job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, StorageError>;
     async fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError>;
     #[allow(clippy::too_many_arguments)]
     async fn update_job(
-&self,
-job_id: &str,
-desired_state: Option<&str>,
-observed_state: Option<&str>,
-convergence: Option<&str>,
-generation: Option<u64>,
-checkpoint_id: Option<&str>,
-last_error: Option<&str>,
-) -> Result<Option<JobRecord>, StorageError>;
+        &self,
+        job_id: &str,
+        desired_state: Option<&str>,
+        observed_state: Option<&str>,
+        convergence: Option<&str>,
+        generation: Option<u64>,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError>;
     #[allow(clippy::too_many_arguments)]
     async fn update_job_observation(
-&self,
-job_id: &str,
-observed_state: &str,
-convergence: &str,
-generation: u64,
-expected_generation: u64,
-checkpoint_id: Option<&str>,
-last_error: Option<&str>,
-) -> Result<Option<JobRecord>, StorageError>;
+        &self,
+        job_id: &str,
+        observed_state: &str,
+        convergence: &str,
+        generation: u64,
+        expected_generation: u64,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError>;
     async fn update_job_desired_state(
-&self,
-job_id: &str,
-desired_state: &str,
-expected_generation: u64,
-) -> Result<Option<JobRecord>, StorageError>;
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError>;
     async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError>;
     async fn list_job_checkpoints(
-&self,
-job_id: &str,
-) -> Result<Vec<JobCheckpointRecord>, StorageError>;
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<JobCheckpointRecord>, StorageError>;
     async fn delete_job_checkpoint(
         &self,
         job_id: &str,
@@ -2653,7 +2671,9 @@ impl ControlPlaneStore {
     #[cfg(test)]
     pub async fn contract(label: &str) -> ControlPlaneStore {
         match std::env::var("ARKFLOW_TEST_POSTGRES_URL") {
-            Ok(_) => ControlPlaneStore::open(&contract_database_url(label).await).await.unwrap(),
+            Ok(_) => ControlPlaneStore::open(&contract_database_url(label).await)
+                .await
+                .unwrap(),
             Err(_) => ControlPlaneStore::in_memory().unwrap(),
         }
     }
@@ -2672,7 +2692,9 @@ pub(crate) async fn contract_database_url(label: &str) -> String {
     // admin session's lifetime is exactly the serialization we need (test
     // helper only; the pool size is one admin connection at a time).
     static ADMIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ADMIN_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = ADMIN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // A label can be requested more than once per test run (a fixture
     // helper plus the test body); each request gets its own database so a
     // recreate never drops a database another holder still uses.
@@ -2785,17 +2807,23 @@ impl StorageBackend for ControlPlaneStore {
     async fn reset_observed_cursors(&self, node_id: &str) -> Result<(), StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::reset_observed_cursors(backend, node_id).await,
-            Self::Postgres(backend) => StorageBackend::reset_observed_cursors(backend, node_id).await,
+            Self::Postgres(backend) => {
+                StorageBackend::reset_observed_cursors(backend, node_id).await
+            }
         }
     }
     async fn set_node_maintenance(
-&self,
-mutation: NodeMaintenanceMutation,
-now_ms: u64,
-) -> Result<bool, StorageError> {
+        &self,
+        mutation: NodeMaintenanceMutation,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::set_node_maintenance(backend, mutation, now_ms).await,
-            Self::Postgres(backend) => StorageBackend::set_node_maintenance(backend, mutation, now_ms).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::set_node_maintenance(backend, mutation, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::set_node_maintenance(backend, mutation, now_ms).await
+            }
         }
     }
     async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError> {
@@ -2805,32 +2833,38 @@ now_ms: u64,
         }
     }
     async fn operational_aggregates(
-&self,
-now_ms: u64,
-) -> Result<OperationalAggregates, StorageError> {
+        &self,
+        now_ms: u64,
+    ) -> Result<OperationalAggregates, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::operational_aggregates(backend, now_ms).await,
-            Self::Postgres(backend) => StorageBackend::operational_aggregates(backend, now_ms).await,
+            Self::Postgres(backend) => {
+                StorageBackend::operational_aggregates(backend, now_ms).await
+            }
         }
     }
     async fn claim_outbox(
-&self,
-worker_id: &str,
-now_ms: u64,
-) -> Result<Option<OutboxRecord>, StorageError> {
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<OutboxRecord>, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::claim_outbox(backend, worker_id, now_ms).await,
-            Self::Postgres(backend) => StorageBackend::claim_outbox(backend, worker_id, now_ms).await,
+            Self::Postgres(backend) => {
+                StorageBackend::claim_outbox(backend, worker_id, now_ms).await
+            }
         }
     }
     async fn get_desired(
-&self,
-node_id: &str,
-stream_id: &str,
-) -> Result<Option<DesiredRecord>, StorageError> {
+        &self,
+        node_id: &str,
+        stream_id: &str,
+    ) -> Result<Option<DesiredRecord>, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::get_desired(backend, node_id, stream_id).await,
-            Self::Postgres(backend) => StorageBackend::get_desired(backend, node_id, stream_id).await,
+            Self::Postgres(backend) => {
+                StorageBackend::get_desired(backend, node_id, stream_id).await
+            }
         }
     }
     async fn get_intent(&self, intent_id: &str) -> Result<Option<IntentRecord>, StorageError> {
@@ -2848,7 +2882,9 @@ stream_id: &str,
     async fn recover_reconciliation(&self, now_ms: u64) -> Result<(), StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::recover_reconciliation(backend, now_ms).await,
-            Self::Postgres(backend) => StorageBackend::recover_reconciliation(backend, now_ms).await,
+            Self::Postgres(backend) => {
+                StorageBackend::recover_reconciliation(backend, now_ms).await
+            }
         }
     }
     async fn wake_node(&self, node_id: &str, now_ms: u64) -> Result<(), StorageError> {
@@ -2870,49 +2906,72 @@ stream_id: &str,
         }
     }
     async fn prune_operation_history(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError> {
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::prune_operation_history(backend, older_than_ms, max_retained).await,
-            Self::Postgres(backend) => StorageBackend::prune_operation_history(backend, older_than_ms, max_retained).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::prune_operation_history(backend, older_than_ms, max_retained).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::prune_operation_history(backend, older_than_ms, max_retained).await
+            }
         }
     }
-    async fn prune_job_checkpoint_records(&self, older_than_ms: i64) -> Result<usize, StorageError> {
+    async fn prune_job_checkpoint_records(
+        &self,
+        older_than_ms: i64,
+    ) -> Result<usize, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::prune_job_checkpoint_records(backend, older_than_ms).await,
-            Self::Postgres(backend) => StorageBackend::prune_job_checkpoint_records(backend, older_than_ms).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::prune_job_checkpoint_records(backend, older_than_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::prune_job_checkpoint_records(backend, older_than_ms).await
+            }
         }
     }
     async fn prune_audit_events(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError> {
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::prune_audit_events(backend, older_than_ms, max_retained).await,
-            Self::Postgres(backend) => StorageBackend::prune_audit_events(backend, older_than_ms, max_retained).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::prune_audit_events(backend, older_than_ms, max_retained).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::prune_audit_events(backend, older_than_ms, max_retained).await
+            }
         }
     }
     async fn prune_processed_outbox(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError> {
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::prune_processed_outbox(backend, older_than_ms, max_retained).await,
-            Self::Postgres(backend) => StorageBackend::prune_processed_outbox(backend, older_than_ms, max_retained).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::prune_processed_outbox(backend, older_than_ms, max_retained).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::prune_processed_outbox(backend, older_than_ms, max_retained).await
+            }
         }
     }
     async fn prune_terminal_attempts(
-&self,
-older_than_ms: i64,
-max_retained: i64,
-) -> Result<usize, StorageError> {
+        &self,
+        older_than_ms: i64,
+        max_retained: i64,
+    ) -> Result<usize, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::prune_terminal_attempts(backend, older_than_ms, max_retained).await,
-            Self::Postgres(backend) => StorageBackend::prune_terminal_attempts(backend, older_than_ms, max_retained).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::prune_terminal_attempts(backend, older_than_ms, max_retained).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::prune_terminal_attempts(backend, older_than_ms, max_retained).await
+            }
         }
     }
     async fn claim_attempt(&self, intent_id: &str) -> Result<Option<AttemptRecord>, StorageError> {
@@ -2922,24 +2981,32 @@ max_retained: i64,
         }
     }
     async fn complete_attempt(
-&self,
-attempt_id: &str,
-state: &str,
-failure_class: Option<&str>,
-) -> Result<(), StorageError> {
+        &self,
+        attempt_id: &str,
+        state: &str,
+        failure_class: Option<&str>,
+    ) -> Result<(), StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::complete_attempt(backend, attempt_id, state, failure_class).await,
-            Self::Postgres(backend) => StorageBackend::complete_attempt(backend, attempt_id, state, failure_class).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::complete_attempt(backend, attempt_id, state, failure_class).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::complete_attempt(backend, attempt_id, state, failure_class).await
+            }
         }
     }
     async fn mark_attempt_dispatched(
-&self,
-attempt_id: &str,
-expires_at_ms: u64,
-) -> Result<(), StorageError> {
+        &self,
+        attempt_id: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::mark_attempt_dispatched(backend, attempt_id, expires_at_ms).await,
-            Self::Postgres(backend) => StorageBackend::mark_attempt_dispatched(backend, attempt_id, expires_at_ms).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::mark_attempt_dispatched(backend, attempt_id, expires_at_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::mark_attempt_dispatched(backend, attempt_id, expires_at_ms).await
+            }
         }
     }
     async fn expire_attempts(&self, now_ms: u64) -> Result<usize, StorageError> {
@@ -2956,8 +3023,12 @@ expires_at_ms: u64,
     }
     async fn mark_outbox_processed(&self, outbox_id: i64, now_ms: u64) -> Result<(), StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::mark_outbox_processed(backend, outbox_id, now_ms).await,
-            Self::Postgres(backend) => StorageBackend::mark_outbox_processed(backend, outbox_id, now_ms).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::mark_outbox_processed(backend, outbox_id, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::mark_outbox_processed(backend, outbox_id, now_ms).await
+            }
         }
     }
     async fn record_audit(&self, record: AuditRecord) -> Result<i64, StorageError> {
@@ -2966,32 +3037,49 @@ expires_at_ms: u64,
             Self::Postgres(backend) => StorageBackend::record_audit(backend, record).await,
         }
     }
-    async fn list_audit(&self, resource_id: Option<&str>) -> Result<Vec<AuditRecord>, StorageError> {
+    async fn list_audit(
+        &self,
+        resource_id: Option<&str>,
+    ) -> Result<Vec<AuditRecord>, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::list_audit(backend, resource_id).await,
             Self::Postgres(backend) => StorageBackend::list_audit(backend, resource_id).await,
         }
     }
     async fn create_rollout(
-&self,
-rollout: RolloutRecord,
-targets: Vec<RolloutTargetRecord>,
-) -> Result<(), StorageError> {
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+    ) -> Result<(), StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::create_rollout(backend, rollout, targets).await,
-            Self::Postgres(backend) => StorageBackend::create_rollout(backend, rollout, targets).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::create_rollout(backend, rollout, targets).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::create_rollout(backend, rollout, targets).await
+            }
         }
     }
     async fn create_rollout_with_content(
-&self,
-rollout: RolloutRecord,
-targets: Vec<RolloutTargetRecord>,
-content: &str,
-created_by: Option<&str>,
-) -> Result<(), StorageError> {
+        &self,
+        rollout: RolloutRecord,
+        targets: Vec<RolloutTargetRecord>,
+        content: &str,
+        created_by: Option<&str>,
+    ) -> Result<(), StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::create_rollout_with_content(backend, rollout, targets, content, created_by).await,
-            Self::Postgres(backend) => StorageBackend::create_rollout_with_content(backend, rollout, targets, content, created_by).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::create_rollout_with_content(
+                    backend, rollout, targets, content, created_by,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::create_rollout_with_content(
+                    backend, rollout, targets, content, created_by,
+                )
+                .await
+            }
         }
     }
     async fn get_rollout(&self, rollout_id: &str) -> Result<Option<RolloutRecord>, StorageError> {
@@ -3001,24 +3089,46 @@ created_by: Option<&str>,
         }
     }
     async fn list_rollout_targets(
-&self,
-rollout_id: &str,
-) -> Result<Vec<RolloutTargetRecord>, StorageError> {
+        &self,
+        rollout_id: &str,
+    ) -> Result<Vec<RolloutTargetRecord>, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::list_rollout_targets(backend, rollout_id).await,
-            Self::Postgres(backend) => StorageBackend::list_rollout_targets(backend, rollout_id).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::list_rollout_targets(backend, rollout_id).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::list_rollout_targets(backend, rollout_id).await
+            }
         }
     }
     async fn update_rollout(
-&self,
-rollout_id: &str,
-state: &str,
-current_batch: u32,
-updated_at_ms: u64,
-) -> Result<(), StorageError> {
+        &self,
+        rollout_id: &str,
+        state: &str,
+        current_batch: u32,
+        updated_at_ms: u64,
+    ) -> Result<(), StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::update_rollout(backend, rollout_id, state, current_batch, updated_at_ms).await,
-            Self::Postgres(backend) => StorageBackend::update_rollout(backend, rollout_id, state, current_batch, updated_at_ms).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::update_rollout(
+                    backend,
+                    rollout_id,
+                    state,
+                    current_batch,
+                    updated_at_ms,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::update_rollout(
+                    backend,
+                    rollout_id,
+                    state,
+                    current_batch,
+                    updated_at_ms,
+                )
+                .await
+            }
         }
     }
     async fn update_rollout_target(&self, update: RolloutTargetUpdate) -> Result<(), StorageError> {
@@ -3028,24 +3138,28 @@ updated_at_ms: u64,
         }
     }
     async fn get_config_version_content(
-&self,
-config_version_id: &str,
-) -> Result<Option<String>, StorageError> {
+        &self,
+        config_version_id: &str,
+    ) -> Result<Option<String>, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::get_config_version_content(backend, config_version_id).await,
-            Self::Postgres(backend) => StorageBackend::get_config_version_content(backend, config_version_id).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::get_config_version_content(backend, config_version_id).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::get_config_version_content(backend, config_version_id).await
+            }
         }
     }
     async fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::recover_rollouts(backend, ).await,
-            Self::Postgres(backend) => StorageBackend::recover_rollouts(backend, ).await,
+            Self::Sqlite(backend) => StorageBackend::recover_rollouts(backend).await,
+            Self::Postgres(backend) => StorageBackend::recover_rollouts(backend).await,
         }
     }
     async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::list_rollouts(backend, ).await,
-            Self::Postgres(backend) => StorageBackend::list_rollouts(backend, ).await,
+            Self::Sqlite(backend) => StorageBackend::list_rollouts(backend).await,
+            Self::Postgres(backend) => StorageBackend::list_rollouts(backend).await,
         }
     }
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
@@ -3110,30 +3224,34 @@ config_version_id: &str,
         }
     }
     async fn get_operation(
-&self,
-operation_id: &str,
-) -> Result<Option<PersistedOperation>, StorageError> {
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<PersistedOperation>, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::get_operation(backend, operation_id).await,
             Self::Postgres(backend) => StorageBackend::get_operation(backend, operation_id).await,
         }
     }
     async fn list_operations(
-&self,
-node_id: Option<&str>,
-) -> Result<Vec<PersistedOperation>, StorageError> {
+        &self,
+        node_id: Option<&str>,
+    ) -> Result<Vec<PersistedOperation>, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::list_operations(backend, node_id).await,
             Self::Postgres(backend) => StorageBackend::list_operations(backend, node_id).await,
         }
     }
     async fn list_job_start_operations(
-&self,
-resource_id: &str,
-) -> Result<Vec<PersistedOperation>, StorageError> {
+        &self,
+        resource_id: &str,
+    ) -> Result<Vec<PersistedOperation>, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::list_job_start_operations(backend, resource_id).await,
-            Self::Postgres(backend) => StorageBackend::list_job_start_operations(backend, resource_id).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::list_job_start_operations(backend, resource_id).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::list_job_start_operations(backend, resource_id).await
+            }
         }
     }
     async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
@@ -3143,13 +3261,27 @@ resource_id: &str,
         }
     }
     async fn update_job_with_expected_generation(
-&self,
-job: JobRecord,
-expected_generation: u64,
-) -> Result<JobRecord, StorageError> {
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::update_job_with_expected_generation(backend, job, expected_generation).await,
-            Self::Postgres(backend) => StorageBackend::update_job_with_expected_generation(backend, job, expected_generation).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::update_job_with_expected_generation(
+                    backend,
+                    job,
+                    expected_generation,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::update_job_with_expected_generation(
+                    backend,
+                    job,
+                    expected_generation,
+                )
+                .await
+            }
         }
     }
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError> {
@@ -3172,49 +3304,113 @@ expected_generation: u64,
     }
     async fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::list_jobs(backend, ).await,
-            Self::Postgres(backend) => StorageBackend::list_jobs(backend, ).await,
+            Self::Sqlite(backend) => StorageBackend::list_jobs(backend).await,
+            Self::Postgres(backend) => StorageBackend::list_jobs(backend).await,
         }
     }
     async fn update_job(
-&self,
-job_id: &str,
-desired_state: Option<&str>,
-observed_state: Option<&str>,
-convergence: Option<&str>,
-generation: Option<u64>,
-checkpoint_id: Option<&str>,
-last_error: Option<&str>,
-) -> Result<Option<JobRecord>, StorageError> {
+        &self,
+        job_id: &str,
+        desired_state: Option<&str>,
+        observed_state: Option<&str>,
+        convergence: Option<&str>,
+        generation: Option<u64>,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::update_job(backend, job_id, desired_state, observed_state, convergence, generation, checkpoint_id, last_error).await,
-            Self::Postgres(backend) => StorageBackend::update_job(backend, job_id, desired_state, observed_state, convergence, generation, checkpoint_id, last_error).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::update_job(
+                    backend,
+                    job_id,
+                    desired_state,
+                    observed_state,
+                    convergence,
+                    generation,
+                    checkpoint_id,
+                    last_error,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::update_job(
+                    backend,
+                    job_id,
+                    desired_state,
+                    observed_state,
+                    convergence,
+                    generation,
+                    checkpoint_id,
+                    last_error,
+                )
+                .await
+            }
         }
     }
     async fn update_job_observation(
-&self,
-job_id: &str,
-observed_state: &str,
-convergence: &str,
-generation: u64,
-expected_generation: u64,
-checkpoint_id: Option<&str>,
-last_error: Option<&str>,
-) -> Result<Option<JobRecord>, StorageError> {
+        &self,
+        job_id: &str,
+        observed_state: &str,
+        convergence: &str,
+        generation: u64,
+        expected_generation: u64,
+        checkpoint_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::update_job_observation(backend, job_id, observed_state, convergence, generation, expected_generation, checkpoint_id, last_error).await,
-            Self::Postgres(backend) => StorageBackend::update_job_observation(backend, job_id, observed_state, convergence, generation, expected_generation, checkpoint_id, last_error).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::update_job_observation(
+                    backend,
+                    job_id,
+                    observed_state,
+                    convergence,
+                    generation,
+                    expected_generation,
+                    checkpoint_id,
+                    last_error,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::update_job_observation(
+                    backend,
+                    job_id,
+                    observed_state,
+                    convergence,
+                    generation,
+                    expected_generation,
+                    checkpoint_id,
+                    last_error,
+                )
+                .await
+            }
         }
     }
     async fn update_job_desired_state(
-&self,
-job_id: &str,
-desired_state: &str,
-expected_generation: u64,
-) -> Result<Option<JobRecord>, StorageError> {
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::update_job_desired_state(backend, job_id, desired_state, expected_generation).await,
-            Self::Postgres(backend) => StorageBackend::update_job_desired_state(backend, job_id, desired_state, expected_generation).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::update_job_desired_state(
+                    backend,
+                    job_id,
+                    desired_state,
+                    expected_generation,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::update_job_desired_state(
+                    backend,
+                    job_id,
+                    desired_state,
+                    expected_generation,
+                )
+                .await
+            }
         }
     }
     async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
@@ -3224,22 +3420,26 @@ expected_generation: u64,
         }
     }
     async fn list_job_checkpoints(
-&self,
-job_id: &str,
-) -> Result<Vec<JobCheckpointRecord>, StorageError> {
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<JobCheckpointRecord>, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::list_job_checkpoints(backend, job_id).await,
             Self::Postgres(backend) => StorageBackend::list_job_checkpoints(backend, job_id).await,
         }
     }
     async fn delete_job_checkpoint(
-&self,
-job_id: &str,
-checkpoint_id: &str,
-) -> Result<(), StorageError> {
+        &self,
+        job_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<(), StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::delete_job_checkpoint(backend, job_id, checkpoint_id).await,
-            Self::Postgres(backend) => StorageBackend::delete_job_checkpoint(backend, job_id, checkpoint_id).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::delete_job_checkpoint(backend, job_id, checkpoint_id).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::delete_job_checkpoint(backend, job_id, checkpoint_id).await
+            }
         }
     }
     async fn try_acquire_hub_lease(
@@ -3251,12 +3451,24 @@ checkpoint_id: &str,
     ) -> Result<HubLeaseAcquire, StorageError> {
         match self {
             Self::Sqlite(backend) => {
-                StorageBackend::try_acquire_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms)
-                    .await
+                StorageBackend::try_acquire_hub_lease(
+                    backend,
+                    holder,
+                    advertise_url,
+                    ttl_ms,
+                    now_ms,
+                )
+                .await
             }
             Self::Postgres(backend) => {
-                StorageBackend::try_acquire_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms)
-                    .await
+                StorageBackend::try_acquire_hub_lease(
+                    backend,
+                    holder,
+                    advertise_url,
+                    ttl_ms,
+                    now_ms,
+                )
+                .await
             }
         }
     }
@@ -3269,10 +3481,12 @@ checkpoint_id: &str,
     ) -> Result<HubLeaseRenew, StorageError> {
         match self {
             Self::Sqlite(backend) => {
-                StorageBackend::renew_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms).await
+                StorageBackend::renew_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms)
+                    .await
             }
             Self::Postgres(backend) => {
-                StorageBackend::renew_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms).await
+                StorageBackend::renew_hub_lease(backend, holder, advertise_url, ttl_ms, now_ms)
+                    .await
             }
         }
     }
@@ -3284,8 +3498,12 @@ checkpoint_id: &str,
     }
     async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::release_hub_lease(backend, holder, now_ms).await,
-            Self::Postgres(backend) => StorageBackend::release_hub_lease(backend, holder, now_ms).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::release_hub_lease(backend, holder, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::release_hub_lease(backend, holder, now_ms).await
+            }
         }
     }
     async fn current_lease_epoch(&self) -> Result<Option<u64>, StorageError> {
@@ -3296,8 +3514,12 @@ checkpoint_id: &str,
     }
     async fn begin_write_fence(&self, claimed_epoch: u64) -> Result<WriteFence, StorageError> {
         match self {
-            Self::Sqlite(backend) => StorageBackend::begin_write_fence(backend, claimed_epoch).await,
-            Self::Postgres(backend) => StorageBackend::begin_write_fence(backend, claimed_epoch).await,
+            Self::Sqlite(backend) => {
+                StorageBackend::begin_write_fence(backend, claimed_epoch).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::begin_write_fence(backend, claimed_epoch).await
+            }
         }
     }
     async fn end_write_fence(&self) -> Result<(), StorageError> {
@@ -3370,12 +3592,10 @@ mod tests {
         // The stored phase here is "verifying" (set above).
         let mut guarded = record.clone();
         guarded.phase = "committing_version".into();
-        assert!(
-            store
-                .transition_job_upgrade(guarded, "verifying")
-                .await
-                .unwrap()
-        );
+        assert!(store
+            .transition_job_upgrade(guarded, "verifying")
+            .await
+            .unwrap());
         let mut moved = record.clone();
         moved.phase = "rolling_back".into();
         assert!(
@@ -3385,7 +3605,11 @@ mod tests {
                 .unwrap(),
             "the phase moved; the stale writer must lose"
         );
-        let stored = store.get_job_upgrade("job-upgrade-1").await.unwrap().unwrap();
+        let stored = store
+            .get_job_upgrade("job-upgrade-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.phase, "committing_version");
         record.phase = "committing_version".into();
 
@@ -3401,11 +3625,12 @@ mod tests {
         store.upsert_job_upgrade(record.clone()).await.unwrap();
         assert!(record.phase_is_terminal());
         assert!(store.recover_job_upgrades().await.unwrap().is_empty());
-        store
-            .prune_job_upgrades(15_000, 0)
+        store.prune_job_upgrades(15_000, 0).await.unwrap();
+        assert!(store
+            .get_job_upgrade("job-upgrade-1")
             .await
-            .unwrap();
-        assert!(store.get_job_upgrade("job-upgrade-1").await.unwrap().is_none());
+            .unwrap()
+            .is_none());
     }
 
     fn audit_row(event: u64) -> AuditRecord {
@@ -3442,7 +3667,10 @@ mod tests {
 
         // hub-a acquires (epoch 1) through the UNfenced lease operation.
         assert_eq!(
-            actor.try_acquire_hub_lease("hub-a", None, 1_000, 100).await.unwrap(),
+            actor
+                .try_acquire_hub_lease("hub-a", None, 1_000, 100)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
         assert_eq!(store.current_lease_epoch().await.unwrap(), Some(1));
@@ -3455,13 +3683,19 @@ mod tests {
         actor.leadership_epoch().store(0, Ordering::Release);
         assert!(matches!(
             actor.record_audit(audit_row(3)).await,
-            Err(StorageError::StaleLeader { claimed_epoch: 0, current_epoch: 1 })
+            Err(StorageError::StaleLeader {
+                claimed_epoch: 0,
+                current_epoch: 1
+            })
         ));
 
         // Takeover by hub-b past expiry bumps the epoch to 2; hub-a's old
         // claim (still 1) is now stale — the exact zombie-leader window.
         assert_eq!(
-            actor.try_acquire_hub_lease("hub-b", None, 1_000, 2_000).await.unwrap(),
+            actor
+                .try_acquire_hub_lease("hub-b", None, 1_000, 2_000)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 2 }
         );
         // Restore hub-a's stale leader claim (it has not noticed yet).
@@ -3469,7 +3703,10 @@ mod tests {
         let before = actor.list_audit(None::<String>).await.unwrap().len();
         assert!(matches!(
             actor.record_audit(audit_row(4)).await,
-            Err(StorageError::StaleLeader { claimed_epoch: 1, current_epoch: 2 })
+            Err(StorageError::StaleLeader {
+                claimed_epoch: 1,
+                current_epoch: 2
+            })
         ));
         assert_eq!(
             actor.list_audit(None::<String>).await.unwrap().len(),
@@ -3481,7 +3718,10 @@ mod tests {
         // throughout.
         actor.leadership_epoch().store(2, Ordering::Release);
         actor.record_audit(audit_row(5)).await.unwrap();
-        assert_eq!(actor.list_audit(None::<String>).await.unwrap().len(), before + 1);
+        assert_eq!(
+            actor.list_audit(None::<String>).await.unwrap().len(),
+            before + 1
+        );
     }
 
     /// CodeRabbit finding: with HA disabled, a LEFTOVER lease row (an
@@ -3489,12 +3729,16 @@ mod tests {
     /// is the explicit UNFENCED sentinel, not the absence of the row.
     #[tokio::test]
     async fn unfenced_claim_bypasses_a_leftover_lease_row() {
-        let store = ControlPlaneStore::contract("unfenced_claim_bypasses_a_leftover_lease_row").await;
+        let store =
+            ControlPlaneStore::contract("unfenced_claim_bypasses_a_leftover_lease_row").await;
         let actor = StorageActor::start(store.clone(), 16);
         // Simulate a prior HA deployment: a lease row exists (epoch 1 —
         // a live holder's self-acquire stays idempotent).
         assert_eq!(
-            store.try_acquire_hub_lease("old-hub", None, 1_000, 100).await.unwrap(),
+            store
+                .try_acquire_hub_lease("old-hub", None, 1_000, 100)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
         assert_eq!(store.current_lease_epoch().await.unwrap(), Some(1));
@@ -3507,10 +3751,7 @@ mod tests {
         );
         actor.record_audit(audit_row(11)).await.unwrap();
         actor.record_audit(audit_row(12)).await.unwrap();
-        assert_eq!(
-            actor.list_audit(None::<String>).await.unwrap().len(),
-            2
-        );
+        assert_eq!(actor.list_audit(None::<String>).await.unwrap().len(), 2);
     }
 
     /// The hub-lease contract every backend must satisfy: expiry takeover
@@ -3533,7 +3774,10 @@ mod tests {
         // Another live holder is refused and observes the current lease
         // including the advertisement.
         assert_eq!(
-            store.try_acquire_hub_lease("hub-b", None, 1_000, 200).await.unwrap(),
+            store
+                .try_acquire_hub_lease("hub-b", None, 1_000, 200)
+                .await
+                .unwrap(),
             HubLeaseAcquire::HeldByOther(HubLeaseSnapshot {
                 holder: "hub-a".into(),
                 epoch: 1,
@@ -3561,18 +3805,27 @@ mod tests {
         );
         // Non-holder renewal is Lost without touching the row.
         assert_eq!(
-            store.renew_hub_lease("hub-b", None, 1_000, 500).await.unwrap(),
+            store
+                .renew_hub_lease("hub-b", None, 1_000, 500)
+                .await
+                .unwrap(),
             HubLeaseRenew::Lost
         );
         // Past expiry the old holder can no longer renew.
         assert_eq!(
-            store.renew_hub_lease("hub-a", None, 1_000, 2_000).await.unwrap(),
+            store
+                .renew_hub_lease("hub-a", None, 1_000, 2_000)
+                .await
+                .unwrap(),
             HubLeaseRenew::Lost
         );
         // Takeover after expiry bumps the epoch and rewrites the row to the
         // taker's advertisement (here: none, which clears the column).
         assert_eq!(
-            store.try_acquire_hub_lease("hub-b", None, 1_000, 2_000).await.unwrap(),
+            store
+                .try_acquire_hub_lease("hub-b", None, 1_000, 2_000)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 2 }
         );
         assert_eq!(
@@ -3586,11 +3839,17 @@ mod tests {
         );
         // Self-acquire keeps the epoch and extends the TTL.
         assert_eq!(
-            store.try_acquire_hub_lease("hub-b", None, 2_000, 2_500).await.unwrap(),
+            store
+                .try_acquire_hub_lease("hub-b", None, 2_000, 2_500)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 2 }
         );
         assert_eq!(
-            store.try_acquire_hub_lease("hub-a", None, 1_000, 2_600).await.unwrap(),
+            store
+                .try_acquire_hub_lease("hub-a", None, 1_000, 2_600)
+                .await
+                .unwrap(),
             HubLeaseAcquire::HeldByOther(HubLeaseSnapshot {
                 holder: "hub-b".into(),
                 epoch: 2,
@@ -3604,7 +3863,10 @@ mod tests {
         assert!(store.release_hub_lease("hub-b", 2_900).await.unwrap());
         assert!(!store.release_hub_lease("hub-b", 2_950).await.unwrap());
         assert_eq!(
-            store.try_acquire_hub_lease("hub-a", None, 1_000, 3_000).await.unwrap(),
+            store
+                .try_acquire_hub_lease("hub-a", None, 1_000, 3_000)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 3 }
         );
     }
@@ -3616,7 +3878,9 @@ mod tests {
             std::process::id(),
             now_ms()
         ));
-        let store = ControlPlaneStore::open(path.to_str().unwrap()).await.unwrap();
+        let store = ControlPlaneStore::open(path.to_str().unwrap())
+            .await
+            .unwrap();
         let audit_id = store
             .record_audit(AuditRecord {
                 event_id: 0,
@@ -3632,7 +3896,8 @@ mod tests {
                 message: None,
                 occurred_at_ms: 10,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         assert!(audit_id > 0);
         store
             .with_connection(|connection| {
@@ -3668,16 +3933,29 @@ mod tests {
                     updated_at_ms: 10,
                 }],
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         drop(store);
 
-        let reopened = ControlPlaneStore::open(path.to_str().unwrap()).await.unwrap();
-        assert_eq!(reopened.list_audit(Some("rollout-1")).await.unwrap().len(), 1);
+        let reopened = ControlPlaneStore::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.list_audit(Some("rollout-1")).await.unwrap().len(),
+            1
+        );
         assert_eq!(
             reopened.recover_rollouts().await.unwrap()[0].rollout_id,
             "rollout-1"
         );
-        assert_eq!(reopened.list_rollout_targets("rollout-1").await.unwrap().len(), 1);
+        assert_eq!(
+            reopened
+                .list_rollout_targets("rollout-1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         reopened
             .upsert_operation(PersistedOperation {
                 operation_id: "op-1".into(),
@@ -3689,11 +3967,13 @@ mod tests {
                 updated_at_ms: 10,
                 operation_json: r#"{"id":"op-1"}"#.into(),
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(
             reopened
                 .get_operation("op-1")
-                .await.unwrap()
+                .await
+                .unwrap()
                 .unwrap()
                 .operation_json,
             r#"{"id":"op-1"}"#
@@ -3704,7 +3984,8 @@ mod tests {
 
     #[tokio::test]
     async fn rollout_creation_is_atomic_when_a_target_conflicts() {
-        let store = ControlPlaneStore::contract("rollout_creation_is_atomic_when_a_target_conflicts").await;
+        let store =
+            ControlPlaneStore::contract("rollout_creation_is_atomic_when_a_target_conflicts").await;
         // Seed the config version through the public surface: a desired
         // mutation carrying config + payload inserts the inline version row
         // (PostgreSQL enforces the rollout foreign key).
@@ -3721,49 +4002,52 @@ mod tests {
             })
             .await
             .unwrap();
-        let result = store.create_rollout(
-            RolloutRecord {
-                rollout_id: "rollout-1".into(),
-                config_version_id: "cfg-1".into(),
-                state: "applying".into(),
-                batch_size: 1,
-                current_batch: 0,
-                total_targets: 2,
-                actor: None,
-                correlation_id: None,
-                created_at_ms: 10,
-                updated_at_ms: 10,
-            },
-            vec![
-                RolloutTargetRecord {
+        let result = store
+            .create_rollout(
+                RolloutRecord {
                     rollout_id: "rollout-1".into(),
-                    node_id: "node-a".into(),
-                    ordinal: 0,
-                    state: "pending".into(),
-                    attempt_id: None,
-                    error: None,
-                    observed_config_version: None,
+                    config_version_id: "cfg-1".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 2,
+                    actor: None,
+                    correlation_id: None,
+                    created_at_ms: 10,
                     updated_at_ms: 10,
                 },
-                RolloutTargetRecord {
-                    rollout_id: "rollout-1".into(),
-                    node_id: "node-a".into(),
-                    ordinal: 1,
-                    state: "pending".into(),
-                    attempt_id: None,
-                    error: None,
-                    observed_config_version: None,
-                    updated_at_ms: 10,
-                },
-            ],
-        ).await;
+                vec![
+                    RolloutTargetRecord {
+                        rollout_id: "rollout-1".into(),
+                        node_id: "node-a".into(),
+                        ordinal: 0,
+                        state: "pending".into(),
+                        attempt_id: None,
+                        error: None,
+                        observed_config_version: None,
+                        updated_at_ms: 10,
+                    },
+                    RolloutTargetRecord {
+                        rollout_id: "rollout-1".into(),
+                        node_id: "node-a".into(),
+                        ordinal: 1,
+                        state: "pending".into(),
+                        attempt_id: None,
+                        error: None,
+                        observed_config_version: None,
+                        updated_at_ms: 10,
+                    },
+                ],
+            )
+            .await;
         assert!(result.is_err());
         assert!(store.get_rollout("rollout-1").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn maintenance_transitions_are_durable_and_audited() {
-        let store = ControlPlaneStore::contract("maintenance_transitions_are_durable_and_audited").await;
+        let store =
+            ControlPlaneStore::contract("maintenance_transitions_are_durable_and_audited").await;
         store
             .upsert_node(NodeMutation {
                 node_id: "node-a".into(),
@@ -3777,7 +4061,8 @@ mod tests {
                 maintenance_state: None,
                 maintenance_updated_at_ms: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         assert!(store
             .set_node_maintenance(
                 NodeMaintenanceMutation {
@@ -3788,9 +4073,14 @@ mod tests {
                 },
                 20
             )
-            .await.unwrap());
+            .await
+            .unwrap());
         assert_eq!(
-            store.get_node_maintenance("node-a").await.unwrap().as_deref(),
+            store
+                .get_node_maintenance("node-a")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("draining")
         );
         let events = store.list_events(Some("node-a")).await.unwrap();
@@ -3828,9 +4118,10 @@ mod tests {
     /// filter keeps addressing single resources.
     #[tokio::test]
     async fn audit_retention_reclaims_old_rows_and_keeps_the_filter_addressable() {
-        let store =
-            ControlPlaneStore::contract("audit_retention_reclaims_old_rows_and_keeps_the_filter_addressable")
-                .await;
+        let store = ControlPlaneStore::contract(
+            "audit_retention_reclaims_old_rows_and_keeps_the_filter_addressable",
+        )
+        .await;
         let row = |resource: &str, occurred_at_ms: u64| AuditRecord {
             event_id: 0,
             actor: Some("retention-test".into()),
@@ -3869,7 +4160,10 @@ mod tests {
 
     #[tokio::test]
     async fn operational_aggregates_are_bounded_and_include_pending_age() {
-        let store = ControlPlaneStore::contract("operational_aggregates_are_bounded_and_include_pending_age").await;
+        let store = ControlPlaneStore::contract(
+            "operational_aggregates_are_bounded_and_include_pending_age",
+        )
+        .await;
         store
             .upsert_node(NodeMutation {
                 node_id: "node-a".into(),
@@ -3883,7 +4177,8 @@ mod tests {
                 maintenance_state: None,
                 maintenance_updated_at_ms: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let status = store.operational_aggregates(10_010).await.unwrap();
         assert_eq!(status.stale_nodes, 1);
         assert_eq!(status.node_states, vec![("stale".into(), 1)]);
@@ -3905,7 +4200,8 @@ mod tests {
                 maintenance_state: None,
                 maintenance_updated_at_ms: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         store
             .record_observed(ObservedMutation {
                 node_id: "node-a".into(),
@@ -3920,7 +4216,8 @@ mod tests {
                 last_error_code: None,
                 last_error_message: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let version: String = store
             .with_connection(|connection| {
                 connection.query_row(
@@ -3986,7 +4283,8 @@ mod tests {
     #[tokio::test]
     async fn desired_mutation_commits_intent_and_outbox_atomically() {
         let store =
-            ControlPlaneStore::contract("desired_mutation_commits_intent_and_outbox_atomically").await;
+            ControlPlaneStore::contract("desired_mutation_commits_intent_and_outbox_atomically")
+                .await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4001,7 +4299,8 @@ mod tests {
                 intent_type: None,
                 payload_json: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(intent.generation, 1);
         let events = store.list_events(Some("node-a")).await.unwrap();
         assert_eq!(events.len(), 1);
@@ -4020,18 +4319,20 @@ mod tests {
             1
         );
         assert!(matches!(
-            store.set_desired(DesiredMutation {
-                node_id: "node-a".into(),
-                stream_id: "orders".into(),
-                desired_state: "stopped".into(),
-                config_version_id: None,
-                action_id: None,
-                expected_generation: Some(0),
-                actor: None,
-                correlation_id: None,
-                idempotency_key: None,
-                ..Default::default()
-            }).await,
+            store
+                .set_desired(DesiredMutation {
+                    node_id: "node-a".into(),
+                    stream_id: "orders".into(),
+                    desired_state: "stopped".into(),
+                    config_version_id: None,
+                    action_id: None,
+                    expected_generation: Some(0),
+                    actor: None,
+                    correlation_id: None,
+                    idempotency_key: None,
+                    ..Default::default()
+                })
+                .await,
             Err(StorageError::GenerationConflict { .. })
         ));
     }
@@ -4045,7 +4346,9 @@ mod tests {
     /// a stateless one.
     #[tokio::test]
     async fn conditional_job_write_preserves_a_newer_recovery_pointer() {
-        let store = ControlPlaneStore::contract("conditional_job_write_preserves_a_newer_recovery_pointer").await;
+        let store =
+            ControlPlaneStore::contract("conditional_job_write_preserves_a_newer_recovery_pointer")
+                .await;
         let job = |job_id: &str, checkpoint_id: Option<&str>| JobRecord {
             job_id: job_id.into(),
             version: 2,
@@ -4059,21 +4362,17 @@ mod tests {
             last_error: None,
             updated_at_ms: 0,
         };
-        store.upsert_job(job("orders", Some("ckpt-old"))).await.unwrap();
+        store
+            .upsert_job(job("orders", Some("ckpt-old")))
+            .await
+            .unwrap();
 
         // A concurrent checkpoint observation moves the pointer without
         // touching the generation.
         let concurrent = store
-            .update_job(
-                "orders",
-                None,
-                None,
-                None,
-                None,
-                Some("ckpt-new"),
-                None,
-            )
-            .await.unwrap();
+            .update_job("orders", None, None, None, None, Some("ckpt-new"), None)
+            .await
+            .unwrap();
         assert_eq!(
             concurrent
                 .as_ref()
@@ -4084,7 +4383,8 @@ mod tests {
         // The rollback handler writes the record it read (the older pointer).
         let written = store
             .update_job_with_expected_generation(job("orders", Some("ckpt-old")), 1)
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(
             written.checkpoint_id.as_deref(),
             Some("ckpt-new"),
@@ -4103,7 +4403,8 @@ mod tests {
         store.upsert_job(job("etl", None)).await.unwrap();
         let written = store
             .update_job_with_expected_generation(job("etl", Some("ckpt-fresh")), 1)
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(
             written.checkpoint_id, None,
             "the rollback write must not invent a recovery pointer"
@@ -4112,7 +4413,9 @@ mod tests {
 
         // A stale generation still conflicts.
         assert!(matches!(
-            store.update_job_with_expected_generation(job("orders", None), 1).await,
+            store
+                .update_job_with_expected_generation(job("orders", None), 1)
+                .await,
             Err(StorageError::GenerationConflict { .. })
         ));
     }
@@ -4120,7 +4423,8 @@ mod tests {
     #[tokio::test]
     async fn outbox_claim_is_idempotent_and_reclaimable_after_lease() {
         let store =
-            ControlPlaneStore::contract("outbox_claim_is_idempotent_and_reclaimable_after_lease").await;
+            ControlPlaneStore::contract("outbox_claim_is_idempotent_and_reclaimable_after_lease")
+                .await;
         // A desired mutation enqueues exactly one reconcile outbox row.
         store
             .set_desired(DesiredMutation {
@@ -4137,19 +4441,29 @@ mod tests {
         assert_eq!(first.event_type, "reconcile_intent");
         assert_eq!(first.node_id, "node-a");
         assert_eq!(first.stream_id.as_deref(), Some("orders"));
-        assert!(store.claim_outbox("worker-b", base + 1).await.unwrap().is_none());
+        assert!(store
+            .claim_outbox("worker-b", base + 1)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(
             store
                 .claim_outbox("worker-b", base + 30_011)
-                .await.unwrap()
+                .await
+                .unwrap()
                 .unwrap()
                 .outbox_id,
             first.outbox_id
         );
         store
             .mark_outbox_processed(first.outbox_id, base + 30_012)
-            .await.unwrap();
-        assert!(store.claim_outbox("worker-c", base + 30_013).await.unwrap().is_none());
+            .await
+            .unwrap();
+        assert!(store
+            .claim_outbox("worker-c", base + 30_013)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// The outbox retention reclaims only processed rows: the unprocessed
@@ -4158,7 +4472,8 @@ mod tests {
     #[tokio::test]
     async fn prune_processed_outbox_reclaims_only_processed_rows() {
         let store =
-            ControlPlaneStore::contract("prune_processed_outbox_reclaims_only_processed_rows").await;
+            ControlPlaneStore::contract("prune_processed_outbox_reclaims_only_processed_rows")
+                .await;
         // Enqueue three rows: one to process early, one to leave claimed, and
         // one to process recently.
         let seed = |node: &str, stream: &str| {
@@ -4190,8 +4505,16 @@ mod tests {
             .mark_outbox_processed(old_processed.outbox_id, 100)
             .await
             .unwrap();
-        let claimed_pending = store.claim_outbox("worker", base + 1).await.unwrap().unwrap();
-        let recent_processed = store.claim_outbox("worker", base + 2).await.unwrap().unwrap();
+        let claimed_pending = store
+            .claim_outbox("worker", base + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let recent_processed = store
+            .claim_outbox("worker", base + 2)
+            .await
+            .unwrap()
+            .unwrap();
         store
             .mark_outbox_processed(recent_processed.outbox_id, 9_000)
             .await
@@ -4212,7 +4535,10 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(bulk.outbox_id, recent_processed.outbox_id + 1 + index as i64);
+            assert_eq!(
+                bulk.outbox_id,
+                recent_processed.outbox_id + 1 + index as i64
+            );
             store
                 .mark_outbox_processed(bulk.outbox_id, 2_000 + index)
                 .await
@@ -4221,16 +4547,19 @@ mod tests {
         assert_eq!(store.prune_processed_outbox(1_000, 2).await.unwrap(), 5);
         let aggregates_after = store.operational_aggregates(base + 100).await.unwrap();
         assert_eq!(
-            aggregates_before.outbox_pending,
-            aggregates_after.outbox_pending,
+            aggregates_before.outbox_pending, aggregates_after.outbox_pending,
             "the claimed-but-unprocessed work queue survives every sweep"
         );
-        assert_eq!(aggregates_before.outbox_claimed, aggregates_after.outbox_claimed);
+        assert_eq!(
+            aggregates_before.outbox_claimed,
+            aggregates_after.outbox_claimed
+        );
         // The claimed row is still reclaimable by its original bookkeeping.
         assert_eq!(
             store
                 .claim_outbox("worker-z", base + 30_011)
-                .await.unwrap()
+                .await
+                .unwrap()
                 .unwrap()
                 .outbox_id,
             claimed_pending.outbox_id
@@ -4243,7 +4572,8 @@ mod tests {
     #[tokio::test]
     async fn prune_terminal_attempts_reclaims_only_terminal_rows() {
         let store =
-            ControlPlaneStore::contract("prune_terminal_attempts_reclaims_only_terminal_rows").await;
+            ControlPlaneStore::contract("prune_terminal_attempts_reclaims_only_terminal_rows")
+                .await;
         // Past 2100-01-01: every attempt finished at wall-clock now is older.
         const FAR_FUTURE_MS: i64 = 4_102_444_800_000;
         let terminal_intent = |node: &str, stream: &str, state: &str| {
@@ -4262,7 +4592,11 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                let attempt = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+                let attempt = store
+                    .claim_attempt(&intent.intent_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 store
                     .complete_attempt(&attempt.attempt_id, &state, None)
                     .await
@@ -4282,17 +4616,30 @@ mod tests {
             })
             .await
             .unwrap();
-        let active_attempt = store.claim_attempt(&active.intent_id).await.unwrap().unwrap();
+        let active_attempt = store
+            .claim_attempt(&active.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(active_attempt.state, "queued");
 
         // The age window reclaims only the terminal rows past the cutoff.
         assert_eq!(
-            store.prune_terminal_attempts(FAR_FUTURE_MS, 4_096).await.unwrap(),
+            store
+                .prune_terminal_attempts(FAR_FUTURE_MS, 4_096)
+                .await
+                .unwrap(),
             2
         );
         // The count bound trims terminal history down to the newest rows.
         terminal_intent("node-b", "etl", "succeeded").await;
-        assert_eq!(store.prune_terminal_attempts(FAR_FUTURE_MS, 0).await.unwrap(), 1);
+        assert_eq!(
+            store
+                .prune_terminal_attempts(FAR_FUTURE_MS, 0)
+                .await
+                .unwrap(),
+            1
+        );
         let aggregates = store.operational_aggregates(now_ms()).await.unwrap();
         assert_eq!(aggregates.attempt_states, vec![("queued".into(), 1)]);
         assert_eq!(aggregates.active_attempts, 1);
@@ -4347,7 +4694,8 @@ mod tests {
 
     #[tokio::test]
     async fn observed_generation_converges_intent_and_attempt() {
-        let store = ControlPlaneStore::contract("observed_generation_converges_intent_and_attempt").await;
+        let store =
+            ControlPlaneStore::contract("observed_generation_converges_intent_and_attempt").await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4361,8 +4709,13 @@ mod tests {
                 idempotency_key: None,
                 ..Default::default()
             })
-            .await.unwrap();
-        let attempt = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+            .await
+            .unwrap();
+        let attempt = store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(attempt.generation, 1);
         store
             .record_observed(ObservedMutation {
@@ -4378,7 +4731,8 @@ mod tests {
                 last_error_code: None,
                 last_error_message: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let converged = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
         assert_eq!(converged.state, "converged");
         assert_eq!(converged.convergence_state, "in_sync");
@@ -4405,7 +4759,8 @@ mod tests {
                 last_error_code: None,
                 last_error_message: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let reports = store
             .list_events(Some("node-a"))
             .await
@@ -4413,7 +4768,11 @@ mod tests {
             .into_iter()
             .filter(|event| event.event_type == "observed_report")
             .collect::<Vec<_>>();
-        assert_eq!(reports.len(), 1, "the replayed report leaves no durable trace");
+        assert_eq!(
+            reports.len(),
+            1,
+            "the replayed report leaves no durable trace"
+        );
         assert_eq!(reports[0].outcome, "running");
     }
 
@@ -4424,8 +4783,10 @@ mod tests {
     /// high-water mark, blinding convergence for the whole rebuild gap.
     #[tokio::test]
     async fn stable_boot_session_rebuild_resets_the_observation_cursor() {
-        let store =
-            ControlPlaneStore::contract("stable_boot_session_rebuild_resets_the_observation_cursor").await;
+        let store = ControlPlaneStore::contract(
+            "stable_boot_session_rebuild_resets_the_observation_cursor",
+        )
+        .await;
         let observed = |seq: u64, state: &str| ObservedMutation {
             node_id: "node-a".into(),
             stream_id: "orders".into(),
@@ -4475,8 +4836,13 @@ mod tests {
                 idempotency_key: None,
                 ..Default::default()
             })
-            .await.unwrap();
-        let attempt = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+            .await
+            .unwrap();
+        let attempt = store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(attempt.operation, "restart");
         assert_eq!(attempt.action_id.as_deref(), Some("restart-1"));
         store
@@ -4493,7 +4859,8 @@ mod tests {
                 last_error_code: None,
                 last_error_message: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         // A different completed action does not satisfy the restart intent.
         assert_eq!(
             store
@@ -4518,7 +4885,8 @@ mod tests {
                 last_error_code: None,
                 last_error_message: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         // The matching action id completes the restart.
         assert_eq!(
             store
@@ -4534,7 +4902,8 @@ mod tests {
     #[tokio::test]
     async fn recovery_requeues_pending_intents_after_processed_outbox() {
         let store =
-            ControlPlaneStore::contract("recovery_requeues_pending_intents_after_processed_outbox").await;
+            ControlPlaneStore::contract("recovery_requeues_pending_intents_after_processed_outbox")
+                .await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4548,7 +4917,8 @@ mod tests {
                 idempotency_key: None,
                 ..Default::default()
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let base = now_ms();
         let pending = || async {
             store
@@ -4564,7 +4934,8 @@ mod tests {
         assert_eq!(outbox.intent_id.as_deref(), Some(intent.intent_id.as_str()));
         store
             .mark_outbox_processed(outbox.outbox_id, base + 1)
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(pending().await, 0);
         // Once the outbox work is processed, recovery requeues the intent.
         store.recover_reconciliation(base + 2).await.unwrap();
@@ -4573,8 +4944,10 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_ack_is_not_terminal_and_temporary_failure_retries() {
-        let store =
-            ControlPlaneStore::contract("attempt_ack_is_not_terminal_and_temporary_failure_retries").await;
+        let store = ControlPlaneStore::contract(
+            "attempt_ack_is_not_terminal_and_temporary_failure_retries",
+        )
+        .await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4588,14 +4961,24 @@ mod tests {
                 idempotency_key: None,
                 ..Default::default()
             })
-            .await.unwrap();
-        let attempt = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+            .await
+            .unwrap();
+        let attempt = store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         store
             .complete_attempt(&attempt.attempt_id, "acknowledged", None)
-            .await.unwrap();
+            .await
+            .unwrap();
         // "acknowledged" is not terminal: the same attempt stays claimable
         // and the intent keeps converging instead of being blocked.
-        let reclaimed = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+        let reclaimed = store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(reclaimed.attempt_id, attempt.attempt_id);
         assert_eq!(reclaimed.state, "acknowledged");
         store
@@ -4604,12 +4987,16 @@ mod tests {
                 "timed_out",
                 Some("temporary_execution"),
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         let requeued = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
         assert_eq!(requeued.state, "retrying");
         assert_eq!(requeued.convergence_state, "degraded");
         assert_eq!(requeued.retry_count, 1);
-        assert_eq!(requeued.failure_class.as_deref(), Some("temporary_execution"));
+        assert_eq!(
+            requeued.failure_class.as_deref(),
+            Some("temporary_execution")
+        );
         // The retry is durable outbox work: claim the original reconcile row
         // first, then the retry row once its backoff makes it available.
         let base = now_ms();
@@ -4617,10 +5004,13 @@ mod tests {
         assert_eq!(first.event_type, "reconcile_intent");
         store
             .mark_outbox_processed(first.outbox_id, base + 1)
-            .await.unwrap();
+            .await
+            .unwrap();
         let retry = store
             .claim_outbox("worker", now_ms() + 1_500)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(retry.event_type, "retry_intent");
         assert_eq!(retry.intent_id.as_deref(), Some(intent.intent_id.as_str()));
     }
@@ -4639,12 +5029,18 @@ mod tests {
                 expected_generation: Some(0),
                 ..Default::default()
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let timestamp = now_ms();
-        let outbox = store.claim_outbox("worker", timestamp).await.unwrap().unwrap();
+        let outbox = store
+            .claim_outbox("worker", timestamp)
+            .await
+            .unwrap()
+            .unwrap();
         store
             .mark_outbox_processed(outbox.outbox_id, timestamp + 1)
-            .await.unwrap();
+            .await
+            .unwrap();
         let pending = || async {
             store
                 .operational_aggregates(now_ms())
@@ -4666,7 +5062,9 @@ mod tests {
 
     #[tokio::test]
     async fn configuration_intent_requires_matching_observed_version() {
-        let store = ControlPlaneStore::contract("configuration_intent_requires_matching_observed_version").await;
+        let store =
+            ControlPlaneStore::contract("configuration_intent_requires_matching_observed_version")
+                .await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4678,11 +5076,17 @@ mod tests {
                 payload_json: Some(r#"{"format":"json","content":"{}"}"#.into()),
                 ..Default::default()
             })
-            .await.unwrap();
-        let attempt = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+            .await
+            .unwrap();
+        let attempt = store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         store
             .mark_attempt_dispatched(&attempt.attempt_id, 10)
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(store.expire_attempts(10).await.unwrap(), 1);
         let ambiguous = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
         assert_eq!(ambiguous.convergence_state, "degraded");
@@ -4725,11 +5129,17 @@ mod tests {
                 expected_generation: Some(0),
                 ..Default::default()
             })
-            .await.unwrap();
-        let attempt = store.claim_attempt(&first.intent_id).await.unwrap().unwrap();
+            .await
+            .unwrap();
+        let attempt = store
+            .claim_attempt(&first.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         store
             .complete_attempt(&attempt.attempt_id, "failed", Some("permanent_execution"))
-            .await.unwrap();
+            .await
+            .unwrap();
         let blocked = store.get_intent(&first.intent_id).await.unwrap().unwrap();
         assert_eq!(blocked.state, "blocked");
         assert_eq!(blocked.convergence_state, "blocked");
@@ -4739,14 +5149,20 @@ mod tests {
         );
         // A permanent failure never schedules retry work.
         let timestamp = now_ms();
-        let outbox = store.claim_outbox("worker", timestamp).await.unwrap().unwrap();
+        let outbox = store
+            .claim_outbox("worker", timestamp)
+            .await
+            .unwrap()
+            .unwrap();
         store
             .mark_outbox_processed(outbox.outbox_id, timestamp + 1)
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(
             store
                 .operational_aggregates(now_ms())
-                .await.unwrap()
+                .await
+                .unwrap()
                 .outbox_pending,
             0
         );
@@ -4762,14 +5178,17 @@ mod tests {
                 expected_generation: Some(first.generation),
                 ..Default::default()
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(rollback.generation, first.generation + 1);
         assert_eq!(rollback.state, "accepted");
     }
 
     #[tokio::test]
     async fn configuration_convergence_waits_for_affected_streams() {
-        let store = ControlPlaneStore::contract("configuration_convergence_waits_for_affected_streams").await;
+        let store =
+            ControlPlaneStore::contract("configuration_convergence_waits_for_affected_streams")
+                .await;
         let stream = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4778,7 +5197,8 @@ mod tests {
                 expected_generation: Some(0),
                 ..Default::default()
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let config = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4790,7 +5210,8 @@ mod tests {
                 expected_generation: Some(0),
                 ..Default::default()
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         store
             .record_observed(ObservedMutation {
                 node_id: "node-a".into(),
@@ -4805,7 +5226,8 @@ mod tests {
                 last_error_code: None,
                 last_error_message: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         store
             .record_observed(ObservedMutation {
                 node_id: "node-a".into(),
@@ -4820,9 +5242,15 @@ mod tests {
                 last_error_code: None,
                 last_error_message: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_intent(&config.intent_id).await.unwrap().unwrap().state,
+            store
+                .get_intent(&config.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             "converged"
         );
 
@@ -4837,7 +5265,8 @@ mod tests {
                 expected_generation: Some(config.generation),
                 ..Default::default()
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         store
             .record_observed(ObservedMutation {
                 node_id: "node-a".into(),
@@ -4852,7 +5281,8 @@ mod tests {
                 last_error_code: None,
                 last_error_message: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let next_state = store.get_intent(&next.intent_id).await.unwrap().unwrap();
         assert_eq!(next_state.state, "converging");
         assert_eq!(next_state.convergence_state, "applying");
@@ -4861,7 +5291,8 @@ mod tests {
     #[tokio::test]
     async fn expired_attempt_becomes_ambiguous_until_fresh_report() {
         let store =
-            ControlPlaneStore::contract("expired_attempt_becomes_ambiguous_until_fresh_report").await;
+            ControlPlaneStore::contract("expired_attempt_becomes_ambiguous_until_fresh_report")
+                .await;
         let intent = store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -4870,15 +5301,26 @@ mod tests {
                 expected_generation: Some(0),
                 ..Default::default()
             })
-            .await.unwrap();
-        let wake = store.claim_outbox("worker", now_ms()).await.unwrap().unwrap();
+            .await
+            .unwrap();
+        let wake = store
+            .claim_outbox("worker", now_ms())
+            .await
+            .unwrap()
+            .unwrap();
         store
             .mark_outbox_processed(wake.outbox_id, now_ms())
-            .await.unwrap();
-        let attempt = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+            .await
+            .unwrap();
+        let attempt = store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         store
             .mark_attempt_dispatched(&attempt.attempt_id, 10)
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(store.expire_attempts(10).await.unwrap(), 1);
         // Both the attempt and the intent degrade to ambiguous.
         let ambiguous = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
@@ -4889,14 +5331,16 @@ mod tests {
         assert!(aggregates.attempt_states.contains(&("ambiguous".into(), 1)));
         store
             .complete_attempt(&attempt.attempt_id, "ambiguous", Some("ambiguous"))
-            .await.unwrap();
+            .await
+            .unwrap();
         let still_degraded = store.get_intent(&intent.intent_id).await.unwrap().unwrap();
         assert_eq!(still_degraded.state, "converging");
         assert_eq!(still_degraded.convergence_state, "degraded");
         assert_eq!(
             store
                 .operational_aggregates(now_ms())
-                .await.unwrap()
+                .await
+                .unwrap()
                 .outbox_pending,
             0,
             "an ambiguous intent is never auto-retried"
@@ -4905,7 +5349,8 @@ mod tests {
         assert_eq!(
             store
                 .operational_aggregates(now_ms())
-                .await.unwrap()
+                .await
+                .unwrap()
                 .outbox_pending,
             0,
             "waking the node must not bypass the ambiguity fence"
@@ -4924,13 +5369,15 @@ mod tests {
                 last_error_code: None,
                 last_error_message: None,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         // A fresh report from the new session resolves the ambiguity and
         // requeues reconciliation work.
         assert_eq!(
             store
                 .operational_aggregates(now_ms())
-                .await.unwrap()
+                .await
+                .unwrap()
                 .outbox_pending,
             1
         );
@@ -4955,8 +5402,13 @@ mod tests {
                 expected_generation: Some(0),
                 ..Default::default()
             })
-            .await.unwrap();
-        let desired = store.get_desired("node-a", "orders").await.unwrap().unwrap();
+            .await
+            .unwrap();
+        let desired = store
+            .get_desired("node-a", "orders")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(desired.node_id, "node-a");
         assert_eq!(desired.stream_id, "orders");
         assert_eq!(desired.generation, 1);
@@ -4964,7 +5416,11 @@ mod tests {
         assert_eq!(desired.config_version_id.as_deref(), Some("cfg-1"));
         assert_eq!(desired.action_id, None);
         assert_eq!(desired.correlation_id.as_deref(), Some("corr-1"));
-        assert!(store.get_desired("node-a", "missing").await.unwrap().is_none());
+        assert!(store
+            .get_desired("node-a", "missing")
+            .await
+            .unwrap()
+            .is_none());
 
         store
             .set_desired(DesiredMutation {
@@ -4974,7 +5430,8 @@ mod tests {
                 expected_generation: Some(0),
                 ..Default::default()
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let all = store.list_intents(None).await.unwrap();
         assert_eq!(all.len(), 2);
         let node_a = store.list_intents(Some("node-a")).await.unwrap();
@@ -4991,7 +5448,11 @@ mod tests {
         assert_eq!(node_a[0].superseded_generation, None);
         assert_eq!(node_a[0].observed_generation, None);
         assert_eq!(node_a[0].observed_state, None);
-        assert!(store.list_intents(Some("node-zzz")).await.unwrap().is_empty());
+        assert!(store
+            .list_intents(Some("node-zzz"))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// The rollout orchestration surface: content-bearing creation seeds the
@@ -5024,19 +5485,28 @@ mod tests {
                     created_at_ms: 10,
                     updated_at_ms: 10,
                 },
-                vec![target("rollout-1", "node-a", 0), target("rollout-1", "node-b", 1)],
+                vec![
+                    target("rollout-1", "node-a", 0),
+                    target("rollout-1", "node-b", 1),
+                ],
                 "{\"version\":1}",
                 Some("operator"),
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         // The inline content is addressable as a config version.
         assert_eq!(
-            store.get_config_version_content("cfg-1").await.unwrap().as_deref(),
+            store
+                .get_config_version_content("cfg-1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("{\"version\":1}")
         );
         assert!(store
             .get_config_version_content("cfg-missing")
-            .await.unwrap()
+            .await
+            .unwrap()
             .is_none());
         assert_eq!(
             store.get_rollout("rollout-1").await.unwrap().unwrap(),
@@ -5053,7 +5523,11 @@ mod tests {
                 updated_at_ms: 10,
             }
         );
-        assert!(store.get_rollout("rollout-missing").await.unwrap().is_none());
+        assert!(store
+            .get_rollout("rollout-missing")
+            .await
+            .unwrap()
+            .is_none());
         let targets = store.list_rollout_targets("rollout-1").await.unwrap();
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].node_id, "node-a");
@@ -5061,7 +5535,10 @@ mod tests {
         assert_eq!(targets[0].state, "pending");
 
         // Batch and per-target progress land durably.
-        store.update_rollout("rollout-1", "applying", 1, 50).await.unwrap();
+        store
+            .update_rollout("rollout-1", "applying", 1, 50)
+            .await
+            .unwrap();
         store
             .update_rollout_target(RolloutTargetUpdate {
                 rollout_id: "rollout-1".into(),
@@ -5072,7 +5549,8 @@ mod tests {
                 observed_config_version: Some("cfg-1".into()),
                 updated_at_ms: 55,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let updated = store.get_rollout("rollout-1").await.unwrap().unwrap();
         assert_eq!(updated.current_batch, 1);
         assert_eq!(updated.updated_at_ms, 50);
@@ -5101,7 +5579,8 @@ mod tests {
                 "{}",
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         let recoverable = store.recover_rollouts().await.unwrap();
         assert_eq!(recoverable.len(), 1);
         assert_eq!(recoverable[0].rollout_id, "rollout-1");
@@ -5127,9 +5606,13 @@ mod tests {
                 },
                 vec![target("rollout-3", "node-c", 0)],
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         assert!(store.get_rollout("rollout-3").await.unwrap().is_some());
-        assert_eq!(store.list_rollout_targets("rollout-3").await.unwrap().len(), 1);
+        assert_eq!(
+            store.list_rollout_targets("rollout-3").await.unwrap().len(),
+            1
+        );
     }
 
     /// Job version history and checkpoint artifacts round-trip, and
@@ -5144,10 +5627,19 @@ mod tests {
             plan_json: plan.into(),
             created_at_ms: version,
         };
-        store.upsert_job_version(version(1, "plan-1")).await.unwrap();
-        store.upsert_job_version(version(2, "plan-2")).await.unwrap();
+        store
+            .upsert_job_version(version(1, "plan-1"))
+            .await
+            .unwrap();
+        store
+            .upsert_job_version(version(2, "plan-2"))
+            .await
+            .unwrap();
         // Re-upserting a version rewrites its plan.
-        store.upsert_job_version(version(2, "plan-2b")).await.unwrap();
+        store
+            .upsert_job_version(version(2, "plan-2b"))
+            .await
+            .unwrap();
         let versions = store.list_job_versions("orders").await.unwrap();
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].version, 2, "newest version first");
@@ -5173,13 +5665,16 @@ mod tests {
         };
         store
             .upsert_job_checkpoint(checkpoint("cp-1", "savepoint", "pending", 10, 10))
-            .await.unwrap();
+            .await
+            .unwrap();
         store
             .upsert_job_checkpoint(checkpoint("cp-2", "snapshot", "completed", 20, 20))
-            .await.unwrap();
+            .await
+            .unwrap();
         store
             .upsert_job_checkpoint(checkpoint("cp-3", "savepoint", "failed", 5, 5))
-            .await.unwrap();
+            .await
+            .unwrap();
         let checkpoints = store.list_job_checkpoints("orders").await.unwrap();
         assert_eq!(
             checkpoints
@@ -5194,7 +5689,8 @@ mod tests {
         // A completed status re-arms the retention pin on an existing row.
         store
             .upsert_job_checkpoint(checkpoint("cp-1", "savepoint", "completed", 10, 30))
-            .await.unwrap();
+            .await
+            .unwrap();
         // Retention reclaims only pending/failed artifacts past the cutoff.
         assert_eq!(store.prune_job_checkpoint_records(15).await.unwrap(), 1);
         let surviving = store.list_job_checkpoints("orders").await.unwrap();
@@ -5208,11 +5704,18 @@ mod tests {
         assert_eq!(surviving[1].status, "completed", "cp-1 was re-armed above");
         // Explicit delete removes a specific artifact; missing ids are no-ops.
         store.delete_job_checkpoint("orders", "cp-2").await.unwrap();
-        store.delete_job_checkpoint("orders", "cp-missing").await.unwrap();
+        store
+            .delete_job_checkpoint("orders", "cp-missing")
+            .await
+            .unwrap();
         let remaining = store.list_job_checkpoints("orders").await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].checkpoint_id, "cp-1");
-        assert!(store.list_job_checkpoints("missing").await.unwrap().is_empty());
+        assert!(store
+            .list_job_checkpoints("missing")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// Job observations apply as a compare-and-swap: a report conditioned on
@@ -5220,7 +5723,8 @@ mod tests {
     #[tokio::test]
     async fn job_observation_update_is_conditioned_on_generation() {
         let store =
-            ControlPlaneStore::contract("job_observation_update_is_conditioned_on_generation").await;
+            ControlPlaneStore::contract("job_observation_update_is_conditioned_on_generation")
+                .await;
         let job = JobRecord {
             job_id: "orders".into(),
             version: 1,
@@ -5238,7 +5742,9 @@ mod tests {
         assert_eq!(stored.generation, 1);
         let observed = store
             .update_job_observation("orders", "running", "in_sync", 2, 1, Some("cp-obs"), None)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(observed.observed_state, "running");
         assert_eq!(observed.convergence, "in_sync");
         assert_eq!(observed.generation, 2);
@@ -5257,7 +5763,9 @@ mod tests {
         // checkpoint pointer survives a NULL carry.
         let next = store
             .update_job_observation("orders", "failed", "degraded", 3, 2, None, Some("boom"))
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(next.observed_state, "failed");
         assert_eq!(next.last_error.as_deref(), Some("boom"));
         assert_eq!(next.checkpoint_id.as_deref(), Some("cp-obs"));
@@ -5275,19 +5783,29 @@ mod tests {
     #[tokio::test]
     async fn operations_round_trip_and_filter_by_node() {
         let store = ControlPlaneStore::contract("operations_round_trip_and_filter_by_node").await;
-        let operation = |operation_id: &str, node_id: &str, updated_at_ms: u64| PersistedOperation {
-            operation_id: operation_id.into(),
-            node_id: node_id.into(),
-            resource_id: "orders".into(),
-            operation: "restart".into(),
-            state: "queued".into(),
-            created_at_ms: 1,
-            updated_at_ms,
-            operation_json: format!("{{\"id\":\"{operation_id}\"}}"),
-        };
-        store.upsert_operation(operation("op-1", "node-a", 1)).await.unwrap();
-        store.upsert_operation(operation("op-2", "node-b", 2)).await.unwrap();
-        store.upsert_operation(operation("op-3", "node-a", 3)).await.unwrap();
+        let operation =
+            |operation_id: &str, node_id: &str, updated_at_ms: u64| PersistedOperation {
+                operation_id: operation_id.into(),
+                node_id: node_id.into(),
+                resource_id: "orders".into(),
+                operation: "restart".into(),
+                state: "queued".into(),
+                created_at_ms: 1,
+                updated_at_ms,
+                operation_json: format!("{{\"id\":\"{operation_id}\"}}"),
+            };
+        store
+            .upsert_operation(operation("op-1", "node-a", 1))
+            .await
+            .unwrap();
+        store
+            .upsert_operation(operation("op-2", "node-b", 2))
+            .await
+            .unwrap();
+        store
+            .upsert_operation(operation("op-3", "node-a", 3))
+            .await
+            .unwrap();
         let loaded = store.get_operation("op-1").await.unwrap().unwrap();
         assert_eq!(loaded.node_id, "node-a");
         assert_eq!(loaded.operation, "restart");
@@ -5304,7 +5822,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["op-3", "op-1"]
         );
-        assert!(store.list_operations(Some("node-zzz")).await.unwrap().is_empty());
+        assert!(store
+            .list_operations(Some("node-zzz"))
+            .await
+            .unwrap()
+            .is_empty());
         // Re-upserting updates the mutable columns only.
         store
             .upsert_operation(PersistedOperation {
@@ -5317,7 +5839,8 @@ mod tests {
                 updated_at_ms: 4,
                 operation_json: r#"{"id":"op-1","state":"succeeded"}"#.into(),
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let updated = store.get_operation("op-1").await.unwrap().unwrap();
         assert_eq!(updated.state, "succeeded");
         assert_eq!(updated.updated_at_ms, 4);
@@ -5333,10 +5856,12 @@ mod tests {
                 updated_at_ms: 5,
                 operation_json: r#"{"operation":"job_start"}"#.into(),
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         store
             .upsert_operation(operation("start-2", "node-a", 6))
-            .await.unwrap();
+            .await
+            .unwrap();
         let starts = store.list_job_start_operations("orders").await.unwrap();
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].operation_id, "start-1");
@@ -5361,10 +5886,19 @@ mod tests {
             maintenance_state: maintenance.map(str::to_owned),
             maintenance_updated_at_ms: None,
         };
-        store.upsert_node(node("node-a", "online", None)).await.unwrap();
-        store.upsert_node(node("node-b", "online", Some("draining"))).await.unwrap();
+        store
+            .upsert_node(node("node-a", "online", None))
+            .await
+            .unwrap();
+        store
+            .upsert_node(node("node-b", "online", Some("draining")))
+            .await
+            .unwrap();
         // Re-registering an existing node updates rather than duplicates.
-        store.upsert_node(node("node-a", "offline", None)).await.unwrap();
+        store
+            .upsert_node(node("node-a", "offline", None))
+            .await
+            .unwrap();
         store
             .set_desired(DesiredMutation {
                 node_id: "node-a".into(),
@@ -5373,13 +5907,19 @@ mod tests {
                 expected_generation: Some(0),
                 ..Default::default()
             })
-            .await.unwrap();
+            .await
+            .unwrap();
         let intent = store
             .list_intents(Some("node-a"))
-            .await.unwrap()
+            .await
+            .unwrap()
             .pop()
             .unwrap();
-        store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+        store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         let aggregates = store.operational_aggregates(now_ms()).await.unwrap();
         let grouped = |pairs: &[(String, u64)]| {
             let mut sorted = pairs.to_vec();
@@ -5421,7 +5961,11 @@ mod tests {
         );
         // Claiming the only row moves it into the claimed counter and gives
         // the pending queue an age.
-        let outbox = store.claim_outbox("worker", now_ms()).await.unwrap().unwrap();
+        let outbox = store
+            .claim_outbox("worker", now_ms())
+            .await
+            .unwrap()
+            .unwrap();
         let claimed = store.operational_aggregates(now_ms()).await.unwrap();
         assert_eq!(claimed.outbox_pending, 1);
         assert_eq!(claimed.outbox_claimed, 1);
@@ -5433,7 +5977,8 @@ mod tests {
     #[tokio::test]
     async fn maintenance_transitions_reject_unknown_states_and_nodes() {
         let store =
-            ControlPlaneStore::contract("maintenance_transitions_reject_unknown_states_and_nodes").await;
+            ControlPlaneStore::contract("maintenance_transitions_reject_unknown_states_and_nodes")
+                .await;
         let mutation = |node_id: &str, state: &str| NodeMaintenanceMutation {
             node_id: node_id.into(),
             state: state.into(),
@@ -5441,9 +5986,15 @@ mod tests {
             correlation_id: None,
         };
         // An unsupported state is refused before touching the store.
-        assert!(!store.set_node_maintenance(mutation("node-a", "bogus"), 10).await.unwrap());
+        assert!(!store
+            .set_node_maintenance(mutation("node-a", "bogus"), 10)
+            .await
+            .unwrap());
         // An unknown node is a miss, not an error.
-        assert!(!store.set_node_maintenance(mutation("node-zzz", "draining"), 11).await.unwrap());
+        assert!(!store
+            .set_node_maintenance(mutation("node-zzz", "draining"), 11)
+            .await
+            .unwrap());
         assert_eq!(store.get_node_maintenance("node-zzz").await.unwrap(), None);
         store
             .upsert_node(NodeMutation {
@@ -5458,12 +6009,23 @@ mod tests {
                 maintenance_state: None,
                 maintenance_updated_at_ms: None,
             })
-            .await.unwrap();
-        assert!(store.set_node_maintenance(mutation("node-a", "draining"), 20).await.unwrap());
+            .await
+            .unwrap();
+        assert!(store
+            .set_node_maintenance(mutation("node-a", "draining"), 20)
+            .await
+            .unwrap());
         // Re-asserting the same state succeeds without a second audit event.
-        assert!(store.set_node_maintenance(mutation("node-a", "draining"), 21).await.unwrap());
+        assert!(store
+            .set_node_maintenance(mutation("node-a", "draining"), 21)
+            .await
+            .unwrap());
         assert_eq!(
-            store.get_node_maintenance("node-a").await.unwrap().as_deref(),
+            store
+                .get_node_maintenance("node-a")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("draining")
         );
         let events = store.list_events(Some("node-a")).await.unwrap();
@@ -5474,9 +6036,16 @@ mod tests {
                 .count(),
             1
         );
-        assert!(store.set_node_maintenance(mutation("node-a", "maintenance"), 22).await.unwrap());
+        assert!(store
+            .set_node_maintenance(mutation("node-a", "maintenance"), 22)
+            .await
+            .unwrap());
         assert_eq!(
-            store.get_node_maintenance("node-a").await.unwrap().as_deref(),
+            store
+                .get_node_maintenance("node-a")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("maintenance")
         );
     }
@@ -5494,7 +6063,10 @@ mod tests {
         // A live lease row exists at epoch 1; this process carries a standby
         // claim (0) that never entered the election.
         assert_eq!(
-            store.try_acquire_hub_lease("hub-live", None, 3_600_000, 100).await.unwrap(),
+            store
+                .try_acquire_hub_lease("hub-live", None, 3_600_000, 100)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
         actor.leadership_epoch().store(0, Ordering::Release);
@@ -5571,14 +6143,15 @@ mod tests {
         assert_stale(actor.upsert_job(job.clone()).await);
         assert_stale(actor.update_job_with_expected_generation(job, 1).await);
         assert_stale(
-            actor.upsert_job_version(JobVersionRecord {
-                job_id: "orders".into(),
-                version: 1,
-                spec_json: "{}".into(),
-                plan_json: "plan".into(),
-                created_at_ms: 1,
-            })
-            .await,
+            actor
+                .upsert_job_version(JobVersionRecord {
+                    job_id: "orders".into(),
+                    version: 1,
+                    spec_json: "{}".into(),
+                    plan_json: "plan".into(),
+                    created_at_ms: 1,
+                })
+                .await,
         );
         assert_stale(
             actor
@@ -5686,7 +6259,11 @@ mod tests {
         );
         assert_stale(actor.recover_rollouts().await);
         assert_stale(actor.upsert_job_upgrade(upgrade.clone()).await);
-        assert_stale(actor.transition_job_upgrade(upgrade, "saving_savepoint").await);
+        assert_stale(
+            actor
+                .transition_job_upgrade(upgrade, "saving_savepoint")
+                .await,
+        );
         assert_stale(actor.recover_job_upgrades().await);
         assert_stale(actor.prune_job_upgrades(10, 10).await);
         assert_stale(
@@ -5708,25 +6285,40 @@ mod tests {
         assert!(store.list_jobs().await.unwrap().is_empty());
         assert!(store.list_intents(None::<&str>).await.unwrap().is_empty());
         assert!(store.list_rollouts().await.unwrap().is_empty());
-        assert!(store.list_operations(None::<&str>).await.unwrap().is_empty());
+        assert!(store
+            .list_operations(None::<&str>)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// The actor carries the (unfenced) lease and retention surfaces through
     /// the same FIFO: acquire, renew, lose, release, and event retention.
     #[tokio::test]
     async fn storage_actor_exposes_the_lease_and_retention_surfaces() {
-        let store = ControlPlaneStore::contract("storage_actor_exposes_the_lease_and_retention_surfaces").await;
+        let store =
+            ControlPlaneStore::contract("storage_actor_exposes_the_lease_and_retention_surfaces")
+                .await;
         let actor = StorageActor::start(store, 16);
         assert_eq!(
-            actor.try_acquire_hub_lease("hub-a", None, 1_000, 100).await.unwrap(),
+            actor
+                .try_acquire_hub_lease("hub-a", None, 1_000, 100)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
         assert_eq!(
-            actor.renew_hub_lease("hub-a", None, 1_000, 200).await.unwrap(),
+            actor
+                .renew_hub_lease("hub-a", None, 1_000, 200)
+                .await
+                .unwrap(),
             HubLeaseRenew::Renewed { epoch: 1 }
         );
         assert_eq!(
-            actor.renew_hub_lease("hub-b", None, 1_000, 200).await.unwrap(),
+            actor
+                .renew_hub_lease("hub-b", None, 1_000, 200)
+                .await
+                .unwrap(),
             HubLeaseRenew::Lost
         );
         assert!(!actor.release_hub_lease("hub-b", 300).await.unwrap());
@@ -5830,11 +6422,14 @@ mod tests {
                 )
                 .unwrap();
         }
-        let store = ControlPlaneStore::open(path.to_str().unwrap()).await.unwrap();
+        let store = ControlPlaneStore::open(path.to_str().unwrap())
+            .await
+            .unwrap();
         fn has_column(store: &ControlPlaneStore, table: &str, column: &str) -> bool {
             store
                 .with_connection(|connection| {
-                    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+                    let mut statement =
+                        connection.prepare(&format!("PRAGMA table_info({table})"))?;
                     let columns = statement
                         .query_map([], |row| row.get::<_, String>(1))?
                         .collect::<Result<Vec<_>, _>>()?;
@@ -5906,13 +6501,13 @@ mod tests {
     async fn sqlite_write_fence_commit_failure_is_reported_loudly() {
         let store = ControlPlaneStore::in_memory().unwrap();
         assert_eq!(
-            store.try_acquire_hub_lease("hub-a", None, 1_000, 100).await.unwrap(),
+            store
+                .try_acquire_hub_lease("hub-a", None, 1_000, 100)
+                .await
+                .unwrap(),
             HubLeaseAcquire::Acquired { epoch: 1 }
         );
-        assert_eq!(
-            store.begin_write_fence(1).await.unwrap(),
-            WriteFence::Held
-        );
+        assert_eq!(store.begin_write_fence(1).await.unwrap(), WriteFence::Held);
         // Kill the ambient transaction behind the fence's back (the
         // I/O-level rollback it cannot observe).
         store
@@ -5954,7 +6549,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let attempt = store.claim_attempt(&intent.intent_id).await.unwrap().unwrap();
+        let attempt = store
+            .claim_attempt(&intent.intent_id)
+            .await
+            .unwrap()
+            .unwrap();
         store
             .complete_attempt(&attempt.attempt_id, "superseded", Some("stale_generation"))
             .await
@@ -5972,16 +6571,21 @@ mod tests {
             .complete_attempt("attempt-missing", "failed", None)
             .await
             .unwrap();
-        assert!(store.claim_attempt("intent-missing").await.unwrap().is_none());
+        assert!(store
+            .claim_attempt("intent-missing")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// The desired-state CAS distinguishes a moved generation (conflict)
     /// from an unknown Job (miss).
     #[tokio::test]
     async fn job_desired_state_update_conflicts_and_misses_are_distinct() {
-        let store =
-            ControlPlaneStore::contract("job_desired_state_update_conflicts_and_misses_are_distinct")
-                .await;
+        let store = ControlPlaneStore::contract(
+            "job_desired_state_update_conflicts_and_misses_are_distinct",
+        )
+        .await;
         store
             .upsert_job(JobRecord {
                 job_id: "orders".into(),
@@ -6002,7 +6606,10 @@ mod tests {
         // on the superseded generation 0 conflicts.
         assert!(matches!(
             store.update_job_desired_state("orders", "running", 0).await,
-            Err(StorageError::GenerationConflict { expected: 0, current: 1 })
+            Err(StorageError::GenerationConflict {
+                expected: 0,
+                current: 1
+            })
         ));
         // An unknown Job is a miss, not a conflict.
         assert!(store
@@ -6051,7 +6658,8 @@ mod tests {
     /// silently merging histories.
     #[tokio::test]
     async fn rollout_identity_conflicts_are_atomic_errors() {
-        let store = ControlPlaneStore::contract("rollout_identity_conflicts_are_atomic_errors").await;
+        let store =
+            ControlPlaneStore::contract("rollout_identity_conflicts_are_atomic_errors").await;
         let target = |rollout_id: &str, node: &str| RolloutTargetRecord {
             rollout_id: rollout_id.into(),
             node_id: node.into(),
@@ -6084,48 +6692,44 @@ mod tests {
             .unwrap();
         // Re-creating the same rollout id through either entry point is an
         // error; the config version already seeded survives.
-        assert!(
-            store
-                .create_rollout_with_content(
-                    RolloutRecord {
-                        rollout_id: "rollout-1".into(),
-                        config_version_id: "cfg-1".into(),
-                        state: "applying".into(),
-                        batch_size: 1,
-                        current_batch: 0,
-                        total_targets: 0,
-                        actor: None,
-                        correlation_id: None,
-                        created_at_ms: 20,
-                        updated_at_ms: 20,
-                    },
-                    Vec::new(),
-                    "{}",
-                    None,
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            store
-                .create_rollout(
-                    RolloutRecord {
-                        rollout_id: "rollout-1".into(),
-                        config_version_id: "cfg-1".into(),
-                        state: "applying".into(),
-                        batch_size: 1,
-                        current_batch: 0,
-                        total_targets: 0,
-                        actor: None,
-                        correlation_id: None,
-                        created_at_ms: 30,
-                        updated_at_ms: 30,
-                    },
-                    Vec::new(),
-                )
-                .await
-                .is_err()
-        );
+        assert!(store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "rollout-1".into(),
+                    config_version_id: "cfg-1".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 0,
+                    actor: None,
+                    correlation_id: None,
+                    created_at_ms: 20,
+                    updated_at_ms: 20,
+                },
+                Vec::new(),
+                "{}",
+                None,
+            )
+            .await
+            .is_err());
+        assert!(store
+            .create_rollout(
+                RolloutRecord {
+                    rollout_id: "rollout-1".into(),
+                    config_version_id: "cfg-1".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 0,
+                    actor: None,
+                    correlation_id: None,
+                    created_at_ms: 30,
+                    updated_at_ms: 30,
+                },
+                Vec::new(),
+            )
+            .await
+            .is_err());
         assert_eq!(
             store.list_rollout_targets("rollout-1").await.unwrap().len(),
             1,
@@ -6133,28 +6737,26 @@ mod tests {
         );
         // A duplicate target node inside one content-bearing rollout is an
         // error too (the primary key is (rollout_id, node_id)).
-        assert!(
-            store
-                .create_rollout_with_content(
-                    RolloutRecord {
-                        rollout_id: "rollout-2".into(),
-                        config_version_id: "cfg-1".into(),
-                        state: "applying".into(),
-                        batch_size: 1,
-                        current_batch: 0,
-                        total_targets: 2,
-                        actor: None,
-                        correlation_id: None,
-                        created_at_ms: 40,
-                        updated_at_ms: 40,
-                    },
-                    vec![target("rollout-2", "node-a"), target("rollout-2", "node-a")],
-                    "{}",
-                    None,
-                )
-                .await
-                .is_err()
-        );
+        assert!(store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "rollout-2".into(),
+                    config_version_id: "cfg-1".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 2,
+                    actor: None,
+                    correlation_id: None,
+                    created_at_ms: 40,
+                    updated_at_ms: 40,
+                },
+                vec![target("rollout-2", "node-a"), target("rollout-2", "node-a")],
+                "{}",
+                None,
+            )
+            .await
+            .is_err());
         assert!(store.get_rollout("rollout-2").await.unwrap().is_none());
     }
 }
@@ -6192,7 +6794,8 @@ mod job_storage_tests {
                 Some("cp-1"),
                 None,
             )
-            .await.unwrap()
+            .await
+            .unwrap()
             .unwrap();
         assert_eq!(updated.desired_state, "running");
         assert_eq!(updated.checkpoint_id.as_deref(), Some("cp-1"));
@@ -6231,7 +6834,8 @@ mod job_storage_tests {
                 last_error: None,
                 updated_at_ms: 2,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
 
         assert_eq!(replacement.generation, 5);
         assert_eq!(replacement.version, 2);
@@ -6240,7 +6844,8 @@ mod job_storage_tests {
 
     #[tokio::test]
     async fn desired_state_update_marks_job_as_reconciling() {
-        let store = ControlPlaneStore::contract("desired_state_update_marks_job_as_reconciling").await;
+        let store =
+            ControlPlaneStore::contract("desired_state_update_marks_job_as_reconciling").await;
         store
             .upsert_job(JobRecord {
                 job_id: "orders".into(),
@@ -6255,11 +6860,13 @@ mod job_storage_tests {
                 last_error: None,
                 updated_at_ms: 1,
             })
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let updated = store
             .update_job_desired_state("orders", "running", 3)
-            .await.unwrap()
+            .await
+            .unwrap()
             .unwrap();
         assert_eq!(updated.generation, 4);
         assert_eq!(updated.convergence, "reconciling");
@@ -6267,7 +6874,10 @@ mod job_storage_tests {
 
     #[tokio::test]
     async fn operation_pruning_preserves_the_latest_job_start_recovery_fact() {
-        let store = ControlPlaneStore::contract("operation_pruning_preserves_the_latest_job_start_recovery_fact").await;
+        let store = ControlPlaneStore::contract(
+            "operation_pruning_preserves_the_latest_job_start_recovery_fact",
+        )
+        .await;
         store
             .upsert_operation(PersistedOperation {
                 operation_id: "job-start-1".into(),
@@ -6291,11 +6901,19 @@ mod job_storage_tests {
                 updated_at_ms: 1,
                 operation_json: "{}".into(),
             })
-            .await.unwrap();
+            .await
+            .unwrap();
 
         store.prune_operation_history(100, 0).await.unwrap();
         assert!(store.get_operation("job-start-1").await.unwrap().is_some());
         assert!(store.get_operation("old-stop").await.unwrap().is_none());
-        assert_eq!(store.list_job_start_operations("orders").await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_job_start_operations("orders")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

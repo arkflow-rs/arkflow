@@ -69,10 +69,7 @@ impl MigrationReport {
     }
 }
 
-fn sqlite_table_columns(
-    source: &SqliteBackend,
-    table: &str,
-) -> Result<Vec<String>, StorageError> {
+fn sqlite_table_columns(source: &SqliteBackend, table: &str) -> Result<Vec<String>, StorageError> {
     source.with_connection(|connection| {
         let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = statement
@@ -106,21 +103,19 @@ fn sqlite_read_table(
 
 fn sqlite_count_rows(source: &SqliteBackend, table: &str) -> Result<usize, StorageError> {
     source.with_connection(|connection| {
-        let count: i64 = connection.query_row(
-            &format!("SELECT COUNT(*) FROM {table}"),
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })?;
         Ok(count as usize)
     })
 }
 
 async fn pg_count(pool: &sqlx::PgPool, table: &str) -> Result<usize, StorageError> {
-    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT COUNT(*) FROM {table}"
-    )))
-    .fetch_one(pool)
-    .await?;
+    let count: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(pool)
+            .await?;
     Ok(count as usize)
 }
 
@@ -182,9 +177,7 @@ pub async fn migrate_sqlite_to_postgres(
         // Parents-first row order for self-referencing tables: the natural
         // scan order can place a child ahead of its parent and the foreign
         // key rejects the insert mid-migration.
-        if let Some((_, parent_column)) =
-            SELF_REFERENCING.iter().find(|(name, _)| *name == table)
-        {
+        if let Some((_, parent_column)) = SELF_REFERENCING.iter().find(|(name, _)| *name == table) {
             rows = order_parents_first(&columns, rows, parent_column);
         }
         for chunk in rows.chunks(CHUNK) {
@@ -243,8 +236,7 @@ fn order_parents_first(
     };
     // All present keys: a parent reference that no row satisfies is
     // dangling and never blocks emission.
-    let present: std::collections::BTreeSet<String> =
-        rows.iter().filter_map(key_of).collect();
+    let present: std::collections::BTreeSet<String> = rows.iter().filter_map(key_of).collect();
     let mut emitted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut pending: std::collections::VecDeque<Vec<PgVal>> = rows.into();
     let mut ordered: Vec<Vec<PgVal>> = Vec::with_capacity(pending.len());
@@ -369,7 +361,9 @@ mod tests {
         // the file until the migration has read it.
         drop(sqlite);
 
-        let report = super::migrate_sqlite_to_postgres(&path, &url).await.unwrap();
+        let report = super::migrate_sqlite_to_postgres(&path, &url)
+            .await
+            .unwrap();
         assert!(report.total_rows() >= 1);
         let jobs = report
             .rows_per_table
@@ -394,10 +388,7 @@ mod tests {
     #[test]
     fn value_to_pg_maps_every_sqlite_value_kind() {
         assert!(matches!(value_to_pg(ValueRef::Null), PgVal::Null));
-        assert!(matches!(
-            value_to_pg(ValueRef::Integer(-7)),
-            PgVal::Int(-7)
-        ));
+        assert!(matches!(value_to_pg(ValueRef::Integer(-7)), PgVal::Int(-7)));
         assert!(matches!(
             value_to_pg(ValueRef::Real(2.5)),
             PgVal::Real(v) if v == 2.5
@@ -440,11 +431,8 @@ mod tests {
         let ordered = order_parents_first(&["other".to_string()], rows.clone(), "parent");
         assert_eq!(ordered.len(), 1);
         // Key column present but the parent column is absent.
-        let ordered = order_parents_first(
-            &["intent_id".to_string()],
-            rows,
-            "superseded_by_intent_id",
-        );
+        let ordered =
+            order_parents_first(&["intent_id".to_string()], rows, "superseded_by_intent_id");
         assert_eq!(ordered.len(), 1);
     }
 

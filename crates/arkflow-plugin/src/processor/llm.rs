@@ -251,12 +251,12 @@ impl LlmProcessor {
             return Ok(Completion { text, tool_calls });
         }
 
-        let parsed: ChatCompletionResponse = serde_json::from_str(&body).map_err(|e| {
-            Error::Process(format!("LLM API response parse failed: {}", e))
-        })?;
-        let choice = parsed.choices.first().ok_or_else(|| {
-            Error::Process("LLM API response has no choice content".to_string())
-        })?;
+        let parsed: ChatCompletionResponse = serde_json::from_str(&body)
+            .map_err(|e| Error::Process(format!("LLM API response parse failed: {}", e)))?;
+        let choice = parsed
+            .choices
+            .first()
+            .ok_or_else(|| Error::Process("LLM API response has no choice content".to_string()))?;
         // A tool-calls-only response legitimately has `content: null`.
         let text = choice.message.content.clone().unwrap_or_default();
         if text.is_empty() && choice.message.tool_calls.is_none() {
@@ -387,11 +387,14 @@ impl ProcessorBuilder for LlmProcessorBuilder {
         }
         // Loopback endpoints (local vLLM/Ollama gateways, tests) bypass a
         // system proxy — proxying localhost is never what a user means.
-        let is_loopback = reqwest::Url::parse(&format!("{}/", config.api_base.trim_end_matches('/')))
-            .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-            .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]")
-            .unwrap_or(false);
+        let is_loopback =
+            reqwest::Url::parse(&format!("{}/", config.api_base.trim_end_matches('/')))
+                .ok()
+                .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+                .map(|host| {
+                    host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+                })
+                .unwrap_or(false);
         let mut builder = Client::builder().timeout(Duration::from_millis(config.timeout_ms));
         if is_loopback {
             builder = builder.no_proxy();
@@ -403,10 +406,7 @@ impl ProcessorBuilder for LlmProcessorBuilder {
     }
 }
 
-fn extract_string_column<'a>(
-    batch: &'a MessageBatch,
-    field: &str,
-) -> Result<Vec<&'a str>, Error> {
+fn extract_string_column<'a>(batch: &'a MessageBatch, field: &str) -> Result<Vec<&'a str>, Error> {
     let column = batch
         .schema()
         .fields()
@@ -523,9 +523,8 @@ mod tests {
                     let tracker_in_flight = tracker_in_flight.clone();
                     let tracker_max = tracker_max.clone();
                     std::thread::spawn(move || {
-                        let now_in_flight = tracker_in_flight
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                            + 1;
+                        let now_in_flight =
+                            tracker_in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         tracker_max.fetch_max(now_in_flight, std::sync::atomic::Ordering::SeqCst);
 
                         let mut buffer = Vec::new();
@@ -554,7 +553,10 @@ mod tests {
                             let _ = stream.read_exact(&mut body_bytes);
                         }
                         let body = String::from_utf8_lossy(&body_bytes).to_string();
-                        request_log.lock().unwrap().push((head.clone(), body.clone()));
+                        request_log
+                            .lock()
+                            .unwrap()
+                            .push((head.clone(), body.clone()));
 
                         let (status, response_body) = handler(&body);
                         // Decrement before the response is written: with
@@ -629,7 +631,10 @@ mod tests {
     async fn completes_rows_in_order_and_keeps_original_column() {
         let mock = MockApi::spawn(|body| {
             let parsed: Value = serde_json::from_str(body).unwrap();
-            let text = parsed["messages"][0]["content"].as_str().unwrap().to_string();
+            let text = parsed["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_string();
             (200, completion_body(&format!("out-{text}")))
         });
         let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
@@ -652,9 +657,19 @@ mod tests {
             .unwrap();
         assert_eq!(text_col.value(1), "b", "original column must be untouched");
         for row in 0..3 {
-            assert_eq!(response_col.value(row), format!("out-{}", ["a", "b", "c"][row]));
+            assert_eq!(
+                response_col.value(row),
+                format!("out-{}", ["a", "b", "c"][row])
+            );
         }
-        assert_eq!(output.schema().field_with_name("response").unwrap().data_type(), &DataType::Utf8);
+        assert_eq!(
+            output
+                .schema()
+                .field_with_name("response")
+                .unwrap()
+                .data_type(),
+            &DataType::Utf8
+        );
     }
 
     #[tokio::test]
@@ -665,7 +680,10 @@ mod tests {
             mock.addr,
             serde_json::json!({"system_prompt": "be brief"}),
         ));
-        processor.process(text_batch(vec![Some("x")])).await.unwrap();
+        processor
+            .process(text_batch(vec![Some("x")]))
+            .await
+            .unwrap();
         let (_, body) = mock.requests().remove(0);
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["messages"][0]["role"], "system");
@@ -678,16 +696,26 @@ mod tests {
             mock.addr,
             serde_json::json!({"prompt_template": "Translate: {{value}}"}),
         ));
-        processor.process(text_batch(vec![Some("hi")])).await.unwrap();
+        processor
+            .process(text_batch(vec![Some("hi")]))
+            .await
+            .unwrap();
         let (_, body) = mock.requests().remove(0);
         let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["messages"].as_array().unwrap().len(), 1, "no system message when unset");
+        assert_eq!(
+            parsed["messages"].as_array().unwrap().len(),
+            1,
+            "no system message when unset"
+        );
         assert_eq!(parsed["messages"][0]["content"], "Translate: hi");
 
         // neither set: raw text is the user message
         let mock = MockApi::spawn(|_body| (200, completion_body("ok")));
         let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
-        processor.process(text_batch(vec![Some("raw")])).await.unwrap();
+        processor
+            .process(text_batch(vec![Some("raw")]))
+            .await
+            .unwrap();
         let (_, body) = mock.requests().remove(0);
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["messages"][0]["content"], "raw");
@@ -697,7 +725,10 @@ mod tests {
     async fn optional_params_omitted_when_unset_and_sent_when_set() {
         let mock = MockApi::spawn(|_body| (200, completion_body("ok")));
         let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
-        processor.process(text_batch(vec![Some("x")])).await.unwrap();
+        processor
+            .process(text_batch(vec![Some("x")]))
+            .await
+            .unwrap();
         let (_, body) = mock.requests().remove(0);
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert!(parsed.get("temperature").is_none());
@@ -708,7 +739,10 @@ mod tests {
             mock.addr,
             serde_json::json!({"temperature": 0.2, "max_tokens": 64}),
         ));
-        processor.process(text_batch(vec![Some("x")])).await.unwrap();
+        processor
+            .process(text_batch(vec![Some("x")]))
+            .await
+            .unwrap();
         let (_, body) = mock.requests().remove(0);
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["temperature"], 0.2);
@@ -744,9 +778,16 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         for (row, name) in ["a", "b", "c", "d"].iter().enumerate() {
-            assert_eq!(response_col.value(row), format!("done-{name}"), "row order must hold");
+            assert_eq!(
+                response_col.value(row),
+                format!("done-{name}"),
+                "row order must hold"
+            );
         }
-        assert!(elapsed < std::time::Duration::from_millis(320), "no overlap: took {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(320),
+            "no overlap: took {elapsed:?}"
+        );
         assert_eq!(mock.requests().len(), 4);
     }
 
@@ -755,24 +796,40 @@ mod tests {
         let mock = MockApi::spawn(|body| {
             let parsed: Value = serde_json::from_str(body).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(30));
-            (200, completion_body(parsed["messages"][0]["content"].as_str().unwrap()))
+            (
+                200,
+                completion_body(parsed["messages"][0]["content"].as_str().unwrap()),
+            )
         });
         let processor = build_processor(base_config(
             mock.addr,
             serde_json::json!({"concurrency": 2}),
         ));
-        let batch = text_batch(vec![Some("a"), Some("b"), Some("c"), Some("d"), Some("e"), Some("f")]);
+        let batch = text_batch(vec![
+            Some("a"),
+            Some("b"),
+            Some("c"),
+            Some("d"),
+            Some("e"),
+            Some("f"),
+        ]);
         processor.process(batch).await.unwrap();
         let max = mock.max_in_flight();
         assert!(max <= 2, "in-flight requests exceeded the cap: {max}");
-        assert!(max >= 2, "requests did not overlap; expected pipelining, max={max}");
+        assert!(
+            max >= 2,
+            "requests did not overlap; expected pipelining, max={max}"
+        );
     }
 
     #[tokio::test]
     async fn api_key_sent_as_bearer() {
         let mock = MockApi::spawn(|_body| (200, completion_body("ok")));
         let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
-        processor.process(text_batch(vec![Some("x")])).await.unwrap();
+        processor
+            .process(text_batch(vec![Some("x")]))
+            .await
+            .unwrap();
         let (head, _) = mock.requests().remove(0);
         assert!(head.contains("authorization: Bearer sk-test"), "{head}");
     }
@@ -780,16 +837,20 @@ mod tests {
     #[tokio::test]
     async fn no_api_key_sends_no_auth_header() {
         let mock = MockApi::spawn(|_body| (200, completion_body("ok")));
-        let processor = build_processor(
-            serde_json::json!({
-                "api_base": format!("http://{}", mock.addr),
-                "model": "m",
-                "field": "text",
-            }),
-        );
-        processor.process(text_batch(vec![Some("x")])).await.unwrap();
+        let processor = build_processor(serde_json::json!({
+            "api_base": format!("http://{}", mock.addr),
+            "model": "m",
+            "field": "text",
+        }));
+        processor
+            .process(text_batch(vec![Some("x")]))
+            .await
+            .unwrap();
         let (head, _) = mock.requests().remove(0);
-        assert!(!head.to_ascii_lowercase().contains("authorization:"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("authorization:"),
+            "{head}"
+        );
     }
 
     #[tokio::test]
@@ -807,7 +868,12 @@ mod tests {
 
     #[tokio::test]
     async fn missing_content_errors() {
-        let mock = MockApi::spawn(|_body| (200, r#"{"choices": [{"message": {"role": "assistant", "content": null}}]}"#.to_string()));
+        let mock = MockApi::spawn(|_body| {
+            (
+                200,
+                r#"{"choices": [{"message": {"role": "assistant", "content": null}}]}"#.to_string(),
+            )
+        });
         let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
         let err = processor
             .process(text_batch(vec![Some("x")]))
@@ -855,7 +921,11 @@ mod tests {
     async fn large_utf8_column_is_supported() {
         let mock = MockApi::spawn(|_body| (200, completion_body("ok")));
         let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
-        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::LargeUtf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "text",
+            DataType::LargeUtf8,
+            true,
+        )]));
         let array = Arc::new(LargeStringArray::from(vec![Some("hello")]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(schema, vec![array]).unwrap(),
@@ -898,8 +968,8 @@ mod tests {
 
 #[cfg(test)]
 mod streaming_tests {
+    use super::tests::{test_resource, text_batch, MockApi};
     use super::*;
-    use super::tests::{text_batch, test_resource, MockApi};
     use serde_json::json;
 
     fn build(config_extra: Value, addr: std::net::SocketAddr) -> Arc<dyn Processor> {

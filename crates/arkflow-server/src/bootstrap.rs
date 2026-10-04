@@ -49,16 +49,20 @@ pub async fn run_migrate(
         return Ok(2);
     }
     let postgres_url = to;
-    let report = crate::storage::migrate_tool::migrate_sqlite_to_postgres(sqlite_path, &postgres_url)
-        .await
-        .map_err(|error| {
-            error_sink(format!("migration failed: {error}"));
-            error
-        })?;
+    let report =
+        crate::storage::migrate_tool::migrate_sqlite_to_postgres(sqlite_path, &postgres_url)
+            .await
+            .map_err(|error| {
+                error_sink(format!("migration failed: {error}"));
+                error
+            })?;
     for (table, rows) in &report.rows_per_table {
         error_sink(format!("{table}: {rows} rows"));
     }
-    error_sink(format!("migration complete: {} rows total", report.total_rows()));
+    error_sink(format!(
+        "migration complete: {} rows total",
+        report.total_rows()
+    ));
     Ok(0)
 }
 
@@ -71,8 +75,9 @@ pub fn validate_ha_config(ha: &HubHaConfig, config: &ServerConfig) -> Result<(),
         return Ok(());
     }
     if let Some(url) = ha.advertise_url.as_deref() {
-        let parsed = url::Url::parse(url)
-            .map_err(|error| format!("ARKFLOW_HUB_HA_ADVERTISE_URL is not a valid URL ({url}): {error}"))?;
+        let parsed = url::Url::parse(url).map_err(|error| {
+            format!("ARKFLOW_HUB_HA_ADVERTISE_URL is not a valid URL ({url}): {error}")
+        })?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             return Err(format!(
                 "ARKFLOW_HUB_HA_ADVERTISE_URL must be an absolute http(s) URL with a host: {url}"
@@ -85,10 +90,9 @@ pub fn validate_ha_config(ha: &HubHaConfig, config: &ServerConfig) -> Result<(),
                 .into(),
         );
     }
-    let is_postgres = config
-        .hub_storage
-        .as_deref()
-        .is_some_and(|value| value.starts_with("postgres://") || value.starts_with("postgresql://"));
+    let is_postgres = config.hub_storage.as_deref().is_some_and(|value| {
+        value.starts_with("postgres://") || value.starts_with("postgresql://")
+    });
     if !is_postgres {
         tracing::warn!(
             "HA election is enabled on a SQLite store: multi-instance HA requires the \

@@ -537,7 +537,8 @@ impl Wal {
                     // another caller for a later sequence remains parked.
                     entry.last_error = None;
                     let cursor_advanced = if cursor < seq {
-                        self.call_store(move |store| store.advance_cursor(seq)).await?;
+                        self.call_store(move |store| store.advance_cursor(seq))
+                            .await?;
                         true
                     } else {
                         false
@@ -576,8 +577,9 @@ impl Wal {
                     // can be reclaimed. A reclamation failure costs disk space,
                     // not correctness — the acknowledgement itself stands — so
                     // it is reported and not propagated.
-                    if let Err(error) =
-                        self.call_store(move |store| store.mark_committed(seq)).await
+                    if let Err(error) = self
+                        .call_store(move |store| store.mark_committed(seq))
+                        .await
                     {
                         tracing::warn!(
                             seq,
@@ -1313,23 +1315,19 @@ mod tests {
         let err = empty_stream.validate().unwrap_err();
         assert!(err.to_string().contains("stream_id is required"));
 
-        let empty_bucket =
-            object_store_config(serde_json::json!({"s3": {"bucket": " "}}));
+        let empty_bucket = object_store_config(serde_json::json!({"s3": {"bucket": " "}}));
         let err = empty_bucket.validate().unwrap_err();
         assert!(err.to_string().contains("bucket is required"));
 
-        let per_entry =
-            object_store_config(serde_json::json!({"sync": "per_entry"}));
+        let per_entry = object_store_config(serde_json::json!({"sync": "per_entry"}));
         let err = per_entry.validate().unwrap_err();
         assert!(err.to_string().contains("per_entry"));
 
-        let zero_workers =
-            object_store_config(serde_json::json!({"parallel_put": {"workers": 0}}));
+        let zero_workers = object_store_config(serde_json::json!({"parallel_put": {"workers": 0}}));
         let err = zero_workers.validate().unwrap_err();
         assert!(err.to_string().contains("must be positive"));
 
-        let many_workers =
-            object_store_config(serde_json::json!({"parallel_put": {"workers": 9}}));
+        let many_workers = object_store_config(serde_json::json!({"parallel_put": {"workers": 9}}));
         let err = many_workers.validate().unwrap_err();
         assert!(err.to_string().contains("out of range"));
 
@@ -1406,12 +1404,10 @@ mod tests {
         fn advance_cursor(&self, seq: u64) -> Result<(), Error> {
             let mut current = self.cursor.load(Ordering::SeqCst);
             while seq > current {
-                match self.cursor.compare_exchange(
-                    current,
-                    seq,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
+                match self
+                    .cursor
+                    .compare_exchange(current, seq, Ordering::SeqCst, Ordering::SeqCst)
+                {
                     Ok(_) => break,
                     Err(observed) => current = observed,
                 }
@@ -1631,31 +1627,38 @@ mod tests {
     async fn failed_source_ack_compensates_and_fences_then_a_retry_clears_it() {
         let dir = tempdir();
         let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 2);
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            2
+        );
 
         // The source commit fails after the cursor was advanced: the cursor is
         // compensated back to zero and both entries stay replayable.
         let flaky = StdArc::new(FlakySourceAck {
             failures_left: StdArc::new(AtomicU64::new(1)),
         });
-        let failing: StdArc<dyn Ack> =
-            StdArc::new(WalAck::new(wal.clone(), 1, flaky));
+        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(wal.clone(), 1, flaky));
         let error = failing.ack().await.unwrap_err();
-        assert!(error.to_string().contains("transient source commit failure"));
+        assert!(error
+            .to_string()
+            .contains("transient source commit failure"));
         assert_eq!(wal.cursor().await.unwrap(), 0);
         assert_eq!(wal.read_after_cursor().await.unwrap().len(), 2);
 
         // A later sequence must not overtake the failed one.
-        let later: StdArc<dyn Ack> =
-            StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(NoopAck)));
+        let later: StdArc<dyn Ack> = StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(NoopAck)));
         let error = later.ack().await.unwrap_err();
-        assert!(error.to_string().contains("blocked by an earlier source failure"));
+        assert!(error
+            .to_string()
+            .contains("blocked by an earlier source failure"));
 
         // Retrying the failed sequence clears the fence and completes: the
         // retry runs the stored (now healthy) source acknowledgement.
-        let retry: StdArc<dyn Ack> =
-            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        let retry: StdArc<dyn Ack> = StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
         retry.ack().await.unwrap();
         assert_eq!(wal.cursor().await.unwrap(), 1);
 
@@ -1673,7 +1676,10 @@ mod tests {
     async fn concurrent_acks_of_one_sequence_share_the_outcome() {
         let dir = tempdir();
         let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
 
         let (gate_tx, gate_rx) = tokio::sync::mpsc::channel::<()>(1);
         let entered = StdArc::new(AtomicU64::new(0));
@@ -1726,11 +1732,9 @@ mod tests {
 
         wal.close().await.unwrap();
         let error = task.await.unwrap().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("WAL closed while acknowledgement was pending")
-        );
+        assert!(error
+            .to_string()
+            .contains("WAL closed while acknowledgement was pending"));
     }
 
     /// Acknowledging a sequence the cursor already covers skips the cursor
@@ -1739,7 +1743,10 @@ mod tests {
     async fn acknowledging_a_covered_sequence_skips_the_cursor_bump() {
         let dir = tempdir();
         let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
         wal.advance(1).await.unwrap();
 
         let calls = StdArc::new(StdMutex::new(Vec::new()));
@@ -1764,8 +1771,14 @@ mod tests {
     async fn undo_of_unregistered_sequences_spans_no_op_behind_and_at_the_cursor() {
         let dir = tempdir();
         let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 2);
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            2
+        );
 
         // Future sequence, cursor below it: nothing to undo.
         WalAck::new(wal.clone(), 5, StdArc::new(NoopAck))
@@ -1804,10 +1817,16 @@ mod tests {
         .ack()
         .await
         .unwrap();
-        WalAck::new(wal.clone(), 2, StdArc::new(UndoCountingAck { undone: undone.clone() }))
-            .undo()
-            .await
-            .unwrap();
+        WalAck::new(
+            wal.clone(),
+            2,
+            StdArc::new(UndoCountingAck {
+                undone: undone.clone(),
+            }),
+        )
+        .undo()
+        .await
+        .unwrap();
         assert_eq!(undone.load(Ordering::SeqCst), 1);
         assert_eq!(wal.cursor().await.unwrap(), 1);
         wal.close().await.unwrap();
@@ -1820,8 +1839,14 @@ mod tests {
     async fn undo_of_registered_acknowledgements_removes_parks_or_rejects() {
         let dir = tempdir();
         let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 2);
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            2
+        );
 
         // Sequence 2 parks behind the unacknowledged 1.
         let parked: StdArc<dyn Ack> =
@@ -1862,11 +1887,8 @@ mod tests {
 
         // A registered (failed) entry stranded behind a later cursor is
         // refused: sequencing 2 fails, then the cursor advances past it.
-        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
-            wal.clone(),
-            2,
-            StdArc::new(FailingSourceAck),
-        ));
+        let failing: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(FailingSourceAck)));
         failing.ack().await.unwrap_err();
         advance_to(&wal, 3).await;
         let error = WalAck::new(wal.clone(), 2, StdArc::new(NoopAck))
@@ -1898,7 +1920,10 @@ mod tests {
             fail_mark_committed: false,
         });
         let wal = Wal::open_with_store(&config, store, 1).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
         let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
             wal.clone(),
             1,
@@ -1909,8 +1934,7 @@ mod tests {
         failing.ack().await.unwrap_err();
         assert_eq!(wal.cursor().await.unwrap(), 0);
         assert_eq!(wal.read_after_cursor().await.unwrap().len(), 1);
-        let retry: StdArc<dyn Ack> =
-            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        let retry: StdArc<dyn Ack> = StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
         retry.ack().await.unwrap();
         assert_eq!(wal.cursor().await.unwrap(), 1);
         wal.close().await.unwrap();
@@ -1925,12 +1949,12 @@ mod tests {
             fail_mark_committed: false,
         });
         let wal = Wal::open_with_store(&config, store, 1).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
-        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
-            wal.clone(),
-            1,
-            StdArc::new(FailingSourceAck),
-        ));
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        let failing: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(FailingSourceAck)));
         let error = failing.ack().await.unwrap_err();
         let message = error.to_string();
         assert!(message.contains("source commit failed"), "{message}");
@@ -1945,14 +1969,14 @@ mod tests {
     async fn a_failing_ack_without_a_cursor_bump_returns_the_raw_error() {
         let dir = tempdir();
         let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
         advance_to(&wal, 1).await;
 
-        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
-            wal.clone(),
-            1,
-            StdArc::new(FailingSourceAck),
-        ));
+        let failing: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(FailingSourceAck)));
         let error = failing.ack().await.unwrap_err();
         let message = error.to_string();
         assert!(message.contains("source commit failed"), "{message}");
@@ -1967,12 +1991,12 @@ mod tests {
     async fn undo_after_a_failed_ack_retries_the_source_abort() {
         let dir = tempdir();
         let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
-        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
-            wal.clone(),
-            1,
-            StdArc::new(FailingSourceAck),
-        ));
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        let failing: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(FailingSourceAck)));
         failing.ack().await.unwrap_err();
 
         // With the cursor moved back onto the failed sequence, the undo's
@@ -1985,8 +2009,7 @@ mod tests {
             .unwrap();
         assert_eq!(wal.cursor().await.unwrap(), 0);
         // The entry is gone: a fresh acknowledgement runs normally.
-        let retry: StdArc<dyn Ack> =
-            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        let retry: StdArc<dyn Ack> = StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
         retry.ack().await.unwrap();
         assert_eq!(wal.cursor().await.unwrap(), 1);
         wal.close().await.unwrap();
@@ -1998,12 +2021,12 @@ mod tests {
     async fn undo_after_a_failed_ack_whose_abort_fails_keeps_the_fence() {
         let dir = tempdir();
         let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
-        let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
-            wal.clone(),
-            1,
-            StdArc::new(FailingAbortAck),
-        ));
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        let failing: StdArc<dyn Ack> =
+            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(FailingAbortAck)));
         failing.ack().await.unwrap_err();
 
         let error = WalAck::new(wal.clone(), 1, StdArc::new(NoopAck))
@@ -2014,11 +2037,15 @@ mod tests {
 
         // The fenced entry still blocks nothing: a later sequence continues to
         // observe the earlier failure.
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 2);
-        let later: StdArc<dyn Ack> =
-            StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(NoopAck)));
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            2
+        );
+        let later: StdArc<dyn Ack> = StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(NoopAck)));
         let error = later.ack().await.unwrap_err();
-        assert!(error.to_string().contains("blocked by an earlier source failure"));
+        assert!(error
+            .to_string()
+            .contains("blocked by an earlier source failure"));
         wal.close().await.unwrap();
     }
 
@@ -2028,7 +2055,10 @@ mod tests {
     async fn undo_after_an_abort_that_moves_the_cursor_behind_fails_closed() {
         let dir = tempdir();
         let wal = Wal::open(&local_cfg(&dir, SyncPolicy::PerEntry)).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
         let failing: StdArc<dyn Ack> = StdArc::new(WalAck::new(
             wal.clone(),
             1,
@@ -2064,9 +2094,11 @@ mod tests {
             ..WalConfig::default()
         };
         let wal = Wal::open_with_store(&config, store, 1).unwrap();
-        assert_eq!(wal.append(&StdArc::new(sample_batch(None))).await.unwrap(), 1);
-        let ack: StdArc<dyn Ack> =
-            StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        let ack: StdArc<dyn Ack> = StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
         ack.ack().await.unwrap();
         assert_eq!(wal.cursor().await.unwrap(), 1);
         wal.close().await.unwrap();

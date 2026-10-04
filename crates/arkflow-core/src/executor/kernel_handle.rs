@@ -2093,10 +2093,7 @@ mod tests {
             "source-0".to_string(),
             Arc::new(tokio::sync::Mutex::new(Some(gate))),
         );
-        gates.insert(
-            "taken".to_string(),
-            Arc::new(tokio::sync::Mutex::new(None)),
-        );
+        gates.insert("taken".to_string(), Arc::new(tokio::sync::Mutex::new(None)));
         let handle = KernelJobRunner::spawn_with_cancellation(
             graph,
             vec![input],
@@ -2182,10 +2179,7 @@ mod tests {
                 .await
                 .unwrap()
                 .expect_err("an unknown chain must fail the round");
-            assert!(
-                error.to_string().contains("unknown chain"),
-                "{error}"
-            );
+            assert!(error.to_string().contains("unknown chain"), "{error}");
         }
     }
 
@@ -2212,7 +2206,9 @@ mod tests {
                 .unwrap()
                 .expect_err("a duplicate report must fail the round");
             assert!(
-                error.to_string().contains("duplicate chain checkpoint report"),
+                error
+                    .to_string()
+                    .contains("duplicate chain checkpoint report"),
                 "{error}"
             );
         }
@@ -2237,10 +2233,7 @@ mod tests {
                 .await
                 .unwrap()
                 .expect_err("a closed reports channel must fail the round");
-            assert!(
-                error.to_string().contains("ended"),
-                "{error}"
-            );
+            assert!(error.to_string().contains("ended"), "{error}");
         }
     }
 
@@ -2256,7 +2249,9 @@ mod tests {
         drop(error_sender);
         let error = result.expect_err("a closed reports channel must fail the round");
         assert!(
-            error.to_string().contains("kernel ended before checkpoint completed"),
+            error
+                .to_string()
+                .contains("kernel ended before checkpoint completed"),
             "{error}"
         );
     }

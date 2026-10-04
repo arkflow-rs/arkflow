@@ -80,10 +80,7 @@ mod tests {
         );
         assert_eq!(HubError::NotFound.failure_class(), "not_found");
         // Both storage flavors aggregate into the repository class.
-        assert_eq!(
-            HubError::StorageUnavailable.failure_class(),
-            "repository"
-        );
+        assert_eq!(HubError::StorageUnavailable.failure_class(), "repository");
         assert_eq!(
             HubError::Storage("backend exploded".into()).failure_class(),
             "repository"
@@ -106,7 +103,10 @@ mod tests {
         );
         // Everything else funnels into the shared invalid-request bucket.
         assert_eq!(HubError::Capacity.failure_class(), "invalid");
-        assert_eq!(HubError::Invalid("bad input".into()).failure_class(), "invalid");
+        assert_eq!(
+            HubError::Invalid("bad input".into()).failure_class(),
+            "invalid"
+        );
         assert_eq!(
             HubError::GenerationConflict {
                 expected: 1,

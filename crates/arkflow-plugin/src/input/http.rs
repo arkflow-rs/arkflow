@@ -165,9 +165,9 @@ impl Input for HttpInput {
         // Bind inside connect so a port conflict fails THIS call: a bind
         // panic in a detached listener task would leave the input silently
         // "connected" with no server behind it and no error anywhere.
-        let listener = TcpListener::bind(&addr).await.map_err(|e| {
-            Error::Connection(format!("HTTP input failed to bind {addr}: {e}"))
-        })?;
+        let listener = TcpListener::bind(&addr)
+            .await
+            .map_err(|e| Error::Connection(format!("HTTP input failed to bind {addr}: {e}")))?;
 
         let server_handle = tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())
@@ -337,11 +337,17 @@ mod tests {
             .await
             .expect_err("bind conflict must fail connect");
         let message = error.to_string();
-        assert!(message.contains("bind"), "error names the bind failure: {message}");
+        assert!(
+            message.contains("bind"),
+            "error names the bind failure: {message}"
+        );
 
         // The input must not be marked connected: read refuses instead of
         // blocking forever on a queue no server will ever feed.
-        assert!(input.read().await.is_err(), "read must refuse on an unconnected input");
+        assert!(
+            input.read().await.is_err(),
+            "read must refuse on an unconnected input"
+        );
     }
 
     #[tokio::test]
@@ -519,7 +525,9 @@ mod tests {
     /// does not flag compliant inputs.
     #[tokio::test]
     async fn read_survives_cancellation_during_codec_decode() {
-        use crate::input::codec_helper::contract::{cancel_pending_read_then_expect_delivery, gate};
+        use crate::input::codec_helper::contract::{
+            cancel_pending_read_then_expect_delivery, gate,
+        };
         use arkflow_core::input::Input;
 
         // Reserve then release an ephemeral port for the input's listener.
@@ -562,5 +570,4 @@ mod tests {
             .expect("compliant http input must deliver through a cancelled read");
         assert_eq!(batch.len(), 1);
     }
-
 }

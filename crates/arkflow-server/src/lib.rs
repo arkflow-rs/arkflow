@@ -583,9 +583,8 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
                         (snapshot.expires_at_ms > now).then_some(advertise)
                     }
                     .await;
-                    let details = leader_url.map(|leader| {
-                        serde_json::json!({ "leader_url": leader })
-                    });
+                    let details =
+                        leader_url.map(|leader| serde_json::json!({ "leader_url": leader }));
                     problem_with_details(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "hub_standby",
@@ -1400,9 +1399,9 @@ async fn hub_job_upgrade(
         &headers,
         OperatorAction::Configure,
         "job",
-        Some(job_id.clone())
+        Some(job_id.clone()),
     )
-        .await
+    .await
     {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -1823,18 +1822,13 @@ async fn hub_job_upgrade_action(
             )
         }
     };
-    let principal = match require_operator_action(
-        &hub,
-        &headers,
-        action_level,
-        "job",
-        Some(job_id.clone())
-    )
-        .await
-    {
-        Ok(principal) => principal,
-        Err(response) => return response,
-    };
+    let principal =
+        match require_operator_action(&hub, &headers, action_level, "job", Some(job_id.clone()))
+            .await
+        {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
     // Resolve before acting so an unknown id is a 404, not the generic
     // action-rejected conflict.
     match hub.job_upgrade(&upgrade_id).await {
@@ -2229,9 +2223,9 @@ async fn hub_configuration_command<T: Serialize>(
         headers,
         OperatorAction::Configure,
         "configuration",
-        Some(node_id.clone())
+        Some(node_id.clone()),
     )
-        .await
+    .await
     {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -2378,9 +2372,9 @@ async fn hub_targeted_command(
         &headers,
         OperatorAction::Operate,
         "stream",
-        Some(format!("{node_id}/{id}"))
+        Some(format!("{node_id}/{id}")),
     )
-        .await
+    .await
     {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -2575,9 +2569,9 @@ async fn hub_desired_state(
         &headers,
         OperatorAction::Operate,
         "stream",
-        Some(format!("{node_id}/{id}"))
+        Some(format!("{node_id}/{id}")),
     )
-        .await
+    .await
     {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -2887,9 +2881,9 @@ async fn create_rollout(
         &headers,
         OperatorAction::ManageRollouts,
         "rollout",
-        None
+        None,
     )
-        .await
+    .await
     {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -2955,9 +2949,9 @@ async fn rollout_action(
         &headers,
         OperatorAction::ManageRollouts,
         "rollout",
-        Some(id.clone())
+        Some(id.clone()),
     )
-        .await
+    .await
     {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -3178,9 +3172,9 @@ async fn hub_set_maintenance(
         &headers,
         OperatorAction::ManageNodes,
         "node",
-        Some(node_id.clone())
+        Some(node_id.clone()),
     )
-        .await
+    .await
     {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -4234,15 +4228,18 @@ mod tests {
             claimed: 3,
             current: 4,
         });
-        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(
-            response.into_body(),
-            usize::MAX,
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = String::from_utf8_lossy(&body).into_owned();
-        assert!(text.contains("\"stale_leader\""), "body carries the code: {text}");
+        assert!(
+            text.contains("\"stale_leader\""),
+            "body carries the code: {text}"
+        );
     }
 
     use super::*;
@@ -5656,7 +5653,7 @@ mod tests {
             job_tasks: Default::default(),
             boot_id: Some(session.session_token.clone()),
             connected_hub: None,
-        report_seq: 1,
+            report_seq: 1,
         })
         .await
         .unwrap();
@@ -6188,10 +6185,8 @@ mod tests {
         static TLS_MATERIAL_SEQUENCE: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
         let sequence = TLS_MATERIAL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "arkflow-hub-tls-{}-{sequence}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("arkflow-hub-tls-{}-{sequence}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
@@ -6699,10 +6694,7 @@ mod tests {
 
     fn storage_hub() -> hub::Hub {
         let store = storage::ControlPlaneStore::in_memory().unwrap();
-        hub::Hub::with_storage(
-            storage_hub_config(),
-            storage::StorageActor::start(store, 8),
-        )
+        hub::Hub::with_storage(storage_hub_config(), storage::StorageActor::start(store, 8))
     }
 
     fn scoped_operator_hub_config() -> hub::HubConfig {
@@ -6836,7 +6828,10 @@ mod tests {
         assert_eq!(config.node_token.as_deref(), Some("node"));
         assert_eq!(config.lease_ttl_ms, 12_345);
         assert_eq!(config.session_ttl_ms, 678);
-        assert_eq!(config.cors_origins, vec!["https://console.example".to_owned()]);
+        assert_eq!(
+            config.cors_origins,
+            vec!["https://console.example".to_owned()]
+        );
         assert!(config.tls_cert.is_none() && config.tls_key.is_none());
         assert!(!config.insecure_local && config.hub_storage.is_none());
 
@@ -6853,12 +6848,11 @@ mod tests {
             insecure_local: true,
             ..ServerConfig::default()
         };
-        assert!(
-            bad.validate_hub_startup(&local_hub)
-                .unwrap_err()
-                .to_string()
-                .contains("invalid Hub bind address")
-        );
+        assert!(bad
+            .validate_hub_startup(&local_hub)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid Hub bind address"));
     }
 
     #[tokio::test]
@@ -7081,9 +7075,13 @@ mod tests {
             tls_key: Some(key_path.to_string_lossy().into_owned()),
             ..base()
         };
-        let error = serve_hub(local_hub(), config, tokio_util::sync::CancellationToken::new())
-            .await
-            .unwrap_err();
+        let error = serve_hub(
+            local_hub(),
+            config,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("could not be read"), "{error}");
 
         // Certificate file without any PEM certificate entries.
@@ -7095,13 +7093,14 @@ mod tests {
             tls_key: Some(key_path.to_string_lossy().into_owned()),
             ..base()
         };
-        let error = serve_hub(local_hub(), config, tokio_util::sync::CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("no PEM certificates"),
-            "{error}"
-        );
+        let error = serve_hub(
+            local_hub(),
+            config,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no PEM certificates"), "{error}");
 
         // Key file that does not exist.
         let config = ServerConfig {
@@ -7109,9 +7108,13 @@ mod tests {
             tls_key: Some("/nonexistent/key.pem".into()),
             ..base()
         };
-        let error = serve_hub(local_hub(), config, tokio_util::sync::CancellationToken::new())
-            .await
-            .unwrap_err();
+        let error = serve_hub(
+            local_hub(),
+            config,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("could not be read"), "{error}");
 
         // Key file without a PEM private key.
@@ -7122,13 +7125,14 @@ mod tests {
             tls_key: Some(empty_key.to_string_lossy().into_owned()),
             ..base()
         };
-        let error = serve_hub(local_hub(), config, tokio_util::sync::CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("no PEM private key"),
-            "{error}"
-        );
+        let error = serve_hub(
+            local_hub(),
+            config,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no PEM private key"), "{error}");
     }
 
     /// A plaintext (or garbage) peer fails the TLS handshake; the listener
@@ -7173,14 +7177,14 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        let _ = client.get(format!("https://{address}/liveness")).send().await;
-        let (_stream, peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            accept_task,
-        )
-        .await
-        .expect("accept returns after a healthy handshake")
-        .unwrap();
+        let _ = client
+            .get(format!("https://{address}/liveness"))
+            .send()
+            .await;
+        let (_stream, peer) = tokio::time::timeout(std::time::Duration::from_secs(3), accept_task)
+            .await
+            .expect("accept returns after a healthy handshake")
+            .unwrap();
         assert_eq!(peer.ip(), address.ip());
     }
 
@@ -7264,44 +7268,67 @@ mod tests {
 
         create_job(&app, "acted-job").await;
         // Unknown action and unknown Job.
-        let (status, body) =
-            request_without_body(&app, "POST", "/api/v1/jobs/acted-job/actions/pause", Some("operator"))
-                .await;
+        let (status, body) = request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/acted-job/actions/pause",
+            Some("operator"),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], "invalid_job_action");
-        let (status, _) =
-            request_without_body(&app, "POST", "/api/v1/jobs/missing/actions/start", Some("operator"))
-                .await;
+        let (status, _) = request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/missing/actions/start",
+            Some("operator"),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _) =
-            request_without_body(&app, "POST", "/api/v1/jobs/missing/savepoints", Some("operator"))
-                .await;
+        let (status, _) = request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/missing/savepoints",
+            Some("operator"),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // Start converges the desired state and is audited.
-        let (status, job) =
-            request_without_body(&app, "POST", "/api/v1/jobs/acted-job/actions/start", Some("operator"))
-                .await;
+        let (status, job) = request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/acted-job/actions/start",
+            Some("operator"),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{job}");
         assert_eq!(job["desired_state"], "running");
-        let (status, job) =
-            request_without_body(&app, "POST", "/api/v1/jobs/acted-job/actions/stop", Some("operator"))
-                .await;
+        let (status, job) = request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/acted-job/actions/stop",
+            Some("operator"),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{job}");
         assert_eq!(job["desired_state"], "stopped");
 
         // A savepoint trigger is accepted, audited once, and listed.
-        let (status, job) =
-            request_without_body(&app, "POST", "/api/v1/jobs/acted-job/savepoints", Some("operator"))
-                .await;
+        let (status, job) = request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/acted-job/savepoints",
+            Some("operator"),
+        )
+        .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{job}");
-        assert!(
-            hub.audit(Some("acted-job"))
-                .await
-                .unwrap()
-                .iter()
-                .any(|record| record.action == "job.savepoint" && record.outcome == "accepted")
-        );
+        assert!(hub
+            .audit(Some("acted-job"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.action == "job.savepoint" && record.outcome == "accepted"));
         let (status, checkpoints) =
             get_json(&app, "/api/v1/jobs/acted-job/checkpoints", "operator").await;
         assert_eq!(status, StatusCode::OK);
@@ -7312,8 +7339,7 @@ mod tests {
 
         // Detail with node-scoped placement filters the node view and marks
         // unobserved tasks.
-        let (status, detail) =
-            get_json(&app, "/api/v1/jobs/acted-job/detail", "operator").await;
+        let (status, detail) = get_json(&app, "/api/v1/jobs/acted-job/detail", "operator").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(detail["nodes"].as_array().unwrap().len(), 1);
 
@@ -7564,7 +7590,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["desired_state"], "stopped");
 
-        let viewer_app = hub_router(hub::Hub::new(scoped_operator_hub_config()), &ServerConfig::default());
+        let viewer_app = hub_router(
+            hub::Hub::new(scoped_operator_hub_config()),
+            &ServerConfig::default(),
+        );
         let (status, _) = post_json(
             &viewer_app,
             "/api/v1/jobs",
@@ -7595,8 +7624,12 @@ mod tests {
         let app = hub_router(hub, &ServerConfig::default());
         create_job(&app, "upgraded-job").await;
 
-        let upgrade = |spec: serde_json::Value, expected_generation: u64, mode: Option<&str>, savepoint_id: Option<&str>| {
-            let mut body = serde_json::json!({"spec": spec, "expected_generation": expected_generation});
+        let upgrade = |spec: serde_json::Value,
+                       expected_generation: u64,
+                       mode: Option<&str>,
+                       savepoint_id: Option<&str>| {
+            let mut body =
+                serde_json::json!({"spec": spec, "expected_generation": expected_generation});
             if let Some(mode) = mode {
                 body["mode"] = serde_json::json!(mode);
             }
@@ -7694,8 +7727,13 @@ mod tests {
         assert_eq!(body["code"], "savepoint_not_ready");
 
         // Trigger a savepoint; still pending, so still not ready.
-        request_without_body(&app, "POST", "/api/v1/jobs/upgraded-job/savepoints", Some("operator"))
-            .await;
+        request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/upgraded-job/savepoints",
+            Some("operator"),
+        )
+        .await;
         let (_, checkpoints) =
             get_json(&app, "/api/v1/jobs/upgraded-job/checkpoints", "operator").await;
         let savepoint_id = checkpoints[0]["checkpoint_id"].as_str().unwrap().to_owned();
@@ -7712,16 +7750,12 @@ mod tests {
         // Complete the artifact; a state-format mismatch is rejected.
         store
             .with_connection(|connection| {
-                connection.execute(
-                    "UPDATE cp_job_checkpoints SET status = 'completed'",
-                    [],
-                )?;
+                connection.execute("UPDATE cp_job_checkpoints SET status = 'completed'", [])?;
                 Ok(())
             })
             .unwrap();
         let mut new_format = job_spec("upgraded-job", 2);
-        new_format["state"] =
-            serde_json::json!({"backend": "embedded_kv", "durability": "ephemeral", "format_version": 2});
+        new_format["state"] = serde_json::json!({"backend": "embedded_kv", "durability": "ephemeral", "format_version": 2});
         let (status, body) = post_json(
             &app,
             "/api/v1/jobs/upgraded-job/upgrades",
@@ -7794,7 +7828,12 @@ mod tests {
             &viewer_app,
             "/api/v1/jobs/upgraded-job/upgrades",
             "viewer-secret",
-            upgrade(job_spec("upgraded-job", 2), generation, None, Some(&savepoint_id)),
+            upgrade(
+                job_spec("upgraded-job", 2),
+                generation,
+                None,
+                Some(&savepoint_id),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -7811,8 +7850,13 @@ mod tests {
         );
         let app = hub_router(hub.clone(), &ServerConfig::default());
         create_job(&app, "format-job").await;
-        request_without_body(&app, "POST", "/api/v1/jobs/format-job/savepoints", Some("operator"))
-            .await;
+        request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/format-job/savepoints",
+            Some("operator"),
+        )
+        .await;
         // Artifact written under format 2, previous version spec is format 1.
         store
             .with_connection(|connection| {
@@ -7827,8 +7871,7 @@ mod tests {
             get_json(&app, "/api/v1/jobs/format-job/checkpoints", "operator").await;
         let checkpoint_id = checkpoints[0]["checkpoint_id"].as_str().unwrap().to_owned();
         let mut version_two = job_spec("format-job", 2);
-        version_two["state"] =
-            serde_json::json!({"backend": "embedded_kv", "durability": "ephemeral", "format_version": 2});
+        version_two["state"] = serde_json::json!({"backend": "embedded_kv", "durability": "ephemeral", "format_version": 2});
         hub.upsert_job(storage::JobRecord {
             job_id: "format-job".into(),
             version: 2,
@@ -8087,7 +8130,9 @@ mod tests {
         let app = hub_router(hub.clone(), &ServerConfig::default());
         register_job_node(&app, "node-a").await;
         create_job(&app, "fenced-job").await;
-        assert!(reject_if_job_upgrade_active(&hub, "fenced-job").await.is_ok());
+        assert!(reject_if_job_upgrade_active(&hub, "fenced-job")
+            .await
+            .is_ok());
         put_json(
             &app,
             "/api/v1/jobs/fenced-job/desired-state",
@@ -8164,16 +8209,14 @@ mod tests {
 
         let (status, rollouts) = get_json(&app, "/api/v1/rollouts", "operator").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(rollouts.as_array().unwrap().iter().any(|item| {
-            item["rollout_id"].as_str() == Some(rollout_id.as_str())
-        }));
+        assert!(rollouts
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["rollout_id"].as_str() == Some(rollout_id.as_str()) }));
 
-        let (status, fetched) = get_json(
-            &app,
-            &format!("/api/v1/rollouts/{rollout_id}"),
-            "operator",
-        )
-        .await;
+        let (status, fetched) =
+            get_json(&app, &format!("/api/v1/rollouts/{rollout_id}"), "operator").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(fetched["rollout"]["rollout_id"], rollout_id.as_str());
         assert_eq!(fetched["targets"].as_array().unwrap().len(), 1);
@@ -8318,12 +8361,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(filtered["total"].as_u64().unwrap() <= all["total"].as_u64().unwrap());
-        let (status, none) = get_json(
-            &app,
-            "/api/v1/events?correlation_id=never-used",
-            "operator",
-        )
-        .await;
+        let (status, none) =
+            get_json(&app, "/api/v1/events?correlation_id=never-used", "operator").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(none["total"], 0);
 
@@ -8341,7 +8380,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         // Agent endpoints reject missing session credentials.
-        let (status, _) = request_without_body(&app, "GET", "/api/v1/agent/commands?node_id=node-a", None).await;
+        let (status, _) =
+            request_without_body(&app, "GET", "/api/v1/agent/commands?node_id=node-a", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _) = post_json(
             &app,
@@ -8373,10 +8413,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let hub = hub::Hub::with_storage(
-            storage_hub_config(),
-            storage::StorageActor::start(store, 8),
-        );
+        let hub =
+            hub::Hub::with_storage(storage_hub_config(), storage::StorageActor::start(store, 8));
         let app = hub_router(hub.clone(), &ServerConfig::default());
         // Agent-reported events are the live broadcast source; register the
         // node so a report can drive one after the replay drains.
@@ -8467,10 +8505,8 @@ mod tests {
     #[tokio::test]
     async fn hub_metrics_and_operational_status_cover_fleet_and_rollout_state() {
         let store = storage::ControlPlaneStore::in_memory().unwrap();
-        let hub = hub::Hub::with_storage(
-            storage_hub_config(),
-            storage::StorageActor::start(store, 8),
-        );
+        let hub =
+            hub::Hub::with_storage(storage_hub_config(), storage::StorageActor::start(store, 8));
         let app = hub_router(hub.clone(), &ServerConfig::default());
         let session = register_hub_node(&app, "node-a").await;
         let mut report = agent_report_body(&session);
@@ -8548,13 +8584,9 @@ mod tests {
         let app = hub_router(hub, &ServerConfig::default());
         register_hub_node(&app, "node-a").await;
 
-        let (status, node) = request_without_body(
-            &app,
-            "POST",
-            "/api/v1/nodes/node-a/drain",
-            Some("operator"),
-        )
-        .await;
+        let (status, node) =
+            request_without_body(&app, "POST", "/api/v1/nodes/node-a/drain", Some("operator"))
+                .await;
         assert_eq!(status, StatusCode::OK, "{node}");
         assert_eq!(node["maintenance_state"], "draining");
         let (status, node) = request_without_body(
@@ -8736,11 +8768,12 @@ mod tests {
                 .unwrap(),
             storage::HubLeaseAcquire::Acquired { .. }
         ));
-        let standby = hub::Hub::with_storage(storage_hub_config(), actor).with_ha(hub::HubHaConfig {
-            enabled: true,
-            lease_ttl_ms: 1_000,
-            ..hub::HubHaConfig::default()
-        });
+        let standby =
+            hub::Hub::with_storage(storage_hub_config(), actor).with_ha(hub::HubHaConfig {
+                enabled: true,
+                lease_ttl_ms: 1_000,
+                ..hub::HubHaConfig::default()
+            });
         standby.enter_election().await;
         let app = hub_router(standby, &ServerConfig::default());
         let (status, body) = get_json(&app, "/api/v1/nodes", "operator").await;
@@ -8759,11 +8792,12 @@ mod tests {
                 .unwrap(),
             storage::HubLeaseAcquire::Acquired { .. }
         ));
-        let standby = hub::Hub::with_storage(storage_hub_config(), actor).with_ha(hub::HubHaConfig {
-            enabled: true,
-            lease_ttl_ms: 1_000,
-            ..hub::HubHaConfig::default()
-        });
+        let standby =
+            hub::Hub::with_storage(storage_hub_config(), actor).with_ha(hub::HubHaConfig {
+                enabled: true,
+                lease_ttl_ms: 1_000,
+                ..hub::HubHaConfig::default()
+            });
         standby.enter_election().await;
         let app = hub_router(standby, &ServerConfig::default());
         let (status, body) = get_json(&app, "/api/v1/nodes", "operator").await;
@@ -8940,7 +8974,8 @@ mod tests {
             hub::Hub::new(scoped_operator_hub_config()),
             &ServerConfig::default(),
         );
-        let (status, body) = get_json(&app, "/api/v1/nodes/missing/configuration", "operator").await;
+        let (status, body) =
+            get_json(&app, "/api/v1/nodes/missing/configuration", "operator").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert_eq!(body["code"], "node_configuration_unavailable");
         let (status, _) = get_json(
@@ -9091,9 +9126,8 @@ mod tests {
                     let request_line = lines.next().unwrap_or_default().to_owned();
                     let mut content_length = 0usize;
                     for line in lines {
-                        if let Some(value) = line
-                            .to_ascii_lowercase()
-                            .strip_prefix("content-length:")
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
                         {
                             content_length = value.trim().parse().unwrap_or(0);
                         }
@@ -9102,7 +9136,11 @@ mod tests {
                     if content_length > 0 {
                         let _ = stream.read_exact(&mut body).await;
                     }
-                    let path = request_line.split(' ').nth(1).unwrap_or_default().to_owned();
+                    let path = request_line
+                        .split(' ')
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned();
                     let issuer = format!("http://127.0.0.1:{port}");
                     let (status, payload) = match path.as_str() {
                         "/.well-known/openid-configuration" => (
@@ -9402,9 +9440,21 @@ mod tests {
     #[tokio::test]
     async fn hub_problem_maps_error_kinds_to_status_and_code() {
         let cases = [
-            (hub::HubError::Unauthorized, StatusCode::UNAUTHORIZED, "agent_request_rejected"),
-            (hub::HubError::NodeUnavailable, StatusCode::CONFLICT, "agent_request_rejected"),
-            (hub::HubError::NotFound, StatusCode::NOT_FOUND, "agent_request_rejected"),
+            (
+                hub::HubError::Unauthorized,
+                StatusCode::UNAUTHORIZED,
+                "agent_request_rejected",
+            ),
+            (
+                hub::HubError::NodeUnavailable,
+                StatusCode::CONFLICT,
+                "agent_request_rejected",
+            ),
+            (
+                hub::HubError::NotFound,
+                StatusCode::NOT_FOUND,
+                "agent_request_rejected",
+            ),
             (
                 hub::HubError::OrchestrationInProgress,
                 StatusCode::CONFLICT,
@@ -9481,8 +9531,8 @@ mod tests {
 
     async fn local_engine_with_stream() -> (ControlPlane, tokio_util::sync::CancellationToken) {
         arkflow_plugin::initialize().unwrap();
-        let stream: arkflow_core::stream::StreamConfig = serde_json::from_value(
-            serde_json::json!({
+        let stream: arkflow_core::stream::StreamConfig =
+            serde_json::from_value(serde_json::json!({
                 "id": "orders",
                 "input": {
                     "type": "generate",
@@ -9492,9 +9542,8 @@ mod tests {
                 },
                 "pipeline": {"thread_num": 1, "processors": []},
                 "output": {"type": "drop"}
-            }),
-        )
-        .unwrap();
+            }))
+            .unwrap();
         let engine = Engine::new(EngineConfig {
             streams: vec![stream],
             jobs: Vec::new(),
@@ -9577,8 +9626,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(page["total"].as_u64().unwrap() >= 1);
         let operation_id = page["items"][0]["id"].as_str().unwrap().to_owned();
-        let (status, _) =
-            get_json(&app, "/api/v1/operations/missing", "local-token").await;
+        let (status, _) = get_json(&app, "/api/v1/operations/missing", "local-token").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = request_without_body(
             &app,
@@ -9827,10 +9875,7 @@ mod tests {
                 poll_interval_ms: 10_000,
                 session_ttl_ms: default_session_ttl_ms(),
             },
-            storage::StorageActor::start(
-                storage::ControlPlaneStore::in_memory().unwrap(),
-                8,
-            ),
+            storage::StorageActor::start(storage::ControlPlaneStore::in_memory().unwrap(), 8),
         );
         let config = ServerConfig {
             address: format!("127.0.0.1:{port}"),
@@ -9879,10 +9924,7 @@ mod tests {
                 poll_interval_ms: 10_000,
                 session_ttl_ms: default_session_ttl_ms(),
             },
-            storage::StorageActor::start(
-                storage::ControlPlaneStore::in_memory().unwrap(),
-                8,
-            ),
+            storage::StorageActor::start(storage::ControlPlaneStore::in_memory().unwrap(), 8),
         );
         let config = ServerConfig {
             address: format!("127.0.0.1:{port}"),
@@ -9940,8 +9982,13 @@ mod tests {
 
         // A stopped-mode upgrade whose savepoint lookup fails: only the
         // checkpoint table is broken at this stage so the job read succeeds.
-        request_without_body(&app, "POST", "/api/v1/jobs/failing-job/savepoints", Some("operator"))
-            .await;
+        request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/failing-job/savepoints",
+            Some("operator"),
+        )
+        .await;
         let job_version = 1;
         store
             .with_connection(|connection| {
@@ -9964,8 +10011,7 @@ mod tests {
         // The detail view and recovery-artifact trigger surface the same
         // failure while the Job record itself is still readable, and an
         // upgrade against an unknown Job keeps its 404.
-        let (status, body) =
-            get_json(&app, "/api/v1/jobs/failing-job/detail", "operator").await;
+        let (status, body) = get_json(&app, "/api/v1/jobs/failing-job/detail", "operator").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         let (status, body) = request_without_body(
             &app,
@@ -10108,10 +10154,8 @@ mod tests {
     async fn hub_targeted_command_conflicts_and_desired_state_validation() {
         let _ = arkflow_plugin::initialize();
         let store = storage::ControlPlaneStore::in_memory().unwrap();
-        let hub = hub::Hub::with_storage(
-            storage_hub_config(),
-            storage::StorageActor::start(store, 8),
-        );
+        let hub =
+            hub::Hub::with_storage(storage_hub_config(), storage::StorageActor::start(store, 8));
         let app = hub_router(hub, &ServerConfig::default());
 
         // A desired state outside the running/stopped vocabulary is rejected.
@@ -10129,13 +10173,11 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                axum::http::Request::post(
-                    "/api/v1/nodes/node-a/streams/orders/actions/restart",
-                )
-                .header("authorization", "Bearer operator")
-                .header("if-match", "generation-999")
-                .body(axum::body::Body::empty())
-                .unwrap(),
+                axum::http::Request::post("/api/v1/nodes/node-a/streams/orders/actions/restart")
+                    .header("authorization", "Bearer operator")
+                    .header("if-match", "generation-999")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -10406,14 +10448,16 @@ mod tests {
         create_job(&app, "pin-job").await;
 
         // Complete a savepoint, then upgrade with an explicit node pinning.
-        request_without_body(&app, "POST", "/api/v1/jobs/pin-job/savepoints", Some("operator"))
-            .await;
+        request_without_body(
+            &app,
+            "POST",
+            "/api/v1/jobs/pin-job/savepoints",
+            Some("operator"),
+        )
+        .await;
         store
             .with_connection(|connection| {
-                connection.execute(
-                    "UPDATE cp_job_checkpoints SET status = 'completed'",
-                    [],
-                )?;
+                connection.execute("UPDATE cp_job_checkpoints SET status = 'completed'", [])?;
                 Ok(())
             })
             .unwrap();
@@ -10546,10 +10590,13 @@ mod tests {
         // Recovery artifacts and rollback are Operate actions.
         for (method, path) in [
             ("POST", "/api/v1/jobs/scoped-mutate/savepoints"),
-            ("POST", "/api/v1/jobs/scoped-mutate/upgrades/restore-v1/rollback"),
+            (
+                "POST",
+                "/api/v1/jobs/scoped-mutate/upgrades/restore-v1/rollback",
+            ),
         ] {
-            let (status, body) = request_without_body(&app, method, path, Some("viewer-secret"))
-                .await;
+            let (status, body) =
+                request_without_body(&app, method, path, Some("viewer-secret")).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
         }
 
@@ -10632,7 +10679,12 @@ mod tests {
             .as_str()
             .expect("at least one operation exists")
             .to_owned();
-        let (status, _) = get_json(&app, &format!("/api/v1/operations/{operation_id}"), "local-token").await;
+        let (status, _) = get_json(
+            &app,
+            &format!("/api/v1/operations/{operation_id}"),
+            "local-token",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
 
         // Cancelling the in-flight start records an event synchronously, so
@@ -10735,10 +10787,8 @@ mod tests {
     #[tokio::test]
     async fn sse_filters_live_events_lags_to_resync_and_ends_on_close() {
         let store = storage::ControlPlaneStore::in_memory().unwrap();
-        let hub = hub::Hub::with_storage(
-            storage_hub_config(),
-            storage::StorageActor::start(store, 8),
-        );
+        let hub =
+            hub::Hub::with_storage(storage_hub_config(), storage::StorageActor::start(store, 8));
         let app = hub_router(hub.clone(), &ServerConfig::default());
         let session = register_hub_node(&app, "node-a").await;
 
@@ -10767,24 +10817,25 @@ mod tests {
         let session_b = node_b_session.session_token.clone();
         let driver = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let report = |session_token: &str, node_id: &str, event_type: &str, correlation: &str| {
-                serde_json::json!({
-                    "node_id": node_id,
-                    "session_token": session_token,
-                    "version": "test-node",
-                    "state": "online",
-                    "events": [{
-                        "occurred_at_ms": 100,
-                        "event_type": event_type,
-                        "stream_id": "orders",
-                        "outcome": "accepted",
-                        "message": null,
-                        "operation_id": null,
-                        "correlation_id": correlation,
-                        "actor": null
-                    }]
-                })
-            };
+            let report =
+                |session_token: &str, node_id: &str, event_type: &str, correlation: &str| {
+                    serde_json::json!({
+                        "node_id": node_id,
+                        "session_token": session_token,
+                        "version": "test-node",
+                        "state": "online",
+                        "events": [{
+                            "occurred_at_ms": 100,
+                            "event_type": event_type,
+                            "stream_id": "orders",
+                            "outcome": "accepted",
+                            "message": null,
+                            "operation_id": null,
+                            "correlation_id": correlation,
+                            "actor": null
+                        }]
+                    })
+                };
             // node-b's event does not match the node_id filter.
             let _ = driver_app
                 .clone()
@@ -10814,8 +10865,7 @@ mod tests {
         });
         let mut saw_matching = false;
         for _ in 0..32 {
-            let chunk =
-                tokio::time::timeout(std::time::Duration::from_secs(2), body.next()).await;
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next()).await;
             match chunk {
                 Ok(Some(Ok(chunk))) => {
                     let text = String::from_utf8(chunk.to_vec()).unwrap();
@@ -10895,8 +10945,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let mut saw_resync = false;
         for _ in 0..64 {
-            let chunk =
-                tokio::time::timeout(std::time::Duration::from_secs(2), body.next()).await;
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next()).await;
             match chunk {
                 Ok(Some(Ok(chunk))) => {
                     let text = String::from_utf8(chunk.to_vec()).unwrap();
@@ -11014,9 +11063,8 @@ mod tests {
                     let request_line = lines.next().unwrap_or_default().to_owned();
                     let mut content_length = 0usize;
                     for line in lines {
-                        if let Some(value) = line
-                            .to_ascii_lowercase()
-                            .strip_prefix("content-length:")
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
                         {
                             content_length = value.trim().parse().unwrap_or(0);
                         }
@@ -11025,7 +11073,11 @@ mod tests {
                     if content_length > 0 {
                         let _ = stream.read_exact(&mut body).await;
                     }
-                    let path = request_line.split(' ').nth(1).unwrap_or_default().to_owned();
+                    let path = request_line
+                        .split(' ')
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned();
                     let issuer = format!("http://127.0.0.1:{port}");
                     let (status, payload) = match path.as_str() {
                         "/.well-known/openid-configuration" => (

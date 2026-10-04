@@ -781,7 +781,9 @@ mod tests {
     fn record_failure_fences_one_partition_until_cleared() {
         let frontier = CommitFrontier::new();
         frontier.record_failure(Some("orders"), 0, 12, "store_offset failed");
-        let failure = frontier.failure(Some("orders"), 0).expect("failure is fenced");
+        let failure = frontier
+            .failure(Some("orders"), 0)
+            .expect("failure is fenced");
         assert_eq!(failure.next_offset, 12);
         assert_eq!(failure.error, "store_offset failed");
         // Other partitions (and the same partition by another key) are not
@@ -828,12 +830,7 @@ mod tests {
         let snapshot = frontier.snapshot_partition(Some("orders"), 0);
         // The frontier advanced past the value the caller expected.
         frontier.acknowledge(&position("orders", 0, 6));
-        assert!(!frontier.restore_partition_if_current(
-            Some("orders"),
-            0,
-            5,
-            snapshot
-        ));
+        assert!(!frontier.restore_partition_if_current(Some("orders"), 0, 5, snapshot));
         assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(6));
     }
 
@@ -842,12 +839,7 @@ mod tests {
         let frontier = CommitFrontier::new();
         let snapshot = frontier.snapshot_partition(Some("orders"), 0);
         // An active snapshot can only restore onto an existing frontier.
-        assert!(!frontier.restore_partition_if_current(
-            Some("orders"),
-            0,
-            0,
-            snapshot
-        ));
+        assert!(!frontier.restore_partition_if_current(Some("orders"), 0, 0, snapshot));
     }
 
     #[test]
@@ -863,12 +855,7 @@ mod tests {
         );
         // The frontier itself did not move, so the snapshot restores both the
         // pending set and the offset.
-        assert!(frontier.restore_partition_if_current(
-            Some("orders"),
-            0,
-            5,
-            snapshot
-        ));
+        assert!(frontier.restore_partition_if_current(Some("orders"), 0, 5, snapshot));
         assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(5));
         assert_eq!(
             frontier.acknowledge(&position("orders", 0, 6)),

@@ -153,10 +153,18 @@ impl Processor for MilvusSearchProcessor {
             return Ok(ProcessResult::None);
         }
 
-        let vectors =
-            vector_util::extract_vectors("milvus_search processor", &msg_batch, &self.config.vector_field)?;
+        let vectors = vector_util::extract_vectors(
+            "milvus_search processor",
+            &msg_batch,
+            &self.config.vector_field,
+        )?;
         let matches = self.search_all(vectors).await?;
-        let batch = vector_util::append_column("milvus_search processor", &msg_batch, &self.config.target_field, &matches)?;
+        let batch = vector_util::append_column(
+            "milvus_search processor",
+            &msg_batch,
+            &self.config.target_field,
+            &matches,
+        )?;
         Ok(ProcessResult::Single(Arc::new(batch)))
     }
 
@@ -328,9 +336,7 @@ mod tests {
     use super::*;
     use crate::vector_util::test_support::MockApi as MockMilvus;
     use arkflow_core::MessageBatch;
-    use datafusion::arrow::array::{
-        Array, FixedSizeListArray, Float32Array, StringArray,
-    };
+    use datafusion::arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
@@ -436,8 +442,14 @@ mod tests {
             })
             .expect("row 0's request carries the [1.0, 0.0] vector")
             .clone();
-        assert!(head.starts_with("POST /v2/vectordb/entities/search "), "{head}");
-        assert!(head.contains("authorization: Bearer root:Milvus-pw"), "{head}");
+        assert!(
+            head.starts_with("POST /v2/vectordb/entities/search "),
+            "{head}"
+        );
+        assert!(
+            head.contains("authorization: Bearer root:Milvus-pw"),
+            "{head}"
+        );
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["collectionName"], "docs");
         assert_eq!(parsed["data"].as_array().unwrap().len(), 1);
@@ -452,9 +464,15 @@ mod tests {
     #[tokio::test]
     async fn auto_id_omits_id_from_output_fields_and_matches() {
         let mock = MockMilvus::spawn(|_body| {
-            (200, r#"{"code":0,"data":[{"distance":0.3,"payload":{"text":"x"}}]}"#.to_string())
+            (
+                200,
+                r#"{"code":0,"data":[{"distance":0.3,"payload":{"text":"x"}}]}"#.to_string(),
+            )
         });
-        let processor = build_processor(base_config(mock.addr(), serde_json::json!({"id_field": ""})));
+        let processor = build_processor(base_config(
+            mock.addr(),
+            serde_json::json!({"id_field": ""}),
+        ));
         let batch = vector_batch(vec![vec![1.0, 2.0]]);
         let result = processor.process(batch).await.unwrap();
         let ProcessResult::Single(output) = result else {
@@ -472,16 +490,27 @@ mod tests {
         let (_, body) = mock.last_request();
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert!(
-            !parsed["outputFields"].as_array().unwrap().contains(&json!("doc_id")),
+            !parsed["outputFields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("doc_id")),
             "auto-id collections must not request the id field"
         );
     }
 
     #[tokio::test]
     async fn metric_type_is_configurable() {
-        let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0,"data":[[{"distance":1.0}]]}"#.to_string()));
-        let processor = build_processor(base_config(mock.addr(), serde_json::json!({"metric": "IP"})));
-        processor.process(vector_batch(vec![vec![1.0]])).await.unwrap();
+        let mock = MockMilvus::spawn(|_body| {
+            (200, r#"{"code":0,"data":[[{"distance":1.0}]]}"#.to_string())
+        });
+        let processor = build_processor(base_config(
+            mock.addr(),
+            serde_json::json!({"metric": "IP"}),
+        ));
+        processor
+            .process(vector_batch(vec![vec![1.0]]))
+            .await
+            .unwrap();
         let (_, body) = mock.last_request();
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["searchParams"]["metricType"], "IP");
@@ -490,7 +519,10 @@ mod tests {
     #[tokio::test]
     async fn http_200_with_nonzero_code_fails() {
         let mock = MockMilvus::spawn(|_body| {
-            (200, r#"{"code":100,"message":"collection not found"}"#.to_string())
+            (
+                200,
+                r#"{"code":100,"message":"collection not found"}"#.to_string(),
+            )
         });
         let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
         let err = processor
@@ -540,7 +572,11 @@ mod tests {
     async fn empty_batch_short_circuits_without_request() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"code":0}"#.to_string()));
         let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
-        let schema = Arc::new(Schema::new(vec![Field::new("embedding", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::Utf8,
+            true,
+        )]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(
                 schema,

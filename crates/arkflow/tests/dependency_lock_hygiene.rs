@@ -39,7 +39,10 @@ use std::path::PathBuf;
 /// (including subcrates like `datafusion-common`), and the vendored
 /// zstd C library pair.
 fn is_guarded(name: &str) -> bool {
-    name.starts_with("arrow") || name.starts_with("datafusion") || name == "zstd" || name == "zstd-safe"
+    name.starts_with("arrow")
+        || name.starts_with("datafusion")
+        || name == "zstd"
+        || name == "zstd-safe"
 }
 
 fn repo_root() -> PathBuf {

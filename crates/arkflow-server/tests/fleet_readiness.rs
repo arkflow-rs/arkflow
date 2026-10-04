@@ -130,12 +130,7 @@ fn empty_control_plane() -> ControlPlane {
     )
 }
 
-fn fleet_job(
-    job_id: &str,
-    node_id: &str,
-    checkpoint_uri: String,
-    state_root: String,
-) -> JobSpec {
+fn fleet_job(job_id: &str, node_id: &str, checkpoint_uri: String, state_root: String) -> JobSpec {
     let processing_time = || TimeSpec {
         mode: TimeMode::ProcessingTime,
         timestamp_field: None,
@@ -147,7 +142,7 @@ fn fleet_job(
     JobSpec {
         resources: Default::default(),
         rebalance: None,
-rescale: false,
+        rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new(job_id).unwrap(),
         version: JobVersion(1),
@@ -930,7 +925,8 @@ async fn run_soak(
         churn_round(&live.hub, &jobs, round, recorder_for_round).await;
         in_restart_window = false;
         round += 1;
-        if started.elapsed() > duration / 2 && started.elapsed() < duration / 2 + Duration::from_secs(1)
+        if started.elapsed() > duration / 2
+            && started.elapsed() < duration / 2 + Duration::from_secs(1)
         {
             assert_history_converged(&live.hub, &store, "soak midpoint").await;
         }
@@ -957,10 +953,9 @@ async fn run_soak(
     let after_first = history_counts(&store).await;
     hub_prune_all(&live.hub).await;
     let after_second = history_counts(&store).await;
-    for (store_name, (&first, &second)) in
-        ["ops", "outbox", "attempts", "audit", "events"]
-            .iter()
-            .zip(after_first.iter().zip(after_second.iter()))
+    for (store_name, (&first, &second)) in ["ops", "outbox", "attempts", "audit", "events"]
+        .iter()
+        .zip(after_first.iter().zip(after_second.iter()))
     {
         assert!(
             second <= first + 8,
@@ -1000,8 +995,7 @@ async fn run_soak(
             }
         }
     }
-    let first_third: Vec<u64> =
-        recorder.samples_ms[..recorder.samples_ms.len() / 3].to_vec();
+    let first_third: Vec<u64> = recorder.samples_ms[..recorder.samples_ms.len() / 3].to_vec();
     let last_third: Vec<u64> = recorder.samples_ms[recorder.samples_ms.len() * 2 / 3..].to_vec();
     let drift_check = |samples: &[u64], p: f64| -> Option<u64> {
         let mut sorted = samples.to_vec();

@@ -102,10 +102,8 @@ impl Hub {
         // spec, so its state format is the current spec's format; recovery
         // into the target version then follows the same equal-format rule
         // the shared compatibility evaluator applies.
-        let current_spec: arkflow_core::job::JobSpec =
-            serde_json::from_str(&current.spec_json).map_err(|error| {
-                HubError::Invalid(format!("invalid persisted Job spec: {error}"))
-            })?;
+        let current_spec: arkflow_core::job::JobSpec = serde_json::from_str(&current.spec_json)
+            .map_err(|error| HubError::Invalid(format!("invalid persisted Job spec: {error}")))?;
         if crate::hub::checkpoint::job_state_format_version(&current_spec)
             != crate::hub::checkpoint::job_state_format_version(spec)
         {
@@ -128,7 +126,10 @@ impl Hub {
             .map_err(|error| HubError::Invalid(format!("invalid Job spec: {error}")))?;
         let now = now_ms();
         let mut record = JobUpgradeRecord {
-            upgrade_id: format!("job-upgrade-{}", HUB_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
+            upgrade_id: format!(
+                "job-upgrade-{}",
+                HUB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ),
             job_id: job_id.to_owned(),
             from_version: current.version,
             to_version: spec.version.0,
@@ -178,10 +179,15 @@ impl Hub {
             .write()
             .await
             .insert(record.upgrade_id.clone(), record.clone());
-        self.emit_job_upgrade_event(&record, "initiated", format!(
-            "atomic upgrade started: {} -> {}",
-            record.from_version, record.to_version
-        )).await;
+        self.emit_job_upgrade_event(
+            &record,
+            "initiated",
+            format!(
+                "atomic upgrade started: {} -> {}",
+                record.from_version, record.to_version
+            ),
+        )
+        .await;
         Ok(record)
     }
 
@@ -207,10 +213,7 @@ impl Hub {
     /// The non-terminal orchestration owning a Job, if any (cache read; the
     /// cache is repopulated at boot recovery and maintained on every
     /// transition).
-    pub(crate) async fn active_job_upgrade_for(
-        &self,
-        job_id: &str,
-    ) -> Option<JobUpgradeRecord> {
+    pub(crate) async fn active_job_upgrade_for(&self, job_id: &str) -> Option<JobUpgradeRecord> {
         self.job_upgrades
             .read()
             .await
@@ -226,9 +229,7 @@ impl Hub {
     /// generation and for a restored previous one alike.
     pub(crate) async fn job_upgrade_fences_reconciliation(&self, job_id: &str) -> bool {
         match self.active_job_upgrade_for(job_id).await {
-            Some(record) => {
-                record.phase != phase::VERIFYING && record.phase != phase::ROLLING_BACK
-            }
+            Some(record) => record.phase != phase::VERIFYING && record.phase != phase::ROLLING_BACK,
             None => false,
         }
     }
@@ -282,13 +283,21 @@ impl Hub {
                 record.phase = phase::PAUSED.into();
                 self.finish_job_upgrade_transition(&mut record, &expected_phase, None)
                     .await?;
-                self.audit_job_upgrade_action(&record, "job.upgrade.atomic.pause", actor, correlation_id, "accepted")
-                    .await?;
+                self.audit_job_upgrade_action(
+                    &record,
+                    "job.upgrade.atomic.pause",
+                    actor,
+                    correlation_id,
+                    "accepted",
+                )
+                .await?;
                 Ok(record)
             }
             "resume" => {
                 if record.phase != phase::PAUSED {
-                    return Err(HubError::Invalid("only a paused job upgrade can resume".into()));
+                    return Err(HubError::Invalid(
+                        "only a paused job upgrade can resume".into(),
+                    ));
                 }
                 let resumed = record
                     .paused_from
@@ -298,12 +307,17 @@ impl Hub {
                 record.paused_from = None;
                 // A long pause may have outlived the phase deadline: re-arm
                 // it so resume does not immediately time the phase out.
-                record.phase_deadline_at_ms =
-                    now_ms() + phase_timeout_ms(&record, &record.phase);
+                record.phase_deadline_at_ms = now_ms() + phase_timeout_ms(&record, &record.phase);
                 self.finish_job_upgrade_transition(&mut record, &expected_phase, None)
                     .await?;
-                self.audit_job_upgrade_action(&record, "job.upgrade.atomic.resume", actor, correlation_id, "accepted")
-                    .await?;
+                self.audit_job_upgrade_action(
+                    &record,
+                    "job.upgrade.atomic.resume",
+                    actor,
+                    correlation_id,
+                    "accepted",
+                )
+                .await?;
                 Ok(record)
             }
             "cancel" => {
@@ -314,8 +328,14 @@ impl Hub {
                     Some("cancelled by operator"),
                 )
                 .await?;
-                self.audit_job_upgrade_action(&record, "job.upgrade.atomic.cancel", actor, correlation_id, "accepted")
-                    .await?;
+                self.audit_job_upgrade_action(
+                    &record,
+                    "job.upgrade.atomic.cancel",
+                    actor,
+                    correlation_id,
+                    "accepted",
+                )
+                .await?;
                 Ok(record)
             }
             "rollback" => {
@@ -331,8 +351,14 @@ impl Hub {
                 record.phase_deadline_at_ms = now_ms() + verify_timeout_ms(&record);
                 self.finish_job_upgrade_transition(&mut record, &expected_phase, None)
                     .await?;
-                self.audit_job_upgrade_action(&record, "job.upgrade.atomic.rollback", actor, correlation_id, "accepted")
-                    .await?;
+                self.audit_job_upgrade_action(
+                    &record,
+                    "job.upgrade.atomic.rollback",
+                    actor,
+                    correlation_id,
+                    "accepted",
+                )
+                .await?;
                 Ok(record)
             }
             _ => Err(HubError::Invalid(
@@ -359,9 +385,7 @@ impl Hub {
             let expected_phase = record.phase.clone();
             let stepped = match record.phase.as_str() {
                 phase::PAUSED => Ok(()),
-                phase::SAVING_SAVEPOINT => {
-                    self.step_savepoint_phase(&mut record).await
-                }
+                phase::SAVING_SAVEPOINT => self.step_savepoint_phase(&mut record).await,
                 phase::COMMITTING_VERSION => self.step_commit_phase(&mut record).await,
                 phase::VERIFYING => self.step_verify_phase(&mut record).await,
                 phase::ROLLING_BACK => self.step_rollback_phase(&mut record).await,
@@ -429,12 +453,11 @@ impl Hub {
                     )
                     .await;
             }
-            let spec: arkflow_core::job::JobSpec = serde_json::from_str(&job.spec_json)
-                .map_err(|error| HubError::Invalid(format!("invalid persisted Job spec: {error}")))?;
-            let checkpoint_id = format!(
-                "savepoint-{}-{}-{}",
-                record.job_id, job.generation, now
-            );
+            let spec: arkflow_core::job::JobSpec =
+                serde_json::from_str(&job.spec_json).map_err(|error| {
+                    HubError::Invalid(format!("invalid persisted Job spec: {error}"))
+                })?;
+            let checkpoint_id = format!("savepoint-{}-{}-{}", record.job_id, job.generation, now);
             let checkpoint = JobCheckpointRecord {
                 job_id: record.job_id.clone(),
                 job_version: job.version,
@@ -526,8 +549,7 @@ impl Hub {
                 )
                 .await;
         };
-        let already_committed =
-            job.version == record.to_version && job.desired_state == "running";
+        let already_committed = job.version == record.to_version && job.desired_state == "running";
         if already_committed {
             record.phase = phase::VERIFYING.into();
             record.phase_deadline_at_ms = now + verify_timeout_ms(record);
@@ -623,11 +645,7 @@ impl Hub {
         let Some(job) = self.job(&record.job_id).await? else {
             record.phase = phase::FAILED.into();
             return self
-                .finish_job_upgrade_transition(
-                    record,
-                    phase::VERIFYING,
-                    Some("job disappeared"),
-                )
+                .finish_job_upgrade_transition(record, phase::VERIFYING, Some("job disappeared"))
                 .await;
         };
         if job.version == record.to_version && job.observed_state == "running" {
@@ -660,12 +678,13 @@ impl Hub {
             // the deadline: restore the previous version from the same cut.
             record.phase = phase::ROLLING_BACK.into();
             record.phase_deadline_at_ms = now + verify_timeout_ms(record);
-            return self.finish_job_upgrade_transition(
-                record,
-                phase::VERIFYING,
-                Some("verification deadline exceeded; rolling back to the previous version"),
-            )
-            .await;
+            return self
+                .finish_job_upgrade_transition(
+                    record,
+                    phase::VERIFYING,
+                    Some("verification deadline exceeded; rolling back to the previous version"),
+                )
+                .await;
         }
         Ok(())
     }
@@ -680,11 +699,7 @@ impl Hub {
         let Some(job) = self.job(&record.job_id).await? else {
             record.phase = phase::FAILED.into();
             return self
-                .finish_job_upgrade_transition(
-                    record,
-                    phase::ROLLING_BACK,
-                    Some("job disappeared"),
-                )
+                .finish_job_upgrade_transition(record, phase::ROLLING_BACK, Some("job disappeared"))
                 .await;
         };
         let restore_applied = job.version == record.from_version && job.desired_state == "running";
@@ -753,7 +768,10 @@ impl Hub {
                 .into_iter()
                 .find(|checkpoint| checkpoint.checkpoint_id == savepoint_id)
                 .is_some_and(|checkpoint| {
-                    crate::hub::checkpoint::recovery_record_is_compatible(&restored_spec, &checkpoint)
+                    crate::hub::checkpoint::recovery_record_is_compatible(
+                        &restored_spec,
+                        &checkpoint,
+                    )
                 });
             if !compatible {
                 record.phase = phase::FAILED.into();
@@ -768,9 +786,7 @@ impl Hub {
         }
         restored_spec
             .validate()
-            .and_then(|_| {
-                arkflow_core::job::JobPlan::compile(restored_spec.clone()).map(|_| ())
-            })
+            .and_then(|_| arkflow_core::job::JobPlan::compile(restored_spec.clone()).map(|_| ()))
             .map_err(|error| HubError::Invalid(error.to_string()))?;
         let restored_spec_json = serde_json::to_string(&restored_spec)
             .map_err(|error| HubError::Invalid(format!("invalid Job spec: {error}")))?;
@@ -864,7 +880,12 @@ impl Hub {
         Ok(())
     }
 
-    async fn emit_job_upgrade_event(&self, record: &JobUpgradeRecord, outcome: &str, message: String) {
+    async fn emit_job_upgrade_event(
+        &self,
+        record: &JobUpgradeRecord,
+        outcome: &str,
+        message: String,
+    ) {
         let event = ControlEvent {
             occurred_at_ms: now_ms(),
             event_type: "job.upgrade".into(),

@@ -7,8 +7,8 @@
 //! `ON CONFLICT DO NOTHING` at runtime. The FIFO actor serializes calls,
 //! so per-statement semantics match SQLite's single-writer behavior.
 use super::*;
-use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions, PgRow};
 use sqlx::postgres::PgQueryResult;
+use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions, PgRow};
 use sqlx::Arguments;
 use sqlx::{AssertSqlSafe, Postgres, Row as SqlxRow};
 use std::time::Duration;
@@ -73,7 +73,9 @@ impl From<Option<String>> for PgVal {
 }
 impl From<Option<&str>> for PgVal {
     fn from(value: Option<&str>) -> Self {
-        value.map(|v| PgVal::Text(v.to_owned())).unwrap_or(PgVal::Null)
+        value
+            .map(|v| PgVal::Text(v.to_owned()))
+            .unwrap_or(PgVal::Null)
     }
 }
 impl From<&Option<String>> for PgVal {
@@ -83,12 +85,16 @@ impl From<&Option<String>> for PgVal {
 }
 impl From<&Option<&str>> for PgVal {
     fn from(value: &Option<&str>) -> Self {
-        value.map(|v| PgVal::Text((*v).to_owned())).unwrap_or(PgVal::Null)
+        value
+            .map(|v| PgVal::Text((*v).to_owned()))
+            .unwrap_or(PgVal::Null)
     }
 }
 impl From<&Option<u64>> for PgVal {
     fn from(value: &Option<u64>) -> Self {
-        value.map(|v| PgVal::Int(v as i64)).unwrap_or(PgVal::NullInt)
+        value
+            .map(|v| PgVal::Int(v as i64))
+            .unwrap_or(PgVal::NullInt)
     }
 }
 impl From<&Option<i64>> for PgVal {
@@ -98,7 +104,9 @@ impl From<&Option<i64>> for PgVal {
 }
 impl From<&Option<u32>> for PgVal {
     fn from(value: &Option<u32>) -> Self {
-        value.map(|v| PgVal::Int(v as i64)).unwrap_or(PgVal::NullInt)
+        value
+            .map(|v| PgVal::Int(v as i64))
+            .unwrap_or(PgVal::NullInt)
     }
 }
 impl From<&u64> for PgVal {
@@ -153,7 +161,10 @@ impl From<&&String> for PgVal {
 }
 impl From<&&Option<String>> for PgVal {
     fn from(value: &&Option<String>) -> Self {
-        value.as_ref().map(|v| PgVal::Text(v.clone())).unwrap_or(PgVal::Null)
+        value
+            .as_ref()
+            .map(|v| PgVal::Text(v.clone()))
+            .unwrap_or(PgVal::Null)
     }
 }
 impl From<&Option<Option<String>>> for PgVal {
@@ -254,12 +265,14 @@ impl PgGet for u32 {
 }
 impl PgGet for Option<String> {
     fn pg_get(row: &PgRow, idx: usize) -> Result<Self, StorageError> {
-        row.try_get::<Option<String>, _>(idx).map_err(StorageError::from)
+        row.try_get::<Option<String>, _>(idx)
+            .map_err(StorageError::from)
     }
 }
 impl PgGet for Option<i64> {
     fn pg_get(row: &PgRow, idx: usize) -> Result<Self, StorageError> {
-        row.try_get::<Option<i64>, _>(idx).map_err(StorageError::from)
+        row.try_get::<Option<i64>, _>(idx)
+            .map_err(StorageError::from)
     }
 }
 impl PgGet for Option<u64> {
@@ -330,8 +343,9 @@ pub(crate) struct PgConn {
 impl PgConn {
     pub async fn execute(&mut self, sql: &str, vals: &[PgVal]) -> Result<u64, StorageError> {
         let args = push_arguments(vals);
-        let result: PgQueryResult =
-            sqlx::query_with(AssertSqlSafe(q(sql)), args).execute(&mut *self.connection).await?;
+        let result: PgQueryResult = sqlx::query_with(AssertSqlSafe(q(sql)), args)
+            .execute(&mut *self.connection)
+            .await?;
         Ok(result.rows_affected())
     }
 
@@ -342,7 +356,10 @@ impl PgConn {
         map: impl Fn(&Row<'_>) -> Result<T, StorageError>,
     ) -> RowResult<T> {
         let args = push_arguments(vals);
-        match sqlx::query_with(AssertSqlSafe(q(sql)), args).fetch_one(&mut *self.connection).await {
+        match sqlx::query_with(AssertSqlSafe(q(sql)), args)
+            .fetch_one(&mut *self.connection)
+            .await
+        {
             Ok(row) => match map(&Row(&row)) {
                 Ok(value) => RowResult(Ok(Some(value))),
                 Err(error) => RowResult(Err(error)),
@@ -717,8 +734,9 @@ impl PgTx {
 
     pub async fn execute(&mut self, sql: &str, vals: &[PgVal]) -> Result<u64, StorageError> {
         let args = push_arguments(vals);
-        let result: PgQueryResult =
-            sqlx::query_with(AssertSqlSafe(q(sql)), args).execute(&mut *self.transaction).await?;
+        let result: PgQueryResult = sqlx::query_with(AssertSqlSafe(q(sql)), args)
+            .execute(&mut *self.transaction)
+            .await?;
         Ok(result.rows_affected())
     }
 
@@ -729,7 +747,10 @@ impl PgTx {
         map: impl Fn(&Row<'_>) -> Result<T, StorageError>,
     ) -> RowResult<T> {
         let args = push_arguments(vals);
-        match sqlx::query_with(AssertSqlSafe(q(sql)), args).fetch_one(&mut *self.transaction).await {
+        match sqlx::query_with(AssertSqlSafe(q(sql)), args)
+            .fetch_one(&mut *self.transaction)
+            .await
+        {
             Ok(row) => match map(&Row(&row)) {
                 Ok(value) => RowResult(Ok(Some(value))),
                 Err(error) => RowResult(Err(error)),
@@ -970,8 +991,6 @@ mod tests {
             "{conflict_error:?}"
         );
 
-
-
         // Job round-trip preserves the record and bumps generation.
         let job = storage
             .upsert_job(JobRecord {
@@ -1033,9 +1052,15 @@ mod tests {
         assert!(audit_id > 0);
 
         // Outbox claim is exclusive and observable through aggregates.
-        let claimed = storage.claim_outbox("worker-pg", 4_102_444_800_000).await.unwrap();
+        let claimed = storage
+            .claim_outbox("worker-pg", 4_102_444_800_000)
+            .await
+            .unwrap();
         assert!(claimed.is_some());
-        let aggregates = storage.operational_aggregates(4_102_444_800_000).await.unwrap();
+        let aggregates = storage
+            .operational_aggregates(4_102_444_800_000)
+            .await
+            .unwrap();
         assert!(aggregates.outbox_pending >= 1);
 
         // Hub-lease contract parity with the SQLite suite. Epochs are
@@ -1048,11 +1073,21 @@ mod tests {
             .try_acquire_hub_lease(&run, Some("http://leader-a:8080".into()), ttl, now)
             .await
             .unwrap();
-        assert!(matches!(acquired, HubLeaseAcquire::Acquired { .. }), "{acquired:?}");
-        let HubLeaseAcquire::Acquired { epoch } = acquired else { unreachable!() };
+        assert!(
+            matches!(acquired, HubLeaseAcquire::Acquired { .. }),
+            "{acquired:?}"
+        );
+        let HubLeaseAcquire::Acquired { epoch } = acquired else {
+            unreachable!()
+        };
         assert_eq!(
             storage
-                .try_acquire_hub_lease("pg-other", Some("http://leader-b:8080".into()), ttl, now + 1)
+                .try_acquire_hub_lease(
+                    "pg-other",
+                    Some("http://leader-b:8080".into()),
+                    ttl,
+                    now + 1
+                )
                 .await
                 .unwrap(),
             HubLeaseAcquire::HeldByOther(HubLeaseSnapshot {
@@ -1113,6 +1148,9 @@ mod tests {
                 advertise_url: None,
             })
         );
-        assert!(storage.release_hub_lease("pg-other", now + 7).await.unwrap());
+        assert!(storage
+            .release_hub_lease("pg-other", now + 7)
+            .await
+            .unwrap());
     }
 }

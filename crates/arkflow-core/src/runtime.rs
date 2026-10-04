@@ -380,17 +380,12 @@ impl JobMetricsRegistry {
         self.jobs.lock().unwrap().remove(job_id);
     }
 
-    pub fn get(
-        &self,
-        job_id: &str,
-    ) -> Option<Arc<crate::executor::metrics::KernelMetrics>> {
+    pub fn get(&self, job_id: &str) -> Option<Arc<crate::executor::metrics::KernelMetrics>> {
         self.jobs.lock().unwrap().get(job_id).cloned()
     }
 
     /// Snapshot every registered Job's kernel metrics.
-    pub fn snapshots(
-        &self,
-    ) -> BTreeMap<String, crate::executor::metrics::KernelMetricsSnapshot> {
+    pub fn snapshots(&self) -> BTreeMap<String, crate::executor::metrics::KernelMetricsSnapshot> {
         self.jobs
             .lock()
             .unwrap()
@@ -616,11 +611,8 @@ impl RuntimeManager {
             let build_result = async {
                 let resource = adapter.build_resource()?;
                 let plan = crate::job::JobPlan::compile(spec.clone())?;
-                crate::executor::graph::ExecutionGraphBuilder::default().build(
-                    &plan,
-                    &adapter,
-                    &resource,
-                )?;
+                crate::executor::graph::ExecutionGraphBuilder::default()
+                    .build(&plan, &adapter, &resource)?;
                 Ok::<(), Error>(())
             }
             .await;
@@ -1928,9 +1920,7 @@ mod validation_lifecycle_tests {
         EofInputBuilder2
             .build(None, &None, None, &resource)
             .unwrap();
-        DevNullBuilder2
-            .build(None, &None, None, &resource)
-            .unwrap();
+        DevNullBuilder2.build(None, &None, None, &resource).unwrap();
     }
 }
 
@@ -1987,8 +1977,14 @@ mod race_tests {
             let c = entries.get("c").unwrap().lock().await.index;
             (b, c)
         };
-        assert_ne!(index_b, index_c, "two active streams must never share an index");
-        assert!(index_c > index_b, "re-registration must get a strictly greater index: b={index_b} c={index_c}");
+        assert_ne!(
+            index_b, index_c,
+            "two active streams must never share an index"
+        );
+        assert!(
+            index_c > index_b,
+            "re-registration must get a strictly greater index: b={index_b} c={index_c}"
+        );
     }
 
     /// Spec "Concurrent stop during restart does not leave a Running stream":
@@ -2001,10 +1997,27 @@ mod race_tests {
         // not the running-task level.
         let config_s = StreamConfig {
             id: Some("s".to_string()),
-            input: InputConfig { input_type: "memory".into(), name: None, codec: None, config: None },
-            pipeline: PipelineConfig { thread_num: 1, processors: vec![] },
-            output: OutputConfig { output_type: "stdout".into(), name: None, codec: None, config: None },
-            error_output: None, buffer: None, durability: None, state: None, temporary: Default::default(),
+            input: InputConfig {
+                input_type: "memory".into(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            pipeline: PipelineConfig {
+                thread_num: 1,
+                processors: vec![],
+            },
+            output: OutputConfig {
+                output_type: "stdout".into(),
+                name: None,
+                codec: None,
+                config: None,
+            },
+            error_output: None,
+            buffer: None,
+            durability: None,
+            state: None,
+            temporary: Default::default(),
         };
         manager.register("s".into(), config_s).await.unwrap();
 
@@ -2020,10 +2033,9 @@ mod race_tests {
         // Simultaneously issue restart and stop.
         let m1 = manager.clone();
         let m2 = manager.clone();
-        let (restart_result, stop_result) = tokio::join!(
-            async { m1.restart("s").await },
-            async { m2.stop("s").await },
-        );
+        let (restart_result, stop_result) = tokio::join!(async { m1.restart("s").await }, async {
+            m2.stop("s").await
+        },);
         // The restart may legitimately fail here (the test process has no
         // plugin registrations, so start() cannot compile the input). What
         // matters is that the STOP returned Ok without intercepting the
@@ -2195,7 +2207,9 @@ mod coverage_tests {
         store
             .update(&first.id, OperationState::Running, 10, None)
             .await;
-        let second = store.find_or_create("start", "stream", "orders", None).await;
+        let second = store
+            .find_or_create("start", "stream", "orders", None)
+            .await;
         assert_eq!(second.id, first.id, "an active operation is reused");
         assert_eq!(second.state, OperationState::Running);
         assert_eq!(store.get(&first.id).await.unwrap().id, first.id);
@@ -2209,11 +2223,10 @@ mod coverage_tests {
         store
             .update(&first.id, OperationState::Succeeded, 100, None)
             .await;
-        let second = store.find_or_create("start", "stream", "orders", None).await;
-        assert_ne!(
-            second.id, first.id,
-            "a terminal operation is never reused"
-        );
+        let second = store
+            .find_or_create("start", "stream", "orders", None)
+            .await;
+        assert_ne!(second.id, first.id, "a terminal operation is never reused");
         assert_eq!(second.state, OperationState::Queued);
     }
 
@@ -2223,12 +2236,7 @@ mod coverage_tests {
         let mut created = Vec::new();
         for index in 0..=(MAX_OPERATIONS + 4) {
             let record = store
-                .find_or_create(
-                    "restart",
-                    "stream",
-                    format!("stream-{index}"),
-                    None,
-                )
+                .find_or_create("restart", "stream", format!("stream-{index}"), None)
                 .await;
             created.push(record.id);
         }
@@ -2300,7 +2308,9 @@ mod coverage_tests {
             .unwrap();
         // Missing entries are tolerated.
         manager.set_active_operation("ghost", None).await;
-        manager.set_last_completed_action("ghost", "action".into()).await;
+        manager
+            .set_last_completed_action("ghost", "action".into())
+            .await;
 
         manager
             .set_active_operation("orders", Some("op-9".into()))
@@ -2309,7 +2319,10 @@ mod coverage_tests {
             .set_last_completed_action("orders", "action-1".into())
             .await;
         manager.set_observed_config_version("cfg-7".into()).await;
-        assert_eq!(manager.observed_config_version().await.as_deref(), Some("cfg-7"));
+        assert_eq!(
+            manager.observed_config_version().await.as_deref(),
+            Some("cfg-7")
+        );
 
         let entry = manager.get("orders").await.unwrap();
         let runtime = entry.lock().await;
@@ -2355,10 +2368,7 @@ mod coverage_tests {
             runtime.handle = Some(tokio::spawn(async { Ok(()) }));
         }
         let error = manager.start("broken").await.unwrap_err().to_string();
-        assert!(
-            error.contains("cannot map to a Job id"),
-            "{error}"
-        );
+        assert!(error.contains("cannot map to a Job id"), "{error}");
         assert_eq!(
             state_of(&manager, "broken").await,
             StreamState::Failed,
@@ -2454,10 +2464,7 @@ mod coverage_tests {
         // reconciliation fails, and so does the restoration attempt.
         let mut old_config = stream_config();
         old_config.input.input_type = "missing-input-old".into();
-        manager
-            .register("orders".into(), old_config)
-            .await
-            .unwrap();
+        manager.register("orders".into(), old_config).await.unwrap();
         force_state(&manager, "orders", StreamState::Running).await;
 
         let mut new_config = stream_config();
@@ -2596,8 +2603,14 @@ mod coverage_tests {
         };
         // "a-ok" is visited first: a completing task settles the entry to
         // Stopped. "z-bad" then fails and wait_all returns the error.
-        manager.register("a-ok".into(), config("a-ok")).await.unwrap();
-        manager.register("z-bad".into(), config("z-bad")).await.unwrap();
+        manager
+            .register("a-ok".into(), config("a-ok"))
+            .await
+            .unwrap();
+        manager
+            .register("z-bad".into(), config("z-bad"))
+            .await
+            .unwrap();
         {
             let entry = manager.get("a-ok").await.unwrap();
             let mut runtime = entry.lock().await;

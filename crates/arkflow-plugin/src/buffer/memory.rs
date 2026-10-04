@@ -126,7 +126,11 @@ impl MemoryBuffer {
             .collect();
         let new_batch = arrow::compute::concat_batches(&schema, &x)
             .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
-        let acks: Vec<Arc<dyn Ack>> = queue_lock.iter().rev().map(|(_, ack)| Arc::clone(ack)).collect();
+        let acks: Vec<Arc<dyn Ack>> = queue_lock
+            .iter()
+            .rev()
+            .map(|(_, ack)| Arc::clone(ack))
+            .collect();
 
         queue_lock.clear();
         // Capacity released: wake writers that are waiting for room.
@@ -320,7 +324,9 @@ mod tests {
     impl Ack for RecordingAck {
         async fn ack(&self) -> Result<(), Error> {
             if self.fail {
-                Err(Error::Process("injected acknowledgement failure".to_string()))
+                Err(Error::Process(
+                    "injected acknowledgement failure".to_string(),
+                ))
             } else {
                 Ok(())
             }
@@ -517,9 +523,7 @@ mod tests {
         })
         .unwrap();
 
-        buf.write(binary_msg("a"), Arc::new(NoopAck))
-            .await
-            .unwrap();
+        buf.write(binary_msg("a"), Arc::new(NoopAck)).await.unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let arrow_batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
@@ -552,16 +556,14 @@ mod tests {
         })
         .unwrap();
 
-        buf.write(binary_msg("first"), ok_ack.clone()).await.unwrap();
+        buf.write(binary_msg("first"), ok_ack.clone())
+            .await
+            .unwrap();
         buf.write(binary_msg("second"), fail_ack.clone())
             .await
             .unwrap();
 
-        let (merged, ack) = buf
-            .read()
-            .await
-            .unwrap()
-            .expect("merged batch expected");
+        let (merged, ack) = buf.read().await.unwrap().expect("merged batch expected");
         assert_eq!(merged.len(), 2);
 
         // The composite acknowledgement fails on the second constituent and

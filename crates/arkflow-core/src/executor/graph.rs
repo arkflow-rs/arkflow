@@ -47,9 +47,15 @@ pub fn operator_routing_index(plan: &JobPlan) -> BTreeMap<String, u32> {
         .iter()
         .enumerate()
         .map(|(position, source)| (source.operator_id.clone(), position as u32))
-        .chain(plan.spec.operators.iter().enumerate().map(|(position, operator)| {
-            (operator.id.clone(), (source_count + position) as u32)
-        }))
+        .chain(
+            plan.spec
+                .operators
+                .iter()
+                .enumerate()
+                .map(|(position, operator)| {
+                    (operator.id.clone(), (source_count + position) as u32)
+                }),
+        )
         .chain(plan.spec.sinks.iter().enumerate().map(|(position, sink)| {
             (
                 sink.operator_id.clone(),
@@ -63,11 +69,14 @@ impl RemoteEdgeContext {
     /// The node a task is assigned to, failing closed on an incomplete
     /// assignment view.
     fn node_of(&self, task_id: &str) -> Result<&str, Error> {
-        self.task_nodes.get(task_id).map(String::as_str).ok_or_else(|| {
-            Error::Config(format!(
-                "remote edge context has no node for task '{task_id}'"
-            ))
-        })
+        self.task_nodes
+            .get(task_id)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "remote edge context has no node for task '{task_id}'"
+                ))
+            })
     }
 }
 
@@ -836,9 +845,9 @@ impl ExecutionGraphBuilder {
                     if senders.contains_key(&(upstream_task_id.clone(), target.clone())) {
                         continue;
                     }
-                    let upstream_task = index
-                        .task(upstream_task_id.as_str())
-                        .ok_or_else(|| Error::Config(format!("task '{upstream_task_id}' lost its run")))?;
+                    let upstream_task = index.task(upstream_task_id.as_str()).ok_or_else(|| {
+                        Error::Config(format!("task '{upstream_task_id}' lost its run"))
+                    })?;
                     if !run_of_task.contains_key(target.as_str()) {
                         // Remote target: route through the network manager.
                         let Some(ctx) = remote else {
@@ -846,40 +855,38 @@ impl ExecutionGraphBuilder {
                                 "edge target '{target}' is remote but no remote edge context is wired"
                             )));
                         };
-                        let target_task = index
-                            .task(target.as_str())
-                            .ok_or_else(|| Error::Config(format!("unknown remote target '{target}'")))?;
+                        let target_task = index.task(target.as_str()).ok_or_else(|| {
+                            Error::Config(format!("unknown remote target '{target}'"))
+                        })?;
                         let quad = super::remote::Quad {
-                            src_op: *operator_index.get(&upstream_task.operator_id)
-                                .ok_or_else(|| {
+                            src_op: *operator_index.get(&upstream_task.operator_id).ok_or_else(
+                                || {
                                     Error::Config(format!(
                                         "operator '{}' has no routing index",
                                         upstream_task.operator_id
                                     ))
-                                })?,
+                                },
+                            )?,
                             src_subtask: upstream_task.subtask,
-                            dst_op: *operator_index.get(&target_task.operator_id)
-                                .ok_or_else(|| {
+                            dst_op: *operator_index.get(&target_task.operator_id).ok_or_else(
+                                || {
                                     Error::Config(format!(
                                         "operator '{}' has no routing index",
                                         target_task.operator_id
                                     ))
-                                })?,
+                                },
+                            )?,
                             dst_subtask: target_task.subtask,
                         };
                         let node = ctx.node_of(target)?;
                         let addr = *ctx.node_addrs.get(node).ok_or_else(|| {
-                            Error::Config(format!(
-                                "no data-plane address for remote node '{node}'"
-                            ))
+                            Error::Config(format!("no data-plane address for remote node '{node}'"))
                         })?;
-                        let transport = std::sync::Arc::new(
-                            super::remote::TcpEdgeTransport {
-                                addr,
-                                max_attempts: 5,
-                                tls: ctx.tls.clone(),
-                            },
-                        );
+                        let transport = std::sync::Arc::new(super::remote::TcpEdgeTransport {
+                            addr,
+                            max_attempts: 5,
+                            tls: ctx.tls.clone(),
+                        });
                         let sender = ctx
                             .manager
                             .open_edge_deferred_for_job(
@@ -922,20 +929,18 @@ impl ExecutionGraphBuilder {
                             continue; // handled by the local channel path above
                         }
                         let quad = super::remote::Quad {
-                            src_op: *operator_index.get(upstream_operator)
-                                .ok_or_else(|| {
-                                    Error::Config(format!(
-                                        "operator '{upstream_operator}' has no routing index"
-                                    ))
-                                })?,
+                            src_op: *operator_index.get(upstream_operator).ok_or_else(|| {
+                                Error::Config(format!(
+                                    "operator '{upstream_operator}' has no routing index"
+                                ))
+                            })?,
                             src_subtask: upstream_task.subtask,
-                            dst_op: *operator_index.get(&task.operator_id)
-                                .ok_or_else(|| {
-                                    Error::Config(format!(
-                                        "operator '{}' has no routing index",
-                                        task.operator_id
-                                    ))
-                                })?,
+                            dst_op: *operator_index.get(&task.operator_id).ok_or_else(|| {
+                                Error::Config(format!(
+                                    "operator '{}' has no routing index",
+                                    task.operator_id
+                                ))
+                            })?,
                             dst_subtask: task.subtask,
                         };
                         let (sender, receiver) = flume::bounded(self.channel_capacity);
@@ -948,9 +953,9 @@ impl ExecutionGraphBuilder {
                                 generation: ctx.generation,
                             },
                         )?;
-                        let entry_run = *run_of_task
-                            .get(task.id.as_str())
-                            .ok_or_else(|| Error::Config(format!("task '{}' lost its run", task.id)))?;
+                        let entry_run = *run_of_task.get(task.id.as_str()).ok_or_else(|| {
+                            Error::Config(format!("task '{}' lost its run", task.id))
+                        })?;
                         receivers
                             .entry(runs[entry_run][0].id.clone())
                             .or_default()
@@ -1054,53 +1059,53 @@ impl ExecutionGraphBuilder {
                     .ok_or_else(|| {
                         Error::Config(format!("task '{}' references unknown operator", task.id))
                     })?;
-                let processor: Arc<dyn Processor> =
-                    if operator.kind == crate::job::OperatorKind::Join {
-                        let config: super::join::JoinOperatorConfig =
-                            serde_json::from_value(operator.config.clone()).map_err(|error| {
-                                Error::Config(format!(
-                                    "join operator '{}' has invalid config: {error}",
-                                    operator.id
-                                ))
-                            })?;
-                        config.validate()?;
-                        let operator = super::join::JoinOperator::new(config)?
-                            .with_input_producers(
-                                input_producers
-                                    .get(&first.id)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or_default(),
-                            )?;
-                        Arc::new(operator)
-                    } else if operator.kind == crate::job::OperatorKind::Window {
-                        let backend = state_backend.clone().ok_or_else(|| {
+                let processor: Arc<dyn Processor> = if operator.kind
+                    == crate::job::OperatorKind::Join
+                {
+                    let config: super::join::JoinOperatorConfig =
+                        serde_json::from_value(operator.config.clone()).map_err(|error| {
                             Error::Config(format!(
-                                "stateful operator '{}' requires a Job state backend",
+                                "join operator '{}' has invalid config: {error}",
                                 operator.id
                             ))
                         })?;
-                        let config: super::window::WindowOperatorConfig =
-                            serde_json::from_value(operator.config.clone()).map_err(|error| {
-                                Error::Config(format!(
-                                    "window operator '{}' has invalid config: {error}",
-                                    operator.id
-                                ))
-                            })?;
-                        config.validate()?;
-                        let namespace = crate::job::effective_state_namespace(
-                            &plan.spec.id,
-                            plan.spec.state.as_ref(),
-                            &operator.id,
-                            &task.id,
-                        );
-                        let event_time_source = event_time_source_for_operator(plan, &operator.id);
-                        let late_event_policy = event_time_source
-                            .map(|source| source.time.late_event_policy)
-                            .unwrap_or_default();
-                        let late_event_route_configured = event_time_source
-                            .and_then(|source| source.time.late_event_route.as_ref())
-                            .is_some();
-                        let operator_instance = Arc::new(
+                    config.validate()?;
+                    let operator = super::join::JoinOperator::new(config)?.with_input_producers(
+                        input_producers
+                            .get(&first.id)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    )?;
+                    Arc::new(operator)
+                } else if operator.kind == crate::job::OperatorKind::Window {
+                    let backend = state_backend.clone().ok_or_else(|| {
+                        Error::Config(format!(
+                            "stateful operator '{}' requires a Job state backend",
+                            operator.id
+                        ))
+                    })?;
+                    let config: super::window::WindowOperatorConfig =
+                        serde_json::from_value(operator.config.clone()).map_err(|error| {
+                            Error::Config(format!(
+                                "window operator '{}' has invalid config: {error}",
+                                operator.id
+                            ))
+                        })?;
+                    config.validate()?;
+                    let namespace = crate::job::effective_state_namespace(
+                        &plan.spec.id,
+                        plan.spec.state.as_ref(),
+                        &operator.id,
+                        &task.id,
+                    );
+                    let event_time_source = event_time_source_for_operator(plan, &operator.id);
+                    let late_event_policy = event_time_source
+                        .map(|source| source.time.late_event_policy)
+                        .unwrap_or_default();
+                    let late_event_route_configured = event_time_source
+                        .and_then(|source| source.time.late_event_route.as_ref())
+                        .is_some();
+                    let operator_instance = Arc::new(
                         super::window::ColumnarWindowOperator::with_journal_and_late_event_policy(
                             config,
                             backend,
@@ -1112,44 +1117,44 @@ impl ExecutionGraphBuilder {
                             late_event_route_configured,
                         ),
                     );
-                        window_late_event_rows = Some(operator_instance.late_event_row_counter());
-                        operator_instance
+                    window_late_event_rows = Some(operator_instance.late_event_row_counter());
+                    operator_instance
+                } else {
+                    let processor = adapter.build_processor(operator, resource)?;
+                    if !operator.stateful {
+                        processor
                     } else {
-                        let processor = adapter.build_processor(operator, resource)?;
-                        if !operator.stateful {
-                            processor
-                        } else {
-                            state_backend.as_ref().ok_or_else(|| {
+                        state_backend.as_ref().ok_or_else(|| {
+                            Error::Config(format!(
+                                "stateful operator '{}' requires a Job state backend",
+                                operator.id
+                            ))
+                        })?;
+                        Arc::new(super::stateful::StatefulOperator::with_journal(
+                            processor,
+                            shared_journal.clone().expect("state backend checked above"),
+                            crate::job::effective_state_namespace(
+                                &plan.spec.id,
+                                plan.spec.state.as_ref(),
+                                &operator.id,
+                                &task.id,
+                            ),
+                            operator.key_field.clone().ok_or_else(|| {
                                 Error::Config(format!(
-                                    "stateful operator '{}' requires a Job state backend",
+                                    "stateful operator '{}' requires key_field",
                                     operator.id
                                 ))
-                            })?;
-                            Arc::new(super::stateful::StatefulOperator::with_journal(
-                                processor,
-                                shared_journal.clone().expect("state backend checked above"),
-                                crate::job::effective_state_namespace(
-                                    &plan.spec.id,
-                                    plan.spec.state.as_ref(),
-                                    &operator.id,
-                                    &task.id,
-                                ),
-                                operator.key_field.clone().ok_or_else(|| {
-                                    Error::Config(format!(
-                                        "stateful operator '{}' requires key_field",
-                                        operator.id
-                                    ))
-                                })?,
-                                plan.spec.state.as_ref().and_then(|state| state.ttl_ms),
-                                operator
-                                    .config
-                                    .get("state_output_field")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("__arkflow_state_count")
-                                    .to_owned(),
-                            ))
-                        }
-                    };
+                            })?,
+                            plan.spec.state.as_ref().and_then(|state| state.ttl_ms),
+                            operator
+                                .config
+                                .get("state_output_field")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("__arkflow_state_count")
+                                .to_owned(),
+                        ))
+                    }
+                };
                 processors.push(processor);
             }
 
@@ -1264,10 +1269,7 @@ impl ExecutionGraphBuilder {
                     processor_parallelism.unwrap_or(1)
                 },
                 tags_input_index: has_join,
-                input_producers: input_producers
-                    .get(&first.id)
-                    .cloned()
-                    .unwrap_or_default(),
+                input_producers: input_producers.get(&first.id).cloned().unwrap_or_default(),
                 window_timings: if is_source {
                     window_timings_for_source(plan, &first.operator_id)?
                 } else {

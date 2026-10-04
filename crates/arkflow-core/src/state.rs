@@ -549,12 +549,8 @@ impl RedbStateBackend {
             if next == current {
                 return;
             }
-            match counter.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return,
                 Err(observed) => current = observed,
             }
@@ -733,7 +729,10 @@ impl StateBackend for RedbStateBackend {
             // check (the exact contract of the budget tests); without a
             // budget the purge is amortized space reclamation.
             if self.max_bytes.is_some()
-                || self.writes.fetch_add(1, Ordering::Relaxed).is_multiple_of(PURGE_INTERVAL_WRITES)
+                || self
+                    .writes
+                    .fetch_add(1, Ordering::Relaxed)
+                    .is_multiple_of(PURGE_INTERVAL_WRITES)
             {
                 let (bytes, keys) = Self::remove_expired_in_table(&mut table, now_ms)?;
                 freed_bytes += bytes;
@@ -849,15 +848,7 @@ impl StateBackend for RedbStateBackend {
             .db
             .begin_write()
             .map_err(|error| Error::Process(format!("state write: {error}")))?;
-        let (
-            previous_bytes,
-            had_previous,
-            next,
-            next_len,
-            freed_bytes,
-            freed_keys,
-            budget_delta,
-        ) = {
+        let (previous_bytes, had_previous, next, next_len, freed_bytes, freed_keys, budget_delta) = {
             let mut table = tx
                 .open_table(STATE_TABLE)
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
@@ -867,7 +858,10 @@ impl StateBackend for RedbStateBackend {
             // check; without a budget the purge is amortized space
             // reclamation (reads hide expired values either way).
             if self.max_bytes.is_some()
-                || self.writes.fetch_add(1, Ordering::Relaxed).is_multiple_of(PURGE_INTERVAL_WRITES)
+                || self
+                    .writes
+                    .fetch_add(1, Ordering::Relaxed)
+                    .is_multiple_of(PURGE_INTERVAL_WRITES)
             {
                 let (bytes, keys) = Self::remove_expired_in_table(&mut table, current_time_ms)?;
                 freed_bytes += bytes;
@@ -883,8 +877,7 @@ impl StateBackend for RedbStateBackend {
                 // Same rule as `put_with_ttl`: an expired row is purged rather
                 // than overwritten, so the key counter does not increment for a
                 // row that was already present.
-                let (bytes, keys) =
-                    Self::remove_expired_in_table(&mut table, current_time_ms)?;
+                let (bytes, keys) = Self::remove_expired_in_table(&mut table, current_time_ms)?;
                 freed_bytes = freed_bytes.saturating_add(bytes);
                 freed_keys = freed_keys.saturating_add(keys);
             }
@@ -1132,10 +1125,7 @@ impl StateBackend for RedbStateBackend {
         let now = now_ms();
         let mut live_entries = BTreeMap::<String, &StateEntry>::new();
         for entry in &snapshot.entries {
-            if entry
-                .expires_at_ms
-                .is_some_and(|expires| expires <= now)
-            {
+            if entry.expires_at_ms.is_some_and(|expires| expires <= now) {
                 continue;
             }
             live_entries.insert(Self::storage_key(&entry.namespace, &entry.key), entry);
@@ -1395,12 +1385,16 @@ mod tests {
         // state-journal compensation (`restore_entry` with the entry it
         // replaced).
         backend
-            .restore_entry("orders", b"a", Some(&StateEntry {
-                namespace: "orders".into(),
-                key: b"a".to_vec(),
-                value: vec![b'x'; 900],
-                expires_at_ms: Some(base + 1),
-            }))
+            .restore_entry(
+                "orders",
+                b"a",
+                Some(&StateEntry {
+                    namespace: "orders".into(),
+                    key: b"a".to_vec(),
+                    value: vec![b'x'; 900],
+                    expires_at_ms: Some(base + 1),
+                }),
+            )
             .unwrap();
         // The next write purges the expired row. The budget measures the table
         // exactly, so a legal write must still succeed.
@@ -1593,7 +1587,10 @@ mod tests {
         let backend = InMemoryStateBackend::new(1).unwrap();
         let base = now_ms();
         backend.put("ns", b"k", b"v").unwrap();
-        assert_eq!(backend.get("ns", b"k").unwrap().as_deref(), Some(b"v".as_slice()));
+        assert_eq!(
+            backend.get("ns", b"k").unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
         assert_eq!(
             backend.get_entry("ns", b"k").unwrap().map(|e| e.value),
             Some(b"v".to_vec())
@@ -1657,7 +1654,10 @@ mod tests {
         assert!(snapshot.verify());
         backend.delete("ns", b"k").unwrap();
         backend.restore(&snapshot).unwrap();
-        assert_eq!(backend.get("ns", b"k").unwrap().as_deref(), Some(b"v".as_slice()));
+        assert_eq!(
+            backend.get("ns", b"k").unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
 
         // An incompatible snapshot is rejected wholesale.
         let foreign = StateSnapshot::new(2, vec![]);
@@ -1792,7 +1792,9 @@ mod tests {
 
         // Default `update_i64_with_ttl` ignores the TTL and delegates.
         assert_eq!(
-            backend.update_i64_with_ttl("ns", b"c", 4, Some(60_000)).unwrap(),
+            backend
+                .update_i64_with_ttl("ns", b"c", 4, Some(60_000))
+                .unwrap(),
             4
         );
         assert_eq!(
@@ -1813,7 +1815,10 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert_eq!(backend.get("ns", b"r").unwrap().as_deref(), Some(b"restored".as_slice()));
+        assert_eq!(
+            backend.get("ns", b"r").unwrap().as_deref(),
+            Some(b"restored".as_slice())
+        );
 
         // An entry whose expiration has passed restores as a delete.
         backend
@@ -1908,11 +1913,7 @@ mod tests {
         assert_eq!(backend.update_i64("aggregate", b"c", 3).unwrap(), 3);
         assert_eq!(backend.metrics().unwrap().keys, 1);
         assert_eq!(
-            backend
-                .get_entry("aggregate", b"c")
-                .unwrap()
-                .unwrap()
-                .value,
+            backend.get_entry("aggregate", b"c").unwrap().unwrap().value,
             b"3".to_vec()
         );
     }
@@ -1935,7 +1936,10 @@ mod tests {
             .unwrap();
         // The update-path budget scan does the same while replacing its row.
         assert_eq!(backend.update_i64("orders", b"keep", 2).unwrap(), 9);
-        assert_eq!(backend.get("orders", b"fresh").unwrap().as_deref(), Some(b"y".as_slice()));
+        assert_eq!(
+            backend.get("orders", b"fresh").unwrap().as_deref(),
+            Some(b"y".as_slice())
+        );
     }
 
     #[test]
@@ -2030,12 +2034,15 @@ mod tests {
         assert_eq!(backend.get("ns", b"k2").unwrap(), None);
 
         // A corrupted checksum is rejected wholesale.
-        let mut snapshot = StateSnapshot::new(1, vec![StateEntry {
-            namespace: "ns".into(),
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-            expires_at_ms: None,
-        }]);
+        let mut snapshot = StateSnapshot::new(
+            1,
+            vec![StateEntry {
+                namespace: "ns".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                expires_at_ms: None,
+            }],
+        );
         snapshot.checksum = 0;
         assert!(backend.restore(&snapshot).is_err());
     }
@@ -2096,5 +2103,4 @@ mod tests {
         assert!(msg.contains("remove it and restart"), "{msg}");
         assert_eq!(std::fs::read(&db_path).unwrap(), before);
     }
-
 }

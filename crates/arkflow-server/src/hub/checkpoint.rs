@@ -416,7 +416,8 @@ impl Hub {
         for record in completed
             .into_iter()
             .skip(retention)
-            .filter(|record| !pinned.contains(&record.checkpoint_id)) {
+            .filter(|record| !pinned.contains(&record.checkpoint_id))
+        {
             let artifact = arkflow_core::checkpoint::RecoveryArtifact {
                 id: record.checkpoint_id.clone(),
                 kind: arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,

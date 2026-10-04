@@ -161,11 +161,18 @@ impl Processor for PgVectorSearchProcessor {
             return Ok(ProcessResult::None);
         }
 
-        let vectors =
-            vector_util::extract_vectors("pgvector_search processor", &msg_batch, &self.config.vector_field)?;
+        let vectors = vector_util::extract_vectors(
+            "pgvector_search processor",
+            &msg_batch,
+            &self.config.vector_field,
+        )?;
         let matches = self.search_all(&vectors).await?;
-        let batch =
-            vector_util::append_column("pgvector_search processor", &msg_batch, &self.config.target_field, &matches)?;
+        let batch = vector_util::append_column(
+            "pgvector_search processor",
+            &msg_batch,
+            &self.config.target_field,
+            &matches,
+        )?;
         Ok(ProcessResult::Single(Arc::new(batch)))
     }
 
@@ -206,9 +213,17 @@ fn build_search_sql(config: &PgVectorSearchProcessorConfig) -> String {
     // the row decode shape stays identical across configurations. Identifiers
     // are quoted with embedded `"` escaped so names cannot break the quoting.
     let quoted = |name: &str| crate::vector_util::escape_identifier(name);
-    let mut columns = vec![format!("{}::text AS {}", quoted(&config.id_column), quoted("id"))];
+    let mut columns = vec![format!(
+        "{}::text AS {}",
+        quoted(&config.id_column),
+        quoted("id")
+    )];
     if !config.payload_column.is_empty() {
-        columns.push(format!("{}::text AS {}", quoted(&config.payload_column), quoted("payload")));
+        columns.push(format!(
+            "{}::text AS {}",
+            quoted(&config.payload_column),
+            quoted("payload")
+        ));
     } else {
         columns.push(format!("NULL::text AS {}", quoted("payload")));
     }
@@ -230,7 +245,10 @@ fn build_search_sql(config: &PgVectorSearchProcessorConfig) -> String {
 
 /// Maps fetched rows (id, payload text, distance) into the compact JSON
 /// matches array for one input row.
-fn rows_to_matches(rows: Vec<(String, Option<String>, f64)>, include_payload: bool) -> Result<String, Error> {
+fn rows_to_matches(
+    rows: Vec<(String, Option<String>, f64)>,
+    include_payload: bool,
+) -> Result<String, Error> {
     let items: Vec<Value> = rows
         .into_iter()
         .map(|(id, payload, distance)| {
@@ -252,8 +270,12 @@ fn rows_to_matches(rows: Vec<(String, Option<String>, f64)>, include_payload: bo
             Ok(Value::Object(object))
         })
         .collect::<Result<Vec<Value>, Error>>()?;
-    serde_json::to_string(&items)
-        .map_err(|e| Error::Process(format!("pgvector_search processor: serialization failed: {}", e)))
+    serde_json::to_string(&items).map_err(|e| {
+        Error::Process(format!(
+            "pgvector_search processor: serialization failed: {}",
+            e
+        ))
+    })
 }
 
 struct PgVectorSearchProcessorBuilder;
@@ -382,7 +404,9 @@ mod tests {
             cosine,
             "SELECT \"id\"::text AS \"id\", \"payload\"::text AS \"payload\", \"embedding\" <=> $1::vector AS \"distance\" FROM \"documents\" ORDER BY \"embedding\" <=> $1::vector LIMIT 5"
         );
-        let l2 = build_search_sql(&config_with(serde_json::json!({"metric": "l2", "top_k": 3})));
+        let l2 = build_search_sql(&config_with(
+            serde_json::json!({"metric": "l2", "top_k": 3}),
+        ));
         assert!(l2.contains("\"embedding\" <-> $1::vector"), "{l2}");
         assert!(l2.ends_with("LIMIT 3"), "{l2}");
         let inner = build_search_sql(&config_with(serde_json::json!({"metric": "inner_product"})));
@@ -411,13 +435,16 @@ mod tests {
             true,
         )
         .unwrap();
-        let parsed: Vec<Value> =
-            serde_json::from_str(&matches).expect("valid JSON array");
+        let parsed: Vec<Value> = serde_json::from_str(&matches).expect("valid JSON array");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["id"], "42");
         assert_eq!(parsed[0]["distance"], 0.1);
         assert_eq!(parsed[0]["payload"]["text"], "a");
-        assert_eq!(parsed[1]["payload"], Value::Null, "null jsonb becomes null payload");
+        assert_eq!(
+            parsed[1]["payload"],
+            Value::Null,
+            "null jsonb becomes null payload"
+        );
     }
 
     #[test]
@@ -476,7 +503,10 @@ mod tests {
             RecordBatch::try_new(schema, vec![array]).unwrap(),
         ));
         let err = processor.process(batch).await.unwrap_err().to_string();
-        assert!(err.contains("must be FixedSizeList(Float32) or List(Float32)"), "{err}");
+        assert!(
+            err.contains("must be FixedSizeList(Float32) or List(Float32)"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -485,7 +515,11 @@ mod tests {
             "url": "postgres://postgres:postgres@localhost:5432/vectors",
             "table": "documents",
         }));
-        let schema = Arc::new(Schema::new(vec![Field::new("embedding", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::Utf8,
+            true,
+        )]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(
                 schema,
@@ -527,7 +561,10 @@ mod tests {
             )
             .err()
             .expect("blank url must be rejected");
-        assert!(format!("{err}").contains("'url' must not be empty"), "{err}");
+        assert!(
+            format!("{err}").contains("'url' must not be empty"),
+            "{err}"
+        );
 
         let err = PgVectorSearchProcessorBuilder
             .build(
@@ -537,7 +574,10 @@ mod tests {
             )
             .err()
             .expect("blank table must be rejected");
-        assert!(format!("{err}").contains("'table' must not be empty"), "{err}");
+        assert!(
+            format!("{err}").contains("'table' must not be empty"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -598,11 +638,12 @@ mod tests {
         let batch = vector_batch(vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]);
         assert_eq!(batch.num_rows(), 3);
         let vectors =
-            vector_util::extract_vectors("pgvector_search processor", &batch, "embedding")
-                .unwrap();
-        assert_eq!(vectors, vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]);
+            vector_util::extract_vectors("pgvector_search processor", &batch, "embedding").unwrap();
+        assert_eq!(
+            vectors,
+            vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]
+        );
     }
-
 
     /// Live round-trip against a real Postgres with pgvector. Run with:
     /// `docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg16`
@@ -672,11 +713,7 @@ mod tests {
             "table": "arkflow_search_missing_table",
         }));
         let batch = vector_batch(vec![vec![1.0, 0.0]]);
-        let err = failing
-            .process(batch)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = failing.process(batch).await.unwrap_err().to_string();
         assert!(err.contains("query failed"), "{err}");
         assert!(
             err.to_lowercase().contains("does not exist"),

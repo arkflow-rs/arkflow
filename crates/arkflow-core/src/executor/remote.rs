@@ -1067,17 +1067,20 @@ impl DataPlaneTlsConfig {
         let fail = |context: &str, error: &str| {
             Error::Config(format!("data-plane TLS {context}: {error}"))
         };
-        let read_certs = |pem: &str, context: &str| -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Error> {
-            let mut reader = std::io::BufReader::new(pem.as_bytes());
-            let mut certs = Vec::new();
-            for result in rustls_pemfile::certs(&mut reader) {
-                certs.push(result.map_err(|error| fail(context, &error.to_string()))?);
-            }
-            if certs.is_empty() {
-                return Err(fail(context, "no PEM certificates found"));
-            }
-            Ok(certs)
-        };
+        let read_certs =
+            |pem: &str,
+             context: &str|
+             -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Error> {
+                let mut reader = std::io::BufReader::new(pem.as_bytes());
+                let mut certs = Vec::new();
+                for result in rustls_pemfile::certs(&mut reader) {
+                    certs.push(result.map_err(|error| fail(context, &error.to_string()))?);
+                }
+                if certs.is_empty() {
+                    return Err(fail(context, "no PEM certificates found"));
+                }
+                Ok(certs)
+            };
         let cert_chain = read_certs(cert_pem, "certificate")?;
         let ca_certs = read_certs(ca_pem, "fleet CA")?;
         let private_key = {
@@ -1094,11 +1097,9 @@ impl DataPlaneTlsConfig {
         let ca_store_for_client = ca_store.clone();
         let server_config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(
-                rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(
-                    ca_store,
-                ))
-                .build()
-                .map_err(|error| fail("client verifier", &error.to_string()))?,
+                rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(ca_store))
+                    .build()
+                    .map_err(|error| fail("client verifier", &error.to_string()))?,
             )
             .with_single_cert(cert_chain.clone(), private_key.clone_key())
             .map_err(|error| fail("server config", &error.to_string()))?;
@@ -1107,12 +1108,12 @@ impl DataPlaneTlsConfig {
             .with_client_auth_cert(cert_chain, private_key)
             .map_err(|error| fail("client config", &error.to_string()))?;
         Ok(Self {
-            connector: std::sync::Arc::new(tokio_rustls::TlsConnector::from(
-                std::sync::Arc::new(client_config),
-            )),
-            acceptor: std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(
-                std::sync::Arc::new(server_config),
-            )),
+            connector: std::sync::Arc::new(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+                client_config,
+            ))),
+            acceptor: std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+                server_config,
+            ))),
         })
     }
 
@@ -1447,12 +1448,7 @@ impl PendingReceipts {
     fn replay_snapshot(&self) -> Vec<(u64, crate::MessageBatchRef)> {
         let map = self.map.lock().expect("pending receipts lock");
         map.iter()
-            .filter_map(|(seq, pending)| {
-                pending
-                    .replay
-                    .clone()
-                    .map(|batch| (*seq, batch))
-            })
+            .filter_map(|(seq, pending)| pending.replay.clone().map(|batch| (*seq, batch)))
             .collect()
     }
 
@@ -1500,8 +1496,7 @@ impl PendingReceipts {
                 }
             }
             ReceiptKind::Failed => {
-                let PendingBatch { branch, bytes, .. } =
-                    map.remove(&receipt.seq).expect("checked");
+                let PendingBatch { branch, bytes, .. } = map.remove(&receipt.seq).expect("checked");
                 self.release_bytes(bytes);
                 // Abort off the read loop: branch compensation may block on
                 // journal/WAL undo, and the connection must keep draining.
@@ -1550,8 +1545,7 @@ pub fn capture_trace_context() -> Option<String> {
         return None;
     }
     let mut carrier = std::collections::HashMap::new();
-    opentelemetry_sdk::propagation::TraceContextPropagator::new()
-        .inject_context(&cx, &mut carrier);
+    opentelemetry_sdk::propagation::TraceContextPropagator::new().inject_context(&cx, &mut carrier);
     carrier.get("traceparent").cloned()
 }
 
@@ -1609,8 +1603,7 @@ pub struct NetworkManager {
     /// started on one connection still completes after a transparent
     /// reconnect swaps the wire underneath it. A forwarder task drains the
     /// queue into whichever connection is currently serving the session.
-    session_receipts:
-        std::sync::Mutex<BTreeMap<EdgeSessionKey, SessionReceiptRoute>>,
+    session_receipts: std::sync::Mutex<BTreeMap<EdgeSessionKey, SessionReceiptRoute>>,
     /// Delivery-level dedup state per session key: the highest data-frame
     /// sequence number already routed into the local channel. A transparent
     /// reconnect replays every frame the upstream has not receipted, so the
@@ -1624,8 +1617,7 @@ pub struct NetworkManager {
     /// both pass the dedup check for the same sequence, and the old
     /// connection's late completion overwrites the delivered mark with a
     /// lower value, letting later replays slip through the dedup.
-    delivery_locks:
-        std::sync::Mutex<BTreeMap<EdgeSessionKey, Arc<tokio::sync::Mutex<()>>>>,
+    delivery_locks: std::sync::Mutex<BTreeMap<EdgeSessionKey, Arc<tokio::sync::Mutex<()>>>>,
     /// Registration generation per session key, bumped whenever a connection
     /// successfully (re)routes the key. The reconnect grace watcher compares
     /// its snapshot against the current generation to decide whether the
@@ -1655,14 +1647,12 @@ impl NetworkManager {
         self: &Arc<Self>,
         key: &EdgeSessionKey,
     ) -> flume::Sender<(Quad, ReceiptFrame)> {
-        let mut routes = self
-            .session_receipts
-            .lock()
-            .expect("session receipt lock");
+        let mut routes = self.session_receipts.lock().expect("session receipt lock");
         if let Some(route) = routes.get(key) {
             return route.queue.clone();
         }
-        let (queue_tx, queue_rx) = flume::bounded::<(Quad, ReceiptFrame)>(self.config.max_receipt_queue);
+        let (queue_tx, queue_rx) =
+            flume::bounded::<(Quad, ReceiptFrame)>(self.config.max_receipt_queue);
         let cancel = tokio_util::sync::CancellationToken::new();
         let route = SessionReceiptRoute {
             queue: queue_tx.clone(),
@@ -1731,15 +1721,9 @@ impl NetworkManager {
         key: &EdgeSessionKey,
         sender: Option<flume::Sender<(Quad, ReceiptFrame)>>,
     ) {
-        let routes = self
-            .session_receipts
-            .lock()
-            .expect("session receipt lock");
+        let routes = self.session_receipts.lock().expect("session receipt lock");
         if let Some(route) = routes.get(key) {
-            *route
-                .current
-                .write()
-                .expect("session receipt slot lock") = sender;
+            *route.current.write().expect("session receipt slot lock") = sender;
         }
     }
 
@@ -1753,17 +1737,11 @@ impl NetworkManager {
         key: &EdgeSessionKey,
         ours: &flume::Sender<(Quad, ReceiptFrame)>,
     ) {
-        let routes = self
-            .session_receipts
-            .lock()
-            .expect("session receipt lock");
+        let routes = self.session_receipts.lock().expect("session receipt lock");
         let Some(route) = routes.get(key) else {
             return;
         };
-        let mut slot = route
-            .current
-            .write()
-            .expect("session receipt slot lock");
+        let mut slot = route.current.write().expect("session receipt slot lock");
         if slot
             .as_ref()
             .is_some_and(|current| current.same_channel(ours))
@@ -2171,8 +2149,7 @@ impl NetworkManager {
                                 tokio::spawn(async move {
                                     match tls.accept(stream).await {
                                         Ok(tls_stream) => {
-                                            handshake_manager
-                                                .accept_stream(Box::new(tls_stream));
+                                            handshake_manager.accept_stream(Box::new(tls_stream));
                                         }
                                         Err(error) => {
                                             handshake_manager.report_failure(error);
@@ -2257,9 +2234,9 @@ impl NetworkManager {
         let (sender, receiver) =
             flume::bounded::<super::envelope::Envelope>(self.config.channel_capacity);
         let pending = Arc::new(PendingReceipts::with_byte_budget(
-                self.config.max_pending_receipts,
-                self.config.max_pending_bytes,
-            ));
+            self.config.max_pending_receipts,
+            self.config.max_pending_bytes,
+        ));
         let session_key = auth
             .as_ref()
             .map(SessionAuth::edge_key)
@@ -2299,9 +2276,9 @@ impl NetworkManager {
         let (sender, receiver) =
             flume::bounded::<super::envelope::Envelope>(self.config.channel_capacity);
         let pending = Arc::new(PendingReceipts::with_byte_budget(
-                self.config.max_pending_receipts,
-                self.config.max_pending_bytes,
-            ));
+            self.config.max_pending_receipts,
+            self.config.max_pending_bytes,
+        ));
         self.outbound
             .write()
             .expect("outbound registry lock")
@@ -2430,15 +2407,7 @@ impl NetworkManager {
         auth: Option<SessionAuth>,
         session_key: EdgeSessionKey,
     ) {
-        self.attach_stream_with_redial(
-            stream,
-            quad,
-            receiver,
-            pending,
-            auth,
-            session_key,
-            None,
-        );
+        self.attach_stream_with_redial(stream, quad, receiver, pending, auth, session_key, None);
     }
 
     /// [`Self::attach_stream`] with a redial handle: when the transport is
@@ -2495,9 +2464,7 @@ impl NetworkManager {
                 // Clean requires BOTH halves to end cleanly: the read loop
                 // already classifies a post-drain peer close as Ok, so any Err
                 // on either half is a stream-level failure.
-                let error = pump_result
-                    .err()
-                    .or(read_result.err());
+                let error = pump_result.err().or(read_result.err());
                 match error {
                     None => {
                         clean_exit = true;
@@ -2533,14 +2500,9 @@ impl NetworkManager {
                         let redial = redial.clone().expect("retry implies redial");
                         match redial.connect(quad).await {
                             Ok(mut stream) => {
-                                if let Err(error) = replay_pending(
-                                    &mut stream,
-                                    quad,
-                                    &pending,
-                                    &auth,
-                                    &config,
-                                )
-                                .await
+                                if let Err(error) =
+                                    replay_pending(&mut stream, quad, &pending, &auth, &config)
+                                        .await
                                 {
                                     final_error = Some(error);
                                     break;
@@ -2833,10 +2795,8 @@ impl NetworkManager {
                             let delivery_lock = self.delivery_lock(&route_key);
                             let _delivery_guard = delivery_lock.lock().await;
                             let duplicate = {
-                                let delivered = self
-                                    .delivered_seq
-                                    .lock()
-                                    .expect("delivered seq lock");
+                                let delivered =
+                                    self.delivered_seq.lock().expect("delivered seq lock");
                                 match delivered.get(&route_key) {
                                     Some(last) => seq <= *last,
                                     None => false,
@@ -2863,10 +2823,8 @@ impl NetworkManager {
                                 break Ok(()); // local chain gone; close the edge
                             }
                             {
-                                let mut delivered = self
-                                    .delivered_seq
-                                    .lock()
-                                    .expect("delivered seq lock");
+                                let mut delivered =
+                                    self.delivered_seq.lock().expect("delivered seq lock");
                                 let mark = delivered.entry(route_key.clone()).or_insert(0);
                                 if seq > *mark {
                                     *mark = seq;
@@ -3196,10 +3154,7 @@ async fn run_edge_connection(
     reconnectable: bool,
     failures: flume::Sender<Error>,
     shutdown: &tokio_util::sync::CancellationToken,
-) -> (
-    Result<(), Error>,
-    Result<(), Error>,
-) {
+) -> (Result<(), Error>, Result<(), Error>) {
     let (reader, writer) = tokio::io::split(stream);
     let connection_cancel = shutdown.child_token();
     let outbound_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3321,9 +3276,11 @@ async fn run_edge_connection(
         result
     });
 
-    let pump_result = pump_task
-        .await
-        .unwrap_or_else(|error| Err(Error::Process(format!("remote edge pump task failed: {error}"))));
+    let pump_result = pump_task.await.unwrap_or_else(|error| {
+        Err(Error::Process(format!(
+            "remote edge pump task failed: {error}"
+        )))
+    });
     if pump_result.is_err() {
         // A failed pump tears the connection down: no receipt can complete a
         // frame that never reached the wire, and the supervisor decides on
@@ -3333,9 +3290,11 @@ async fn run_edge_connection(
         // timeout, or the manager's shutdown).
         connection_cancel.cancel();
     }
-    let read_result = read_task
-        .await
-        .unwrap_or_else(|error| Err(Error::Process(format!("remote edge read task failed: {error}"))));
+    let read_result = read_task.await.unwrap_or_else(|error| {
+        Err(Error::Process(format!(
+            "remote edge read task failed: {error}"
+        )))
+    });
     (pump_result, read_result)
 }
 
@@ -3378,9 +3337,10 @@ async fn replay_pending(
         )
         .await?;
     }
-    writer.flush().await.map_err(|error| {
-        Error::Process(format!("remote edge replay flush failed: {error}"))
-    })?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| Error::Process(format!("remote edge replay flush failed: {error}")))?;
     Ok(())
 }
 
@@ -4367,11 +4327,10 @@ mod tests {
         })
         .await
         .expect("the already pending batch must be aborted with the edge");
-        let failure =
-            tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
-                .await
-                .expect("pending limit failure within timeout")
-                .unwrap();
+        let failure = tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
+            .await
+            .expect("pending limit failure within timeout")
+            .unwrap();
         assert!(
             failure.to_string().contains("pending receipt limit"),
             "{failure}"
@@ -4408,10 +4367,7 @@ mod tests {
         let error = pending
             .register(&branch, 1, Some(Arc::new(dictionary_batch(None))))
             .expect_err("the second batch exceeds the budget");
-        assert!(
-            error.to_string().contains("byte budget"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("byte budget"), "{error}");
         // Completing the first entry releases its bytes; a new registration
         // of the same size fits again.
         pending.apply(
@@ -4599,7 +4555,9 @@ mod tests {
             "transparent recovery must not abort the branch"
         );
         // No edge failure surfaced: the reconnect healed the loss.
-        if let Ok(failure) = tokio::time::timeout(std::time::Duration::from_millis(300), failures.recv_async()).await {
+        if let Ok(failure) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), failures.recv_async()).await
+        {
             panic!("unexpected failure: {failure:?}");
         }
         upstream.shutdown();
@@ -4759,10 +4717,7 @@ mod tests {
             .await
             .expect("budget exhaustion must report the edge failure")
             .unwrap();
-        assert!(
-            failure.to_string().contains("reconnect"),
-            "{failure}"
-        );
+        assert!(failure.to_string().contains("reconnect"), "{failure}");
         upstream.shutdown();
         downstream.shutdown();
     }
@@ -4777,12 +4732,10 @@ mod tests {
             ..NetworkManagerConfig::default()
         };
         let upstream = NetworkManager::with_config(offline).unwrap();
-        let downstream = NetworkManager::with_config(
-            NetworkManagerConfig {
-                reconnect_attempts: 0,
-                ..NetworkManagerConfig::default()
-            },
-        )
+        let downstream = NetworkManager::with_config(NetworkManagerConfig {
+            reconnect_attempts: 0,
+            ..NetworkManagerConfig::default()
+        })
         .unwrap();
         upstream.spawn();
         downstream.spawn();
@@ -5028,11 +4981,10 @@ mod tests {
         drop(edge);
         upstream.shutdown();
 
-        let failure =
-            tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
-                .await
-                .expect("failure within timeout")
-                .expect("failure channel open");
+        let failure = tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
+            .await
+            .expect("failure within timeout")
+            .expect("failure channel open");
         assert!(
             failure.to_string().contains("without Eos"),
             "expected an abnormal-termination failure, got: {failure}"
@@ -5134,10 +5086,8 @@ mod tests {
         let ca = ca_params.self_signed(&ca_key).unwrap();
         let mut nodes = Vec::new();
         for _ in 0..2 {
-            let node_params = CertificateParams::new(vec![
-                super::DATA_PLANE_TLS_SERVER_NAME.to_owned(),
-            ])
-            .unwrap();
+            let node_params =
+                CertificateParams::new(vec![super::DATA_PLANE_TLS_SERVER_NAME.to_owned()]).unwrap();
             let node_key = KeyPair::generate().unwrap();
             let node = node_params.signed_by(&node_key, &ca, &ca_key).unwrap();
             nodes.push((node.pem(), node_key.serialize_pem()));
@@ -5145,7 +5095,13 @@ mod tests {
         (nodes, ca.pem())
     }
 
-    fn tls_manager_config(node: &str, secret: &str, cert: &str, key: &str, ca: &str) -> NetworkManagerConfig {
+    fn tls_manager_config(
+        node: &str,
+        secret: &str,
+        cert: &str,
+        key: &str,
+        ca: &str,
+    ) -> NetworkManagerConfig {
         let credentials = DataPlaneCredentials::new(node, secret).expect("test credentials");
         NetworkManagerConfig {
             credentials: Some(credentials),
@@ -5207,9 +5163,7 @@ mod tests {
         let transport = TcpEdgeTransport {
             addr: format!("127.0.0.1:{port}").parse().expect("addr"),
             max_attempts: 3,
-            tls: Some(
-                DataPlaneTlsConfig::from_pem(cert_a, key_a, &ca).expect("client tls"),
-            ),
+            tls: Some(DataPlaneTlsConfig::from_pem(cert_a, key_a, &ca).expect("client tls")),
         };
         let edge = upstream
             .open_edge_for_session(&transport, quad, "node-b", "tls-job", 1)
@@ -5364,7 +5318,6 @@ mod tests {
         downstream.shutdown();
     }
 
-
     /// Partial TLS material is an explicit construction error.
     #[test]
     fn tls_partial_material_is_rejected() {
@@ -5390,10 +5343,7 @@ mod tests {
 
         let error = DataPlaneCredentials::new("node-a", "")
             .expect_err("an empty shared secret must be rejected");
-        assert!(
-            error.to_string().contains("must not be empty"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("must not be empty"), "{error}");
     }
 
     #[test]
@@ -5407,10 +5357,7 @@ mod tests {
         // Any identity drift is a protocol error before the MAC check.
         ack.job_id = "other-job".into();
         let error = auth.verify_server_ack(&ack).unwrap_err();
-        assert!(
-            error.to_string().contains("identity mismatch"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("identity mismatch"), "{error}");
     }
 
     #[test]
@@ -5461,7 +5408,9 @@ mod tests {
     #[test]
     fn decoder_rejects_schema_id_mismatch_and_unparsable_schema() {
         let mut encoder_a = DataEncoder::new();
-        let payload_a = encoder_a.encode(&dictionary_batch(None), 0).expect("encode A");
+        let payload_a = encoder_a
+            .encode(&dictionary_batch(None), 0)
+            .expect("encode A");
         let mut decoder = DataDecoder::new();
         decoder.decode(&payload_a).expect("learn schema A");
 
@@ -5495,11 +5444,8 @@ mod tests {
 
     fn int64_only_batch() -> MessageBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )
-        .expect("valid batch");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+            .expect("valid batch");
         MessageBatch::new_arrow(batch)
     }
 
@@ -5514,10 +5460,7 @@ mod tests {
         let (mut garbage, _) = rewrite_meta(&payload, false);
         garbage.extend_from_slice(&craft_piece(&[0x11, 0x22, 0x33, 0x44, 0x55]));
         let error = decoder.decode(&garbage).unwrap_err();
-        assert!(
-            error.to_string().contains("IPC message invalid"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("IPC message invalid"), "{error}");
 
         // A schema message arriving without `has_schema` set is a protocol
         // error: keep the original pieces (schema first) but claim no schema.
@@ -5643,10 +5586,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            error.to_string().contains("read idle timeout"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("read idle timeout"), "{error}");
     }
 
     #[tokio::test]
@@ -5661,10 +5601,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            error.to_string().contains("exceeds the 8 limit"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("exceeds the 8 limit"), "{error}");
     }
 
     #[test]
@@ -5717,10 +5654,7 @@ mod tests {
         }
         .validate()
         .unwrap_err();
-        assert!(
-            error.to_string().contains("must not exceed"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("must not exceed"), "{error}");
         invalid(
             NetworkManagerConfig {
                 read_idle_timeout: std::time::Duration::ZERO,
@@ -5791,7 +5725,11 @@ mod tests {
         let (failures_tx, failures_rx) = flume::unbounded::<Error>();
 
         let seq = pending
-            .register(&(Arc::new(FailingLifecycleAck) as Arc<dyn crate::input::Ack>), 1, None)
+            .register(
+                &(Arc::new(FailingLifecycleAck) as Arc<dyn crate::input::Ack>),
+                1,
+                None,
+            )
             .expect("register");
         pending.apply(
             ReceiptFrame {
@@ -5807,7 +5745,11 @@ mod tests {
         );
 
         let seq = pending
-            .register(&(Arc::new(FailingLifecycleAck) as Arc<dyn crate::input::Ack>), 1, None)
+            .register(
+                &(Arc::new(FailingLifecycleAck) as Arc<dyn crate::input::Ack>),
+                1,
+                None,
+            )
             .expect("register");
         pending.apply(
             ReceiptFrame {
@@ -5877,10 +5819,11 @@ mod tests {
         // A live writer drains the queued receipt.
         let (live_tx, live_rx) = flume::bounded::<(Quad, ReceiptFrame)>(1);
         manager.set_session_receipt_writer(&key, Some(live_tx));
-        let received = tokio::time::timeout(std::time::Duration::from_secs(5), live_rx.recv_async())
-            .await
-            .expect("receipt forwarded within timeout")
-            .expect("writer channel open");
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), live_rx.recv_async())
+                .await
+                .expect("receipt forwarded within timeout")
+                .expect("writer channel open");
         assert_eq!(received.1.seq, 0);
 
         // Clearing an unknown key is a no-op; clearing routes cancels the
@@ -5901,11 +5844,10 @@ mod tests {
         // process-wide channel.
         let failures = manager.failure_receiver_for_job("legacy", 4);
         manager.report_failure(Error::Process("legacy failure".into()));
-        let failure = failures.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert!(
-            failure.to_string().contains("legacy failure"),
-            "{failure}"
-        );
+        let failure = failures
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(failure.to_string().contains("legacy failure"), "{failure}");
     }
 
     #[test]
@@ -5914,9 +5856,7 @@ mod tests {
         let (nodes, ca) = generate_fleet_material();
         let (cert, key) = &nodes[0];
         let manager = NetworkManager::with_config(NetworkManagerConfig {
-            credentials: Some(
-                DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap(),
-            ),
+            credentials: Some(DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap()),
             tls: Some(DataPlaneTlsConfig::from_pem(cert, key, &ca).unwrap()),
             ..Default::default()
         })
@@ -5936,9 +5876,13 @@ mod tests {
         manager.accept_stream(Box::new(s1));
         let (_c2, s2) = tokio::io::duplex(64);
         manager.accept_stream(Box::new(s2));
-        let failure = failures.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let failure = failures
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         assert!(
-            failure.to_string().contains("accepted-connection limit 1 reached"),
+            failure
+                .to_string()
+                .contains("accepted-connection limit 1 reached"),
             "{failure}"
         );
     }
@@ -6049,16 +5993,11 @@ mod tests {
         downstream.remove_job_session("late-attach-job", 1);
         assert!(job_session_state_is_cleared(&downstream));
         drop(_hold); // release the connect
-        // The edge fails closed: the sender errors once the aborted receiver
-        // is dropped by the attach path.
+                     // The edge fails closed: the sender errors once the aborted receiver
+                     // is dropped by the attach path.
         tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
             loop {
-                if edge
-                    .sender
-                    .send_async(Envelope::Eos)
-                    .await
-                    .is_err()
-                {
+                if edge.sender.send_async(Envelope::Eos).await.is_err() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -6068,7 +6007,9 @@ mod tests {
         .expect("edge must fail closed after job removal");
         // No failure may land in the recreated per-Job channel: the Job is
         // gone and its state must not be resurrected.
-        if let Ok(Ok(failure)) = tokio::time::timeout(std::time::Duration::from_secs(2), failures.recv_async()).await {
+        if let Ok(Ok(failure)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), failures.recv_async()).await
+        {
             panic!("unexpected late failure: {failure}");
         }
         downstream.shutdown();
@@ -6195,10 +6136,7 @@ mod tests {
         let failures = manager.failure_receiver();
         let _ = edge;
         let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
-        assert!(
-            failure.contains("flush failed"),
-            "{failure}"
-        );
+        assert!(failure.contains("flush failed"), "{failure}");
         manager.shutdown();
     }
 
@@ -6214,10 +6152,7 @@ mod tests {
             .open_edge_with_stream_for_session(Box::new(client), quad, "node-b", "flush-job", 1)
             .unwrap();
         let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
-        assert!(
-            failure.contains("handshake flush failed"),
-            "{failure}"
-        );
+        assert!(failure.contains("handshake flush failed"), "{failure}");
         manager.shutdown();
     }
 
@@ -6246,17 +6181,7 @@ mod tests {
         .await
         .unwrap();
         drop(tx);
-        let result = pump_edge(
-            rx,
-            writer,
-            quad,
-            pending,
-            shutdown,
-            config,
-            None,
-            false,
-        )
-        .await;
+        let result = pump_edge(rx, writer, quad, pending, shutdown, config, None, false).await;
         let error = result.unwrap_err();
         assert!(
             error
@@ -6291,7 +6216,8 @@ mod tests {
                 .await
                 .unwrap();
             let (_pump, read) =
-                run_receipt_harness(Box::new(client), quad, Some(auth.clone()), config.clone()).await;
+                run_receipt_harness(Box::new(client), quad, Some(auth.clone()), config.clone())
+                    .await;
             drop(server);
             let error = read.unwrap_err();
             assert!(
@@ -6315,7 +6241,8 @@ mod tests {
                 .await
                 .unwrap();
             let (_pump, read) =
-                run_receipt_harness(Box::new(client), quad, Some(auth.clone()), config.clone()).await;
+                run_receipt_harness(Box::new(client), quad, Some(auth.clone()), config.clone())
+                    .await;
             drop(server);
             let error = read.unwrap_err();
             assert!(
@@ -6341,7 +6268,9 @@ mod tests {
             drop(server);
             let error = read.unwrap_err();
             assert!(
-                error.to_string().contains("unexpected Data frame on a receipt channel"),
+                error
+                    .to_string()
+                    .contains("unexpected Data frame on a receipt channel"),
                 "{error}"
             );
         }
@@ -6360,17 +6289,20 @@ mod tests {
         let pending = Arc::new(PendingReceipts::new(64));
         let (failures_tx, _failures_rx) = flume::unbounded::<Error>();
         let shutdown = tokio_util::sync::CancellationToken::new();
-        tokio::time::timeout(TEST_PROPAGATION_BUDGET, run_edge_connection(
-            client,
-            quad,
-            rx,
-            pending,
-            config,
-            auth,
-            false,
-            failures_tx,
-            &shutdown,
-        ))
+        tokio::time::timeout(
+            TEST_PROPAGATION_BUDGET,
+            run_edge_connection(
+                client,
+                quad,
+                rx,
+                pending,
+                config,
+                auth,
+                false,
+                failures_tx,
+                &shutdown,
+            ),
+        )
         .await
         .expect("connection harness settles within timeout")
     }
@@ -6413,7 +6345,9 @@ mod tests {
             .unwrap();
         let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
         assert!(
-            failure.to_string().contains("duplicate remote edge handshake"),
+            failure
+                .to_string()
+                .contains("duplicate remote edge handshake"),
             "{failure}"
         );
 
@@ -6440,7 +6374,9 @@ mod tests {
         .unwrap();
         let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
         assert!(
-            failure.to_string().contains("does not match authenticated quad"),
+            failure
+                .to_string()
+                .contains("does not match authenticated quad"),
             "{failure}"
         );
         downstream.shutdown();
@@ -6467,7 +6403,9 @@ mod tests {
             .unwrap();
         let failure = recv_within(&failures, std::time::Duration::from_secs(5)).await;
         assert!(
-            failure.to_string().contains("inbound frame for unregistered quad"),
+            failure
+                .to_string()
+                .contains("inbound frame for unregistered quad"),
             "{failure}"
         );
 
@@ -6489,7 +6427,9 @@ mod tests {
             .unwrap();
         let failure = recv_within(&failures, std::time::Duration::from_secs(5)).await;
         assert!(
-            failure.to_string().contains("inbound data frame decode failed"),
+            failure
+                .to_string()
+                .contains("inbound data frame decode failed"),
             "{failure}"
         );
 
@@ -6506,7 +6446,9 @@ mod tests {
             .unwrap();
         let failure = recv_within(&failures, std::time::Duration::from_secs(5)).await;
         assert!(
-            failure.to_string().contains("inbound signal frame malformed"),
+            failure
+                .to_string()
+                .contains("inbound signal frame malformed"),
             "{failure}"
         );
 
@@ -6582,7 +6524,9 @@ mod tests {
             &mut client2,
             quad,
             FrameKind::Signal,
-            serde_json::to_vec(&WireSignal::Watermark(1)).unwrap().as_slice(),
+            serde_json::to_vec(&WireSignal::Watermark(1))
+                .unwrap()
+                .as_slice(),
         )
         .await
         .unwrap();
@@ -6786,10 +6730,7 @@ mod tests {
             cx: &mut std::task::Context<'_>,
             buf: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
-            if self
-                .killed
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.killed.load(std::sync::atomic::Ordering::Acquire) {
                 return std::task::Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "write killed",
@@ -6857,10 +6798,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let transport = TcpEdgeTransport::plaintext(
-            format!("127.0.0.1:{port}").parse().unwrap(),
-            2,
-        );
+        let transport =
+            TcpEdgeTransport::plaintext(format!("127.0.0.1:{port}").parse().unwrap(), 2);
         let error = match transport.connect(quad_a_to_b()).await {
             Err(error) => error,
             Ok(_) => panic!("an unbound peer must exhaust the attempt budget"),
@@ -7298,12 +7237,9 @@ mod tests {
         // Past the grace the loss stays suppressed: the upstream recovered.
         tokio::time::sleep(std::time::Duration::from_millis(3_400)).await;
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(300),
-                failures.recv_async()
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(300), failures.recv_async())
+                .await
+                .is_err(),
             "a recovered session must not report a loss"
         );
         upstream2.shutdown();
@@ -7348,20 +7284,13 @@ mod tests {
         .await
         .unwrap();
         drop(tx);
-        let error = pump_edge(
-            rx,
-            writer,
-            quad,
-            pending,
-            shutdown,
-            config,
-            None,
-            false,
-        )
-        .await
-        .unwrap_err();
+        let error = pump_edge(rx, writer, quad, pending, shutdown, config, None, false)
+            .await
+            .unwrap_err();
         assert!(
-            error.to_string().contains("pending receipt limit 1 reached"),
+            error
+                .to_string()
+                .contains("pending receipt limit 1 reached"),
             "{error}"
         );
         assert!(
@@ -7395,9 +7324,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            error.to_string().contains("data write failed"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("data write failed"), "{error}");
     }
 }

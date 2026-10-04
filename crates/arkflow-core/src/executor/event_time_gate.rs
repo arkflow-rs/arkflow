@@ -101,8 +101,7 @@ pub struct EventTimeGate {
     /// settlements whose `abort` failed (retry/report surface). Drained by
     /// [`EventTimeGate::abort_held`], [`EventTimeGate::finish`], and
     /// [`EventTimeGate::take_held_acknowledgements`].
-    pending_eviction_acks:
-        std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn Ack>>>>,
+    pending_eviction_acks: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn Ack>>>>,
     /// Spawned eviction settlements in flight. Bounded: sustained overflow
     /// with slow settlements must not grow detached tasks and retained
     /// acknowledgements without limit — past the bound the observation
@@ -247,9 +246,9 @@ impl EventTimeGate {
             evicted_held_rows: 0,
             last_eviction_warn: None,
             pending_eviction_acks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            outstanding_eviction_aborts: std::sync::Arc::new(
-                std::sync::atomic::AtomicUsize::new(0),
-            ),
+            outstanding_eviction_aborts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                0,
+            )),
             max_outstanding_eviction_aborts: MAX_OUTSTANDING_EVICTION_ABORTS,
         }
     }
@@ -302,9 +301,9 @@ impl EventTimeGate {
             evicted_held_rows: 0,
             last_eviction_warn: None,
             pending_eviction_acks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            outstanding_eviction_aborts: std::sync::Arc::new(
-                std::sync::atomic::AtomicUsize::new(0),
-            ),
+            outstanding_eviction_aborts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                0,
+            )),
             max_outstanding_eviction_aborts: MAX_OUTSTANDING_EVICTION_ABORTS,
         })
     }
@@ -665,17 +664,19 @@ impl EventTimeGate {
                 return Err(error);
             }
         }
-// Deferred eviction acknowledgements (off-runtime embedders, or
+        // Deferred eviction acknowledgements (off-runtime embedders, or
         // spawned settlements whose abort failed) settle here too — a
         // successful finish must not leave them pending forever.
-        let queued = std::mem::take(&mut *self
-            .pending_eviction_acks
-            .lock()
-            .expect("eviction retry queue"));
+        let queued = std::mem::take(
+            &mut *self
+                .pending_eviction_acks
+                .lock()
+                .expect("eviction retry queue"),
+        );
         for ack in queued {
             ack.abort().await?;
         }
-                Ok(decision)
+        Ok(decision)
     }
 
     /// Drop the oldest held batches while the buffer exceeds its row cap.
@@ -726,10 +727,7 @@ impl EventTimeGate {
                                 %error,
                                 "evicted-held abort failed; retained for retry on the cleanup paths"
                             );
-                            retry_queue
-                                .lock()
-                                .expect("eviction retry queue")
-                                .push(ack);
+                            retry_queue.lock().expect("eviction retry queue").push(ack);
                         }
                     });
                 }
@@ -775,10 +773,12 @@ impl EventTimeGate {
         // Bind the take before the loop: the mutex guard must not live
         // across the awaited aborts (the gate sits inside chain futures
         // that must stay Send).
-        let queued = std::mem::take(&mut *self
-            .pending_eviction_acks
-            .lock()
-            .expect("eviction retry queue"));
+        let queued = std::mem::take(
+            &mut *self
+                .pending_eviction_acks
+                .lock()
+                .expect("eviction retry queue"),
+        );
         for ack in queued {
             if let Err(error) = ack.abort().await {
                 first_error.get_or_insert(error);
@@ -822,10 +822,12 @@ impl EventTimeGate {
             .into_iter()
             .map(|pending| pending.ack)
             .collect();
-        acks.append(&mut *self
-            .pending_eviction_acks
-            .lock()
-            .expect("eviction retry queue"));
+        acks.append(
+            &mut *self
+                .pending_eviction_acks
+                .lock()
+                .expect("eviction retry queue"),
+        );
         acks
     }
 
@@ -1835,46 +1837,37 @@ mod tests {
     fn window_timing_edge_cases_return_no_window_ends() {
         // Session boundaries are owned by the window operator: the gate never
         // converts them into a static event+gap deadline.
-        assert!(
-            WindowTiming::Session { gap_ms: 100 }
-                .window_ends_for(1_000)
-                .is_empty()
-        );
+        assert!(WindowTiming::Session { gap_ms: 100 }
+            .window_ends_for(1_000)
+            .is_empty());
         // Degenerate arithmetic produces no memberships instead of panicking.
-        assert!(
-            WindowTiming::Tumbling { size_ms: 0 }
-                .window_ends_for(1_000)
-                .is_empty()
-        );
-        assert!(
-            WindowTiming::Sliding {
-                size_ms: 0,
-                slide_ms: 10
-            }
+        assert!(WindowTiming::Tumbling { size_ms: 0 }
             .window_ends_for(1_000)
-            .is_empty()
-        );
-        assert!(
-            WindowTiming::Sliding {
-                size_ms: 10,
-                slide_ms: 0
-            }
-            .window_ends_for(1_000)
-            .is_empty()
-        );
+            .is_empty());
+        assert!(WindowTiming::Sliding {
+            size_ms: 0,
+            slide_ms: 10
+        }
+        .window_ends_for(1_000)
+        .is_empty());
+        assert!(WindowTiming::Sliding {
+            size_ms: 10,
+            slide_ms: 0
+        }
+        .window_ends_for(1_000)
+        .is_empty());
         // Extreme timestamps saturate instead of panicking: the aligned start
         // of i64::MIN with slide 3 cannot be represented.
-        assert!(
-            WindowTiming::Sliding { size_ms: 5, slide_ms: 3 }
-                .window_ends_for(i64::MIN)
-                .is_empty()
-        );
+        assert!(WindowTiming::Sliding {
+            size_ms: 5,
+            slide_ms: 3
+        }
+        .window_ends_for(i64::MIN)
+        .is_empty());
         // A tumbling end that overflows i64 yields no membership.
-        assert!(
-            WindowTiming::Tumbling { size_ms: 4 }
-                .window_ends_for(i64::MAX - 1)
-                .is_empty()
-        );
+        assert!(WindowTiming::Tumbling { size_ms: 4 }
+            .window_ends_for(i64::MAX - 1)
+            .is_empty());
     }
 
     #[test]
@@ -1996,10 +1989,11 @@ mod tests {
         let tracker = Arc::new(std::sync::Mutex::new(
             WatermarkTracker::from_time_spec(&time_spec(LateEventPolicy::Drop)).unwrap(),
         ));
-        tracker
-            .lock()
-            .unwrap()
-            .observe_partition(&EventTimePartition::for_source("a", 0), 1_000, 0);
+        tracker.lock().unwrap().observe_partition(
+            &EventTimePartition::for_source("a", 0),
+            1_000,
+            0,
+        );
         let gate = EventTimeGate::new_with_shared_tracker(
             &time_spec(LateEventPolicy::Drop),
             Vec::<i64>::new(),
@@ -2186,8 +2180,7 @@ mod tests {
         use datafusion::arrow::array::{MapBuilder, StringBuilder, UInt32Array};
 
         fn ext_map(topics: Vec<Option<&str>>, rows: usize) -> datafusion::arrow::array::ArrayRef {
-            let mut builder =
-                MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+            let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
             for topic in &topics {
                 if let Some(topic) = topic {
                     builder.keys().append_value("topic");
@@ -2226,7 +2219,10 @@ mod tests {
 
         let groups = split_by_physical_partition_for_source(&marked, 7, Some("src")).unwrap();
         assert_eq!(groups.len(), 3, "three distinct physical partitions");
-        let identities = groups.iter().map(|(partition, _)| partition.clone()).collect::<Vec<_>>();
+        let identities = groups
+            .iter()
+            .map(|(partition, _)| partition.clone())
+            .collect::<Vec<_>>();
         assert!(identities.contains(&EventTimePartition::new(Some("topic-a".into()), 0)));
         assert!(identities.contains(&EventTimePartition::new(Some("topic-a".into()), 1)));
         assert!(
@@ -2234,7 +2230,11 @@ mod tests {
             "a NULL partition falls back to the namespaced source partition"
         );
         for (_, slice) in &groups {
-            assert_eq!(slice.len(), 1, "each physical partition keeps exactly its row");
+            assert_eq!(
+                slice.len(),
+                1,
+                "each physical partition keeps exactly its row"
+            );
         }
 
         // Without a partition column the whole delivery is one fallback group.
@@ -2273,7 +2273,9 @@ mod tests {
             panic!("an un-castable partition column must fail");
         };
         assert!(
-            error.to_string().contains("read physical partition metadata"),
+            error
+                .to_string()
+                .contains("read physical partition metadata"),
             "{error}"
         );
     }
@@ -2560,7 +2562,8 @@ mod cut_consistency_tests {
             Ok(())
         }
         async fn abort(&self) -> Result<(), Error> {
-            self.aborted.store(true, std::sync::atomic::Ordering::Release);
+            self.aborted
+                .store(true, std::sync::atomic::Ordering::Release);
             Ok(())
         }
     }
@@ -2591,7 +2594,10 @@ mod cut_consistency_tests {
             .unwrap();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !oldest_ack.aborted.load(std::sync::atomic::Ordering::Acquire) {
+        while !oldest_ack
+            .aborted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the evicted delivery's abort never ran"
@@ -2603,7 +2609,12 @@ mod cut_consistency_tests {
             "an evicted delivery is aborted, never acknowledged"
         );
         assert!(
-            !survivor_ack.aborted.load(std::sync::atomic::Ordering::Acquire) && !survivor_ack.acked.load(std::sync::atomic::Ordering::Acquire),
+            !survivor_ack
+                .aborted
+                .load(std::sync::atomic::Ordering::Acquire)
+                && !survivor_ack
+                    .acked
+                    .load(std::sync::atomic::Ordering::Acquire),
             "the surviving delivery stays pending while held"
         );
         assert_eq!(gate.held_row_totals_for_test(), (1, 1, 1));
@@ -2658,7 +2669,8 @@ mod cut_consistency_tests {
             Ok(())
         }
         async fn abort(&self) -> Result<(), Error> {
-            self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(Error::Process("abort always fails".into()))
         }
     }
@@ -2693,7 +2705,10 @@ mod cut_consistency_tests {
             panic!("past the outstanding bound the observation must fail closed");
         };
         let message = error.to_string();
-        assert!(message.contains("outstanding"), "error names the bound: {message}");
+        assert!(
+            message.contains("outstanding"),
+            "error names the bound: {message}"
+        );
         // Release the hanging settlement so the test task can end.
         hang.notify_one();
     }
@@ -2743,11 +2758,7 @@ mod cut_consistency_tests {
         futures::executor::block_on(async {
             gate.observe_with_ack(0, nullable_batch(vec![Some(2_500)]), oldest.clone())
                 .unwrap();
-            gate.observe(
-                0,
-                nullable_batch(vec![Some(2_600)]),
-            )
-            .unwrap();
+            gate.observe(0, nullable_batch(vec![Some(2_600)])).unwrap();
             // Successful finalization settles the deferred eviction.
             gate.finish().await.unwrap();
         });

@@ -623,10 +623,11 @@ mod tests {
         let state = recording_state();
         assert_eq!(state.format_version(), 1);
         assert!(state.get("ns", b"key").unwrap().is_none());
-        state
-            .put_with_ttl("ns", b"key", b"value", None, 0)
-            .unwrap();
-        assert_eq!(state.get("ns", b"key").unwrap().as_deref(), Some(b"value".as_slice()));
+        state.put_with_ttl("ns", b"key", b"value", None, 0).unwrap();
+        assert_eq!(
+            state.get("ns", b"key").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
         assert_eq!(state.update_i64("ns", b"counter", 2).unwrap(), 2);
         assert!(!state.scan("ns").unwrap().is_empty());
         assert!(state.delete("ns", b"key").unwrap());

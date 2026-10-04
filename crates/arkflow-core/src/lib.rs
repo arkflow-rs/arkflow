@@ -3725,8 +3725,7 @@ mod process_result_tests {
         let result = ProcessResult::Multiple(vec![Arc::new(batch()), Arc::new(batch())]);
         assert_eq!(result.into_vec().len(), 2);
 
-        let result =
-            ProcessResult::SingleWithAck(Arc::new(batch()), Arc::new(input::NoopAck));
+        let result = ProcessResult::SingleWithAck(Arc::new(batch()), Arc::new(input::NoopAck));
         assert_eq!(result.into_vec().len(), 1);
 
         let result =
@@ -3739,7 +3738,10 @@ mod process_result_tests {
 
     #[test]
     fn from_vec_maps_lengths_to_variants() {
-        assert!(matches!(ProcessResult::from_vec(vec![]), ProcessResult::None));
+        assert!(matches!(
+            ProcessResult::from_vec(vec![]),
+            ProcessResult::None
+        ));
         let single = ProcessResult::from_vec(vec![batch()]);
         assert!(matches!(single, ProcessResult::Single(_)));
         let multiple = ProcessResult::from_vec(vec![batch(), batch()]);
@@ -3753,7 +3755,10 @@ mod process_result_tests {
         assert!(!ProcessResult::Single(shared()).is_empty());
         assert_eq!(ProcessResult::Single(shared()).len(), 1);
         assert_eq!(ProcessResult::Multiple(vec![shared(), shared()]).len(), 2);
-        assert_eq!(ProcessResult::SingleWithAck(shared(), Arc::new(input::NoopAck)).len(), 1);
+        assert_eq!(
+            ProcessResult::SingleWithAck(shared(), Arc::new(input::NoopAck)).len(),
+            1
+        );
         assert_eq!(
             ProcessResult::MultipleWithAck(vec![(shared(), Arc::new(input::NoopAck))]).len(),
             1

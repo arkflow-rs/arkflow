@@ -464,7 +464,9 @@ mod tests {
         let port = listener.local_addr()?.port();
         tokio::spawn(async move {
             loop {
-                let Ok((socket, _)) = listener.accept().await else { break };
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let (mut rd, mut wr) = socket.into_split();
@@ -524,7 +526,8 @@ mod tests {
             let port = spawn_fake_broker()
                 .await
                 .map_err(|e| Error::Connection(format!("fake broker bind failed: {e}")))?;
-            let (client, eventloop) = AsyncClient::new(MqttOptions::new("mock", "127.0.0.1", port), 10);
+            let (client, eventloop) =
+                AsyncClient::new(MqttOptions::new("mock", "127.0.0.1", port), 10);
             Ok((Self::new(client), eventloop))
         }
 

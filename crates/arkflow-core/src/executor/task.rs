@@ -19,13 +19,13 @@ use datafusion::arrow::array::{
     UInt8Array,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
-use tracing::Instrument;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// Upper bound on how long a source chain waits for in-flight (non-held)
 /// acknowledgements to drain before sealing a checkpoint cut. Exceeding it
@@ -69,10 +69,7 @@ fn sink_write_timeout() -> std::time::Duration {
 /// Shrink the sink-write bound. Test-only.
 #[cfg(test)]
 pub(crate) fn override_sink_write_timeout_for_tests(timeout: std::time::Duration) {
-    SINK_WRITE_TIMEOUT_OVERRIDE_MS.store(
-        timeout.as_millis() as u64,
-        Ordering::Release,
-    );
+    SINK_WRITE_TIMEOUT_OVERRIDE_MS.store(timeout.as_millis() as u64, Ordering::Release);
 }
 
 /// Drive every chain in the graph to completion (cancellation or all-source
@@ -206,19 +203,10 @@ async fn run_graph_inner(
     // Root span for this graph execution. The future is instrumented (never
     // enter-guarded across await points), so every span and event created
     // within becomes a child of job.run.
-    let job_span = tracing::info_span!(
-        "job.run",
-        chains = graph.chains.len() as i64,
-    );
-    run_graph_inner_instrumented(
-        graph,
-        cancellation,
-        hooks,
-        sources_preconnected,
-        startup,
-    )
-    .instrument(job_span)
-    .await
+    let job_span = tracing::info_span!("job.run", chains = graph.chains.len() as i64,);
+    run_graph_inner_instrumented(graph, cancellation, hooks, sources_preconnected, startup)
+        .instrument(job_span)
+        .await
 }
 
 async fn run_graph_inner_instrumented(
@@ -310,39 +298,36 @@ async fn run_graph_inner_instrumented(
         // Created while the job span is entered, so this span is its child.
         // tokio child tasks do not inherit span context: the span is moved
         // into the task and entered there.
-        let chain_span =
-            tracing::info_span!("chain.run", task = chain.entry_task_id());
-        tasks.push(
-            tokio::spawn(
-                async move {
-                    let edge_failures = chain.edge_failures.clone();
-                    let Some(edge_failures) = edge_failures else {
-                        return run_chain(chain, hook, token).await;
-                    };
-                    // Remote-edge failure watcher: an idle chain (blocked on input)
-                    // never observes a dead edge on its own send path, so a manager
-                    // failure cancels the chain and surfaces as its result. The chain
-                    // still exits through its own cancellation path, closing every
-                    // owned resource.
-                    let (failure_tx, mut failure_rx) = tokio::sync::oneshot::channel::<Error>();
-                    let watcher_token = token.clone();
-                    let watcher = tokio::spawn(async move {
-                        if let Ok(error) = edge_failures.recv_async().await {
-                            watcher_token.cancel();
-                            let _ = failure_tx.send(error);
-                        }
-                    });
-                    let result = run_chain(chain, hook, token).await;
-                    let result = match (result, failure_rx.try_recv()) {
-                        (Ok(()), Ok(error)) => Err(error),
-                        (result, _) => result,
-                    };
-                    watcher.abort();
-                    result
-                }
-                .instrument(chain_span),
-            ),
-        );
+        let chain_span = tracing::info_span!("chain.run", task = chain.entry_task_id());
+        tasks.push(tokio::spawn(
+            async move {
+                let edge_failures = chain.edge_failures.clone();
+                let Some(edge_failures) = edge_failures else {
+                    return run_chain(chain, hook, token).await;
+                };
+                // Remote-edge failure watcher: an idle chain (blocked on input)
+                // never observes a dead edge on its own send path, so a manager
+                // failure cancels the chain and surfaces as its result. The chain
+                // still exits through its own cancellation path, closing every
+                // owned resource.
+                let (failure_tx, mut failure_rx) = tokio::sync::oneshot::channel::<Error>();
+                let watcher_token = token.clone();
+                let watcher = tokio::spawn(async move {
+                    if let Ok(error) = edge_failures.recv_async().await {
+                        watcher_token.cancel();
+                        let _ = failure_tx.send(error);
+                    }
+                });
+                let result = run_chain(chain, hook, token).await;
+                let result = match (result, failure_rx.try_recv()) {
+                    (Ok(()), Ok(error)) => Err(error),
+                    (result, _) => result,
+                };
+                watcher.abort();
+                result
+            }
+            .instrument(chain_span),
+        ));
     }
     // The chains own their source/sink close paths from here on.
     guard.hand_off_stream_resources();
@@ -1723,7 +1708,6 @@ async fn handle_completed_barrier_inner(
     Ok(false)
 }
 
-
 /// Append the join input-side tag column (`__meta_input_index`) to a batch.
 fn tag_input_index(
     batch: datafusion::arrow::record_batch::RecordBatch,
@@ -1731,7 +1715,10 @@ fn tag_input_index(
 ) -> Result<datafusion::arrow::record_batch::RecordBatch, Error> {
     use datafusion::arrow::array::UInt32Array;
     let schema = batch.schema();
-    if schema.index_of(crate::executor::join::META_INPUT_INDEX).is_ok() {
+    if schema
+        .index_of(crate::executor::join::META_INPUT_INDEX)
+        .is_ok()
+    {
         return Ok(batch);
     }
     let mut fields: Vec<datafusion::arrow::datatypes::Field> =
@@ -1750,9 +1737,7 @@ fn tag_input_index(
         std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(fields)),
         columns,
     )
-    .map_err(|error| {
-        Error::Process(format!("failed to tag join input index: {error}"))
-    })
+    .map_err(|error| Error::Process(format!("failed to tag join input index: {error}")))
 }
 
 /// How long an input may go without emitting a watermark before it is
@@ -1762,8 +1747,7 @@ fn tag_input_index(
 /// Excluding them keeps watermark-driven progress — gate releases, window
 /// firing, state cleanup — from freezing forever; their late rows follow the
 /// configured late policy when they resume.
-const WATERMARK_INPUT_IDLE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(5 * 60);
+const WATERMARK_INPUT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// The downstream watermark frontier never moves backwards: a re-joining
 /// idle input can carry a stale value, and downstream consumers (window
@@ -1824,12 +1808,10 @@ async fn handle_envelope(
             // processor; tag the batch with its input index (0 = left,
             // 1 = right) so the join operator can tell the sides apart.
             let batch = if chain.tags_input_index {
-                std::sync::Arc::new(
-                    crate::MessageBatch::new_arrow(tag_input_index(
-                        batch.record_batch().clone(),
-                        input_index as u32,
-                    )?),
-                )
+                std::sync::Arc::new(crate::MessageBatch::new_arrow(tag_input_index(
+                    batch.record_batch().clone(),
+                    input_index as u32,
+                )?))
             } else {
                 batch
             };
@@ -2277,9 +2259,7 @@ impl ProcessorWorkerPool {
 async fn pool_failure(failure: &flume::Receiver<Error>) -> Error {
     match failure.recv_async().await {
         Ok(error) => error,
-        Err(_) => Error::Process(
-            "processor worker pool exited without recording a failure".into(),
-        ),
+        Err(_) => Error::Process("processor worker pool exited without recording a failure".into()),
     }
 }
 
@@ -2797,15 +2777,10 @@ async fn process_chain(
             // absorbed by at-least-once replay (same treatment as a write
             // error).
             let sink_timeout = sink_write_timeout();
-            let write = tokio::time::timeout(
-                sink_timeout,
-                sink.write_batch(&output_batches),
-            )
-            .await
-            .map_err(|_| {
-                Error::Process(format!("sink write timed out after {sink_timeout:?}"))
-            })
-            .and_then(|outcome| outcome);
+            let write = tokio::time::timeout(sink_timeout, sink.write_batch(&output_batches))
+                .await
+                .map_err(|_| Error::Process(format!("sink write timed out after {sink_timeout:?}")))
+                .and_then(|outcome| outcome);
             if let Err(error) = write {
                 if let Some(metrics) = metrics {
                     metrics
@@ -3358,10 +3333,7 @@ mod worker_pool_tests {
     }
 
     fn pool_chain(parallelism: usize, started: Arc<AtomicUsize>) -> Chain {
-        Chain::for_pool_test(
-            parallelism,
-            vec![Arc::new(StallingProcessor { started })],
-        )
+        Chain::for_pool_test(parallelism, vec![Arc::new(StallingProcessor { started })])
     }
 
     /// Regression: the failure channel disconnecting means every worker and the
@@ -3384,14 +3356,13 @@ mod worker_pool_tests {
         // exactly the state a panicking worker leaves behind.
         let failure = pool.failure.clone();
         pool.cancel_and_join().await.expect("the pool drains");
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            pool_failure(&failure),
-        )
-        .await
-        .expect("the failure report must resolve once the pool exits");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), pool_failure(&failure))
+            .await
+            .expect("the failure report must resolve once the pool exits");
         assert!(
-            error.to_string().contains("exited without recording a failure"),
+            error
+                .to_string()
+                .contains("exited without recording a failure"),
             "a silently dead pool must be reported: {error}"
         );
     }
@@ -3510,7 +3481,14 @@ mod watermark_idle_tests {
             ],
         );
         assert_eq!(
-            effective_watermark(&idle, &BTreeSet::new(), 2, now, started, WATERMARK_INPUT_IDLE_TIMEOUT),
+            effective_watermark(
+                &idle,
+                &BTreeSet::new(),
+                2,
+                now,
+                started,
+                WATERMARK_INPUT_IDLE_TIMEOUT
+            ),
             Some(5_000)
         );
         // Once it reports again it rejoins the minimum; the caller clamps
@@ -3523,7 +3501,14 @@ mod watermark_idle_tests {
             ],
         );
         assert_eq!(
-            effective_watermark(&rejoined, &BTreeSet::new(), 2, now, started, WATERMARK_INPUT_IDLE_TIMEOUT),
+            effective_watermark(
+                &rejoined,
+                &BTreeSet::new(),
+                2,
+                now,
+                started,
+                WATERMARK_INPUT_IDLE_TIMEOUT
+            ),
             Some(2_000)
         );
     }
@@ -3591,7 +3576,6 @@ mod watermark_idle_tests {
         // Equal values are stable.
         assert_eq!(clamp_forwarded_watermark(Some(5_000), 5_000), 5_000);
     }
-
 }
 
 /// Unit coverage for the private dispatch/routing helpers of the chain event
@@ -3723,11 +3707,13 @@ mod task_dispatch_tests {
     }
 
     fn utf8_batch(rows: Vec<Option<&str>>) -> crate::MessageBatchRef {
-        Arc::new(crate::MessageBatch::new_arrow(RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, true)])),
-            vec![Arc::new(StringArray::from(rows)) as ArrayRef],
-        )
-        .unwrap()))
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, true)])),
+                vec![Arc::new(StringArray::from(rows)) as ArrayRef],
+            )
+            .unwrap(),
+        ))
     }
 
     fn chain_with_processor(processor: Arc<dyn Processor>) -> Chain {
@@ -3806,11 +3792,7 @@ mod task_dispatch_tests {
             1
         );
         assert_eq!(
-            result_to_batches(ProcessResult::Multiple(vec![
-                batch.clone(),
-                batch.clone()
-            ]))
-            .len(),
+            result_to_batches(ProcessResult::Multiple(vec![batch.clone(), batch.clone()])).len(),
             2
         );
         assert_eq!(
@@ -3830,13 +3812,15 @@ mod task_dispatch_tests {
     #[test]
     fn hash_column_supports_every_keyed_arrow_type() {
         let max_parallelism = 16u32;
-        let group = |bytes: &[u8]| {
-            crate::job::key_group_for_key(bytes, max_parallelism).unwrap()
-        };
+        let group = |bytes: &[u8]| crate::job::key_group_for_key(bytes, max_parallelism).unwrap();
         // Integer-like keys hash the big-endian representation of their
         // native width; nulls hash a typed sentinel instead.
         let cases: Vec<(&str, ArrayRef, u32)> = vec![
-            ("i8", Arc::new(Int8Array::from(vec![Some(1i8)])), group(&1i8.to_be_bytes())),
+            (
+                "i8",
+                Arc::new(Int8Array::from(vec![Some(1i8)])),
+                group(&1i8.to_be_bytes()),
+            ),
             (
                 "i16",
                 Arc::new(Int16Array::from(vec![Some(1i16)])),
@@ -3924,11 +3908,8 @@ mod task_dispatch_tests {
         assert_eq!(booleans[1].unwrap(), group(b"bool:0"));
         assert_eq!(booleans[2].unwrap(), group(b"null:bool"));
 
-        let strings = hash_column(
-            &StringArray::from(vec![Some("a"), None]),
-            max_parallelism,
-        )
-        .unwrap();
+        let strings =
+            hash_column(&StringArray::from(vec![Some("a"), None]), max_parallelism).unwrap();
         assert_eq!(strings[0].unwrap(), group(b"a"));
         assert_eq!(strings[1].unwrap(), group(b"null:utf8"));
 
@@ -3962,15 +3943,20 @@ mod task_dispatch_tests {
         )
         .unwrap_err();
         assert!(
-            error.to_string().contains("2 channels but 1 key-group ranges"),
+            error
+                .to_string()
+                .contains("2 channels but 1 key-group ranges"),
             "{error}"
         );
 
         // A missing key field fails closed.
-        let error = partition_batch_by_key_hash(&batch, "absent", 1, &[crate::job::KeyGroupRange {
-            start: 0,
-            end: 15,
-        }], 16)
+        let error = partition_batch_by_key_hash(
+            &batch,
+            "absent",
+            1,
+            &[crate::job::KeyGroupRange { start: 0, end: 15 }],
+            16,
+        )
         .unwrap_err();
         assert!(
             error.to_string().contains("'absent' is missing from batch"),
@@ -4256,7 +4242,10 @@ mod task_dispatch_tests {
         struct FailingProcessor;
         #[async_trait]
         impl Processor for FailingProcessor {
-            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            async fn process(
+                &self,
+                _batch: crate::MessageBatchRef,
+            ) -> Result<ProcessResult, Error> {
                 Err(Error::Process("injected processor failure".into()))
             }
             async fn close(&self) -> Result<(), Error> {
@@ -4294,8 +4283,8 @@ mod task_dispatch_tests {
             "m".into(),
             vec![super::super::graph::EdgeTarget::Forward(tx)],
         );
-        let batch = mark_event_batch(utf8_batch(vec![Some("late")]), "__arkflow_late_event_route")
-            .unwrap();
+        let batch =
+            mark_event_batch(utf8_batch(vec![Some("late")]), "__arkflow_late_event_route").unwrap();
         flush_outputs(
             &chain,
             vec![ProcessedBatch {
@@ -4319,8 +4308,8 @@ mod task_dispatch_tests {
         );
         let first = Arc::new(ProbeAck::default());
         let second = Arc::new(ProbeAck::default());
-        let marked = mark_event_batch(utf8_batch(vec![Some("late")]), "__arkflow_late_event_route")
-            .unwrap();
+        let marked =
+            mark_event_batch(utf8_batch(vec![Some("late")]), "__arkflow_late_event_route").unwrap();
         let error = flush_outputs(
             &chain,
             vec![
@@ -4385,9 +4374,10 @@ mod task_dispatch_tests {
 
     #[tokio::test]
     async fn generated_multiple_empty_output_settles_the_acknowledgement() {
-        let processor: Arc<dyn Processor> = Arc::new(ScriptedProcessor::new(vec![
-            ProcessResult::Multiple(vec![]),
-        ]));
+        let processor: Arc<dyn Processor> =
+            Arc::new(ScriptedProcessor::new(vec![ProcessResult::Multiple(
+                vec![],
+            )]));
         let probe = Arc::new(ProbeAck::default());
         process_generated_batches(&processor, processed(probe.clone()))
             .await
@@ -4397,9 +4387,10 @@ mod task_dispatch_tests {
 
     #[tokio::test]
     async fn generated_multiple_empty_output_fails_when_the_ack_fails() {
-        let processor: Arc<dyn Processor> = Arc::new(ScriptedProcessor::new(vec![
-            ProcessResult::Multiple(vec![]),
-        ]));
+        let processor: Arc<dyn Processor> =
+            Arc::new(ScriptedProcessor::new(vec![ProcessResult::Multiple(
+                vec![],
+            )]));
         let probe = Arc::new(ProbeAck::default());
         probe.fail_ack.store(true, Ordering::SeqCst);
         let Err(error) = process_generated_batches(&processor, processed(probe.clone())).await
@@ -4489,7 +4480,10 @@ mod task_dispatch_tests {
         struct FailAfterFirst;
         #[async_trait]
         impl Processor for FailAfterFirst {
-            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            async fn process(
+                &self,
+                _batch: crate::MessageBatchRef,
+            ) -> Result<ProcessResult, Error> {
                 Err(Error::Process("second stage failed".into()))
             }
             async fn close(&self) -> Result<(), Error> {
@@ -4511,7 +4505,10 @@ mod task_dispatch_tests {
         struct FailAfterFirst;
         #[async_trait]
         impl Processor for FailAfterFirst {
-            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            async fn process(
+                &self,
+                _batch: crate::MessageBatchRef,
+            ) -> Result<ProcessResult, Error> {
                 Err(Error::Process("stage failed".into()))
             }
             async fn close(&self) -> Result<(), Error> {
@@ -4559,9 +4556,10 @@ mod task_dispatch_tests {
                 ProcessResult::Single(empty_batch()),
             ],
         )));
-        chain
-            .outputs
-            .insert("m".into(), vec![super::super::graph::EdgeTarget::Forward(tx)]);
+        chain.outputs.insert(
+            "m".into(),
+            vec![super::super::graph::EdgeTarget::Forward(tx)],
+        );
         dispatch_processor_control(&chain, ProcessorControl::Tick)
             .await
             .unwrap();
@@ -4688,7 +4686,10 @@ mod task_dispatch_tests {
         struct FailingProcessor;
         #[async_trait]
         impl Processor for FailingProcessor {
-            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            async fn process(
+                &self,
+                _batch: crate::MessageBatchRef,
+            ) -> Result<ProcessResult, Error> {
                 Err(Error::Process("operator failed".into()))
             }
             async fn close(&self) -> Result<(), Error> {
@@ -4711,7 +4712,9 @@ mod task_dispatch_tests {
         .await
         .unwrap_err();
         assert!(
-            error.to_string().contains("processor failed and error output routing failed"),
+            error
+                .to_string()
+                .contains("processor failed and error output routing failed"),
             "{error}"
         );
     }
@@ -4856,15 +4859,15 @@ mod task_dispatch_tests {
 #[cfg(test)]
 mod task_loop_tests {
     use super::*;
-    use crate::job::WatermarkStrategy;
-    use crate::executor::event_time_gate::{EventTimeGate, WindowTiming};
     use crate::event_time::WatermarkTracker;
+    use crate::executor::event_time_gate::{EventTimeGate, WindowTiming};
     use crate::executor::graph::EdgeTarget;
     use crate::input::Ack;
+    use crate::job::WatermarkStrategy;
     use crate::job::{LateEventPolicy, TimeMode, TimeSpec, WatermarkSpec};
     use crate::processor::Processor;
     use async_trait::async_trait;
-    use datafusion::arrow::array::{ArrayRef, Int64Array, Int8Array, BinaryArray};
+    use datafusion::arrow::array::{ArrayRef, BinaryArray, Int64Array, Int8Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::collections::VecDeque;
@@ -5097,11 +5100,13 @@ mod task_loop_tests {
     }
 
     fn ts_batch(value: i64) -> crate::MessageBatchRef {
-        Arc::new(crate::MessageBatch::new_arrow(RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)])),
-            vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
-        )
-        .unwrap()))
+        Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+            )
+            .unwrap(),
+        ))
     }
 
     fn event_time_spec() -> TimeSpec {
@@ -5160,9 +5165,8 @@ mod task_loop_tests {
     #[tokio::test(start_paused = true)]
     async fn barrier_drain_timeout_aborts_the_round_and_reports() {
         let seen = Arc::new(AtomicUsize::new(0));
-        let mut chain = Chain::for_pool_test(1, vec![Arc::new(RetainAckProcessor {
-            seen: seen.clone(),
-        })]);
+        let mut chain =
+            Chain::for_pool_test(1, vec![Arc::new(RetainAckProcessor { seen: seen.clone() })]);
         chain.task_ids = vec!["src".into()];
         let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
         let (fail_tx, mut fail_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5196,12 +5200,17 @@ mod task_loop_tests {
             .expect("the drain timeout reports a checkpoint failure")
             .expect("reporter alive");
         assert!(
-            report.to_string().contains("drain timed out with 1 acknowledgements"),
+            report
+                .to_string()
+                .contains("drain timed out with 1 acknowledgements"),
             "{report}"
         );
         token.cancel();
         let result = settle(task).await;
-        assert!(result.is_ok(), "an aborted round must not fail the chain: {result:?}");
+        assert!(
+            result.is_ok(),
+            "an aborted round must not fail the chain: {result:?}"
+        );
     }
 
     // ---------- source loop: cancellation inside the barrier branch ----------
@@ -5268,10 +5277,7 @@ mod task_loop_tests {
 
     // ---------- source loop: event-time gate failures ----------
 
-    fn poisoned_gate() -> (
-        Arc<std::sync::Mutex<WatermarkTracker>>,
-        EventTimeGate,
-    ) {
+    fn poisoned_gate() -> (Arc<std::sync::Mutex<WatermarkTracker>>, EventTimeGate) {
         let tracker = Arc::new(std::sync::Mutex::new(
             WatermarkTracker::from_time_spec(&event_time_spec()).unwrap(),
         ));
@@ -5301,9 +5307,13 @@ mod task_loop_tests {
             partition: Some(0),
             ..Default::default()
         };
-        let error = settle(tokio::spawn(run_chain(chain, hook, CancellationToken::new())))
-            .await
-            .unwrap_err();
+        let error = settle(tokio::spawn(run_chain(
+            chain,
+            hook,
+            CancellationToken::new(),
+        )))
+        .await
+        .unwrap_err();
         assert!(
             error.to_string().contains("tracker lock is poisoned"),
             "{error}"
@@ -5331,11 +5341,11 @@ mod task_loop_tests {
     /// discarded (debug-logged), never surfaced as a chain failure.
     #[tokio::test]
     async fn held_rows_flushed_during_cancellation_ignore_dispatch_failures() {
-        let mut gate =
-            EventTimeGate::new(&event_time_spec(), vec![WindowTiming::Tumbling {
-                size_ms: 60_000,
-            }])
-            .unwrap();
+        let mut gate = EventTimeGate::new(
+            &event_time_spec(),
+            vec![WindowTiming::Tumbling { size_ms: 60_000 }],
+        )
+        .unwrap();
         let probe = Arc::new(ProbeAck::default());
         gate.observe_with_ack(0, ts_batch(1_000), probe.clone())
             .unwrap();
@@ -5357,11 +5367,11 @@ mod task_loop_tests {
 
     #[tokio::test]
     async fn aborting_held_gate_acknowledgements_reports_the_first_failure() {
-        let mut gate =
-            EventTimeGate::new(&event_time_spec(), vec![WindowTiming::Tumbling {
-                size_ms: 60_000,
-            }])
-            .unwrap();
+        let mut gate = EventTimeGate::new(
+            &event_time_spec(),
+            vec![WindowTiming::Tumbling { size_ms: 60_000 }],
+        )
+        .unwrap();
         let probe = Arc::new(ProbeAck::default());
         probe.fail_abort.store(true, Ordering::SeqCst);
         gate.observe_with_ack(0, ts_batch(1_000), probe.clone())
@@ -5432,7 +5442,10 @@ mod task_loop_tests {
         token.cancel();
         drop(held);
         let result = settle(task).await;
-        assert!(result.is_ok(), "cleanup failures must not fail shutdown: {result:?}");
+        assert!(
+            result.is_ok(),
+            "cleanup failures must not fail shutdown: {result:?}"
+        );
     }
 
     /// Shutdown with envelopes still queued on the inbound channels: each is
@@ -5541,7 +5554,9 @@ mod task_loop_tests {
         // when the EOS drain reached it first, or the control fence times
         // out when the idle tick fenced the stuck pool first.
         assert!(
-            error.to_string().contains("did not finish draining within 30s")
+            error
+                .to_string()
+                .contains("did not finish draining within 30s")
                 || error.to_string().contains("did not publish delivery"),
             "{error}"
         );
@@ -5555,12 +5570,8 @@ mod task_loop_tests {
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let held = gate.clone().lock_owned().await;
         let failure = || Error::Process("pooled operator failure".into());
-        let processor = GatedScriptProcessor::new(
-            gate.clone(),
-            1,
-            Some(Err(failure())),
-            Some(Err(failure())),
-        );
+        let processor =
+            GatedScriptProcessor::new(gate.clone(), 1, Some(Err(failure())), Some(Err(failure())));
         let (chain, _senders) = interior_chain(2, vec![processor], 1);
         let token = CancellationToken::new();
         let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
@@ -5640,10 +5651,7 @@ mod task_loop_tests {
     /// drain instead of leaking their acknowledgements.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queued_pool_deliveries_are_aborted_by_the_drain() {
-        let processor = GatedScriptProcessor::passthrough(
-            Arc::new(tokio::sync::Mutex::new(())),
-            1,
-        );
+        let processor = GatedScriptProcessor::passthrough(Arc::new(tokio::sync::Mutex::new(())), 1);
         let (chain, _senders) = interior_chain(2, vec![processor], 1);
         let token = CancellationToken::new();
         let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
@@ -5735,9 +5743,7 @@ mod task_loop_tests {
         let seen = Arc::new(AtomicUsize::new(0));
         let (mut chain, mut senders) = interior_chain(
             2,
-            vec![Arc::new(RetainAckProcessor {
-                seen: seen.clone(),
-            })],
+            vec![Arc::new(RetainAckProcessor { seen: seen.clone() })],
             2,
         );
         chain
@@ -5815,10 +5821,7 @@ mod task_loop_tests {
             .await
             .expect("the overflow reports a checkpoint failure")
             .expect("reporter alive");
-        assert!(
-            report.to_string().contains("exceeded the"),
-            "{report}"
-        );
+        assert!(report.to_string().contains("exceeded the"), "{report}");
         drop(senders.swap_remove(0));
         drop(senders.pop().unwrap());
         let result = settle(task).await;
@@ -5838,7 +5841,9 @@ mod task_loop_tests {
         Arc::new(ProbeAck::default())
     }
 
-    fn ready_slice(action: crate::event_time::WindowAction) -> (crate::MessageBatchRef, crate::event_time::WindowAction) {
+    fn ready_slice(
+        action: crate::event_time::WindowAction,
+    ) -> (crate::MessageBatchRef, crate::event_time::WindowAction) {
         (ts_batch(1), action)
     }
 
@@ -5984,9 +5989,7 @@ mod task_loop_tests {
         let mut with_context = crate::checkpoint::CheckpointBarrier {
             checkpoint_id: "c-9".into(),
             generation: 9,
-            trace_context: Some(
-                "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".into(),
-            ),
+            trace_context: Some("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".into()),
         };
         let _span = barrier_span(&chain, &with_context);
         with_context.trace_context = Some("garbage".into());
@@ -6008,7 +6011,10 @@ mod task_loop_tests {
         struct EmptyMultiple;
         #[async_trait]
         impl Processor for EmptyMultiple {
-            async fn process(&self, _batch: crate::MessageBatchRef) -> Result<ProcessResult, Error> {
+            async fn process(
+                &self,
+                _batch: crate::MessageBatchRef,
+            ) -> Result<ProcessResult, Error> {
                 Ok(ProcessResult::Multiple(Vec::new()))
             }
             async fn close(&self) -> Result<(), Error> {
@@ -6058,14 +6064,9 @@ mod task_loop_tests {
     async fn processor_errors_bump_the_runtime_and_chain_metrics() {
         let chain = simple_chain(Arc::new(FailingProcessor));
         let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
-        let error = dispatch_data(
-            &chain,
-            ts_batch(1),
-            probe(),
-            Some(&metrics),
-        )
-        .await
-        .unwrap_err();
+        let error = dispatch_data(&chain, ts_batch(1), probe(), Some(&metrics))
+            .await
+            .unwrap_err();
         assert!(
             error.to_string().contains("injected processor failure"),
             "{error}"
@@ -6107,10 +6108,13 @@ mod task_loop_tests {
             used: AtomicBool::new(false),
         });
         let ack = probe();
-        let outputs = process_generated_batches(&processor, vec![ProcessedBatch {
-            batch: ts_batch(1),
-            ack: ack.clone(),
-        }])
+        let outputs = process_generated_batches(
+            &processor,
+            vec![ProcessedBatch {
+                batch: ts_batch(1),
+                ack: ack.clone(),
+            }],
+        )
         .await
         .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -6196,7 +6200,9 @@ mod task_loop_tests {
         .await
         .unwrap_err();
         assert!(
-            error.to_string().contains("2 channels but 1 key-group ranges"),
+            error
+                .to_string()
+                .contains("2 channels but 1 key-group ranges"),
             "{error}"
         );
     }
@@ -6222,13 +6228,15 @@ mod task_loop_tests {
 
     #[test]
     fn routing_skips_subtasks_whose_key_group_range_is_empty() {
-        let batch = crate::MessageBatch::new_arrow(RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)])),
-            vec![Arc::new(datafusion::arrow::array::StringArray::from(
-                vec!["alpha"],
-            ))],
-        )
-        .unwrap());
+        let batch = crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)])),
+                vec![Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                    "alpha",
+                ]))],
+            )
+            .unwrap(),
+        );
         // The second range covers no key group: its subtask is skipped.
         let routed = partition_batch_by_key_hash(
             &batch,
@@ -6249,8 +6257,8 @@ mod task_loop_tests {
     fn hash_column_covers_the_remaining_null_sentinels() {
         let max_parallelism = 16u32;
         let group = |bytes: &[u8]| crate::job::key_group_for_key(bytes, max_parallelism).unwrap();
-        let small_ints = hash_column(&Int8Array::from(vec![Some(1i8), None]), max_parallelism)
-            .unwrap();
+        let small_ints =
+            hash_column(&Int8Array::from(vec![Some(1i8), None]), max_parallelism).unwrap();
         assert_eq!(small_ints[0].unwrap(), group(&1i8.to_be_bytes()));
         assert_eq!(small_ints[1].unwrap(), group(b"null:i8"));
 

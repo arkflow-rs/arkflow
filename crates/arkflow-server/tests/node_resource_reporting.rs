@@ -88,12 +88,7 @@ async fn agent_resource_gauges_reach_the_hub_metrics_export() {
     // the freshness window keeps them flowing on every subsequent report.
     let deadline = tokio::time::timeout(Duration::from_secs(25), async {
         loop {
-            let Some(view) = hub
-                .metrics_by_node(Some("node-a"))
-                .await
-                .into_iter()
-                .next()
-            else {
+            let Some(view) = hub.metrics_by_node(Some("node-a")).await.into_iter().next() else {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
