@@ -616,8 +616,7 @@ export function streamEvents(
         // event: a Hub that accepts the connection but closes before any
         // frame is still unhealthy and must keep backing off, instead of
         // reconnecting once per second forever.
-        backoffMs =
-          deliveredAnyEvent ? SSE_BACKOFF_FLOOR_MS : Math.min(backoffMs * 2, SSE_BACKOFF_MAX_MS)
+        backoffMs = deliveredAnyEvent ? SSE_BACKOFF_FLOOR_MS : Math.min(backoffMs * 2, SSE_BACKOFF_MAX_MS)
       }
     }
   })()
