@@ -1511,11 +1511,9 @@ impl StorageActor {
 
     /// Send one mutating command behind the write-fencing envelope: the
     /// claimed epoch is captured NOW, the actor checks it against the
-    /// lease row when the command executes.
-    async fn send_fenced(
-        &self,
-        command: StorageCommand,
-    ) -> Result<(), mpsc::error::SendError<StorageCommand>> {
+    /// lease row when the command executes. A send failure means the actor
+    /// is gone; the unsent command is dropped (callers cannot replay it).
+    async fn send_fenced(&self, command: StorageCommand) -> Result<(), StorageError> {
         let claimed_epoch = self
             .leadership_epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1523,7 +1521,11 @@ impl StorageActor {
             // HA disabled: fencing must not depend on the absence of a
             // lease row — a leftover row from an earlier HA deployment
             // would otherwise reject every write.
-            return self.sender.send(command).await;
+            return self
+                .sender
+                .send(command)
+                .await
+                .map_err(|_| StorageError::ActorClosed);
         }
         self.sender
             .send(StorageCommand::Fenced {
@@ -1531,6 +1533,7 @@ impl StorageActor {
                 command: Box::new(command),
             })
             .await
+            .map_err(|_| StorageError::ActorClosed)
     }
 
     pub async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {

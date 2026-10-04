@@ -3609,6 +3609,9 @@ async fn operator_denied(
     }
 }
 
+// Err carries a ready-made axum rejection response (middleware idiom); boxing
+// it would ripple through every handler call site for no perf win.
+#[allow(clippy::result_large_err)]
 async fn require_operator_action(
     hub: &hub::Hub,
     headers: &HeaderMap,
@@ -3686,6 +3689,8 @@ fn hub_problem(error: hub::HubError) -> Response {
 
 /// Reject job-level mutations while an atomic upgrade orchestration owns the
 /// Job. `Ok(())` when no orchestration is active.
+// Err carries a ready-made axum rejection response (middleware idiom).
+#[allow(clippy::result_large_err)]
 async fn reject_if_job_upgrade_active(hub: &hub::Hub, job_id: &str) -> Result<(), Response> {
     if hub.active_job_upgrade_for(job_id).await.is_some() {
         return Err(problem(
