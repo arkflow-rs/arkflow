@@ -303,34 +303,88 @@ export function formatTime(value?: number): string {
 
 const base = import.meta.env.VITE_API_BASE ?? '/api/v1'
 const token = import.meta.env.VITE_API_TOKEN
+
+/** Default per-request budget: a connection black hole must fail the call
+ * (with a readable message) instead of freezing the UI forever. */
+const REQUEST_TIMEOUT_MS = 30_000
+
+/** Timeout signal merged with any caller-provided signal. Feature-detected:
+ * older runtimes (and jsdom) may lack `AbortSignal.any`/`timeout`, where the
+ * caller's signal (if any) applies and the budget is simply absent. */
+function requestSignal(init?: RequestInit): AbortSignal | undefined {
+  if (typeof AbortSignal.timeout !== 'function') return init?.signal ?? undefined
+  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  const caller = init?.signal ?? undefined
+  if (!caller) return timeout
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any([caller, timeout])
+  return caller
+}
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const correlationId = `console-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  const response = await fetch(`${base}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Correlation-ID': correlationId,
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(init?.headers ?? {}),
-    },
-  })
-  if (!response.ok) {
-    if (response.status === 401 && !token) {
-      void redirectToOidcLogin()
-    }
-    const body = (await response.json().catch(() => ({}))) as Partial<ApiError>
-    throw Object.assign(
-      new Error(body.message ?? translate(currentLocale(), 'api.requestFailed', { status: response.status })),
-      {
-        code: body.code ?? 'request_failed',
-        field: body.field,
-        stream_id: body.stream_id,
-        correlation_id: body.correlation_id ?? response.headers.get('x-correlation-id') ?? correlationId,
-        status: response.status,
+  const signal = requestSignal(init)
+  // The timeout signal covers the FULL exchange: fetch resolves on headers,
+  // and a stalled body rejects `response.json()` with the same
+  // TimeoutError, so every read stays inside the translated window.
+  const timeoutError = () =>
+    Object.assign(new Error(translate(currentLocale(), 'api.requestTimeout')), {
+      code: 'request_timeout',
+      correlation_id: correlationId,
+      status: 0,
+    })
+  let response: Response
+  try {
+    response = await fetch(`${base}${path}`, {
+      ...init,
+      signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Correlation-ID': correlationId,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(init?.headers ?? {}),
       },
-    )
+    })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      throw timeoutError()
+    }
+    throw error
   }
-  return response.status === 204 ? (undefined as T) : ((await response.json()) as T)
+  let body: unknown
+  try {
+    if (!response.ok) {
+      if (response.status === 401 && !token) {
+        void redirectToOidcLogin()
+      }
+      // A stalled error-body read rejects with the shared TimeoutError —
+      // it must surface as request_timeout, not be flattened into an empty
+      // body that reports a generic request_failed.
+      const errorBody = (await response.json().catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'TimeoutError') throw error
+        return {}
+      })) as Partial<ApiError>
+      throw Object.assign(
+        new Error(
+          errorBody.message ?? translate(currentLocale(), 'api.requestFailed', { status: response.status }),
+        ),
+        {
+          code: errorBody.code ?? 'request_failed',
+          field: errorBody.field,
+          stream_id: errorBody.stream_id,
+          correlation_id:
+            errorBody.correlation_id ?? response.headers.get('x-correlation-id') ?? correlationId,
+          status: response.status,
+        },
+      )
+    }
+    body = response.status === 204 ? undefined : await response.json()
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      throw timeoutError()
+    }
+    throw error
+  }
+  return body as T
 }
 export const api = {
   system: () => request<SystemResource>('/system'),
@@ -484,18 +538,42 @@ export function streamEvents(
 ): AbortController {
   const controller = new AbortController()
   const path = `/events/stream${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`
+  // Exponential backoff with a cap: a Hub outage must not become a
+  // reconnect storm, and one clean reconnect resets the ladder.
+  const SSE_BACKOFF_FLOOR_MS = 1_000
+  const SSE_BACKOFF_MAX_MS = 30_000
+  let backoffMs = SSE_BACKOFF_FLOOR_MS
   void (async () => {
     let lastEventId: string | undefined
     while (!controller.signal.aborted) {
+      let deliveredAnyEvent = false
+      // Per-attempt abort: the connect deadline cancels a black-holed fetch
+      // (a bare Promise.race would let it dangle until the caller's
+      // cleanup), and the outer controller forwards cancellation through
+      // the WHOLE attempt including body reads. `timedOut` distinguishes
+      // the deadline firing from outer cleanup inside the catch.
+      const attempt = new AbortController()
+      let timedOut = false
+      const forwardAbort = () => attempt.abort()
+      controller.signal.addEventListener('abort', forwardAbort)
       try {
-        const response = await fetch(`${base}${path}`, {
-          headers: {
-            Accept: 'text/event-stream',
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-            ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
-          },
-          signal: controller.signal,
-        })
+        const connectTimer = window.setTimeout(() => {
+          timedOut = true
+          attempt.abort()
+        }, REQUEST_TIMEOUT_MS)
+        let response: Response
+        try {
+          response = await fetch(`${base}${path}`, {
+            headers: {
+              Accept: 'text/event-stream',
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
+            },
+            signal: attempt.signal,
+          })
+        } finally {
+          window.clearTimeout(connectTimer)
+        }
         if (!response.ok || !response.body) {
           throw new Error(translate(currentLocale(), 'api.sseConnectionFailed', { status: response.status }))
         }
@@ -510,6 +588,7 @@ export function streamEvents(
           if (eventType !== 'resync') {
             try {
               onEvent(JSON.parse(data) as ControlEvent)
+              deliveredAnyEvent = true
             } catch {
               /* bounded server payload; ignore malformed frames */
             }
@@ -517,7 +596,7 @@ export function streamEvents(
           data = ''
           eventType = 'message'
         }
-        while (!controller.signal.aborted) {
+        while (!attempt.signal.aborted) {
           const next = await reader.read()
           if (next.done) break
           buffer += decoder.decode(next.value, { stream: true })
@@ -533,9 +612,22 @@ export function streamEvents(
           }
         }
       } catch {
+        // Covers both real failures and the connect-deadline abort; outer
+        // cleanup (controller aborted) reports nothing and exits the loop.
         if (!controller.signal.aborted) onState?.('disconnected')
+      } finally {
+        controller.signal.removeEventListener('abort', forwardAbort)
       }
-      if (!controller.signal.aborted) await new Promise((resolve) => window.setTimeout(resolve, 1000))
+      if (!controller.signal.aborted) {
+        // Reset the ladder BEFORE the sleep when this connection actually
+        // delivered an event (a healthy stream that drops reconnects after
+        // the floor delay, not a stale multiplier); a connect-then-close
+        // Hub with no frames keeps backing off instead of retrying every
+        // second.
+        if (deliveredAnyEvent) backoffMs = SSE_BACKOFF_FLOOR_MS
+        await new Promise((resolve) => window.setTimeout(resolve, backoffMs))
+        backoffMs = Math.min(backoffMs * 2, SSE_BACKOFF_MAX_MS)
+      }
     }
   })()
   return controller

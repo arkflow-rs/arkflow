@@ -43,7 +43,6 @@ streams:
       durability: ephemeral
 
     pipeline:
-      thread_num: 4
       processors:
         - type: json_to_arrow
         - type: sql

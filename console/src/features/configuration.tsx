@@ -163,8 +163,21 @@ export function Configuration({
       toast.success(t('toast.accepted'))
     })
   }
+  // Newest-first ordering with a deterministic tiebreaker; the default diff
+  // baseline of a version is its DIRECT predecessor, not an arbitrary other
+  // version. Guarded against non-array payloads (paged/error shapes).
+  const orderedVersions = (Array.isArray(versions) ? [...versions] : []).sort(
+    (a, b) => b.created_at_ms - a.created_at_ms || (a.id < b.id ? 1 : -1),
+  )
+  const predecessorOf = (id: string): string | undefined => {
+    const index = orderedVersions.findIndex((version) => version.id === id)
+    // Not found (-1) has no predecessor — falling through would index [0]
+    // and diff against the NEWEST version.
+    if (index < 0) return undefined
+    return orderedVersions[index + 1]?.id
+  }
   const compare = async (id: string) => {
-    const to = versions.find((version) => version.id !== id)?.id
+    const to = predecessorOf(id)
     if (!to) return
     await run(t('config.busyComparing'), async () => setDiff(await resolveDiff(id, to, nodeId)))
   }
@@ -285,7 +298,11 @@ export function Configuration({
                 <strong>{version.id}</strong> · {version.format} · {formatTime(version.created_at_ms)}
               </span>
               <div className="actions">
-                <button disabled={versions.length < 2 || !!busy} onClick={() => void compare(version.id)}>
+                <button
+                  disabled={!predecessorOf(version.id) || !!busy}
+                  title={!predecessorOf(version.id) ? t('config.noPredecessor') : undefined}
+                  onClick={() => void compare(version.id)}
+                >
                   {t('config.compare')}
                 </button>
                 <button disabled={!!busy} onClick={() => void rollback(version.id)}>

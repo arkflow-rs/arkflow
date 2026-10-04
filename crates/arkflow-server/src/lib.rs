@@ -140,6 +140,12 @@ impl ServerConfig {
                     "secure Hub startup requires both operator and node credentials; configure ARKFLOW_OPERATOR_TOKEN and ARKFLOW_NODE_TOKEN",
                 ));
             }
+            if let Err(message) = hub.validate_operator_credentials() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    message,
+                ));
+            }
         }
         Ok(address)
     }
@@ -666,6 +672,15 @@ impl axum::serve::Listener for HubTlsListener {
     }
 }
 
+/// Maintenance and reconcile side-sweeps must not silently swallow storage
+/// errors: they are the only line of defense against unbounded history
+/// tables, so a persistently failing sweep has to be visible to operators.
+fn sweep_logged<T>(task: &str, result: Result<T, impl std::fmt::Display>) {
+    if let Err(error) = result {
+        tracing::warn!(task, %error, "periodic sweep failed");
+    }
+}
+
 pub async fn serve_hub(
     hub: hub::Hub,
     config: ServerConfig,
@@ -805,8 +820,11 @@ pub async fn serve_hub(
                     if !reconcile_hub.is_leader().await {
                         continue;
                     }
-                    let _ = reconcile_hub.expire_attempts().await;
-                    let _ = reconcile_hub.schedule_periodic_checkpoints().await;
+                    sweep_logged("expire_attempts", reconcile_hub.expire_attempts().await);
+                    sweep_logged(
+                        "schedule_periodic_checkpoints",
+                        reconcile_hub.schedule_periodic_checkpoints().await,
+                    );
                     let started = crate::hub::now_ms_for_metrics();
                     let result = reconcile_hub.reconcile_once("hub-reconciler").await;
                     reconcile_hub.record_reconcile_result(started, &result).await;
@@ -814,10 +832,16 @@ pub async fn serve_hub(
                     // a savepoint completing here commits in the same tick and
                     // the (unfenced) job reconciler starts the new generation
                     // immediately — the cutover window costs no extra tick.
-                    let _ = reconcile_hub.reconcile_job_upgrades().await;
-                    let _ = reconcile_hub.reconcile_jobs().await;
-                    let _ = reconcile_hub.reconcile_rollouts().await;
-                    let _ = reconcile_hub.expire_stale_job_operations().await;
+                    sweep_logged(
+                        "reconcile_job_upgrades",
+                        reconcile_hub.reconcile_job_upgrades().await,
+                    );
+                    sweep_logged("reconcile_jobs", reconcile_hub.reconcile_jobs().await);
+                    sweep_logged("reconcile_rollouts", reconcile_hub.reconcile_rollouts().await);
+                    sweep_logged(
+                        "expire_stale_job_operations",
+                        reconcile_hub.expire_stale_job_operations().await,
+                    );
                 }
                 _ = reconcile_cancel.cancelled() => break,
             }
@@ -838,13 +862,31 @@ pub async fn serve_hub(
                     if !maintenance_hub.is_leader().await {
                         continue;
                     }
-                    let _ = maintenance_hub.prune_events(2048).await;
-                    let _ = maintenance_hub.prune_operation_history().await;
-                    let _ = maintenance_hub.prune_stale_checkpoint_records().await;
-                    let _ = maintenance_hub.prune_audit_history().await;
-                    let _ = maintenance_hub.prune_outbox_history().await;
-                    let _ = maintenance_hub.prune_attempt_history().await;
-                    let _ = maintenance_hub.prune_job_upgrade_history().await;
+                    sweep_logged("prune_events", maintenance_hub.prune_events(2048).await);
+                    sweep_logged(
+                        "prune_operation_history",
+                        maintenance_hub.prune_operation_history().await,
+                    );
+                    sweep_logged(
+                        "prune_stale_checkpoint_records",
+                        maintenance_hub.prune_stale_checkpoint_records().await,
+                    );
+                    sweep_logged(
+                        "prune_audit_history",
+                        maintenance_hub.prune_audit_history().await,
+                    );
+                    sweep_logged(
+                        "prune_outbox_history",
+                        maintenance_hub.prune_outbox_history().await,
+                    );
+                    sweep_logged(
+                        "prune_attempt_history",
+                        maintenance_hub.prune_attempt_history().await,
+                    );
+                    sweep_logged(
+                        "prune_job_upgrade_history",
+                        maintenance_hub.prune_job_upgrade_history().await,
+                    );
                 }
                 _ = maintenance_cancel.cancelled() => break,
             }
@@ -3042,6 +3084,9 @@ async fn hub_metrics(
         }
     }
     body.push_str(&hub.command_metrics().render());
+    body.push_str(&crate::metrics::encode_families(
+        crate::metrics::storage_families(),
+    ));
     // Data-plane series reported by Agents: the kernel Job vocabulary with an
     // extra `node` label. Expired-lease nodes are excluded by the Hub.
     for (node_id, jobs) in hub.job_metrics().await {
@@ -9135,6 +9180,7 @@ mod tests {
             client_id: Some("console".into()),
             client_secret: Some("console-secret".into()),
             redirect_uri: Some("http://127.0.0.1:1/console/callback".into()),
+            jwks_refresh_interval: None,
         })
         .await
         .expect("federation builds");
@@ -11059,6 +11105,7 @@ mod tests {
             client_id: Some("console".into()),
             client_secret: Some("console-secret".into()),
             redirect_uri: Some("https://127.0.0.1:1/console/callback".into()),
+            jwks_refresh_interval: None,
         })
         .await
         .expect("federation builds");

@@ -100,10 +100,10 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
             onChange={(event) => setState(event.target.value)}
           >
             <option value="all">{t('jobs.allStates')}</option>
-            <option value="running">Running</option>
-            <option value="stopped">Stopped</option>
-            <option value="failed">Failed</option>
-            <option value="degraded">Degraded</option>
+            <option value="running">{t('jobs.state.running')}</option>
+            <option value="stopped">{t('jobs.state.stopped')}</option>
+            <option value="failed">{t('jobs.state.failed')}</option>
+            <option value="degraded">{t('jobs.state.degraded')}</option>
           </select>
         </div>
         {jobsQuery.isPending ? (

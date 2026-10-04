@@ -4194,40 +4194,6 @@ mod metrics_registry_tests {
     };
     use std::sync::Mutex;
 
-    struct OneBatchThenEofInput {
-        sent: Mutex<bool>,
-    }
-
-    #[async_trait]
-    impl Input for OneBatchThenEofInput {
-        async fn connect(&self) -> Result<(), Error> {
-            Ok(())
-        }
-        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
-            let mut sent = self.sent.lock().unwrap();
-            if *sent {
-                return Err(Error::EOF);
-            }
-            *sent = true;
-            let batch = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![Field::new(
-                    "value",
-                    DataType::Int64,
-                    false,
-                )])),
-                vec![Arc::new(Int64Array::from(vec![1]))],
-            )
-            .unwrap();
-            Ok((
-                Arc::new(MessageBatch::new_arrow(batch)),
-                Arc::new(crate::input::NoopAck),
-            ))
-        }
-        async fn close(&self) -> Result<(), Error> {
-            Ok(())
-        }
-    }
-
     struct DevNullOutput;
 
     #[async_trait]
@@ -4255,7 +4221,56 @@ mod metrics_registry_tests {
         }
     }
 
-    struct MinimalAdapter;
+
+    /// One batch, then the reader parks until `released` flips. The Job
+    /// stays RUNNING until the test is done observing the registered
+    /// metrics: with an immediate EOF the run can finish and unregister
+    /// before a loaded test runner gets to look (the CI flake this guards).
+    struct OneBatchThenParkInput {
+        sent: Mutex<bool>,
+        released: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Input for OneBatchThenParkInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
+            let already_sent = {
+                let mut sent = self.sent.lock().unwrap();
+                let was = *sent;
+                *sent = true;
+                was
+            };
+            if !already_sent {
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "value",
+                        DataType::Int64,
+                        false,
+                    )])),
+                    vec![Arc::new(Int64Array::from(vec![1]))],
+                )
+                .unwrap();
+                return Ok((
+                    Arc::new(MessageBatch::new_arrow(batch)),
+                    Arc::new(crate::input::NoopAck),
+                ));
+            }
+            while !self.released.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Err(Error::EOF)
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct MinimalAdapter {
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
 
     impl crate::job::JobComponentAdapter for MinimalAdapter {
         fn build_input(
@@ -4263,8 +4278,9 @@ mod metrics_registry_tests {
             _source: &SourceSpec,
             _resource: &Resource,
         ) -> Result<Arc<dyn Input>, Error> {
-            Ok(Arc::new(OneBatchThenEofInput {
+            Ok(Arc::new(OneBatchThenParkInput {
                 sent: Mutex::new(false),
+                released: self.release.clone(),
             }))
         }
         fn build_output(
@@ -4365,8 +4381,10 @@ mod metrics_registry_tests {
         let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
         let spec = registry_spec();
         let task_registry = registry.clone();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run_release = release.clone();
         let run = tokio::spawn(async move {
-            let adapter = MinimalAdapter;
+            let adapter = MinimalAdapter { release: run_release };
             let mut resource = Resource {
                 temporary: std::collections::HashMap::new(),
                 input_names: std::cell::RefCell::new(Vec::new()),
@@ -4390,6 +4408,9 @@ mod metrics_registry_tests {
         // event loops spin up.
         let _ = metrics.snapshot();
 
+        // Observations done: let the source EOF so the run completes and
+        // unregisters (the parking input is what keeps the window open).
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
         run.await.unwrap().unwrap();
         assert!(registry.get("registry-metrics-job").is_none());
         assert!(registry.snapshots().is_empty());
@@ -4400,7 +4421,11 @@ mod metrics_registry_tests {
     async fn runs_without_a_registry_are_untracked() {
         let registry = crate::runtime::JobMetricsRegistry::default();
         let spec = registry_spec();
-        let adapter = MinimalAdapter;
+        // Released up front: the source emits its batch and EOFs exactly
+        // like the old one-shot input, so the run completes on its own.
+        let adapter = MinimalAdapter {
+            release: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
         let mut resource = Resource {
             temporary: std::collections::HashMap::new(),
             input_names: std::cell::RefCell::new(Vec::new()),

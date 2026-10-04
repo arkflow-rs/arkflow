@@ -48,8 +48,12 @@ Configuration changes are parsed and validated before reconciliation:
 - **unchanged** streams keep their running task;
 - **changed or removed** streams are stopped; new/changed streams are built
   before they are started;
-- versions are written atomically under `.arkflow/config-history`, and rollback
-  creates a new child version rather than rewriting history.
+- versions are written atomically under `.arkflow/config-history`
+  (override with the `ARKFLOW_CONFIG_HISTORY_DIR` environment variable, for
+  example to keep history on a persistent volume), and rollback creates a new
+  child version rather than rewriting history. A version whose runtime
+  application fails is retracted, so the history only contains versions that
+  were actually active.
 
 Stream IDs must contain only ASCII letters, digits, `-`, or `_`; legacy
 configurations receive deterministic `stream-0`, `stream-1`, … IDs.

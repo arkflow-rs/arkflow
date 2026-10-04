@@ -14,7 +14,10 @@ Set `VITE_API_TOKEN` only in a controlled build environment when the ArkFlow
 listener has an operator credential configured. The compatibility credential
 may be a raw token (admin) or `principal|role|secret`, for example
 `readonly|viewer|viewer-secret`; viewer credentials can read resources and
-audit history but cannot mutate Streams, nodes, or rollouts.
+audit history but cannot mutate Streams, nodes, or rollouts. A value that
+contains `|` but fails to parse (unknown role, empty field, wrong field
+count) refuses Hub startup with a redacted message instead of silently
+becoming an admin credential.
 
 ### Storage backends
 
@@ -180,6 +183,7 @@ it with environment variables:
 | `ARKFLOW_OIDC_ISSUER` | yes | Token issuer; must match the token's `iss` claim. |
 | `ARKFLOW_OIDC_AUDIENCE` | yes | Expected `aud` claim for the Hub. |
 | `ARKFLOW_OIDC_JWKS_URL` | no | JWKS endpoint; defaults to `{issuer}/.well-known/jwks.json`. |
+| `ARKFLOW_OIDC_JWKS_REFRESH_MS` | no | Periodic whole-table JWKS refresh cadence in milliseconds (default 3600000, minimum 1000). The refresh revokes signing keys the provider rotated away; a failed refresh keeps the previous keys and logs a warning. |
 | `ARKFLOW_OIDC_ROLE_CLAIM` | no | Claim carrying the role(s); defaults to `roles`. |
 | `ARKFLOW_OIDC_SCOPES_CLAIM` | no | Claim carrying resource scopes; defaults to `scopes`. |
 | `ARKFLOW_OIDC_CLIENT_ID` | login | OAuth2 client id for the browser authorization-code flow. |

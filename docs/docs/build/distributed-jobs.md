@@ -91,6 +91,12 @@ aggregation and re-emits the full corrected result with an
 `__arkflow_window_update` marker column; the buffer is only cleaned up after
 the period expires.
 
+The keyed aggregate buffer is bounded by `max_buffered_keys` (default 65536
+live `(window, key)` entries). When the bound is reached — a stalled
+watermark or extreme key cardinality — the oldest-window aggregates are
+evicted (announced by a throttled `warn` log naming the eviction count); the
+evicted windows emit nothing when their trigger eventually fires.
+
 ## Embedded state and checkpoints
 
 Hot-path state lives in an embedded KV store local to the Compute node,

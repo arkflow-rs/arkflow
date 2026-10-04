@@ -123,36 +123,40 @@ pub(crate) fn bounded_text(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+/// Parse a structured operator credential `id|role|secret[|scopes]`.
+///
+/// A string without any `|` is the plain static-token mode and stays a
+/// valid Admin credential (the whole string is the secret). A string that
+/// LOOKS structured (contains `|`) but fails to parse — unknown role, empty
+/// id/secret, or too few fields — returns `None`: it must never silently
+/// degrade into an Admin credential keyed by the whole malformed string.
 pub(crate) fn parse_operator_credential(
     configured: &str,
-) -> (&str, OperatorRole, &str, Vec<ResourceScope>) {
+) -> Option<(&str, OperatorRole, &str, Vec<ResourceScope>)> {
+    if !configured.contains('|') {
+        // Plain static token: the whole string is an Admin secret.
+        return Some(("operator", OperatorRole::Admin, configured, Vec::new()));
+    }
     let mut fields = configured.splitn(4, '|');
-    let Some(id) = fields.next() else {
-        return ("operator", OperatorRole::Admin, configured, Vec::new());
-    };
-    let Some(role) = fields.next() else {
-        return ("operator", OperatorRole::Admin, configured, Vec::new());
-    };
-    let Some(secret) = fields.next() else {
-        return ("operator", OperatorRole::Admin, configured, Vec::new());
-    };
+    let id = fields.next()?;
+    let role = fields.next()?;
+    let secret = fields.next()?;
     let role = match role {
         "admin" => OperatorRole::Admin,
         "operator" => OperatorRole::Operator,
         "viewer" => OperatorRole::Viewer,
-        _ => return ("operator", OperatorRole::Admin, configured, Vec::new()),
+        _ => return None,
     };
     if id.trim().is_empty() || secret.is_empty() {
-        ("operator", OperatorRole::Admin, configured, Vec::new())
-    } else {
-        let scopes = fields
-            .next()
-            .into_iter()
-            .flat_map(|value| value.split(','))
-            .filter_map(parse_resource_scope)
-            .collect();
-        (id, role, secret, scopes)
+        return None;
     }
+    let scopes = fields
+        .next()
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(parse_resource_scope)
+        .collect();
+    Some((id, role, secret, scopes))
 }
 
 fn parse_resource_scope(value: &str) -> Option<ResourceScope> {
@@ -901,5 +905,44 @@ impl Hub {
                 operation.error = Some("Node lease expired".into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    /// Spec: a plain token (no '|') stays a valid Admin credential, and a
+    /// structured credential that fails to parse is rejected instead of
+    /// silently degrading into an Admin credential keyed by the whole
+    /// malformed string.
+    #[test]
+    fn plain_static_token_stays_admin() {
+        let (id, role, secret, scopes) = parse_operator_credential("plain-token").unwrap();
+        assert_eq!(id, "operator");
+        assert_eq!(role, OperatorRole::Admin);
+        assert_eq!(secret, "plain-token");
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn structured_credential_parses_with_scopes() {
+        let (id, role, secret, scopes) =
+            parse_operator_credential("alice|viewer|hush|node=node-a,stream=orders").unwrap();
+        assert_eq!(id, "alice");
+        assert_eq!(role, OperatorRole::Viewer);
+        assert_eq!(secret, "hush");
+        assert_eq!(scopes.len(), 2);
+    }
+
+    #[test]
+    fn malformed_structured_credentials_are_rejected() {
+        // Unknown role — the CR's privilege-escalation typo.
+        assert!(parse_operator_credential("alice|typo|secret").is_none());
+        // Too few fields to be structured.
+        assert!(parse_operator_credential("alice|admin").is_none());
+        // Empty id / secret.
+        assert!(parse_operator_credential("|admin|secret").is_none());
+        assert!(parse_operator_credential("alice|admin|").is_none());
     }
 }

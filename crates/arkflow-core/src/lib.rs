@@ -14,6 +14,10 @@
 
 //! Rust stream processing engine
 
+// The engine-config JSON Schema literal (component/mod.rs) nests deep enough
+// to exceed serde_json's default macro recursion.
+#![recursion_limit = "512"]
+
 use crate::temporary::Temporary;
 use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, MapArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -119,6 +123,12 @@ pub enum Error {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// An upstream input channel closed while a chain was still reading it.
+    /// Dedicated variant so flow control matches structurally instead of
+    /// comparing `Process` message strings.
+    #[error("input channel closed")]
+    InputChannelClosed,
 }
 
 #[derive(Clone)]

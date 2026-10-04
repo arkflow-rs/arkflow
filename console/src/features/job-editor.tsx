@@ -26,7 +26,7 @@ import {
 } from './job-dag'
 import { useConfirm } from './confirm'
 import { ComponentBrowserControls, ComponentKind, filterComponents } from './component-browser'
-import { useT } from '../i18n'
+import { useT, type TKey } from '../i18n'
 
 const copy = <T,>(v: T): T => structuredClone(v)
 function JobNode({ data }: { data: DagNodeData }) {
@@ -990,7 +990,9 @@ export function JobEditor({
         <div className="validation">
           <strong>{t('editor.issueCount', { count: issues.length })}</strong>
           {issues.map((issue) => (
-            <p key={issue}>{issue}</p>
+            // Edge-check issues arrive as dictionary keys; server validation
+            // messages arrive as pre-localized text and pass through.
+            <p key={issue}>{issue.startsWith('dag.edge.') ? t(issue as TKey) : issue}</p>
           ))}
         </div>
       )}

@@ -247,6 +247,20 @@ pub fn data_plane_exposition(
     encode_families(families)
 }
 
+/// Control-plane storage actor observability: the queue-depth gauge is a
+/// process-global snapshot, so it renders as a single unlabeled series.
+pub fn storage_families() -> Vec<MetricFamily> {
+    let depth = crate::storage::STORAGE_QUEUE_DEPTH.load(std::sync::atomic::Ordering::Relaxed);
+    family(
+        "arkflow_storage_queue_depth",
+        "Commands buffered in the storage actor queue (plus the one in flight).",
+        MetricType::GAUGE,
+        vec![(vec![], depth)],
+    )
+    .into_iter()
+    .collect()
+}
+
 /// Encode families as Prometheus text format 0.0.4 (HELP/TYPE included).
 pub fn encode_families(families: Vec<MetricFamily>) -> String {
     let encoder = TextEncoder::new();

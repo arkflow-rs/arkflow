@@ -193,6 +193,39 @@ impl Hub {
             .collect()
     }
 
+    /// Compiled plan for a spec, cached by content hash so reconcile ticks
+    /// do not re-parse and re-compile unchanged specs fleet-wide. A parse
+    /// or compile failure is cached as `None` — a malformed spec fails
+    /// cheaply on every tick instead of being retried.
+    pub(crate) fn cached_plan(
+        &self,
+        spec_json: &str,
+    ) -> Option<std::sync::Arc<arkflow_core::job::JobPlan>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        spec_json.hash(&mut hasher);
+        let key = hasher.finish();
+        let mut cache = self.plan_cache.lock().expect("plan cache lock");
+        // Look up before any capacity reset: clearing first would discard
+        // entries that are about to be hits, forcing a recompile of exactly
+        // the plans the cache exists to keep.
+        if let Some(plan) = cache.get(&key) {
+            return plan.clone();
+        }
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                serde_json::from_str::<arkflow_core::job::JobSpec>(spec_json)
+                    .ok()
+                    .and_then(|spec| arkflow_core::job::JobPlan::compile(spec).ok())
+                    .map(std::sync::Arc::new)
+            })
+            .clone()
+    }
+
     /// Stateless recompute of declared per-node allocations: every
     /// desired-running Job (except `exclude_job`) that declares resources
     /// contributes its per-task request times its per-node assignment count
@@ -213,17 +246,12 @@ impl Hub {
             if job.job_id == exclude_job || job.desired_state != "running" {
                 continue;
             }
-            let Ok(spec) =
-                serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json)
-            else {
+            let Some(plan) = self.cached_plan(&job.spec_json) else {
                 continue;
             };
-            if !spec.resources.is_declared() {
+            if !plan.spec.resources.is_declared() {
                 continue;
             }
-            let Ok(plan) = arkflow_core::job::JobPlan::compile(spec) else {
-                continue;
-            };
             let order = {
                 let remembered = self
                     .placement_order
@@ -1317,5 +1345,78 @@ impl Hub {
             .await
             .map_err(HubError::from)?;
         Ok(Some(operation))
+    }
+}
+
+#[cfg(test)]
+mod plan_cache_tests {
+    fn spec_json(job_id: &str) -> String {
+        serde_json::json!({
+            "id": job_id,
+            "version": 1,
+            "parallelism": 1,
+            "max_parallelism": 2,
+            "operators": [
+                {"id": "source", "kind": "source", "stateful": false},
+                {"id": "sink", "kind": "sink", "stateful": false}
+            ],
+            "edges": [{"id": "e1", "from": "source", "to": "sink"}],
+            "sources": [{
+                "operator_id": "source",
+                "input_type": "vec",
+                "config": {},
+                "time": {"mode": "processing_time"}
+            }],
+            "sinks": [{"operator_id": "sink", "output_type": "vec", "config": {}}],
+        })
+        .to_string()
+    }
+
+    /// Spec: an unchanged spec hits the cache; a changed spec recompiles; the
+    /// capacity bound resets the cache wholesale.
+    #[test]
+    fn cached_plan_hits_on_same_spec_and_misses_on_change() {
+        let hub = crate::hub::Hub::new(crate::hub::HubConfig {
+            operator_token: Some("operator".into()),
+            node_token: Some("node-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 1000,
+            poll_interval_ms: 1000,
+            session_ttl_ms: crate::hub::default_session_ttl_ms(),
+        });
+        let first = hub.cached_plan(&spec_json("orders")).expect("compiles");
+        // Same content again: served from the cache (identical assignments).
+        let again = hub.cached_plan(&spec_json("orders")).expect("cached");
+        assert_eq!(first.spec.id, again.spec.id);
+        // Different spec string: guaranteed miss, fresh compile.
+        let other = hub.cached_plan(&spec_json("etl")).expect("compiles");
+        assert_ne!(first.spec.id, other.spec.id);
+        // Capacity bound: beyond 1024 distinct specs the cache clears
+        // wholesale instead of growing without limit.
+        for index in 0..=1024 {
+            let _ = hub.cached_plan(&spec_json(&format!("job-{index}")));
+        }
+        let depth = hub.plan_cache.lock().expect("plan cache lock").len();
+        assert!(depth <= 1024, "cache must stay bounded: {depth}");
+    }
+
+    #[test]
+    fn cached_plan_caches_malformed_specs_as_none() {
+        let hub = crate::hub::Hub::new(crate::hub::HubConfig {
+            operator_token: Some("operator".into()),
+            node_token: Some("node-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 1000,
+            poll_interval_ms: 1000,
+            session_ttl_ms: crate::hub::default_session_ttl_ms(),
+        });
+        assert!(hub.cached_plan("not-json").is_none());
+        // The failure is cached: the map holds the None verdict.
+        assert!(hub
+            .plan_cache
+            .lock()
+            .expect("plan cache lock")
+            .values()
+            .any(Option::is_none));
     }
 }

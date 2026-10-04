@@ -34,15 +34,15 @@ describe('Job DAG model', () => {
   })
   it('rejects self loops, duplicate and invalid source/sink connections', () => {
     const graph = jobSpecToDag(spec)
-    expect(edgeIssue(graph.nodes, graph.edges, { source: 'in', target: 'in' })).toMatch(/itself/)
-    expect(edgeIssue(graph.nodes, graph.edges, { source: 'in', target: 'map' })).toMatch(/Duplicate/)
-    expect(edgeIssue(graph.nodes, graph.edges, { source: 'out', target: 'map' })).toMatch(/sink/)
-    expect(edgeIssue(graph.nodes, graph.edges, { source: 'map', target: 'in' })).toMatch(/source/)
+    expect(edgeIssue(graph.nodes, graph.edges, { source: 'in', target: 'in' })).toMatch(/dag.edge.self/)
+    expect(edgeIssue(graph.nodes, graph.edges, { source: 'in', target: 'map' })).toMatch(/dag.edge.duplicate/)
+    expect(edgeIssue(graph.nodes, graph.edges, { source: 'out', target: 'map' })).toMatch(/dag.edge.sinkOut/)
+    expect(edgeIssue(graph.nodes, graph.edges, { source: 'map', target: 'in' })).toMatch(/dag.edge.sourceIn/)
   })
   it('rejects graph cycles', () => {
     const graph = jobSpecToDag(spec)
-    expect(edgeIssue(graph.nodes, graph.edges, { source: 'out', target: 'in' })).toMatch(/sink/)
-    expect(edgeIssue(graph.nodes, graph.edges, { source: 'map', target: 'in' })).toMatch(/source/)
+    expect(edgeIssue(graph.nodes, graph.edges, { source: 'out', target: 'in' })).toMatch(/dag.edge.sinkOut/)
+    expect(edgeIssue(graph.nodes, graph.edges, { source: 'map', target: 'in' })).toMatch(/dag.edge.sourceIn/)
     const processorOnly = jobSpecToDag({
       ...spec,
       operators: spec.operators.slice(0, 2),

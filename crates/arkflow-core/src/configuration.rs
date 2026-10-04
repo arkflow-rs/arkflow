@@ -116,6 +116,20 @@ impl ConfigVersionStore {
             content_verbatim: None,
         })
     }
+
+    /// Remove one version record. A missing file is success — the caller's
+    /// compensating delete races nothing but its own save. Used to retract a
+    /// version whose runtime application failed, so the history only ever
+    /// contains versions that were actually active.
+    pub fn delete_version(&self, id: &str) -> Result<(), Error> {
+        validate_version_id(id)?;
+        let path = self.root.join(format!("{id}.json"));
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 /// Version identifiers end up in filesystem paths, so caller-supplied ids are
