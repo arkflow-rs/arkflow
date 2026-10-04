@@ -2813,7 +2813,7 @@ mod coverage_tests {
         let plan = JobPlan::compile(base_job()).unwrap();
         let attempts = plan.assignments_for_node("node-a");
         assert_eq!(attempts.len(), plan.tasks.len());
-        assert_eq!(attempts[0].id, format!("source-0:node-a:0"));
+        assert_eq!(attempts[0].id, "source-0:node-a:0");
         assert_eq!(attempts[0].task_id, "source-0");
         assert_eq!(attempts[0].job_id, JobId::new("orders").unwrap());
         assert_eq!(attempts[0].job_version, JobVersion(1));
