@@ -277,7 +277,7 @@ mod pulsar_tests {
 
         let builder = arkflow_plugin::input::pulsar::PulsarInputBuilder;
         let result = builder.build(
-            Some(&"test-input".to_string()),
+            Some("test-input"),
             &Some(config_json),
             None,
             &arkflow_core::Resource {
@@ -300,7 +300,7 @@ mod pulsar_tests {
 
         let builder = arkflow_plugin::input::pulsar::PulsarInputBuilder;
         let result = builder.build(
-            Some(&"test-input".to_string()),
+            Some("test-input"),
             &Some(config_json),
             None,
             &arkflow_core::Resource {
@@ -325,7 +325,7 @@ mod pulsar_tests {
 
         let builder = arkflow_plugin::output::pulsar::PulsarOutputBuilder;
         let result = builder.build(
-            Some(&"test-output".to_string()),
+            Some("test-output"),
             &Some(config_json),
             None,
             &arkflow_core::Resource {
@@ -347,7 +347,7 @@ mod pulsar_tests {
 
         let builder = arkflow_plugin::output::pulsar::PulsarOutputBuilder;
         let result = builder.build(
-            Some(&"test-output".to_string()),
+            Some("test-output"),
             &Some(config_json),
             None,
             &arkflow_core::Resource {

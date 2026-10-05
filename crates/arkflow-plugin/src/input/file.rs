@@ -157,10 +157,10 @@ struct FileInput {
 }
 
 impl FileInput {
-    fn new(name: Option<&String>, config: FileInputConfig) -> Result<Self, Error> {
+    fn new(name: Option<&str>, config: FileInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             config,
             stream: Arc::new(Mutex::new(None)),
             cancellation_token,
@@ -460,7 +460,7 @@ struct FileBuilder;
 impl InputBuilder for FileBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

@@ -268,7 +268,7 @@ pub fn validate_config(config: &EngineConfig) -> ConfigValidationReport {
             message: error.to_string(),
         });
     }
-    if let Err(error) = config.health_check.validate_hub_urls() {
+    if let Err(error) = config.node.agent.validate_hub_urls() {
         errors.push(ConfigIssue {
             path: "health_check.hub_urls".to_string(),
             message: error.to_string(),
@@ -336,7 +336,7 @@ pub fn parse_and_validate(
 }
 
 /// Return a copy of a JSON value with credential-like fields redacted.
-pub fn redact_secrets(value: &Value) -> Value {
+pub(crate) fn redact_secrets(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
             let mut redacted = Map::new();
@@ -553,7 +553,10 @@ mod tests {
         };
         let config = candidate.parse().unwrap();
         std::env::remove_var("ARKFLOW_CP_TEST_TOKEN");
-        assert_eq!(config.health_check.api_token.as_deref(), Some("from-env"));
+        assert_eq!(
+            config.node.control_api.api_token.as_deref(),
+            Some("from-env")
+        );
     }
 
     #[test]

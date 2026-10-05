@@ -7,9 +7,11 @@
 
 use crate::executor::graph::ExecutionGraphBuilder;
 use crate::executor::kernel_handle::KernelJobRunner;
-use crate::executor::task::{
-    run_graph, run_graph_with_hooks, run_graph_with_metrics_startup, CheckpointHook,
-};
+use crate::executor::task::run_graph_with_metrics_startup;
+#[cfg(test)]
+use crate::executor::task::CheckpointHook;
+#[cfg(test)]
+use crate::executor::task::{run_graph, run_graph_with_hooks};
 use crate::job::{JobComponentAdapter, JobPlan, JobSpec};
 use crate::Error;
 use crate::Resource;
@@ -54,19 +56,6 @@ pub async fn run_job<A: JobComponentAdapter>(
     run_job_with_metrics(spec, adapter, resource, cancellation, None).await
 }
 
-/// Run a local Job through the same command-driven kernel runner used by an
-/// Agent.  Jobs with a checkpoint section get an embedded interval driver;
-/// jobs without one still use the same graph, state, and event-time setup but
-/// do not create a checkpoint task.
-pub async fn run_job_with_checkpoints<A: JobComponentAdapter>(
-    spec: &JobSpec,
-    adapter: &A,
-    resource: &mut Resource,
-    cancellation: CancellationToken,
-) -> Result<(), Error> {
-    run_job_with_checkpoints_started(spec, adapter, resource, cancellation, None, None).await
-}
-
 /// Run a local Job and notify the caller once the graph's resource startup
 /// has completed. The notification is used by the Engine to delay readiness
 /// until component construction and resource connection have actually
@@ -74,7 +63,7 @@ pub async fn run_job_with_checkpoints<A: JobComponentAdapter>(
 /// callers. When `metrics_registry` is `Some`, the spawned Job's
 /// `KernelMetrics` are registered under the Job id for observability export
 /// and unregistered once the run finishes.
-pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
+pub(crate) async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
     spec: &JobSpec,
     adapter: &A,
     resource: &mut Resource,
@@ -308,7 +297,7 @@ pub async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
 /// Run a JobSpec with runtime metrics: per-batch counters update the shared
 /// `RuntimeMetrics` (input/processing/output/errors) so control-plane
 /// snapshots observe kernel activity.
-pub async fn run_job_with_metrics<A: JobComponentAdapter>(
+pub(crate) async fn run_job_with_metrics<A: JobComponentAdapter>(
     spec: &JobSpec,
     adapter: &A,
     resource: &mut Resource,
@@ -321,7 +310,7 @@ pub async fn run_job_with_metrics<A: JobComponentAdapter>(
 /// Metrics-enabled local Job runner with an optional startup handshake. The
 /// sender is completed by the graph runner only after temporary stores,
 /// sources, sinks, and state backends have connected successfully.
-pub async fn run_job_with_metrics_started<A: JobComponentAdapter>(
+pub(crate) async fn run_job_with_metrics_started<A: JobComponentAdapter>(
     spec: &JobSpec,
     adapter: &A,
     resource: &mut Resource,
@@ -342,41 +331,6 @@ pub async fn run_job_with_metrics_started<A: JobComponentAdapter>(
         state.close()?;
     }
     result
-}
-
-/// Run a JobPlan's assigned task subset (Agent mode). The assignment must not
-/// split an edge across the co-location boundary.
-pub async fn run_job_tasks<A: JobComponentAdapter>(
-    plan: &JobPlan,
-    task_ids: &[String],
-    adapter: &A,
-    resource: &mut Resource,
-    cancellation: CancellationToken,
-) -> Result<(), Error> {
-    let mut graph =
-        ExecutionGraphBuilder::default().build_subgraph(plan, task_ids, adapter, resource, None)?;
-    graph.temporaries = resource.temporary.values().cloned().collect();
-    run_graph(graph, cancellation).await
-}
-
-/// Run a whole JobSpec with per-chain checkpoint hooks (entry task id →
-/// hook). Used by callers that drive a `BarrierCoordinator`.
-pub async fn run_job_with_hooks<A: JobComponentAdapter>(
-    spec: &JobSpec,
-    adapter: &A,
-    resource: &mut Resource,
-    cancellation: CancellationToken,
-    hooks: BTreeMap<String, CheckpointHook>,
-) -> Result<(), Error> {
-    let plan = JobPlan::compile(spec.clone())?;
-    let state = local_state_backend(&plan)?;
-    let builder = match state {
-        Some(state) => ExecutionGraphBuilder::default().with_state(state),
-        None => ExecutionGraphBuilder::default(),
-    };
-    let mut graph = builder.build(&plan, adapter, resource)?;
-    graph.temporaries = resource.temporary.values().cloned().collect();
-    run_graph_with_hooks(graph, cancellation, hooks).await
 }
 
 /// Build the durable local state backend described by a Job.  Streams that
@@ -1183,8 +1137,57 @@ fn local_checkpoint_root(uri: &str) -> Result<PathBuf, Error> {
     Ok(PathBuf::from(uri))
 }
 
+#[cfg(test)]
+/// Run a local Job through the same command-driven kernel runner used by an
+/// Agent.  Jobs with a checkpoint section get an embedded interval driver;
+/// jobs without one still use the same graph, state, and event-time setup but
+/// do not create a checkpoint task.
+pub(crate) async fn run_job_with_checkpoints<A: JobComponentAdapter>(
+    spec: &JobSpec,
+    adapter: &A,
+    resource: &mut Resource,
+    cancellation: CancellationToken,
+) -> Result<(), Error> {
+    run_job_with_checkpoints_started(spec, adapter, resource, cancellation, None, None).await
+}
+#[cfg(test)]
+/// Run a JobPlan's assigned task subset (Agent mode). The assignment must not
+/// split an edge across the co-location boundary.
+pub(crate) async fn run_job_tasks<A: JobComponentAdapter>(
+    plan: &JobPlan,
+    task_ids: &[String],
+    adapter: &A,
+    resource: &mut Resource,
+    cancellation: CancellationToken,
+) -> Result<(), Error> {
+    let mut graph =
+        ExecutionGraphBuilder::default().build_subgraph(plan, task_ids, adapter, resource, None)?;
+    graph.temporaries = resource.temporary.values().cloned().collect();
+    run_graph(graph, cancellation).await
+}
+#[cfg(test)]
+/// Run a whole JobSpec with per-chain checkpoint hooks (entry task id →
+/// hook). Used by callers that drive a `BarrierCoordinator`.
+pub(crate) async fn run_job_with_hooks<A: JobComponentAdapter>(
+    spec: &JobSpec,
+    adapter: &A,
+    resource: &mut Resource,
+    cancellation: CancellationToken,
+    hooks: BTreeMap<String, CheckpointHook>,
+) -> Result<(), Error> {
+    let plan = JobPlan::compile(spec.clone())?;
+    let state = local_state_backend(&plan)?;
+    let builder = match state {
+        Some(state) => ExecutionGraphBuilder::default().with_state(state),
+        None => ExecutionGraphBuilder::default(),
+    };
+    let mut graph = builder.build(&plan, adapter, resource)?;
+    graph.temporaries = resource.temporary.values().cloned().collect();
+    run_graph_with_hooks(graph, cancellation, hooks).await
+}
+#[cfg(test)]
 /// Convenience for building the shared `Resource` outside the executor.
-pub fn shared_resource(resource: Resource) -> std::sync::Arc<Resource> {
+pub(crate) fn shared_resource(resource: Resource) -> std::sync::Arc<Resource> {
     // `Resource` is not `Sync` (its `input_names` RefCell is only touched
     // during the single-threaded build phase), so this Arc is shared for
     // cheap cloning, never for cross-thread mutation of that field.
@@ -3248,7 +3251,7 @@ mod runner_tests {
     impl InputBuilder for EofInputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &Resource,
@@ -3264,7 +3267,7 @@ mod runner_tests {
     impl OutputBuilder for DevNullOutputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &Resource,
@@ -3403,7 +3406,7 @@ mod runner_tests {
     impl crate::processor::ProcessorBuilder for PassThroughProcessorBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _resource: &Resource,
         ) -> Result<Arc<dyn Processor>, Error> {

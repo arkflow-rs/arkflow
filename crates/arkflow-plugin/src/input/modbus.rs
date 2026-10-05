@@ -224,7 +224,7 @@ struct ModbusInputBuilder;
 impl InputBuilder for ModbusInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<Value>,
         codec: Option<Arc<dyn arkflow_core::codec::Codec>>,
         _resource: &Resource,
@@ -243,7 +243,7 @@ impl InputBuilder for ModbusInputBuilder {
             .ok_or(Error::Process("Modbus input config is missing".to_string()))?;
         let config: ModbusInputConfig = serde_json::from_value(config.clone())
             .map_err(|e| Error::Process(format!("Failed to parse modbus input config:{}", e)))?;
-        Ok(Arc::new(ModbusInput::new(config, name.cloned())))
+        Ok(Arc::new(ModbusInput::new(config, name.map(str::to_string))))
     }
 }
 

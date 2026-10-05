@@ -37,7 +37,7 @@ tokio::task_local! {
 /// staging call so the affected chain surfaces the error instead of growing
 /// memory without limit.
 #[derive(Debug, Clone, Copy)]
-pub struct JournalLimits {
+pub(crate) struct JournalLimits {
     /// Maximum number of simultaneously registered transactions (one per
     /// unacknowledged output / open window group).
     pub max_pending_transactions: usize,
@@ -113,7 +113,7 @@ impl StagedMutation {
 /// Handle for one staging group. `Copy` by design: the journal tracks the
 /// group's lifecycle, making `apply`/`complete`/`undo`/`rollback` idempotent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct StateTxn {
+pub(crate) struct StateTxn {
     id: u64,
 }
 
@@ -139,7 +139,7 @@ enum TxnState {
 /// still need to undo that already-completed state change; dropping the
 /// pre-apply values at `complete` would make that impossible.
 #[derive(Debug, Clone)]
-pub struct StateRollback {
+pub(crate) struct StateRollback {
     txn: StateTxn,
     mutations: Vec<StagedMutation>,
     previous: Vec<Option<StateEntry>>,
@@ -182,7 +182,7 @@ impl JournalInner {
 }
 
 /// The execution-local mutation journal over one state backend.
-pub struct StateJournal {
+pub(crate) struct StateJournal {
     backend: Arc<dyn StateBackend>,
     inner: Mutex<JournalInner>,
     /// Serialize backend mutations and their journal version transitions.
@@ -237,10 +237,12 @@ impl StateJournal {
 
     /// The committed-only backend. Barrier snapshots read through this handle
     /// so a checkpoint captures the applied epoch, never the pending overlay.
+    #[cfg(test)]
     pub fn backend(&self) -> &Arc<dyn StateBackend> {
         &self.backend
     }
 
+    #[cfg(test)]
     pub fn pending_transactions(&self) -> usize {
         self.inner.lock().unwrap().txns.len()
     }
@@ -370,6 +372,7 @@ impl StateJournal {
             .cloned()
     }
 
+    #[cfg(test)]
     pub fn staged_bytes(&self) -> usize {
         self.inner.lock().unwrap().staged_bytes
     }
@@ -431,6 +434,7 @@ impl StateJournal {
     }
 
     /// Stage a raw put.
+    #[cfg(test)]
     pub fn put(
         &self,
         txn: StateTxn,
@@ -961,7 +965,7 @@ impl StateJournal {
 /// If the wrapped acknowledgement fails after the apply, the transaction is
 /// undone: the source position stays uncommitted, the record replays, and the
 /// replayed mutation applies exactly once.
-pub struct CommitOnAck {
+pub(crate) struct CommitOnAck {
     journal: Arc<StateJournal>,
     txn: StateTxn,
     inner: Arc<dyn Ack>,
@@ -973,7 +977,7 @@ pub struct CommitOnAck {
 /// single output; keeping the source acknowledgement inside this composite is
 /// what lets a source failure undo every group instead of leaving finalized
 /// window state behind.
-pub struct CommitGroupOnAck {
+pub(crate) struct CommitGroupOnAck {
     journal: Arc<StateJournal>,
     txns: Vec<StateTxn>,
     inner: Arc<dyn Ack>,

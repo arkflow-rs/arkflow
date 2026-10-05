@@ -1303,7 +1303,7 @@ impl Hub {
         if attempt.operation == "apply_configuration" {
             if let Some(payload) = &attempt.payload_json {
                 if payload.contains("secret:") {
-                    match arkflow_core::secret::resolve_candidate_payload(payload.clone()) {
+                    match super::secret_dispatch::resolve_candidate_payload(payload.clone()) {
                         Ok(Some(resolved)) => attempt.payload_json = Some(resolved),
                         Ok(None) => {}
                         Err(error) => {

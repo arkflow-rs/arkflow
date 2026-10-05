@@ -34,13 +34,13 @@ use crate::processor::Processor;
 use crate::{Error, MessageBatch, MessageBatchRef, ProcessResult};
 
 /// The input-side tag column written by the chain loop for join chains.
-pub const META_INPUT_INDEX: &str = "__meta_input_index";
+pub(crate) const META_INPUT_INDEX: &str = "__meta_input_index";
 
 /// Join flavour: matched pairs always emit; outer forms additionally emit
 /// the outer side's never-matched rows once the match window closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum JoinType {
+pub(crate) enum JoinType {
     #[default]
     Inner,
     LeftOuter,
@@ -72,7 +72,7 @@ impl JoinType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JoinOperatorConfig {
+pub(crate) struct JoinOperatorConfig {
     /// Upstream operator id feeding the left side. Required for graphs with
     /// more than one inbound edge: channel ordering is a kernel-internal
     /// detail, so sides are declared by producer identity, not position.
@@ -237,7 +237,7 @@ struct PendingUnmatched {
     right: VecDeque<MatchedRow>,
 }
 
-pub struct JoinOperator {
+pub(crate) struct JoinOperator {
     config: JoinOperatorConfig,
     /// Resolved channel indices for the left and right sides, in the chain's
     /// receiver order (see `JoinOperator::new`).

@@ -17,9 +17,6 @@ use arkflow_core::codec::{Codec, CodecConfig};
 use arkflow_core::temporary::{Temporary, TemporaryBuilder};
 use arkflow_core::{temporary, Error, MessageBatch, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::array::AsArray;
-use datafusion::common::ScalarValue;
-use datafusion::logical_expr::ColumnarValue;
 use redis::aio::ConnectionLike;
 use redis::{cmd, Pipeline};
 use serde::{Deserialize, Serialize};
@@ -56,7 +53,7 @@ impl Temporary for RedisTemporary {
         Ok(())
     }
 
-    async fn get(&self, keys: &[ColumnarValue]) -> Result<Option<MessageBatch>, Error> {
+    async fn get(&self, keys: &[String]) -> Result<Option<MessageBatch>, Error> {
         let cli_lock = self.cli.read().await;
         let Some(cli) = cli_lock.as_ref() else {
             return Err(Error::Disconnection);
@@ -64,14 +61,10 @@ impl Temporary for RedisTemporary {
 
         let mut connection = cli.clone();
 
-        assert_eq!(keys.len(), 1, "only have a single key");
-
         let data: Vec<Vec<String>> = match self.config.redis_type {
             RedisType::List => {
-                let key = &keys[0];
-                let key = Self::get_key(key);
-                let mut pipeline = Pipeline::with_capacity(key.len());
-                for x in key {
+                let mut pipeline = Pipeline::with_capacity(keys.len());
+                for x in keys {
                     pipeline.lrange(x, 0, -1);
                 }
 
@@ -83,9 +76,8 @@ impl Temporary for RedisTemporary {
                     })?
             }
             RedisType::String => {
-                let key = &keys[0];
                 let mut mget = cmd("mget");
-                let key = Self::get_key(key).into_iter().collect::<HashSet<_>>();
+                let key = keys.iter().collect::<HashSet<_>>();
                 for x in key {
                     mget.arg(x);
                 }
@@ -133,23 +125,6 @@ impl RedisTemporary {
             codec,
             cli: Arc::new(RwLock::new(None)),
         })
-    }
-
-    fn get_key(key: &ColumnarValue) -> Vec<&str> {
-        let mut vec = Vec::with_capacity(1);
-        match key {
-            ColumnarValue::Array(array) => {
-                for s in array.as_string::<i32>() {
-                    vec.push(s.unwrap());
-                }
-            }
-            ColumnarValue::Scalar(s) => {
-                if let ScalarValue::Utf8(str) = &s {
-                    vec.push(str.as_ref().unwrap());
-                }
-            }
-        }
-        vec
     }
 }
 

@@ -179,7 +179,7 @@ struct DebeziumJsonCodecBuilder;
 impl CodecBuilder for DebeziumJsonCodecBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         _config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Codec>, Error> {

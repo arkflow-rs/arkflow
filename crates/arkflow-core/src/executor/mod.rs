@@ -28,20 +28,18 @@ pub mod window;
 #[cfg(test)]
 mod tests;
 
-pub use barrier::{Aligner, BarrierCoordinator, ChainSnapshot};
-pub use commit::{AckAdvance, CheckpointCut, CommitFrontier, PartitionKey};
+pub use commit::{AckAdvance, CommitFrontier};
 pub use envelope::Envelope;
-pub use graph::{
-    Chain, EdgeTarget, ExecutionGraph, ExecutionGraphBuilder, DEFAULT_CHANNEL_CAPACITY,
-};
-pub use job_runner_adapter::{
-    run_job, run_job_tasks, run_job_with_checkpoints, run_job_with_checkpoints_started,
-    run_job_with_hooks, run_job_with_metrics, run_job_with_metrics_started,
-};
-pub use resource_guard::JobResourceGuard;
-pub use state_journal::{CommitOnAck, JournalLimits, StateJournal, StateTxn};
-pub use stream_adapter::{StreamJobAdapter, WalInput};
-pub use task::{run_graph, run_graph_with_hooks, run_graph_with_metrics, CheckpointHook};
-pub use window::{
-    AggregateBuffer, ColumnarWindowOperator, WindowKind, WindowOperatorConfig, WindowTrigger,
-};
+pub use graph::{Chain, ExecutionGraphBuilder};
+pub use job_runner_adapter::run_job;
+pub use stream_adapter::StreamJobAdapter;
+
+// Internal aliases kept for in-crate call sites (tests, runtime) that import
+// through this module.
+#[cfg(test)]
+pub(crate) use barrier::BarrierCoordinator;
+#[cfg(test)]
+pub(crate) use graph::ExecutionGraph;
+pub(crate) use job_runner_adapter::run_job_with_metrics_started;
+#[cfg(test)]
+pub(crate) use task::run_graph;

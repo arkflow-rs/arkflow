@@ -77,7 +77,7 @@ pub(crate) fn override_sink_write_timeout_for_tests(timeout: std::time::Duration
 /// Optional per-chain checkpoint hook: barriers injected at sources are
 /// forwarded with data; chains report snapshots through the sender.
 #[derive(Clone, Default)]
-pub struct CheckpointHook {
+pub(crate) struct CheckpointHook {
     /// Report snapshots for this chain's entry task (source chains report
     /// their input positions; stateful chains report their keyed state).
     pub reporter: Option<tokio::sync::mpsc::UnboundedSender<super::barrier::ChainSnapshot>>,
@@ -104,7 +104,8 @@ pub struct CheckpointHook {
     pub finished_reporter: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
-pub async fn run_graph(
+#[cfg(test)]
+pub(crate) async fn run_graph(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
@@ -114,7 +115,8 @@ pub async fn run_graph(
 /// Run the graph with runtime metrics: source chains count input
 /// batches/rows, processing errors and outputs update on every envelope
 /// result, mirroring the legacy runtime counters.
-pub async fn run_graph_with_metrics(
+#[cfg(test)]
+pub(crate) async fn run_graph_with_metrics(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
     metrics: Option<Arc<crate::runtime::RuntimeMetrics>>,
@@ -150,7 +152,8 @@ pub(crate) async fn run_graph_with_metrics_startup(
 
 /// Compatibility wrapper for the retired global checkpoint gate. Barriers are
 /// now ordered control envelopes; the supplied gate is intentionally ignored.
-pub async fn run_graph_with_gate(
+#[cfg(test)]
+pub(crate) async fn run_graph_with_gate(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
     gate: super::kernel_handle::SnapshotGate,
@@ -160,7 +163,8 @@ pub async fn run_graph_with_gate(
 }
 
 /// Run the graph with per-chain checkpoint hooks keyed by entry task id.
-pub async fn run_graph_with_hooks(
+#[cfg(test)]
+pub(crate) async fn run_graph_with_hooks(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
     hooks: BTreeMap<String, CheckpointHook>,
@@ -183,7 +187,8 @@ pub(crate) async fn run_graph_with_hooks_startup(
 /// Compatibility wrapper for callers that still pass the retired global gate.
 /// The barrier path itself remains fully asynchronous and does not acquire a
 /// job-wide read/write lock.
-pub async fn run_graph_with_hooks_and_gate(
+#[cfg(test)]
+pub(crate) async fn run_graph_with_hooks_and_gate(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
     hooks: BTreeMap<String, CheckpointHook>,
@@ -613,10 +618,7 @@ async fn run_source_chain(
                                 .unwrap_or_else(|| chain.entry_task_id().to_owned());
                             let _ = reporter.send(super::barrier::ChainSnapshot {
                                 task_id: task_id.clone(),
-                                attempt_id: format!("{task_id}-attempt"),
-                                partition: hook.partition.unwrap_or_default(),
                                 barrier: barrier.clone(),
-                                cut_generation: cut.generation,
                                 state,
                                 source_positions: cut.positions,
                                 watermark_ms: cut.watermark_ms,
@@ -1666,10 +1668,7 @@ async fn handle_completed_barrier_inner(
                     .unwrap_or_else(|| chain.entry_task_id().to_owned());
                 let _ = reporter.send(super::barrier::ChainSnapshot {
                     task_id: task_id.clone(),
-                    attempt_id: format!("{task_id}-attempt"),
-                    partition: hook.partition.unwrap_or_default(),
                     barrier: barrier.clone(),
-                    cut_generation: barrier.generation,
                     state,
                     source_positions: Vec::new(),
                     watermark_ms: None,
@@ -5304,7 +5303,6 @@ mod task_loop_tests {
         chain.source = Some(ScriptSource::idle());
         let hook = CheckpointHook {
             event_time_gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
-            partition: Some(0),
             ..Default::default()
         };
         let error = settle(tokio::spawn(run_chain(

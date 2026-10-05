@@ -40,7 +40,7 @@ pub trait Buffer: Send + Sync {
 pub trait BufferBuilder: Send + Sync {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Buffer>, Error>;
@@ -62,7 +62,7 @@ impl BufferConfig {
         let builders = BUFFER_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.buffer_type) {
-            builder.build(self.name.as_ref(), &self.config, resource)
+            builder.build(self.name.as_deref(), &self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown buffer type: {}",

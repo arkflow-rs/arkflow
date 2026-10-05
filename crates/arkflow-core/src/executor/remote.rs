@@ -68,15 +68,15 @@ use tokio::time::timeout;
 
 /// Upper bound on one frame's payload. A frame declares its length up front;
 /// anything past this bound is a protocol error rather than an allocation.
-pub const MAX_FRAME_LEN: u32 = 1 << 28;
+pub(crate) const MAX_FRAME_LEN: u32 = 1 << 28;
 
 /// Version of the authenticated data-plane handshake.  A version mismatch
 /// is a protocol error rather than a best-effort downgrade.
-pub const DATA_PLANE_PROTOCOL_VERSION: u16 = 1;
+pub(crate) const DATA_PLANE_PROTOCOL_VERSION: u16 = 1;
 const HANDSHAKE_NONCE_LEN: usize = 32;
 
 /// Fixed frame header length: six little-endian `u32`s.
-pub const FRAME_HEADER_LEN: usize = 24;
+pub(crate) const FRAME_HEADER_LEN: usize = 24;
 
 /// Routing identity of one (upstream task subtask → downstream subtask)
 /// channel. All frames on the wire address a quad; one TCP connection serves
@@ -92,7 +92,7 @@ pub struct Quad {
 /// Wire frame kinds. `0` is never valid so an all-zero (zeroed-memory) header
 /// is rejected instead of silently misparsed.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum FrameKind {
+pub(crate) enum FrameKind {
     /// A [`MessageBatch`] in Arrow IPC form.
     Data = 1,
     /// A serialized [`WireSignal`].
@@ -120,7 +120,7 @@ impl FrameKind {
 
 /// Fixed 24-byte frame header preceding every payload.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct FrameHeader {
+pub(crate) struct FrameHeader {
     pub quad: Quad,
     /// Payload length in bytes; never exceeds [`MAX_FRAME_LEN`].
     pub len: u32,
@@ -128,6 +128,10 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
+    #[cfg(test)]
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode_with_max(bytes, MAX_FRAME_LEN)
+    }
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         out.reserve(FRAME_HEADER_LEN);
         out.extend_from_slice(&self.quad.src_op.to_le_bytes());
@@ -136,10 +140,6 @@ impl FrameHeader {
         out.extend_from_slice(&self.quad.dst_subtask.to_le_bytes());
         out.extend_from_slice(&self.len.to_le_bytes());
         out.extend_from_slice(&(self.kind as u32).to_le_bytes());
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        Self::decode_with_max(bytes, MAX_FRAME_LEN)
     }
 
     pub fn decode_with_max(bytes: &[u8], max_frame_len: u32) -> Result<Self, Error> {
@@ -400,7 +400,7 @@ fn canonical_handshake_bytes(payload: &HandshakePayload, direction: &[u8]) -> Ve
 /// Control elements that travel alongside data on a remote edge, in the same
 /// strict FIFO order as the in-process `Envelope` they encode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WireSignal {
+pub(crate) enum WireSignal {
     Barrier(CheckpointBarrier),
     Watermark(i64),
     Eos,
@@ -434,7 +434,7 @@ impl WireSignal {
 /// failure), letting the upstream abort the branch immediately instead of
 /// waiting for the barrier-drain timeout.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReceiptKind {
+pub(crate) enum ReceiptKind {
     Acked,
     Held,
     Released,
@@ -442,7 +442,7 @@ pub enum ReceiptKind {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReceiptFrame {
+pub(crate) struct ReceiptFrame {
     pub kind: ReceiptKind,
     /// Sender-assigned sequence number of the data frame this receipt refers
     /// to. Sequence numbers are per quad channel and start at 0.
@@ -474,7 +474,7 @@ struct WireDataMeta {
 /// observes a new dictionary. A mid-connection schema change re-sends the
 /// schema so the receiver's cache tracks it; a stream edge's schema is fixed
 /// by the plan, so in practice this never fires.
-pub struct DataEncoder {
+pub(crate) struct DataEncoder {
     generator: IpcDataGenerator,
     tracker: DictionaryTracker,
     options: IpcWriteOptions,
@@ -548,7 +548,7 @@ impl DataEncoder {
 /// schema (the encoder guarantees it) — a frame referencing an unknown schema
 /// id is a protocol error.
 #[derive(Default)]
-pub struct DataDecoder {
+pub(crate) struct DataDecoder {
     schema: Option<(u64, SchemaRef)>,
     dictionaries: HashMap<i64, ArrayRef>,
 }
@@ -748,16 +748,30 @@ fn hash_schema(schema: &Schema) -> u64 {
 // Frame framing over async sockets
 // ---------------------------------------------------------------------------
 
+/// Reads a frame while applying the configured payload and per-read idle
+/// limits.  The header is decoded before allocating the payload buffer.
+#[cfg(test)]
 /// Reads one frame: a 24-byte header followed by its payload.
-pub async fn read_frame(
+#[cfg(test)]
+/// Writes one frame: header then payload, ideally buffered behind the caller's
+/// `BufWriter` so small frames coalesce until the flush tick.
+pub(crate) async fn write_frame(
+    writer: &mut (impl AsyncWrite + Unpin),
+    quad: Quad,
+    kind: FrameKind,
+    payload: &[u8],
+) -> Result<(), Error> {
+    write_frame_with_limit(writer, quad, kind, payload, MAX_FRAME_LEN).await
+}
+
+#[cfg(test)]
+pub(crate) async fn read_frame(
     reader: &mut (impl AsyncRead + Unpin),
 ) -> Result<(FrameHeader, Vec<u8>), Error> {
     read_frame_with_limits(reader, MAX_FRAME_LEN, None).await
 }
 
-/// Reads a frame while applying the configured payload and per-read idle
-/// limits.  The header is decoded before allocating the payload buffer.
-pub async fn read_frame_with_limits(
+pub(crate) async fn read_frame_with_limits(
     reader: &mut (impl AsyncRead + Unpin),
     max_frame_len: u32,
     idle_timeout: Option<std::time::Duration>,
@@ -872,18 +886,7 @@ async fn read_exact_with_idle(
     Ok(())
 }
 
-/// Writes one frame: header then payload, ideally buffered behind the caller's
-/// `BufWriter` so small frames coalesce until the flush tick.
-pub async fn write_frame(
-    writer: &mut (impl AsyncWrite + Unpin),
-    quad: Quad,
-    kind: FrameKind,
-    payload: &[u8],
-) -> Result<(), Error> {
-    write_frame_with_limit(writer, quad, kind, payload, MAX_FRAME_LEN).await
-}
-
-pub async fn write_frame_with_limit(
+pub(crate) async fn write_frame_with_limit(
     writer: &mut (impl AsyncWrite + Unpin),
     quad: Quad,
     kind: FrameKind,
@@ -935,7 +938,7 @@ pub trait EdgeTransport: Send + Sync {
 /// TCP transport with bounded exponential backoff, mirroring Arroyo's
 /// `OutNetworkLink::connect`.
 #[derive(Clone)]
-pub struct TcpEdgeTransport {
+pub(crate) struct TcpEdgeTransport {
     pub addr: std::net::SocketAddr,
     pub max_attempts: usize,
     /// When set, the outbound connection completes the fleet-CA mTLS
@@ -999,7 +1002,8 @@ impl EdgeTransport for TcpEdgeTransport {
 /// Plaintext transport constructor for tests and existing call sites; the
 /// TLS-carrying form is built by the graph from the job's edge context.
 impl TcpEdgeTransport {
-    pub fn plaintext(addr: std::net::SocketAddr, max_attempts: usize) -> Self {
+    #[cfg(test)]
+    pub(crate) fn plaintext(addr: std::net::SocketAddr, max_attempts: usize) -> Self {
         Self {
             addr,
             max_attempts,
@@ -1054,7 +1058,7 @@ pub struct DataPlaneTlsConfig {
 /// The fixed SNI/ServerName the outbound side verifies and node
 /// certificates must carry as a SAN. Node identity itself is proven by the
 /// HMAC handshake, so the name is only the chain-verification carrier.
-pub const DATA_PLANE_TLS_SERVER_NAME: &str = "arkflow-data-plane";
+pub(crate) const DATA_PLANE_TLS_SERVER_NAME: &str = "arkflow-data-plane";
 
 impl DataPlaneTlsConfig {
     /// Build both directions from PEM material. Any parse or key-mismatch
@@ -1247,7 +1251,7 @@ impl NetworkManagerConfig {
 /// downstream chain wraps every decoded remote batch in one of these; the
 /// kernel's existing fan-out and state wrappers compose on top of it exactly
 /// as they do around local acknowledgements.
-pub struct RemoteAck {
+pub(crate) struct RemoteAck {
     outbox: flume::Sender<(Quad, ReceiptFrame)>,
     quad: Quad,
     seq: u64,
@@ -1535,7 +1539,7 @@ impl PendingReceipts {
 /// Capture the current span context as a W3C `traceparent` string, or `None`
 /// when the current context carries no valid span — including tracing being
 /// disabled entirely, which keeps barriers byte-identical on the wire.
-pub fn capture_trace_context() -> Option<String> {
+pub(crate) fn capture_trace_context() -> Option<String> {
     use opentelemetry::propagation::TextMapPropagator as _;
     use opentelemetry::trace::TraceContextExt as _;
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -1552,7 +1556,7 @@ pub fn capture_trace_context() -> Option<String> {
 /// Extract a remote parent context from a barrier's captured `traceparent`.
 /// Returns `None` for absent or unparsable values so a malformed hop can
 /// never detach a downstream span from its local parent.
-pub fn extract_trace_context(trace_context: &str) -> Option<opentelemetry::Context> {
+pub(crate) fn extract_trace_context(trace_context: &str) -> Option<opentelemetry::Context> {
     use opentelemetry::propagation::TextMapPropagator as _;
     use opentelemetry::trace::TraceContextExt as _;
 

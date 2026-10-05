@@ -18,7 +18,6 @@
 
 use crate::{Error, MessageBatch, Resource};
 use async_trait::async_trait;
-use datafusion::logical_expr::ColumnarValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -39,7 +38,7 @@ pub struct TemporaryConfig {
 #[async_trait]
 pub trait Temporary: Send + Sync {
     async fn connect(&self) -> Result<(), Error>;
-    async fn get(&self, keys: &[ColumnarValue]) -> Result<Option<MessageBatch>, Error>;
+    async fn get(&self, keys: &[String]) -> Result<Option<MessageBatch>, Error>;
     async fn close(&self) -> Result<(), Error>;
 }
 

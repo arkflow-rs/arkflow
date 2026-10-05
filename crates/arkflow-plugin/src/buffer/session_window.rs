@@ -179,7 +179,7 @@ impl BufferBuilder for SessionWindowBuilder {
     /// * `Result<Arc<dyn Buffer>, Error>` - A new session window buffer instance or an error
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Buffer>, Error> {
@@ -410,7 +410,7 @@ mod tests {
         });
 
         let result = builder.build(
-            Some(&"test-buffer".to_string()),
+            Some("test-buffer"),
             &Some(config_json),
             &create_test_resource(),
         );
@@ -426,7 +426,7 @@ mod tests {
         });
 
         let result = builder.build(
-            Some(&"test-buffer".to_string()),
+            Some("test-buffer"),
             &Some(config_json),
             &create_test_resource(),
         );
@@ -437,11 +437,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_window_builder_without_config() {
         let builder = SessionWindowBuilder;
-        let result = builder.build(
-            Some(&"test-buffer".to_string()),
-            &None,
-            &create_test_resource(),
-        );
+        let result = builder.build(Some("test-buffer"), &None, &create_test_resource());
 
         assert!(result.is_err());
     }

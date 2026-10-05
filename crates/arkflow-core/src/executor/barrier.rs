@@ -35,15 +35,19 @@ pub(crate) fn override_snapshot_timeout_for_tests(timeout: std::time::Duration) 
     );
 }
 
-use crate::checkpoint::{CheckpointBarrier, CheckpointCoordinator, TaskCheckpointAck};
+use crate::checkpoint::CheckpointBarrier;
+#[cfg(test)]
+use crate::checkpoint::{CheckpointCoordinator, TaskCheckpointAck};
+#[cfg(test)]
 use crate::job::{JobId, JobVersion};
 use crate::state::{StateBackend, StateSnapshot};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 /// Alignment state for one inbound channel while a barrier is in flight.
-pub struct Aligner {
+pub(crate) struct Aligner {
     /// Envelopes buffered from inputs whose barrier has not yet arrived.
     buffered: BTreeMap<usize, Vec<super::envelope::Envelope>>,
     /// Indices of inputs whose barrier has arrived.
@@ -249,17 +253,9 @@ impl Aligner {
 }
 
 /// A chain's snapshot report for one barrier.
-pub struct ChainSnapshot {
+pub(crate) struct ChainSnapshot {
     pub task_id: String,
-    pub attempt_id: String,
-    pub partition: u32,
     pub barrier: CheckpointBarrier,
-    /// Generation of the sealed acknowledged cut this report belongs to.
-    /// Source chains seal the cut (positions + watermark) at barrier
-    /// injection; interior chains inherit the barrier's identity, so a
-    /// report's positions, watermark, barrier, and attempt all reference one
-    /// cut generation.
-    pub cut_generation: u64,
     pub state: StateSnapshot,
     pub source_positions: Vec<crate::checkpoint::SourcePosition>,
     pub watermark_ms: Option<i64>,
@@ -272,7 +268,8 @@ pub struct ChainSnapshot {
 /// the acknowledged cut from chain snapshots and hands the result to callers.
 /// Persisting checkpoint manifests is owned by the Agent/Engine wiring (local
 /// checkpoint loop or hub-driven checkpoint commands), not this type.
-pub struct BarrierCoordinator {
+#[cfg(test)]
+pub(crate) struct BarrierCoordinator {
     job_id: JobId,
     job_version: JobVersion,
     generation: u64,
@@ -284,6 +281,7 @@ pub struct BarrierCoordinator {
     last_error: std::sync::Mutex<Option<crate::Error>>,
 }
 
+#[cfg(test)]
 impl BarrierCoordinator {
     pub fn new(
         job_id: JobId,
@@ -338,8 +336,8 @@ impl BarrierCoordinator {
                     }
                     let ack = TaskCheckpointAck {
                         task_id: report.task_id.clone(),
-                        attempt_id: report.attempt_id.clone(),
-                        partition: report.partition,
+                        attempt_id: format!("{}-attempt", report.task_id),
+                        partition: 0,
                         checkpoint_id: barrier.checkpoint_id.clone(),
                         generation: barrier.generation,
                         state: report.state.clone(),
@@ -386,7 +384,9 @@ impl BarrierCoordinator {
 
 /// Snapshot helper shared by chains: capture a state backend snapshot without
 /// blocking the caller's event loop (spawn_blocking-friendly).
-pub async fn snapshot_state(backend: Arc<dyn StateBackend>) -> Result<StateSnapshot, crate::Error> {
+pub(crate) async fn snapshot_state(
+    backend: Arc<dyn StateBackend>,
+) -> Result<StateSnapshot, crate::Error> {
     // Bounded join: a wedged state backend (e.g. a lock-starved redb)
     // fails the round explicitly instead of freezing the chain and the
     // round. The abandoned blocking task is read-only — if it completes
@@ -429,14 +429,11 @@ mod tests {
     fn snapshot_report(task_id: &str, checkpoint_id: &str) -> ChainSnapshot {
         ChainSnapshot {
             task_id: task_id.into(),
-            attempt_id: format!("{task_id}-attempt"),
-            partition: 0,
             barrier: CheckpointBarrier {
                 checkpoint_id: checkpoint_id.into(),
                 generation: 1,
                 trace_context: None,
             },
-            cut_generation: 1,
             state: crate::state::StateSnapshot::new(1, Vec::new()),
             source_positions: vec![SourcePosition::for_partition(0, 1)],
             watermark_ms: None,

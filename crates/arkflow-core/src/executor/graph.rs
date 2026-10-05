@@ -11,7 +11,7 @@ use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
+pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Cross-node edge wiring for `build_subgraph`. When present, placement may
 /// split an edge between this node and a peer: the split endpoints become
@@ -39,7 +39,7 @@ pub struct RemoteEdgeContext {
 /// sections overwriting earlier ones for shared operator ids. Both endpoints
 /// of a remote edge derive it from the same plan, so tests reuse this instead
 /// of hand-computing indices.
-pub fn operator_routing_index(plan: &JobPlan) -> BTreeMap<String, u32> {
+pub(crate) fn operator_routing_index(plan: &JobPlan) -> BTreeMap<String, u32> {
     let source_count = plan.spec.sources.len();
     let operator_count = plan.spec.operators.len();
     plan.spec

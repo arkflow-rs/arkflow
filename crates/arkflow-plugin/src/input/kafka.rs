@@ -115,7 +115,7 @@ impl KafkaInput {
 
     /// Create a new Kafka input component
     pub fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: KafkaInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
@@ -128,7 +128,7 @@ impl KafkaInput {
             None
         };
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             config,
             consumer: Arc::new(RwLock::new(None)),
             assigned_partition: Arc::new(RwLock::new(None)),
@@ -1066,7 +1066,7 @@ pub(crate) struct KafkaInputBuilder;
 impl InputBuilder for KafkaInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

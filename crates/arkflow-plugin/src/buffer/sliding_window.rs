@@ -259,7 +259,7 @@ impl BufferBuilder for SlidingWindowBuilder {
     /// * `Result<Arc<dyn Buffer>, Error>` - A new sliding window buffer instance or an error
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Buffer>, Error> {
@@ -350,7 +350,7 @@ mod tests {
         });
 
         let result = builder.build(
-            Some(&"test-buffer".to_string()),
+            Some("test-buffer"),
             &Some(config_json),
             &create_test_resource(),
         );
@@ -368,7 +368,7 @@ mod tests {
         });
 
         let result = builder.build(
-            Some(&"test-buffer".to_string()),
+            Some("test-buffer"),
             &Some(config_json),
             &create_test_resource(),
         );
@@ -387,7 +387,7 @@ mod tests {
         });
 
         let result = builder.build(
-            Some(&"test-buffer".to_string()),
+            Some("test-buffer"),
             &Some(config_json),
             &create_test_resource(),
         );
@@ -406,7 +406,7 @@ mod tests {
         });
 
         let result = builder.build(
-            Some(&"test-buffer".to_string()),
+            Some("test-buffer"),
             &Some(config_json),
             &create_test_resource(),
         );
@@ -418,11 +418,7 @@ mod tests {
     #[test]
     fn test_sliding_window_builder_without_config() {
         let builder = SlidingWindowBuilder;
-        let result = builder.build(
-            Some(&"test-buffer".to_string()),
-            &None,
-            &create_test_resource(),
-        );
+        let result = builder.build(Some("test-buffer"), &None, &create_test_resource());
 
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::Config(_))));

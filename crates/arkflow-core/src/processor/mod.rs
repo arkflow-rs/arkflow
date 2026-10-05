@@ -129,7 +129,7 @@ impl ProcessorConfig {
         let builders = PROCESSOR_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.processor_type) {
-            builder.build(self.name.as_ref(), &self.config, resource)
+            builder.build(self.name.as_deref(), &self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown processor type: {}",
@@ -142,7 +142,7 @@ impl ProcessorConfig {
 pub trait ProcessorBuilder: Send + Sync {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error>;

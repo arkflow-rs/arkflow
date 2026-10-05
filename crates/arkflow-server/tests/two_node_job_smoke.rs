@@ -1,4 +1,4 @@
-use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
+use arkflow_core::config::{EngineConfig, LoggingConfig, NodeConfig};
 use arkflow_core::control_plane::ControlPlane;
 use arkflow_core::job::{
     CheckpointSpec, JobId, JobSpec, JobVersion, OperatorKind, OperatorSpec, SinkSpec, SourceSpec,
@@ -28,7 +28,7 @@ fn empty_control_plane() -> ControlPlane {
             streams: Vec::new(),
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         },
         RuntimeManager::new(),
     )

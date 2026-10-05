@@ -299,7 +299,7 @@ struct MilvusSearchProcessorBuilder;
 impl ProcessorBuilder for MilvusSearchProcessorBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {

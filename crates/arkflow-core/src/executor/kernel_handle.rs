@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Compatibility type for callers that still mention the retired global gate.
 /// The kernel no longer reads or writes this lock; barriers are in-band.
-pub type SnapshotGate = Arc<RwLock<()>>;
+pub(crate) type SnapshotGate = Arc<RwLock<()>>;
 
 /// Shared completion signal for the run: resolved with the graph's result
 /// when every chain exits (cancellation or end-of-stream). The result sits
@@ -974,14 +974,11 @@ mod tests {
     fn snapshot_report(task: &str, checkpoint: &str, generation: u64) -> ChainSnapshot {
         ChainSnapshot {
             task_id: task.to_string(),
-            attempt_id: format!("{task}:test:0"),
-            partition: 0,
             barrier: CheckpointBarrier {
                 checkpoint_id: checkpoint.to_string(),
                 generation,
                 trace_context: None,
             },
-            cut_generation: generation,
             state: crate::state::StateSnapshot::new(1, Vec::new()),
             source_positions: Vec::new(),
             watermark_ms: None,

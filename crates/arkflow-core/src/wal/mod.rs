@@ -35,10 +35,7 @@ pub mod config;
 pub mod store;
 
 pub use config::WalBackend;
-pub use store::{
-    build_wal_store, ensure_local_store_registered, lookup_wal_store_builder,
-    register_wal_store_builder, registered_wal_store_count, RedbStore, WalStore, WalStoreBuilder,
-};
+pub use store::{build_wal_store, register_wal_store_builder, WalStore, WalStoreBuilder};
 
 use crate::wal::store::serialize;
 use crate::{Error, MessageBatchRef};
@@ -874,7 +871,7 @@ impl Wal {
 /// the wrapped source acknowledgement. Wired into the stream so WAL ordering
 /// remains deterministic while transient source commit failures stay retryable
 /// in the in-memory acknowledgement frontier.
-pub struct WalAck {
+pub(crate) struct WalAck {
     wal: Arc<Wal>,
     seq: u64,
     inner: Arc<dyn crate::input::Ack>,

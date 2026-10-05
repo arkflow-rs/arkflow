@@ -134,9 +134,40 @@ fn default_observability_live_path() -> String {
     "/live".into()
 }
 
-/// Health check configuration
+/// Node-level configuration for everything this process does beyond running
+/// streams: health endpoints, the control-plane API, Agent-mode Hub
+/// membership, and the shuffle data plane. The YAML section keeps its
+/// historical `health_check` key (`EngineConfig::node` carries a serde
+/// rename), so the flattened sub-structs below must stay key-compatible
+/// with the historical flat mapping; do not add `deny_unknown_fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthCheckConfig {
+pub struct NodeConfig {
+    /// Health check server endpoints.
+    #[serde(flatten)]
+    pub health: HealthEndpointsConfig,
+    /// Versioned control-plane API served alongside the health endpoints.
+    #[serde(flatten)]
+    pub control_api: ControlApiConfig,
+    /// Compute-node Agent mode (membership to a Hub). Empty `hub_urls`
+    /// keeps standalone mode.
+    #[serde(flatten)]
+    pub agent: AgentConfig,
+    /// Cross-node shuffle data plane.
+    #[serde(flatten)]
+    pub data_plane: DataPlaneConfig,
+    /// Process-level observability export (metrics, readiness, liveness).
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+    /// Sentinel for the removed single-address key: any present occurrence
+    /// fails deserialization with a migration hint instead of being silently
+    /// ignored (a dropped key would start the process in standalone mode).
+    #[serde(default, skip_serializing)]
+    pub hub_url: DeprecatedHubUrl,
+}
+
+/// Health check server endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthEndpointsConfig {
     /// Whether health check is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -152,6 +183,11 @@ pub struct HealthCheckConfig {
     /// Path for liveness check endpoint
     #[serde(default = "default_liveness_path")]
     pub liveness_path: String,
+}
+
+/// Versioned control-plane API configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlApiConfig {
     /// Prefix for the versioned control-plane API.
     #[serde(default = "default_api_prefix")]
     pub api_prefix: String,
@@ -161,15 +197,15 @@ pub struct HealthCheckConfig {
     /// Explicit browser origins allowed to call the control API. Empty denies cross-origin calls.
     #[serde(default)]
     pub cors_origins: Vec<String>,
+}
+
+/// Compute-node Agent mode configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
     /// Hub addresses for compute-node Agent mode, tried in order as failover
     /// candidates (see hub-ha stage 3). Empty keeps standalone mode.
     #[serde(default)]
     pub hub_urls: Vec<String>,
-    /// Sentinel for the removed single-address key: any present occurrence
-    /// fails deserialization with a migration hint instead of being silently
-    /// ignored (a dropped key would start the process in standalone mode).
-    #[serde(default, skip_serializing)]
-    pub hub_url: DeprecatedHubUrl,
     /// Stable identity used when this process reports to a Hub.
     #[serde(default)]
     pub node_id: Option<String>,
@@ -182,6 +218,11 @@ pub struct HealthCheckConfig {
     /// Lifetime of a Hub-issued agent session credential.
     #[serde(default = "default_agent_session_ttl_ms")]
     pub agent_session_ttl_ms: u64,
+}
+
+/// Cross-node shuffle data plane configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DataPlaneConfig {
     /// Data-plane listen port for cross-node shuffle. When absent the node
     /// runs without a network data plane and the Hub placement keeps every
     /// Job edge co-located (the default contract).
@@ -192,9 +233,6 @@ pub struct HealthCheckConfig {
     /// take part in split placement; loopback-only nodes stay colocated-only.
     #[serde(default)]
     pub data_host: Option<String>,
-    /// Process-level observability export (metrics, readiness, liveness).
-    #[serde(default)]
-    pub observability: ObservabilityConfig,
 }
 
 /// Placeholder type for the removed `health_check.hub_url` key. Its
@@ -215,7 +253,7 @@ impl<'de> Deserialize<'de> for DeprecatedHubUrl {
     }
 }
 
-impl HealthCheckConfig {
+impl AgentConfig {
     /// Every Agent-mode Hub address must be an absolute http(s) base URL the
     /// reqwest client can target (scheme + non-empty host).
     pub fn validate_hub_urls(&self) -> Result<(), Error> {
@@ -251,9 +289,9 @@ pub struct EngineConfig {
     /// Logging configuration (optional)
     #[serde(default)]
     pub logging: LoggingConfig,
-    /// Health check configuration (optional)
-    #[serde(default)]
-    pub health_check: HealthCheckConfig,
+    /// Node-level configuration (YAML section `health_check`).
+    #[serde(default, rename = "health_check")]
+    pub node: NodeConfig,
 }
 
 impl EngineConfig {
@@ -389,7 +427,7 @@ fn default_agent_session_ttl_ms() -> u64 {
     3_600_000
 }
 
-impl Default for HealthCheckConfig {
+impl Default for HealthEndpointsConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
@@ -397,18 +435,41 @@ impl Default for HealthCheckConfig {
             health_path: default_health_path(),
             readiness_path: default_readiness_path(),
             liveness_path: default_liveness_path(),
+        }
+    }
+}
+
+impl Default for ControlApiConfig {
+    fn default() -> Self {
+        Self {
             api_prefix: default_api_prefix(),
             api_token: None,
             cors_origins: Vec::new(),
+        }
+    }
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
             hub_urls: Vec::new(),
-            hub_url: DeprecatedHubUrl,
             node_id: None,
             node_token: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
             agent_session_ttl_ms: default_agent_session_ttl_ms(),
-            data_port: None,
-            data_host: None,
+        }
+    }
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            health: HealthEndpointsConfig::default(),
+            control_api: ControlApiConfig::default(),
+            agent: AgentConfig::default(),
+            data_plane: DataPlaneConfig::default(),
             observability: ObservabilityConfig::default(),
+            hub_url: DeprecatedHubUrl,
         }
     }
 }
@@ -497,12 +558,12 @@ mod tests {
 
     #[test]
     fn test_health_check_config_default() {
-        let config = HealthCheckConfig::default();
-        assert!(config.enabled);
-        assert_eq!(config.address, "127.0.0.1:8080");
-        assert_eq!(config.health_path, "/health");
-        assert_eq!(config.readiness_path, "/readiness");
-        assert_eq!(config.liveness_path, "/liveness");
+        let config = NodeConfig::default();
+        assert!(config.health.enabled);
+        assert_eq!(config.health.address, "127.0.0.1:8080");
+        assert_eq!(config.health.health_path, "/health");
+        assert_eq!(config.health.readiness_path, "/readiness");
+        assert_eq!(config.health.liveness_path, "/liveness");
     }
 
     #[test]
@@ -561,12 +622,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.health_check.hub_urls,
+            config.node.agent.hub_urls,
             vec!["http://hub-a:8080", "http://hub-b:8080/"]
         );
 
         let config: EngineConfig = serde_json::from_str("{}").unwrap();
-        assert!(config.health_check.hub_urls.is_empty());
+        assert!(config.node.agent.hub_urls.is_empty());
     }
 
     #[test]
@@ -589,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_hub_url_sentinel_is_not_serialized() {
-        let serialized = serde_json::to_string(&HealthCheckConfig::default()).unwrap();
+        let serialized = serde_json::to_string(&NodeConfig::default()).unwrap();
         assert!(
             !serialized.contains("hub_url\""),
             "serialized = {serialized}"
@@ -598,7 +659,7 @@ mod tests {
 
     #[test]
     fn test_validate_hub_urls() {
-        let mut config = HealthCheckConfig::default();
+        let mut config = AgentConfig::default();
         assert!(config.validate_hub_urls().is_ok());
 
         config.hub_urls = vec!["http://hub-a:8080".into(), "https://hub-b".into()];
@@ -616,36 +677,69 @@ mod tests {
 
     #[test]
     fn test_health_check_config_serialization() {
-        let config = HealthCheckConfig {
-            enabled: false,
-            address: "127.0.0.1:9090".to_string(),
-            health_path: "/healthz".to_string(),
-            readiness_path: "/ready".to_string(),
-            liveness_path: "/live".to_string(),
-            api_prefix: "/api/v1".to_string(),
-            api_token: Some("test-token".to_string()),
-            cors_origins: Vec::new(),
-            hub_urls: Vec::new(),
-            hub_url: DeprecatedHubUrl,
-            node_id: None,
-            node_token: None,
-            agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
-            agent_session_ttl_ms: default_agent_session_ttl_ms(),
-            data_port: None,
-            data_host: None,
+        let config = NodeConfig {
+            health: HealthEndpointsConfig {
+                enabled: false,
+                address: "127.0.0.1:9090".to_string(),
+                health_path: "/healthz".to_string(),
+                readiness_path: "/ready".to_string(),
+                liveness_path: "/live".to_string(),
+            },
+            control_api: ControlApiConfig {
+                api_prefix: "/api/v1".to_string(),
+                api_token: Some("test-token".to_string()),
+                cors_origins: Vec::new(),
+            },
+            agent: AgentConfig::default(),
+            data_plane: DataPlaneConfig::default(),
             observability: ObservabilityConfig::default(),
+            hub_url: DeprecatedHubUrl,
         };
 
         let serialized = serde_json::to_string(&config).unwrap();
-        let deserialized: HealthCheckConfig = serde_json::from_str(&serialized).unwrap();
+        // The flattened sub-structs must keep the historical flat key set.
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        for key in [
+            "enabled",
+            "address",
+            "health_path",
+            "readiness_path",
+            "liveness_path",
+            "api_prefix",
+            "api_token",
+            "cors_origins",
+            "hub_urls",
+            "node_id",
+            "node_token",
+            "agent_lease_ttl_ms",
+            "agent_session_ttl_ms",
+            "data_port",
+            "data_host",
+            "observability",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "serialized key set must keep `{key}`"
+            );
+        }
+        assert!(
+            value.get("hub_url").is_none(),
+            "sentinel must not serialize"
+        );
 
-        assert!(!deserialized.enabled);
-        assert_eq!(deserialized.address, "127.0.0.1:9090");
-        assert_eq!(deserialized.health_path, "/healthz");
-        assert_eq!(deserialized.readiness_path, "/ready");
-        assert_eq!(deserialized.liveness_path, "/live");
-        assert_eq!(deserialized.api_prefix, "/api/v1");
-        assert_eq!(deserialized.api_token.as_deref(), Some("test-token"));
+        // The historical flat document shape still deserializes into the
+        // split type with every field landing in its group.
+        let deserialized: NodeConfig = serde_json::from_str(&serialized).unwrap();
+        assert!(!deserialized.health.enabled);
+        assert_eq!(deserialized.health.address, "127.0.0.1:9090");
+        assert_eq!(deserialized.health.health_path, "/healthz");
+        assert_eq!(deserialized.health.readiness_path, "/ready");
+        assert_eq!(deserialized.health.liveness_path, "/live");
+        assert_eq!(deserialized.control_api.api_prefix, "/api/v1");
+        assert_eq!(
+            deserialized.control_api.api_token.as_deref(),
+            Some("test-token")
+        );
         assert!(deserialized.observability.enabled);
     }
 
@@ -661,18 +755,30 @@ mod tests {
 
     #[test]
     fn test_health_check_without_observability_section_uses_defaults() {
-        let health: HealthCheckConfig = serde_json::from_str(json!({}).to_string().as_str())
+        let health: NodeConfig = serde_json::from_str(json!({}).to_string().as_str())
             .expect("an empty object must deserialize with all defaults");
         assert!(health.observability.enabled);
         assert_eq!(health.observability.address, "127.0.0.1:8081");
+        assert!(health.health.enabled, "flattened groups use their defaults");
 
-        let health: HealthCheckConfig = serde_json::from_str(
-            json!({"observability": {"enabled": false}})
+        let health: NodeConfig = serde_json::from_str(
+            json!({"observability": {"enabled": false}, "api_prefix": "/x", "hub_urls": ["http://h:1"]})
                 .to_string()
                 .as_str(),
         )
         .unwrap();
         assert!(!health.observability.enabled);
+        assert_eq!(health.control_api.api_prefix, "/x");
+        assert_eq!(health.agent.hub_urls, vec!["http://h:1".to_string()]);
+
+        // EngineConfig keeps the historical `health_check` YAML/JSON key.
+        let engine: EngineConfig = serde_json::from_str(
+            json!({"health_check": {"enabled": false}})
+                .to_string()
+                .as_str(),
+        )
+        .unwrap();
+        assert!(!engine.node.health.enabled);
     }
 
     #[test]
@@ -750,8 +856,8 @@ streams: []
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.file_path, Some("/tmp/test.log".to_string()));
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert!(!config.health_check.enabled);
-        assert_eq!(config.health_check.address, "127.0.0.1:9090");
+        assert!(!config.node.health.enabled);
+        assert_eq!(config.node.health.address, "127.0.0.1:9090");
         assert!(config.streams.is_empty());
 
         // Clean up
@@ -783,8 +889,8 @@ streams: []
 
         assert_eq!(config.logging.level, "info");
         assert!(matches!(config.logging.format, LogFormat::PLAIN));
-        assert!(config.health_check.enabled);
-        assert_eq!(config.health_check.address, "0.0.0.0:8080");
+        assert!(config.node.health.enabled);
+        assert_eq!(config.node.health.address, "0.0.0.0:8080");
         assert!(config.streams.is_empty());
 
         // Clean up
@@ -827,8 +933,8 @@ type = "stdout"
 
         assert_eq!(config.logging.level, "warn");
         assert!(matches!(config.logging.format, LogFormat::JSON));
-        assert!(!config.health_check.enabled);
-        assert_eq!(config.health_check.address, "192.168.1.1:8888");
+        assert!(!config.node.health.enabled);
+        assert_eq!(config.node.health.address, "192.168.1.1:8888");
         assert_eq!(config.streams.len(), 1);
 
         // Clean up
@@ -895,7 +1001,7 @@ type = "stdout"
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         };
 
         let serialized = serde_json::to_string(&config).unwrap();
@@ -903,8 +1009,8 @@ type = "stdout"
 
         assert_eq!(deserialized.logging.level, "info");
         assert!(matches!(deserialized.logging.format, LogFormat::PLAIN));
-        assert!(deserialized.health_check.enabled);
-        assert_eq!(deserialized.health_check.address, "127.0.0.1:8080");
+        assert!(deserialized.node.health.enabled);
+        assert_eq!(deserialized.node.health.address, "127.0.0.1:8080");
     }
 
     fn test_stream(id: Option<&str>) -> crate::stream::StreamConfig {
@@ -940,7 +1046,7 @@ type = "stdout"
             streams: vec![test_stream(None), test_stream(None)],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         };
 
         assert_eq!(config.stream_ids().unwrap(), ["stream-0", "stream-1"]);
@@ -952,7 +1058,7 @@ type = "stdout"
             streams: vec![test_stream(Some("bad id"))],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         };
         assert!(invalid.stream_ids().is_err());
 
@@ -960,7 +1066,7 @@ type = "stdout"
             streams: vec![test_stream(Some("orders")), test_stream(Some("orders"))],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         };
         assert!(duplicate.stream_ids().is_err());
     }
@@ -994,7 +1100,10 @@ health_check:
         .unwrap();
         let config = EngineConfig::from_file(path.to_str().unwrap()).unwrap();
         std::env::remove_var("ARKFLOW_CONFIG_TEST_TOKEN");
-        assert_eq!(config.health_check.api_token.as_deref(), Some("from-env"));
+        assert_eq!(
+            config.node.control_api.api_token.as_deref(),
+            Some("from-env")
+        );
     }
 
     #[test]
@@ -1012,7 +1121,10 @@ health_check:
         .to_string();
         std::fs::write(&path, content).unwrap();
         let config = EngineConfig::from_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(config.health_check.api_token.as_deref(), Some("from-file"));
+        assert_eq!(
+            config.node.control_api.api_token.as_deref(),
+            Some("from-file")
+        );
     }
 
     #[test]

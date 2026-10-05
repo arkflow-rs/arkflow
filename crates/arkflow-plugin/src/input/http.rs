@@ -81,7 +81,7 @@ type AppState = Arc<AppStateInner>;
 
 impl HttpInput {
     pub fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: HttpInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
@@ -89,7 +89,7 @@ impl HttpInput {
         let auth = config.auth.clone();
 
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             config,
             server_handle: Arc::new(Mutex::new(None)),
             connected: AtomicBool::new(false),
@@ -215,7 +215,7 @@ pub(crate) struct HttpInputBuilder;
 impl InputBuilder for HttpInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

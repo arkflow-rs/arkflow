@@ -6,6 +6,7 @@ use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::datatypes::DataType;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +68,8 @@ pub enum WindowAction {
 }
 
 #[derive(Debug, Default)]
-pub struct EventTimeMetrics {
+#[cfg(test)]
+pub(crate) struct EventTimeMetrics {
     pub watermark_lag_ms: AtomicI64,
     pub late_events_total: AtomicU64,
     pub late_events_dropped: AtomicU64,
@@ -75,6 +77,7 @@ pub struct EventTimeMetrics {
     pub late_events_updated: AtomicU64,
 }
 
+#[cfg(test)]
 impl EventTimeMetrics {
     pub fn record_watermark_lag(&self, lag_ms: i64) {
         self.watermark_lag_ms
@@ -285,7 +288,7 @@ impl WatermarkTracker {
     }
 }
 
-pub fn window_action(
+pub(crate) fn window_action(
     window_end_ms: i64,
     event_time_ms: i64,
     watermark_ms: Option<i64>,
@@ -316,15 +319,17 @@ pub fn window_action(
     }
 }
 
-pub trait TimestampExtractor: Send + Sync {
+#[cfg(test)]
+pub(crate) trait TimestampExtractor: Send + Sync {
     fn extract_timestamp_ms(&self, batch: &MessageBatch) -> Result<i64, Error>;
 }
 
 #[derive(Debug, Clone)]
-pub struct FieldTimestampExtractor {
+pub(crate) struct FieldTimestampExtractor {
     pub field: String,
 }
 
+#[cfg(test)]
 impl TimestampExtractor for FieldTimestampExtractor {
     fn extract_timestamp_ms(&self, batch: &MessageBatch) -> Result<i64, Error> {
         self.extract_timestamp_at_zero(batch)?
@@ -367,6 +372,7 @@ impl FieldTimestampExtractor {
         }
     }
 
+    #[cfg(test)]
     fn extract_timestamp_at_zero(&self, batch: &MessageBatch) -> Result<Option<i64>, Error> {
         Ok(self
             .extract_timestamps_ms(batch)?

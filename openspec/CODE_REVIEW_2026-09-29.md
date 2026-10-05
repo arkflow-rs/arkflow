@@ -66,7 +66,7 @@
 
 ## P3 — 结构债（不阻塞 v1.0，但 1.0 前最划算的几件）
 
-- **core pub 面收缩**（v1.0 semver 前置）：~685 pub item + executor/wal 520 行 pub；8 个 builder trait 全线 `Option<&String>` 应为 `Option<&str>`（改即 breaking，趁消费者只有自家 crate 一次做完）；删 `Pipeline`、dead Error variants；`HealthCheckConfig` 改名拆分；`resolve_candidate_payload`（Hub 专用）移出 core；`Temporary::get` 泄漏 DataFusion `ColumnarValue` 进公共 trait。
+- ~~**core pub 面收缩**（v1.0 semver 前置）：~685 pub item + executor/wal 520 行 pub；8 个 builder trait 全线 `Option<&String>` 应为 `Option<&str>`（改即 breaking，趁消费者只有自家 crate 一次做完）；删 `Pipeline`、dead Error variants；`HealthCheckConfig` 改名拆分；`resolve_candidate_payload`（Hub 专用）移出 core；`Temporary::get` 泄漏 DataFusion `ColumnarValue` 进公共 trait。~~ ✅ 2026-10-05 已落地（`shrink-core-api-surface`：dead variants 删除；5 个 builder trait `Option<&str>`；`Temporary::get` 改 `&[String]` 且 null 键 fail-closed；`HealthCheckConfig`→`NodeConfig` 拆分（serde flatten，YAML 逐字节不变）；`resolve_candidate_payload` envelope 迁 server `hub/secret_dispatch.rs`（secret-only 遍历留 core 作语法原语）；pub 修剪 318→221 顶层 item（139 降级、~40 假阴性回退），连带删除彻底死代码（run_job 兼容壳、control.rs 四类型、JobState 族等）与 `#[cfg(test)]` 门控测试专用项；`Pipeline` 已在此前变更删除）。
 - **server 结构**：lib.rs 6.7k 行 94 handler 双 API 巨石；hub/ 15 子模块 `use super::*` 伪拆分；storage 5 层 × 45 操作 ~2000 行委托样板（宏/泛型通道可砍 2/3）；SQL `?N→$N` 每次执行重写零缓存且双方言双份维护；agent.rs 4.5k 行 8 种关注点、字符串命令协议；无版本号 DB 迁移（无 PRAGMA user_version）。
 - **executor 结构**：remote.rs 5 合 1（wire/TLS/认证/注册表/pump）；window.rs 4.8k 行；`CheckpointHook` god-struct（10 个 Option 字段 6 类关注点）；7 个 run_graph_* + 7 个 run_job_* 兼容壳；state_journal 指针身份 finalize 防护（`state_journal.rs:215-236`）。
 - 杂项：`INITIALIZATION: OnceLock` 缓存首次失败（plugin `lib.rs:38-58`）；kernel watcher 50ms 轮询任务潜在泄漏（`kernel_handle.rs:465-482`）；StorageActor panic 无重启；`SharedCheckpointStore` 每操作一线程（`agent.rs:140-161`）；`wal/mod.rs:395` 注释与实现矛盾；console 无 ESLint、`JOB_DETAIL_INTERVAL_MS` 死常量自打脸、JobVersions 绕过数据层。
@@ -83,6 +83,6 @@
 
 - **批次 A（数据正确性）**：P1-1、P1-3、P1-4、P1-5、P1-6、P1-9 + join inner 驱逐日志（P2）。
 - **批次 B（组件可用性）**：P1-2、P1-7、P1-8、P1-10、P1-11、P1-12。
-- **批次 C（API 面收缩，v1.0 semver 前一次性）**：P3 第一条全部。
+- **批次 C（API 面收缩，v1.0 semver 前一次性）** ✅ 2026-10-05 已落地（`shrink-core-api-surface`）：P3 第一条全部（见上）。
 - **批次 D（P2 高优）**：内核无界缓冲/超时批、RuntimeManager 两缺陷、input_name、认证中间件化+矩阵测试、Error Boundary、文档脱节批。
 - **批次 E（发布工程）** ✅ 2026-10-04 已全部落地（除「发 0.6」作废外，`release-engineering-batch-e`：release 自动化 + CI fmt/clippy 门禁 + CHANGELOG/SECURITY.md/版本策略 + server CLI 与 MAX_NODES 文档；契约合规测试框架已随 P1-5 提前落地）。

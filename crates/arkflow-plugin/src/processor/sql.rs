@@ -23,6 +23,7 @@ use arkflow_core::temporary::Temporary;
 use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
 use datafusion::arrow;
+use datafusion::arrow::array::AsArray;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
@@ -42,6 +43,32 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 const DEFAULT_TABLE_NAME: &str = "flow";
+
+/// Convert a key expression's evaluation result into the string lookup keys
+/// consumed by `Temporary::get`. A null or non-UTF-8 key is a configuration
+/// error and fails closed instead of silently dropping or panicking.
+fn utf8_keys(value: ColumnarValue) -> Result<Vec<String>, Error> {
+    match value {
+        ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => Ok(vec![s]),
+        ColumnarValue::Array(array) => {
+            let strings = array
+                .as_string::<i32>()
+                .iter()
+                .map(|v| {
+                    v.ok_or_else(|| {
+                        Error::Process("temporary key expression evaluated a null key".to_string())
+                    })
+                    .map(|v| v.to_string())
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            Ok(strings)
+        }
+        _ => Err(Error::Process(
+            "temporary key expression must evaluate to UTF-8 strings".to_string(),
+        )),
+    }
+}
+
 /// SQL processor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SqlProcessorConfig {
@@ -421,16 +448,17 @@ impl SqlProcessor {
         use futures::future::join_all;
 
         let futures = temporary_map.iter().map(|(_, (temporary, config))| async {
-            let columnar_value = match &config.key {
-                Expr::Expr { expr: expr_str } => expr::evaluate_expr(expr_str, batch)
-                    .await
-                    .map_err(|e| Error::Process(format!("Evaluate expression failed: {}", e)))?,
-                Expr::Value { value } => {
-                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(value.clone())))
+            let keys: Vec<String> = match &config.key {
+                Expr::Expr { expr: expr_str } => {
+                    let evaluated = expr::evaluate_expr(expr_str, batch).await.map_err(|e| {
+                        Error::Process(format!("Evaluate expression failed: {}", e))
+                    })?;
+                    utf8_keys(evaluated)?
                 }
+                Expr::Value { value } => vec![value.clone()],
             };
 
-            if let Some(data) = temporary.get(&[columnar_value]).await? {
+            if let Some(data) = temporary.get(&keys).await? {
                 ctx.register_batch(&config.table_name, data.into())
                     .map_err(|e| {
                         Error::Process(format!("Register temporary message batch failed: {}", e))
@@ -486,7 +514,7 @@ struct SqlProcessorBuilder;
 impl ProcessorBuilder for SqlProcessorBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<serde_json::Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
@@ -908,7 +936,7 @@ mod tests {
             Ok(())
         }
 
-        async fn get(&self, _keys: &[ColumnarValue]) -> Result<Option<MessageBatch>, Error> {
+        async fn get(&self, _keys: &[String]) -> Result<Option<MessageBatch>, Error> {
             Ok(Some(MessageBatch::new_arrow(self.0.clone())))
         }
 

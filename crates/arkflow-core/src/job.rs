@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
-pub const DEFAULT_MAX_PARALLELISM: u32 = 128;
+pub(crate) const DEFAULT_MAX_PARALLELISM: u32 = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -46,40 +47,6 @@ impl std::fmt::Display for JobId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct JobVersion(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobState {
-    Draft,
-    Validated,
-    Starting,
-    Running,
-    Stopping,
-    Stopped,
-    Recovering,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobDesiredState {
-    #[default]
-    Stopped,
-    Running,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobConvergenceState {
-    #[default]
-    Unknown,
-    Pending,
-    Applying,
-    InSync,
-    Degraded,
-    Blocked,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1292,7 +1259,8 @@ pub fn key_group_for_key(key: &[u8], max_parallelism: u32) -> Result<u32, Error>
     Ok((hash % u64::from(max_parallelism)) as u32)
 }
 
-pub fn task_for_key<'a>(
+#[cfg(test)]
+pub(crate) fn task_for_key<'a>(
     plan: &'a JobPlan,
     operator_id: &str,
     key: &[u8],
@@ -1315,11 +1283,13 @@ pub fn task_for_key<'a>(
 }
 
 #[derive(Debug)]
-pub struct TaskAttemptController {
+#[cfg(test)]
+pub(crate) struct TaskAttemptController {
     attempt: TaskAttempt,
     cancellation: CancellationToken,
 }
 
+#[cfg(test)]
 impl TaskAttemptController {
     pub fn new(attempt: TaskAttempt) -> Self {
         Self {
@@ -1364,7 +1334,8 @@ impl TaskAttemptController {
     }
 }
 
-pub fn bounded_job_channel<T>(
+#[cfg(test)]
+pub(crate) fn bounded_job_channel<T>(
     capacity: usize,
 ) -> Result<(flume::Sender<T>, flume::Receiver<T>), Error> {
     if capacity == 0 {
@@ -1389,7 +1360,8 @@ pub enum TaskAttemptState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JobCommand {
+#[cfg(test)]
+pub(crate) enum JobCommand {
     Start {
         generation: u64,
     },
@@ -1409,7 +1381,9 @@ pub enum JobCommand {
     },
 }
 
+#[cfg(test)]
 impl JobCommand {
+    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         match self {
             Self::Start { generation }

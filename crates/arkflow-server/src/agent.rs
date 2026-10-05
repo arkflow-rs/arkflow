@@ -1878,20 +1878,22 @@ fn normalize_hub_urls(urls: &[String]) -> Vec<String> {
 
 impl NodeAgentConfig {
     pub fn from_engine(config: &arkflow_core::config::EngineConfig) -> Option<Self> {
-        let hub_urls = normalize_hub_urls(&config.health_check.hub_urls);
+        let hub_urls = normalize_hub_urls(&config.node.agent.hub_urls);
         let hub_url = hub_urls.first()?.clone();
         let node_id = config
-            .health_check
+            .node
+            .agent
             .node_id
             .clone()
             .or_else(|| std::env::var("ARKFLOW_NODE_ID").ok())?;
         let node_token = config
-            .health_check
+            .node
+            .agent
             .node_token
             .clone()
             .or_else(|| std::env::var("ARKFLOW_NODE_TOKEN").ok())
             .unwrap_or_default();
-        let ttl = config.health_check.agent_lease_ttl_ms.max(3_000);
+        let ttl = config.node.agent.agent_lease_ttl_ms.max(3_000);
         let boot_nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
@@ -1899,7 +1901,12 @@ impl NodeAgentConfig {
         Some(Self {
             hub_url,
             hub_urls,
-            api_prefix: config.health_check.api_prefix.trim_end_matches('/').into(),
+            api_prefix: config
+                .node
+                .control_api
+                .api_prefix
+                .trim_end_matches('/')
+                .into(),
             node_id,
             node_token,
             // PID alone can be reused after a real process restart. Include
@@ -1909,8 +1916,8 @@ impl NodeAgentConfig {
             heartbeat_interval: Duration::from_millis(ttl / 3),
             report_interval: Duration::from_secs(2),
             poll_interval: Duration::from_secs(1),
-            data_port: config.health_check.data_port,
-            data_host: config.health_check.data_host.clone(),
+            data_port: config.node.data_plane.data_port,
+            data_host: config.node.data_plane.data_host.clone(),
         })
     }
 }
@@ -3442,7 +3449,7 @@ async fn crashed_previous_teardown_surfaces_the_join_error() {
 mod tests {
     use super::*;
     use crate::{hub_router, ServerConfig};
-    use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
+    use arkflow_core::config::{AgentConfig, EngineConfig, LoggingConfig, NodeConfig};
     use arkflow_core::control_plane::ControlPlane;
     use arkflow_core::runtime::RuntimeManager;
 
@@ -3889,16 +3896,19 @@ mod tests {
 
     #[test]
     fn agent_mode_requires_hub_and_stable_identity() {
-        let health = HealthCheckConfig {
-            hub_urls: vec!["http://hub".into()],
-            node_id: Some("node-a".into()),
+        let health = NodeConfig {
+            agent: AgentConfig {
+                hub_urls: vec!["http://hub".into()],
+                node_id: Some("node-a".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let config = EngineConfig {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: health,
+            node: health,
         };
         let agent = NodeAgentConfig::from_engine(&config).unwrap();
         assert_eq!(agent.node_id, "node-a");
@@ -3916,26 +3926,29 @@ mod tests {
         assert_eq!(shuffle.len(), base.len() + 1);
         assert!(shuffle.contains(&"network_shuffle".to_string()));
 
-        let mut health = HealthCheckConfig {
-            hub_urls: vec!["http://hub".into()],
-            node_id: Some("node-a".into()),
+        let mut health = NodeConfig {
+            agent: AgentConfig {
+                hub_urls: vec!["http://hub".into()],
+                node_id: Some("node-a".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let config = EngineConfig {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: health.clone(),
+            node: health.clone(),
         };
         let agent = NodeAgentConfig::from_engine(&config).unwrap();
         assert_eq!(agent.data_port, None);
 
-        health.data_port = Some(9501);
+        health.data_plane.data_port = Some(9501);
         let config = EngineConfig {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: health,
+            node: health,
         };
         let agent = NodeAgentConfig::from_engine(&config).unwrap();
         assert_eq!(agent.data_port, Some(9501));
@@ -6604,7 +6617,7 @@ mod tests {
             streams: vec![generate_drop_stream(stream_id)],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         }
     }
 
@@ -6979,7 +6992,7 @@ mod tests {
                 streams: Vec::new(),
                 jobs: Vec::new(),
                 logging: LoggingConfig::default(),
-                health_check: HealthCheckConfig::default(),
+                node: NodeConfig::default(),
             },
             RuntimeManager::new(),
         );
@@ -7041,7 +7054,7 @@ mod tests {
                 streams: Vec::new(),
                 jobs: Vec::new(),
                 logging: LoggingConfig::default(),
-                health_check: HealthCheckConfig::default(),
+                node: NodeConfig::default(),
             },
             RuntimeManager::new(),
         )

@@ -86,7 +86,7 @@ impl OutputConfig {
                 None
             };
 
-            builder.build(self.name.as_ref(), &self.config, codec, resource)
+            builder.build(self.name.as_deref(), &self.config, codec, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown output type: {}",
@@ -99,7 +99,7 @@ impl OutputConfig {
 pub trait OutputBuilder: Send + Sync {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         resource: &Resource,

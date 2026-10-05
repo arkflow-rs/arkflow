@@ -122,7 +122,7 @@ struct JsonCodecBuilder;
 impl CodecBuilder for JsonCodecBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Codec>, Error> {
@@ -251,11 +251,7 @@ mod tests {
     #[tokio::test]
     async fn test_json_codec_builder() {
         let builder = JsonCodecBuilder;
-        let result = builder.build(
-            Some(&"test-codec".to_string()),
-            &None,
-            &create_test_resource(),
-        );
+        let result = builder.build(Some("test-codec"), &None, &create_test_resource());
 
         assert!(result.is_ok());
     }
@@ -265,11 +261,7 @@ mod tests {
         let builder = JsonCodecBuilder;
         let config = serde_json::json!({});
 
-        let result = builder.build(
-            Some(&"test-codec".to_string()),
-            &Some(config),
-            &create_test_resource(),
-        );
+        let result = builder.build(Some("test-codec"), &Some(config), &create_test_resource());
 
         assert!(result.is_ok());
     }
@@ -407,11 +399,7 @@ mod tests {
         let builder = JsonCodecBuilder;
         let config = serde_json::json!({"on_error": "skip"});
         let codec = builder
-            .build(
-                Some(&"test-codec".to_string()),
-                &Some(config),
-                &create_test_resource(),
-            )
+            .build(Some("test-codec"), &Some(config), &create_test_resource())
             .unwrap();
         let data = vec![b"bad".to_vec(), br#"{"ok":1}"#.to_vec()];
         let batch = codec.decode(data).await.unwrap();
@@ -423,11 +411,7 @@ mod tests {
         let builder = JsonCodecBuilder;
         let config = serde_json::json!({"on_error": "explode"});
         assert!(builder
-            .build(
-                Some(&"test-codec".to_string()),
-                &Some(config),
-                &create_test_resource()
-            )
+            .build(Some("test-codec"), &Some(config), &create_test_resource())
             .is_err());
     }
 }

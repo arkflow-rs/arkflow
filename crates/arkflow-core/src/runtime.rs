@@ -1105,7 +1105,7 @@ fn is_active(state: StreamState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
+    use crate::config::{EngineConfig, LoggingConfig, NodeConfig};
     use crate::input::InputConfig;
     use crate::output::OutputConfig;
     use crate::pipeline::PipelineConfig;
@@ -1379,7 +1379,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: crate::config::LoggingConfig::default(),
-            health_check: crate::config::HealthCheckConfig::default(),
+            node: crate::config::NodeConfig::default(),
         };
         assert!(manager.replace_config(&config).await.unwrap().is_empty());
         assert!(manager.ids().await.is_empty());
@@ -1396,7 +1396,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         };
         let affected = manager.replace_config(&config).await.unwrap();
         assert_eq!(affected, vec!["orders"]);
@@ -1418,7 +1418,7 @@ mod tests {
             streams: vec![invalid],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         };
         assert!(manager.replace_config(&config).await.is_err());
         assert!(manager.get("broken").await.is_none());
@@ -1431,7 +1431,7 @@ mod tests {
             streams: vec![stream_config()],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         };
         assert_eq!(config.stream_ids().unwrap(), ["orders"]);
     }
@@ -1489,7 +1489,7 @@ mod durability_tests {
     impl InputBuilder for EofInputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
@@ -1518,7 +1518,7 @@ mod durability_tests {
     impl OutputBuilder for DevNullOutputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
@@ -1623,7 +1623,7 @@ mod startup_failure_tests {
     impl InputBuilder for ConnectFailureInputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
@@ -1654,7 +1654,7 @@ mod startup_failure_tests {
     impl OutputBuilder for ConnectFailureOutputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
@@ -1806,7 +1806,7 @@ mod validation_lifecycle_tests {
     impl InputBuilder for EofInputBuilder2 {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
@@ -1835,7 +1835,7 @@ mod validation_lifecycle_tests {
     impl OutputBuilder for DevNullBuilder2 {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
@@ -1871,7 +1871,7 @@ mod validation_lifecycle_tests {
             streams: vec![config.clone()],
             jobs: Vec::new(),
             logging: crate::config::LoggingConfig::default(),
-            health_check: crate::config::HealthCheckConfig::default(),
+            node: crate::config::NodeConfig::default(),
         });
         assert!(report.valid, "{report:?}");
 
@@ -2073,7 +2073,7 @@ mod race_tests {
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
-    use crate::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
+    use crate::config::{EngineConfig, LoggingConfig, NodeConfig};
     use crate::input::{Input, InputBuilder, InputConfig};
     use crate::output::{Output, OutputBuilder, OutputConfig};
     use crate::pipeline::PipelineConfig;
@@ -2112,7 +2112,7 @@ mod coverage_tests {
             streams,
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         }
     }
 
@@ -2139,7 +2139,7 @@ mod coverage_tests {
     impl InputBuilder for EofInputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
@@ -2172,7 +2172,7 @@ mod coverage_tests {
     impl OutputBuilder for DevNullOutputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
