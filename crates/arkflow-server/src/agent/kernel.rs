@@ -492,9 +492,14 @@ impl JobRuntime {
                     {
                         Ok(runtime) => Some(Arc::new(runtime)),
                         Err(error) => {
+                            // Same cleanup as the marker-failure path below:
+                            // fail before persisting anything, and close the
+                            // opened state so it does not leak past a start
+                            // that never reached registration.
+                            let _ = state.close();
                             return Err(format!(
                                 "dedicated runtime for Job '{job_id}' failed to build: {error}"
-                            ))
+                            ));
                         }
                     }
                 }

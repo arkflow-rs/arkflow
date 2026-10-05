@@ -685,13 +685,25 @@ impl HubTlsListener {
         let local_addr = inner.local_addr()?;
         let (tx, ready) = tokio::sync::mpsc::channel(128);
         tokio::spawn(async move {
+            // Bound concurrent handshakes: decoupling admission from
+            // consumption would otherwise let a connection flood multiply
+            // in-flight handshake tasks without limit (each held for at
+            // most the handshake timeout). Excess connections wait for a
+            // permit while their TCP connection stays open.
+            let handshake_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
             loop {
                 match inner.accept().await {
                     Ok((stream, peer)) => {
                         let _ = stream.set_nodelay(true);
                         let acceptor = acceptor.clone();
                         let tx = tx.clone();
+                        let permit = handshake_permits
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("handshake semaphore is never closed");
                         tokio::spawn(async move {
+                            let _permit = permit;
                             // Same bounded handshake as before, now off the
                             // admission path: a stalled or malicious peer
                             // only ties up its own task.
