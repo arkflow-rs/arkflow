@@ -1693,10 +1693,7 @@ mod validation_tests {
         let error = context
             .redistribute(entry)
             .expect_err("an operator absent from the plan can have no owner task");
-        assert!(
-            error.to_string().contains("no owner task"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("no owner task"), "{error}");
     }
 
     #[test]
@@ -1707,15 +1704,12 @@ mod validation_tests {
         );
         // The segment ends at the next separator; percent escapes decode.
         assert_eq!(
-            RescaleContext::task_of_namespace(
-                "job:j:state:d:operator:agg:task:agg%3A2:x:rest"
-            )
-            .unwrap(),
+            RescaleContext::task_of_namespace("job:j:state:d:operator:agg:task:agg%3A2:x:rest")
+                .unwrap(),
             "agg:2"
         );
         assert_eq!(
-            RescaleContext::task_of_namespace("job:j:state:d:operator:agg:task:agg%252")
-                .unwrap(),
+            RescaleContext::task_of_namespace("job:j:state:d:operator:agg:task:agg%252").unwrap(),
             "agg%2"
         );
         assert!(
@@ -1736,8 +1730,9 @@ mod validation_tests {
     #[test]
     fn restore_local_snapshot_rejects_format_mismatches() {
         let directory = tempfile::tempdir().unwrap();
-        let backend: Arc<dyn crate::state::StateBackend> =
-            Arc::new(crate::state::RedbStateBackend::open(directory.path().join("backend"), 1).unwrap());
+        let backend: Arc<dyn crate::state::StateBackend> = Arc::new(
+            crate::state::RedbStateBackend::open(directory.path().join("backend"), 1).unwrap(),
+        );
         let repository = crate::checkpoint::CheckpointRepository::new(
             crate::checkpoint::FileCheckpointStore::new(directory.path().join("store")).unwrap(),
         );
@@ -1754,11 +1749,11 @@ mod validation_tests {
             &old_task.id,
         );
         // Snapshot sealed under format 2 while the backend runs format 1.
-        let snapshot = crate::state::StateSnapshot::new(
-            2,
-            vec![snapshot_entry(namespace, b"utf8:k")],
-        );
-        let reference = repository.write_state_snapshot("cp-format", &snapshot).unwrap();
+        let snapshot =
+            crate::state::StateSnapshot::new(2, vec![snapshot_entry(namespace, b"utf8:k")]);
+        let reference = repository
+            .write_state_snapshot("cp-format", &snapshot)
+            .unwrap();
         let manifest = crate::checkpoint::CheckpointManifest {
             checkpoint_id: "cp-format".into(),
             job_id: plan.spec.id.clone(),
@@ -1791,8 +1786,9 @@ mod validation_tests {
     #[test]
     fn restore_local_snapshot_redistributes_entries_during_rescale() {
         let directory = tempfile::tempdir().unwrap();
-        let backend: Arc<dyn crate::state::StateBackend> =
-            Arc::new(crate::state::RedbStateBackend::open(directory.path().join("backend"), 1).unwrap());
+        let backend: Arc<dyn crate::state::StateBackend> = Arc::new(
+            crate::state::RedbStateBackend::open(directory.path().join("backend"), 1).unwrap(),
+        );
         let repository = crate::checkpoint::CheckpointRepository::new(
             crate::checkpoint::FileCheckpointStore::new(directory.path().join("store")).unwrap(),
         );
@@ -1811,11 +1807,11 @@ mod validation_tests {
             &old_task.id,
         );
         let key = b"utf8:omega".to_vec();
-        let snapshot = crate::state::StateSnapshot::new(
-            1,
-            vec![snapshot_entry(old_namespace.clone(), &key)],
-        );
-        let reference = repository.write_state_snapshot("cp-rescale", &snapshot).unwrap();
+        let snapshot =
+            crate::state::StateSnapshot::new(1, vec![snapshot_entry(old_namespace.clone(), &key)]);
+        let reference = repository
+            .write_state_snapshot("cp-rescale", &snapshot)
+            .unwrap();
         let manifest = crate::checkpoint::CheckpointManifest {
             checkpoint_id: "cp-rescale".into(),
             job_id: old_plan.spec.id.clone(),
@@ -3384,7 +3380,12 @@ mod runner_tests {
         let hooks = plan
             .tasks
             .iter()
-            .map(|task| (task.id.clone(), crate::executor::task::CheckpointHook::default()))
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    crate::executor::task::CheckpointHook::default(),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         run_job_with_hooks(
             &spec,
@@ -3597,7 +3598,9 @@ mod runner_tests {
         .await
         .expect_err("a failed marker persist must fail the restart");
         assert!(
-            error.to_string().contains("could not persist its start marker"),
+            error
+                .to_string()
+                .contains("could not persist its start marker"),
             "{error}"
         );
         assert!(
@@ -3715,7 +3718,9 @@ mod runner_tests {
         let empty = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(empty.path().join("checkpoints").join("junk")).unwrap();
         assert!(
-            latest_local_checkpoint(empty.path(), &plan).unwrap().is_none(),
+            latest_local_checkpoint(empty.path(), &plan)
+                .unwrap()
+                .is_none(),
             "a directory without a manifest must be skipped"
         );
 
@@ -3745,10 +3750,10 @@ mod runner_tests {
 
         // Sealed manifest with no state snapshots at all.
         let directory = tempfile::tempdir().unwrap();
-        write_manifest_under(directory.path(), &seal_manifest(probe_manifest(
-            plan.spec.id.as_str(),
-            &tasks,
-        )));
+        write_manifest_under(
+            directory.path(),
+            &seal_manifest(probe_manifest(plan.spec.id.as_str(), &tasks)),
+        );
         assert!(
             latest_local_checkpoint(directory.path(), &plan)
                 .unwrap()
@@ -3798,8 +3803,7 @@ mod runner_tests {
     fn latest_local_checkpoint_skips_snapshots_outside_the_job_namespace() {
         let (plan, tasks) = scan_plan_tasks();
         let directory = tempfile::tempdir().unwrap();
-        let store =
-            crate::checkpoint::FileCheckpointStore::new(directory.path()).unwrap();
+        let store = crate::checkpoint::FileCheckpointStore::new(directory.path()).unwrap();
         let repository = crate::checkpoint::CheckpointRepository::new(store);
         // A perfectly readable snapshot whose entries live under another
         // Job's namespace: the manifest seals fine, every structural check
@@ -3854,12 +3858,17 @@ mod runner_tests {
         // Corrupt manifest: readable directory, unusable content.
         std::fs::create_dir_all(root.join("checkpoints").join("corrupt")).unwrap();
         std::fs::write(
-            root.join("checkpoints").join("corrupt").join("manifest.json"),
+            root.join("checkpoints")
+                .join("corrupt")
+                .join("manifest.json"),
             b"not json",
         )
         .unwrap();
         // Sealed manifest belonging to another Job: readable but not recorded.
-        write_manifest_under(root, &seal_manifest(probe_manifest("runner-other-job", &tasks)));
+        write_manifest_under(
+            root,
+            &seal_manifest(probe_manifest("runner-other-job", &tasks)),
+        );
         let store = crate::checkpoint::FileCheckpointStore::new(root).unwrap();
         let catalog = local_checkpoint_catalog(root, &store, &plan);
         assert!(
@@ -4017,8 +4026,7 @@ mod runner_tests {
         time: TimeSpec,
         group: Option<&str>,
     ) -> crate::executor::graph::Chain {
-        let mut chain =
-            crate::executor::graph::Chain::for_pool_test(1, Vec::new());
+        let mut chain = crate::executor::graph::Chain::for_pool_test(1, Vec::new());
         chain.task_ids = vec![task.to_string()];
         chain.source_time = Some(time);
         chain.watermark_group = group.map(str::to_string);
@@ -4045,10 +4053,7 @@ mod runner_tests {
         let error = event_time_gates(&graph)
             .err()
             .expect("a timestamp-less group member must fail gate construction");
-        assert!(
-            error.to_string().contains("timestamp_field"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("timestamp_field"), "{error}");
     }
 
     /// Seeding skips chains that own a gate but no source, and gates whose
@@ -4082,10 +4087,7 @@ mod runner_tests {
             .entry_task_id()
             .to_string();
         // The window chain owns a gate but has no source to enumerate.
-        gates.insert(
-            window_task,
-            gates.get(&source_task).unwrap().clone(),
-        );
+        gates.insert(window_task, gates.get(&source_task).unwrap().clone());
         // The source chain's gate was taken: seeding must skip it silently.
         gates.insert(source_task, Arc::new(tokio::sync::Mutex::new(None)));
         seed_event_time_partitions(&graph, &gates)
@@ -4139,7 +4141,8 @@ mod runner_tests {
         assert_eq!(
             known,
             vec![crate::event_time::EventTimePartition::for_source(
-                &source_task, 0
+                &source_task,
+                0
             )],
             "a fresh gate must seed its chain partition"
         );
@@ -4220,7 +4223,6 @@ mod metrics_registry_tests {
             Ok(())
         }
     }
-
 
     /// One batch, then the reader parks until `released` flips. The Job
     /// stays RUNNING until the test is done observing the registered
@@ -4384,7 +4386,9 @@ mod metrics_registry_tests {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let run_release = release.clone();
         let run = tokio::spawn(async move {
-            let adapter = MinimalAdapter { release: run_release };
+            let adapter = MinimalAdapter {
+                release: run_release,
+            };
             let mut resource = Resource {
                 temporary: std::collections::HashMap::new(),
                 input_names: std::cell::RefCell::new(Vec::new()),

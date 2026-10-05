@@ -241,13 +241,11 @@ pub async fn run_suite(
         let results = run_each(count).await?;
         best = Some(match best {
             None => results,
-            Some(previous) => {
-                previous
-                    .into_iter()
-                    .zip(results)
-                    .map(|(old, new)| if new.wall < old.wall { new } else { old })
-                    .collect()
-            }
+            Some(previous) => previous
+                .into_iter()
+                .zip(results)
+                .map(|(old, new)| if new.wall < old.wall { new } else { old })
+                .collect(),
         });
     }
     Ok(best.expect("runs >= 1"))
@@ -317,7 +315,13 @@ mod tests {
             assert!(result.per_second() > 0.0, "{} zero throughput", result.name);
         }
         for result in &results {
-            println!("{}: {:?} ({:.0} {}/s)", result.name, result.wall, result.per_second(), result.unit);
+            println!(
+                "{}: {:?} ({:.0} {}/s)",
+                result.name,
+                result.wall,
+                result.per_second(),
+                result.unit
+            );
         }
         let names: Vec<&str> = results.iter().map(|r| r.name).collect();
         for expected in [

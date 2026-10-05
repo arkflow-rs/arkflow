@@ -36,24 +36,19 @@ fn registry() -> &'static std::sync::Mutex<BTreeMap<String, GroupRegistration>> 
 /// live group metadata.
 pub(crate) fn register_group(group_id: &str, topics: Vec<String>) -> SharedMetadata {
     let slot = Arc::new(RwLock::new(None));
-    registry()
-        .lock()
-        .expect("kafka txn registry lock")
-        .insert(
-            group_id.to_owned(),
-            GroupRegistration {
-                metadata: Arc::downgrade(&slot),
-                topics,
-            },
-        );
+    registry().lock().expect("kafka txn registry lock").insert(
+        group_id.to_owned(),
+        GroupRegistration {
+            metadata: Arc::downgrade(&slot),
+            topics,
+        },
+    );
     slot
 }
 
 /// Look up the live group metadata for a consumer group, if its input is
 /// still running in this process.
-pub(crate) async fn group_metadata(
-    group_id: &str,
-) -> Option<Arc<ConsumerGroupMetadata>> {
+pub(crate) async fn group_metadata(group_id: &str) -> Option<Arc<ConsumerGroupMetadata>> {
     let weak = registry()
         .lock()
         .expect("kafka txn registry lock")

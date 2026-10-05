@@ -152,8 +152,7 @@ impl Hub {
                     operation.failure_class = Some("recovery_required".into());
                     operation.finished_at_ms = Some(now);
                     operation.error = Some(
-                        "successful Job start invalidated by a failed runtime observation"
-                            .into(),
+                        "successful Job start invalidated by a failed runtime observation".into(),
                     );
                     operation.clone()
                 })

@@ -560,10 +560,7 @@ mod tests {
         });
         let error = compile_stream(&stream, 0).unwrap_err();
         let message = error.to_string();
-        assert!(
-            message.contains("Job DAG join operator"),
-            "{message}"
-        );
+        assert!(message.contains("Job DAG join operator"), "{message}");
         assert!(message.contains("two inbound edges"), "{message}");
     }
 
@@ -577,10 +574,7 @@ mod tests {
         });
         let error = compile_stream(&stream, 0).unwrap_err();
         let message = error.to_string();
-        assert!(
-            message.contains("Job DAG join operator"),
-            "{message}"
-        );
+        assert!(message.contains("Job DAG join operator"), "{message}");
     }
 
     #[test]

@@ -251,8 +251,12 @@ async fn job_upgrade_reads_list_history_and_require_storage() {
 
     let listed = hub.job_upgrades("list-job").await.unwrap();
     assert_eq!(listed.len(), 2, "{listed:?}");
-    assert!(listed.iter().any(|record| record.upgrade_id == first.upgrade_id));
-    assert!(listed.iter().any(|record| record.upgrade_id == second.upgrade_id));
+    assert!(listed
+        .iter()
+        .any(|record| record.upgrade_id == first.upgrade_id));
+    assert!(listed
+        .iter()
+        .any(|record| record.upgrade_id == second.upgrade_id));
 
     // Without durable storage the reads surface unavailability, and a
     // lookup against a foreign Job stays empty.
@@ -380,11 +384,7 @@ async fn savepoint_round_deadline_aborts_and_leaves_the_running_job_alone() {
         .unwrap();
     // First tick dispatches the savepoint round.
     tick(&hub).await;
-    let dispatched = hub
-        .job_upgrade(&record.upgrade_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let dispatched = hub.job_upgrade(&record.upgrade_id).await.unwrap().unwrap();
     let savepoint_id = dispatched.savepoint_id.clone().expect("round dispatched");
 
     // The round stays pending past the phase deadline: abort, keep the Job.

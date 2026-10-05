@@ -267,11 +267,7 @@ impl StateJournal {
                 previous: previous.clone(),
                 previous_versions: previous_versions.clone(),
                 applied_versions: applied_versions.clone(),
-                staged_versions: inner
-                    .apply_fences
-                    .get(&txn.id)
-                    .cloned()
-                    .unwrap_or_default(),
+                staged_versions: inner.apply_fences.get(&txn.id).cloned().unwrap_or_default(),
             }),
             _ => None,
         }
@@ -295,8 +291,10 @@ impl StateJournal {
             let mut inner = self.inner.lock().unwrap();
             let skips = inner.replay_applied.entry(snapshot.txn.id).or_default();
             for index in ownership_skipped {
-                if matches!(snapshot.mutations.get(index), Some(StagedMutation::Increment { .. }))
-                {
+                if matches!(
+                    snapshot.mutations.get(index),
+                    Some(StagedMutation::Increment { .. })
+                ) {
                     skips.insert(index);
                 }
             }
@@ -350,10 +348,12 @@ impl StateJournal {
             .previous_versions
             .iter()
             .enumerate()
-            .map(|(index, version)| match snapshot.applied_versions.get(index) {
-                Some(Some(_)) => *version,
-                _ => snapshot.staged_versions.get(index).copied().flatten(),
-            })
+            .map(
+                |(index, version)| match snapshot.applied_versions.get(index) {
+                    Some(Some(_)) => *version,
+                    _ => snapshot.staged_versions.get(index).copied().flatten(),
+                },
+            )
             .collect::<Vec<_>>();
         inner.apply_fences.insert(snapshot.txn.id, fence);
         Ok(())
@@ -362,7 +362,12 @@ impl StateJournal {
     /// The version fence a transaction currently carries (test observability).
     #[cfg(test)]
     fn fence_for_test(&self, txn: StateTxn) -> Option<Vec<Option<u64>>> {
-        self.inner.lock().unwrap().apply_fences.get(&txn.id).cloned()
+        self.inner
+            .lock()
+            .unwrap()
+            .apply_fences
+            .get(&txn.id)
+            .cloned()
     }
 
     pub fn staged_bytes(&self) -> usize {
@@ -852,7 +857,8 @@ impl StateJournal {
                 _ => return Ok(()),
             }
         };
-        let ownership_skipped = self.restore_previous(&applied.0, &applied.1, &applied.2, &applied.3)?;
+        let ownership_skipped =
+            self.restore_previous(&applied.0, &applied.1, &applied.2, &applied.3)?;
         let mut inner = self.inner.lock().unwrap();
         // A skipped restore means the mutation's effect is embedded in a
         // later committed value. Mark relative mutations (Increment) so the
@@ -1345,7 +1351,9 @@ mod tests {
         journal.undo(first).unwrap();
         // A later transaction replaces the value outright.
         let second = journal.begin().unwrap();
-        journal.put(second, "ns", b"k", b"5".to_vec(), None).unwrap();
+        journal
+            .put(second, "ns", b"k", b"5".to_vec(), None)
+            .unwrap();
         journal.commit(second).unwrap();
         // The retry of the relative mutation still lands on the newer value.
         journal.apply(first).unwrap();
@@ -1527,14 +1535,20 @@ mod tests {
         let a = journal.begin().unwrap();
         journal.update_i64(a, "ns", b"k", 1, None).unwrap();
         journal.apply(a).unwrap();
-        assert_eq!(journal.backend().get("ns", b"k").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"1".to_vec())
+        );
         // B commits +1 while A is applied: the committed value now embeds
         // A's delta.
         let b = journal.begin().unwrap();
         journal.update_i64(b, "ns", b"k", 1, None).unwrap();
         journal.apply(b).unwrap();
         journal.complete(b);
-        assert_eq!(journal.backend().get("ns", b"k").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"2".to_vec())
+        );
         // A's wrapped acknowledgement fails: the compensation is skipped
         // because B's commit owns the key.
         journal.undo(a).unwrap();
@@ -1709,9 +1723,7 @@ mod tests {
     async fn undo_compensates_state_before_rewinding_the_source_cursor() {
         let journal = Arc::new(StateJournal::new(backend()));
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"1".to_vec(), None)
-            .unwrap();
+        journal.put(txn, "ns", b"k", b"1".to_vec(), None).unwrap();
         journal.apply(txn).unwrap();
         assert_eq!(
             journal.backend().get("ns", b"k").unwrap(),
@@ -2053,7 +2065,8 @@ mod coverage_tests {
             if puts > self.fail_put_after.load(Ordering::SeqCst) {
                 return Err(Error::Process("injected put failure".into()));
             }
-            self.inner.put_with_ttl(namespace, key, value, ttl_ms, now_ms)
+            self.inner
+                .put_with_ttl(namespace, key, value, ttl_ms, now_ms)
         }
         fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
             self.inner.update_i64(namespace, key, delta)
@@ -2173,19 +2186,14 @@ mod coverage_tests {
         let flaky = Arc::new(FlakyBackend::new(backend()));
         let journal = StateJournal::new(flaky.clone() as Arc<dyn StateBackend>);
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"v".to_vec(), None)
-            .unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
         journal.apply(txn).unwrap();
         let rollback = journal.capture_applied(txn).unwrap();
         journal.complete(txn);
 
         flaky.fail_restore.store(true, Ordering::SeqCst);
         let error = journal.undo_snapshot(&rollback).unwrap_err().to_string();
-        assert!(
-            error.contains("injected restore failure"),
-            "{error}"
-        );
+        assert!(error.contains("injected restore failure"), "{error}");
     }
 
     #[test]
@@ -2297,16 +2305,12 @@ mod coverage_tests {
             },
         );
         let a = journal.begin().unwrap();
-        journal
-            .put(a, "ns", b"k", vec![0; 8], None)
-            .unwrap();
+        journal.put(a, "ns", b"k", vec![0; 8], None).unwrap();
         journal.apply(a).unwrap();
         let rollback = journal.capture_applied(a).unwrap();
         journal.complete(a);
         let b = journal.begin().unwrap();
-        journal
-            .put(b, "ns", b"j", vec![0; 8], None)
-            .unwrap();
+        journal.put(b, "ns", b"j", vec![0; 8], None).unwrap();
         let error = journal.restage_snapshot(&rollback).unwrap_err().to_string();
         assert!(error.contains("staging bound"), "{error}");
     }
@@ -2385,9 +2389,7 @@ mod coverage_tests {
         // A stages a put (still on time) and a delete whose key a later
         // transaction commits first, making the delete stale.
         let a = journal.begin().unwrap();
-        journal
-            .put(a, "ns", b"owned", b"v".to_vec(), None)
-            .unwrap();
+        journal.put(a, "ns", b"owned", b"v".to_vec(), None).unwrap();
         journal.delete(a, "ns", b"contested").unwrap();
         let b = journal.begin().unwrap();
         journal
@@ -2400,8 +2402,7 @@ mod coverage_tests {
         // the rollback itself fails, which must surface as a combined error.
         let error = journal.apply(a).unwrap_err().to_string();
         assert!(
-            error.contains("refused a stale mutation")
-                && error.contains("rollback also failed"),
+            error.contains("refused a stale mutation") && error.contains("rollback also failed"),
             "{error}"
         );
         assert_eq!(
@@ -2462,9 +2463,7 @@ mod coverage_tests {
         flaky.fail_restore.store(true, Ordering::SeqCst);
         let journal = Arc::new(StateJournal::new(flaky as Arc<dyn StateBackend>));
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"v".to_vec(), None)
-            .unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
         let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
             journal.clone(),
             vec![txn],
@@ -2507,9 +2506,7 @@ mod coverage_tests {
         flaky.fail_restore.store(true, Ordering::SeqCst);
         let journal = Arc::new(StateJournal::new(flaky as Arc<dyn StateBackend>));
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"v".to_vec(), None)
-            .unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
         journal.apply(txn).unwrap();
         let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
             journal.clone(),
@@ -2523,9 +2520,7 @@ mod coverage_tests {
         // the transaction for a retry.
         let journal = Arc::new(StateJournal::new(backend()));
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"v".to_vec(), None)
-            .unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
         let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
             journal.clone(),
             vec![txn],
@@ -2549,9 +2544,7 @@ mod coverage_tests {
         let flaky = Arc::new(FlakyBackend::new(backend()));
         let journal = Arc::new(StateJournal::new(flaky.clone() as Arc<dyn StateBackend>));
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"v".to_vec(), None)
-            .unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
         let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
             journal.clone(),
             vec![txn],
@@ -2562,10 +2555,7 @@ mod coverage_tests {
         // surface without rewinding the source cursor.
         flaky.fail_restore.store(true, Ordering::SeqCst);
         let error = ack.undo().await.unwrap_err().to_string();
-        assert!(
-            error.contains("injected restore failure"),
-            "{error}"
-        );
+        assert!(error.contains("injected restore failure"), "{error}");
     }
 
     #[tokio::test]
@@ -2578,9 +2568,7 @@ mod coverage_tests {
             },
         ));
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"v".to_vec(), None)
-            .unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
         let ack: Arc<dyn Ack> = Arc::new(CommitGroupOnAck::new(
             journal.clone(),
             vec![txn],
@@ -2642,9 +2630,7 @@ mod coverage_tests {
         flaky.fail_restore.store(true, Ordering::SeqCst);
         let journal = Arc::new(StateJournal::new(flaky as Arc<dyn StateBackend>));
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"v".to_vec(), None)
-            .unwrap();
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
         journal.apply(txn).unwrap();
         let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
             journal.clone(),
@@ -2664,11 +2650,8 @@ mod coverage_tests {
         let journal = Arc::new(StateJournal::new(backend()));
         let single_inner = RecordingAck::succeeding();
         let txn = journal.begin().unwrap();
-        let single: Arc<dyn Ack> = Arc::new(CommitOnAck::new(
-            journal.clone(),
-            txn,
-            single_inner.clone(),
-        ));
+        let single: Arc<dyn Ack> =
+            Arc::new(CommitOnAck::new(journal.clone(), txn, single_inner.clone()));
         single.mark_held();
         single.release_held();
         assert!(single_inner.held.load(Ordering::SeqCst));
@@ -2692,11 +2675,8 @@ mod coverage_tests {
         let journal = Arc::new(StateJournal::new(backend()));
         let inner = RecordingAck::succeeding();
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"v".to_vec(), None)
-            .unwrap();
-        let ack: Arc<dyn Ack> =
-            Arc::new(CommitOnAck::new(journal.clone(), txn, inner.clone()));
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(journal.clone(), txn, inner.clone()));
         ack.abort().await.unwrap();
         // Neither registered nor carrying a completed rollback: a no-op undo
         // that still rewinds the wrapped acknowledgement.
@@ -2709,11 +2689,8 @@ mod coverage_tests {
         let journal = Arc::new(StateJournal::new(backend()));
         let inner = RecordingAck::succeeding();
         let txn = journal.begin().unwrap();
-        journal
-            .put(txn, "ns", b"k", b"v".to_vec(), None)
-            .unwrap();
-        let ack: Arc<dyn Ack> =
-            Arc::new(CommitOnAck::new(journal.clone(), txn, inner.clone()));
+        journal.put(txn, "ns", b"k", b"v".to_vec(), None).unwrap();
+        let ack: Arc<dyn Ack> = Arc::new(CommitOnAck::new(journal.clone(), txn, inner.clone()));
         ack.ack().await.unwrap();
         assert_eq!(
             journal.backend().get("ns", b"k").unwrap(),

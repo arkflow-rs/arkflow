@@ -71,7 +71,10 @@ impl RespClient {
         .await
         .expect("tcp connect timeout")
         .expect("tcp connect");
-        Self { stream, buf: Vec::new() }
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
     }
 
     async fn cmd(&mut self, args: &[&str]) -> String {
@@ -120,18 +123,18 @@ async fn redis_lease() -> Option<RedisLease> {
             return None;
         }
         let container = start_redis().await;
-        let port = container.get_host_port_ipv4(6379).await.expect("mapped port");
+        let port = container
+            .get_host_port_ipv4(6379)
+            .await
+            .expect("mapped port");
         let addr = format!("127.0.0.1:{port}");
         *redis = Some(container);
         // Wait until the server answers PING.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(Instant::now() < deadline, "redis never became ready");
-            if let Ok(mut client) = tokio::time::timeout(
-                Duration::from_secs(2),
-                RespClient::connect(&addr),
-            )
-            .await
+            if let Ok(mut client) =
+                tokio::time::timeout(Duration::from_secs(2), RespClient::connect(&addr)).await
             {
                 if client.cmd(&["PING"]).await.starts_with('+') {
                     break;
@@ -224,7 +227,9 @@ fn first_payload(batch: &MessageBatchRef) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn channel_subscription_delivers_published_payloads() {
-    let Some(lease) = redis_lease().await else { return };
+    let Some(lease) = redis_lease().await else {
+        return;
+    };
     let input = build_input(serde_json::json!({
         "mode": {"type": "single", "url": format!("redis://{}", lease.addr)},
         "redis_type": {"type": "subscribe", "subscribe": {"type": "channels", "channels": ["ark-test-ch"]}}
@@ -235,7 +240,9 @@ async fn channel_subscription_delivers_published_payloads() {
     // Let the subscription register server-side before publishing.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut publisher = RespClient::connect(&lease.addr).await;
-    publisher.cmd(&["PUBLISH", "ark-test-ch", "hello-channels"]).await;
+    publisher
+        .cmd(&["PUBLISH", "ark-test-ch", "hello-channels"])
+        .await;
     publisher
         .cmd(&["PUBLISH", "other-channel", "must-not-arrive"])
         .await;
@@ -247,7 +254,9 @@ async fn channel_subscription_delivers_published_payloads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pattern_subscription_delivers_matching_payloads() {
-    let Some(lease) = redis_lease().await else { return };
+    let Some(lease) = redis_lease().await else {
+        return;
+    };
     let input = build_input(serde_json::json!({
         "mode": {"type": "single", "url": format!("redis://{}", lease.addr)},
         "redis_type": {"type": "subscribe", "subscribe": {"type": "patterns", "patterns": ["ark-test-pat-*"]}}
@@ -271,7 +280,9 @@ async fn pattern_subscription_delivers_matching_payloads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_mode_pops_pushed_entries() {
-    let Some(lease) = redis_lease().await else { return };
+    let Some(lease) = redis_lease().await else {
+        return;
+    };
     let input = build_input(serde_json::json!({
         "mode": {"type": "single", "url": format!("redis://{}", lease.addr)},
         "redis_type": {"type": "list", "list": ["ark-test-list"]}
@@ -280,7 +291,9 @@ async fn list_mode_pops_pushed_entries() {
     input.connect().await.expect("connect redis input");
 
     let mut producer = RespClient::connect(&lease.addr).await;
-    producer.cmd(&["LPUSH", "ark-test-list", "hello-list"]).await;
+    producer
+        .cmd(&["LPUSH", "ark-test-list", "hello-list"])
+        .await;
 
     let batch = read_with_timeout(&input).await;
     assert_eq!(first_payload(&batch), b"hello-list");

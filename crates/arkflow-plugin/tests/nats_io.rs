@@ -22,13 +22,13 @@ use arkflow_core::input::{Input, InputConfig};
 use arkflow_core::{Error, Resource};
 use async_nats::ConnectOptions;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, Image, ImageExt, core::IntoContainerPort};
+use testcontainers::{core::IntoContainerPort, ContainerAsync, GenericImage, Image, ImageExt};
 
 const NATS_HOST_PORT: u16 = 4222;
 const NATS_URL: &str = "nats://127.0.0.1:4222";
@@ -63,13 +63,7 @@ impl Image for NatsServer {
 
     fn cmd(&self) -> impl IntoIterator<Item = impl Into<std::borrow::Cow<'_, str>>> {
         [
-            "-js",
-            "-sd",
-            "/tmp",
-            "--user",
-            NATS_USER,
-            "--pass",
-            NATS_PASS,
+            "-js", "-sd", "/tmp", "--user", NATS_USER, "--pass", NATS_PASS,
         ]
     }
 }
@@ -168,7 +162,9 @@ fn sweep_leftover_servers() {
         return;
     }
     for id in String::from_utf8_lossy(&listing.stdout).split_whitespace() {
-        let _ = std::process::Command::new("docker").args(["rm", "-f", id]).output();
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
     }
 }
 
@@ -314,7 +310,9 @@ async fn regular_input_reads_and_acks_published_messages() {
     .await;
 
     let client = admin_client().await.expect("publisher client");
-    let expected: Vec<Vec<u8>> = (0..3).map(|i| format!("payload-{i}").into_bytes()).collect();
+    let expected: Vec<Vec<u8>> = (0..3)
+        .map(|i| format!("payload-{i}").into_bytes())
+        .collect();
     for payload in &expected {
         client
             .publish(subject.clone(), payload.clone().into())
@@ -416,7 +414,10 @@ async fn jetstream_input_reads_and_acks_durable_messages() {
     let mut expected: Vec<Vec<u8>> = (0..TOTAL).map(|i| format!("js-{i}").into_bytes()).collect();
     payloads.sort();
     expected.sort();
-    assert_eq!(payloads, expected, "all published messages must be delivered");
+    assert_eq!(
+        payloads, expected,
+        "all published messages must be delivered"
+    );
     input.close().await.expect("close input");
 
     // A second durable consumer on the same subscription must not
@@ -433,7 +434,7 @@ async fn jetstream_input_reads_and_acks_durable_messages() {
     }))
     .await;
     match tokio::time::timeout(Duration::from_secs(2), verifier.read()).await {
-        Err(_) => {} // no redelivery within the window: pass
+        Err(_) => {}     // no redelivery within the window: pass
         Ok(Err(_)) => {} // surfaced as disconnection, not redelivered data: pass
         Ok(Ok((batch, _))) => panic!(
             "acknowledged JetStream messages were re-delivered: {:?}",
@@ -473,8 +474,5 @@ async fn jetstream_unknown_stream_fails_at_connect() {
         matches!(error, Error::Connection(_)),
         "unexpected error: {error}"
     );
-    assert!(
-        error.to_string().contains("JetStream"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("JetStream"), "{error}");
 }

@@ -428,10 +428,7 @@ mod tests {
         let result = build_sqlite("/nonexistent/arkflow/missing.db", "SELECT 1");
         if let Ok(input) = result {
             match input.connect().await {
-                Err(err) => assert!(
-                    err.to_string().to_lowercase().contains("sqlite"),
-                    "{err}"
-                ),
+                Err(err) => assert!(err.to_string().to_lowercase().contains("sqlite"), "{err}"),
                 Ok(()) => panic!("a missing sqlite file must fail connect"),
             }
         }

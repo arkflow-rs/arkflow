@@ -17,9 +17,9 @@
 //! become the columns of a single-row batch. Nested records, arrays, maps and
 //! unions other than `[null, T]` are rejected rather than silently flattened.
 
-use apache_avro::Schema as AvroSchema;
 use apache_avro::reader::datum::GenericDatumReader;
 use apache_avro::types::Value as AvroValue;
+use apache_avro::Schema as AvroSchema;
 use arkflow_core::Error;
 use datafusion::arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
@@ -199,9 +199,10 @@ fn leaf_to_arrow(
     nullable: bool,
 ) -> Result<(Arc<Field>, Arc<dyn Array>), Error> {
     let (dt, arr): (DataType, Arc<dyn Array>) = match (schema, value) {
-        (AvroSchema::Boolean, AvroValue::Boolean(v)) => {
-            (DataType::Boolean, Arc::new(BooleanArray::from(vec![Some(*v)])))
-        }
+        (AvroSchema::Boolean, AvroValue::Boolean(v)) => (
+            DataType::Boolean,
+            Arc::new(BooleanArray::from(vec![Some(*v)])),
+        ),
         (AvroSchema::Int, AvroValue::Int(v)) => {
             (DataType::Int32, Arc::new(Int32Array::from(vec![Some(*v)])))
         }
@@ -240,9 +241,10 @@ fn leaf_to_arrow(
             DataType::Utf8,
             Arc::new(StringArray::from(vec![Some(v.as_str())])),
         ),
-        (AvroSchema::Date, AvroValue::Date(v)) => {
-            (DataType::Date32, Arc::new(Date32Array::from(vec![Some(*v)])))
-        }
+        (AvroSchema::Date, AvroValue::Date(v)) => (
+            DataType::Date32,
+            Arc::new(Date32Array::from(vec![Some(*v)])),
+        ),
         (AvroSchema::TimeMillis, AvroValue::TimeMillis(v)) => (
             DataType::Time32(TimeUnit::Millisecond),
             Arc::new(Time32MillisecondArray::from(vec![Some(*v)])),
@@ -292,10 +294,7 @@ fn leaf_to_arrow(
                 })?;
             (DataType::Decimal128(precision, scale), Arc::new(arr))
         }
-        (
-            AvroSchema::Record(_) | AvroSchema::Array(_) | AvroSchema::Map(_),
-            _,
-        ) => {
+        (AvroSchema::Record(_) | AvroSchema::Array(_) | AvroSchema::Map(_), _) => {
             return Err(Error::Process(format!(
                 "Unsupported nested Avro type for field '{}': nested records/arrays/maps are not supported by the flat Arrow mapping",
                 name
@@ -311,10 +310,7 @@ fn leaf_to_arrow(
     Ok((Arc::new(Field::new(name, dt, nullable)), arr))
 }
 
-fn decimal_metadata(
-    d: &apache_avro::schema::DecimalSchema,
-    name: &str,
-) -> Result<(u8, i8), Error> {
+fn decimal_metadata(d: &apache_avro::schema::DecimalSchema, name: &str) -> Result<(u8, i8), Error> {
     let precision = d.precision;
     let scale = d.scale;
     if precision == 0 || precision > 38 {
@@ -385,10 +381,7 @@ mod tests {
                 ("name".into(), Value::String("sensor".into())),
                 ("score".into(), Value::Double(1.5)),
                 ("active".into(), Value::Boolean(true)),
-                (
-                    "ts".into(),
-                    Value::TimestampMillis(1_700_000_000_000),
-                ),
+                ("ts".into(), Value::TimestampMillis(1_700_000_000_000)),
                 ("day".into(), Value::Date(19_000)),
                 ("level".into(), Value::Enum(1, "HIGH".into())),
                 ("payload".into(), Value::Bytes(vec![0xAB, 0xCD])),
@@ -398,17 +391,38 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
 
         use datafusion::arrow::array::AsArray;
-        use datafusion::arrow::datatypes::{Date32Type, Float64Type, Int64Type, TimestampMillisecondType};
-        assert_eq!(batch.column_by_name("id").unwrap().as_primitive::<Int64Type>().value(0), 42);
+        use datafusion::arrow::datatypes::{
+            Date32Type, Float64Type, Int64Type, TimestampMillisecondType,
+        };
         assert_eq!(
-            batch.column_by_name("name").unwrap().as_string::<i32>().value(0),
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .value(0),
+            42
+        );
+        assert_eq!(
+            batch
+                .column_by_name("name")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
             "sensor"
         );
         assert_eq!(
-            batch.column_by_name("score").unwrap().as_primitive::<Float64Type>().value(0),
+            batch
+                .column_by_name("score")
+                .unwrap()
+                .as_primitive::<Float64Type>()
+                .value(0),
             1.5
         );
-        assert!(batch.column_by_name("active").unwrap().as_boolean().value(0));
+        assert!(batch
+            .column_by_name("active")
+            .unwrap()
+            .as_boolean()
+            .value(0));
         assert_eq!(
             batch
                 .column_by_name("ts")
@@ -430,11 +444,19 @@ mod tests {
             19_000
         );
         assert_eq!(
-            batch.column_by_name("level").unwrap().as_string::<i32>().value(0),
+            batch
+                .column_by_name("level")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
             "HIGH"
         );
         assert_eq!(
-            batch.column_by_name("payload").unwrap().as_binary::<i32>().value(0),
+            batch
+                .column_by_name("payload")
+                .unwrap()
+                .as_binary::<i32>()
+                .value(0),
             &[0xAB, 0xCD]
         );
     }
@@ -451,11 +473,17 @@ mod tests {
         );
         let with_value = encode(
             &schema,
-            Value::Record(vec![("note".into(), Value::Union(1, Box::new(Value::String("hi".into()))))]),
+            Value::Record(vec![(
+                "note".into(),
+                Value::Union(1, Box::new(Value::String("hi".into()))),
+            )]),
         );
         let with_null = encode(
             &schema,
-            Value::Record(vec![("note".into(), Value::Union(0, Box::new(Value::Null)))]),
+            Value::Record(vec![(
+                "note".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            )]),
         );
         let b1 = avro_to_arrow(&schema, &with_value).unwrap();
         let b2 = avro_to_arrow(&schema, &with_null).unwrap();
@@ -486,7 +514,11 @@ mod tests {
         let col = batch.column_by_name("amount").unwrap();
         assert_eq!(col.data_type().to_string(), "Decimal128(10, 2)");
         use datafusion::arrow::array::AsArray;
-        assert_eq!(col.as_primitive::<datafusion::arrow::datatypes::Decimal128Type>().value(0), 12345);
+        assert_eq!(
+            col.as_primitive::<datafusion::arrow::datatypes::Decimal128Type>()
+                .value(0),
+            12345
+        );
     }
 
     #[test]
@@ -526,7 +558,11 @@ mod tests {
         let batch = avro_to_arrow(&schema, &payload).unwrap();
         use datafusion::arrow::array::AsArray;
         assert_eq!(
-            batch.column_by_name("uid").unwrap().as_string::<i32>().value(0),
+            batch
+                .column_by_name("uid")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
             "00000000-0000-0000-0000-000000000001"
         );
     }
@@ -591,9 +627,8 @@ mod tests {
 
     #[test]
     fn null_value_under_a_non_nullable_schema_is_rejected() {
-        let schema = parse(
-            r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": "int"}]}"#,
-        );
+        let schema =
+            parse(r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": "int"}]}"#);
         // Build the mismatch directly through avro_value_to_arrow so the
         // null-under-non-nullable branch is exercised without the encoder
         // refusing first.
@@ -608,10 +643,7 @@ mod tests {
         let schema = parse(
             r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": {"type": "array", "items": "int"}}]}"#,
         );
-        let value = Value::Record(vec![(
-            "x".into(),
-            Value::Array(vec![Value::Int(1)]),
-        )]);
+        let value = Value::Record(vec![("x".into(), Value::Array(vec![Value::Int(1)]))]);
         let err = avro_value_to_arrow(&schema, &value).unwrap_err();
         assert!(
             err.to_string().contains("Unsupported nested Avro type"),
@@ -641,10 +673,7 @@ mod tests {
             ("by", Value::Bytes(vec![0xAB])),
             ("s", Value::String("text".into())),
             ("tmcs", Value::TimeMicros(1_500)),
-            (
-                "tslocal",
-                Value::LocalTimestampMillis(1_700_000_000_000),
-            ),
+            ("tslocal", Value::LocalTimestampMillis(1_700_000_000_000)),
             (
                 "tslocal_us",
                 Value::LocalTimestampMicros(1_700_000_000_000_000),
@@ -685,15 +714,11 @@ mod tests {
     #[test]
     fn schema_value_mismatch_is_rejected_in_leaf_mapping() {
         // Schema says long but the value is a string: the catch-all arm.
-        let schema = parse(
-            r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": "long"}]}"#,
-        );
+        let schema =
+            parse(r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": "long"}]}"#);
         let value = Value::Record(vec![("x".into(), Value::String("nope".into()))]);
         let err = avro_value_to_arrow(&schema, &value).unwrap_err();
-        assert!(
-            err.to_string().contains("Unsupported Avro type"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("Unsupported Avro type"), "{err}");
     }
 
     #[test]
@@ -718,7 +743,10 @@ mod tests {
         );
         let payload = encode(
             &schema,
-            Value::Record(vec![("tags".into(), Value::Array(vec![Value::String("a".into())]))]),
+            Value::Record(vec![(
+                "tags".into(),
+                Value::Array(vec![Value::String("a".into())]),
+            )]),
         );
         let err = avro_to_arrow(&schema, &payload).unwrap_err();
         assert!(format!("{err}").contains("nested"), "got: {err}");
@@ -733,7 +761,10 @@ mod tests {
         );
         let payload = encode(
             &schema,
-            Value::Record(vec![("v".into(), Value::Union(1, Box::new(Value::String("x".into()))))]),
+            Value::Record(vec![(
+                "v".into(),
+                Value::Union(1, Box::new(Value::String("x".into()))),
+            )]),
         );
         let err = avro_to_arrow(&schema, &payload).unwrap_err();
         assert!(format!("{err}").contains("union"), "got: {err}");

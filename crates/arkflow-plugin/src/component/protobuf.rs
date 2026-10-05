@@ -551,7 +551,10 @@ message Sample {
             includes: None,
         })
         .unwrap_err();
-        assert!(err.to_string().contains("Failed to parse the proto file"), "{err}");
+        assert!(
+            err.to_string().contains("Failed to parse the proto file"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -563,7 +566,10 @@ message Sample {
         assert!(err.to_string().contains("Message type not found"), "{err}");
 
         let err = parse_proto_source("garbage {", "x.Y").unwrap_err();
-        assert!(err.to_string().contains("Failed to parse proto source"), "{err}");
+        assert!(
+            err.to_string().contains("Failed to parse proto source"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -608,10 +614,7 @@ message Sample {
         let arr = Arc::new(StringArray::from(vec![Some("x")]));
         let rb = RecordBatch::try_new(schema, vec![arr]).unwrap();
         let err = arrow_to_protobuf(&descriptor, &MessageBatch::new_arrow(rb)).unwrap_err();
-        assert!(
-            err.to_string().contains("expects proto Int64"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("expects proto Int64"), "{err}");
     }
 
     #[tokio::test]
@@ -633,7 +636,10 @@ message Sample {
         let arr = Arc::new(StringArray::from(vec![Some("x")]));
         let rb = RecordBatch::try_new(schema, vec![arr]).unwrap();
         let err = arrow_to_protobuf(&descriptor, &MessageBatch::new_arrow(rb)).unwrap_err();
-        assert!(err.to_string().contains("Unsupported Protobuf type"), "{err}");
+        assert!(
+            err.to_string().contains("Unsupported Protobuf type"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -660,7 +666,10 @@ message Sample {
 
         // A truncated buffer fails decode loudly.
         let err = protobuf_to_arrow(&descriptor, &encoded[..encoded.len() / 2]).unwrap_err();
-        assert!(err.to_string().contains("Protobuf message parsing failed"), "{err}");
+        assert!(
+            err.to_string().contains("Protobuf message parsing failed"),
+            "{err}"
+        );
     }
 
     fn write_proto(dir: &tempfile::TempDir, name: &str, content: &str) -> String {

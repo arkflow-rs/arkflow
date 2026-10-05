@@ -642,10 +642,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("read before connect must fail"),
         };
-        assert!(
-            error.to_string().contains("not connected"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("not connected"), "{error}");
     }
 
     #[tokio::test]

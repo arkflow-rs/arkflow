@@ -120,7 +120,7 @@ async fn agent_kernel_job_snapshots_and_stops() {
     let spec = JobSpec {
         resources: Default::default(),
         rebalance: None,
-rescale: false,
+        rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new("kernel-agent-job").unwrap(),
         version: JobVersion(1),
@@ -472,7 +472,7 @@ fn kernel_job_spec() -> JobSpec {
     JobSpec {
         resources: Default::default(),
         rebalance: None,
-rescale: false,
+        rescale: false,
         placement: arkflow_core::job::PlacementStrategy::Colocated,
         id: JobId::new("fault-injection").unwrap(),
         version: JobVersion(1),

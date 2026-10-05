@@ -16,13 +16,13 @@
 //!
 //! Receive data from a Pulsar topic
 
+use crate::input::codec_helper::Delivery;
 use crate::pulsar::{
     PulsarAuth, PulsarClientUtils, PulsarConfigValidator, RetryConfig, SubscriptionType,
 };
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
-use crate::input::codec_helper::Delivery;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
@@ -115,9 +115,11 @@ impl Input for PulsarInput {
             PulsarClientUtils::create_client_builder(&self.config.service_url, &self.config.auth)?;
         if let Some(tls) = &self.config.tls {
             if let Some(chain_file) = &tls.certificate_chain_file {
-                builder = builder.with_certificate_chain_file(chain_file).map_err(|e| {
-                    Error::Config(format!("pulsar: failed to load certificate chain: {e}"))
-                })?;
+                builder = builder
+                    .with_certificate_chain_file(chain_file)
+                    .map_err(|e| {
+                        Error::Config(format!("pulsar: failed to load certificate chain: {e}"))
+                    })?;
             }
             if let Some(enabled) = tls.hostname_verification {
                 builder = builder.with_tls_hostname_verification_enabled(enabled);

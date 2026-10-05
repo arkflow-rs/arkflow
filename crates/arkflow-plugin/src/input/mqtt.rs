@@ -16,10 +16,10 @@
 //!
 //! Receive data from the MQTT broker
 
+use crate::input::codec_helper::Delivery;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
-use crate::input::codec_helper::Delivery;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
@@ -366,18 +366,19 @@ mod tests {
             "clean_session": false,
             "keep_alive": 30
         }));
-        assert!(
-            MqttInputBuilder
-                .build(None, &config, None, &test_resource())
-                .is_ok()
-        );
+        assert!(MqttInputBuilder
+            .build(None, &config, None, &test_resource())
+            .is_ok());
     }
 
     #[test]
     fn qos_variants_deserialize() {
         assert_eq!(config(Some(0)).qos, Some(0));
         assert_eq!(config(Some(2)).qos, Some(2));
-        assert!(config(Some(9)).qos.is_some(), "out-of-range qos still parses");
+        assert!(
+            config(Some(9)).qos.is_some(),
+            "out-of-range qos still parses"
+        );
         assert!(config(None).qos.is_none());
         assert!(config(None).tls.is_none(), "tls defaults to none");
     }

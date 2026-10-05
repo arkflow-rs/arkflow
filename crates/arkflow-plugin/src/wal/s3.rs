@@ -443,13 +443,10 @@ impl S3Store {
         let segments_prefix = format!("{}/segments", ns);
         let manifest_key = format!("{}/manifest.json", ns);
 
-        let runtime = runtime_slot
-            .as_ref()
-            .expect("construction runtime present");
-        let first_index =
-            block_on_init(runtime, async {
-                probe_next_segment_index(&*client, &segments_prefix).await
-            })??;
+        let runtime = runtime_slot.as_ref().expect("construction runtime present");
+        let first_index = block_on_init(runtime, async {
+            probe_next_segment_index(&*client, &segments_prefix).await
+        })??;
 
         let store = Arc::new(Self {
             runtime: runtime_slot.take(),
@@ -1349,11 +1346,13 @@ mod tests {
         let wal = Wal::open_with_store(&config, store, 1).unwrap();
 
         for expected in 1..=3u64 {
-            let seq = wal.append(&Arc::new(arkflow_core::MessageBatch::try_from(vec![
-                format!("{{\"v\":{expected}}}"),
-            ]).unwrap()))
-            .await
-            .unwrap_or_else(|e| panic!("append {expected} through the async API: {e}"));
+            let seq = wal
+                .append(&Arc::new(
+                    arkflow_core::MessageBatch::try_from(vec![format!("{{\"v\":{expected}}}")])
+                        .unwrap(),
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("append {expected} through the async API: {e}"));
             assert_eq!(seq, expected);
         }
         // Drives append_batch on the blocking pool (the exact call that
@@ -2555,7 +2554,10 @@ mod tests {
             .expect("worker queue has capacity");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while done.load(Ordering::SeqCst) == 0 {
-            assert!(std::time::Instant::now() < deadline, "PUT worker never completed");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PUT worker never completed"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(done.load(Ordering::SeqCst), 7);
@@ -2594,7 +2596,11 @@ mod tests {
             .expect("send");
         // Give the worker time to attempt (and log) the failing upload.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert_eq!(done.load(Ordering::SeqCst), 0, "failed PUT must not complete");
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            0,
+            "failed PUT must not complete"
+        );
     }
 
     /// The worker pool caps at 8 workers and warns (task 3.3).
@@ -2679,8 +2685,10 @@ mod tests {
     /// `S3Store::build` rejects configs whose backend is not `object_store`.
     #[test]
     fn build_requires_object_store_backend() {
-        let err = unwrap_err(S3Store::build(&WalConfig::default()),
-            "default config has no object_store backend");
+        let err = unwrap_err(
+            S3Store::build(&WalConfig::default()),
+            "default config has no object_store backend",
+        );
         assert!(err.to_string().contains("requires `backend: object_store`"));
     }
 
@@ -2857,7 +2865,9 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let next = probe_next_segment_index(&*client, "ns/segments").await.unwrap();
+            let next = probe_next_segment_index(&*client, "ns/segments")
+                .await
+                .unwrap();
             assert_eq!(next, 11, "max seen index is 10");
         });
     }
@@ -2930,9 +2940,8 @@ mod tests {
     /// recovery is an error, not a skip.
     #[test]
     fn recovery_errors_when_segment_get_fails() {
-        let client: Arc<dyn object_store::ObjectStore> = Arc::new(FailGetStore::segments(
-            inmemory_client(),
-        ));
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(FailGetStore::segments(inmemory_client()));
         let payload = sample_payload(None);
         let mut seg_bytes = Vec::new();
         super::super::segment::encode(&[(1u64, payload)], &mut seg_bytes).unwrap();
@@ -2953,18 +2962,14 @@ mod tests {
             client,
         );
         let err = unwrap_err(result, "segment GET failure must fail recovery");
-        assert!(
-            err.to_string().contains("S3 GET segment"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("S3 GET segment"), "got: {err}");
     }
 
     /// A generic manifest GET failure fails recovery (not treated as fresh).
     #[test]
     fn recovery_errors_when_manifest_get_fails() {
-        let client: Arc<dyn object_store::ObjectStore> = Arc::new(FailGetStore::manifest(
-            inmemory_client(),
-        ));
+        let client: Arc<dyn object_store::ObjectStore> =
+            Arc::new(FailGetStore::manifest(inmemory_client()));
         let result = S3Store::build_with_client(
             &WalConfig::default(),
             osc_base(),
@@ -2972,10 +2977,7 @@ mod tests {
             client,
         );
         let err = unwrap_err(result, "manifest GET failure must fail recovery");
-        assert!(
-            err.to_string().contains("S3 GET manifest"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("S3 GET manifest"), "got: {err}");
     }
 
     /// `read_manifest_with_etag` and `read_after_cursor` both surface a
@@ -2998,17 +3000,11 @@ mod tests {
             .rt()
             .block_on(async move { read_manifest_with_etag(&inner_store).await })
             .expect_err("the post-recovery manifest GET must fail");
-        assert!(
-            err.to_string().contains("S3 GET manifest"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("S3 GET manifest"), "got: {err}");
         let err = store
             .read_after_cursor()
             .expect_err("read_after_cursor must hit the same branch");
-        assert!(
-            err.to_string().contains("S3 GET manifest"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("S3 GET manifest"), "got: {err}");
         // close()'s final flush fails on the same branch; it must not panic.
         let _ = store.close();
     }
@@ -3044,10 +3040,7 @@ mod tests {
         let err = store
             .read_after_cursor()
             .expect_err("segment GET failure must surface");
-        assert!(
-            err.to_string().contains("S3 GET segment"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("S3 GET segment"), "got: {err}");
         let _ = store.close();
     }
 
@@ -3113,9 +3106,8 @@ mod tests {
         osc.segment.flush_interval = std::time::Duration::from_millis(100);
         osc.cursor.interval = std::time::Duration::from_millis(150);
         osc.cursor.max_entries = 1_000_000;
-        let store =
-            S3Store::build_with_client(&WalConfig::default(), osc, runtime, client.clone())
-                .unwrap();
+        let store = S3Store::build_with_client(&WalConfig::default(), osc, runtime, client.clone())
+            .unwrap();
         let payload = sample_payload(None);
         store.append_batch(vec![(1, payload)]).unwrap();
         // Wait for at least two flusher ticks (tolerates a slow CI machine).
@@ -3127,8 +3119,9 @@ mod tests {
                 .block_on(async {
                     use futures::StreamExt;
                     let mut n = 0u32;
-                    let mut stream =
-                        client.list(Some(&ObjectPath::from(format!("{COV_NS}/segments").as_str())));
+                    let mut stream = client.list(Some(&ObjectPath::from(
+                        format!("{COV_NS}/segments").as_str(),
+                    )));
                     while let Some(item) = stream.next().await {
                         item?;
                         n += 1;
@@ -3159,19 +3152,12 @@ mod tests {
             fail_for_first: AtomicU64::new(3),
         });
         let runtime = Runtime::new().unwrap();
-        let store = S3Store::build_with_client(
-            &WalConfig::default(),
-            osc_base(),
-            runtime,
-            client,
-        )
-        .unwrap();
+        let store =
+            S3Store::build_with_client(&WalConfig::default(), osc_base(), runtime, client).unwrap();
         let inner_store = store.clone();
         store
             .rt()
-            .block_on(async move {
-                write_manifest_with_etag(&inner_store, |m| m.cursor = 5).await
-            })
+            .block_on(async move { write_manifest_with_etag(&inner_store, |m| m.cursor = 5).await })
             .expect("retries converge after contention");
         let inner_store = store.clone();
         store.rt().block_on(async move {
@@ -3191,13 +3177,8 @@ mod tests {
             inner: inner.clone(),
         });
         let runtime = Runtime::new().unwrap();
-        let store = S3Store::build_with_client(
-            &WalConfig::default(),
-            osc_base(),
-            runtime,
-            client,
-        )
-        .unwrap();
+        let store =
+            S3Store::build_with_client(&WalConfig::default(), osc_base(), runtime, client).unwrap();
         let inner_store = store.clone();
         store
             .rt()
@@ -3222,22 +3203,14 @@ mod tests {
         let client: Arc<dyn object_store::ObjectStore> =
             Arc::new(FailGetStore::manifest_after(inner, 1));
         let runtime = Runtime::new().unwrap();
-        let store = S3Store::build_with_client(
-            &WalConfig::default(),
-            osc_base(),
-            runtime,
-            client,
-        )
-        .unwrap();
+        let store =
+            S3Store::build_with_client(&WalConfig::default(), osc_base(), runtime, client).unwrap();
         let inner_store = store.clone();
         let err = store
             .rt()
             .block_on(async move { flush_manifest(&inner_store).await })
             .expect_err("flush must fail when the manifest cannot be read");
-        assert!(
-            err.to_string().contains("S3 GET manifest"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("S3 GET manifest"), "got: {err}");
         let _ = store.close();
     }
 

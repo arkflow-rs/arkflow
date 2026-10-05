@@ -81,10 +81,10 @@ fn headroom_key(
         if let Some(cores) = record
             .metrics
             .get("node_cpu_cores")
-            .copied().filter(|cores| cores.is_finite() && *cores > 0.0)
+            .copied()
+            .filter(|cores| cores.is_finite() && *cores > 0.0)
         {
-            let allocated_percent =
-                allocated_cpu as f64 / (cores * 1000.0) * 100.0;
+            let allocated_percent = allocated_cpu as f64 / (cores * 1000.0) * 100.0;
             cpu_headroom = (cpu_headroom - allocated_percent).max(0.0);
         }
     }
@@ -233,10 +233,7 @@ impl Hub {
     /// successful-start nodes). Recomputing from the current view — instead
     /// of maintaining an incremental ledger — keeps the numbers self-healing
     /// across Hub restarts and retention re-dispatches.
-    pub(crate) async fn declared_node_allocations(
-        &self,
-        exclude_job: &str,
-    ) -> NodeAllocations {
+    pub(crate) async fn declared_node_allocations(&self, exclude_job: &str) -> NodeAllocations {
         let jobs = match self.jobs().await {
             Ok(jobs) => jobs,
             Err(_) => return NodeAllocations::new(),
@@ -272,8 +269,7 @@ impl Hub {
             if order.is_empty() {
                 continue;
             }
-            let Ok(assignments) = plan.assignments_for_nodes(&order, job.generation)
-            else {
+            let Ok(assignments) = plan.assignments_for_nodes(&order, job.generation) else {
                 continue;
             };
             for assignment in assignments {
@@ -330,12 +326,11 @@ impl Hub {
                 record
                     .metrics
                     .get("node_cpu_cores")
-                    .copied().filter(|cores| cores.is_finite() && *cores > 0.0),
+                    .copied()
+                    .filter(|cores| cores.is_finite() && *cores > 0.0),
             ) {
                 let capacity_millicores = cores * 1000.0;
-                if allocated_cpu as f64 + (requested as u64 * count) as f64
-                    > capacity_millicores
-                {
+                if allocated_cpu as f64 + (requested as u64 * count) as f64 > capacity_millicores {
                     return Err(HubError::Invalid(format!(
                         "insufficient CPU capacity on node '{node_id}': allocated {} + requested {} of {} millicores",
                         allocated_cpu,
@@ -348,7 +343,8 @@ impl Hub {
                 if let Some(total) = record
                     .metrics
                     .get("node_memory_total_bytes")
-                    .copied().filter(|total| total.is_finite() && *total > 0.0)
+                    .copied()
+                    .filter(|total| total.is_finite() && *total > 0.0)
                 {
                     // 10% reserve for the OS and agent overhead.
                     let limit = total * 0.9;
@@ -774,8 +770,7 @@ impl Hub {
             // surviving node keeps its exact task set and its successful
             // start stays truthful. Falls back to the full ranked placement
             // when nothing of the previous placement survives.
-            let requires_shuffle =
-                spec.placement == arkflow_core::job::PlacementStrategy::Split;
+            let requires_shuffle = spec.placement == arkflow_core::job::PlacementStrategy::Split;
             let merged = self
                 .incremental_targets(
                     &job.job_id,
@@ -931,7 +926,10 @@ impl Hub {
                         // re-dispatch rather than trust a stale claim.
                         recorded.is_none_or(|recorded| {
                             recorded
-                                != Self::assignment_fingerprint(&assignments, &operation_record.node_id)
+                                != Self::assignment_fingerprint(
+                                    &assignments,
+                                    &operation_record.node_id,
+                                )
                         })
                     })
                     .cloned()
@@ -1069,8 +1067,7 @@ impl Hub {
                     .await
                     .get(&(job.job_id.clone(), node_id.clone(), job.generation))
                     .is_some_and(|recorded| {
-                        *recorded
-                            == Self::assignment_fingerprint(&assignments, node_id.as_str())
+                        *recorded == Self::assignment_fingerprint(&assignments, node_id.as_str())
                     });
             let already_terminal = fingerprint_matches
                 && self
@@ -1137,10 +1134,10 @@ impl Hub {
             )
             .await?;
             if let Some((node_id, fingerprint)) = fingerprint {
-                self.start_dispatch_fingerprints.write().await.insert(
-                    (job.job_id.clone(), node_id, job.generation),
-                    fingerprint,
-                );
+                self.start_dispatch_fingerprints
+                    .write()
+                    .await
+                    .insert((job.job_id.clone(), node_id, job.generation), fingerprint);
             }
             dispatched += 1;
         }

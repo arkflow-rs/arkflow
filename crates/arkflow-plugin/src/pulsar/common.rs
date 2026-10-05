@@ -358,17 +358,24 @@ mod tls_url_tests {
 
     #[test]
     fn pulsar_ssl_url_passes_validation() {
-        assert!(PulsarConfigValidator::validate_service_url("pulsar+ssl://broker.example.com:6651").is_ok());
+        assert!(PulsarConfigValidator::validate_service_url(
+            "pulsar+ssl://broker.example.com:6651"
+        )
+        .is_ok());
     }
 
     #[test]
     fn plain_pulsar_url_passes_validation() {
-        assert!(PulsarConfigValidator::validate_service_url("pulsar://broker.example.com:6650").is_ok());
+        assert!(
+            PulsarConfigValidator::validate_service_url("pulsar://broker.example.com:6650").is_ok()
+        );
     }
 
     #[test]
     fn invalid_scheme_is_rejected() {
-        assert!(PulsarConfigValidator::validate_service_url("http://broker.example.com:6650").is_err());
+        assert!(
+            PulsarConfigValidator::validate_service_url("http://broker.example.com:6650").is_err()
+        );
     }
 
     #[test]
@@ -413,12 +420,7 @@ mod topic_tests {
 
     #[test]
     fn dotdot_and_slash_topics_rejected() {
-        for topic in [
-            "a/../b",
-            "a//b",
-            "/leading",
-            "trailing/",
-        ] {
+        for topic in ["a/../b", "a//b", "/leading", "trailing/"] {
             assert!(
                 PulsarConfigValidator::validate_topic(topic).is_err(),
                 "'{topic}' should be rejected"
@@ -428,9 +430,7 @@ mod topic_tests {
 
     #[test]
     fn fully_qualified_topic_may_contain_double_slash() {
-        assert!(
-            PulsarConfigValidator::validate_topic("persistent://tenant/ns/topic").is_ok()
-        );
+        assert!(PulsarConfigValidator::validate_topic("persistent://tenant/ns/topic").is_ok());
     }
 
     #[test]
@@ -540,17 +540,17 @@ mod auth_config_tests {
     #[test]
     fn empty_token_rejected() {
         assert!(
-            PulsarConfigValidator::validate_auth_config(&PulsarAuth::Token { token: String::new() })
-                .is_err()
+            PulsarConfigValidator::validate_auth_config(&PulsarAuth::Token {
+                token: String::new()
+            })
+            .is_err()
         );
     }
 
     #[test]
     fn overlong_token_rejected() {
         let token = "t".repeat(4097);
-        assert!(
-            PulsarConfigValidator::validate_auth_config(&PulsarAuth::Token { token }).is_err()
-        );
+        assert!(PulsarConfigValidator::validate_auth_config(&PulsarAuth::Token { token }).is_err());
     }
 
     fn oauth2(issuer_url: &str, credentials_url: &str, audience: &str) -> PulsarAuth {
@@ -563,14 +563,12 @@ mod auth_config_tests {
 
     #[test]
     fn valid_oauth2_passes() {
-        assert!(
-            PulsarConfigValidator::validate_auth_config(&oauth2(
-                "https://issuer.example.com",
-                "https://issuer.example.com/credentials",
-                "urn:audience"
-            ))
-            .is_ok()
-        );
+        assert!(PulsarConfigValidator::validate_auth_config(&oauth2(
+            "https://issuer.example.com",
+            "https://issuer.example.com/credentials",
+            "urn:audience"
+        ))
+        .is_ok());
     }
 
     #[test]
@@ -578,7 +576,11 @@ mod auth_config_tests {
         for auth in [
             oauth2("", "https://issuer.example.com/creds", "aud"),
             oauth2("https://issuer.example.com", "", "aud"),
-            oauth2("https://issuer.example.com", "https://issuer.example.com/creds", ""),
+            oauth2(
+                "https://issuer.example.com",
+                "https://issuer.example.com/creds",
+                "",
+            ),
         ] {
             assert!(PulsarConfigValidator::validate_auth_config(&auth).is_err());
         }
@@ -587,7 +589,11 @@ mod auth_config_tests {
     #[test]
     fn non_http_oauth2_urls_rejected() {
         for auth in [
-            oauth2("issuer.example.com", "https://issuer.example.com/creds", "aud"),
+            oauth2(
+                "issuer.example.com",
+                "https://issuer.example.com/creds",
+                "aud",
+            ),
             oauth2("https://issuer.example.com", "file:///tmp/creds", "aud"),
         ] {
             assert!(PulsarConfigValidator::validate_auth_config(&auth).is_err());
@@ -617,17 +623,15 @@ mod client_builder_tests {
 
     #[test]
     fn builder_without_auth() {
-        assert!(
-            PulsarClientUtils::create_client_builder("pulsar://127.0.0.1:6650", &None).is_ok()
-        );
+        assert!(PulsarClientUtils::create_client_builder("pulsar://127.0.0.1:6650", &None).is_ok());
     }
 
     #[test]
     fn builder_with_token_auth() {
-        let auth = Some(PulsarAuth::Token { token: "t".to_string() });
-        assert!(
-            PulsarClientUtils::create_client_builder("pulsar://127.0.0.1:6650", &auth).is_ok()
-        );
+        let auth = Some(PulsarAuth::Token {
+            token: "t".to_string(),
+        });
+        assert!(PulsarClientUtils::create_client_builder("pulsar://127.0.0.1:6650", &auth).is_ok());
     }
 
     #[test]
@@ -722,8 +726,7 @@ mod tls_config_tests {
 
     #[test]
     fn defaults_apply_when_fields_omitted() {
-        let config: PulsarTlsConfig =
-            serde_json::from_value(serde_json::json!({})).unwrap();
+        let config: PulsarTlsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(config.ca_file.is_none());
         assert!(config.certificate_chain_file.is_none());
         assert_eq!(config.hostname_verification, Some(true));
@@ -738,8 +741,10 @@ mod tls_config_tests {
         }))
         .unwrap();
         assert_eq!(config.ca_file.as_deref(), Some("/etc/ca.pem"));
-        assert_eq!(config.certificate_chain_file.as_deref(), Some("/etc/cert.pem"));
+        assert_eq!(
+            config.certificate_chain_file.as_deref(),
+            Some("/etc/cert.pem")
+        );
         assert_eq!(config.hostname_verification, Some(false));
     }
 }
-

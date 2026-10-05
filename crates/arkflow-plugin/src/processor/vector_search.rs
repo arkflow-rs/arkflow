@@ -118,9 +118,18 @@ impl Processor for VectorSearchProcessor {
             return Ok(ProcessResult::None);
         }
 
-        let vectors = vector_util::extract_vectors("vector_search processor", &msg_batch, &self.config.vector_field)?;
+        let vectors = vector_util::extract_vectors(
+            "vector_search processor",
+            &msg_batch,
+            &self.config.vector_field,
+        )?;
         let matches = self.search_all(&vectors).await?;
-        let batch = vector_util::append_column("vector_search processor", &msg_batch, &self.config.target_field, &matches)?;
+        let batch = vector_util::append_column(
+            "vector_search processor",
+            &msg_batch,
+            &self.config.target_field,
+            &matches,
+        )?;
         Ok(ProcessResult::Single(Arc::new(batch)))
     }
 
@@ -195,8 +204,9 @@ impl VectorSearchProcessor {
         }
         // Compact serialization: the column feeds llm prompt templates and
         // downstream JSON tooling, so keep it dense and predictable.
-        let compact = serde_json::to_string(result)
-            .map_err(|e| Error::Process(format!("Vector search result serialization failed: {}", e)))?;
+        let compact = serde_json::to_string(result).map_err(|e| {
+            Error::Process(format!("Vector search result serialization failed: {}", e))
+        })?;
         Ok(compact)
     }
 }
@@ -342,7 +352,10 @@ mod tests {
     async fn request_body_has_limit_and_optional_threshold() {
         let mock = MockApi::spawn(|_body| (200, search_body("x")));
         let processor = build_processor(base_config(mock.addr(), serde_json::json!({"top_k": 3})));
-        processor.process(vector_batch(vec![vec![1.0, 2.0]])).await.unwrap();
+        processor
+            .process(vector_batch(vec![vec![1.0, 2.0]]))
+            .await
+            .unwrap();
         let (_, body) = mock.requests().remove(0);
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["limit"], 3);
@@ -354,7 +367,10 @@ mod tests {
             mock.addr(),
             serde_json::json!({"top_k": 2, "score_threshold": 0.8}),
         ));
-        processor.process(vector_batch(vec![vec![1.0, 2.0]])).await.unwrap();
+        processor
+            .process(vector_batch(vec![vec![1.0, 2.0]]))
+            .await
+            .unwrap();
         let (_, body) = mock.requests().remove(0);
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["limit"], 2);
@@ -395,7 +411,10 @@ mod tests {
                 "row order must hold"
             );
         }
-        assert!(elapsed < std::time::Duration::from_millis(320), "no overlap: took {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(320),
+            "no overlap: took {elapsed:?}"
+        );
         assert_eq!(mock.requests().len(), 4);
     }
 
@@ -409,7 +428,14 @@ mod tests {
             mock.addr(),
             serde_json::json!({"concurrency": 2}),
         ));
-        let batch = vector_batch(vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0], vec![6.0]]);
+        let batch = vector_batch(vec![
+            vec![1.0],
+            vec![2.0],
+            vec![3.0],
+            vec![4.0],
+            vec![5.0],
+            vec![6.0],
+        ]);
         let err = processor.process(batch).await.unwrap_err().to_string();
         assert!(err.contains("500"), "{err}");
         let sent = mock.requests().len();
@@ -429,18 +455,31 @@ mod tests {
             mock.addr(),
             serde_json::json!({"concurrency": 2}),
         ));
-        let batch = vector_batch(vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0], vec![6.0]]);
+        let batch = vector_batch(vec![
+            vec![1.0],
+            vec![2.0],
+            vec![3.0],
+            vec![4.0],
+            vec![5.0],
+            vec![6.0],
+        ]);
         processor.process(batch).await.unwrap();
         let max = mock.max_in_flight();
         assert!(max <= 2, "in-flight requests exceeded the cap: {max}");
-        assert!(max >= 2, "requests did not overlap; expected pipelining, max={max}");
+        assert!(
+            max >= 2,
+            "requests did not overlap; expected pipelining, max={max}"
+        );
     }
 
     #[tokio::test]
     async fn api_key_sent_as_bearer() {
         let mock = MockApi::spawn(|_body| (200, search_body("x")));
         let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
-        processor.process(vector_batch(vec![vec![1.0]])).await.unwrap();
+        processor
+            .process(vector_batch(vec![vec![1.0]]))
+            .await
+            .unwrap();
         let (head, _) = mock.requests().remove(0);
         assert!(head.contains("authorization: Bearer sk-q"), "{head}");
     }
@@ -452,14 +491,25 @@ mod tests {
             "url": format!("http://{}", mock.addr()),
             "collection": "docs",
         }));
-        processor.process(vector_batch(vec![vec![1.0]])).await.unwrap();
+        processor
+            .process(vector_batch(vec![vec![1.0]]))
+            .await
+            .unwrap();
         let (head, _) = mock.requests().remove(0);
-        assert!(!head.to_ascii_lowercase().contains("authorization:"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("authorization:"),
+            "{head}"
+        );
     }
 
     #[tokio::test]
     async fn non_2xx_is_surfaced_with_status_and_body() {
-        let mock = MockApi::spawn(|_body| (404, r#"{"status":{"error":"collection not found"}}"#.to_string()));
+        let mock = MockApi::spawn(|_body| {
+            (
+                404,
+                r#"{"status":{"error":"collection not found"}}"#.to_string(),
+            )
+        });
         let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
         let err = processor
             .process(vector_batch(vec![vec![1.0]]))
@@ -508,13 +558,20 @@ mod tests {
     async fn non_list_column_errors() {
         let mock = MockApi::spawn(|_body| (200, search_body("x")));
         let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
-        let schema = Arc::new(Schema::new(vec![Field::new("embedding", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::Utf8,
+            true,
+        )]));
         let array = Arc::new(StringArray::from(vec!["not a vector"]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(schema, vec![array]).unwrap(),
         ));
         let err = processor.process(batch).await.unwrap_err().to_string();
-        assert!(err.contains("must be FixedSizeList(Float32) or List(Float32)"), "{err}");
+        assert!(
+            err.contains("must be FixedSizeList(Float32) or List(Float32)"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -547,7 +604,11 @@ mod tests {
     async fn empty_batch_short_circuits_without_http() {
         let mock = MockApi::spawn(|_body| (200, search_body("x")));
         let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
-        let schema = Arc::new(Schema::new(vec![Field::new("embedding", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::Utf8,
+            true,
+        )]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(
                 schema,

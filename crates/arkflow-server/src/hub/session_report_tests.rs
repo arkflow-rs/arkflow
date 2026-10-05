@@ -522,7 +522,7 @@ async fn delayed_report_from_an_old_session_is_ignored() {
             configuration_version: None,
             boot_id: Some(first.session_token.clone()),
             connected_hub: None,
-        report_seq: 99,
+            report_seq: 99,
             config_versions: Vec::new(),
             job_tasks: BTreeMap::new(),
         })

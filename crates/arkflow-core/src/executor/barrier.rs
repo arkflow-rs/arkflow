@@ -397,9 +397,7 @@ pub async fn snapshot_state(backend: Arc<dyn StateBackend>) -> Result<StateSnaps
         tokio::task::spawn_blocking(move || backend.snapshot()),
     )
     .await
-    .map_err(|_| {
-        crate::Error::Process(format!("state snapshot timed out after {bound:?}"))
-    })?;
+    .map_err(|_| crate::Error::Process(format!("state snapshot timed out after {bound:?}")))?;
     handle.map_err(|error| crate::Error::Process(format!("state snapshot task failed: {error}")))?
 }
 
@@ -463,7 +461,10 @@ mod tests {
         // Input 1 ends while the barrier is still aligning: EOS is an implicit
         // barrier for that input and completes the round.
         let completed = aligner.observe(1, crate::executor::Envelope::Eos).unwrap();
-        assert_eq!(completed.expect("EOS completes the round").checkpoint_id, "cp-1");
+        assert_eq!(
+            completed.expect("EOS completes the round").checkpoint_id,
+            "cp-1"
+        );
         // The EOS is retained behind the checkpoint and forwarded in order.
         let released = aligner.release();
         assert_eq!(released.len(), 1);
@@ -491,9 +492,7 @@ mod tests {
     #[test]
     fn a_barrier_from_an_ended_input_is_rejected() {
         let mut aligner = Aligner::new(2, 10);
-        aligner
-            .observe(1, crate::executor::Envelope::Eos)
-            .unwrap();
+        aligner.observe(1, crate::executor::Envelope::Eos).unwrap();
         let error = aligner.observe(1, barrier("cp-1", 1)).unwrap_err();
         assert!(
             error.to_string().contains("arrived from ended input"),
@@ -518,7 +517,9 @@ mod tests {
         aligner.observe(0, barrier("cp-2", 2)).unwrap();
         let error = aligner.observe(0, barrier("cp-1", 1)).unwrap_err();
         assert!(
-            error.to_string().contains("stale barrier 'cp-1' generation 1"),
+            error
+                .to_string()
+                .contains("stale barrier 'cp-1' generation 1"),
             "{error}"
         );
     }
@@ -618,12 +619,7 @@ mod tests {
             ) -> Result<(), crate::Error> {
                 Ok(())
             }
-            fn update_i64(
-                &self,
-                _ns: &str,
-                _key: &[u8],
-                _delta: i64,
-            ) -> Result<i64, crate::Error> {
+            fn update_i64(&self, _ns: &str, _key: &[u8], _delta: i64) -> Result<i64, crate::Error> {
                 Ok(0)
             }
             fn delete(&self, _ns: &str, _key: &[u8]) -> Result<bool, crate::Error> {
@@ -639,10 +635,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(200));
                 Ok(crate::state::StateSnapshot::new(1, Vec::new()))
             }
-            fn restore(
-                &self,
-                _snapshot: &crate::state::StateSnapshot,
-            ) -> Result<(), crate::Error> {
+            fn restore(&self, _snapshot: &crate::state::StateSnapshot) -> Result<(), crate::Error> {
                 Ok(())
             }
             fn metrics(&self) -> Result<crate::state::StateMetrics, crate::Error> {
@@ -697,12 +690,7 @@ mod tests {
             ) -> Result<(), crate::Error> {
                 Ok(())
             }
-            fn update_i64(
-                &self,
-                _ns: &str,
-                _key: &[u8],
-                _delta: i64,
-            ) -> Result<i64, crate::Error> {
+            fn update_i64(&self, _ns: &str, _key: &[u8], _delta: i64) -> Result<i64, crate::Error> {
                 Ok(0)
             }
             fn delete(&self, _ns: &str, _key: &[u8]) -> Result<bool, crate::Error> {
@@ -717,10 +705,7 @@ mod tests {
             fn snapshot_at(&self, _now: u64) -> Result<crate::state::StateSnapshot, crate::Error> {
                 panic!("snapshot exploded")
             }
-            fn restore(
-                &self,
-                _snapshot: &crate::state::StateSnapshot,
-            ) -> Result<(), crate::Error> {
+            fn restore(&self, _snapshot: &crate::state::StateSnapshot) -> Result<(), crate::Error> {
                 Ok(())
             }
             fn metrics(&self) -> Result<crate::state::StateMetrics, crate::Error> {

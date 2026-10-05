@@ -877,7 +877,12 @@ mod tests {
             "measurement": "m",
             "fields": [{"field": "value", "field_name": "value"}]
         }));
-        let error = match InfluxDBOutputBuilder.build(None, &config, Some(Arc::new(NoopCodec)), &resource) {
+        let error = match InfluxDBOutputBuilder.build(
+            None,
+            &config,
+            Some(Arc::new(NoopCodec)),
+            &resource,
+        ) {
             Ok(_) => panic!("codec must be rejected"),
             Err(error) => error,
         };
@@ -926,7 +931,10 @@ mod tests {
             Some("ts".into()),
         ))
         .unwrap();
-        assert_eq!(output.convert_to_line_protocol(&msg).unwrap(), vec!["m count=7i 99"]);
+        assert_eq!(
+            output.convert_to_line_protocol(&msg).unwrap(),
+            vec!["m count=7i 99"]
+        );
     }
 
     #[test]
@@ -948,7 +956,9 @@ mod tests {
         assert!(line.starts_with("m ok=true "), "{line}");
         let timestamp = line.rsplit(' ').next().unwrap();
         assert!(
-            timestamp.parse::<u128>().is_ok_and(|v| v > 1_600_000_000_000_000_000),
+            timestamp
+                .parse::<u128>()
+                .is_ok_and(|v| v > 1_600_000_000_000_000_000),
             "fallback timestamp must be current nanos: {timestamp}"
         );
     }
@@ -971,11 +981,7 @@ mod tests {
         .unwrap();
         let lines = output.convert_to_line_protocol(&msg).unwrap();
         assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0].starts_with("m note=\"a\\\"b\" "),
-            "{}",
-            lines[0]
-        );
+        assert!(lines[0].starts_with("m note=\"a\\\"b\" "), "{}", lines[0]);
     }
 
     #[test]
@@ -992,8 +998,14 @@ mod tests {
                 field_type: Some(FieldType::Float),
             }],
             Some(vec![
-                TagMapping { field: "region".into(), tag_name: "region".into() },
-                TagMapping { field: "host".into(), tag_name: "host".into() },
+                TagMapping {
+                    field: "region".into(),
+                    tag_name: "region".into(),
+                },
+                TagMapping {
+                    field: "host".into(),
+                    tag_name: "host".into(),
+                },
             ]),
             None,
         ))
@@ -1004,17 +1016,17 @@ mod tests {
 
     #[test]
     fn test_missing_tag_column_is_ignored() {
-        let msg = column_batch(vec![(
-            "value",
-            Arc::new(Float64Array::from(vec![1.5])),
-        )]);
+        let msg = column_batch(vec![("value", Arc::new(Float64Array::from(vec![1.5])))]);
         let output = InfluxDBOutput::new(flexible_config(
             vec![FieldMapping {
                 field: "value".into(),
                 field_name: "value".into(),
                 field_type: Some(FieldType::Float),
             }],
-            Some(vec![TagMapping { field: "nope".into(), tag_name: "nope".into() }]),
+            Some(vec![TagMapping {
+                field: "nope".into(),
+                tag_name: "nope".into(),
+            }]),
             Some("also-nope".into()),
         ))
         .unwrap();
@@ -1046,7 +1058,9 @@ mod tests {
         let lines = output.convert_to_line_protocol(&msg).unwrap();
         let timestamp = lines[0].rsplit(' ').next().unwrap();
         assert!(
-            timestamp.parse::<u128>().is_ok_and(|v| v > 1_600_000_000_000_000_000),
+            timestamp
+                .parse::<u128>()
+                .is_ok_and(|v| v > 1_600_000_000_000_000_000),
             "null timestamp must fall back to now: {timestamp}"
         );
     }
@@ -1054,7 +1068,10 @@ mod tests {
     #[test]
     fn test_multiple_rows_each_become_a_line() {
         let msg = column_batch(vec![
-            ("host", Arc::new(StringArray::from(vec![Some("a"), Some("b")]))),
+            (
+                "host",
+                Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+            ),
             ("value", Arc::new(Float64Array::from(vec![1.0, 2.0]))),
             ("ts", Arc::new(Int64Array::from(vec![10, 20]))),
         ]);
@@ -1064,7 +1081,10 @@ mod tests {
                 field_name: "value".into(),
                 field_type: Some(FieldType::Float),
             }],
-            Some(vec![TagMapping { field: "host".into(), tag_name: "host".into() }]),
+            Some(vec![TagMapping {
+                field: "host".into(),
+                tag_name: "host".into(),
+            }]),
             Some("ts".into()),
         ))
         .unwrap();
@@ -1141,8 +1161,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let output =
-            InfluxDBOutput::new(typed_config(server.uri(), 1)).unwrap();
+        let output = InfluxDBOutput::new(typed_config(server.uri(), 1)).unwrap();
         output.connect().await.unwrap();
         output.write(Arc::new(typed_batch())).await.unwrap();
         assert!(
@@ -1164,7 +1183,10 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(authorization, "Token token");
         let body = String::from_utf8(request.body.clone()).unwrap();
-        assert_eq!(body, "sensor\\ data,device=lab\\ 1 reading=42.5 1700000000000000000");
+        assert_eq!(
+            body,
+            "sensor\\ data,device=lab\\ 1 reading=42.5 1700000000000000000"
+        );
     }
 
     #[tokio::test]

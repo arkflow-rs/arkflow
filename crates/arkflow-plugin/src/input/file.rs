@@ -525,13 +525,19 @@ mod tests {
     struct NoopCodec;
     #[async_trait::async_trait]
     impl Encoder for NoopCodec {
-        async fn encode(&self, _: arkflow_core::MessageBatch) -> Result<Vec<arkflow_core::Bytes>, Error> {
+        async fn encode(
+            &self,
+            _: arkflow_core::MessageBatch,
+        ) -> Result<Vec<arkflow_core::Bytes>, Error> {
             Ok(Vec::new())
         }
     }
     #[async_trait::async_trait]
     impl Decoder for NoopCodec {
-        async fn decode(&self, _: Vec<arkflow_core::Bytes>) -> Result<arkflow_core::MessageBatch, Error> {
+        async fn decode(
+            &self,
+            _: Vec<arkflow_core::Bytes>,
+        ) -> Result<arkflow_core::MessageBatch, Error> {
             unimplemented!("not needed for the rejection test")
         }
     }
@@ -541,10 +547,7 @@ mod tests {
         FileBuilder.build(None, &config, None, &resource())
     }
 
-    fn build_with_query(
-        input_type: Value,
-        query: Value,
-    ) -> Result<Arc<dyn Input>, Error> {
+    fn build_with_query(input_type: Value, query: Value) -> Result<Arc<dyn Input>, Error> {
         let config = Some(serde_json::json!({
             "input_type": input_type,
             "query": query,
@@ -596,9 +599,9 @@ mod tests {
     #[tokio::test]
     async fn parquet_round_trip_reads_written_file() -> Result<(), Error> {
         use datafusion::arrow::array::Int64Array;
-        use datafusion::parquet::arrow::ArrowWriter as ParquetWriter;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter as ParquetWriter;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.parquet");
@@ -609,7 +612,9 @@ mod tests {
             let file = std::fs::File::create(&path).unwrap();
             let mut writer = ParquetWriter::try_new(file, batch.schema(), None)
                 .map_err(|e| Error::Process(e.to_string()))?;
-            writer.write(&batch).map_err(|e| Error::Process(e.to_string()))?;
+            writer
+                .write(&batch)
+                .map_err(|e| Error::Process(e.to_string()))?;
             writer.close().map_err(|e| Error::Process(e.to_string()))?;
         }
 
@@ -639,7 +644,9 @@ mod tests {
             let file = std::fs::File::create(&path).unwrap();
             let mut writer = IpcWriter::try_new(file, schema.as_ref())
                 .map_err(|e| Error::Process(e.to_string()))?;
-            writer.write(&batch).map_err(|e| Error::Process(e.to_string()))?;
+            writer
+                .write(&batch)
+                .map_err(|e| Error::Process(e.to_string()))?;
             writer.finish().map_err(|e| Error::Process(e.to_string()))?;
         }
 
@@ -663,16 +670,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.parquet");
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
-        )
-        .map_err(|e| Error::Process(e.to_string()))?;
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))])
+                .map_err(|e| Error::Process(e.to_string()))?;
         {
             let file = std::fs::File::create(&path).unwrap();
             let mut writer = ParquetWriter::try_new(file, batch.schema(), None)
                 .map_err(|e| Error::Process(e.to_string()))?;
-            writer.write(&batch).map_err(|e| Error::Process(e.to_string()))?;
+            writer
+                .write(&batch)
+                .map_err(|e| Error::Process(e.to_string()))?;
             writer.close().map_err(|e| Error::Process(e.to_string()))?;
         }
 
@@ -699,16 +706,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.arrow");
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![5, 6]))],
-        )
-        .map_err(|e| Error::Process(e.to_string()))?;
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![5, 6]))])
+                .map_err(|e| Error::Process(e.to_string()))?;
         {
             let file = std::fs::File::create(&path).unwrap();
             let mut writer = IpcWriter::try_new(file, schema.as_ref())
                 .map_err(|e| Error::Process(e.to_string()))?;
-            writer.write(&batch).map_err(|e| Error::Process(e.to_string()))?;
+            writer
+                .write(&batch)
+                .map_err(|e| Error::Process(e.to_string()))?;
             writer.finish().map_err(|e| Error::Process(e.to_string()))?;
         }
 
@@ -783,7 +790,12 @@ mod tests {
         ) else {
             panic!("a codec must be rejected");
         };
-        assert!(codec_rejected.to_string().contains("does not support a codec"), "{codec_rejected}");
+        assert!(
+            codec_rejected
+                .to_string()
+                .contains("does not support a codec"),
+            "{codec_rejected}"
+        );
 
         let Err(bad_config) = FileBuilder.build(
             None,

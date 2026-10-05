@@ -127,9 +127,7 @@ impl Hub {
         // the standby claim (0) is rejected while another holder's lease
         // row exists.
         if let Some(storage) = &self.storage {
-            storage
-                .leadership_epoch()
-                .store(0, Ordering::Release);
+            storage.leadership_epoch().store(0, Ordering::Release);
         }
         let mut leadership = self.leadership.write().await;
         if matches!(*leadership, Leadership::Disabled) {
@@ -291,13 +289,14 @@ impl Hub {
                         // Publish the fencing claim before the promotion's
                         // recovery writes: they are fenced commands and must
                         // carry the freshly acquired epoch.
-                        storage
-                            .leadership_epoch()
-                            .store(epoch, Ordering::Release);
+                        storage.leadership_epoch().store(epoch, Ordering::Release);
                         match self.reload_durable_state_for_promotion().await {
                             Ok(()) => {
                                 self.transition_to(
-                                    Leadership::Leader { epoch, since_ms: now },
+                                    Leadership::Leader {
+                                        epoch,
+                                        since_ms: now,
+                                    },
                                     "lease_acquired",
                                 )
                                 .await;
@@ -309,9 +308,7 @@ impl Hub {
                                     "promotion recovery failed; releasing the lease and staying standby"
                                 );
                                 storage.leadership_epoch().store(0, Ordering::Release);
-                                let _ = storage
-                                    .release_hub_lease(&holder, now_ms())
-                                    .await;
+                                let _ = storage.release_hub_lease(&holder, now_ms()).await;
                             }
                         }
                     }

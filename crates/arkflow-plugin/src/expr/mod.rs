@@ -234,7 +234,11 @@ mod tests {
         // shift every later row onto the wrong destination.
         let batch = RecordBatch::try_from_iter([(
             "name",
-            Arc::new(StringArray::from(vec![Some("Alice"), None, Some("Charlie")])) as _,
+            Arc::new(StringArray::from(vec![
+                Some("Alice"),
+                None,
+                Some("Charlie"),
+            ])) as _,
         )])
         .unwrap();
 

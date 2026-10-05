@@ -18,7 +18,7 @@ use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use rumqttc::{Transport, TlsConfiguration};
+use rumqttc::{TlsConfiguration, Transport};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
@@ -61,8 +61,7 @@ impl MqttTlsConfig {
         match (&self.client_cert, &self.client_key) {
             (Some(_), None) | (None, Some(_)) => {
                 return Err(Error::Config(
-                    "mqtt tls: client_cert and client_key must be configured together"
-                        .to_string(),
+                    "mqtt tls: client_cert and client_key must be configured together".to_string(),
                 ));
             }
             _ => {}
@@ -71,9 +70,8 @@ impl MqttTlsConfig {
         // PEM files are read on a blocking thread: connect() runs on the
         // async executor and re-reads on every reconnect.
         fn read(path: &str) -> Result<Vec<u8>, Error> {
-            std::fs::read(path).map_err(|e| {
-                Error::Config(format!("mqtt tls: failed to read file '{path}': {e}"))
-            })
+            std::fs::read(path)
+                .map_err(|e| Error::Config(format!("mqtt tls: failed to read file '{path}': {e}")))
         }
         let (ca, client_cert, client_key) = (
             self.ca.clone(),
@@ -88,8 +86,7 @@ impl MqttTlsConfig {
             ))
         })
         .await
-        .map_err(|e| Error::Process(format!("mqtt tls: PEM read task failed: {e}")))??
-;
+        .map_err(|e| Error::Process(format!("mqtt tls: PEM read task failed: {e}")))??;
 
         // Broker trust roots: the configured CA if present, otherwise the
         // platform trust store.
@@ -121,25 +118,27 @@ impl MqttTlsConfig {
         let client_auth = match (&cert_pem, &key_pem) {
             (None, None) => None,
             (Some(cert_pem), Some(key_pem)) => {
-                let certs = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(cert_pem.clone())))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        Error::Config(format!(
-                            "mqtt tls: failed to parse client certificate: {error}"
-                        ))
-                    })?;
+                let certs =
+                    rustls_pemfile::certs(&mut BufReader::new(Cursor::new(cert_pem.clone())))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| {
+                            Error::Config(format!(
+                                "mqtt tls: failed to parse client certificate: {error}"
+                            ))
+                        })?;
                 if certs.is_empty() {
                     return Err(Error::Config(
                         "mqtt tls: no valid certificate in client_cert".to_string(),
                     ));
                 }
-                let key = rustls_pemfile::private_key(&mut BufReader::new(Cursor::new(key_pem.clone())))
-                    .map_err(|error| {
-                        Error::Config(format!("mqtt tls: failed to parse client key: {error}"))
-                    })?
-                    .ok_or_else(|| {
-                        Error::Config("mqtt tls: no private key in client_key".to_string())
-                    })?;
+                let key =
+                    rustls_pemfile::private_key(&mut BufReader::new(Cursor::new(key_pem.clone())))
+                        .map_err(|error| {
+                            Error::Config(format!("mqtt tls: failed to parse client key: {error}"))
+                        })?
+                        .ok_or_else(|| {
+                            Error::Config("mqtt tls: no private key in client_key".to_string())
+                        })?;
                 Some((certs, key))
             }
             _ => unreachable!("incomplete pairs are rejected above"),
@@ -156,15 +155,15 @@ impl MqttTlsConfig {
                 .with_root_certificates(roots)
                 .with_client_auth_cert(certs, key)
                 .map_err(|error| {
-                    Error::Config(format!("mqtt tls: invalid client certificate pair: {error}"))
+                    Error::Config(format!(
+                        "mqtt tls: invalid client certificate pair: {error}"
+                    ))
                 })?,
-            None => builder
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
+            None => builder.with_root_certificates(roots).with_no_client_auth(),
         };
-        options.set_transport(Transport::tls_with_config(TlsConfiguration::Rustls(Arc::new(
-            config,
-        ))));
+        options.set_transport(Transport::tls_with_config(TlsConfiguration::Rustls(
+            Arc::new(config),
+        )));
         Ok(())
     }
 }
@@ -178,10 +177,8 @@ mod tests {
     }
 
     fn write_temp_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "arkflow-mqtt-tls-{}-{name}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("arkflow-mqtt-tls-{}-{name}", std::process::id()));
         std::fs::write(&path, contents).expect("write temp file");
         path
     }
@@ -203,7 +200,8 @@ mod tests {
     async fn disabled_tls_is_a_no_op() {
         let mut options = mqtt_options();
         config(None, None, None)
-            .apply(&mut options).await
+            .apply(&mut options)
+            .await
             .expect("disabled tls applies cleanly");
     }
 
@@ -212,7 +210,8 @@ mod tests {
         let cert = write_temp_file("only-cert.pem", b"unused");
         let mut options = mqtt_options();
         let error = config(None, Some(cert.to_string_lossy().into()), None)
-            .apply(&mut options).await
+            .apply(&mut options)
+            .await
             .expect_err("half a client pair must fail");
         assert!(
             error.to_string().contains("client_cert and client_key"),
@@ -233,7 +232,8 @@ mod tests {
             Some(cert_path.to_string_lossy().into()),
             Some(key_path.to_string_lossy().into()),
         )
-        .apply(&mut options).await
+        .apply(&mut options)
+        .await
         .expect("client pair without ca must build a rustls transport");
     }
 
@@ -247,7 +247,8 @@ mod tests {
             Some(cert_path.to_string_lossy().into()),
             Some(key_path.to_string_lossy().into()),
         )
-        .apply(&mut options).await
+        .apply(&mut options)
+        .await
         .expect_err("unparseable client key must fail");
         assert!(
             error.to_string().contains("client_key"),
@@ -260,7 +261,8 @@ mod tests {
         let ca_path = write_temp_file("ca.pem", TEST_CLIENT_CERT.as_bytes());
         let mut options = mqtt_options();
         config(Some(ca_path.to_string_lossy().into()), None, None)
-            .apply(&mut options).await
+            .apply(&mut options)
+            .await
             .expect("ca-only must build a simple transport");
     }
 

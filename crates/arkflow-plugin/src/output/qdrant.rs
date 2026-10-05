@@ -117,7 +117,8 @@ impl Output for QdrantOutput {
         if rows == 0 {
             return Ok(());
         }
-        let vectors = crate::vector_util::extract_vectors("qdrant output", &msg, &self.config.vector_field)?;
+        let vectors =
+            crate::vector_util::extract_vectors("qdrant output", &msg, &self.config.vector_field)?;
         let ids = extract_ids(&msg, &self.config.id_field)?;
         let payloads = extract_payloads(&msg, &self.config)?;
 
@@ -178,7 +179,12 @@ impl QdrantOutput {
 
         let mut attempt = 0u32;
         loop {
-            match request.try_clone().expect("request body is JSON").send().await {
+            match request
+                .try_clone()
+                .expect("request body is JSON")
+                .send()
+                .await
+            {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
@@ -196,7 +202,12 @@ impl QdrantOutput {
                             crate::vector_util::truncate_body(&body)
                         )));
                     }
-                    error!("Qdrant upsert attempt {} failed: {} {}", attempt + 1, status, crate::vector_util::truncate_body(&body));
+                    error!(
+                        "Qdrant upsert attempt {} failed: {} {}",
+                        attempt + 1,
+                        status,
+                        crate::vector_util::truncate_body(&body)
+                    );
                     if attempt >= self.config.retry_count {
                         return Err(Error::Process(format!(
                             "Qdrant returned {} after {} attempts: {}",
@@ -218,7 +229,10 @@ impl QdrantOutput {
     }
 }
 
-fn extract_ids(batch: &MessageBatchRef, field: &Option<String>) -> Result<Option<Vec<Value>>, Error> {
+fn extract_ids(
+    batch: &MessageBatchRef,
+    field: &Option<String>,
+) -> Result<Option<Vec<Value>>, Error> {
     let field = match field {
         Some(field) if !field.trim().is_empty() => field.clone(),
         _ => return Ok(None),
@@ -227,10 +241,15 @@ fn extract_ids(batch: &MessageBatchRef, field: &Option<String>) -> Result<Option
     let mut ids = Vec::with_capacity(column.len());
     match column.data_type() {
         DataType::Int64 => {
-            let array = column.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap();
+            let array = column
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap();
             for row in 0..array.len() {
                 if array.is_null(row) {
-                    return Err(Error::Process(format!("qdrant output: id column '{field}' has a null value at row {row}")));
+                    return Err(Error::Process(format!(
+                        "qdrant output: id column '{field}' has a null value at row {row}"
+                    )));
                 }
                 let value = array.value(row);
                 let id = u64::try_from(value).map_err(|_| {
@@ -242,20 +261,29 @@ fn extract_ids(batch: &MessageBatchRef, field: &Option<String>) -> Result<Option
             }
         }
         DataType::Int32 => {
-            let array = column.as_any().downcast_ref::<datafusion::arrow::array::Int32Array>().unwrap();
+            let array = column
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap();
             for row in 0..array.len() {
                 if array.is_null(row) {
-                    return Err(Error::Process(format!("qdrant output: id column '{field}' has a null value at row {row}")));
+                    return Err(Error::Process(format!(
+                        "qdrant output: id column '{field}' has a null value at row {row}"
+                    )));
                 }
-                ids.push(json!(u64::try_from(array.value(row)).map_err(|_| Error::Process(format!(
-                    "qdrant output: id column '{field}' has a negative value at row {row}"
-                )))?));
+                ids.push(json!(u64::try_from(array.value(row)).map_err(|_| {
+                    Error::Process(format!(
+                        "qdrant output: id column '{field}' has a negative value at row {row}"
+                    ))
+                })?));
             }
         }
         DataType::Utf8 | DataType::LargeUtf8 => {
             for row in 0..column.len() {
                 if column.is_null(row) {
-                    return Err(Error::Process(format!("qdrant output: id column '{field}' has a null value at row {row}")));
+                    return Err(Error::Process(format!(
+                        "qdrant output: id column '{field}' has a null value at row {row}"
+                    )));
                 }
                 let value = downcast_string_value(column, row)?;
                 ids.push(json!(value));
@@ -274,10 +302,7 @@ fn extract_ids(batch: &MessageBatchRef, field: &Option<String>) -> Result<Option
 fn downcast_string_value(column: &Arc<dyn Array>, row: usize) -> Result<&str, Error> {
     if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
         Ok(array.value(row))
-    } else if let Some(array) = column
-        .as_any()
-        .downcast_ref::<LargeStringArray>()
-    {
+    } else if let Some(array) = column.as_any().downcast_ref::<LargeStringArray>() {
         Ok(array.value(row))
     } else {
         Err(Error::Process(
@@ -286,7 +311,10 @@ fn downcast_string_value(column: &Arc<dyn Array>, row: usize) -> Result<&str, Er
     }
 }
 
-fn extract_payloads(batch: &MessageBatchRef, config: &QdrantOutputConfig) -> Result<Vec<Value>, Error> {
+fn extract_payloads(
+    batch: &MessageBatchRef,
+    config: &QdrantOutputConfig,
+) -> Result<Vec<Value>, Error> {
     let all_fields: Vec<String> = batch
         .schema()
         .fields()
@@ -308,7 +336,8 @@ fn extract_payloads(batch: &MessageBatchRef, config: &QdrantOutputConfig) -> Res
         None => all_fields
             .iter()
             .filter(|name| {
-                name.as_str() != config.vector_field && Some(name.as_str()) != config.id_field.as_deref()
+                name.as_str() != config.vector_field
+                    && Some(name.as_str()) != config.id_field.as_deref()
             })
             .cloned()
             .collect(),
@@ -317,25 +346,33 @@ fn extract_payloads(batch: &MessageBatchRef, config: &QdrantOutputConfig) -> Res
         return Ok(vec![Value::Object(Map::new()); batch.num_rows()]);
     }
 
-    let filtered =
-        batch.filter_columns(&payload_columns.iter().cloned().collect::<std::collections::HashSet<_>>())?;
+    let filtered = batch.filter_columns(
+        &payload_columns
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>(),
+    )?;
     let mut buffer = Vec::new();
     let mut writer = datafusion::arrow::json::LineDelimitedWriter::new(&mut buffer);
-    writer
-        .write(&filtered)
-        .map_err(|e| Error::Process(format!("qdrant output: payload serialization failed: {}", e)))?;
-    writer
-        .finish()
-        .map_err(|e| Error::Process(format!("qdrant output: payload serialization failed: {}", e)))?;
-
-    let text = String::from_utf8(buffer).map_err(|e| {
-        Error::Process(format!("qdrant output: payload is not UTF-8: {}", e))
+    writer.write(&filtered).map_err(|e| {
+        Error::Process(format!(
+            "qdrant output: payload serialization failed: {}",
+            e
+        ))
     })?;
+    writer.finish().map_err(|e| {
+        Error::Process(format!(
+            "qdrant output: payload serialization failed: {}",
+            e
+        ))
+    })?;
+
+    let text = String::from_utf8(buffer)
+        .map_err(|e| Error::Process(format!("qdrant output: payload is not UTF-8: {}", e)))?;
     text.lines()
         .map(|line| {
-            serde_json::from_str(line).map_err(|e| {
-                Error::Process(format!("qdrant output: payload parse failed: {}", e))
-            })
+            serde_json::from_str(line)
+                .map_err(|e| Error::Process(format!("qdrant output: payload parse failed: {}", e)))
         })
         .collect()
 }
@@ -347,14 +384,12 @@ fn find_column<'a>(batch: &'a MessageBatchRef, field: &str) -> Result<&'a Arc<dy
         .iter()
         .position(|f| f.name() == field)
         .map(|index| batch.column(index))
-        .ok_or_else(|| {
-            Error::Process(format!("qdrant output: column '{}' not found", field))
-        })
+        .ok_or_else(|| Error::Process(format!("qdrant output: column '{}' not found", field)))
 }
 
 /// Formats a random UUID v4 (no uuid crate).
 fn random_uuid_v4() -> String {
-        let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 16];
     bytes[0..8].copy_from_slice(&rand::random::<u64>().to_be_bytes());
     bytes[8..16].copy_from_slice(&rand::random::<u64>().to_be_bytes());
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
@@ -369,7 +404,6 @@ fn random_uuid_v4() -> String {
         &hex[20..32]
     )
 }
-
 
 struct QdrantOutputBuilder;
 impl OutputBuilder for QdrantOutputBuilder {
@@ -399,9 +433,9 @@ impl OutputBuilder for QdrantOutputBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{FixedSizeListArray, Float32Array};
     use arkflow_core::MessageBatch;
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::array::{FixedSizeListArray, Float32Array};
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
@@ -462,7 +496,10 @@ mod tests {
                         let _ = stream.read_exact(&mut body_bytes);
                     }
                     let body = String::from_utf8_lossy(&body_bytes).to_string();
-                    request_log.lock().unwrap().push((head.clone(), body.clone()));
+                    request_log
+                        .lock()
+                        .unwrap()
+                        .push((head.clone(), body.clone()));
 
                     let (status, response_body) = handler(&body);
                     let response = format!(
@@ -504,7 +541,11 @@ mod tests {
         ));
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Int64, false),
-            Field::new("embedding", DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim), true),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
             Field::new("text", DataType::Utf8, true),
         ]));
         let columns: Vec<ArrayRef> = vec![
@@ -627,7 +668,10 @@ mod tests {
             .unwrap();
         output.write(sample_batch()).await.unwrap();
         let (head, _) = mock.last_request();
-        assert!(!head.to_ascii_lowercase().contains("authorization:"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("authorization:"),
+            "{head}"
+        );
     }
 
     #[tokio::test]
@@ -660,8 +704,11 @@ mod tests {
         let output = build_output(base_config(mock.addr, serde_json::json!({})));
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
         let batch = Arc::new(MessageBatch::new_arrow(
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(Vec::<Option<&str>>::new()))])
-                .unwrap(),
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(StringArray::from(Vec::<Option<&str>>::new()))],
+            )
+            .unwrap(),
         ));
         output.write(batch).await.unwrap();
         assert_eq!(mock.request_count(), 0);
@@ -690,7 +737,12 @@ mod tests {
         let dim = 2i32;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let flat = Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0]);
-        let vectors = Arc::new(FixedSizeListArray::new(item_field, dim, Arc::new(flat), None));
+        let vectors = Arc::new(FixedSizeListArray::new(
+            item_field,
+            dim,
+            Arc::new(flat),
+            None,
+        ));
         let schema = Arc::new(Schema::new(vec![
             Field::new(name, id_type, true),
             Field::new(
@@ -726,7 +778,10 @@ mod tests {
         ));
         output.write(sample_batch()).await.unwrap();
         let (head, _) = mock.last_request();
-        assert!(head.to_ascii_lowercase().contains("x-trace-id: abc123"), "{head}");
+        assert!(
+            head.to_ascii_lowercase().contains("x-trace-id: abc123"),
+            "{head}"
+        );
     }
 
     #[tokio::test]
@@ -744,7 +799,10 @@ mod tests {
     async fn int32_and_large_utf8_ids_are_supported() {
         let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
 
-        let int32 = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let int32 = build_output(base_config(
+            mock.addr,
+            serde_json::json!({"id_field": "doc_id"}),
+        ));
         int32
             .write(vector_batch_with_id(
                 "doc_id",
@@ -757,7 +815,10 @@ mod tests {
         assert_eq!(body["points"][0]["id"], 7);
         assert_eq!(body["points"][1]["id"], 8);
 
-        let large = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let large = build_output(base_config(
+            mock.addr,
+            serde_json::json!({"id_field": "doc_id"}),
+        ));
         large
             .write(vector_batch_with_id(
                 "doc_id",
@@ -775,7 +836,10 @@ mod tests {
     async fn null_and_negative_ids_error() {
         let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
 
-        let output = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let output = build_output(base_config(
+            mock.addr,
+            serde_json::json!({"id_field": "doc_id"}),
+        ));
         let error = output
             .write(vector_batch_with_id(
                 "doc_id",
@@ -787,7 +851,10 @@ mod tests {
             .to_string();
         assert!(error.contains("null value at row 1"), "{error}");
 
-        let output = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let output = build_output(base_config(
+            mock.addr,
+            serde_json::json!({"id_field": "doc_id"}),
+        ));
         let error = output
             .write(vector_batch_with_id(
                 "doc_id",
@@ -799,7 +866,10 @@ mod tests {
             .to_string();
         assert!(error.contains("negative value"), "{error}");
 
-        let output = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let output = build_output(base_config(
+            mock.addr,
+            serde_json::json!({"id_field": "doc_id"}),
+        ));
         let error = output
             .write(vector_batch_with_id(
                 "doc_id",
@@ -815,7 +885,10 @@ mod tests {
     #[tokio::test]
     async fn unsupported_id_type_errors() {
         let mock = MockQdrant::spawn(|_body| (200, "{}".to_string()));
-        let output = build_output(base_config(mock.addr, serde_json::json!({"id_field": "doc_id"})));
+        let output = build_output(base_config(
+            mock.addr,
+            serde_json::json!({"id_field": "doc_id"}),
+        ));
         let error = output
             .write(vector_batch_with_id(
                 "doc_id",
@@ -825,10 +898,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("must be Int64/Int32 or Utf8"),
-            "{error}"
-        );
+        assert!(error.contains("must be Int64/Int32 or Utf8"), "{error}");
     }
 
     #[tokio::test]
@@ -839,10 +909,7 @@ mod tests {
             serde_json::json!({"payload_fields": ["nope"]}),
         ));
         let error = output.write(sample_batch()).await.unwrap_err().to_string();
-        assert!(
-            error.contains("payload column 'nope' not found"),
-            "{error}"
-        );
+        assert!(error.contains("payload column 'nope' not found"), "{error}");
     }
 
     #[tokio::test]
@@ -855,7 +922,12 @@ mod tests {
         let dim = 2i32;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let flat = Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0]);
-        let vectors = Arc::new(FixedSizeListArray::new(item_field, dim, Arc::new(flat), None));
+        let vectors = Arc::new(FixedSizeListArray::new(
+            item_field,
+            dim,
+            Arc::new(flat),
+            None,
+        ));
         let schema = Arc::new(Schema::new(vec![Field::new(
             "embedding",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),

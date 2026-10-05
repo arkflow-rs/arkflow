@@ -61,11 +61,17 @@ struct RespClient {
 
 impl RespClient {
     async fn connect(addr: &str) -> Self {
-        let stream = tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(addr))
-            .await
-            .expect("tcp connect timeout")
-            .expect("tcp connect");
-        Self { stream, buf: Vec::new() }
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .expect("tcp connect timeout")
+        .expect("tcp connect");
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
     }
 
     async fn cmd(&mut self, args: &[String]) -> String {
@@ -170,7 +176,10 @@ async fn cluster_lease() -> Option<ClusterLease> {
 
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            assert!(Instant::now() < deadline, "redis cluster never reached state ok");
+            assert!(
+                Instant::now() < deadline,
+                "redis cluster never reached state ok"
+            );
             let info = admin.cmd(&["CLUSTER".into(), "INFO".into()]).await;
             if info.contains("cluster_state:ok") {
                 break;
@@ -255,7 +264,9 @@ fn first_payload(batch: &MessageBatchRef) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_channels_subscription_delivers_published_payloads() {
-    let Some(lease) = cluster_lease().await else { return };
+    let Some(lease) = cluster_lease().await else {
+        return;
+    };
     let input = build_cluster_input(serde_json::json!({
         "type": "subscribe",
         "subscribe": {"type": "channels", "channels": ["ark-cluster-ch"]}
@@ -267,10 +278,18 @@ async fn cluster_channels_subscription_delivers_published_payloads() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut publisher = RespClient::connect(&lease.addr).await;
     publisher
-        .cmd(&["PUBLISH".into(), "ark-cluster-ch".into(), "hello-cluster".into()])
+        .cmd(&[
+            "PUBLISH".into(),
+            "ark-cluster-ch".into(),
+            "hello-cluster".into(),
+        ])
         .await;
     publisher
-        .cmd(&["PUBLISH".into(), "other-cluster-ch".into(), "must-not-arrive".into()])
+        .cmd(&[
+            "PUBLISH".into(),
+            "other-cluster-ch".into(),
+            "must-not-arrive".into(),
+        ])
         .await;
 
     let batch = read_with_timeout(&input).await;
@@ -280,7 +299,9 @@ async fn cluster_channels_subscription_delivers_published_payloads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_list_mode_pops_pushed_entries() {
-    let Some(lease) = cluster_lease().await else { return };
+    let Some(lease) = cluster_lease().await else {
+        return;
+    };
     let input = build_cluster_input(serde_json::json!({
         "type": "list", "list": ["ark-cluster-list"]
     }))
@@ -289,7 +310,11 @@ async fn cluster_list_mode_pops_pushed_entries() {
 
     let mut producer = RespClient::connect(&lease.addr).await;
     producer
-        .cmd(&["LPUSH".into(), "ark-cluster-list".into(), "hello-cluster-list".into()])
+        .cmd(&[
+            "LPUSH".into(),
+            "ark-cluster-list".into(),
+            "hello-cluster-list".into(),
+        ])
         .await;
 
     let batch = read_with_timeout(&input).await;

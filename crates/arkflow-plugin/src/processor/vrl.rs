@@ -942,7 +942,7 @@ mod tests {
         let processor = build_processor(".")?;
         use datafusion::arrow::array::{
             BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int16Array,
-            Int8Array, Int32Array, TimestampMillisecondArray, UInt16Array, UInt32Array,
+            Int32Array, Int8Array, TimestampMillisecondArray, UInt16Array, UInt32Array,
             UInt64Array, UInt8Array,
         };
         let fields = vec![
@@ -980,7 +980,9 @@ mod tests {
             Arc::new(Date32Array::from(vec![Some(19_000)])),
             Arc::new(Date64Array::from(vec![Some(1_700_000_000_000)])),
             Arc::new(datafusion::arrow::array::NullArray::new(1)),
-            Arc::new(TimestampMillisecondArray::from(vec![Some(1_700_000_000_000)])),
+            Arc::new(TimestampMillisecondArray::from(vec![Some(
+                1_700_000_000_000,
+            )])),
         ];
         let rb = RecordBatch::try_new(schema, columns)
             .map_err(|e| Error::Process(format!("arrow: {e}")))?;
@@ -1120,9 +1122,12 @@ mod tests {
         // the builder default) fails here while all other tests stay
         // green.
         async fn evaluate_tz_name(tz: &str) -> Result<String, Error> {
-            let processor =
-                build_processor_with_timezone(".tz, err = get_timezone_name()\n.", tz)?;
-            let schema = Arc::new(Schema::new(vec![Field::new("message", DataType::Utf8, true)]));
+            let processor = build_processor_with_timezone(".tz, err = get_timezone_name()\n.", tz)?;
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "message",
+                DataType::Utf8,
+                true,
+            )]));
             let arr = Arc::new(StringArray::from(vec![Some("hello")]));
             let rb = RecordBatch::try_new(schema, vec![arr])
                 .map_err(|e| Error::Process(format!("arrow: {e}")))?;
@@ -1209,7 +1214,11 @@ mod tests {
         // same guarantee must hold for a nested object produced as a FIELD
         // value — it must not silently coerce to a string or drop rows.
         let processor = build_processor(".geo = {\"city\": \"shanghai\"}\n.")?;
-        let schema = Arc::new(Schema::new(vec![Field::new("message", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "message",
+            DataType::Utf8,
+            true,
+        )]));
         let arr = Arc::new(StringArray::from(vec![Some("hello")]));
         let rb = RecordBatch::try_new(schema, vec![arr])
             .map_err(|e| Error::Process(format!("arrow: {e}")))?;

@@ -815,7 +815,8 @@ mod tests {
         let sql = build_postgres_insert(&postgres_config(false, None), &columns(), rows())
             .build()
             .sql()
-            .as_str().to_string();
+            .as_str()
+            .to_string();
         assert!(sql.starts_with("INSERT INTO events (\"id\", \"name\")"),);
         assert!(!sql.contains("ON CONFLICT"));
     }
@@ -826,7 +827,8 @@ mod tests {
             build_postgres_insert(&postgres_config(true, Some(vec!["id"])), &columns(), rows())
                 .build()
                 .sql()
-                .as_str().to_string();
+                .as_str()
+                .to_string();
         assert!(sql.contains("ON CONFLICT (\"id\") DO UPDATE SET"));
         assert!(sql.contains("\"name\" = EXCLUDED.\"name\""));
         // key columns are not assigned in the update set
@@ -845,7 +847,8 @@ mod tests {
         let sql = build_mysql_insert(&config, &columns(), rows())
             .build()
             .sql()
-            .as_str().to_string();
+            .as_str()
+            .to_string();
         assert!(sql.contains("INSERT INTO events (`id`, `name`)"));
         assert!(sql.contains(" ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"));
         assert!(!sql.contains("`id` = VALUES"));
@@ -862,7 +865,8 @@ mod tests {
         )
         .build()
         .sql()
-        .as_str().to_string();
+        .as_str()
+        .to_string();
         assert!(sql.contains("ON CONFLICT (\"id\", \"name\") DO UPDATE SET"));
         assert!(sql.contains("\"id\" = EXCLUDED.\"id\""));
         assert!(sql.contains("\"name\" = EXCLUDED.\"name\""));
@@ -1107,7 +1111,10 @@ mod tests {
             "VERIFY_CA",
         ] {
             let result = ssl_config(mode).generate_mysql_ssl_opts(&config).await;
-            assert!(result.is_ok(), "mysql ssl_mode '{mode}' must parse: {result:?}");
+            assert!(
+                result.is_ok(),
+                "mysql ssl_mode '{mode}' must parse: {result:?}"
+            );
         }
     }
 
@@ -1195,11 +1202,17 @@ mod tests {
 
         let mut pg_cert_only = ssl_config("require");
         pg_cert_only.client_cert = Some("/nonexistent/client.pem".to_string());
-        assert!(pg_cert_only.generate_postgres_ssl_opts(&postgres).await.is_ok());
+        assert!(pg_cert_only
+            .generate_postgres_ssl_opts(&postgres)
+            .await
+            .is_ok());
 
         let mut pg_key_only = ssl_config("require");
         pg_key_only.client_key = Some("/nonexistent/client.key".to_string());
-        assert!(pg_key_only.generate_postgres_ssl_opts(&postgres).await.is_ok());
+        assert!(pg_key_only
+            .generate_postgres_ssl_opts(&postgres)
+            .await
+            .is_ok());
     }
 
     // ---- connection failures against a guaranteed-closed local port ----
@@ -1224,7 +1237,10 @@ mod tests {
         };
         let output = SqlOutput::new(config).unwrap();
         let err = output.connect().await.unwrap_err();
-        assert!(format!("{err}").contains("Failed to connect to MySQL"), "{err}");
+        assert!(
+            format!("{err}").contains("Failed to connect to MySQL"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -1279,8 +1295,7 @@ mod tests {
         let output = SqlOutput::new(config).unwrap();
         let err = output.connect().await.unwrap_err();
         assert!(
-            format!("{err}")
-                .contains("Failed to connect to PostgreSQL with SSL"),
+            format!("{err}").contains("Failed to connect to PostgreSQL with SSL"),
             "{err}"
         );
     }
@@ -1311,10 +1326,7 @@ mod tests {
         let output = SqlOutput::new(postgres_config(false, None)).unwrap();
         let err = output.write(typed_batch()).await.unwrap_err();
         assert!(matches!(err, Error::Disconnection), "{err:?}");
-        let err = output
-            .write_batch(&[typed_batch()])
-            .await
-            .unwrap_err();
+        let err = output.write_batch(&[typed_batch()]).await.unwrap_err();
         assert!(matches!(err, Error::Disconnection), "{err:?}");
         // close stays a no-op success whether or not a connection existed
         assert!(output.close().await.is_ok());
@@ -1375,7 +1387,10 @@ mod tests {
         ));
         let null_bools = BooleanArray::from(vec![None::<bool>]);
         assert!(matches!(
-            output.matching_data_type("b", &null_bools, 0).await.unwrap(),
+            output
+                .matching_data_type("b", &null_bools, 0)
+                .await
+                .unwrap(),
             SqlValue::Null
         ));
 
@@ -1386,7 +1401,10 @@ mod tests {
         ));
         let null_floats = Float64Array::from(vec![None::<f64>]);
         assert!(matches!(
-            output.matching_data_type("f", &null_floats, 0).await.unwrap(),
+            output
+                .matching_data_type("f", &null_floats, 0)
+                .await
+                .unwrap(),
             SqlValue::Null
         ));
 
@@ -1397,12 +1415,18 @@ mod tests {
         ));
         let null_uints = UInt64Array::from(vec![None::<u64>]);
         assert!(matches!(
-            output.matching_data_type("u", &null_uints, 0).await.unwrap(),
+            output
+                .matching_data_type("u", &null_uints, 0)
+                .await
+                .unwrap(),
             SqlValue::Null
         ));
         let null_strings = StringArray::from(vec![None::<&str>]);
         assert!(matches!(
-            output.matching_data_type("s", &null_strings, 0).await.unwrap(),
+            output
+                .matching_data_type("s", &null_strings, 0)
+                .await
+                .unwrap(),
             SqlValue::Null
         ));
     }
@@ -1411,8 +1435,7 @@ mod tests {
     async fn matching_data_type_formats_date64_and_all_timestamp_units() {
         let output = SqlOutput::new(postgres_config(false, None)).unwrap();
         use datafusion::arrow::array::{
-            Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
-            TimestampSecondArray,
+            Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
         };
 
         let dates = Date64Array::from(vec![Some(86_400_000i64)]);
@@ -1422,7 +1445,10 @@ mod tests {
         ));
         let null_dates = Date64Array::from(vec![None::<i64>]);
         assert!(matches!(
-            output.matching_data_type("d", &null_dates, 0).await.unwrap(),
+            output
+                .matching_data_type("d", &null_dates, 0)
+                .await
+                .unwrap(),
             SqlValue::Null
         ));
 

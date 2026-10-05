@@ -35,8 +35,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use futures::StreamExt;
 use pulsar::{Pulsar, SubType, TokioExecutor};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 use testcontainers::core::{ContainerPort, IntoContainerPort, WaitFor};
@@ -174,7 +174,9 @@ fn sweep_leftover_brokers() {
         return;
     }
     for id in String::from_utf8_lossy(&listing.stdout).split_whitespace() {
-        let _ = std::process::Command::new("docker").args(["rm", "-f", id]).output();
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
     }
 }
 
@@ -391,7 +393,9 @@ async fn output_delivers_messages_verified_by_real_consumer() {
     let topic = unique("e2e-out");
     let output = build_output(serde_json::json!({"type": "value", "value": topic})).await;
 
-    let expected: Vec<Vec<u8>> = (0..5).map(|i| format!("payload-{i}").into_bytes()).collect();
+    let expected: Vec<Vec<u8>> = (0..5)
+        .map(|i| format!("payload-{i}").into_bytes())
+        .collect();
     for payload in &expected {
         output.write(binary_batch(payload)).await.expect("write");
     }
@@ -492,16 +496,25 @@ async fn output_write_fails_when_broker_stops() {
     let output = build_output(serde_json::json!({"type": "value", "value": topic})).await;
 
     // Prove the path works first, then kill the broker.
-    output.write(binary_batch(b"before")).await.expect("write before stop");
+    output
+        .write(binary_batch(b"before"))
+        .await
+        .expect("write before stop");
 
     stop_shared_broker().await;
 
     // A reliable output must resolve to an error (not fire-and-forget Ok,
     // and not hang) once the broker is gone.
-    let outcome = tokio::time::timeout(Duration::from_secs(60), output.write(binary_batch(b"after")))
-        .await
-        .expect("write must resolve after broker loss, not hang");
-    assert!(outcome.is_err(), "write after broker loss must fail: {outcome:?}");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        output.write(binary_batch(b"after")),
+    )
+    .await
+    .expect("write must resolve after broker loss, not hang");
+    assert!(
+        outcome.is_err(),
+        "write after broker loss must fail: {outcome:?}"
+    );
 }
 
 /// Stop and remove the shared broker, clearing the slot so the next lease
@@ -566,7 +579,10 @@ async fn input_reads_and_ack_prevents_redelivery() {
     if let Ok(Some(Ok(message))) =
         tokio::time::timeout(Duration::from_secs(5), verifier.next()).await
     {
-        panic!("acknowledged message re-delivered: {:?}", message.payload.data);
+        panic!(
+            "acknowledged message re-delivered: {:?}",
+            message.payload.data
+        );
     }
 }
 
@@ -597,4 +613,3 @@ async fn ack_completes_when_message_flow_stops() {
         .expect("ack must succeed");
     input.close().await.expect("close input");
 }
-

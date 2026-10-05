@@ -166,8 +166,9 @@ impl Output for PgVectorOutput {
         // so each INSERT stays under it. Slices preserve row order and a
         // chunk failure stops the rest (at-least-once redelivery re-writes
         // the batch; the upsert clause keeps re-writes idempotent).
-        let binds_per_row =
-            usize::from(self.config.id_field.is_some()) + 1 + usize::from(!self.config.payload_field.is_empty());
+        let binds_per_row = usize::from(self.config.id_field.is_some())
+            + 1
+            + usize::from(!self.config.payload_field.is_empty());
         let rows_per_chunk = (65_000 / binds_per_row).max(1);
         for chunk in point_rows.chunks(rows_per_chunk) {
             build_insert(&self.config, chunk)
@@ -396,7 +397,9 @@ fn extract_ids(
                 if column.is_null(row) {
                     return Err(null_id_error(&field, row));
                 }
-                ids.push(IdValue::Text(downcast_string_value(column, row)?.to_string()));
+                ids.push(IdValue::Text(
+                    downcast_string_value(column, row)?.to_string(),
+                ));
             }
         }
         other => {
@@ -434,13 +437,10 @@ fn extract_payloads(
     if config.payload_field.is_empty() {
         return Ok(None);
     }
-    let excluded: Vec<String> = vec![
-        Some(config.vector_field.clone()),
-        config.id_field.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let excluded: Vec<String> = vec![Some(config.vector_field.clone()), config.id_field.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
     let payload_columns: Vec<String> = batch
         .schema()
         .fields()
@@ -454,33 +454,41 @@ fn extract_payloads(
         return Ok(Some(vec![empty; batch.num_rows()]));
     }
 
-    let filtered = batch
-        .filter_columns(&payload_columns.iter().cloned().collect::<std::collections::HashSet<_>>())?;
+    let filtered = batch.filter_columns(
+        &payload_columns
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>(),
+    )?;
     let mut buffer = Vec::new();
     let mut writer = LineDelimitedWriter::new(&mut buffer);
-    writer
-        .write(&filtered)
-        .map_err(|e| Error::Process(format!("pgvector output: payload serialization failed: {}", e)))?;
-    writer
-        .finish()
-        .map_err(|e| Error::Process(format!("pgvector output: payload serialization failed: {}", e)))?;
+    writer.write(&filtered).map_err(|e| {
+        Error::Process(format!(
+            "pgvector output: payload serialization failed: {}",
+            e
+        ))
+    })?;
+    writer.finish().map_err(|e| {
+        Error::Process(format!(
+            "pgvector output: payload serialization failed: {}",
+            e
+        ))
+    })?;
     let text = String::from_utf8(buffer)
         .map_err(|e| Error::Process(format!("pgvector output: payload is not UTF-8: {}", e)))?;
     text.lines()
         .map(|line| {
             // Re-serialize compactly so each payload is one JSON object text.
-            let value: Value = serde_json::from_str(line)
-                .map_err(|e| Error::Process(format!("pgvector output: payload parse failed: {}", e)))?;
+            let value: Value = serde_json::from_str(line).map_err(|e| {
+                Error::Process(format!("pgvector output: payload parse failed: {}", e))
+            })?;
             Ok(value.to_string())
         })
         .collect::<Result<Vec<String>, Error>>()
         .map(Some)
 }
 
-fn find_column<'a>(
-    batch: &'a MessageBatchRef,
-    field: &str,
-) -> Result<&'a Arc<dyn Array>, Error> {
+fn find_column<'a>(batch: &'a MessageBatchRef, field: &str) -> Result<&'a Arc<dyn Array>, Error> {
     batch
         .schema()
         .fields()
@@ -500,9 +508,7 @@ impl OutputBuilder for PgVectorOutputBuilder {
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         let mut config: PgVectorOutputConfig = parse_config(config, "pgvector output")?;
-        config.id_field = config
-            .id_field
-            .filter(|field| !field.trim().is_empty());
+        config.id_field = config.id_field.filter(|field| !field.trim().is_empty());
         if config.url.trim().is_empty() {
             return Err(Error::Config(
                 "pgvector output: 'url' must not be empty".to_string(),
@@ -519,9 +525,8 @@ impl OutputBuilder for PgVectorOutputBuilder {
             ));
         }
         // Touch the URL so a malformed connection string fails at build time.
-        Url::parse(&config.url).map_err(|e| {
-            Error::Config(format!("pgvector output: invalid 'url': {e}"))
-        })?;
+        Url::parse(&config.url)
+            .map_err(|e| Error::Config(format!("pgvector output: invalid 'url': {e}")))?;
         Ok(Arc::new(PgVectorOutput {
             config,
             pool: Mutex::new(None),
@@ -572,10 +577,19 @@ mod tests {
         let dim = 2i32;
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let flat = Float32Array::from(vec![1.5f32, 2.0, -3.0, 4.25]);
-        let vectors = Arc::new(FixedSizeListArray::new(item_field, dim, Arc::new(flat), None));
+        let vectors = Arc::new(FixedSizeListArray::new(
+            item_field,
+            dim,
+            Arc::new(flat),
+            None,
+        ));
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Int64, false),
-            Field::new("embedding", DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim), true),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
             Field::new("text", DataType::Utf8, true),
         ]));
         let columns: Vec<ArrayRef> = vec![
@@ -601,10 +615,14 @@ mod tests {
         let config = config_with(serde_json::json!({}));
         let sql = build_insert(
             &config,
-            &[row_of(1, "[1.0,2.0]", r#"{"text":"a"}"#), row_of(2, "[3.0,4.0]", r#"{"text":"b"}"#)],
+            &[
+                row_of(1, "[1.0,2.0]", r#"{"text":"a"}"#),
+                row_of(2, "[3.0,4.0]", r#"{"text":"b"}"#),
+            ],
         )
         .sql()
-        .as_str().to_string();
+        .as_str()
+        .to_string();
         assert_eq!(
             sql,
             "INSERT INTO \"documents\" (\"doc_id\", \"embedding\", \"payload\") VALUES ($1, $2::vector, $3::jsonb), ($4, $5::vector, $6::jsonb) ON CONFLICT (\"doc_id\") DO UPDATE SET \"embedding\" = EXCLUDED.\"embedding\", \"payload\" = EXCLUDED.\"payload\""
@@ -706,14 +724,22 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["text"], "hello");
         assert_eq!(parsed[1]["text"], "world");
-        assert!(parsed[0].get("doc_id").is_none(), "id must not leak into payload");
-        assert!(parsed[0].get("embedding").is_none(), "vector must not leak into payload");
+        assert!(
+            parsed[0].get("doc_id").is_none(),
+            "id must not leak into payload"
+        );
+        assert!(
+            parsed[0].get("embedding").is_none(),
+            "vector must not leak into payload"
+        );
     }
 
     #[tokio::test]
     async fn payload_disabled_yields_none() {
         let config = config_with(serde_json::json!({"payload_field": ""}));
-        assert!(extract_payloads(&sample_batch(), &config).unwrap().is_none());
+        assert!(extract_payloads(&sample_batch(), &config)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -732,7 +758,9 @@ mod tests {
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(schema, vec![Arc::new(with_null)]).unwrap(),
         ));
-        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        let err = extract_vectors(&batch, "embedding")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("null vector at row 1"), "{err}");
     }
 
@@ -768,8 +796,11 @@ mod tests {
         }));
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
         let batch = Arc::new(MessageBatch::new_arrow(
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(Vec::<Option<&str>>::new()))])
-                .unwrap(),
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(StringArray::from(Vec::<Option<&str>>::new()))],
+            )
+            .unwrap(),
         ));
         // Not connected: an empty batch must short-circuit before the
         // connection check produces an error.
@@ -821,7 +852,10 @@ mod tests {
             )
             .err()
             .expect("blank url must be rejected");
-        assert!(format!("{err}").contains("'url' must not be empty"), "{err}");
+        assert!(
+            format!("{err}").contains("'url' must not be empty"),
+            "{err}"
+        );
 
         let err = PgVectorOutputBuilder
             .build(
@@ -832,7 +866,10 @@ mod tests {
             )
             .err()
             .expect("blank table must be rejected");
-        assert!(format!("{err}").contains("'table' must not be empty"), "{err}");
+        assert!(
+            format!("{err}").contains("'table' must not be empty"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -866,38 +903,38 @@ mod tests {
             "doc_id",
             Arc::new(Int64Array::from(vec![Some(7i64), Some(0)])),
         );
-        let ids = extract_ids(&i64s, &Some("doc_id".to_string())).unwrap().unwrap();
+        let ids = extract_ids(&i64s, &Some("doc_id".to_string()))
+            .unwrap()
+            .unwrap();
         assert!(matches!(ids[0], IdValue::Int(7)));
         assert!(matches!(ids[1], IdValue::Int(0)));
 
-        let i32s = single_column_batch(
-            "doc_id",
-            Arc::new(Int32Array::from(vec![Some(42i32)])),
-        );
-        let ids = extract_ids(&i32s, &Some("doc_id".to_string())).unwrap().unwrap();
+        let i32s = single_column_batch("doc_id", Arc::new(Int32Array::from(vec![Some(42i32)])));
+        let ids = extract_ids(&i32s, &Some("doc_id".to_string()))
+            .unwrap()
+            .unwrap();
         assert!(matches!(ids[0], IdValue::Int(42)));
 
-        let utf8 = single_column_batch(
-            "doc_id",
-            Arc::new(StringArray::from(vec![Some("doc-1")])),
-        );
-        let ids = extract_ids(&utf8, &Some("doc_id".to_string())).unwrap().unwrap();
+        let utf8 = single_column_batch("doc_id", Arc::new(StringArray::from(vec![Some("doc-1")])));
+        let ids = extract_ids(&utf8, &Some("doc_id".to_string()))
+            .unwrap()
+            .unwrap();
         assert!(matches!(&ids[0], IdValue::Text(t) if t == "doc-1"));
 
         let large = single_column_batch(
             "doc_id",
             Arc::new(LargeStringArray::from(vec![Some("doc-2")])),
         );
-        let ids = extract_ids(&large, &Some("doc_id".to_string())).unwrap().unwrap();
+        let ids = extract_ids(&large, &Some("doc_id".to_string()))
+            .unwrap()
+            .unwrap();
         assert!(matches!(&ids[0], IdValue::Text(t) if t == "doc-2"));
     }
 
     #[tokio::test]
     async fn extract_ids_rejects_nulls_and_negative_values() {
-        let null_i64 = single_column_batch(
-            "doc_id",
-            Arc::new(Int64Array::from(vec![Some(1), None])),
-        );
+        let null_i64 =
+            single_column_batch("doc_id", Arc::new(Int64Array::from(vec![Some(1), None])));
         let err = extract_ids(&null_i64, &Some("doc_id".to_string()))
             .err()
             .expect("null id must be rejected")
@@ -959,11 +996,9 @@ mod tests {
     #[tokio::test]
     async fn extract_ids_blank_or_missing_field_yields_none() {
         assert!(extract_ids(&sample_batch(), &None).unwrap().is_none());
-        assert!(
-            extract_ids(&sample_batch(), &Some("   ".to_string()))
-                .unwrap()
-                .is_none()
-        );
+        assert!(extract_ids(&sample_batch(), &Some("   ".to_string()))
+            .unwrap()
+            .is_none());
     }
 
     // ---- vector extraction edge cases ----
@@ -991,7 +1026,9 @@ mod tests {
             _,
         >(vec![Some(vec![])]));
         let batch = single_column_batch("embedding", list);
-        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        let err = extract_vectors(&batch, "embedding")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("empty vector at row 0"), "{err}");
     }
 
@@ -1003,7 +1040,9 @@ mod tests {
             _,
         >(vec![Some(vec![Some(1)])]));
         let batch = single_column_batch("embedding", list);
-        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        let err = extract_vectors(&batch, "embedding")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not a Float32 vector list"), "{err}");
     }
 
@@ -1018,14 +1057,18 @@ mod tests {
             None,
         ));
         let batch = single_column_batch("embedding", list);
-        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        let err = extract_vectors(&batch, "embedding")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not a Float32 vector list"), "{err}");
     }
 
     #[tokio::test]
     async fn scalar_vector_column_errors() {
         let batch = single_column_batch("embedding", Arc::new(StringArray::from(vec!["x"])));
-        let err = extract_vectors(&batch, "embedding").unwrap_err().to_string();
+        let err = extract_vectors(&batch, "embedding")
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("must be FixedSizeList(Float32) or List(Float32)"),
             "{err}"
@@ -1049,20 +1092,14 @@ mod tests {
             Field::new("doc_id", DataType::Int64, false),
             Field::new(
                 "embedding",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dim,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
                 true,
             ),
         ]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(
                 schema,
-                vec![
-                    Arc::new(Int64Array::from(vec![1i64, 2])),
-                    vectors,
-                ],
+                vec![Arc::new(Int64Array::from(vec![1i64, 2])), vectors],
             )
             .unwrap(),
         ));
@@ -1107,7 +1144,13 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(first, vec![("[1.5,2]".to_string(), r#"{"text": "hello"}"#.to_string()), ("[-3,4.25]".to_string(), r#"{"text": "world"}"#.to_string())]);
+        assert_eq!(
+            first,
+            vec![
+                ("[1.5,2]".to_string(), r#"{"text": "hello"}"#.to_string()),
+                ("[-3,4.25]".to_string(), r#"{"text": "world"}"#.to_string())
+            ]
+        );
 
         // Same ids again: the upsert must overwrite, not duplicate.
         output.write(sample_batch()).await.unwrap();

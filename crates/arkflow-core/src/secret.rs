@@ -119,9 +119,8 @@ pub fn resolve_candidate_payload(payload: String) -> Result<Option<String>, Erro
     // path free of plaintext at rest. `serde` adds the field only when set.
     candidate["content_verbatim"] = json!(content);
     candidate["format"] = json!("json");
-    let serialized = serde_json::to_string(&candidate).map_err(|e| {
-        Error::Config(format!("candidate payload serialization failed: {}", e))
-    })?;
+    let serialized = serde_json::to_string(&candidate)
+        .map_err(|e| Error::Config(format!("candidate payload serialization failed: {}", e)))?;
     Ok(Some(serialized))
 }
 
@@ -314,11 +313,7 @@ fn resolve_env(spec: &str, reference: &str, path: &str) -> Result<String, Error>
 
 fn resolve_file(spec: &str, reference: &str, path: &str) -> Result<String, Error> {
     if spec.is_empty() {
-        return Err(secret_error(
-            path,
-            reference,
-            "empty file path".to_string(),
-        ));
+        return Err(secret_error(path, reference, "empty file path".to_string()));
     }
     // Path sandbox: only absolute paths without `..` components are
     // accepted. This prevents the ${file:} reference from being weaponized
@@ -333,9 +328,10 @@ fn resolve_file(spec: &str, reference: &str, path: &str) -> Result<String, Error
             "file path must be absolute".to_string(),
         ));
     }
-    if candidate.components().any(|c| {
-        matches!(c, std::path::Component::ParentDir)
-    }) {
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(secret_error(
             path,
             reference,
@@ -376,8 +372,9 @@ mod tests {
             "content": "health_check:\n  api_token: ${secret:INJECTED_REF}\n"
         })
         .to_string();
-        let resolved =
-            resolve_candidate_payload(payload).expect("resolution succeeds").expect("changed");
+        let resolved = resolve_candidate_payload(payload)
+            .expect("resolution succeeds")
+            .expect("changed");
         let content: serde_json::Value = serde_json::from_str(&resolved).unwrap();
         let content = content["content"].as_str().unwrap();
         assert!(
@@ -389,8 +386,7 @@ mod tests {
         let mut tree: serde_json::Value = serde_yaml::from_str(content).unwrap();
         resolve_value(&mut tree).unwrap();
         assert_eq!(
-            tree["health_check"]["api_token"],
-            "${env:TOTALLY_UNSET_VAR}",
+            tree["health_check"]["api_token"], "${env:TOTALLY_UNSET_VAR}",
             "the value must land as a literal, never re-expanded"
         );
     }
@@ -406,12 +402,16 @@ mod tests {
             "content": "health_check:\n  api_token: ${secret:VERBATIM_PROBE}\n"
         })
         .to_string();
-        let resolved =
-            resolve_candidate_payload(payload).expect("resolution succeeds").expect("changed");
+        let resolved = resolve_candidate_payload(payload)
+            .expect("resolution succeeds")
+            .expect("changed");
         let envelope: serde_json::Value = serde_json::from_str(&resolved).unwrap();
         assert_eq!(envelope["format"], "json");
         assert!(
-            !envelope["content"].as_str().unwrap().contains("${secret:VERBATIM_PROBE}"),
+            !envelope["content"]
+                .as_str()
+                .unwrap()
+                .contains("${secret:VERBATIM_PROBE}"),
             "dispatched content must be resolved"
         );
         assert_eq!(
@@ -420,7 +420,6 @@ mod tests {
             "verbatim content must keep the reference"
         );
     }
-
 
     /// Unique per-test env var names: cargo runs tests in parallel threads
     /// sharing one process environment.
@@ -526,22 +525,21 @@ mod tests {
         std::fs::write(&path, "-----BEGIN KEY-----\nabc\ndef\n-----END KEY-----\n").unwrap();
         let reference = format!("${{file:{}}}", path.display());
         let resolved = resolve_string(&reference, "tls.key").unwrap();
-        assert_eq!(
-            resolved,
-            "-----BEGIN KEY-----\nabc\ndef\n-----END KEY-----"
-        );
+        assert_eq!(resolved, "-----BEGIN KEY-----\nabc\ndef\n-----END KEY-----");
     }
 
     #[test]
     fn file_missing_errors_with_kind_not_content() {
-        let err =
-            resolve_string("${file:/nonexistent/arkflow/nope.pem}", "tls.ca").unwrap_err();
+        let err = resolve_string("${file:/nonexistent/arkflow/nope.pem}", "tls.ca").unwrap_err();
         let message = err.to_string();
         // The sandbox returns a fixed error description that does NOT
         // include the underlying IO error kind or file content. The
         // reference itself (with the user-provided path) is included by
         // the secret_error helper for diagnostics — that is not a leak.
-        assert!(message.contains("unable to read the referenced file"), "{message}");
+        assert!(
+            message.contains("unable to read the referenced file"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -703,15 +701,15 @@ mod tests {
             "${kms:arn:key}"
         );
         // Only known schemes resolve; a typo stays literal too.
-        assert_eq!(
-            resolve_string("${envs:VAR}", "a").unwrap(),
-            "${envs:VAR}"
-        );
+        assert_eq!(resolve_string("${envs:VAR}", "a").unwrap(), "${envs:VAR}");
     }
 
     #[test]
     fn unterminated_reference_stays_literal() {
-        assert_eq!(resolve_string("value ${env:OPEN", "").unwrap(), "value ${env:OPEN");
+        assert_eq!(
+            resolve_string("value ${env:OPEN", "").unwrap(),
+            "value ${env:OPEN"
+        );
     }
 
     #[test]
@@ -769,12 +767,15 @@ mod tests {
     #[test]
     fn resolve_document_yaml_json_toml() {
         set_env("ARKFLOW_SECRET_TEST_DOC", "resolved");
-        let yaml = resolve_document(ConfigDocument::Yaml("value: ${env:ARKFLOW_SECRET_TEST_DOC}"))
-            .unwrap();
+        let yaml = resolve_document(ConfigDocument::Yaml(
+            "value: ${env:ARKFLOW_SECRET_TEST_DOC}",
+        ))
+        .unwrap();
         assert_eq!(yaml["value"], "resolved");
-        let json_doc =
-            resolve_document(ConfigDocument::Json(r#"{"value": "${env:ARKFLOW_SECRET_TEST_DOC}"}"#))
-                .unwrap();
+        let json_doc = resolve_document(ConfigDocument::Json(
+            r#"{"value": "${env:ARKFLOW_SECRET_TEST_DOC}"}"#,
+        ))
+        .unwrap();
         assert_eq!(json_doc["value"], "resolved");
         let toml_doc = resolve_document(ConfigDocument::Toml(
             "value = \"${env:ARKFLOW_SECRET_TEST_DOC}\"",

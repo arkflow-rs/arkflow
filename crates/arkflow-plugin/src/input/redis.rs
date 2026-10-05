@@ -16,10 +16,10 @@
 //!
 //! Receive data from Redis pub/sub channels
 
+use crate::input::codec_helper::Delivery;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
-use crate::input::codec_helper::Delivery;
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
 use async_trait::async_trait;
@@ -631,10 +631,11 @@ mod tests {
             "push handling never signals connection loss"
         );
 
-        let delivery = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv_async())
-            .await
-            .expect("delivery arrives")
-            .expect("channel stays open");
+        let delivery =
+            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv_async())
+                .await
+                .expect("delivery arrives")
+                .expect("channel stays open");
         let Delivery::Data(batch, _ack) = delivery else {
             panic!("no-codec push decode cannot fail");
         };
@@ -801,7 +802,10 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        assert!(matches!(rt.block_on(input.read()), Err(Error::Disconnection)));
+        assert!(matches!(
+            rt.block_on(input.read()),
+            Err(Error::Disconnection)
+        ));
     }
 
     #[test]
@@ -821,7 +825,10 @@ mod tests {
             .unwrap();
         rt.block_on(input.close()).unwrap();
         // After close, read still reports the disconnected state.
-        assert!(matches!(rt.block_on(input.read()), Err(Error::Disconnection)));
+        assert!(matches!(
+            rt.block_on(input.read()),
+            Err(Error::Disconnection)
+        ));
     }
 
     fn test_resource() -> Resource {
@@ -834,12 +841,7 @@ mod tests {
     // ===== Offline connection-error paths (no Redis server required) =====
 
     fn input_from(value: serde_json::Value) -> RedisInput {
-        RedisInput::new(
-            None,
-            serde_json::from_value(value).unwrap(),
-            None,
-        )
-        .unwrap()
+        RedisInput::new(None, serde_json::from_value(value).unwrap(), None).unwrap()
     }
 
     /// The builder accepts both well-formed mode shapes (validation of the
@@ -880,7 +882,8 @@ mod tests {
         }));
         let err = input.connect().await.expect_err("no cluster nodes");
         assert!(
-            err.to_string().contains("Failed to connect to Redis cluster"),
+            err.to_string()
+                .contains("Failed to connect to Redis cluster"),
             "got: {err}"
         );
     }
@@ -894,18 +897,15 @@ mod tests {
             "mode": {"type": "cluster", "urls": ["redis://127.0.0.1:1/", "redis://127.0.0.1:2/"]},
             "redis_type": {"type": "subscribe", "subscribe": {"type": "channels", "channels": ["c"]}}
         }));
-        let err = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            input.connect(),
-        )
-        .await
-        {
-            Ok(Err(e)) => e,
-            Ok(Ok(())) => panic!("unreachable cluster seeds must not connect"),
-            Err(_) => panic!("cluster connect must fail fast on refused ports"),
-        };
+        let err =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), input.connect()).await {
+                Ok(Err(e)) => e,
+                Ok(Ok(())) => panic!("unreachable cluster seeds must not connect"),
+                Err(_) => panic!("cluster connect must fail fast on refused ports"),
+            };
         assert!(
-            err.to_string().contains("Failed to connect to Redis cluster"),
+            err.to_string()
+                .contains("Failed to connect to Redis cluster"),
             "got: {err}"
         );
         // A failed connect leaves the client slot empty: read reports the
@@ -926,7 +926,8 @@ mod tests {
         }));
         let err = input.connect().await.expect_err("invalid db path");
         assert!(
-            err.to_string().contains("Failed to connect to Redis server"),
+            err.to_string()
+                .contains("Failed to connect to Redis server"),
             "got: {err}"
         );
         // The failed connect leaves the client slot empty.

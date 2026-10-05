@@ -166,12 +166,7 @@ pub fn register_processor_builder(
 /// Names of all registered processor builders, sorted. Used by the registry
 /// consistency test to detect builders without docs metadata.
 pub fn registered_names() -> Vec<String> {
-    let mut names: Vec<String> = PROCESSOR_BUILDERS
-        .read()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
+    let mut names: Vec<String> = PROCESSOR_BUILDERS.read().unwrap().keys().cloned().collect();
     names.sort();
     names
 }

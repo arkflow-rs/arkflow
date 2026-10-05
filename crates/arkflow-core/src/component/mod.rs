@@ -1006,7 +1006,10 @@ mod tests {
         // entries for one kind, so allow repeats within a kind group.
         let mut sorted_ranks = ranks.clone();
         sorted_ranks.sort_unstable();
-        assert_eq!(ranks, sorted_ranks, "kinds should appear in canonical order");
+        assert_eq!(
+            ranks, sorted_ranks,
+            "kinds should appear in canonical order"
+        );
 
         let found = list
             .iter()
@@ -1037,11 +1040,8 @@ mod tests {
     #[test]
     fn export_registry_is_deterministic_and_typed() {
         let _guard = REGISTER_LOCK.lock().unwrap();
-        register_temporary_metadata(ComponentMetadata::unit(
-            "test_export_temp",
-            "Export test.",
-        ))
-        .unwrap();
+        register_temporary_metadata(ComponentMetadata::unit("test_export_temp", "Export test."))
+            .unwrap();
         register_processor_metadata(
             ComponentMetadata::with_schema(
                 "test_export_proc",

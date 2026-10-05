@@ -409,7 +409,10 @@ mod tests {
             Int8Array, LargeBinaryArray, LargeStringArray, UInt16Array, UInt32Array, UInt8Array,
         };
         let msg = batch(vec![
-            ("large_text", Arc::new(LargeStringArray::from(vec![Some("large")]))),
+            (
+                "large_text",
+                Arc::new(LargeStringArray::from(vec![Some("large")])),
+            ),
             ("i8", Arc::new(Int8Array::from(vec![Some(-8)]))),
             ("i16", Arc::new(Int16Array::from(vec![Some(-16)]))),
             ("i32", Arc::new(Int32Array::from(vec![Some(-32)]))),
@@ -419,8 +422,14 @@ mod tests {
             ("f32", Arc::new(Float32Array::from(vec![Some(2.5f32)]))),
             ("f64", Arc::new(Float64Array::from(vec![Some(-1.25)]))),
             ("flag", Arc::new(BooleanArray::from(vec![Some(true)]))),
-            ("blob", Arc::new(BinaryArray::from(vec![Some(b"raw" as &[u8])]))),
-            ("large_blob", Arc::new(LargeBinaryArray::from(vec![Some(b"big" as &[u8])]))),
+            (
+                "blob",
+                Arc::new(BinaryArray::from(vec![Some(b"raw" as &[u8])])),
+            ),
+            (
+                "large_blob",
+                Arc::new(LargeBinaryArray::from(vec![Some(b"big" as &[u8])])),
+            ),
         ]);
         let document = MongoDBOutput::row_to_document(&msg, 0).unwrap();
         assert_eq!(document.get_str("large_text").unwrap(), "large");
@@ -469,14 +478,12 @@ mod tests {
             );
         }
         // mongodb+srv URIs are accepted.
-        assert!(
-            MongoDBOutput::new(MongoDBOutputConfig {
-                uri: "mongodb+srv://cluster.example.com".to_string(),
-                database: "db".to_string(),
-                collection: "events".to_string(),
-            })
-            .is_ok()
-        );
+        assert!(MongoDBOutput::new(MongoDBOutputConfig {
+            uri: "mongodb+srv://cluster.example.com".to_string(),
+            database: "db".to_string(),
+            collection: "events".to_string(),
+        })
+        .is_ok());
     }
 
     #[tokio::test]
@@ -518,13 +525,10 @@ mod tests {
             collection: "events".to_string(),
         })
         .unwrap();
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            output.connect(),
-        )
-        .await
-        .expect("connect must fail within the selection timeout, not hang")
-        .unwrap_err();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(15), output.connect())
+            .await
+            .expect("connect must fail within the selection timeout, not hang")
+            .unwrap_err();
         assert!(
             error.to_string().to_lowercase().contains("connect"),
             "unexpected error: {error}"
@@ -541,10 +545,7 @@ mod tests {
         })
         .unwrap();
         let error = output.connect().await.unwrap_err();
-        assert!(
-            error.to_string().contains("Invalid MongoDB URI"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("Invalid MongoDB URI"), "{error}");
     }
 
     /// A no-op codec used to exercise the codec-rejection branch.
@@ -575,10 +576,11 @@ mod tests {
             "database": "db",
             "collection": "events"
         }));
-        let error = match MongoDBOutputBuilder.build(None, &config, Some(Arc::new(NoopCodec)), &resource) {
-            Ok(_) => panic!("codec must be rejected"),
-            Err(error) => error,
-        };
+        let error =
+            match MongoDBOutputBuilder.build(None, &config, Some(Arc::new(NoopCodec)), &resource) {
+                Ok(_) => panic!("codec must be rejected"),
+                Err(error) => error,
+            };
         assert!(error.to_string().contains("codec"), "{error}");
 
         // Missing config and unknown fields are configuration errors.
@@ -591,6 +593,8 @@ mod tests {
             MongoDBOutputBuilder.build(None, &bad, None, &resource),
             Err(Error::Config(_))
         ));
-        assert!(MongoDBOutputBuilder.build(None, &config, None, &resource).is_ok());
+        assert!(MongoDBOutputBuilder
+            .build(None, &config, None, &resource)
+            .is_ok());
     }
 }

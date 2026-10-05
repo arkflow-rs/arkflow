@@ -141,13 +141,10 @@ impl EmbeddingProcessor {
 
     async fn embed_chunk(&self, chunk: &[&str]) -> Result<Vec<Vec<f32>>, Error> {
         let url = format!("{}/embeddings", self.config.api_base.trim_end_matches('/'));
-        let mut request = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({
-                "model": self.config.model,
-                "input": chunk,
-            }));
+        let mut request = self.client.post(&url).json(&serde_json::json!({
+            "model": self.config.model,
+            "input": chunk,
+        }));
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
         }
@@ -162,9 +159,10 @@ impl EmbeddingProcessor {
             Error::Process(format!("Embedding API request failed: {}", e))
         })?;
         let status = response.status();
-        let body = response.text().await.map_err(|e| {
-            Error::Process(format!("Embedding API response read failed: {}", e))
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| Error::Process(format!("Embedding API response read failed: {}", e)))?;
         if !status.is_success() {
             return Err(Error::Process(format!(
                 "Embedding API returned {}: {}",
@@ -173,9 +171,8 @@ impl EmbeddingProcessor {
             )));
         }
 
-        let parsed: EmbeddingsResponse = serde_json::from_str(&body).map_err(|e| {
-            Error::Process(format!("Embedding API response parse failed: {}", e))
-        })?;
+        let parsed: EmbeddingsResponse = serde_json::from_str(&body)
+            .map_err(|e| Error::Process(format!("Embedding API response parse failed: {}", e)))?;
         if parsed.data.len() != chunk.len() {
             return Err(Error::Process(format!(
                 "Embedding API returned {} vectors for {} inputs",
@@ -238,11 +235,14 @@ impl ProcessorBuilder for EmbeddingProcessorBuilder {
         }
         // Loopback endpoints (local vLLM/Ollama/TEI, tests) bypass a system
         // proxy — proxying localhost is never what a user means.
-        let is_loopback = reqwest::Url::parse(&format!("{}/", config.api_base.trim_end_matches('/')))
-            .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-            .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]")
-            .unwrap_or(false);
+        let is_loopback =
+            reqwest::Url::parse(&format!("{}/", config.api_base.trim_end_matches('/')))
+                .ok()
+                .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+                .map(|host| {
+                    host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+                })
+                .unwrap_or(false);
         let mut builder = Client::builder().timeout(Duration::from_millis(config.timeout_ms));
         if is_loopback {
             builder = builder.no_proxy();
@@ -254,10 +254,7 @@ impl ProcessorBuilder for EmbeddingProcessorBuilder {
     }
 }
 
-fn extract_string_column<'a>(
-    batch: &'a MessageBatch,
-    field: &str,
-) -> Result<Vec<&'a str>, Error> {
+fn extract_string_column<'a>(batch: &'a MessageBatch, field: &str) -> Result<Vec<&'a str>, Error> {
     let column = batch
         .schema()
         .fields()
@@ -412,9 +409,7 @@ mod tests {
                         .to_ascii_lowercase()
                         .split("content-length:")
                         .nth(1)
-                        .and_then(|rest| {
-                            rest.split("\r\n").next()
-                        })
+                        .and_then(|rest| rest.split("\r\n").next())
                         .and_then(|value| value.trim().parse::<usize>().ok())
                         .unwrap_or(0);
                     let mut body_bytes = vec![0u8; content_length];
@@ -449,8 +444,9 @@ mod tests {
     fn embeddings_body(dimension: usize, count: usize) -> String {
         let data: Vec<String> = (0..count)
             .map(|i| {
-                let vector: Vec<String> =
-                    (0..dimension).map(|d| format!("{}", (i * d) as f32)).collect();
+                let vector: Vec<String> = (0..dimension)
+                    .map(|d| format!("{}", (i * d) as f32))
+                    .collect();
                 format!(r#"{{"index": {i}, "embedding": [{}]}}"#, vector.join(", "))
             })
             .collect();
@@ -486,7 +482,12 @@ mod tests {
     }
 
     fn vector_column(batch: &MessageBatch, name: &str) -> (i32, Vec<Vec<f32>>) {
-        let index = batch.schema().fields().iter().position(|f| f.name() == name).unwrap();
+        let index = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == name)
+            .unwrap();
         let column = batch.column(index);
         let list = column
             .as_any()
@@ -501,7 +502,11 @@ mod tests {
         let mut vectors = Vec::new();
         for row in 0..list.len() {
             let start = (row * dim as usize) as i64;
-            vectors.push((start..start + dim as i64).map(|i| values.value(i as usize)).collect());
+            vectors.push(
+                (start..start + dim as i64)
+                    .map(|i| values.value(i as usize))
+                    .collect(),
+            );
         }
         (dim, vectors)
     }
@@ -518,11 +523,12 @@ mod tests {
         };
         assert_eq!(output.num_rows(), 3);
         assert_eq!(
-            output.schema().field_with_name("embedding").unwrap().data_type(),
-            &DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                4
-            )
+            output
+                .schema()
+                .field_with_name("embedding")
+                .unwrap()
+                .data_type(),
+            &DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4)
         );
         let (dim, vectors) = vector_column(&output, "embedding");
         assert_eq!(dim, 4);
@@ -544,10 +550,8 @@ mod tests {
             let count = parsed["input"].as_array().unwrap().len();
             (200, embeddings_body(2, count))
         });
-        let processor = build_processor(base_config(
-            api.addr,
-            serde_json::json!({"batch_size": 2}),
-        ));
+        let processor =
+            build_processor(base_config(api.addr, serde_json::json!({"batch_size": 2})));
         let batch = text_batch(vec![Some("a"), Some("b"), Some("c"), Some("d"), Some("e")]);
         let result = processor.process(batch).await.unwrap();
         let ProcessResult::Single(output) = result else {
@@ -592,10 +596,7 @@ mod tests {
     async fn empty_batch_short_circuits_without_http() {
         let api = MockApi::spawn(200, embeddings_body(2, 0));
         let processor = build_processor(base_config(api.addr, serde_json::json!({})));
-        let result = processor
-            .process(text_batch(vec![]))
-            .await
-            .unwrap();
+        let result = processor.process(text_batch(vec![])).await.unwrap();
         assert!(matches!(result, ProcessResult::None));
         assert_eq!(api.request_count().await, 0);
     }
@@ -617,7 +618,11 @@ mod tests {
     async fn large_utf8_column_is_supported() {
         let api = MockApi::spawn(200, embeddings_body(2, 1));
         let processor = build_processor(base_config(api.addr, serde_json::json!({})));
-        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::LargeUtf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "text",
+            DataType::LargeUtf8,
+            true,
+        )]));
         let array = Arc::new(LargeStringArray::from(vec![Some("hello")]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(schema, vec![array]).unwrap(),

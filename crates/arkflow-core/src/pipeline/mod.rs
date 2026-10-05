@@ -26,7 +26,6 @@ pub struct PipelineConfig {
     pub processors: Vec<crate::processor::ProcessorConfig>,
 }
 
-
 pub(crate) fn default_thread_num() -> u32 {
     num_cpus::get() as u32
 }

@@ -22,13 +22,13 @@ use arkflow_core::input::{Input, InputConfig};
 use arkflow_core::Resource;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort};
+use testcontainers::{core::IntoContainerPort, ContainerAsync, GenericImage, ImageExt};
 
 const MQTT_HOST_PORT: u16 = 1883;
 const MQTT_HOST: &str = "127.0.0.1";
@@ -129,7 +129,9 @@ fn sweep_leftover_brokers() {
         return;
     }
     for id in String::from_utf8_lossy(&listing.stdout).split_whitespace() {
-        let _ = std::process::Command::new("docker").args(["rm", "-f", id]).output();
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
     }
 }
 
@@ -271,7 +273,9 @@ async fn input_reads_and_acks_published_messages() {
     // before it is active are dropped (MQTT has no replay for new subs).
     tokio::time::sleep(Duration::from_millis(2_000)).await;
 
-    let expected: Vec<Vec<u8>> = (0..3).map(|i| format!("reading-{i}").into_bytes()).collect();
+    let expected: Vec<Vec<u8>> = (0..3)
+        .map(|i| format!("reading-{i}").into_bytes())
+        .collect();
     let payloads: Vec<&[u8]> = expected.iter().map(|v| v.as_slice()).collect();
     publish(&topic, &payloads).await;
 

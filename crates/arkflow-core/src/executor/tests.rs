@@ -502,8 +502,7 @@ fn stateful_operator(id: &str) -> OperatorSpec {
 #[test]
 fn explicit_parallelism_on_stateful_chain_is_rejected() {
     let mut job = stateful_operator_job();
-    job.sources[0].config =
-        serde_json::json!({"__arkflow_processor_parallelism": 2});
+    job.sources[0].config = serde_json::json!({"__arkflow_processor_parallelism": 2});
     let plan = JobPlan::compile(job).unwrap();
     let adapter = Adapter {
         input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
@@ -513,10 +512,11 @@ fn explicit_parallelism_on_stateful_chain_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let backend: Arc<dyn crate::state::StateBackend> =
         Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
-    let error = match ExecutionGraphBuilder::default()
-        .with_state(backend)
-        .build(&plan, &adapter, &resource())
-    {
+    let error = match ExecutionGraphBuilder::default().with_state(backend).build(
+        &plan,
+        &adapter,
+        &resource(),
+    ) {
         Ok(_) => panic!("the explicit parallelism override must be rejected"),
         Err(error) => error.to_string(),
     };
@@ -2506,10 +2506,7 @@ async fn checkpoint_round_fails_when_chain_ends_without_reporting() {
         async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
             match self.reads.fetch_add(1, Ordering::SeqCst) {
                 0 => Ok((
-                    Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
-                        0,
-                        "a".into(),
-                    )]))),
+                    Arc::new(MessageBatch::new_arrow(int64_batch(vec![(0, "a".into())]))),
                     Arc::new(crate::input::NoopAck),
                 )),
                 // Fail mid-flight (NOT a clean EOF): the chain exits with an
@@ -3909,15 +3906,12 @@ fn window_stream_with_default_thread_num_compiles_single_parallelism() {
     let stream = window_stream_config("windowed-default", crate::pipeline::default_thread_num());
     let spec = crate::executor::stream_compiler::compile_stream(&stream, 0).unwrap();
     // The parallelism key rides the source OPERATOR's config.
-    let concurrency = spec
-        .operators
-        .iter()
-        .find_map(|operator| {
-            operator
-                .config
-                .get("__arkflow_processor_parallelism")
-                .and_then(serde_json::Value::as_u64)
-        });
+    let concurrency = spec.operators.iter().find_map(|operator| {
+        operator
+            .config
+            .get("__arkflow_processor_parallelism")
+            .and_then(serde_json::Value::as_u64)
+    });
     assert_eq!(
         concurrency,
         Some(1),
@@ -4685,10 +4679,7 @@ async fn remote_graph_fails_closed_when_downstream_unreachable() {
         tls: None,
         local_node: "node-a".into(),
         task_nodes: task_nodes(),
-        node_addrs: BTreeMap::from([(
-            "node-b".to_string(),
-            "127.0.0.1:1".parse().unwrap(),
-        )]),
+        node_addrs: BTreeMap::from([("node-b".to_string(), "127.0.0.1:1".parse().unwrap())]),
         manager: manager_a.clone(),
         generation: 1,
     };
@@ -4831,11 +4822,7 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
     }
 
     let cancellation = CancellationToken::new();
-    let runner = tokio::spawn(run_graph_with_hooks(
-        graph_b,
-        cancellation.clone(),
-        hooks,
-    ));
+    let runner = tokio::spawn(run_graph_with_hooks(graph_b, cancellation.clone(), hooks));
 
     // One edge per (source subtask → map subtask) quad, over real TCP.
     let transport = || {
@@ -4858,16 +4845,22 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
         dst_subtask: dst,
     };
     let open_edge = |src: u32, dst: u32| {
-        manager_a.open_edge_deferred_for_session(
-            transport(),
-            quad(src, dst),
-            "node-b".into(),
-            plan.spec.id.to_string(),
-            1,
-        )
-        .expect("authenticated edge")
+        manager_a
+            .open_edge_deferred_for_session(
+                transport(),
+                quad(src, dst),
+                "node-b".into(),
+                plan.spec.id.to_string(),
+                1,
+            )
+            .expect("authenticated edge")
     };
-    let edges = [open_edge(0, 0), open_edge(1, 0), open_edge(0, 1), open_edge(1, 1)];
+    let edges = [
+        open_edge(0, 0),
+        open_edge(1, 0),
+        open_edge(0, 1),
+        open_edge(1, 1),
+    ];
 
     let barrier = |checkpoint: &str| {
         Envelope::Barrier(CheckpointBarrier {
@@ -4878,7 +4871,10 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
     };
     let data = |value: i64, key: &str| {
         Envelope::Data(
-            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(value, key.into())]))),
+            Arc::new(MessageBatch::new_arrow(int64_batch(vec![(
+                value,
+                key.into(),
+            )]))),
             Arc::new(crate::input::NoopAck),
         )
     };
@@ -5034,8 +5030,7 @@ async fn downstream_processing_failure_keeps_upstream_branch_pending() {
 /// Tests isolate themselves by filtering on unique task markers, not by
 /// exporter identity. A `OnceLock` guarantees the first span test to run
 /// installs the layer and every test observes the same finished spans.
-fn span_test_tracing()
--> (
+fn span_test_tracing() -> (
     &'static opentelemetry_sdk::trace::InMemorySpanExporter,
     &'static opentelemetry_sdk::trace::SdkTracerProvider,
 ) {
@@ -5062,7 +5057,7 @@ fn span_test_tracing()
 }
 
 #[serial_test::serial]
-    #[tokio::test]
+#[tokio::test]
 async fn job_and_chain_spans_are_exported_with_parent_links() {
     let (exporter, provider) = span_test_tracing();
 
@@ -5106,9 +5101,10 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
         .iter()
         .find(|span| {
             span.name.as_ref() == "chain.run"
-                && span.attributes.iter().any(|kv| {
-                    kv.key.as_str() == "task" && kv.value.as_str() == "span-op-7351-0"
-                })
+                && span
+                    .attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == "span-op-7351-0")
         })
         .expect("op chain span must be exported");
     let job = finished
@@ -5118,7 +5114,7 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
                 && span.span_context.span_id() == op_chain.parent_span_id
         })
         .expect("job.run parent of the chain span");
-        let chains_attr = job
+    let chains_attr = job
         .attributes
         .iter()
         .find(|kv| kv.key.as_str() == "chains")
@@ -5137,18 +5133,16 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
         .iter()
         .find(|span| {
             span.name.as_ref() == "chain.run"
-                && span.attributes.iter().any(|kv| {
-                    kv.key.as_str() == "task" && kv.value.as_str() == "span-op-7351-0"
-                })
+                && span
+                    .attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "task" && kv.value.as_str() == "span-op-7351-0")
         })
         .expect("op chain span must be exported");
     let job_span_id = op_chain.parent_span_id;
     let job = finished
         .iter()
-        .find(|span| {
-            span.name.as_ref() == "job.run"
-                && span.span_context.span_id() == job_span_id
-        })
+        .find(|span| span.name.as_ref() == "job.run" && span.span_context.span_id() == job_span_id)
         .expect("job.run parent of the chain span");
     let chains_attr = job
         .attributes
@@ -5163,9 +5157,7 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
 
     let chain_runs: Vec<_> = finished
         .iter()
-        .filter(|span| {
-            span.name.as_ref() == "chain.run" && span.parent_span_id == job_span_id
-        })
+        .filter(|span| span.name.as_ref() == "chain.run" && span.parent_span_id == job_span_id)
         .collect();
     assert_eq!(chain_runs.len(), 3);
     for chain in &chain_runs {
@@ -5190,7 +5182,7 @@ async fn job_and_chain_spans_are_exported_with_parent_links() {
 }
 
 #[serial_test::serial]
-    #[tokio::test]
+#[tokio::test]
 async fn batch_span_carries_rows_and_task_with_chain_parent() {
     let (exporter, provider) = span_test_tracing();
 
@@ -5267,7 +5259,7 @@ async fn batch_span_carries_rows_and_task_with_chain_parent() {
 }
 
 #[serial_test::serial]
-    #[tokio::test]
+#[tokio::test]
 async fn operator_failure_is_recorded_as_chain_batch_event() {
     let (exporter, provider) = span_test_tracing();
 
@@ -5338,7 +5330,7 @@ fn barrier_wire_json_is_backward_and_forward_compatible() {
 }
 
 #[serial_test::serial]
-    #[tokio::test]
+#[tokio::test]
 async fn trace_context_round_trips_to_a_remote_parent() {
     let (exporter, provider) = span_test_tracing();
     let root = tracing::info_span!("trace-root-7354");
@@ -5397,7 +5389,7 @@ async fn capture_is_none_without_an_active_span() {
 }
 
 #[serial_test::serial]
-    #[tokio::test]
+#[tokio::test]
 async fn barrier_carries_remote_trace_context_across_chains() {
     let (exporter, provider) = span_test_tracing();
 
@@ -5509,8 +5501,7 @@ async fn barrier_carries_remote_trace_context_across_chains() {
         .find(|span| {
             span.name.as_ref() == "chain.barrier"
                 && span.attributes.iter().any(|kv| {
-                    kv.key.as_str() == "checkpoint_id"
-                        && kv.value.as_str() == "cp-trace-7354"
+                    kv.key.as_str() == "checkpoint_id" && kv.value.as_str() == "cp-trace-7354"
                 })
         })
         .expect("chain.barrier span for the propagated barrier");
@@ -5624,8 +5615,7 @@ async fn two_input_join_emits_matched_pairs_end_to_end() {
     ];
     let plan = JobPlan::compile(job).unwrap();
     let task_ids = plan.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
-    let left: Arc<dyn crate::input::Input> =
-        Arc::new(VecInput::new(vec![vec![(100, "a".into())]]));
+    let left: Arc<dyn crate::input::Input> = Arc::new(VecInput::new(vec![vec![(100, "a".into())]]));
     let right: Arc<dyn crate::input::Input> =
         Arc::new(VecInput::new(vec![vec![(5_100, "a".into())]]));
     let output = Arc::new(CollectOutput::default());
@@ -5646,12 +5636,7 @@ async fn two_input_join_emits_matched_pairs_end_to_end() {
     let join_chain = graph
         .chains
         .iter()
-        .find(|chain| {
-            chain
-                .task_ids
-                .iter()
-                .any(|id| id.starts_with("join-"))
-        })
+        .find(|chain| chain.task_ids.iter().any(|id| id.starts_with("join-")))
         .expect("join chain");
     assert_eq!(join_chain.inputs.len(), 2);
     assert!(join_chain.tags_input_index);
@@ -5811,7 +5796,10 @@ async fn left_outer_join_emits_unmatched_rows_end_to_end() {
     }
     // The matched pair keeps both sides; the unmatched left row carries a
     // null right side.
-    assert!(rows.contains(&("a".to_owned(), Some("a".to_owned()))), "{rows:?}");
+    assert!(
+        rows.contains(&("a".to_owned(), Some("a".to_owned()))),
+        "{rows:?}"
+    );
     assert!(rows.contains(&("b".to_owned(), None)), "{rows:?}");
 }
 
@@ -5923,12 +5911,7 @@ async fn hung_state_snapshot_fails_within_a_bound() {
         ) -> Result<(), Error> {
             Ok(())
         }
-        fn update_i64(
-            &self,
-            _namespace: &str,
-            _key: &[u8],
-            _delta: i64,
-        ) -> Result<i64, Error> {
+        fn update_i64(&self, _namespace: &str, _key: &[u8], _delta: i64) -> Result<i64, Error> {
             Ok(0)
         }
         fn delete(&self, _namespace: &str, _key: &[u8]) -> Result<bool, Error> {
@@ -5961,8 +5944,7 @@ async fn hung_state_snapshot_fails_within_a_bound() {
         }
     }
 
-    let result =
-        crate::executor::barrier::snapshot_state(Arc::new(HangingBackend)).await;
+    let result = crate::executor::barrier::snapshot_state(Arc::new(HangingBackend)).await;
     crate::executor::barrier::override_snapshot_timeout_for_tests(Duration::from_secs(5 * 60));
     let Err(error) = result else {
         panic!("a hung snapshot must fail within the bound");
@@ -5982,10 +5964,7 @@ async fn wedged_round_fails_at_the_deadline_instead_of_parking() {
     struct WedgingProcessor;
     #[async_trait]
     impl Processor for WedgingProcessor {
-        async fn process(
-            &self,
-            _msg: MessageBatchRef,
-        ) -> Result<ProcessResult, Error> {
+        async fn process(&self, _msg: MessageBatchRef) -> Result<ProcessResult, Error> {
             // Park the worker forever: the barrier queues behind the stuck
             // delivery and the round can never collect its report.
             std::future::pending::<()>().await;
@@ -6051,14 +6030,11 @@ fn window_operator(id: &str, config: serde_json::Value) -> OperatorSpec {
 fn window_config_json(kind: serde_json::Value) -> serde_json::Value {
     let mut config = kind;
     let object = config.as_object_mut().expect("window kind object");
-    object.insert(
-        "timestamp_field".to_string(),
-        serde_json::json!("ts"),
-    );
+    object.insert("timestamp_field".to_string(), serde_json::json!("ts"));
     object.insert("key_field".to_string(), serde_json::json!("key"));
     object.insert("trigger".to_string(), serde_json::json!("watermark"));
     config
-    }
+}
 
 fn graph_coverage_event_time(timestamp_field: &str) -> TimeSpec {
     TimeSpec {
@@ -6118,10 +6094,7 @@ fn empty_task_assignment_is_rejected() {
         .build_subgraph(&plan, &[], &adapter, &resource(), None)
         .err()
         .expect("an empty assignment must fail the build");
-    assert!(
-        error.to_string().contains("contains no tasks"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("contains no tasks"), "{error}");
 }
 
 #[test]
@@ -6290,7 +6263,11 @@ fn late_event_route_target_missing_from_assignment_is_rejected() {
     let error = ExecutionGraphBuilder::default()
         .build_subgraph(
             &plan,
-            &["source-0".to_string(), "map-0".to_string(), "sink-0".to_string()],
+            &[
+                "source-0".to_string(),
+                "map-0".to_string(),
+                "sink-0".to_string(),
+            ],
             &simple_adapter(),
             &resource(),
             None,
@@ -6458,12 +6435,7 @@ fn session_window_builds_window_side_late_route_and_gate_timing() {
     let window_chain = graph
         .chains
         .iter()
-        .find(|chain| {
-            chain
-                .task_ids
-                .iter()
-                .any(|id| id.starts_with("win-"))
-        })
+        .find(|chain| chain.task_ids.iter().any(|id| id.starts_with("win-")))
         .expect("window chain");
     assert!(
         window_chain
@@ -6489,7 +6461,9 @@ fn sliding_window_timing_reaches_the_source_gate() {
     let mut job = spec(
         vec![window_operator(
             "win",
-            window_config_json(serde_json::json!({"kind": "sliding", "size_ms": 10_000, "slide_ms": 2_000})),
+            window_config_json(
+                serde_json::json!({"kind": "sliding", "size_ms": 10_000, "slide_ms": 2_000}),
+            ),
         )],
         vec![edge("source", "win"), edge("win", "sink")],
         1,
@@ -6506,7 +6480,10 @@ fn sliding_window_timing_reaches_the_source_gate() {
         .expect("source chain");
     assert!(matches!(
         source_chain.window_timings[0],
-        crate::executor::event_time_gate::WindowTiming::Sliding { size_ms: 10_000, slide_ms: 2_000 }
+        crate::executor::event_time_gate::WindowTiming::Sliding {
+            size_ms: 10_000,
+            slide_ms: 2_000
+        }
     ));
 }
 
@@ -6516,8 +6493,14 @@ fn watermark_groups_merge_overlapping_sources_and_share_windows() {
     // both sources into one watermark group (compatible TimeSpecs).
     let mut job = spec(
         vec![
-            window_operator("w1", window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 1000}))),
-            window_operator("w2", window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 2000}))),
+            window_operator(
+                "w1",
+                window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 1000})),
+            ),
+            window_operator(
+                "w2",
+                window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 2000})),
+            ),
         ],
         vec![
             edge("source", "w1"),
@@ -6563,8 +6546,14 @@ fn watermark_groups_merge_overlapping_sources_and_share_windows() {
     // build time instead of letting the two gates disagree.
     let mut job2 = spec(
         vec![
-            window_operator("w1", window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 1000}))),
-            window_operator("w2", window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 2000}))),
+            window_operator(
+                "w1",
+                window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 1000})),
+            ),
+            window_operator(
+                "w2",
+                window_config_json(serde_json::json!({"kind": "tumbling", "size_ms": 2000})),
+            ),
         ],
         vec![
             edge("source", "w1"),
@@ -6613,7 +6602,10 @@ fn session_window_route_reachability_walks_unrelated_sources() {
     // the not-reachable outcome) without contributing a route operator.
     let mut job = spec(
         vec![
-            window_operator("win", window_config_json(serde_json::json!({"kind": "session", "gap_ms": 500}))),
+            window_operator(
+                "win",
+                window_config_json(serde_json::json!({"kind": "session", "gap_ms": 500})),
+            ),
             map_operator("m1"),
             map_operator("m2"),
         ],
@@ -6710,7 +6702,9 @@ fn remote_edge_without_address_or_credentials_fails_the_build() {
         .err()
         .expect("a remote node without an address must fail the build");
     assert!(
-        error.to_string().contains("no data-plane address for remote node 'node-c'"),
+        error
+            .to_string()
+            .contains("no data-plane address for remote node 'node-c'"),
         "{error}"
     );
 
@@ -6785,18 +6779,27 @@ fn unauthenticated_transport_serves_only_one_job() {
         .map(str::to_string)
         .collect();
     ExecutionGraphBuilder::default()
-        .build_subgraph(&plan_a, &task_ids, &simple_adapter(), &resource(), Some(&context(&plan_a)))
+        .build_subgraph(
+            &plan_a,
+            &task_ids,
+            &simple_adapter(),
+            &resource(),
+            Some(&context(&plan_a)),
+        )
         .expect("first job claims the legacy transport");
 
     let plan_b = downstream_plan("legacy-job-b");
     let error = ExecutionGraphBuilder::default()
-        .build_subgraph(&plan_b, &task_ids, &simple_adapter(), &resource(), Some(&context(&plan_b)))
+        .build_subgraph(
+            &plan_b,
+            &task_ids,
+            &simple_adapter(),
+            &resource(),
+            Some(&context(&plan_b)),
+        )
         .err()
         .expect("a second job must be rejected by the legacy transport");
-    assert!(
-        error.to_string().contains("cannot carry Job"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("cannot carry Job"), "{error}");
 }
 
 // ---------- run_graph wrapper / startup / shutdown coverage ----------
@@ -6926,9 +6929,10 @@ async fn retired_gate_wrappers_still_run_the_graph() {
 
 #[tokio::test]
 async fn preconnected_startup_runs_the_graph() {
-    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(1, "a".into())],
-    )))]);
+    let input =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "a".into()),
+        ])))]);
     let collect = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: input.clone(),
@@ -7059,10 +7063,7 @@ async fn a_panic_inside_a_close_path_fails_the_chain_task() {
     let message = result.unwrap_err().to_string();
     // The panic escaped the event loop's catch_unwind (it fired in the close
     // path), so the join error surfaces as a chain task panic.
-    assert!(
-        message.contains("chain task panicked"),
-        "{message}"
-    );
+    assert!(message.contains("chain task panicked"), "{message}");
 }
 
 #[tokio::test]
@@ -7210,9 +7211,10 @@ fn source_hook(
 
 #[tokio::test]
 async fn non_barrier_envelopes_on_the_barrier_channel_are_ignored() {
-    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(1, "a".into())],
-    )))]);
+    let input =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "a".into()),
+        ])))]);
     let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(8);
     let graph = barrier_hooked_graph(input.clone(), barrier_rx.clone());
     let cancellation = CancellationToken::new();
@@ -7295,9 +7297,10 @@ impl crate::state::StateBackend for FailingSnapshotBackend {
 
 #[tokio::test]
 async fn source_barrier_snapshot_failure_reports_and_forwards_the_barrier() {
-    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(1, "a".into())],
-    )))]);
+    let input =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "a".into()),
+        ])))]);
     let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(8);
     let graph = barrier_hooked_graph(input.clone(), barrier_rx.clone());
     let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -7305,7 +7308,11 @@ async fn source_barrier_snapshot_failure_reports_and_forwards_the_barrier() {
     let runner = tokio::spawn(crate::executor::task::run_graph_with_hooks(
         graph,
         cancellation.clone(),
-        source_hook(barrier_rx, Some(Arc::new(FailingSnapshotBackend)), Some(failure_tx)),
+        source_hook(
+            barrier_rx,
+            Some(Arc::new(FailingSnapshotBackend)),
+            Some(failure_tx),
+        ),
     ));
     tokio::time::sleep(Duration::from_millis(20)).await;
     let _ = barrier_tx
@@ -7348,9 +7355,10 @@ async fn cancellation_during_barrier_drain_shuts_the_source_down() {
             Ok(())
         }
     }
-    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(1, "a".into())],
-    )))]);
+    let input =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "a".into()),
+        ])))]);
     let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(8);
     let collect = Arc::new(CollectOutput::default());
     let adapter = Adapter {
@@ -7688,7 +7696,10 @@ impl Input for TogglePartitionsInput {
     }
 }
 
-fn typed_batch(schema: Schema, columns: Vec<Arc<dyn datafusion::arrow::array::Array>>) -> MessageBatchRef {
+fn typed_batch(
+    schema: Schema,
+    columns: Vec<Arc<dyn datafusion::arrow::array::Array>>,
+) -> MessageBatchRef {
     Arc::new(MessageBatch::new_arrow(
         RecordBatch::try_new(Arc::new(schema), columns).unwrap(),
     ))
@@ -7696,9 +7707,10 @@ fn typed_batch(schema: Schema, columns: Vec<Arc<dyn datafusion::arrow::array::Ar
 
 #[tokio::test]
 async fn event_time_seed_failure_after_a_read_fails_the_chain() {
-    let input = TogglePartitionsInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(1, "a".into())],
-    )))]);
+    let input =
+        TogglePartitionsInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "a".into()),
+        ])))]);
     let collect = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: input.clone(),
@@ -7711,10 +7723,7 @@ async fn event_time_seed_failure_after_a_read_fails_the_chain() {
         .unwrap();
     let result = run_graph(graph, CancellationToken::new()).await;
     let message = result.unwrap_err().to_string();
-    assert!(
-        message.contains("partition discovery failed"),
-        "{message}"
-    );
+    assert!(message.contains("partition discovery failed"), "{message}");
 }
 
 #[tokio::test]
@@ -7738,7 +7747,10 @@ async fn event_time_seed_failure_during_the_idle_tick_fails_the_chain() {
         .expect("the tick seed failure must end the chain")
         .unwrap();
     assert!(
-        result.unwrap_err().to_string().contains("partition discovery failed"),
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("partition discovery failed"),
         "the tick's seed failure must fail the chain"
     );
 }
@@ -7788,19 +7800,15 @@ async fn malformed_partition_metadata_fails_the_event_time_source() {
                 false,
             ),
         ]),
-        vec![
-            Arc::new(Int64Array::from(vec![1i64])),
-            {
-                let offsets =
-                    datafusion::arrow::buffer::OffsetBuffer::new(vec![0i32, 1].into());
-                Arc::new(datafusion::arrow::array::ListArray::new(
-                    Arc::new(Field::new("item", DataType::Int64, true)),
-                    offsets,
-                    Arc::new(Int64Array::from(vec![1i64])),
-                    None,
-                ))
-            }
-        ],
+        vec![Arc::new(Int64Array::from(vec![1i64])), {
+            let offsets = datafusion::arrow::buffer::OffsetBuffer::new(vec![0i32, 1].into());
+            Arc::new(datafusion::arrow::array::ListArray::new(
+                Arc::new(Field::new("item", DataType::Int64, true)),
+                offsets,
+                Arc::new(Int64Array::from(vec![1i64])),
+                None,
+            ))
+        }],
     );
     let input = TogglePartitionsInput::with_fail_from(vec![batch], usize::MAX);
     input.finish();
@@ -7985,7 +7993,10 @@ async fn source_shutdown_tolerates_a_closed_downstream_channel() {
         .expect("the sink failure must unblock the graph")
         .unwrap();
     assert!(
-        result.unwrap_err().to_string().contains("sink write failed"),
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("sink write failed"),
         "the sink error surfaces while the source shutdown is tolerated"
     );
 }
@@ -8154,9 +8165,10 @@ async fn a_pooled_sink_failure_fails_the_running_chain() {
             Ok(())
         }
     }
-    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(1, "a".into())],
-    )))]);
+    let input =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "a".into()),
+        ])))]);
     let adapter = Adapter {
         input: input.clone(),
         output: Arc::new(FailingWriteOutput),
@@ -8178,7 +8190,10 @@ async fn a_pooled_sink_failure_fails_the_running_chain() {
     .await
     .expect("the pooled sink failure must fail the chain");
     assert!(
-        result.unwrap_err().to_string().contains("sink write failed"),
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("sink write failed"),
         "the worker pool must surface the sink failure"
     );
     assert!(
@@ -8348,12 +8363,14 @@ fn barrier_hook_for(task_id: &str) -> crate::executor::task::CheckpointHook {
 
 #[tokio::test]
 async fn buffered_eos_envelopes_complete_an_in_flight_barrier() {
-    let left = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(1, "left".into())],
-    )))]);
-    let right = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(2, "right".into())],
-    )))]);
+    let left =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "left".into()),
+        ])))]);
+    let right =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (2, "right".into()),
+        ])))]);
     let output = Arc::new(CollectOutput::default());
     let adapter = MultiInputAdapter {
         inputs: HashMap::from([
@@ -8372,7 +8389,10 @@ async fn buffered_eos_envelopes_complete_an_in_flight_barrier() {
     left_hook.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
     let hooks = BTreeMap::from([
         ("left-source-0".to_string(), left_hook),
-        ("right-source-0".to_string(), barrier_hook_for("right-source-0")),
+        (
+            "right-source-0".to_string(),
+            barrier_hook_for("right-source-0"),
+        ),
     ]);
     let cancellation = CancellationToken::new();
     let runner = tokio::spawn(crate::executor::task::run_graph_with_hooks(
@@ -8414,9 +8434,10 @@ async fn buffered_eos_envelopes_complete_an_in_flight_barrier() {
 
 #[tokio::test]
 async fn barrier_alignment_overflow_releases_the_buffered_data() {
-    let left = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(1, "left".into())],
-    )))]);
+    let left =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "left".into()),
+        ])))]);
     let right = ClosableParkingInput::with(vec![]);
     let output = Arc::new(CollectOutput::default());
     let adapter = MultiInputAdapter {
@@ -8440,7 +8461,10 @@ async fn barrier_alignment_overflow_releases_the_buffered_data() {
     let hooks = BTreeMap::from([
         ("left-source-0".to_string(), left_hook),
         ("merge-0".to_string(), merge_hook),
-        ("right-source-0".to_string(), barrier_hook_for("right-source-0")),
+        (
+            "right-source-0".to_string(),
+            barrier_hook_for("right-source-0"),
+        ),
     ]);
     let cancellation = CancellationToken::new();
     let runner = tokio::spawn(crate::executor::task::run_graph_with_hooks(
@@ -8487,14 +8511,18 @@ async fn barrier_alignment_overflow_releases_the_buffered_data() {
         .iter()
         .map(|batch| batch.num_rows())
         .sum::<usize>();
-    assert_eq!(rows, 1_031, "every buffered and later row must reach the sink");
+    assert_eq!(
+        rows, 1_031,
+        "every buffered and later row must reach the sink"
+    );
 }
 
 #[tokio::test]
 async fn interior_barrier_snapshot_failure_reports_and_forwards() {
-    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(
-        vec![(1, "a".into())],
-    )))]);
+    let input =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "a".into()),
+        ])))]);
     let output = Arc::new(CollectOutput::default());
     let adapter = Adapter {
         input: input.clone(),
@@ -8573,9 +8601,10 @@ async fn a_failing_temporary_close_fails_the_run_after_the_chains_exit() {
     }
     // A hand-built bounded source chain with no downstream: every chain
     // succeeds, so the temporary's close failure is the run's only error.
-    let input = ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(
-        int64_batch(vec![(1, "a".into())]),
-    ))]);
+    let input =
+        ClosableParkingInput::with(vec![Arc::new(MessageBatch::new_arrow(int64_batch(vec![
+            (1, "a".into()),
+        ])))]);
     input.finish();
     let mut chain = crate::executor::graph::Chain::for_pool_test(1, vec![]);
     chain.task_ids = vec!["source-0".into()];

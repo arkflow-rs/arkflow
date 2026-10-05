@@ -132,7 +132,10 @@ fn exclusions_always_carry_a_reason() {
     for (name, _, validate, reason) in manifest_entries() {
         if validate == Some(false) {
             assert!(
-                reason.as_deref().map(|r| !r.trim().is_empty()).unwrap_or(false),
+                reason
+                    .as_deref()
+                    .map(|r| !r.trim().is_empty())
+                    .unwrap_or(false),
                 "example {name} sets \"validate\": false but its manifest entry has no reason"
             );
         }

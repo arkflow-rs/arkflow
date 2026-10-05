@@ -157,21 +157,13 @@ impl KafkaSecurityConfig {
                     "Kafka security: a sasl_* protocol requires a security.sasl block".to_string(),
                 )
             })?;
-            if sasl
-                .username
-                .as_deref()
-                .is_none_or(|v| v.trim().is_empty())
-            {
+            if sasl.username.as_deref().is_none_or(|v| v.trim().is_empty()) {
                 return Err(Error::Config(format!(
                     "Kafka security: sasl mechanism {} requires a non-empty security.sasl.username",
                     sasl.mechanism.as_librdkafka_value()
                 )));
             }
-            if sasl
-                .password
-                .as_deref()
-                .is_none_or(|v| v.trim().is_empty())
-            {
+            if sasl.password.as_deref().is_none_or(|v| v.trim().is_empty()) {
                 return Err(Error::Config(format!(
                     "Kafka security: sasl mechanism {} requires a non-empty security.sasl.password",
                     sasl.mechanism.as_librdkafka_value()
@@ -375,7 +367,10 @@ mod tests {
         let (_, client_config) = applied(serde_json::json!({
             "sasl": {"mechanism": "scram-sha-256", "username": "u", "password": "p"}
         }));
-        assert_eq!(client_config.get("security.protocol"), Some("sasl_plaintext"));
+        assert_eq!(
+            client_config.get("security.protocol"),
+            Some("sasl_plaintext")
+        );
         assert_eq!(client_config.get("sasl.mechanisms"), Some("SCRAM-SHA-256"));
         assert_eq!(client_config.get("sasl.username"), Some("u"));
         assert_eq!(client_config.get("sasl.password"), Some("p"));

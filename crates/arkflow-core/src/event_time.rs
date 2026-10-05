@@ -634,11 +634,9 @@ mod tests {
             .expect("observed partition has progress");
         assert_eq!(progress.watermark_ms, 4_900);
         assert!(!progress.idle);
-        assert!(
-            tracker
-                .partition_progress_for(&EventTimePartition::new(Some("topic-b".into()), 0))
-                .is_none()
-        );
+        assert!(tracker
+            .partition_progress_for(&EventTimePartition::new(Some("topic-b".into()), 0))
+            .is_none());
     }
 
     #[test]
@@ -752,7 +750,10 @@ mod tests {
         let null_first = batch_of(
             "ts",
             DataType::Timestamp(TimeUnit::Millisecond, None),
-            StdArc::new(TimestampMillisecondArray::from(vec![Option::<i64>::None, Some(9)])),
+            StdArc::new(TimestampMillisecondArray::from(vec![
+                Option::<i64>::None,
+                Some(9),
+            ])),
         );
         let error = extractor.extract_timestamp_ms(&null_first).unwrap_err();
         assert!(error.to_string().contains("no value"), "{error}");

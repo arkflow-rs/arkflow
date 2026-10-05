@@ -298,11 +298,8 @@ pub fn validate_config(config: &EngineConfig) -> ConfigValidationReport {
             )?;
             let resource = adapter.build_resource()?;
             let plan = crate::job::JobPlan::compile(spec)?;
-            crate::executor::graph::ExecutionGraphBuilder::default().build(
-                &plan,
-                &adapter,
-                &resource,
-            )?;
+            crate::executor::graph::ExecutionGraphBuilder::default()
+                .build(&plan, &adapter, &resource)?;
             Ok(())
         })() {
             errors.push(ConfigIssue {
@@ -386,8 +383,7 @@ fn redact_url_password(text: &str) -> Option<String> {
         // Empty password segment: nothing to redact.
         return None;
     }
-    let mut redacted =
-        String::with_capacity(text.len() + 4);
+    let mut redacted = String::with_capacity(text.len() + 4);
     redacted.push_str(scheme);
     redacted.push_str("://");
     redacted.push_str(&authority[..colon]);
@@ -440,8 +436,7 @@ mod tests {
         let version = store.save(&candidate).unwrap();
         let stored = store.load(&version.id).unwrap();
         assert_eq!(
-            stored.content,
-            "health_check:\n  api_token: ${secret:db_pass}\n",
+            stored.content, "health_check:\n  api_token: ${secret:db_pass}\n",
             "the verbatim reference must be persisted, not the resolved plaintext"
         );
 
@@ -470,11 +465,17 @@ mod tests {
             &"a".repeat(129),
         ] {
             let err = store.load(bad).unwrap_err().to_string();
-            assert!(err.contains("unknown configuration version"), "{bad}: {err}");
+            assert!(
+                err.contains("unknown configuration version"),
+                "{bad}: {err}"
+            );
         }
         // A well-shaped id simply reports not found via the same class.
         let err = store.load("1737500000000-0").unwrap_err().to_string();
-        assert!(err.contains("unknown configuration version") || err.contains("No such file"), "{err}");
+        assert!(
+            err.contains("unknown configuration version") || err.contains("No such file"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -494,23 +495,30 @@ mod tests {
             "postgres://admin:******@db.internal:5432/vectors"
         );
         assert_eq!(redacted["plain_url"], "http://qdrant.internal:6333");
-        assert_eq!(redacted["user_only_url"], "postgres://admin@db.internal/vectors");
-        assert_eq!(redacted["nested"]["url"], "mysql://root:******@localhost/app");
+        assert_eq!(
+            redacted["user_only_url"],
+            "postgres://admin@db.internal/vectors"
+        );
+        assert_eq!(
+            redacted["nested"]["url"],
+            "mysql://root:******@localhost/app"
+        );
         assert_eq!(redacted["name"], "not a url");
     }
-
 
     #[test]
     fn candidate_parses_json_and_reports_syntax_errors() {
         let valid = ConfigCandidate {
             format: ConfigFormat::Json,
-            content: r#"{"streams":[]}"#.to_string(), content_verbatim: None,
+            content: r#"{"streams":[]}"#.to_string(),
+            content_verbatim: None,
         };
         assert!(valid.parse().is_ok());
 
         let invalid = ConfigCandidate {
             format: ConfigFormat::Json,
-            content: "not-json".to_string(), content_verbatim: None,
+            content: "not-json".to_string(),
+            content_verbatim: None,
         };
         assert!(invalid
             .parse()
@@ -540,8 +548,8 @@ mod tests {
         std::env::set_var("ARKFLOW_CP_TEST_TOKEN", "from-env");
         let candidate = ConfigCandidate {
             format: ConfigFormat::Yaml,
-            content: "health_check:\n  api_token: \"${env:ARKFLOW_CP_TEST_TOKEN}\"\n"
-                .to_string(), content_verbatim: None,
+            content: "health_check:\n  api_token: \"${env:ARKFLOW_CP_TEST_TOKEN}\"\n".to_string(),
+            content_verbatim: None,
         };
         let config = candidate.parse().unwrap();
         std::env::remove_var("ARKFLOW_CP_TEST_TOKEN");
@@ -553,8 +561,8 @@ mod tests {
         std::env::remove_var("ARKFLOW_CP_TEST_UNSET");
         let candidate = ConfigCandidate {
             format: ConfigFormat::Yaml,
-            content: "health_check:\n  api_token: \"${env:ARKFLOW_CP_TEST_UNSET}\"\n"
-                .to_string(), content_verbatim: None,
+            content: "health_check:\n  api_token: \"${env:ARKFLOW_CP_TEST_UNSET}\"\n".to_string(),
+            content_verbatim: None,
         };
         let issue = candidate.parse().unwrap_err();
         assert!(
@@ -562,15 +570,18 @@ mod tests {
             "{}",
             issue.message
         );
-        assert!(issue.message.contains("health_check.api_token"), "{}", issue.message);
+        assert!(
+            issue.message.contains("health_check.api_token"),
+            "{}",
+            issue.message
+        );
     }
 
     #[test]
     fn parse_without_references_keeps_line_numbers() {
         let candidate = ConfigCandidate {
             format: ConfigFormat::Yaml,
-            content: "logging:\n  level: debug\nhealth_check:\n  api_token: [1, 2]\n"
-                .to_string(),
+            content: "logging:\n  level: debug\nhealth_check:\n  api_token: [1, 2]\n".to_string(),
             content_verbatim: None,
         };
         let issue = candidate.parse().unwrap_err();
@@ -587,7 +598,8 @@ mod tests {
         let store = ConfigVersionStore::new(&root);
         let candidate = ConfigCandidate {
             format: ConfigFormat::Json,
-            content: r#"{"streams":[]}"#.to_string(), content_verbatim: None,
+            content: r#"{"streams":[]}"#.to_string(),
+            content_verbatim: None,
         };
         let version = store.save(&candidate).unwrap();
         assert_eq!(store.list().unwrap().len(), 1);

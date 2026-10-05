@@ -206,12 +206,9 @@ fn docker_available() -> bool {
     // The default socket plus the paths Docker Desktop, Colima, Rancher, and
     // podman publish. A probe that only knew /var/run/docker.sock reported a
     // running daemon as absent and silently skipped every case.
-    [
-        "/var/run/docker.sock",
-        "/run/docker.sock",
-    ]
-    .iter()
-    .any(|path| std::path::Path::new(path).exists())
+    ["/var/run/docker.sock", "/run/docker.sock"]
+        .iter()
+        .any(|path| std::path::Path::new(path).exists())
         || std::env::var_os("HOME").is_some_and(|home| {
             let home = std::path::PathBuf::from(home);
             [
@@ -300,7 +297,6 @@ async fn wait_for_broker(brokers: &str) {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
-
 
 fn l3_suffix() -> u32 {
     std::process::id()
@@ -477,11 +473,19 @@ async fn l3_transactional_offset_commit_advances_the_group() {
     let (batch, ack) = input.read().await.expect("l3 read");
 
     // The batch carries Kafka source metadata (partition + offset).
-    let out = build_output_with_group(&sink_topic, true, Some(&format!("l3-txn-{}", l3_suffix())), Some(&group)).await;
+    let out = build_output_with_group(
+        &sink_topic,
+        true,
+        Some(&format!("l3-txn-{}", l3_suffix())),
+        Some(&group),
+    )
+    .await;
     out.write_batch(std::slice::from_ref(&batch))
         .await
         .expect("l3 write_batch commits source offsets in the transaction");
-    ack.ack().await.expect("ack completes (frontier only, no local store)");
+    ack.ack()
+        .await
+        .expect("ack completes (frontier only, no local store)");
 
     // The group's committed position advanced inside the transaction: a
     // fresh consumer with the same group sees no re-delivery.

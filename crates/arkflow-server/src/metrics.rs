@@ -335,14 +335,10 @@ mod tests {
         // Format 0.0.4 sample lines: name{labels} value. Label order follows
         // the vocabulary insertion order: extra labels, then job, then chain.
         assert!(
-            text.contains(
-                "arkflow_job_chain_batches_in_total{job=\"orders-job\",chain=\"src\"} 7"
-            ),
+            text.contains("arkflow_job_chain_batches_in_total{job=\"orders-job\",chain=\"src\"} 7"),
             "unexpected exposition:\n{text}"
         );
-        assert!(text.contains(
-            "arkflow_job_chain_errors_total{job=\"orders-job\",chain=\"sql\"} 3"
-        ));
+        assert!(text.contains("arkflow_job_chain_errors_total{job=\"orders-job\",chain=\"sql\"} 3"));
         assert!(text.contains("arkflow_job_watermark_lag_ms{job=\"orders-job\"} 250"));
         assert!(text.contains("arkflow_job_checkpoint_duration_ms{job=\"orders-job\"} 120"));
         // Only the closed vocabulary appears as label names.

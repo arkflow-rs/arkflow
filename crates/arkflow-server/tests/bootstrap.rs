@@ -37,15 +37,20 @@ async fn migrate_rejects_each_malformed_invocation() {
         .unwrap();
     assert_eq!(code, 2);
     // --from without the sqlite: prefix.
-    let code = bootstrap::run_migrate(&args(&["--from", "a.db", "--to", "postgres://x"]), &mut sink)
-        .await
-        .unwrap();
+    let code = bootstrap::run_migrate(
+        &args(&["--from", "a.db", "--to", "postgres://x"]),
+        &mut sink,
+    )
+    .await
+    .unwrap();
     assert_eq!(code, 2);
     // --to without a postgres scheme.
-    let code =
-        bootstrap::run_migrate(&args(&["--from", "sqlite:a.db", "--to", "mysql://x"]), &mut sink)
-            .await
-            .unwrap();
+    let code = bootstrap::run_migrate(
+        &args(&["--from", "sqlite:a.db", "--to", "mysql://x"]),
+        &mut sink,
+    )
+    .await
+    .unwrap();
     assert_eq!(code, 2);
     // A value with no pending flag is dropped, leaving --to missing.
     let code = bootstrap::run_migrate(&args(&["--from", "sqlite:a.db", "stray"]), &mut sink)
@@ -61,7 +66,12 @@ async fn migrate_reports_a_missing_source_database_loudly() {
     let mut messages = Vec::new();
     let mut sink = |message: String| messages.push(message);
     let result = bootstrap::run_migrate(
-        &args(&["--from", "sqlite:/nonexistent/arkflow/none.db", "--to", "postgres://127.0.0.1:1/db"]),
+        &args(&[
+            "--from",
+            "sqlite:/nonexistent/arkflow/none.db",
+            "--to",
+            "postgres://127.0.0.1:1/db",
+        ]),
         &mut sink,
     )
     .await;
@@ -81,11 +91,9 @@ async fn migrate_end_to_end_against_live_postgres_when_available() {
     // Seed a sqlite source with one job through the contract store.
     let dir = tempfile::tempdir().unwrap();
     let sqlite_path = dir.path().join("migrate.db");
-    let store = arkflow_server::storage::ControlPlaneStore::open(
-        sqlite_path.to_str().unwrap(),
-    )
-    .await
-    .unwrap();
+    let store = arkflow_server::storage::ControlPlaneStore::open(sqlite_path.to_str().unwrap())
+        .await
+        .unwrap();
     arkflow_server::storage::StorageBackend::upsert_job(
         &store,
         arkflow_server::storage::JobRecord {
@@ -123,7 +131,12 @@ async fn migrate_end_to_end_against_live_postgres_when_available() {
         }
     }
     let code = bootstrap::run_migrate(
-        &args(&["--from", &format!("sqlite:{}", sqlite_path.display()), "--to", &target]),
+        &args(&[
+            "--from",
+            &format!("sqlite:{}", sqlite_path.display()),
+            "--to",
+            &target,
+        ]),
         &mut sink,
     )
     .await

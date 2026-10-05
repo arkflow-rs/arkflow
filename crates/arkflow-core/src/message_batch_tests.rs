@@ -217,8 +217,16 @@ mod tests {
 fn filter_columns_preserves_input_name() {
     let batch = {
         let schema = std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-            datafusion::arrow::datatypes::Field::new("keep", datafusion::arrow::datatypes::DataType::Int64, false),
-            datafusion::arrow::datatypes::Field::new("drop", datafusion::arrow::datatypes::DataType::Int64, false),
+            datafusion::arrow::datatypes::Field::new(
+                "keep",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+            datafusion::arrow::datatypes::Field::new(
+                "drop",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
         ]));
         let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
             schema,
@@ -245,11 +253,17 @@ fn filter_columns_preserves_input_name() {
 fn new_binary_with_origin_preserves_input_name() {
     let batch = {
         let schema = std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-            datafusion::arrow::datatypes::Field::new("v", datafusion::arrow::datatypes::DataType::Int64, false),
+            datafusion::arrow::datatypes::Field::new(
+                "v",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
         ]));
         let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
             schema,
-            vec![std::sync::Arc::new(datafusion::arrow::array::Int64Array::from(vec![1]))],
+            vec![std::sync::Arc::new(
+                datafusion::arrow::array::Int64Array::from(vec![1]),
+            )],
         )
         .unwrap();
         let mut mb = crate::MessageBatch::new_arrow(rb);

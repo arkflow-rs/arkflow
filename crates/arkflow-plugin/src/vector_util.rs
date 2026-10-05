@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arkflow_core::{Error, MessageBatch, MessageBatchRef};
-use datafusion::arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, StringArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, StringArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use reqwest::Client;
@@ -39,11 +41,7 @@ pub(crate) fn extract_vectors(
         .iter()
         .position(|f| f.name() == field)
         .map(|index| batch.column(index))
-        .ok_or_else(|| {
-            Error::Process(format!(
-                "{component}: input column '{field}' not found"
-            ))
-        })?;
+        .ok_or_else(|| Error::Process(format!("{component}: input column '{field}' not found")))?;
     let rows = column.len();
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(rows);
     match column.data_type() {
@@ -156,9 +154,8 @@ pub(crate) fn append_column(
         .collect();
     columns.push(Arc::new(StringArray::from(values.to_vec())));
 
-    let record_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(
-        |e| Error::Process(format!("{component}: batch rebuild failed: {e}")),
-    )?;
+    let record_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| Error::Process(format!("{component}: batch rebuild failed: {e}")))?;
     Ok(MessageBatch::new_arrow(record_batch))
 }
 
@@ -231,9 +228,8 @@ pub(crate) mod test_support {
                     let tracker_in_flight = tracker_in_flight.clone();
                     let tracker_max = tracker_max.clone();
                     std::thread::spawn(move || {
-                        let now = tracker_in_flight
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                            + 1;
+                        let now =
+                            tracker_in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         tracker_max.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
 
                         let mut buffer = Vec::new();
@@ -262,7 +258,10 @@ pub(crate) mod test_support {
                             let _ = stream.read_exact(&mut body_bytes);
                         }
                         let body = String::from_utf8_lossy(&body_bytes).to_string();
-                        request_log.lock().unwrap().push((head.clone(), body.clone()));
+                        request_log
+                            .lock()
+                            .unwrap()
+                            .push((head.clone(), body.clone()));
 
                         let (status, response_body) = handler(&body);
                         // Decrement before the response is written: with

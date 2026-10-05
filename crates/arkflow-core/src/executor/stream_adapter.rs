@@ -1162,7 +1162,10 @@ mod tests {
             .build_resource()
             .err()
             .expect("unknown temporary type must fail the dry run");
-        assert!(error.to_string().contains("Unknown temporary type"), "{error}");
+        assert!(
+            error.to_string().contains("Unknown temporary type"),
+            "{error}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1290,7 +1293,10 @@ mod tests {
             .build_processor(&operator, &resource)
             .err()
             .expect("unknown processor type must fail the build");
-        assert!(error.to_string().contains("Unknown processor type"), "{error}");
+        assert!(
+            error.to_string().contains("Unknown processor type"),
+            "{error}"
+        );
 
         // A payload stripped down to JSON null hands plugins `{}` rather than
         // a null config object.

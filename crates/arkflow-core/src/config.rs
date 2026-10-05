@@ -240,7 +240,8 @@ impl HealthCheckConfig {
 
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EngineConfig {    /// Streams configuration
+pub struct EngineConfig {
+    /// Streams configuration
     #[serde(default)]
     pub streams: Vec<StreamConfig>,
     /// Local Jobs declared directly in config (executed by the unified
@@ -331,8 +332,9 @@ fn parse_engine_config(content: &str, format: ConfigFormat) -> Result<EngineConf
             .map_err(|e| Error::Config(format!("YAML parsing error: {}", e))),
         ConfigFormat::JSON => serde_json::from_str(content)
             .map_err(|e| Error::Config(format!("JSON parsing error: {}", e))),
-        ConfigFormat::TOML => toml::from_str(content)
-            .map_err(|e| Error::Config(format!("TOML parsing error: {}", e))),
+        ConfigFormat::TOML => {
+            toml::from_str(content).map_err(|e| Error::Config(format!("TOML parsing error: {}", e)))
+        }
     }
 }
 
@@ -588,7 +590,10 @@ mod tests {
     #[test]
     fn test_hub_url_sentinel_is_not_serialized() {
         let serialized = serde_json::to_string(&HealthCheckConfig::default()).unwrap();
-        assert!(!serialized.contains("hub_url\""), "serialized = {serialized}");
+        assert!(
+            !serialized.contains("hub_url\""),
+            "serialized = {serialized}"
+        );
     }
 
     #[test]
@@ -661,9 +666,12 @@ mod tests {
         assert!(health.observability.enabled);
         assert_eq!(health.observability.address, "127.0.0.1:8081");
 
-        let health: HealthCheckConfig =
-            serde_json::from_str(json!({"observability": {"enabled": false}}).to_string().as_str())
-                .unwrap();
+        let health: HealthCheckConfig = serde_json::from_str(
+            json!({"observability": {"enabled": false}})
+                .to_string()
+                .as_str(),
+        )
+        .unwrap();
         assert!(!health.observability.enabled);
     }
 

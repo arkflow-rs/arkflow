@@ -542,6 +542,26 @@ Legacy Stream `join` buffers (including window buffers with a legacy `join`
 field) still fail compilation, with guidance pointing at the Job DAG join
 operator.
 
+## Operational limits
+
+A single Hub supports a fleet of up to **256 agents** (`MAX_NODES`): node
+registration beyond the cap is rejected rather than silently degraded, so an
+over-capacity fleet fails visibly at join time. Sizing deployments beyond 256
+nodes per Hub is untested — reach out to maintainers before planning larger
+fleets (splitting fleets across multiple Hubs with agent multi-Hub discovery
+is one path).
+
+The ceiling is backed by measured evidence from the production-readiness
+harness (in-memory store, single host):
+
+- **Scale staircase 25 → 64 → 128 → 256 nodes at full fleet:** command round
+  p99 stays flat at 1044–1051 ms regardless of fleet size (no knee observed);
+  Hub process RSS at 256 connected nodes: ~441 MB.
+- **One-hour soak (64 nodes, 30 s session TTL, 10 Hub restarts, full-fleet
+  rebirth):** 2859 command rounds, round p99 1055 → 1193 ms (+13%, no drift),
+  RSS growth 38.5 KB/s (below the 50 KB/s gate), and all bounded history
+  tables converged to their retention bounds.
+
 ## API examples
 
 ```http

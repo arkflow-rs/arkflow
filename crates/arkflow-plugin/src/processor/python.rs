@@ -101,11 +101,10 @@ impl Processor for PythonProcessor {
         // The permit lives inside the blocking closure: an async timeout
         // abandons the task but the stuck call keeps holding its permit,
         // so new calls queue here instead of piling more threads.
-        let permit = INFLIGHT_UDFS
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| Error::Process(format!("python UDF in-flight semaphore closed: {e}")))?;
+        let permit =
+            INFLIGHT_UDFS.clone().acquire_owned().await.map_err(|e| {
+                Error::Process(format!("python UDF in-flight semaphore closed: {e}"))
+            })?;
         let handle = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             call_udf(func_to_call, batch)

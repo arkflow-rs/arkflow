@@ -2453,9 +2453,7 @@ async fn register(
                 .await
                 .map_err(|error| RegisterFailure::Transport(error.to_string()))?;
             if problem["code"] == "hub_standby" {
-                let leader_url = problem["details"]["leader_url"]
-                    .as_str()
-                    .map(str::to_owned);
+                let leader_url = problem["details"]["leader_url"].as_str().map(str::to_owned);
                 return Err(RegisterFailure::Standby { leader_url });
             }
         }
@@ -5134,14 +5132,17 @@ mod tests {
             })
             .collect();
         let repository = write_full_artifact(&plan, &uri, "cp-restore", |task_id| {
-            namespaces.get(task_id).map(|namespace| {
-                vec![arkflow_core::state::StateEntry {
-                    namespace: namespace.clone(),
-                    key: format!("utf8:{task_id}").into_bytes(),
-                    value: b"owned".to_vec(),
-                    expires_at_ms: None,
-                }]
-            }).unwrap_or_default()
+            namespaces
+                .get(task_id)
+                .map(|namespace| {
+                    vec![arkflow_core::state::StateEntry {
+                        namespace: namespace.clone(),
+                        key: format!("utf8:{task_id}").into_bytes(),
+                        value: b"owned".to_vec(),
+                        expires_at_ms: None,
+                    }]
+                })
+                .unwrap_or_default()
         });
         let manifest = repository
             .read_manifest(&recovery_artifact(&plan, "cp-restore", false).unwrap())
@@ -5156,11 +5157,20 @@ mod tests {
         // Every assigned snapshot's entries land in the backend.
         let backend = RedbStateBackend::open(unique_state_dir("restore-all"), 1).unwrap();
         let state: Arc<dyn StateBackend> = Arc::new(backend);
-        restore_recovery_state(&plan, &repository, &manifest, &all_assignments, &state, false)
-            .unwrap();
+        restore_recovery_state(
+            &plan,
+            &repository,
+            &manifest,
+            &all_assignments,
+            &state,
+            false,
+        )
+        .unwrap();
         for (task_id, namespace) in &namespaces {
             assert_eq!(
-                state.get(namespace, format!("utf8:{task_id}").as_bytes()).unwrap(),
+                state
+                    .get(namespace, format!("utf8:{task_id}").as_bytes())
+                    .unwrap(),
                 Some(b"owned".to_vec()),
                 "{task_id} entries must restore"
             );
@@ -5169,35 +5179,41 @@ mod tests {
         // A single assigned snapshot restores without merging.
         let backend = RedbStateBackend::open(unique_state_dir("restore-one"), 1).unwrap();
         let state: Arc<dyn StateBackend> = Arc::new(backend);
-        restore_recovery_state(&plan, &repository, &manifest, &source_only, &state, false)
-            .unwrap();
+        restore_recovery_state(&plan, &repository, &manifest, &source_only, &state, false).unwrap();
         assert_eq!(
             state
                 .get(&namespaces["source-0"], b"utf8:source-0")
                 .unwrap(),
             Some(b"owned".to_vec())
         );
-        assert_eq!(state.get(&namespaces["sink-0"], b"utf8:sink-0").unwrap(), None);
+        assert_eq!(
+            state.get(&namespaces["sink-0"], b"utf8:sink-0").unwrap(),
+            None
+        );
 
         // No assigned snapshots: a successful no-op.
         let backend = RedbStateBackend::open(unique_state_dir("restore-none"), 1).unwrap();
         let state: Arc<dyn StateBackend> = Arc::new(backend);
         restore_recovery_state(&plan, &repository, &manifest, &[], &state, false).unwrap();
-        assert_eq!(state.get(&namespaces["source-0"], b"utf8:source-0").unwrap(), None);
+        assert_eq!(
+            state
+                .get(&namespaces["source-0"], b"utf8:source-0")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
     fn recovery_record_validity_guards_every_rejection() {
         let store = tempfile::tempdir().unwrap();
         let uri = format!("file://{}", store.path().display());
-        let spec_value =
-            source_sink_spec_value(
-                "record-valid",
-                "generate",
-                serde_json::json!({"context": "x", "interval": "10ms"}),
-                processing_time(),
-                Some(uri.clone()),
-            );
+        let spec_value = source_sink_spec_value(
+            "record-valid",
+            "generate",
+            serde_json::json!({"context": "x", "interval": "10ms"}),
+            processing_time(),
+            Some(uri.clone()),
+        );
         let plan = JobPlan::compile(serde_json::from_value(spec_value.clone()).unwrap()).unwrap();
         let namespace = arkflow_core::job::effective_state_namespace(
             &plan.spec.id,
@@ -5246,7 +5262,10 @@ mod tests {
         let mut broken = spec_value.clone();
         broken["resources"] = serde_json::json!({"cpu_millicores": 0});
         let broken: arkflow_core::job::JobSpec = serde_json::from_value(broken).unwrap();
-        assert!(!recovery_record_is_valid(&broken, &record("cp-rec", "checkpoint")));
+        assert!(!recovery_record_is_valid(
+            &broken,
+            &record("cp-rec", "checkpoint")
+        ));
 
         // A spec without a checkpoint store cannot be validated either.
         let stateless: arkflow_core::job::JobSpec = serde_json::from_value(source_sink_spec_value(
@@ -5257,7 +5276,10 @@ mod tests {
             None,
         ))
         .unwrap();
-        assert!(!recovery_record_is_valid(&stateless, &record("cp-rec", "checkpoint")));
+        assert!(!recovery_record_is_valid(
+            &stateless,
+            &record("cp-rec", "checkpoint")
+        ));
 
         // A manifest stored under one checkpoint id but describing another
         // fails the identity check.
@@ -5317,15 +5339,13 @@ mod tests {
         let mut rescale = spec_value.clone();
         rescale["rescale"] = serde_json::json!(true);
         let rescale: arkflow_core::job::JobSpec = serde_json::from_value(rescale).unwrap();
-        let repository =
-            CheckpointRepository::new(SharedCheckpointStore::from_uri(&uri).unwrap());
+        let repository = CheckpointRepository::new(SharedCheckpointStore::from_uri(&uri).unwrap());
         let empty_snapshot = arkflow_core::state::StateSnapshot::new(1, Vec::new());
         let mut empty_reference = repository
             .write_state_snapshot("cp-empty", &empty_snapshot)
             .unwrap();
         empty_reference.task_id = "source-0".into();
-        let mut empty_attempts =
-            plan_manifest(&plan, "cp-empty", vec![empty_reference]);
+        let mut empty_attempts = plan_manifest(&plan, "cp-empty", vec![empty_reference]);
         empty_attempts.task_attempts.clear();
         empty_attempts.seal();
         put_manifest_direct(
@@ -5433,12 +5453,13 @@ mod tests {
     #[tokio::test]
     async fn metrics_count_ephemeral_and_recovery_required_jobs() {
         let runtime = JobRuntime::default();
-        for (job_id, ephemeral, recovery) in
-            [("job-eph", true, false), ("job-rec", false, true), ("job-plain", false, false)]
-        {
+        for (job_id, ephemeral, recovery) in [
+            ("job-eph", true, false),
+            ("job-rec", false, true),
+            ("job-plain", false, false),
+        ] {
             let state: Arc<dyn StateBackend> = Arc::new(
-                arkflow_core::state::InMemoryStateBackend::new(1)
-                    .expect("in-memory test backend"),
+                arkflow_core::state::InMemoryStateBackend::new(1).expect("in-memory test backend"),
             );
             runtime.tasks.lock().await.insert(
                 job_id.into(),
@@ -5453,9 +5474,7 @@ mod tests {
                     state,
                     checkpoint_store_uri: None,
                     kernel: None,
-                    handle: tokio::spawn(std::future::pending::<
-                        Result<(), arkflow_core::Error>,
-                    >()),
+                    handle: tokio::spawn(std::future::pending::<Result<(), arkflow_core::Error>>()),
                 },
             );
         }
@@ -5891,7 +5910,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, "checkpoint generation does not match running Job");
         let error = runtime
-            .aggregate_checkpoint("orders-checkpoint", "cp-1", 9, false, &node_a, &planned_task_ids)
+            .aggregate_checkpoint(
+                "orders-checkpoint",
+                "cp-1",
+                9,
+                false,
+                &node_a,
+                &planned_task_ids,
+            )
             .await
             .unwrap_err();
         assert_eq!(error, "checkpoint generation does not match running Job");
@@ -6246,7 +6272,10 @@ mod tests {
         )
         .await
         .expect("the failing reconnect must not hang");
-        assert!(result.is_err(), "a dead websocket endpoint must fail recovery");
+        assert!(
+            result.is_err(),
+            "a dead websocket endpoint must fail recovery"
+        );
         assert!(runtime.tasks.lock().await.is_empty());
     }
 
@@ -6461,15 +6490,7 @@ mod tests {
             recovery_required: false,
         };
         runtime
-            .start(
-                plan,
-                assignments,
-                1,
-                None,
-                false,
-                "node-a",
-                &split,
-            )
+            .start(plan, assignments, 1, None, false, "node-a", &split)
             .await
             .expect("the colocated split start succeeds");
         assert!(runtime.tasks.lock().await.contains_key("orders-remotectx"));
@@ -6673,7 +6694,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.state, HubOperationState::Succeeded);
-        let report = result.result.expect("the validation report rides the payload");
+        let report = result
+            .result
+            .expect("the validation report rides the payload");
         assert_eq!(report["valid"], serde_json::json!(true));
 
         let invalid = arkflow_core::configuration::ConfigCandidate {
@@ -6703,7 +6726,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.state, HubOperationState::Failed);
-        assert_eq!(result.error.as_deref(), Some("missing configuration payload"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("missing configuration payload")
+        );
 
         // Diff configuration between two stored versions.
         let changed = arkflow_core::configuration::ConfigCandidate {
@@ -6717,7 +6743,10 @@ mod tests {
             ),
             content_verbatim: None,
         };
-        let first = cp.version_store().save_with_parent(&candidate, None).unwrap();
+        let first = cp
+            .version_store()
+            .save_with_parent(&candidate, None)
+            .unwrap();
         let second = cp
             .version_store()
             .save_with_parent(&changed, Some(first.id.clone()))
@@ -6778,7 +6807,11 @@ mod tests {
             .unwrap();
         assert_eq!(result.state, HubOperationState::Failed);
         assert!(
-            result.error.as_deref().unwrap().contains("Unknown stream runtime"),
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Unknown stream runtime"),
             "{:?}",
             result.error
         );
@@ -6845,7 +6878,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.state, HubOperationState::Failed);
-        assert_eq!(result.error.as_deref(), Some("missing configuration payload"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("missing configuration payload")
+        );
 
         let command = test_command(
             "rollback_configuration",
@@ -6864,11 +6900,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.state, HubOperationState::Failed);
-        assert_eq!(result.error.as_deref(), Some("missing configuration version"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("missing configuration version")
+        );
 
         // Malformed Job payloads surface their own actionable errors.
         let cases = [
-            ("job_start", None::<serde_json::Value>, "missing Job plan payload"),
+            (
+                "job_start",
+                None::<serde_json::Value>,
+                "missing Job plan payload",
+            ),
             (
                 "job_start",
                 Some(serde_json::json!({})),
@@ -6885,7 +6928,11 @@ mod tests {
                 Some(serde_json::json!({})),
                 "missing checkpoint_id",
             ),
-            ("job_checkpoint_commit", None, "missing checkpoint aggregation payload"),
+            (
+                "job_checkpoint_commit",
+                None,
+                "missing checkpoint aggregation payload",
+            ),
         ];
         for (operation, payload, expected) in cases {
             let command = test_command(operation, "any-job", 1, payload, live_deadline);
@@ -6939,7 +6986,14 @@ mod tests {
         let command = test_command("restart", "orders-stream", 1, None, now_ms() - 1_000);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_command(&client, &cp, &config, &auth, &command, &JobRuntime::default()),
+            execute_command(
+                &client,
+                &cp,
+                &config,
+                &auth,
+                &command,
+                &JobRuntime::default(),
+            ),
         )
         .await
         .expect("delivery failure must not hang")
@@ -7148,8 +7202,12 @@ mod tests {
 
         // (1) port 0 + routable host: the node advertises a data address and
         // the network_shuffle capability at registration.
-        let (agent, cancel) =
-            run_agent(hub_url.clone(), "node-dp-a", Some(0), Some("127.0.0.1".into()));
+        let (agent, cancel) = run_agent(
+            hub_url.clone(),
+            "node-dp-a",
+            Some(0),
+            Some("127.0.0.1".into()),
+        );
         wait_for(Duration::from_secs(15), || {
             let hub = hub.clone();
             async move {
@@ -7258,8 +7316,16 @@ mod tests {
         // An already-cancelled agent exits before any registration attempt.
         let pre_cancelled = CancellationToken::new();
         pre_cancelled.cancel();
-        let outcome = run(empty_control_plane(), test_node_config("http://127.0.0.1:1"), pre_cancelled).await;
-        assert!(outcome.is_ok(), "a pre-cancelled agent exits Ok immediately");
+        let outcome = run(
+            empty_control_plane(),
+            test_node_config("http://127.0.0.1:1"),
+            pre_cancelled,
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "a pre-cancelled agent exits Ok immediately"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -7358,7 +7424,11 @@ mod tests {
             )
             .unwrap();
 
-        let planned = ["source-0".to_string(), "sink-0".to_string(), "extra-0".to_string()];
+        let planned = [
+            "source-0".to_string(),
+            "sink-0".to_string(),
+            "extra-0".to_string(),
+        ];
         let aggregated = runtime
             .aggregate_checkpoint(
                 "orders-plain",
@@ -7569,7 +7639,12 @@ mod tests {
         let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
             .await
             .unwrap();
-        assert_eq!(result.state, HubOperationState::Succeeded, "{:?}", result.error);
+        assert_eq!(
+            result.state,
+            HubOperationState::Succeeded,
+            "{:?}",
+            result.error
+        );
 
         // A checkpoint succeeds and reports its manifest URI.
         let command = test_command(
@@ -7582,11 +7657,19 @@ mod tests {
         let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
             .await
             .unwrap();
-        assert_eq!(result.state, HubOperationState::Succeeded, "{:?}", result.error);
+        assert_eq!(
+            result.state,
+            HubOperationState::Succeeded,
+            "{:?}",
+            result.error
+        );
         let manifest_uri = result
             .checkpoint_manifest_uri
             .expect("a successful checkpoint reports its manifest");
-        assert!(manifest_uri.contains("checkpoints/cp-cmds/"), "{manifest_uri}");
+        assert!(
+            manifest_uri.contains("checkpoints/cp-cmds/"),
+            "{manifest_uri}"
+        );
 
         // The aggregation commit merges the agent manifest.
         let command = test_command(
@@ -7603,7 +7686,12 @@ mod tests {
         let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
             .await
             .unwrap();
-        assert_eq!(result.state, HubOperationState::Succeeded, "{:?}", result.error);
+        assert_eq!(
+            result.state,
+            HubOperationState::Succeeded,
+            "{:?}",
+            result.error
+        );
         assert!(result.checkpoint_manifest_uri.is_some());
 
         // Malformed aggregation payloads settle as terminal failures.
@@ -7615,7 +7703,13 @@ mod tests {
                 "planned_task_ids": 7
             }),
         ] {
-            let command = test_command("job_checkpoint_commit", "orders-cmds", 1, Some(payload), live_deadline);
+            let command = test_command(
+                "job_checkpoint_commit",
+                "orders-cmds",
+                1,
+                Some(payload),
+                live_deadline,
+            );
             let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
                 .await
                 .unwrap();
@@ -7633,7 +7727,12 @@ mod tests {
         let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
             .await
             .unwrap();
-        assert_eq!(result.state, HubOperationState::Succeeded, "{:?}", result.error);
+        assert_eq!(
+            result.state,
+            HubOperationState::Succeeded,
+            "{:?}",
+            result.error
+        );
         let _ = runtime.take_finished().await;
         hub_cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
@@ -7776,9 +7875,7 @@ mod tests {
             loop {
                 let finished = runtime.take_finished().await;
                 collected.extend(finished);
-                let saw_crash = collected
-                    .iter()
-                    .any(|(job_id, _, _)| job_id == "crash-dp");
+                let saw_crash = collected.iter().any(|(job_id, _, _)| job_id == "crash-dp");
                 let saw_bounded = collected
                     .iter()
                     .any(|(job_id, _, _)| job_id == "bounded-dp");
@@ -7947,15 +8044,7 @@ mod tests {
             recovery_required: false,
         };
         runtime
-            .start(
-                plan,
-                assignments,
-                1,
-                None,
-                false,
-                "node-a",
-                &split,
-            )
+            .start(plan, assignments, 1, None, false, "node-a", &split)
             .await
             .expect("the split start with a full map succeeds");
         assert!(runtime.tasks.lock().await.contains_key("orders-ports"));
@@ -7973,15 +8062,7 @@ mod tests {
             recovery_required: false,
         };
         runtime
-            .start(
-                plan,
-                assignments,
-                1,
-                None,
-                false,
-                "node-a",
-                &split,
-            )
+            .start(plan, assignments, 1, None, false, "node-a", &split)
             .await
             .expect("the colocated start succeeds");
         assert!(runtime.tasks.lock().await.contains_key("orders-noports"));
@@ -8015,7 +8096,10 @@ mod tests {
             cancel,
         )
         .await;
-        assert!(outcome.is_ok(), "a pre-cancelled agent exits Ok: {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "a pre-cancelled agent exits Ok: {outcome:?}"
+        );
     }
 
     /// A session that loses its Hub mid-flight logs the reconnect and exits
@@ -8087,15 +8171,12 @@ mod tests {
         let app = axum::Router::new()
             .route(
                 "/api/v1/agent/commands",
-                axum::routing::get(|State(hub): State<std::sync::Arc<ScriptedHub>>| async move {
-                    let batch = hub
-                        .batches
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or_default();
-                    axum::Json(batch)
-                }),
+                axum::routing::get(
+                    |State(hub): State<std::sync::Arc<ScriptedHub>>| async move {
+                        let batch = hub.batches.lock().unwrap().pop_front().unwrap_or_default();
+                        axum::Json(batch)
+                    },
+                ),
             )
             .route(
                 "/api/v1/agent/commands/{id}/result",
@@ -8159,8 +8240,7 @@ mod tests {
         fail_heartbeats: std::sync::atomic::AtomicBool,
     }
 
-    async fn failover_leader_server()
-    -> (
+    async fn failover_leader_server() -> (
         String,
         std::sync::Arc<FailoverLeader>,
         CancellationToken,
@@ -8282,8 +8362,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn standby_503_fails_over_to_next_candidate() {
         let (leader_url, leader, leader_cancel, leader_task) = failover_leader_server().await;
-        let (standby_url, standby_hits, standby_cancel, standby_task) =
-            standby_server(None).await;
+        let (standby_url, standby_hits, standby_cancel, standby_task) = standby_server(None).await;
 
         let cancel = CancellationToken::new();
         let mut config = test_node_config(&standby_url);
@@ -8308,7 +8387,9 @@ mod tests {
             async move {
                 leader.reports.lock().unwrap().iter().any(|report| {
                     report["connected_hub"].as_str() == Some(leader_url.as_str())
-                        && report["metrics"]["hub_failovers"].as_f64().is_some_and(|count| count >= 1.0)
+                        && report["metrics"]["hub_failovers"]
+                            .as_f64()
+                            .is_some_and(|count| count >= 1.0)
                 })
             }
         })
@@ -8354,8 +8435,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reconnect_prefers_the_candidate_that_last_accepted_registration() {
         let (leader_url, leader, leader_cancel, leader_task) = failover_leader_server().await;
-        let (standby_url, standby_hits, standby_cancel, standby_task) =
-            standby_server(None).await;
+        let (standby_url, standby_hits, standby_cancel, standby_task) = standby_server(None).await;
 
         let cancel = CancellationToken::new();
         let mut config = test_node_config(&standby_url);
@@ -8799,13 +8879,7 @@ mod tests {
             )
             .await
             .expect("the shared-tracker event-time recovery start succeeds");
-        assert!(
-            runtime
-                .tasks
-                .lock()
-                .await
-                .contains_key("orders-shared-evt")
-        );
+        assert!(runtime.tasks.lock().await.contains_key("orders-shared-evt"));
         runtime.stop("orders-shared-evt", 1).await.unwrap();
         let _ = runtime.take_finished().await;
     }
@@ -8900,7 +8974,10 @@ mod tests {
             .unwrap();
             match outcome.state {
                 HubOperationState::TimedOut
-                    if outcome.error.as_deref().is_some_and(|e| e.contains("deadline")) =>
+                    if outcome
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("deadline")) =>
                 {
                     saw_deadline = true;
                     break;
