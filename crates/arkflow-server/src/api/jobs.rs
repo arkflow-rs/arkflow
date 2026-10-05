@@ -706,7 +706,7 @@ pub(super) async fn hub_job_upgrade_rollback(
                 StatusCode::CONFLICT,
                 "state_format_incompatible",
                 format!(
-                    "Job {job_id} cannot roll back to version {}: its state format is                      incompatible with the artifact the Job would restore",
+                    "Job {job_id} cannot roll back to version {}: its state format is incompatible with the artifact the Job would restore",
                     previous.version
                 ),
             );

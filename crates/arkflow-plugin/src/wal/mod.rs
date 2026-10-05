@@ -24,10 +24,13 @@ mod manifest;
 mod s3;
 mod segment;
 
+/// WAL backend registration is process-global, so `init()` is idempotent:
+/// the first successful call registers the builders and later calls
+/// short-circuit without touching the registries again. A failed
+/// registration is NOT cached — the next call re-runs it (see
+/// `init_latched`).
+static INIT: std::sync::Mutex<Option<()>> = std::sync::Mutex::new(None);
+
 pub fn init() -> Result<(), arkflow_core::Error> {
-    static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    match INIT.get_or_init(|| s3::register().map_err(|error| error.to_string())) {
-        Ok(()) => Ok(()),
-        Err(error) => Err(arkflow_core::Error::Config(error.clone())),
-    }
+    crate::init_latched(&INIT, s3::register)
 }

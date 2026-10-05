@@ -35,50 +35,21 @@ pub mod wal;
 use arkflow_core::Error;
 use std::sync::Mutex;
 
-/// Successful initialization is latched once per process; failures are not
-/// cached, so a later `initialize()` call retries the registration chain.
-static INITIALIZATION: Mutex<Option<()>> = Mutex::new(None);
-
-/// Per-kind success latches: the per-kind `init()` functions are insert-only
-/// (re-running one reports duplicate registration), so a retried chain must
-/// skip the kinds that already succeeded and resume at the first failure.
-/// The latches live here rather than inside each kind's `init()` so the
-/// retry policy stays in one place.
-static INPUT_DONE: Mutex<Option<()>> = Mutex::new(None);
-static OUTPUT_DONE: Mutex<Option<()>> = Mutex::new(None);
-static PROCESSOR_DONE: Mutex<Option<()>> = Mutex::new(None);
-static BUFFER_DONE: Mutex<Option<()>> = Mutex::new(None);
-static TEMPORARY_DONE: Mutex<Option<()>> = Mutex::new(None);
-static CODEC_DONE: Mutex<Option<()>> = Mutex::new(None);
-static WAL_DONE: Mutex<Option<()>> = Mutex::new(None);
-
-/// Register the built-in component catalogue once per process.
+/// Run one registration step under a success-only latch.
 ///
-/// Both the local Engine and the standalone Hub expose this metadata to
-/// operators, so their startup paths must share one idempotent initializer.
-/// A failed registration run is retried on the next call rather than cached:
-/// kinds that already registered are skipped, so the retry resumes where
-/// the failure happened instead of tripping over duplicate registrations.
-pub fn initialize() -> Result<(), Error> {
-    let mut guard = INITIALIZATION
-        .lock()
-        .map_err(|_| Error::Config("plugin initialization lock poisoned".to_string()))?;
-    if guard.is_some() {
-        return Ok(());
-    }
-    let outcome = register_components();
-    if outcome.is_ok() {
-        *guard = Some(());
-    }
-    outcome
-}
-
-/// Run one registration step under its success latch: an already-registered
-/// kind short-circuits, a failure stays unlatched (retryable), a success is
-/// latched exactly once.
-fn init_step(
+/// Component registration is insert-only (registering an already-registered
+/// name reports a duplicate), so a step that already succeeded
+/// short-circuits, while a failure stays unlatched: the next call re-runs
+/// the step and can succeed once the failure cause is resolved. The latch
+/// also serializes concurrent first calls of the same step.
+///
+/// Every kind's `init()` routes through this helper (and multi-step
+/// registrations latch per step), which is what makes `initialize()`
+/// retryable end to end — an inner `OnceLock<Result<..>>` would cache the
+/// first failure and defeat the retry.
+pub(crate) fn init_latched(
     latch: &'static Mutex<Option<()>>,
-    init: fn() -> Result<(), Error>,
+    register: fn() -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut guard = latch
         .lock()
@@ -86,25 +57,28 @@ fn init_step(
     if guard.is_some() {
         return Ok(());
     }
-    let outcome = init();
+    let outcome = register();
     if outcome.is_ok() {
         *guard = Some(());
     }
     outcome
 }
 
-fn register_components() -> Result<(), Error> {
-    run_registration_chain().map_err(|error| Error::Config(error.to_string()))
-}
-
-fn run_registration_chain() -> Result<(), Error> {
-    init_step(&INPUT_DONE, input::init)?;
-    init_step(&OUTPUT_DONE, output::init)?;
-    init_step(&PROCESSOR_DONE, processor::init)?;
-    init_step(&BUFFER_DONE, buffer::init)?;
-    init_step(&TEMPORARY_DONE, temporary::init)?;
-    init_step(&CODEC_DONE, codec::init)?;
-    init_step(&WAL_DONE, wal::init)
+/// Register the built-in component catalogue once per process.
+///
+/// Both the local Engine and the standalone Hub expose this metadata to
+/// operators, so their startup paths must share one idempotent initializer.
+/// A failed registration run is not cached: the next call re-runs the chain,
+/// every already-registered kind short-circuits through its own success
+/// latch, and the retry resumes at the first failed kind.
+pub fn initialize() -> Result<(), Error> {
+    input::init()?;
+    output::init()?;
+    processor::init()?;
+    buffer::init()?;
+    temporary::init()?;
+    codec::init()?;
+    wal::init()
 }
 
 #[cfg(test)]
@@ -119,11 +93,26 @@ mod tests {
         initialize().expect("latched init succeeds");
     }
 
+    /// Every kind's init() is directly re-runnable: direct callers (the
+    /// benchmark harness, integration tests) bypass `initialize()`, so the
+    /// per-kind success latches — not a top-level cache — carry the
+    /// idempotency.
+    #[test]
+    fn kind_inits_are_directly_idempotent() {
+        input::init().expect("input re-init");
+        output::init().expect("output re-init");
+        processor::init().expect("processor re-init");
+        buffer::init().expect("buffer re-init");
+        temporary::init().expect("temporary re-init");
+        codec::init().expect("codec re-init");
+        wal::init().expect("wal re-init");
+    }
+
     /// A failed step stays retryable: the failure is not cached, the retry
     /// re-invokes the step, and once it succeeds the latch short-circuits
-    /// all later calls. This is the resume path a mid-chain failure takes.
+    /// all later calls.
     #[test]
-    fn init_step_latches_success_and_retries_failure() {
+    fn init_latched_retries_failure_and_latches_success() {
         static LATCH: Mutex<Option<()>> = Mutex::new(None);
         static CALLS: AtomicU8 = AtomicU8::new(0);
         fn fail_once_then_succeed() -> Result<(), Error> {
@@ -133,16 +122,16 @@ mod tests {
             Ok(())
         }
         fn unused() -> Result<(), Error> {
-            unreachable!("latched steps must not invoke their init fn");
+            unreachable!("latched steps must not invoke their register fn");
         }
         assert!(
-            init_step(&LATCH, fail_once_then_succeed).is_err(),
+            init_latched(&LATCH, fail_once_then_succeed).is_err(),
             "first failure surfaces"
         );
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
-        init_step(&LATCH, fail_once_then_succeed).expect("retry is not cached");
-        // Latched: the init fn is never invoked again.
-        init_step(&LATCH, unused).expect("latched step short-circuits");
+        init_latched(&LATCH, fail_once_then_succeed).expect("retry is not cached");
+        // Latched: the register fn is never invoked again.
+        init_latched(&LATCH, unused).expect("latched step short-circuits");
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
     }
 }

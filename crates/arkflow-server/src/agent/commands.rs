@@ -119,33 +119,39 @@ pub(super) async fn execute_command(
                     serde_json::to_value(cp.validate_configuration(&candidate)).unwrap_or_default()
                 })
         } else {
-            let from = command
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("from"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing configuration version".to_string())?;
-            let to = command
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("to"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing configuration version".to_string())?;
-            let from_candidate = cp
-                .version_store()
-                .load(from)
-                .map_err(|error| error.to_string())?;
-            let to_candidate = cp
-                .version_store()
-                .load(to)
-                .map_err(|error| error.to_string())?;
-            Ok(serde_json::json!({
-                "from": from,
-                "to": to,
-                "changed": from_candidate.content != to_candidate.content,
-                "from_format": from_candidate.format,
-                "to_format": to_candidate.format,
-            }))
+            // Errors here are part of the command's outcome (reported to the
+            // Hub as a Failed result), never a transport-level failure:
+            // returning them from execute_command would abort the session
+            // and trigger a redelivery loop for what is a client input error.
+            (|| -> Result<serde_json::Value, String> {
+                let from = command
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("from"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing configuration version".to_string())?;
+                let to = command
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("to"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "missing configuration version".to_string())?;
+                let from_candidate = cp
+                    .version_store()
+                    .load(from)
+                    .map_err(|error| error.to_string())?;
+                let to_candidate = cp
+                    .version_store()
+                    .load(to)
+                    .map_err(|error| error.to_string())?;
+                Ok(serde_json::json!({
+                    "from": from,
+                    "to": to,
+                    "changed": from_candidate.content != to_candidate.content,
+                    "from_format": from_candidate.format,
+                    "to_format": to_candidate.format,
+                }))
+            })()
         };
         let (state, report, error, failure_class) = match outcome {
             Ok(report) => (

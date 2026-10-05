@@ -45,8 +45,8 @@ storage_ops! {
 ### 3. schema 版本
 
 - 常量 `SCHEMA_VERSION: u32 = 1`。
-- SQLite：`ensure_schema_version(conn)` 在 DDL 后执行——`PRAGMA user_version` 读；`> CURRENT` → `StorageError::Config`（指明库版本与二进制版本）；否则 `PRAGMA user_version = 1` 盖章。幂等（重开不重复报错）。
-- PostgreSQL：DDL 增加 `CREATE TABLE IF NOT EXISTS cp_schema_meta (key TEXT PRIMARY KEY, value BIGINT NOT NULL)`；`ensure_schema_version` 读 `schema_version` 键，同上语义（事务内 upsert 盖章）。
+- SQLite：`ensure_schema_version(conn)` 在 DDL 后执行——`PRAGMA user_version` 读；`> CURRENT` → `StorageError::SchemaTooNew`（错误信息含库版本与二进制版本）；否则 `PRAGMA user_version = 1` 盖章。幂等（重开不重复报错）。
+- PostgreSQL：DDL 增加 `CREATE TABLE IF NOT EXISTS cp_schema_meta (key TEXT PRIMARY KEY, value BIGINT NOT NULL)`；`ensure_schema_version` 读 `schema_version` 键，同上语义（单条 upsert 盖章，只升不降；并发启动竞态由盖章后复读兜底）。
 - migrate 工具：复制前校验源库 `user_version`/meta ≤ CURRENT；复制数据含 meta 表；完成后目标库版本 = CURRENT。
 - 测试：SQLite 盖章/新版本拒绝/重开幂等三测；PG 走 `ARKFLOW_TEST_POSTGRES_URL` 门控同套断言。
 

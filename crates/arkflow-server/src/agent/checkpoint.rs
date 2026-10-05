@@ -84,7 +84,10 @@ pub(super) struct CheckpointJob {
 /// Process-wide checkpoint worker: a single OS thread with its own
 /// current-thread runtime drains a bounded command channel, so checkpoint
 /// object-store I/O costs neither a thread nor a runtime per operation.
-/// Commands are panic-isolated individually, mirroring the storage actor.
+/// Each job is spawned onto that runtime, so operations run concurrently
+/// (one Job's slow S3 write cannot delay another Job's recovery read) and
+/// a panicking job is isolated inside its own task. Commands are
+/// panic-isolated individually, mirroring the storage actor.
 pub(super) fn checkpoint_worker() -> &'static flume::Sender<CheckpointJob> {
     static WORKER: OnceLock<flume::Sender<CheckpointJob>> = OnceLock::new();
     WORKER.get_or_init(|| {
@@ -102,14 +105,16 @@ pub(super) fn checkpoint_worker() -> &'static flume::Sender<CheckpointJob> {
                         return;
                     }
                 };
-                while let Ok(job) = receiver.recv() {
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runtime.block_on(job.future)
-                    }));
-                    if outcome.is_err() {
-                        tracing::error!("checkpoint object store command panicked");
+                runtime.block_on(async move {
+                    while let Ok(job) = receiver.recv_async().await {
+                        let handle = tokio::spawn(job.future);
+                        tokio::spawn(async move {
+                            if handle.await.is_err() {
+                                tracing::error!("checkpoint object store command panicked");
+                            }
+                        });
                     }
-                }
+                });
             });
         if let Err(error) = spawned {
             // A spawn failure must not panic inside the OnceLock initializer

@@ -3381,11 +3381,10 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         serde_json::json!(true)
     );
 
-    // NOTE: unlike every other command shape, a malformed
-    // diff_configuration payload escapes `execute_command` as a raw Err
-    // instead of settling as a Failed CommandResult (suspected product
-    // inconsistency — see the report). The test pins the current
-    // behavior so a future fix updates it deliberately.
+    // A malformed diff_configuration payload settles as a Failed
+    // CommandResult like every other command shape: escaping as a raw Err
+    // would abort the Agent session (killing unrelated in-flight commands)
+    // and trigger a Hub redelivery loop for a client input error.
     let command = test_command(
         "diff_configuration",
         "config",
@@ -3393,13 +3392,13 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         Some(serde_json::json!({"to": second.id})),
         live_deadline,
     );
-    let error = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
         .await
-        .unwrap_err();
+        .unwrap();
+    assert_eq!(result.state, HubOperationState::Failed);
     assert_eq!(
-        error.to_string(),
-        "missing configuration version",
-        "diff payload errors currently escape the command path"
+        result.error.as_deref(),
+        Some("missing configuration version")
     );
 
     let command = test_command(
@@ -3409,10 +3408,11 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         Some(serde_json::json!({"from": "no-such-version", "to": second.id})),
         live_deadline,
     );
-    let error = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
         .await
-        .unwrap_err();
-    assert!(!error.to_string().is_empty());
+        .unwrap();
+    assert_eq!(result.state, HubOperationState::Failed);
+    assert!(!result.error.as_deref().unwrap().is_empty());
 
     // Stream lifecycle: an unknown stream fails, a known one settles.
     let command = test_command("restart", "ghost-stream", 1, None, live_deadline);
@@ -5154,14 +5154,41 @@ fn stub_session() -> crate::hub::RegisterResponse {
 async fn run_session_failing_command_ends_the_session() {
     let _ = arkflow_plugin::initialize();
     let live_deadline = now_ms().saturating_add(120_000);
-    let broken = test_command(
-        "diff_configuration",
-        "config",
-        1,
-        Some(serde_json::json!({"to": "some-version"})),
-        live_deadline,
-    );
-    let (hub_url, _hub, hub_cancel, hub_task) = scripted_hub_server(200, vec![vec![broken]]).await;
+    // Command-processing errors now settle as Failed results; the Err paths
+    // that still abort the session are transport-level. Pin that with a hub
+    // that serves one command but rejects the result delivery.
+    let broken = test_command("restart", "orders-stream", 1, None, live_deadline);
+    let (hub_url, _hub, hub_cancel, hub_task) = {
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/agent/commands",
+                axum::routing::get(|| async move { axum::Json(vec![broken]) }),
+            )
+            .route(
+                "/api/v1/agent/commands/{id}/result",
+                axum::routing::post(|| async {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { cancel.cancelled().await })
+                    .await
+                    .unwrap();
+            }
+        });
+        (
+            format!("http://{addr}"),
+            std::sync::Arc::new(()),
+            cancel,
+            task,
+        )
+    };
     let client = build_agent_client(&hub_url).unwrap();
     let config = fast_session_config(&hub_url);
     let cancel = CancellationToken::new();
@@ -5187,10 +5214,9 @@ async fn run_session_failing_command_ends_the_session() {
     .await
     .expect("the session ends")
     .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "missing configuration version",
-        "{error}"
+    assert!(
+        !error.to_string().is_empty(),
+        "the rejected result delivery surfaces as a session error: {error}"
     );
     sampler_cancel.cancel();
     hub_cancel.cancel();

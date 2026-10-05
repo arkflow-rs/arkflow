@@ -316,10 +316,7 @@ impl JobRuntime {
             }
             drop(tasks);
             let mut tasks = self.tasks.lock().await;
-            let mut existing = tasks.remove(&job_id);
-            if let Some(existing) = existing.as_mut() {
-                existing.cancellation.cancel();
-            }
+            let existing = tasks.remove(&job_id);
             // Observed on the removal lock, right before the cancel: a kernel
             // that exited on its own has a genuine crash outcome worth
             // surfacing below; an exit after the cancel is this start's own
@@ -479,6 +476,30 @@ impl JobRuntime {
         } else {
             None
         };
+        // Declared CPU => dedicated bounded runtime: the kernel (and all its
+        // async work) runs on max(1, ceil(millicores/1000)) worker threads
+        // owned by this Job instead of the shared runtime's pool. Undeclared
+        // Jobs keep the shared runtime, byte-identical to before.
+        let mut dedicated_runtime: Option<Arc<tokio::runtime::Runtime>> =
+            match plan.spec.resources.cpu_millicores {
+                Some(millicores) => {
+                    let workers = millicores.div_ceil(1000).max(1) as usize;
+                    match tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(workers)
+                        .thread_name(format!("arkflow-job-{job_id}"))
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => Some(Arc::new(runtime)),
+                        Err(error) => {
+                            return Err(format!(
+                                "dedicated runtime for Job '{job_id}' failed to build: {error}"
+                            ))
+                        }
+                    }
+                }
+                None => None,
+            };
         if let Some(marker) = start_marker.as_deref() {
             if let Err(error) = persist_start_marker(marker) {
                 let _ = state.close();
@@ -554,7 +575,7 @@ impl JobRuntime {
                 None => {
                     warn!(
                         node_id = %node_id,
-                        "split dispatch without a full task→node map;                          deriving remote peers from the local assignment only"
+                        "split dispatch without a full task→node map; deriving remote peers from the local assignment only"
                     );
                     assignments
                         .iter()
@@ -573,30 +594,6 @@ impl JobRuntime {
                 },
             ))
         });
-        // Declared CPU => dedicated bounded runtime: the kernel (and all its
-        // async work) runs on max(1, ceil(millicores/1000)) worker threads
-        // owned by this Job instead of the shared runtime's pool. Undeclared
-        // Jobs keep the shared runtime, byte-identical to before.
-        let mut dedicated_runtime: Option<Arc<tokio::runtime::Runtime>> =
-            match plan.spec.resources.cpu_millicores {
-                Some(millicores) => {
-                    let workers = millicores.div_ceil(1000).max(1) as usize;
-                    match tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(workers)
-                        .thread_name(format!("arkflow-job-{job_id}"))
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(runtime) => Some(Arc::new(runtime)),
-                        Err(error) => {
-                            return Err(format!(
-                                "dedicated runtime for Job '{job_id}' failed to build: {error}"
-                            ))
-                        }
-                    }
-                }
-                None => None,
-            };
         let state_for_spawn = state.clone();
         let owned_plan = plan.clone();
         let owned_task_ids = task_ids.clone();

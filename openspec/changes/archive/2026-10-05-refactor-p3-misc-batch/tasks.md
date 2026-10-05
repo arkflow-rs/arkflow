@@ -18,4 +18,4 @@
 
 - [x] 3.1 `cargo test -p arkflow-plugin -p arkflow-server -p arkflow-core` + clippy + fmt 全绿
 - [x] 3.2 console：`npm run lint`（0 error）/ `typecheck` / `format:check` / `test`（61/61）/ `build` 全绿
-- [ ] 3.3 openspec validate + 归档，CODE_REVIEW_2026-09-29.md / PLANNING.md 划项
+- [x] 3.3 openspec validate + 归档，CODE_REVIEW_2026-09-29.md / PLANNING.md 划项

@@ -463,10 +463,10 @@ async fn operator_auth_middleware(
     next: axum::middleware::Next,
 ) -> Response {
     let path = req.uri().path();
-    if OPERATOR_AUTH_EXEMPT
-        .iter()
-        .any(|p| path.starts_with(p) || path.contains(p))
-    {
+    // Prefix match only: a `contains` match would also exempt unrelated
+    // routes whose path merely embeds an exempt segment (e.g. job or node
+    // resources legitimately named "agent"), skipping operator auth on them.
+    if OPERATOR_AUTH_EXEMPT.iter().any(|p| path.starts_with(p)) {
         return next.run(req).await;
     }
     let token = bearer(req.headers());
@@ -666,46 +666,61 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
 /// axum `Listener` adapter wrapping the TCP listener in TLS: every accepted
 /// connection completes the TLS handshake before the service sees it. Routes,
 /// auth, and readiness semantics are untouched (TLS lives below them).
+///
+/// The TCP accept loop and each TLS handshake run on background tasks and
+/// completed handshakes arrive through a bounded channel: `axum::serve`
+/// awaits `accept` before accepting the next connection, so performing the
+/// (bounded, but multi-second) handshake inline would let one idle peer
+/// stall all subsequent admissions — an unauthenticated availability issue.
 struct HubTlsListener {
-    inner: TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
+    local_addr: std::net::SocketAddr,
+    ready: tokio::sync::mpsc::Receiver<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    )>,
 }
 
 impl HubTlsListener {
-    async fn accept_one(
-        &mut self,
-    ) -> (
-        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-        std::net::SocketAddr,
-    ) {
-        loop {
-            match self.inner.accept().await {
-                Ok((stream, peer)) => {
-                    let _ = stream.set_nodelay(true);
-                    // Bounded handshake so a stalled peer cannot hold the
-                    // accept loop (the handshake runs inline here because
-                    // the axum Listener contract returns the IO directly).
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        self.acceptor.accept(stream),
-                    )
-                    .await
-                    {
-                        Ok(Ok(tls_stream)) => return (tls_stream, peer),
-                        Ok(Err(error)) => {
-                            tracing::warn!(%error, "hub TLS handshake failed");
-                        }
-                        Err(_) => {
-                            tracing::warn!("hub TLS handshake timed out");
-                        }
+    fn spawn(inner: TcpListener, acceptor: tokio_rustls::TlsAcceptor) -> std::io::Result<Self> {
+        let local_addr = inner.local_addr()?;
+        let (tx, ready) = tokio::sync::mpsc::channel(128);
+        tokio::spawn(async move {
+            loop {
+                match inner.accept().await {
+                    Ok((stream, peer)) => {
+                        let _ = stream.set_nodelay(true);
+                        let acceptor = acceptor.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            // Same bounded handshake as before, now off the
+                            // admission path: a stalled or malicious peer
+                            // only ties up its own task.
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                acceptor.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(tls_stream)) => {
+                                    let _ = tx.send((tls_stream, peer)).await;
+                                }
+                                Ok(Err(error)) => {
+                                    tracing::warn!(%error, "hub TLS handshake failed");
+                                }
+                                Err(_) => {
+                                    tracing::warn!("hub TLS handshake timed out");
+                                }
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "hub TLS accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
-                Err(error) => {
-                    tracing::error!(%error, "hub TLS accept failed");
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
             }
-        }
+        });
+        Ok(Self { local_addr, ready })
     }
 }
 
@@ -713,12 +728,15 @@ impl axum::serve::Listener for HubTlsListener {
     type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
     type Addr = std::net::SocketAddr;
 
-    fn accept(&mut self) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
-        self.accept_one()
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        // The channel never closes before the listener is dropped: the
+        // accept-loop task holds a sender clone for its whole life, so a
+        // healthy listener's recv only resolves with a connection.
+        self.ready.recv().await.expect("hub TLS accept loop died")
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.inner.local_addr()
+        Ok(self.local_addr)
     }
 }
 
@@ -945,10 +963,7 @@ pub async fn serve_hub(
     let router = hub_router(hub.clone(), &config).into_make_service();
     let result = match tls_acceptor {
         Some(acceptor) => {
-            let tls_listener = HubTlsListener {
-                inner: listener,
-                acceptor,
-            };
+            let tls_listener = HubTlsListener::spawn(listener, acceptor)?;
             axum::serve(tls_listener, router)
                 .with_graceful_shutdown(async move {
                     cancellation.cancelled().await;

@@ -2946,13 +2946,17 @@ async fn hub_tls_listener_survives_a_failed_handshake() {
         .unwrap();
     let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = inner.local_addr().unwrap();
-    let mut listener = HubTlsListener {
+    let mut listener = HubTlsListener::spawn(
         inner,
-        acceptor: tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config)),
-    };
+        tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config)),
+    )
+    .unwrap();
     assert!(listener.local_addr().is_ok());
 
-    let accept_task = tokio::spawn(async move { listener.accept_one().await });
+    let accept_task = tokio::spawn(async move {
+        use axum::serve::Listener as _;
+        listener.accept().await
+    });
     // First peer speaks plaintext HTTP: the handshake rejects it.
     let mut plaintext = tokio::net::TcpStream::connect(address).await.unwrap();
     plaintext

@@ -760,6 +760,20 @@ impl PostgresBackend {
                 .bind(SCHEMA_VERSION as i64)
                 .execute(pool)
                 .await?;
+                // Re-read after the upsert: a concurrently-starting newer
+                // binary may have stamped a higher version between the first
+                // read and here; this binary must still refuse to run.
+                let stored: i64 = sqlx::query_scalar(
+                    "SELECT value FROM cp_schema_meta WHERE key = 'schema_version'",
+                )
+                .fetch_one(pool)
+                .await?;
+                if stored > SCHEMA_VERSION as i64 {
+                    return Err(StorageError::SchemaTooNew {
+                        database: stored as u32,
+                        binary: SCHEMA_VERSION,
+                    });
+                }
                 Ok(())
             }
         }
