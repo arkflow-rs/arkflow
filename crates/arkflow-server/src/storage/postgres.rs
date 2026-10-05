@@ -19,7 +19,11 @@ use std::time::Duration;
 /// `INSERT OR IGNORE INTO` -> `INSERT INTO ... ON CONFLICT DO NOTHING`.
 ///
 /// The rewrite result is cached by SQL text. Every call site wraps a const
-/// literal, so the cache holds one entry per distinct statement.
+/// literal or a constant-formatted statement (the two `format!` sites bind
+/// `TERMINAL_JOB_UPGRADE_PHASES_SQL`, a fixed tuple), so the cache holds one
+/// entry per distinct statement — bounded by the statement count, not by
+/// data. Do NOT feed dynamically assembled SQL through `q()` without
+/// revisiting this bound.
 pub(crate) fn q(sql: &str) -> String {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));

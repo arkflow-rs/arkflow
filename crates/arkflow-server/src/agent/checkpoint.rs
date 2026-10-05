@@ -89,7 +89,7 @@ pub(super) fn checkpoint_worker() -> &'static flume::Sender<CheckpointJob> {
     static WORKER: OnceLock<flume::Sender<CheckpointJob>> = OnceLock::new();
     WORKER.get_or_init(|| {
         let (sender, receiver) = flume::bounded::<CheckpointJob>(64);
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("arkflow-checkpoint-store".into())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -110,8 +110,18 @@ pub(super) fn checkpoint_worker() -> &'static flume::Sender<CheckpointJob> {
                         tracing::error!("checkpoint object store command panicked");
                     }
                 }
-            })
-            .expect("spawn checkpoint worker thread");
+            });
+        if let Err(error) = spawned {
+            // A spawn failure must not panic inside the OnceLock initializer
+            // (that would poison it and turn every later call into a panic).
+            // The failed spawn drops the closure and with it the receiver,
+            // so every later send fails immediately — `block_on` already
+            // maps that to a graceful "worker unavailable" error.
+            tracing::error!(
+                %error,
+                "checkpoint worker thread spawn failed; checkpoint storage unavailable"
+            );
+        }
         sender
     })
 }
