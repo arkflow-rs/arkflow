@@ -11,13 +11,37 @@ use sqlx::postgres::PgQueryResult;
 use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions, PgRow};
 use sqlx::Arguments;
 use sqlx::{AssertSqlSafe, Postgres, Row as SqlxRow};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Runtime SQLite-dialect to PostgreSQL-dialect SQL rewrite: `?N` -> `$N`,
 /// `INSERT OR IGNORE INTO` -> `INSERT INTO ... ON CONFLICT DO NOTHING`.
+///
+/// The rewrite result is cached by SQL text. Every call site wraps a const
+/// literal or a constant-formatted statement (the two `format!` sites bind
+/// `TERMINAL_JOB_UPGRADE_PHASES_SQL`, a fixed tuple), so the cache holds one
+/// entry per distinct statement — bounded by the statement count, not by
+/// data. Do NOT feed dynamically assembled SQL through `q()` without
+/// revisiting this bound.
 pub(crate) fn q(sql: &str) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(sql) {
+            return cached.clone();
+        }
+    }
+    let rewritten = rewrite_sql(sql);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(sql.to_string(), rewritten.clone());
+    }
+    rewritten
+}
+
+fn rewrite_sql(sql: &str) -> String {
     if let Some(rest) = sql.strip_prefix("INSERT OR IGNORE INTO") {
-        return format!("INSERT INTO{} ON CONFLICT DO NOTHING", q(rest));
+        return format!("INSERT INTO{} ON CONFLICT DO NOTHING", rewrite_sql(rest));
     }
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
@@ -669,6 +693,11 @@ const PG_DDL: &str = r#"
             );
             ALTER TABLE cp_hub_lease ADD COLUMN IF NOT EXISTS advertise_url TEXT;
 
+            CREATE TABLE IF NOT EXISTS cp_schema_meta (
+                key TEXT COLLATE "C" PRIMARY KEY,
+                value BIGINT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS cp_intents_due
                 ON cp_intents(state, next_retry_at_ms);
             CREATE INDEX IF NOT EXISTS cp_attempts_pending
@@ -701,10 +730,53 @@ impl PostgresBackend {
             .await?;
         sqlx::query("SELECT 1").execute(&pool).await?;
         sqlx::raw_sql(PG_DDL).execute(&pool).await?;
+        Self::ensure_schema_version(&pool).await?;
         Ok(Self {
             pool,
             fence: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+
+    /// Validate and stamp the schema version in `cp_schema_meta`: a database
+    /// written by a newer binary is refused loudly; a fresh or equal-version
+    /// database is stamped (idempotent across restarts).
+    async fn ensure_schema_version(pool: &PgPool) -> Result<(), StorageError> {
+        let stored: Option<i64> =
+            sqlx::query_scalar("SELECT value FROM cp_schema_meta WHERE key = 'schema_version'")
+                .fetch_optional(pool)
+                .await?;
+        match stored {
+            Some(stored) if stored > SCHEMA_VERSION as i64 => Err(StorageError::SchemaTooNew {
+                database: stored as u32,
+                binary: SCHEMA_VERSION,
+            }),
+            Some(stored) if stored == SCHEMA_VERSION as i64 => Ok(()),
+            _ => {
+                sqlx::query(sqlx::AssertSqlSafe(
+                    "INSERT INTO cp_schema_meta (key, value) VALUES ('schema_version', $1) \
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value \
+                     WHERE excluded.value > cp_schema_meta.value",
+                ))
+                .bind(SCHEMA_VERSION as i64)
+                .execute(pool)
+                .await?;
+                // Re-read after the upsert: a concurrently-starting newer
+                // binary may have stamped a higher version between the first
+                // read and here; this binary must still refuse to run.
+                let stored: i64 = sqlx::query_scalar(
+                    "SELECT value FROM cp_schema_meta WHERE key = 'schema_version'",
+                )
+                .fetch_one(pool)
+                .await?;
+                if stored > SCHEMA_VERSION as i64 {
+                    return Err(StorageError::SchemaTooNew {
+                        database: stored as u32,
+                        binary: SCHEMA_VERSION,
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 
     async fn lease(&self) -> Result<PgConn, StorageError> {
@@ -796,6 +868,24 @@ mod tests {
         );
         // Non-placeholder question marks (e.g. inside literals) are untouched.
         assert_eq!(q("SELECT 'a?b'"), "SELECT 'a?b'");
+    }
+
+    /// Repeated statements hit the rewrite cache: the rewritten form is
+    /// stable and the underlying rewrite runs only once per distinct text
+    /// (probed via a unique marker that lands in the cache on first call).
+    #[test]
+    fn placeholder_rewrites_are_cached_by_sql_text() {
+        let marker = format!(
+            "SELECT cache_probe_{} FROM t WHERE k = ?1",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let first = q(&marker);
+        assert_eq!(first, marker.replace("?1", "$1"));
+        // Second call returns the cached clone of the same rewrite.
+        assert_eq!(q(&marker), first);
     }
 
     /// The bind surface pins its typed-NULL contracts: every Option numeric

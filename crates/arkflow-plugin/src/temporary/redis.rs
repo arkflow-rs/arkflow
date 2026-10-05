@@ -154,8 +154,17 @@ impl TemporaryBuilder for RedisTemporaryBuilder {
     }
 }
 
-pub fn init() -> Result<(), Error> {
-    temporary::register_temporary_builder("redis", Arc::new(RedisTemporaryBuilder))?;
+/// Each registration step latches on its own success, so a failure in the
+/// second step does not poison a retry with a duplicate-registration error
+/// from the first (see `init_latched`).
+static BUILDER_DONE: std::sync::Mutex<Option<()>> = std::sync::Mutex::new(None);
+static METADATA_DONE: std::sync::Mutex<Option<()>> = std::sync::Mutex::new(None);
+
+fn register_builder() -> Result<(), Error> {
+    temporary::register_temporary_builder("redis", Arc::new(RedisTemporaryBuilder))
+}
+
+fn register_metadata() -> Result<(), Error> {
     arkflow_core::component::register_temporary_metadata(
         arkflow_core::component::ComponentMetadata::with_schema(
             "redis",
@@ -200,4 +209,9 @@ pub fn init() -> Result<(), Error> {
             }),
         ),
     )
+}
+
+pub fn init() -> Result<(), Error> {
+    crate::init_latched(&BUILDER_DONE, register_builder)?;
+    crate::init_latched(&METADATA_DONE, register_metadata)
 }

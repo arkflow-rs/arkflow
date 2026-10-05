@@ -150,18 +150,6 @@ pub(crate) async fn run_graph_with_metrics_startup(
     run_graph_with_hooks_startup(graph, cancellation, hooks, false, startup).await
 }
 
-/// Compatibility wrapper for the retired global checkpoint gate. Barriers are
-/// now ordered control envelopes; the supplied gate is intentionally ignored.
-#[cfg(test)]
-pub(crate) async fn run_graph_with_gate(
-    graph: ExecutionGraph,
-    cancellation: CancellationToken,
-    gate: super::kernel_handle::SnapshotGate,
-) -> Result<(), Error> {
-    let _ = gate;
-    run_graph_with_hooks(graph, cancellation, BTreeMap::new()).await
-}
-
 /// Run the graph with per-chain checkpoint hooks keyed by entry task id.
 #[cfg(test)]
 pub(crate) async fn run_graph_with_hooks(
@@ -182,20 +170,6 @@ pub(crate) async fn run_graph_with_hooks_startup(
     startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
     run_graph_inner(graph, cancellation, hooks, sources_preconnected, startup).await
-}
-
-/// Compatibility wrapper for callers that still pass the retired global gate.
-/// The barrier path itself remains fully asynchronous and does not acquire a
-/// job-wide read/write lock.
-#[cfg(test)]
-pub(crate) async fn run_graph_with_hooks_and_gate(
-    graph: ExecutionGraph,
-    cancellation: CancellationToken,
-    hooks: BTreeMap<String, CheckpointHook>,
-    gate: super::kernel_handle::SnapshotGate,
-) -> Result<(), Error> {
-    let _ = gate;
-    run_graph_with_hooks(graph, cancellation, hooks).await
 }
 
 async fn run_graph_inner(

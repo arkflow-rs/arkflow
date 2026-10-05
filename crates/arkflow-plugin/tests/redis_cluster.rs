@@ -262,7 +262,11 @@ fn first_payload(batch: &MessageBatchRef) -> Vec<u8> {
     panic!("unexpected payload column type: {column:?}");
 }
 
+// Both tests lease the SAME fixed host ports (16379/6390) for the cluster
+// container; parallel starts race on the docker bind and one loses with
+// "port is already allocated". Serialize them (kafka_eos precedent).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
 async fn cluster_channels_subscription_delivers_published_payloads() {
     let Some(lease) = cluster_lease().await else {
         return;
@@ -298,6 +302,7 @@ async fn cluster_channels_subscription_delivers_published_payloads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
 async fn cluster_list_mode_pops_pushed_entries() {
     let Some(lease) = cluster_lease().await else {
         return;

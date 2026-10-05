@@ -53,7 +53,7 @@ pub async fn run_job<A: JobComponentAdapter>(
     resource: &mut Resource,
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
-    run_job_with_metrics(spec, adapter, resource, cancellation, None).await
+    run_job_with_metrics_started(spec, adapter, resource, cancellation, None, None).await
 }
 
 /// Run a local Job and notify the caller once the graph's resource startup
@@ -292,19 +292,6 @@ pub(crate) async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
         state.close()?;
     }
     result
-}
-
-/// Run a JobSpec with runtime metrics: per-batch counters update the shared
-/// `RuntimeMetrics` (input/processing/output/errors) so control-plane
-/// snapshots observe kernel activity.
-pub(crate) async fn run_job_with_metrics<A: JobComponentAdapter>(
-    spec: &JobSpec,
-    adapter: &A,
-    resource: &mut Resource,
-    cancellation: CancellationToken,
-    metrics: Option<std::sync::Arc<crate::runtime::RuntimeMetrics>>,
-) -> Result<(), Error> {
-    run_job_with_metrics_started(spec, adapter, resource, cancellation, metrics, None).await
 }
 
 /// Metrics-enabled local Job runner with an optional startup handshake. The

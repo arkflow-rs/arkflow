@@ -21,7 +21,11 @@ export function Components({ onError }: { onError: (message: string) => void }) 
   }, [componentsQuery.isError, componentsQuery.error, onError])
   const visible = useMemo(() => filterComponents(items, kind, query), [items, kind, query])
   useEffect(() => {
+    // Clamp the selection to the filtered list: a deliberate state-adjust
+    // on external change rather than a derived value, because `selected`
+    // stays user-owned while the list is externally filtered.
     if (!visible.some((item) => `${item.kind}:${item.name}` === selected))
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelected(visible[0] && `${visible[0].kind}:${visible[0].name}`)
   }, [visible, selected])
   const current = visible.find((item) => `${item.kind}:${item.name}` === selected)

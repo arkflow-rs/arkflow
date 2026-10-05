@@ -413,6 +413,9 @@ impl Wal {
     /// appends.
     ///
     /// The store's blocking calls (redb `commit`, S3 `PUT`) are wrapped in
+    /// [`Wal::call_store`]: the local backend stays inline on the caller's
+    /// thread (redb's flock must not contend with the blocking pool), while
+    /// the object-store backend is driven on the blocking pool.
     pub async fn append(&self, msg: &MessageBatchRef) -> Result<u64, Error> {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
         let bytes = serialize(msg)?;

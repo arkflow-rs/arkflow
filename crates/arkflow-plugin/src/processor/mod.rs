@@ -45,16 +45,14 @@ fn register_components() -> Result<(), Error> {
     Ok(())
 }
 
-/// Component registration is process-global, so `init()` is idempotent: the
-/// first call registers every builder and later calls (tests, multi-entry
-/// binaries) return the first result without touching the registries again.
-/// A registration failure is stored and re-returned, so the process cannot
-/// end up with a silently partial registry that still reports successful
-/// initialization.
+/// Component registration is process-global, so `init()` is idempotent:
+/// the first successful call registers every builder and later calls
+/// (tests, multi-entry binaries) short-circuit without touching the
+/// registries again. A failed registration is NOT cached — the next call
+/// re-runs it, so a transient failure does not permanently break the
+/// process (see `init_latched`).
+static INIT: std::sync::Mutex<Option<()>> = std::sync::Mutex::new(None);
+
 pub fn init() -> Result<(), Error> {
-    static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    match INIT.get_or_init(|| register_components().map_err(|error| error.to_string())) {
-        Ok(()) => Ok(()),
-        Err(error) => Err(Error::Config(error.clone())),
-    }
+    crate::init_latched(&INIT, register_components)
 }

@@ -2509,6 +2509,24 @@ impl SqliteBackend {
             "CREATE UNIQUE INDEX IF NOT EXISTS cp_intents_idempotency ON cp_intents(node_id, stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
             [],
         )?;
+        Self::ensure_schema_version(&connection)?;
+        Ok(())
+    }
+
+    /// Validate and stamp `PRAGMA user_version`: a database written by a
+    /// newer binary is refused loudly; a fresh or equal-version database is
+    /// stamped (idempotent across restarts).
+    fn ensure_schema_version(connection: &Connection) -> Result<(), StorageError> {
+        let stored: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if stored > SCHEMA_VERSION {
+            return Err(StorageError::SchemaTooNew {
+                database: stored,
+                binary: SCHEMA_VERSION,
+            });
+        }
+        if stored != SCHEMA_VERSION {
+            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
         Ok(())
     }
 

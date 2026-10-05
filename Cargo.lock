@@ -391,6 +391,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "datafusion",
+ "flume",
  "futures-util",
  "jsonwebtoken",
  "object_store",

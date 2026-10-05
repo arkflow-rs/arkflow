@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { api, errorMessage, formatTime, resolveDiff, resolveValidation, waitForOperation } from '../api'
-import type { ConfigCandidate, ConfigDiff, ConfigIssue, ConfigVersion } from '../api'
+import type { ConfigCandidate, ConfigDiff, ConfigIssue } from '../api'
 import { useT } from '../i18n'
 import { useSystem } from '../queries'
 import { useConfirm } from './confirm'
@@ -90,6 +90,10 @@ export function Configuration({
     }
     const draft = draftRelevant ? draftQuery.data : undefined
     const next = draft ?? { format: 'json' as const, content: JSON.stringify(configQuery.data, null, 2) }
+    // Sync the editable editor state from the server snapshot/draft once it
+    // settles: the accepted "copy external state into local editable state"
+    // pattern — the editor owns mutations until the next snapshot lands.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setContent(next.content)
     setFormat(next.format)
     setSaved(next.content)

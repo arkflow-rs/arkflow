@@ -5,7 +5,7 @@ import { api, ControlNode, errorMessage, formatTime, Job, JobCheckpoint, JobDeta
 import { currentLocale, intlLocale, useT } from '../i18n'
 import { useConfirm } from './confirm'
 import { SkeletonRows } from './shared'
-import { useJobDetail, useJobs, useNodes } from '../queries'
+import { useJobDetail, useJobVersions, useJobs, useNodes, useRollbackJobUpgrade } from '../queries'
 import { JobEditor as VisualJobEditor } from './job-editor'
 
 type JobsProps = {
@@ -273,7 +273,6 @@ function ActiveUpgradeCard({
 function JobDetailPanel({
   detail,
   pollError,
-  nodes,
   canMutate,
   busy,
   onClose,
@@ -515,15 +514,12 @@ function JobVersions({
   onViewPlan: (planJson: string) => void
 }) {
   const t = useT()
-  const [versions, setVersions] = useState<
-    Array<{ version: number; spec_json: string; plan_json: string; created_at_ms: number }>
-  >([])
+  const versionsQuery = useJobVersions(jobId)
+  const rollback = useRollbackJobUpgrade(jobId)
+  const versions = versionsQuery.data ?? []
   useEffect(() => {
-    void api
-      .jobVersions(jobId)
-      .then(setVersions)
-      .catch((cause) => onError(errorMessage(cause)))
-  }, [jobId, onError])
+    if (versionsQuery.isError) onError(errorMessage(versionsQuery.error))
+  }, [versionsQuery.isError, versionsQuery.error, onError])
   return (
     <div>
       {versions.length ? (
@@ -542,7 +538,7 @@ function JobVersions({
                   disabled={!canMutate || busy}
                   onClick={() =>
                     void onAction(t('jobs.restoring'), async () => {
-                      await api.rollbackJobUpgrade(jobId, `restore-v${version.version}`)
+                      await rollback.mutateAsync(`restore-v${version.version}`)
                       onRefresh()
                     })
                   }

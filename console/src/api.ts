@@ -550,15 +550,12 @@ export function streamEvents(
       // Per-attempt abort: the connect deadline cancels a black-holed fetch
       // (a bare Promise.race would let it dangle until the caller's
       // cleanup), and the outer controller forwards cancellation through
-      // the WHOLE attempt including body reads. `timedOut` distinguishes
-      // the deadline firing from outer cleanup inside the catch.
+      // the WHOLE attempt including body reads.
       const attempt = new AbortController()
-      let timedOut = false
       const forwardAbort = () => attempt.abort()
       controller.signal.addEventListener('abort', forwardAbort)
       try {
         const connectTimer = window.setTimeout(() => {
-          timedOut = true
           attempt.abort()
         }, REQUEST_TIMEOUT_MS)
         let response: Response
