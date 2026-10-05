@@ -552,7 +552,7 @@ describe('fleet maintenance actions', () => {
     ])
 
   it('drains a node after confirmation and refreshes the fleet', async () => {
-    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+    const fetchMock = vi.fn((url: string, _init?: RequestInit) => {
       if (url.includes('/nodes?')) return Promise.resolve({ ok: true, json: async () => fleetNodes() })
       if (url.includes('/nodes/node-a/drain'))
         return Promise.resolve({
@@ -618,7 +618,7 @@ describe('fleet maintenance actions', () => {
   })
 
   it('resumes a node out of maintenance with the delete verb', async () => {
-    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+    const fetchMock = vi.fn((url: string, _init?: RequestInit) => {
       if (url.includes('/nodes?'))
         return Promise.resolve({ ok: true, json: async () => fleetNodes('maintenance') })
       if (url.includes('/nodes/node-a/maintenance'))

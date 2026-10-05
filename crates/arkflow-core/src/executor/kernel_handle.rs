@@ -31,7 +31,29 @@ pub(crate) type SnapshotGate = Arc<RwLock<()>>;
 /// Shared completion signal for the run: resolved with the graph's result
 /// when every chain exits (cancellation or end-of-stream). The result sits
 /// behind an `Arc` because `Error` is not `Clone`; observers clone the Arc.
-type Completion = Arc<tokio::sync::Mutex<Option<Arc<Result<(), Error>>>>>;
+/// The watch channel is a lossless wakeup for watchers: a write that lands
+/// between a watcher's state check and its `changed().await` is still
+/// observed, which a bare `Notify` cannot guarantee.
+type Completion = Arc<CompletionSlot>;
+
+struct CompletionSlot {
+    result: tokio::sync::Mutex<Option<Arc<Result<(), Error>>>>,
+    version: tokio::sync::watch::Sender<()>,
+}
+
+impl CompletionSlot {
+    fn unresolved() -> Self {
+        let (version, _) = tokio::sync::watch::channel(());
+        Self {
+            result: tokio::sync::Mutex::new(None),
+            version,
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.version.subscribe()
+    }
+}
 
 /// Handle to a running kernel Job: snapshot/restore/stop without consuming
 /// the handle; completion is observed via `watcher`.
@@ -503,8 +525,12 @@ impl KernelJobHandle {
     pub fn watcher(&self) -> tokio::task::JoinHandle<Result<(), Error>> {
         let completion = self.completion.clone();
         tokio::spawn(async move {
+            // Subscribe before the first check: a receiver created after a
+            // resolution would start at the current version and never fire,
+            // so ordering the subscription first keeps the wakeup lossless.
+            let mut version = completion.subscribe();
             loop {
-                let resolved = { completion.lock().await.clone() };
+                let resolved = { completion.result.lock().await.clone() };
                 if let Some(result) = resolved {
                     // Deref the shared result into an owned copy via the
                     // Arc; on failure clone the display form to rebuild an
@@ -514,14 +540,15 @@ impl KernelJobHandle {
                         Err(error) => Err(Error::Process(error.to_string())),
                     };
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = version.changed().await;
             }
         })
     }
 
     /// Resolve the completion slot (called once by the runner task's guard).
     async fn complete(completion: &Completion, result: Result<(), Error>) {
-        completion.lock().await.replace(Arc::new(result));
+        completion.result.lock().await.replace(Arc::new(result));
+        let _ = completion.version.send(());
     }
 
     pub fn cancellation(&self) -> CancellationToken {
@@ -703,7 +730,7 @@ impl KernelJobRunner {
                 }
             }
         }
-        let completion: Completion = Arc::new(tokio::sync::Mutex::new(None));
+        let completion: Completion = Arc::new(CompletionSlot::unresolved());
         let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
         let (checkpoint_error_tx, checkpoint_error_rx) = tokio::sync::mpsc::unbounded_channel();
         let (chain_finished_tx, chain_finished_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -913,7 +940,7 @@ mod tests {
             next_snapshot_id: AtomicU64::new(0),
             metrics: Arc::new(KernelMetrics::default()),
             state_format: 1,
-            completion: Arc::new(tokio::sync::Mutex::new(None)),
+            completion: Arc::new(CompletionSlot::unresolved()),
         };
         (
             handle,
@@ -955,7 +982,7 @@ mod tests {
             next_snapshot_id: AtomicU64::new(0),
             metrics: Arc::new(KernelMetrics::default()),
             state_format: 1,
-            completion: Arc::new(tokio::sync::Mutex::new(None)),
+            completion: Arc::new(CompletionSlot::unresolved()),
         };
         (
             handle,
@@ -1356,6 +1383,34 @@ mod tests {
             .unwrap()
             .expect_err("Err completion must surface");
         assert!(error.to_string().contains("kernel blew up"), "{error}");
+    }
+
+    /// Watchers park on the version channel until the slot resolves — no
+    /// polling tick. Every parked watcher must wake from one resolution
+    /// (fan-out), including one that subscribes after the value was already
+    /// written (the pre-subscribe check path).
+    #[tokio::test]
+    async fn watchers_wake_from_the_version_channel_without_polling() {
+        let (handle, _channels) = synthetic_handle(&[], CancellationToken::new());
+        let mut watchers = Vec::new();
+        for _ in 0..3 {
+            watchers.push(handle.watcher());
+        }
+        // Let the watchers park on `changed()` before resolving; a bounded
+        // yield loop is enough — the late-subscribe path is covered by the
+        // assertion below regardless of interleaving.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        KernelJobHandle::complete(&handle.completion, Ok(())).await;
+        for watcher in watchers {
+            watcher.await.unwrap().expect("every watcher wakes");
+        }
+        // A watcher created strictly after resolution must return via the
+        // initial state check, not wait for another version bump.
+        let (late, _channels) = synthetic_handle(&[], CancellationToken::new());
+        KernelJobHandle::complete(&late.completion, Ok(())).await;
+        late.watcher().await.unwrap().expect("late watcher returns");
     }
 
     #[tokio::test]

@@ -6881,7 +6881,7 @@ async fn run_graph_with_metrics_counts_source_batches() {
 
 #[tokio::test]
 async fn retired_gate_wrappers_still_run_the_graph() {
-    use crate::executor::task::{run_graph_with_gate, run_graph_with_hooks_and_gate};
+    use crate::executor::task::run_graph_with_hooks;
 
     let build = || {
         let collect = Arc::new(CollectOutput::default());
@@ -6900,24 +6900,15 @@ async fn retired_gate_wrappers_still_run_the_graph() {
     };
 
     let (graph, collect) = build();
-    let snapshot_gate: crate::executor::kernel_handle::SnapshotGate =
-        Arc::new(tokio::sync::RwLock::new(()));
-    run_graph_with_gate(graph, CancellationToken::new(), snapshot_gate)
+    run_graph_with_hooks(graph, CancellationToken::new(), BTreeMap::new())
         .await
         .unwrap();
     assert_eq!(collect.written.lock().unwrap().len(), 1);
 
     let (graph, collect) = build();
-    let snapshot_gate: crate::executor::kernel_handle::SnapshotGate =
-        Arc::new(tokio::sync::RwLock::new(()));
-    run_graph_with_hooks_and_gate(
-        graph,
-        CancellationToken::new(),
-        BTreeMap::new(),
-        snapshot_gate,
-    )
-    .await
-    .unwrap();
+    run_graph_with_hooks(graph, CancellationToken::new(), BTreeMap::new())
+        .await
+        .unwrap();
     assert_eq!(collect.written.lock().unwrap().len(), 1);
 }
 

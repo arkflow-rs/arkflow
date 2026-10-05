@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 futures-util = { workspace = true }
+flume = { workspace = true }
 reqwest = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }

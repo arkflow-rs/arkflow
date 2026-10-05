@@ -1,8 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  oidcLogout,
   oidcStatus,
-  redirectToOidcLogin,
   request,
   resetOidcStatusCacheForTests,
   resolveDiff,
@@ -147,10 +145,6 @@ describe('OIDC console integration', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
-
-function locations_missing(): boolean {
-  return true
-}
 
 describe('read-only configuration reports', () => {
   afterEach(() => {

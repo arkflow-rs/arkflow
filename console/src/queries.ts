@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, SNAPSHOT_INTERVAL_MS } from './api'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { api, JOB_DETAIL_INTERVAL_MS, ROLLOUT_DETAIL_INTERVAL_MS, SNAPSHOT_INTERVAL_MS } from './api'
 
 // The last error raised by any mounted ['live', ...] query, or null while all
 // live resources are healthy. Lets the shell mark the view stale even when the
@@ -67,7 +67,7 @@ export function useJobDetail(jobId: string | undefined) {
     queryKey: ['live', 'job-detail', jobId ?? null],
     queryFn: () => api.jobDetail(jobId!),
     enabled: Boolean(jobId),
-    refetchInterval: 5_000,
+    refetchInterval: JOB_DETAIL_INTERVAL_MS,
     placeholderData: keepPreviousData,
   })
 }
@@ -105,7 +105,29 @@ export function useRolloutDetail(rolloutId: string | undefined) {
     queryKey: ['live', 'rollout-detail', rolloutId ?? null],
     queryFn: () => api.rollout(rolloutId!),
     enabled: Boolean(rolloutId),
-    refetchInterval: 5_000,
+    refetchInterval: ROLLOUT_DETAIL_INTERVAL_MS,
     placeholderData: keepPreviousData,
+  })
+}
+
+// Version history for one Job: fetched through the shared query cache so a
+// rollback can invalidate it alongside the job detail.
+export function useJobVersions(jobId: string) {
+  return useQuery({
+    queryKey: ['job-versions', jobId],
+    queryFn: () => api.jobVersions(jobId),
+    placeholderData: keepPreviousData,
+  })
+}
+
+// Rollback a Job to a stored version; the version list refetches so the
+// restored entry reflects the new current version.
+export function useRollbackJobUpgrade(jobId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (operation: string) => api.rollbackJobUpgrade(jobId, operation),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['job-versions', jobId] })
+    },
   })
 }

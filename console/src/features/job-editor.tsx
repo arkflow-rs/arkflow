@@ -299,6 +299,7 @@ export function JobEditor({
       })
   }
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- loadComponents resets its error/loading state synchronously before fetching
     loadComponents()
   }, [onError])
   // The editor may stay mounted while its target changes (an upgrade opened
@@ -306,8 +307,11 @@ export function JobEditor({
   // draft — spec, graph, validation, selection — to the new target, so an
   // upgrade never submits a stale create draft.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset-on-target-change is the intended semantics here
     setDagNodes(graph.nodes)
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- same reset, grouped for one atomic draft swap
     setEdges(graph.edges)
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- same reset, grouped for one atomic draft swap
     setSpec(initial)
     setSelectedId(undefined)
     setValidation(undefined)

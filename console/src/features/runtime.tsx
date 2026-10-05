@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { useConfirm } from './confirm'
-import { useQueryClient } from '@tanstack/react-query'
 import { formatTime } from '../api'
 import type { ControlEvent, Operation, StreamStatus } from '../api'
 import { useT } from '../i18n'
@@ -54,6 +53,9 @@ export function Runtime({
   const visible = filtered.slice((page - 1) * pageSize, page * pageSize)
   const detail = streams.find((stream) => stream.id === selected)
   useEffect(() => {
+    // Clamp the page when the filtered result shrinks: adjusting pagination
+    // state on an external list change, not a render-derivable value.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (page > pages) setPage(pages)
   }, [page, pages])
   return (
