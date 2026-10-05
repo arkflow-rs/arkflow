@@ -54,7 +54,7 @@ NodeConfig {
 
 ### D5. `resolve_candidate_payload` 迁移目标：`arkflow-server/src/hub/` 新模块
 
-连同私有辅助 `resolve_secret_only_at`/`resolve_secret_only_string` 与 4 个单测整体迁移到 `hub/secret_dispatch.rs`（调用方 `placement.rs` 同目录就近）。core `secret.rs` 保留通用配置解析（`resolve_document`/`resolve_value`，被 core 配置加载使用）。**为何不放 server 根 lib**：避免加大 6.7k 行巨石（P3 结构债另有立项），放 `hub/` 与唯一调用方同域。`secret-references` spec 行为零变化，仅实现位置迁移，故无 delta。
+envelope 处理（候选载荷 format/content/content_verbatim 契约）与 6 个相关单测迁移到 `hub/secret_dispatch.rs`（调用方 `placement.rs` 同目录就近）。secret-only 遍历留在 core：实现中发现 `resolve_secret_only_*` 是 `${secret:}` 语法的遍历器（`secret-references` 能力域，与 `resolve_env` 等语法机制紧耦合），整体搬移需要在 server 复制 env 解析语义；改为 core 以 `pub fn resolve_secret_references` 导出语法原语（净 pub 面 −1/+1），server 只拥有 Hub 分发特有的 envelope 契约。core `secret.rs` 保留通用配置解析（`resolve_document`/`resolve_value`，被 core 配置加载使用）。**为何不放 server 根 lib**：避免加大 6.7k 行巨石（P3 结构债另有立项），放 `hub/` 与唯一调用方同域。`secret-references` spec 行为零变化，仅实现位置迁移，故无 delta。
 
 ## Risks / Trade-offs
 

@@ -20,7 +20,7 @@ v1.0 评审批次 C（PLANNING §9.3：批次 A–E 中唯一未落地项；发�
 - **BREAKING（同上）** `Temporary::get` 签名 `&[ColumnarValue]` → `&[String]`；sql processor 侧求值结果转字符串键，redis temporary 侧删除 `get_key` 的 ScalarValue 解包。
 - 删除 dead Error variants `LockTimeout`、`InvalidConfig`（零构造，删除为纯减法）。
 - `HealthCheckConfig` 改名拆分：Rust 类型改为 `NodeConfig`（`EngineConfig` 字段 `node: NodeConfig` + `#[serde(rename = "health_check")]`），内部分组为 `health`/`control_api`/`agent`/`data_plane` 子结构（serde flatten）+ 既有 `observability` 字段；**YAML/JSON 配置形状逐字节不变**（round-trip 测试与手写 schema 均不动）。
-- `resolve_candidate_payload` 连同其私有辅助（`resolve_secret_only_at`/`resolve_secret_only_string`）与单测从 core `secret.rs` 迁至 arkflow-server（调用方 `hub/placement.rs` 就近）；`secret-references` spec 的行为需求零变化。
+- `resolve_candidate_payload` 的 envelope 处理（format/content/content_verbatim 契约）与全部相关单测从 core `secret.rs` 迁至 arkflow-server `hub/secret_dispatch.rs`（调用方 `hub/placement.rs` 就近）；secret-only 遍历（`resolve_secret_only_*`）留在 core，以 `pub fn resolve_secret_references` 作为 `secret-references` 语法原语导出；`secret-references` spec 的行为需求零变化。
 
 ## Capabilities
 
