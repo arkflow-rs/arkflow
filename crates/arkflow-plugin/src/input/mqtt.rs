@@ -76,14 +76,14 @@ pub struct MqttInput {
 impl MqttInput {
     /// Create a new MQTT input component
     pub fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: MqttInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<Delivery>(1000);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             config,
             client: Arc::new(Mutex::new(None)),
             sender,
@@ -270,7 +270,7 @@ pub(crate) struct MqttInputBuilder;
 impl InputBuilder for MqttInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

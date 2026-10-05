@@ -89,6 +89,12 @@ refactoring is summarized rather than listed commit-by-commit.
 - Stream-level `codec:` is now rejected at build time for file, SQL, and
   Modbus inputs (the setting never worked); use component-level codecs. (#1284)
 - `hub_url` became a list `hub_urls` for agent multi-Hub discovery. (#1289)
+- Internal Rust API surface reduced ahead of the v1.0 semver freeze
+  (builder `name` parameters now `Option<&str>`, `Temporary::get` takes
+  string keys, `HealthCheckConfig` renamed to `NodeConfig` with grouped
+  sub-configs, Hub-only secret dispatch helper moved to `arkflow-server`).
+  Configuration files are unaffected: the YAML/JSON `health_check` section
+  keeps its exact historical shape. (#1304)
 - Error classification tightened: input channel closure has a dedicated
   variant, config parse errors carry line/column locations. (#1207, #1301)
 

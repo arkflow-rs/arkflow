@@ -36,6 +36,7 @@ mod operations;
 mod operator;
 mod placement;
 mod rollout;
+mod secret_dispatch;
 mod wire;
 
 #[cfg(test)]

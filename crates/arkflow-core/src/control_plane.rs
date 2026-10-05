@@ -74,7 +74,7 @@ impl ControlPlane {
         health: Arc<ControlHealth>,
     ) -> Self {
         let events = runtime_manager.event_store();
-        let api_token = config.health_check.api_token.clone();
+        let api_token = config.node.control_api.api_token.clone();
         Self {
             runtime_manager,
             operations: OperationStore::default(),
@@ -496,7 +496,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod retraction_tests {
     use super::*;
-    use crate::config::HealthCheckConfig;
+    use crate::config::NodeConfig;
     use crate::input::{Input, InputBuilder};
     use crate::output::{Output, OutputBuilder};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -528,7 +528,7 @@ mod retraction_tests {
     impl InputBuilder for SecondBuildFailsInputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
@@ -561,7 +561,7 @@ mod retraction_tests {
     impl OutputBuilder for DevNullOutputBuilder {
         fn build(
             &self,
-            _name: Option<&String>,
+            _name: Option<&str>,
             _config: &Option<serde_json::Value>,
             _codec: Option<Arc<dyn crate::codec::Codec>>,
             _resource: &crate::Resource,
@@ -600,7 +600,7 @@ mod retraction_tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: crate::config::LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         })
     }
 
@@ -674,7 +674,7 @@ mod retraction_tests {
         impl InputBuilder for AlwaysOkInputBuilder {
             fn build(
                 &self,
-                _name: Option<&String>,
+                _name: Option<&str>,
                 _config: &Option<serde_json::Value>,
                 _codec: Option<Arc<dyn crate::codec::Codec>>,
                 _resource: &crate::Resource,

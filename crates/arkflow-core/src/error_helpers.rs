@@ -85,17 +85,11 @@ macro_rules! config_error {
     };
 }
 
-/// Map an Arrow error to a process error with context
-///
-/// # Arguments
-///
-/// * `error` - The original Arrow error
-/// * `operation` - Description of the operation that failed
-///
-/// # Returns
-///
-/// * `Err(Error::Process)` - Wrapped error with context
-pub fn map_arrow_error<T>(error: impl std::error::Error, operation: &str) -> Result<T, Error> {
+#[cfg(test)]
+pub(crate) fn map_arrow_error<T>(
+    error: impl std::error::Error,
+    operation: &str,
+) -> Result<T, Error> {
     Err(Error::Process(format!(
         "Arrow {} failed: {}",
         operation, error
@@ -112,7 +106,11 @@ pub fn map_arrow_error<T>(error: impl std::error::Error, operation: &str) -> Res
 /// # Returns
 ///
 /// * `Err(Error::Process)` - Wrapped error with context
-pub fn map_datafusion_error<T>(error: impl std::error::Error, operation: &str) -> Result<T, Error> {
+#[cfg(test)]
+pub(crate) fn map_datafusion_error<T>(
+    error: impl std::error::Error,
+    operation: &str,
+) -> Result<T, Error> {
     Err(Error::Process(format!(
         "DataFusion {} failed: {}",
         operation, error

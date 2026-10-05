@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 /// Identity of one source partition inside a frontier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PartitionKey {
+pub(crate) struct PartitionKey {
     pub topic: Option<String>,
     pub partition: u32,
 }
@@ -391,7 +391,7 @@ impl CommitFrontier {
 /// acknowledgement completes only after its state apply, WAL-cursor advance,
 /// and source-side commit have all finished.
 #[derive(Debug, Default)]
-pub struct AckTracker {
+pub(crate) struct AckTracker {
     dispatched: AtomicUsize,
     completed: AtomicUsize,
     held: AtomicUsize,
@@ -413,7 +413,7 @@ impl AckTracker {
 }
 
 /// Source-side acknowledgement wrapper feeding an [`AckTracker`].
-pub struct TrackingAck {
+pub(crate) struct TrackingAck {
     tracker: Arc<AckTracker>,
     inner: Arc<dyn Ack>,
     /// Outstanding hold claims on this delivery. A fan-out branch (or a

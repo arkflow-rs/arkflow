@@ -34,7 +34,7 @@ lazy_static::lazy_static! {
 pub trait InputBuilder: Send + Sync {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         resource: &Resource,
@@ -93,7 +93,7 @@ pub trait Ack: Send + Sync {
 /// succeeds: every terminal branch has to finish first. The returned child
 /// acknowledgements are idempotent individually and invoke `parent` exactly
 /// once, after all children have been acknowledged successfully.
-pub fn fanout_ack(parent: Arc<dyn Ack>, branches: usize) -> Vec<Arc<dyn Ack>> {
+pub(crate) fn fanout_ack(parent: Arc<dyn Ack>, branches: usize) -> Vec<Arc<dyn Ack>> {
     if branches <= 1 {
         return vec![parent];
     }
@@ -412,7 +412,7 @@ impl From<Arc<dyn Ack>> for VecAck {
 /// sequence cannot block the earlier sequence from running in the same
 /// composite. The caller still observes a single success only after every
 /// child succeeds.
-pub struct ConcurrentAck(pub Vec<Arc<dyn Ack>>);
+pub(crate) struct ConcurrentAck(pub Vec<Arc<dyn Ack>>);
 
 #[async_trait]
 impl Ack for ConcurrentAck {
@@ -721,7 +721,7 @@ impl InputConfig {
                 None
             };
 
-            builder.build(self.name.as_ref(), &self.config, codec, resource)
+            builder.build(self.name.as_deref(), &self.config, codec, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown input type: {}",

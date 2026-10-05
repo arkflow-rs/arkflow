@@ -160,48 +160,6 @@ pub enum ConvergenceState {
     Blocked,
 }
 
-/// Durable operator intent lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IntentState {
-    Accepted,
-    Converging,
-    Retrying,
-    Converged,
-    Blocked,
-    Superseded,
-}
-
-/// One command delivery/execution attempt for an Intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttemptState {
-    Queued,
-    Dispatched,
-    Acknowledged,
-    Running,
-    Succeeded,
-    Failed,
-    Expired,
-    Ambiguous,
-    Superseded,
-}
-
-/// Stable failure category used by reconciliation and API clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureClass {
-    Validation,
-    Authorization,
-    NodeUnavailable,
-    Transport,
-    TemporaryExecution,
-    PermanentExecution,
-    Ambiguous,
-    StaleGeneration,
-    Repository,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -272,15 +230,6 @@ pub struct EngineStatus {
     pub streams_total: usize,
     pub streams_running: usize,
     pub streams_failed: usize,
-}
-
-/// Result returned by a lifecycle command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OperationResult {
-    pub operation: String,
-    pub stream_id: String,
-    pub state: StreamState,
-    pub message: Option<String>,
 }
 
 /// Standard JSON error payload for control-plane routes.

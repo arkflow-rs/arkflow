@@ -165,7 +165,7 @@ struct ProtobufCodecBuilder;
 impl CodecBuilder for ProtobufCodecBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Codec>, Error> {
@@ -259,11 +259,7 @@ mod tests {
     #[tokio::test]
     async fn test_protobuf_codec_builder_without_config() {
         let builder = ProtobufCodecBuilder;
-        let result = builder.build(
-            Some(&"test-codec".to_string()),
-            &None,
-            &create_test_resource(),
-        );
+        let result = builder.build(Some("test-codec"), &None, &create_test_resource());
 
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::Config(_))));
@@ -290,7 +286,7 @@ mod tests {
         });
 
         let result = builder.build(
-            Some(&"test-codec".to_string()),
+            Some("test-codec"),
             &Some(invalid_json),
             &create_test_resource(),
         );

@@ -180,7 +180,7 @@ impl redis::aio::AsyncPushSender for ClusterPushForwarder {
 impl RedisInput {
     /// Create a new Redis input component
     fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: RedisInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
@@ -202,7 +202,7 @@ impl RedisInput {
         };
 
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             config,
             client: Arc::new(Mutex::new(None)),
             sender,
@@ -553,7 +553,7 @@ pub struct RedisInputBuilder;
 impl InputBuilder for RedisInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

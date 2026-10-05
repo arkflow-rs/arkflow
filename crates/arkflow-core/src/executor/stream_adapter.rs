@@ -110,7 +110,7 @@ fn decode_name(payload: &serde_json::Value) -> Option<String> {
 /// Wrap an input with the adapter's WAL: replays unacknowledged entries
 /// before new reads (crash recovery), appends each batch, and gates the ack
 /// on the WAL commit — exactly like the legacy `Stream::do_input` path.
-pub struct WalInput {
+pub(crate) struct WalInput {
     inner: Arc<dyn Input>,
     wal: Arc<Wal>,
     /// Unacked-entry replay queue, initialized on the first read (the
@@ -1176,10 +1176,7 @@ mod tests {
             async fn connect(&self) -> Result<(), Error> {
                 Ok(())
             }
-            async fn get(
-                &self,
-                _keys: &[datafusion::logical_expr::ColumnarValue],
-            ) -> Result<Option<crate::MessageBatch>, Error> {
+            async fn get(&self, _keys: &[String]) -> Result<Option<crate::MessageBatch>, Error> {
                 Ok(None)
             }
             async fn close(&self) -> Result<(), Error> {

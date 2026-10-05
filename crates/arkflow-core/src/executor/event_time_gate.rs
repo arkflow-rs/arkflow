@@ -113,7 +113,7 @@ pub struct EventTimeGate {
 }
 
 /// Default row cap for a gate's held batches (see `EventTimeGate::held_row_cap`).
-pub const DEFAULT_HELD_ROW_CAP: usize = 1 << 20;
+pub(crate) const DEFAULT_HELD_ROW_CAP: usize = 1 << 20;
 
 /// Minimum spacing between eviction warnings.
 /// Upper bound on in-flight spawned eviction settlements before the gate

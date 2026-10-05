@@ -87,14 +87,14 @@ pub struct PulsarInput {
 impl PulsarInput {
     /// Create a new Pulsar input component
     pub fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: PulsarInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         let (sender, receiver) = flume::bounded::<Delivery>(1000);
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             config,
             client: Arc::new(RwLock::new(None)),
             consumer: Arc::new(RwLock::new(None)),
@@ -319,7 +319,7 @@ pub struct PulsarInputBuilder;
 impl InputBuilder for PulsarInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

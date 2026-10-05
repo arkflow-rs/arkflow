@@ -466,7 +466,7 @@ pub fn recovery_manifest_key(kind: RecoveryArtifactKind, checkpoint_id: &str) ->
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct CheckpointCatalog {
+pub(crate) struct CheckpointCatalog {
     artifacts: Vec<RecoveryArtifact>,
 }
 
@@ -479,6 +479,7 @@ impl CheckpointCatalog {
             .sort_by_key(|artifact| artifact.created_at_ms);
     }
 
+    #[cfg(test)]
     pub fn latest_valid(
         &self,
         job_version: JobVersion,
@@ -509,6 +510,7 @@ impl CheckpointCatalog {
         removed
     }
 
+    #[cfg(test)]
     pub fn artifacts(&self) -> &[RecoveryArtifact] {
         &self.artifacts
     }

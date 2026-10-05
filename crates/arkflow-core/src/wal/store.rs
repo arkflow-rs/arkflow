@@ -238,7 +238,7 @@ pub fn register_wal_store_builder(
 }
 
 /// Look up a registered builder by name. Used by [`build_wal_store`].
-pub fn lookup_wal_store_builder(name: &str) -> Option<Arc<dyn WalStoreBuilder>> {
+pub(crate) fn lookup_wal_store_builder(name: &str) -> Option<Arc<dyn WalStoreBuilder>> {
     WAL_STORE_BUILDERS.read().ok()?.get(name).cloned()
 }
 
@@ -261,11 +261,6 @@ pub fn build_wal_store(cfg: &WalConfig) -> Result<Arc<dyn WalStore>, Error> {
     builder.build(cfg)
 }
 
-/// Number of registered WAL store builders. Test-only.
-pub fn registered_wal_store_count() -> usize {
-    WAL_STORE_BUILDERS.read().map(|m| m.len()).unwrap_or(0)
-}
-
 // ---------- Local (redb) backend ----------
 
 /// Embedded `redb` backend. The default when no `backend` key is present or
@@ -274,7 +269,7 @@ pub fn registered_wal_store_count() -> usize {
 /// `redb::Database` is internally `Arc`; on drop, the fcntl flock on the
 /// database file is released, which is what `Wal::open` relies on for
 /// reopen-after-close semantics.
-pub struct RedbStore {
+pub(crate) struct RedbStore {
     db: Database,
 }
 
@@ -474,7 +469,7 @@ impl WalStore for RedbStore {
 }
 
 /// Builder for the local `redb` backend. Registered under the name `"local"`.
-pub struct LocalStoreBuilder;
+pub(crate) struct LocalStoreBuilder;
 
 impl WalStoreBuilder for LocalStoreBuilder {
     fn build(&self, cfg: &WalConfig) -> Result<Arc<dyn WalStore>, Error> {
@@ -496,7 +491,7 @@ impl WalStoreBuilder for LocalStoreBuilder {
 /// Register the local `redb` builder. Idempotent — repeated calls are a
 /// no-op (the registry rejects duplicates, which is fine on repeat). Safe
 /// under concurrent test invocations.
-pub fn ensure_local_store_registered() -> Result<(), Error> {
+pub(crate) fn ensure_local_store_registered() -> Result<(), Error> {
     let mut map = WAL_STORE_BUILDERS
         .write()
         .map_err(|_| Error::Process("WAL store builder registry poisoned".into()))?;

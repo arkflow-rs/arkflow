@@ -386,7 +386,7 @@ struct MilvusOutputBuilder;
 impl OutputBuilder for MilvusOutputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<Value>,
         _codec: Option<Arc<dyn arkflow_core::codec::Codec>>,
         _resource: &Resource,

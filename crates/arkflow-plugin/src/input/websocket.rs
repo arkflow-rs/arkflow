@@ -70,14 +70,14 @@ pub struct WebSocketInput {
 impl WebSocketInput {
     /// Create a new WebSocket input component
     pub fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: WebSocketInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<Delivery>(1000);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             config,
             sender,
             receiver,
@@ -282,7 +282,7 @@ pub(crate) struct WebSocketInputBuilder;
 impl InputBuilder for WebSocketInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

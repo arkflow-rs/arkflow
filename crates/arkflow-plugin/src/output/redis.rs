@@ -187,7 +187,7 @@ struct RedisOutputBuilder;
 impl OutputBuilder for RedisOutputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

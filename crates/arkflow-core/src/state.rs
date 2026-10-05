@@ -342,12 +342,14 @@ impl StateBackend for InMemoryStateBackend {
     }
 }
 
-pub struct KeyedCounter {
+#[cfg(test)]
+pub(crate) struct KeyedCounter {
     backend: std::sync::Arc<dyn StateBackend>,
     namespace: String,
     ttl_ms: Option<u64>,
 }
 
+#[cfg(test)]
 impl KeyedCounter {
     pub fn new(backend: std::sync::Arc<dyn StateBackend>, namespace: impl Into<String>) -> Self {
         Self {
@@ -382,10 +384,12 @@ impl KeyedCounter {
     }
 }
 
-pub struct WindowAccumulator {
+#[cfg(test)]
+pub(crate) struct WindowAccumulator {
     counter: KeyedCounter,
 }
 
+#[cfg(test)]
 impl WindowAccumulator {
     pub fn new(backend: std::sync::Arc<dyn StateBackend>, operator: &str) -> Self {
         Self {

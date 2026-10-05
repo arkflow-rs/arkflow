@@ -42,13 +42,13 @@ struct GenerateInput {
 }
 impl GenerateInput {
     fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: GenerateInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let batch_size = config.batch_size.unwrap_or(1);
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             config,
             count: AtomicI64::new(0),
             batch_size,
@@ -107,7 +107,7 @@ pub(crate) struct GenerateInputBuilder;
 impl InputBuilder for GenerateInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

@@ -48,7 +48,7 @@ pub struct MemoryInput {
 impl MemoryInput {
     /// Create a new memory input component
     pub fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: MemoryInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
@@ -75,7 +75,7 @@ impl MemoryInput {
         }
 
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             queue: Arc::new(Mutex::new(queue)),
             connected: AtomicBool::new(false),
             codec,
@@ -139,7 +139,7 @@ pub(crate) struct MemoryInputBuilder;
 impl InputBuilder for MemoryInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

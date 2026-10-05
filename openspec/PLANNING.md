@@ -544,7 +544,7 @@ S3 WAL 异步路径必崩（tokio 嵌套 runtime panic，实测复现）｜租�
 
 1. **批次 A 数据正确性**：S3-WAL、remote 去重、L3 归因、input 取消安全、SQL 池、buffer 丢数据。
 2. **批次 B 组件可用性**：租约 epoch、Pulsar output/input、multiple_inputs、HTTP bind、console token 链。
-3. **批次 C API 面收缩**（v1.0 semver 前一次性）：~685 pub item 修剪、`Option<&String>`、删 Pipeline/dead variants、HealthCheckConfig 改名。
+3. **批次 C API 面收缩**（v1.0 semver 前一次性） ✅ 2026-10-05 已落地（`shrink-core-api-surface`）：pub item 修剪（318→221 顶层，139 降级 + 死代码删除 + 测试专用项 cfg(test) 门控）、5 个 builder trait `Option<&String>`→`Option<&str>`、删 Pipeline（此前已删）/dead Error variants、`HealthCheckConfig`→`NodeConfig` 改名拆分（serde flatten，YAML 逐字节不变）、`resolve_candidate_payload` 迁 server、`Temporary::get` 不泄漏 `ColumnarValue`。
 4. **批次 D P2 高优**：内核无界缓冲/超时、RuntimeManager 两并发缺陷、认证中间件化+401 矩阵测试、Error Boundary、文档脱节批。
 5. **批次 E 发布工程** ✅ 2026-10-04 已落地（`release-engineering-batch-e`；~~发 0.6 释放积压~~ 维护者决策作废——积压随 v1.0 一次性释放）：release.yml（tag 校验 + linux/macOS 四平台二进制 + GitHub Release + crate `publish --dry-run` 校验）、rust.yml fmt/clippy 门禁、CHANGELOG.md/SECURITY.md、reference/versioning.md 版本策略与升级指南（en/zh）、cli.md `arkflow-server` 章节、distributed-jobs 运营上限（en/zh）；插件层契约合规测试框架已随 P1-5 提前落地。
 

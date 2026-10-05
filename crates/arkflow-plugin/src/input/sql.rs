@@ -132,10 +132,10 @@ pub struct SqlInput {
 }
 
 impl SqlInput {
-    pub fn new(name: Option<&String>, sql_config: SqlInputConfig) -> Result<Self, Error> {
+    pub fn new(name: Option<&str>, sql_config: SqlInputConfig) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             sql_config,
             stream: Arc::new(Mutex::new(None)),
             cancellation_token,
@@ -320,7 +320,7 @@ pub(crate) struct SqlInputBuilder;
 impl InputBuilder for SqlInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

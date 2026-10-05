@@ -18,7 +18,7 @@ use serde_json::json;
 
 /// Key under which the compiled source/sink payloads carry the original
 /// codec config (see `StreamJobAdapter::decode_codec`).
-pub const CODEC_PAYLOAD_KEY: &str = "__stream_codec";
+pub(crate) const CODEC_PAYLOAD_KEY: &str = "__stream_codec";
 
 /// Compile one stream (by config index) into a JobSpec.
 pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Error> {

@@ -1793,10 +1793,10 @@ async fn barrier_flows_to_sink_without_stalling_data() {
             reporter: Some(report_tx),
             failure_reporter: None,
             barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+            partition: Some(0),
             state: None,
             task_id: Some("source-0".to_string()),
             event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
-            partition: Some(0),
             metrics: None,
             finished_reporter: None,
         },
@@ -1844,14 +1844,11 @@ async fn coordinator_completes_only_after_all_participants() {
 
     let report = |task_id: &str, checkpoint_id: &str| ChainSnapshot {
         task_id: task_id.into(),
-        attempt_id: format!("{task_id}-a"),
-        partition: 0,
         barrier: CheckpointBarrier {
             checkpoint_id: checkpoint_id.into(),
             generation: 1,
             trace_context: None,
         },
-        cut_generation: 1,
         state: crate::state::StateSnapshot::new(1, vec![]),
         source_positions: vec![],
         watermark_ms: None,
@@ -3365,10 +3362,7 @@ impl crate::temporary::Temporary for CountingTemporary {
         self.connected.store(true, Ordering::SeqCst);
         Ok(())
     }
-    async fn get(
-        &self,
-        _keys: &[datafusion::logical_expr::ColumnarValue],
-    ) -> Result<Option<MessageBatch>, Error> {
+    async fn get(&self, _keys: &[String]) -> Result<Option<MessageBatch>, Error> {
         // A processor `get` before `connect` is exactly the bug the guard
         // prevents; record it loudly.
         assert!(
@@ -5461,10 +5455,10 @@ async fn barrier_carries_remote_trace_context_across_chains() {
             reporter: Some(report_tx),
             failure_reporter: None,
             barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+            partition: Some(0),
             state: None,
             task_id: Some("source-0".to_string()),
             event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
-            partition: Some(0),
             metrics: None,
             finished_reporter: None,
         },
@@ -7199,10 +7193,10 @@ fn source_hook(
             reporter: None,
             failure_reporter: failure_tx,
             barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+            partition: Some(0),
             state,
             task_id: Some("source-0".to_string()),
             event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
-            partition: Some(0),
             metrics: None,
             finished_reporter: None,
         },
@@ -8352,10 +8346,10 @@ fn barrier_hook_for(task_id: &str) -> crate::executor::task::CheckpointHook {
         reporter: None,
         failure_reporter: None,
         barrier_rx: None,
+        partition: None,
         state: None,
         task_id: Some(task_id.to_string()),
         event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
-        partition: None,
         metrics: None,
         finished_reporter: None,
     }
@@ -8589,10 +8583,7 @@ async fn a_failing_temporary_close_fails_the_run_after_the_chains_exit() {
         async fn connect(&self) -> Result<(), Error> {
             Ok(())
         }
-        async fn get(
-            &self,
-            _keys: &[datafusion::logical_expr::ColumnarValue],
-        ) -> Result<Option<MessageBatch>, Error> {
+        async fn get(&self, _keys: &[String]) -> Result<Option<MessageBatch>, Error> {
             Ok(None)
         }
         async fn close(&self) -> Result<(), Error> {

@@ -204,7 +204,7 @@ struct ProtobufToArrowProcessorBuilder;
 impl ProcessorBuilder for ProtobufToArrowProcessorBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {
@@ -222,7 +222,7 @@ struct ArrowToProtobufProcessorBuilder;
 impl ProcessorBuilder for ArrowToProtobufProcessorBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<serde_json::Value>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error> {

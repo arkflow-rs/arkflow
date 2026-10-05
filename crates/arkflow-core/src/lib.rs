@@ -60,10 +60,7 @@ pub mod wal;
 mod message_batch_tests;
 
 pub const DEFAULT_BINARY_VALUE_FIELD: &str = "__value__";
-pub const DEFAULT_RECORD_BATCH: usize = 8192;
-
-/// Metadata column name prefix
-pub const META_COLUMN_PREFIX: &str = "__meta_";
+pub(crate) const DEFAULT_RECORD_BATCH: usize = 8192;
 
 /// Standard metadata column names for SQL-accessible metadata
 pub mod meta_columns {
@@ -117,12 +114,6 @@ pub enum Error {
 
     #[error("Rate limit exceeded: {0}")]
     RateLimit(String),
-
-    #[error("Lock timeout: {0}")]
-    LockTimeout(String),
-
-    #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
 
     /// An upstream input channel closed while a chain was still reading it.
     /// Dedicated variant so flow control matches structurally instead of

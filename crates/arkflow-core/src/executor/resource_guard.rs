@@ -60,11 +60,37 @@ fn source_name(source: &Arc<dyn Input>) -> &'static str {
 /// Connects a Job's resources in dependency order and closes them in
 /// reverse. Cheap to drop without `close` when nothing was connected.
 #[derive(Default)]
-pub struct JobResourceGuard {
+pub(crate) struct JobResourceGuard {
     connected: Mutex<Vec<Guarded>>,
 }
 
 impl JobResourceGuard {
+    #[cfg(test)]
+    /// Register state backends and temporary stores with an externally
+    /// managed guard (sources/sinks already connected by the caller, e.g. a
+    /// recovery path that restored positions before the graph started).
+    pub(crate) fn attach_shutdown_only(
+        temporaries: &[Arc<dyn Temporary>],
+        states: &[(String, Arc<dyn StateBackend>)],
+    ) -> Self {
+        let guard = Self::new();
+        let mut connected = Vec::new();
+        for (namespace, backend) in states {
+            connected.push(Guarded::State {
+                namespace: namespace.clone(),
+                backend: backend.clone(),
+            });
+        }
+        for (index, temporary) in temporaries.iter().enumerate() {
+            connected.push(Guarded::Temporary {
+                name: index.to_string(),
+                temporary: temporary.clone(),
+            });
+        }
+        *guard.connected.lock().unwrap() = connected;
+        guard
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -128,31 +154,6 @@ impl JobResourceGuard {
         }
         *guard.connected.lock().unwrap() = connected;
         Ok(guard)
-    }
-
-    /// Register state backends and temporary stores with an externally
-    /// managed guard (sources/sinks already connected by the caller, e.g. a
-    /// recovery path that restored positions before the graph started).
-    pub fn attach_shutdown_only(
-        temporaries: &[Arc<dyn Temporary>],
-        states: &[(String, Arc<dyn StateBackend>)],
-    ) -> Self {
-        let guard = Self::new();
-        let mut connected = Vec::new();
-        for (namespace, backend) in states {
-            connected.push(Guarded::State {
-                namespace: namespace.clone(),
-                backend: backend.clone(),
-            });
-        }
-        for (index, temporary) in temporaries.iter().enumerate() {
-            connected.push(Guarded::Temporary {
-                name: index.to_string(),
-                temporary: temporary.clone(),
-            });
-        }
-        *guard.connected.lock().unwrap() = connected;
-        guard
     }
 
     /// Hand ownership of stream resources (sources and sinks) to the chain
@@ -234,10 +235,7 @@ mod tests {
             }
             Ok(())
         }
-        async fn get(
-            &self,
-            _keys: &[datafusion::logical_expr::ColumnarValue],
-        ) -> Result<Option<crate::MessageBatch>, Error> {
+        async fn get(&self, _keys: &[String]) -> Result<Option<crate::MessageBatch>, Error> {
             Ok(None)
         }
         async fn close(&self) -> Result<(), Error> {

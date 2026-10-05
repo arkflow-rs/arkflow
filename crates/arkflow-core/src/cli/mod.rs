@@ -402,7 +402,7 @@ pub fn init_logging(config: &EngineConfig) {
             (None, LogFormat::PLAIN) => fmt::layer().pretty().with_filter(level_filter).boxed(),
         };
 
-    let otel_layer = build_otel_layer(&config.health_check.observability.tracing)
+    let otel_layer = build_otel_layer(&config.node.observability.tracing)
         .map(|layer| layer.with_filter(level_filter));
 
     // try_init: a second initialization (e.g. tests, or an engine restart in

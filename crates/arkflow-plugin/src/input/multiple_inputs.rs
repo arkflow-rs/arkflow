@@ -180,7 +180,7 @@ impl Input for MultipleInputs {
 
 impl MultipleInputs {
     fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: MultipleInputsConfig,
         resource: &Resource,
     ) -> Result<Self, Error> {
@@ -213,7 +213,7 @@ impl MultipleInputs {
         };
 
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             inputs,
             sender,
             receiver,
@@ -227,7 +227,7 @@ struct MultipleInputsBuilder;
 impl InputBuilder for MultipleInputsBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<Value>,
         codec: Option<Arc<dyn Codec>>,
         resource: &Resource,

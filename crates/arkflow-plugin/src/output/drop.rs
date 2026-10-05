@@ -49,7 +49,7 @@ struct DropOutputBuilder;
 impl OutputBuilder for DropOutputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         _: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

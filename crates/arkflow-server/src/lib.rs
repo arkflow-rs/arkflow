@@ -90,24 +90,26 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn from_engine(config: &arkflow_core::config::EngineConfig) -> Self {
-        let health = &config.health_check;
+        let health = &config.node.health;
+        let control_api = &config.node.control_api;
+        let agent = &config.node.agent;
         Self {
             enabled: health.enabled,
             address: health.address.clone(),
-            api_prefix: health.api_prefix.clone(),
+            api_prefix: control_api.api_prefix.clone(),
             health_path: health.health_path.clone(),
             readiness_path: health.readiness_path.clone(),
             tls_cert: None,
             tls_key: None,
             liveness_path: health.liveness_path.clone(),
-            cors_origins: health.cors_origins.clone(),
-            node_token: health.node_token.clone(),
+            cors_origins: control_api.cors_origins.clone(),
+            node_token: agent.node_token.clone(),
             insecure_local: false,
             hub_storage: None,
-            lease_ttl_ms: health.agent_lease_ttl_ms,
+            lease_ttl_ms: agent.agent_lease_ttl_ms,
             poll_interval_ms: default_poll_interval_ms(),
-            session_ttl_ms: health.agent_session_ttl_ms,
-            observability: health.observability.clone(),
+            session_ttl_ms: agent.agent_session_ttl_ms,
+            observability: config.node.observability.clone(),
         }
     }
 
@@ -4294,7 +4296,10 @@ mod tests {
         assert_eq!(bearer_session_token(&headers_with(Some("Bearer   "))), None);
     }
 
-    use arkflow_core::config::{EngineConfig, HealthCheckConfig, LoggingConfig};
+    use arkflow_core::config::{
+        AgentConfig, ControlApiConfig, EngineConfig, HealthEndpointsConfig, LoggingConfig,
+        NodeConfig,
+    };
     use arkflow_core::engine::Engine;
     use futures_util::StreamExt;
     use tower::ServiceExt;
@@ -4341,9 +4346,12 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig {
-                api_token: Some("op-token".into()),
-                ..HealthCheckConfig::default()
+            node: NodeConfig {
+                control_api: ControlApiConfig {
+                    api_token: Some("op-token".into()),
+                    ..Default::default()
+                },
+                ..NodeConfig::default()
             },
         });
         let cp = engine.control_plane();
@@ -4387,7 +4395,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         });
         let cp = engine.control_plane();
         let app = router(cp, &ServerConfig::default());
@@ -4450,7 +4458,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         });
         let app = router(engine.control_plane(), &ServerConfig::default());
         let response = app
@@ -4512,15 +4520,18 @@ mod tests {
 
     #[tokio::test]
     async fn protected_routes_reject_missing_credentials() {
-        let health = HealthCheckConfig {
-            api_token: Some("secret".into()),
+        let health = NodeConfig {
+            control_api: ControlApiConfig {
+                api_token: Some("secret".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let engine = Engine::new(EngineConfig {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: health,
+            node: health,
         });
         let app = router(engine.control_plane(), &ServerConfig::default());
         let response = app
@@ -4651,7 +4662,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         });
         let control_plane = engine.control_plane();
         control_plane.health().set_ready(false);
@@ -4726,7 +4737,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         });
         let control_plane = engine.control_plane();
         control_plane.health().set_ready(true);
@@ -4748,15 +4759,18 @@ mod tests {
 
     #[tokio::test]
     async fn resource_api_integration_covers_routes_filters_redaction_and_aliases() {
-        let health = HealthCheckConfig {
-            api_token: Some("secret-token".into()),
+        let health = NodeConfig {
+            control_api: ControlApiConfig {
+                api_token: Some("secret-token".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let engine = Engine::new(EngineConfig {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: health,
+            node: health,
         });
         let control_plane = engine.control_plane();
         control_plane.health().set_ready(true);
@@ -6805,24 +6819,32 @@ mod tests {
     /// The `from_engine` mapping and startup address validation.
     #[test]
     fn server_config_from_engine_maps_health_settings_and_rejects_bad_addresses() {
-        let health = HealthCheckConfig {
-            enabled: false,
-            address: "127.0.0.1:9999".into(),
-            health_path: "/hub-health".into(),
-            readiness_path: "/hub-readiness".into(),
-            liveness_path: "/hub-liveness".into(),
-            api_prefix: "/api/v2".into(),
-            cors_origins: vec!["https://console.example".into()],
-            node_token: Some("node".into()),
-            agent_lease_ttl_ms: 12_345,
-            agent_session_ttl_ms: 678,
-            ..HealthCheckConfig::default()
+        let health = NodeConfig {
+            health: HealthEndpointsConfig {
+                enabled: false,
+                address: "127.0.0.1:9999".into(),
+                health_path: "/hub-health".into(),
+                readiness_path: "/hub-readiness".into(),
+                liveness_path: "/hub-liveness".into(),
+            },
+            control_api: ControlApiConfig {
+                api_prefix: "/api/v2".into(),
+                cors_origins: vec!["https://console.example".into()],
+                ..Default::default()
+            },
+            agent: AgentConfig {
+                node_token: Some("node".into()),
+                agent_lease_ttl_ms: 12_345,
+                agent_session_ttl_ms: 678,
+                ..Default::default()
+            },
+            ..NodeConfig::default()
         };
         let config = ServerConfig::from_engine(&EngineConfig {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: health,
+            node: health,
         });
         assert!(!config.enabled);
         assert_eq!(config.address, "127.0.0.1:9999");
@@ -6866,7 +6888,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         });
         // Disabled: return before binding anything.
         let disabled = ServerConfig {
@@ -6918,7 +6940,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         });
         // Disabled: returns immediately.
         let disabled = ServerConfig {
@@ -6995,7 +7017,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         });
         let config = ServerConfig {
             cors_origins: vec!["https://console.example".into()],
@@ -9553,9 +9575,12 @@ mod tests {
             streams: vec![stream],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig {
-                api_token: Some("local-token".into()),
-                ..HealthCheckConfig::default()
+            node: NodeConfig {
+                control_api: ControlApiConfig {
+                    api_token: Some("local-token".into()),
+                    ..Default::default()
+                },
+                ..NodeConfig::default()
             },
         });
         let control_plane = engine.control_plane();
@@ -9696,9 +9721,12 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig {
-                api_token: Some("local-token".into()),
-                ..HealthCheckConfig::default()
+            node: NodeConfig {
+                control_api: ControlApiConfig {
+                    api_token: Some("local-token".into()),
+                    ..Default::default()
+                },
+                ..NodeConfig::default()
             },
         });
         let app = router(engine.control_plane(), &ServerConfig::default());
@@ -9818,7 +9846,7 @@ mod tests {
             streams: vec![],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig::default(),
+            node: NodeConfig::default(),
         });
         let port = free_port();
         let config = ServerConfig {
@@ -10630,9 +10658,12 @@ mod tests {
             streams: vec![generate_local_stream("local-orders")],
             jobs: Vec::new(),
             logging: LoggingConfig::default(),
-            health_check: HealthCheckConfig {
-                api_token: Some("local-token".into()),
-                ..HealthCheckConfig::default()
+            node: NodeConfig {
+                control_api: ControlApiConfig {
+                    api_token: Some("local-token".into()),
+                    ..Default::default()
+                },
+                ..NodeConfig::default()
             },
         });
         let cp = engine.control_plane();
@@ -10641,7 +10672,7 @@ mod tests {
                 streams: vec![generate_local_stream("local-orders")],
                 jobs: Vec::new(),
                 logging: LoggingConfig::default(),
-                health_check: HealthCheckConfig::default(),
+                node: NodeConfig::default(),
             })
             .await
             .expect("the stream registers");

@@ -13,22 +13,22 @@
 //! failed sink write cannot durably apply a mutation a replay would repeat.
 
 use crate::processor::Processor;
+#[cfg(test)]
 use crate::state::StateBackend;
 use crate::Error;
 use crate::MessageBatchRef;
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int16Array, Int32Array, Int64Array, Int8Array,
-    StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Array, ArrayRef, BinaryArray, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+    UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
-use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
 /// Wrapper that injects per-key state (running count) as a column before the
 /// inner processor runs, persisting counts into the task's state namespace.
-pub struct StatefulOperator {
+pub(crate) struct StatefulOperator {
     inner: Arc<dyn Processor>,
     /// Increments stage in the journal and apply when the final output
     /// acknowledgement fires. The constructor that accepts a backend creates
@@ -42,6 +42,7 @@ pub struct StatefulOperator {
 }
 
 impl StatefulOperator {
+    #[cfg(test)]
     pub fn new(
         inner: Arc<dyn Processor>,
         backend: Arc<dyn StateBackend>,
@@ -288,18 +289,6 @@ impl StatefulOperator {
         enriched.set_input_name(batch.get_input_name());
         Ok(Arc::new(enriched))
     }
-}
-
-/// Filter helper shared with the gate (kept here for stateful routing use).
-pub fn filter_rows(
-    batch: &crate::MessageBatch,
-    keep: Vec<bool>,
-) -> Result<crate::MessageBatchRef, Error> {
-    let filtered = filter_record_batch(batch.record_batch(), &BooleanArray::from(keep))
-        .map_err(|error| Error::Process(format!("filter stateful batch: {error}")))?;
-    let mut filtered_batch = crate::MessageBatch::new_arrow(filtered);
-    filtered_batch.set_input_name(batch.get_input_name());
-    Ok(Arc::new(filtered_batch))
 }
 
 #[cfg(test)]

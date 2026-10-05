@@ -39,7 +39,7 @@ impl<T> Codec for T where T: Encoder + Decoder {}
 pub trait CodecBuilder: Send + Sync {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Codec>, Error>;
@@ -61,7 +61,7 @@ impl CodecConfig {
         let builders = CODEC_BUILDERS.read().unwrap();
 
         if let Some(builder) = builders.get(&self.codec_type) {
-            builder.build(self.name.as_ref(), &self.config, resource)
+            builder.build(self.name.as_deref(), &self.config, resource)
         } else {
             Err(Error::Config(format!(
                 "Unknown codec type: {}",

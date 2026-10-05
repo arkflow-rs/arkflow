@@ -97,14 +97,14 @@ pub struct NatsInput {
 impl NatsInput {
     /// Create a new NATS input component
     pub fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         config: NatsInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         let (sender, receiver) = flume::bounded::<Delivery>(1000);
         Ok(Self {
-            input_name: name.cloned(),
+            input_name: name.map(str::to_string),
             config,
             client: Arc::new(RwLock::new(None)),
             js_consumer: Arc::new(RwLock::new(None)),
@@ -413,7 +413,7 @@ pub(crate) struct NatsInputBuilder;
 impl InputBuilder for NatsInputBuilder {
     fn build(
         &self,
-        name: Option<&String>,
+        name: Option<&str>,
         config: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,

@@ -158,7 +158,7 @@ impl BufferBuilder for TumblingWindowBuilder {
     /// * `Result<Arc<dyn Buffer>, Error>` - A new tumbling window buffer instance or an error
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         config: &Option<Value>,
         resource: &Resource,
     ) -> Result<Arc<dyn Buffer>, Error> {
@@ -339,7 +339,7 @@ mod tests {
         });
 
         let result = builder.build(
-            Some(&"test-buffer".to_string()),
+            Some("test-buffer"),
             &Some(config_json),
             &create_test_resource(),
         );
@@ -350,11 +350,7 @@ mod tests {
     #[test]
     fn test_tumbling_window_builder_without_config() {
         let builder = TumblingWindowBuilder;
-        let result = builder.build(
-            Some(&"test-buffer".to_string()),
-            &None,
-            &create_test_resource(),
-        );
+        let result = builder.build(Some("test-buffer"), &None, &create_test_resource());
 
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::Config(_))));
@@ -368,7 +364,7 @@ mod tests {
         });
 
         let result = builder.build(
-            Some(&"test-buffer".to_string()),
+            Some("test-buffer"),
             &Some(config_json),
             &create_test_resource(),
         );

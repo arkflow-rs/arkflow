@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
-pub enum NumericKind {
+pub(crate) enum NumericKind {
     #[default]
     Int64,
     Float32,
@@ -68,7 +68,7 @@ impl NumericKind {
 /// envelope so state stays backend-agnostic; the numeric kind travels with
 /// the payload so a restored aggregate emits its original type.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct AggregateBuffer {
+pub(crate) struct AggregateBuffer {
     pub count: u64,
     #[serde(default)]
     pub kind: NumericKind,
@@ -317,7 +317,7 @@ impl AggregateBuffer {
 /// Trigger policy for a window operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WindowTrigger {
+pub(crate) enum WindowTrigger {
     /// Emit when the watermark passes the window end (event-time mode).
     Watermark,
     /// Emit on an interval regardless of watermark state (legacy
@@ -327,7 +327,7 @@ pub enum WindowTrigger {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WindowKind {
+pub(crate) enum WindowKind {
     Tumbling {
         size_ms: i64,
     },
@@ -345,7 +345,7 @@ pub enum WindowKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WindowOperatorConfig {
+pub(crate) struct WindowOperatorConfig {
     #[serde(flatten)]
     pub kind: WindowKind,
     pub timestamp_field: String,
@@ -486,7 +486,7 @@ const MAX_SLIDING_MEMBERSHIPS_PER_EVENT: i64 = 10_000;
 /// The columnar window operator. One instance per stateful operator task;
 /// state is namespaced under the operator id so parallel subtasks stay
 /// isolated.
-pub struct ColumnarWindowOperator {
+pub(crate) struct ColumnarWindowOperator {
     config: WindowOperatorConfig,
     /// Event-time session lateness is evaluated here because the source gate
     /// cannot know a session's key-dependent, dynamically extended end.  The
@@ -733,6 +733,7 @@ impl ColumnarWindowOperator {
         })
     }
 
+    #[cfg(test)]
     pub fn new(
         config: WindowOperatorConfig,
         backend: Arc<dyn StateBackend>,
@@ -751,6 +752,7 @@ impl ColumnarWindowOperator {
     /// Build a window with the upstream Job time policy.  Session windows use
     /// this policy in the operator, after their dynamic per-key boundary is
     /// known, rather than guessing a static boundary in the source gate.
+    #[cfg(test)]
     pub fn with_late_event_policy(
         config: WindowOperatorConfig,
         backend: Arc<dyn StateBackend>,
@@ -798,6 +800,7 @@ impl ColumnarWindowOperator {
     }
 
     /// Build the operator with output-gated state commits.
+    #[cfg(test)]
     pub fn with_journal(
         config: WindowOperatorConfig,
         backend: Arc<dyn StateBackend>,
@@ -2679,6 +2682,7 @@ impl ColumnarWindowOperator {
     /// in the window's transaction and apply to the backend only when the
     /// window's output acknowledgement commits them — a checkpoint therefore
     /// never observes a buffer whose input acknowledgements are still pending.
+    #[cfg(test)]
     pub fn persist_buffers(&self) -> Result<(), Error> {
         self.persist_buffers_for_fired(&[])
     }
@@ -2852,6 +2856,7 @@ impl ColumnarWindowOperator {
     }
 
     /// Restore working buffers from the state backend.
+    #[cfg(test)]
     pub fn restore_buffers(&self) -> Result<usize, Error> {
         let restored = self.restore_buffers_inner()?;
         *self.loaded.lock().unwrap() = true;
