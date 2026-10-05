@@ -748,13 +748,9 @@ fn hash_schema(schema: &Schema) -> u64 {
 // Frame framing over async sockets
 // ---------------------------------------------------------------------------
 
-/// Reads a frame while applying the configured payload and per-read idle
-/// limits.  The header is decoded before allocating the payload buffer.
-#[cfg(test)]
-/// Reads one frame: a 24-byte header followed by its payload.
-#[cfg(test)]
 /// Writes one frame: header then payload, ideally buffered behind the caller's
 /// `BufWriter` so small frames coalesce until the flush tick.
+#[cfg(test)]
 pub(crate) async fn write_frame(
     writer: &mut (impl AsyncWrite + Unpin),
     quad: Quad,
@@ -764,6 +760,7 @@ pub(crate) async fn write_frame(
     write_frame_with_limit(writer, quad, kind, payload, MAX_FRAME_LEN).await
 }
 
+/// Reads one frame: a 24-byte header followed by its payload.
 #[cfg(test)]
 pub(crate) async fn read_frame(
     reader: &mut (impl AsyncRead + Unpin),
@@ -771,6 +768,8 @@ pub(crate) async fn read_frame(
     read_frame_with_limits(reader, MAX_FRAME_LEN, None).await
 }
 
+/// Reads a frame while applying the configured payload and per-read idle
+/// limits.  The header is decoded before allocating the payload buffer.
 pub(crate) async fn read_frame_with_limits(
     reader: &mut (impl AsyncRead + Unpin),
     max_frame_len: u32,

@@ -52,7 +52,12 @@ fn utf8_keys(value: ColumnarValue) -> Result<Vec<String>, Error> {
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => Ok(vec![s]),
         ColumnarValue::Array(array) => {
             let strings = array
-                .as_string::<i32>()
+                .as_string_opt::<i32>()
+                .ok_or_else(|| {
+                    Error::Process(
+                        "temporary key expression must evaluate to UTF-8 strings".to_string(),
+                    )
+                })?
                 .iter()
                 .map(|v| {
                     v.ok_or_else(|| {
@@ -567,6 +572,25 @@ mod tests {
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field};
     use std::cell::RefCell;
+
+    #[test]
+    fn utf8_keys_fails_closed_instead_of_panicking() {
+        let ok = utf8_keys(ColumnarValue::Array(std::sync::Arc::new(
+            StringArray::from(vec!["a", "b"]),
+        )))
+        .unwrap();
+        assert_eq!(ok, vec!["a".to_string(), "b".to_string()]);
+
+        let nulls = StringArray::from(vec![Some("a"), None]);
+        let err = utf8_keys(ColumnarValue::Array(std::sync::Arc::new(nulls))).unwrap_err();
+        assert!(err.to_string().contains("null key"), "{err}");
+
+        // A non-UTF-8 key expression must return an error, never panic on
+        // the string downcast.
+        let ints = Int64Array::from(vec![1, 2]);
+        let err = utf8_keys(ColumnarValue::Array(std::sync::Arc::new(ints))).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
+    }
 
     #[tokio::test]
     async fn test_sql_processor_basic_query() {

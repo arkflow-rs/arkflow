@@ -61,6 +61,12 @@ impl Temporary for RedisTemporary {
 
         let mut connection = cli.clone();
 
+        // An empty key list (empty batch) must not reach Redis: MGET without
+        // keys is a protocol error and an empty pipeline is meaningless.
+        if keys.is_empty() {
+            return Ok(None);
+        }
+
         let data: Vec<Vec<String>> = match self.config.redis_type {
             RedisType::List => {
                 let mut pipeline = Pipeline::with_capacity(keys.len());
