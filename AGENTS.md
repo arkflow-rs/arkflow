@@ -71,5 +71,6 @@ CI requires the protobuf compiler (`protoc` on PATH). Rust 1.97+ (`rust-version`
 - Both `README.md` and `README_zh.md` are CI-checked for doc accuracy — keep component lists in sync with actual plugins.
 - The control-plane console (`console/`) is a separate Node/Vite app with its own package.json; run its checks from that directory.
 - `gh pr edit` can fail silently with only a GraphQL deprecation warning (Projects classic sunset) — the title/body mutation never lands. Always verify with `gh pr view`, and fall back to the REST endpoint: `gh api repos/arkflow-rs/arkflow/pulls/<n> -X PATCH -f title=... -f body=...`.
+- `git push` over this network intermittently fails with "HTTP/2 framing layer" or LibreSSL errors — retry, and if it persists force HTTP/1.1: `git -c http.version=HTTP/1.1 push`.
 - `openspec archive <change> --yes` aborts cleanly when a delta's `MODIFIED Requirements` header doesn't exactly match the main spec (e.g. a renamed requirement); fix by adding a `## RENAMED Requirements` block (`FROM:`/`TO:`) to the delta, then re-run.
 - `cargo test -p arkflow-plugin --test redis_cluster` fails with "port is already allocated" when a leftover testcontainers container holds :16379 — `docker rm -f` it (find via `docker ps -a | grep 16379`) and rerun; the failure is environmental, not a regression.
