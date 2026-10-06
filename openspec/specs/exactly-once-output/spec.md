@@ -112,7 +112,7 @@ A Kafka output configured with `exactly_once: true` SHALL require a non-empty `t
 
 #### Scenario: 混入异源 topic 的行显式失败
 
-- **WHEN** L3 write_batch 的批次携带 `__meta_topic` 列，且存在 Kafka 位点元数据的行其 topic 不等于配对输入订阅的 group topic
+- **WHEN** L3 write_batch 的批次携带 `__meta_ext` 行级 topic 元数据，且存在 Kafka 位点元数据的行其 `topic` 值不等于配对输入订阅的 group topic
 - **THEN** write_batch 以明确的错误失败，事务不提交、位点不推进——不得把这些行的位点折入 group topic 导致中间记录被跳过
 
 声明 `transactional_offsets` 的输入不得进入分区指派（assign）模式：显式指派的消费者不加入组、无法提供组元数据，`assign_partition` SHALL 以明确配置错误拒绝该组合。

@@ -125,7 +125,7 @@ Settling a delivery SHALL NOT require the input's read loop to wait on a durable
 - **THEN** tracker 计数只结算一次（既有行为保持）
 
 ### Requirement: 缓冲型处理器投递 SHALL 延迟结算 ack 至发射确认
-以内存缓冲聚合多条输入投递的处理器（`batch`）SHALL 经 `process_with_ack` 持有投递 ack：缓冲期间返回 `Deferred`（不结算 ack、不提交源位点）；触发 flush 发射合并批时 SHALL 以替换 ack 携带全部暂存 ack，下游写出确认成功后一并结算，失败/中止时按组合 ack 语义补偿（undo/abort 传导至每个暂存 ack）。处理器链取消或关闭时，未发射的暂存 ack SHALL 被 abort；仅当输入源的确认模式与配置保证该投递在恢复后重放时，才由源重放（如 Kafka 已确认 offset 之前的消息；QoS 0 的 MQTT 等至多一次投递无此保证）。
+以内存缓冲聚合多条输入投递的处理器（`batch`）SHALL 经 `process_with_ack` 持有投递 ack：缓冲期间返回 `Deferred`（不结算 ack、不提交源位点）；触发 flush 发射合并批时 SHALL 以替换 ack 携带全部暂存 ack，下游写出确认成功后一并结算，失败/中止时按组合 ack 语义补偿（undo/abort 传导至每个暂存 ack）。链因错误退出时，处理器 close 路径 SHALL abort 未发射的暂存 ack；链收到优雅取消（如 SIGTERM）时，执行体 SHALL 先 abort 队列中尚未处理的投递，再经 Finish 冲刷缓冲尾部：若下游在其自身取消前写出该尾部批，暂存 ack 随写出结算（投递完成）；若下游未读取，该批 ack 不结算、源位点不前进，恢复后重放——两条路径均满足 at-least-once。仅当输入源的确认模式与配置保证该投递在恢复后重放时，才由源重放（如 Kafka 已确认 offset 之前的消息；QoS 0 的 MQTT 等至多一次投递无此保证）。
 
 #### Scenario: 缓冲期间源位点不前进
 
@@ -142,8 +142,13 @@ Settling a delivery SHALL NOT require the input's read loop to wait on a durable
 - **WHEN** flush 后合并批写出失败
 - **THEN** 组合 ack 的失败语义（undo/abort）传导至每个暂存 ack，无一被错误确认
 
-#### Scenario: 关闭时未发射投递被 abort
+#### Scenario: 错误关闭时未发射投递被 abort
 
-- **WHEN** 处理器所在链取消/关闭且缓冲中仍有未发射投递，且输入源的确认模式与配置保证该未确认投递在重启时重放
-- **THEN** 暂存 ack 被 abort（而非 ack），恢复后重放
+- **WHEN** 处理器所在链因错误退出（非优雅取消）且缓冲中仍有未发射投递，且输入源的确认模式与配置保证该未确认投递在重启时重放
+- **THEN** 处理器 close 路径将暂存 ack abort（而非 ack），恢复后重放
+
+#### Scenario: 优雅取消时尾部冲刷保持 at-least-once
+
+- **WHEN** 处理器所在链收到优雅取消且缓冲中仍有未发射投递
+- **THEN** 链先 abort 队列中尚未处理的投递，尾部合并批经 Finish 冲刷下游：下游写出则暂存 ack 随写出结算（无需重放）；下游未读取则 ack 不结算、位点不前进，恢复后重放。两种交错都不丢失、不虚确认
 

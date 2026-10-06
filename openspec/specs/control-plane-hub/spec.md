@@ -161,5 +161,5 @@ The Hub SHALL accept the resource gauge keys `node_cpu_usage_percent`, `node_mem
 #### Scenario: 内部导入治理不改变公共面
 
 - **WHEN** hub 子模块导入显式化重构合入
-- **THEN** crate 外部（api/agent/bootstrap/bin 与 arkflow 二进制）对 `crate::hub::*` 公共项的既有引用无需修改即可编译，server 全量测试通过
+- **THEN** server crate 内部模块（api/agent/bootstrap/bin，经 crate 内路径 `crate::hub::*`）与外部 crate（如 arkflow 二进制，经包限定路径 `arkflow_server::hub::*`）对 hub 公共项的既有引用无需修改即可编译，server 全量测试通过
 

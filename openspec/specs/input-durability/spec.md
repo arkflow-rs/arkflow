@@ -319,7 +319,7 @@ The redb-backed local WAL store SHALL preserve its operator-facing durability co
 - **THEN** 既有 30s 排空窗口与显式失败路径原样保持
 
 ### Requirement: Segment-based batching with a bounded replay window
-The object-store backend SHALL persist entries as immutable segment objects written in batches. A source acknowledgement SHALL complete only after the acknowledged entry's sequence is contained in a sealed segment object: un-sealed work is redone from source re-delivery on restart (replay window), never silently lost. The replay window SHALL be bounded by the configurable segment flush triggers (`max_entries`, `max_bytes`, `flush_interval`), which also bound the acknowledgement latency added by this gating. The `per-entry` sync policy SHALL be rejected for the object-store backend.
+The object-store backend SHALL persist entries as immutable segment objects written in batches. A source acknowledgement SHALL complete only after the acknowledged entry's sequence is contained in a sealed segment object: un-sealed work is redone from source re-delivery on restart (replay window), never silently lost. The replay window SHALL be bounded by the configurable segment flush triggers (`max_entries`, `max_bytes`, `flush_interval`), which set the sealing cadence and thereby the gating contribution to acknowledgement latency; the completion time of each object-store write itself is governed by the storage client, not by these triggers. The `per-entry` sync policy SHALL be rejected for the object-store backend.
 
 #### Scenario: Acknowledged entries are always sealed
 - **WHEN** a source acknowledgement for sequence N completes on the object-store backend
@@ -327,14 +327,14 @@ The object-store backend SHALL persist entries as immutable segment objects writ
 
 #### Scenario: Replay window is configurable
 - **WHEN** the segment flush triggers are set
-- **THEN** the maximum number of entries redone on node loss — and the maximum acknowledgement latency added by seal gating — are bounded by those triggers
+- **THEN** the maximum number of entries redone on node loss is bounded by those triggers, and the seal-gating contribution to acknowledgement latency follows their cadence (object-store write completion time is not bounded by them)
 
 #### Scenario: per-entry sync is rejected on the object-store backend
 - **WHEN** a stream is configured with `backend: s3` and `sync: per_entry`
 - **THEN** the configuration is rejected at load time with an error
 
 ### Requirement: WAL flusher failures SHALL be observable
-The WAL background flusher SHALL NOT silently swallow flush failures on its wake path: each failed flush SHALL be counted in a flush-failure metric and reported via a rate-limited warning, and a persistently failing flusher SHALL escalate to error-level logging. The shutdown path SHALL continue to surface the final flush result through `close()` as today.
+The WAL background flusher SHALL NOT silently swallow flush failures on its wake path: each failed flush SHALL be counted in a flush-failure counter and reported via a rate-limited warning, and a persistently failing flusher SHALL escalate to error-level logging. The counter is maintained inside the WAL (crate-visible to tests; exposing it through the metrics plane is a data-plane-observability follow-up), so today's production visibility is the warning/error log trail. The shutdown path SHALL continue to surface the final flush result through `close()` as today.
 
 #### Scenario: Persistent store failure is visible
 - **WHEN** the WAL flusher's store writes fail persistently on the wake path

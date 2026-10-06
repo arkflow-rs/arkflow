@@ -37,8 +37,8 @@ TBD - created by archiving change fix-plugin-p2-batch. Update Purpose after arch
 
 #### Scenario: 单消息路径行为不变
 
-- **WHEN** 逐条解码（`on_error: skip` 或 Kafka 逐消息解码）
-- **THEN** 每条按自身记录推断，语义与既有版本一致
+- **WHEN** Kafka 逐消息解码，或 `on_error: skip` 模式逐条筛选坏消息
+- **THEN** Kafka 逐消息路径每条按自身记录推断；`skip` 模式的逐条解析仅用于隔离坏消息（warn 并丢弃），幸存消息合入一次全量推断产出批次（并集/取宽语义同样适用）。两条路径语义与既有版本一致
 
 #### Scenario: 全为整数时类型不变
 
