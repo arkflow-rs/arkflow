@@ -21,6 +21,7 @@ async fn hub_problem_maps_stale_leader_to_503() {
 }
 
 use super::*;
+use crate::hub::AgentOperation;
 
 fn headers_with(authorization: Option<&str>) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -1400,7 +1401,7 @@ async fn configuration_apply_persists_target_and_reconciles_offline_write() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(operation.operation, "apply_configuration");
+    assert_eq!(operation.operation.as_str(), "apply_configuration");
     assert_eq!(
         operation.config_version_id.as_deref(),
         Some(config_version.as_str())
@@ -1413,7 +1414,7 @@ async fn configuration_apply_persists_target_and_reconciles_offline_write() {
         .await;
     let commands = commands.unwrap();
     assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].operation, "apply_configuration");
+    assert_eq!(commands[0].operation.as_str(), "apply_configuration");
     assert_eq!(
         commands[0].config_version_id.as_deref(),
         Some(config_version.as_str())
@@ -2303,7 +2304,7 @@ async fn hub_configuration_validate_and_diff_round_trip_through_commands() {
     let commands: Vec<hub::AgentCommand> = serde_json::from_slice(&body).unwrap();
     let command = commands
         .iter()
-        .find(|command| command.operation == "validate_configuration")
+        .find(|command| command.operation.as_str() == "validate_configuration")
         .expect("validate command dispatched");
     assert!(command.payload.is_some());
 
@@ -6074,7 +6075,7 @@ async fn no_storage_hub_reports_enqueue_and_orchestration_limits() {
         let _ = hub
             .enqueue(
                 "node-caps".into(),
-                "validate_configuration".into(),
+                AgentOperation::parse("validate_configuration"),
                 format!("cap-{index}"),
                 None,
             )

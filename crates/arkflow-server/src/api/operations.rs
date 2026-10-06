@@ -19,7 +19,7 @@ pub(super) async fn hub_operations(
         items.retain(|item| item.resource_id == resource_id);
     }
     if let Some(value) = query.operation {
-        items.retain(|item| item.operation == value);
+        items.retain(|item| item.operation.as_str() == value);
     }
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
@@ -87,7 +87,7 @@ pub(super) async fn operations(
         items.retain(|item| item.resource_id == resource_id);
     }
     if let Some(operation) = query.operation {
-        items.retain(|item| item.operation == operation);
+        items.retain(|item| item.operation.as_str() == operation.as_str());
     }
     if let Some(state) = query.state {
         items.retain(|item| item.state == state);

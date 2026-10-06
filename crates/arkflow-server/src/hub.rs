@@ -43,9 +43,9 @@ pub use command_metrics::CommandMetrics;
 pub use error::HubError;
 pub use leadership::{HubHaConfig, Leadership};
 pub use wire::{
-    AgentAuth, AgentCommand, CommandResult, HeartbeatRequest, HubEvent, HubNode, HubNodeMetrics,
-    HubOperation, HubOperationState, JobObservationRequest, NodeConnectionState, NodeReport,
-    RegisterRequest, RegisterResponse,
+    AgentAuth, AgentCommand, AgentOperation, CommandResult, HeartbeatRequest, HubEvent, HubNode,
+    HubNodeMetrics, HubOperation, HubOperationState, JobObservationRequest, NodeConnectionState,
+    NodeReport, RegisterRequest, RegisterResponse,
 };
 
 use nodes::parse_operator_credential;
@@ -189,7 +189,7 @@ async fn persist_operation(
             operation_id: operation.id.clone(),
             node_id: operation.node_id.clone(),
             resource_id: operation.resource_id.clone(),
-            operation: operation.operation.clone(),
+            operation: operation.operation.to_string(),
             state: serde_json::to_value(operation.state)
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_owned))

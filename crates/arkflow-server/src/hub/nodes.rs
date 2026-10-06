@@ -3,8 +3,8 @@
 use super::error::HubError;
 use super::placement::node_under_pressure;
 use super::wire::{
-    default_protocol_version, AgentAuth, AgentCommand, HeartbeatRequest, HubEvent, HubNode,
-    HubOperation, HubOperationState, NodeConnectionState, NodeReport, RegisterRequest,
+    default_protocol_version, AgentAuth, AgentCommand, AgentOperation, HeartbeatRequest, HubEvent,
+    HubNode, HubOperation, HubOperationState, NodeConnectionState, NodeReport, RegisterRequest,
     RegisterResponse,
 };
 use super::{
@@ -482,7 +482,7 @@ impl Hub {
             .values_mut()
             .filter(|operation| {
                 operation.node_id == node_id
-                    && operation.operation == "job_start"
+                    && operation.operation == AgentOperation::JobStart
                     && !matches!(
                         operation.state,
                         HubOperationState::Failed
@@ -748,7 +748,10 @@ impl Hub {
                         operation.finished_at_ms = Some(now);
                         operation.next_retry_at_ms = Some(now);
                         operation.error = Some("command lease expired before execution".into());
-                        if matches!(operation.operation.as_str(), "job_start" | "job_stop") {
+                        if matches!(
+                            operation.operation,
+                            AgentOperation::JobStart | AgentOperation::JobStop
+                        ) {
                             expired_job_ids.insert(operation.resource_id.clone());
                         } else {
                             expired_retries.push(command.clone());
@@ -791,7 +794,7 @@ impl Hub {
         // reconciliation path below so a changed Job spec/placement is
         // rebuilt instead of replaying stale command data.
         for command in expired_retries {
-            if command.operation.starts_with("job_") {
+            if command.operation.is_job() {
                 let Some(job) = self.job(&command.resource_id).await? else {
                     continue;
                 };

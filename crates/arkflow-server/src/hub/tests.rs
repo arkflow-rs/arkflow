@@ -3,8 +3,8 @@ use super::error::HubError;
 use super::leadership::{HubHaConfig, Leadership};
 use super::nodes::{sanitize_capabilities, sanitize_metrics};
 use super::wire::{
-    AgentAuth, AgentCommand, CommandResult, HeartbeatRequest, HubOperation, HubOperationState,
-    NodeConnectionState, NodeReport, RegisterRequest,
+    AgentAuth, AgentCommand, AgentOperation, CommandResult, HeartbeatRequest, HubOperation,
+    HubOperationState, NodeConnectionState, NodeReport, RegisterRequest,
 };
 use super::{
     default_session_ttl_ms, now_ms, Hub, HubConfig, MAX_COMMANDS_PER_NODE,
@@ -322,7 +322,7 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
     let commands = hub1.commands(auth.clone()).await.unwrap();
     let start_command = commands
         .iter()
-        .find(|command| command.operation == "job_start")
+        .find(|command| command.operation.as_str() == "job_start")
         .expect("job_start must be dispatched for a desired-running job")
         .clone();
     hub1.command_result(
@@ -356,7 +356,8 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
     let restored = hub2.restore_persisted_operations().await.unwrap();
     assert!(restored >= 1, "at least the succeeded start is restored");
     assert!(hub2.operations(None).await.iter().any(|operation| {
-        operation.operation == "job_start" && operation.state == HubOperationState::Succeeded
+        operation.operation.as_str() == "job_start"
+            && operation.state == HubOperationState::Succeeded
     }));
 
     let session2 = hub2
@@ -378,7 +379,7 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
     let commands2 = hub2.commands(auth2.clone()).await.unwrap();
     let confirmation = commands2
         .iter()
-        .find(|command| command.operation == "job_start")
+        .find(|command| command.operation.as_str() == "job_start")
         .expect("one assignment-confirmation start is re-dispatched after the restart");
     // The confirmation completes (a real Agent no-ops a matching assignment).
     hub2.command_result(
@@ -408,7 +409,7 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
     assert!(
         !commands3
             .iter()
-            .any(|command| command.operation == "job_start"),
+            .any(|command| command.operation.as_str() == "job_start"),
         "after the one-shot confirmation the dispatch skip holds again"
     );
 }
@@ -572,7 +573,7 @@ async fn declared_resources_within_capacity_dispatch_normally() {
     assert!(
         commands
             .iter()
-            .any(|command| command.operation == "job_start"),
+            .any(|command| command.operation.as_str() == "job_start"),
         "a fitting job must dispatch"
     );
 }
@@ -615,7 +616,7 @@ async fn durable_replacement_without_checkpoint_fails_closed_before_dispatch() {
         .await
         .unwrap()
         .into_iter()
-        .find(|command| command.operation == "job_start")
+        .find(|command| command.operation.as_str() == "job_start")
         .expect("initial durable deployment is allowed to start empty");
     assert_eq!(
         start
@@ -659,7 +660,7 @@ async fn durable_replacement_without_checkpoint_fails_closed_before_dispatch() {
         !node
             .commands
             .iter()
-            .any(|command| command.operation == "job_start" && command.generation == 2)
+            .any(|command| command.operation.as_str() == "job_start" && command.generation == 2)
     }));
 }
 
@@ -711,7 +712,7 @@ async fn current_generation_recovery_required_failure_overrides_running_observat
             intent_id: None,
             command_id: "command-recovery-required".into(),
             node_id: "node-a".into(),
-            operation: "job_start".into(),
+            operation: AgentOperation::parse("job_start"),
             resource_id: job.job_id.clone(),
             checkpoint_id: None,
             generation: job.generation,
@@ -747,7 +748,7 @@ async fn current_generation_recovery_required_failure_overrides_running_observat
     assert!(hub.nodes.read().await.get("node-a").is_some_and(|node| {
         node.commands
             .iter()
-            .all(|command| command.operation != "job_start")
+            .all(|command| command.operation.as_str() != "job_start")
     }));
 }
 
@@ -863,7 +864,7 @@ async fn a_stopped_job_is_not_recommanded_once_its_stop_succeeds() {
         .values()
         .filter(|record| {
             record.resource_id == "orders"
-                && record.operation == "job_stop"
+                && record.operation.as_str() == "job_stop"
                 && record.node_id == "node-a"
         })
         .count();
@@ -914,7 +915,7 @@ async fn one_jobs_dispatch_failure_does_not_stall_the_scan() {
     for index in 0..MAX_COMMANDS_PER_NODE {
         hub.enqueue_with_metadata(
             "node-a".into(),
-            "start".into(),
+            AgentOperation::parse("start"),
             format!("fill-{index}"),
             None,
             None,
@@ -946,13 +947,15 @@ async fn one_jobs_dispatch_failure_does_not_stall_the_scan() {
     assert!(
         operations
             .values()
-            .any(|record| record.resource_id == "job-healthy" && record.operation == "job_start"),
+            .any(|record| record.resource_id == "job-healthy"
+                && record.operation.as_str() == "job_start"),
         "the healthy Job's start must be enqueued"
     );
     assert!(
         !operations
             .values()
-            .any(|record| record.resource_id == "job-blocked" && record.operation == "job_start"),
+            .any(|record| record.resource_id == "job-blocked"
+                && record.operation.as_str() == "job_start"),
         "the blocked Job's start must be skipped, not enqueued"
     );
 }
@@ -1014,7 +1017,7 @@ async fn stale_operation_and_checkpoint_records_are_reclaimed() {
         intent_id: None,
         command_id: "command-stale".into(),
         node_id: "node-a".into(),
-        operation: "job_stop".into(),
+        operation: AgentOperation::parse("job_stop"),
         resource_id: "orders".into(),
         checkpoint_id: None,
         generation: 1,
@@ -1185,7 +1188,7 @@ async fn replaced_placement_supersedes_abandoned_start_and_stops_it() {
             .values()
             .find(|operation| {
                 operation.resource_id == "orders"
-                    && operation.operation == "job_start"
+                    && operation.operation.as_str() == "job_start"
                     && operation.node_id == "node-a"
                     && operation.generation == 1
             })
@@ -1230,7 +1233,7 @@ async fn replaced_placement_supersedes_abandoned_start_and_stops_it() {
         );
         assert!(operations.values().any(|operation| {
             operation.node_id == "node-b"
-                && operation.operation == "job_start"
+                && operation.operation.as_str() == "job_start"
                 && operation.generation == 1
                 && operation.state == HubOperationState::Queued
         }));
@@ -1241,7 +1244,7 @@ async fn replaced_placement_supersedes_abandoned_start_and_stops_it() {
         let mut operations = hub.operations.write().await;
         for operation in operations.values_mut() {
             if operation.node_id == "node-b"
-                && operation.operation == "job_start"
+                && operation.operation.as_str() == "job_start"
                 && operation.generation == 1
             {
                 operation.state = HubOperationState::Succeeded;
@@ -1262,14 +1265,14 @@ async fn replaced_placement_supersedes_abandoned_start_and_stops_it() {
         node_a
             .commands
             .iter()
-            .any(|command| command.operation == "job_stop"),
+            .any(|command| command.operation.as_str() == "job_stop"),
         "the abandoned node must receive a stop command"
     );
     assert_eq!(
         node_a
             .commands
             .iter()
-            .filter(|command| command.operation == "job_start")
+            .filter(|command| command.operation.as_str() == "job_start")
             .count(),
         1,
         "only the original start remains queued; the abandoned node must not be re-targeted"
@@ -1280,7 +1283,7 @@ async fn replaced_placement_supersedes_abandoned_start_and_stops_it() {
             .unwrap()
             .commands
             .iter()
-            .any(|command| command.operation == "job_stop"),
+            .any(|command| command.operation.as_str() == "job_stop"),
         "the live placement must keep running"
     );
 }
@@ -1527,7 +1530,7 @@ fn agent_wire_contract_round_trips_reconciliation_fields() {
         id: "cmd-1".into(),
         operation_id: "intent-1".into(),
         node_id: "node-a".into(),
-        operation: "restart".into(),
+        operation: AgentOperation::parse("restart"),
         resource_id: "orders".into(),
         expires_at_ms: 123,
         generation: 7,
@@ -2480,7 +2483,7 @@ async fn registers_reports_and_dispatches_targeted_commands() {
     let first = hub
         .enqueue(
             "n1".into(),
-            "start".into(),
+            AgentOperation::parse("start"),
             "orders".into(),
             Some("corr".into()),
         )
@@ -2489,7 +2492,7 @@ async fn registers_reports_and_dispatches_targeted_commands() {
     let second = hub
         .enqueue(
             "n1".into(),
-            "start".into(),
+            AgentOperation::parse("start"),
             "orders".into(),
             Some("corr".into()),
         )
@@ -2554,8 +2557,13 @@ async fn expired_lease_is_not_commandable() {
     tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     hub.mark_stale().await;
     assert!(matches!(
-        hub.enqueue("n1".into(), "start".into(), "orders".into(), None)
-            .await,
+        hub.enqueue(
+            "n1".into(),
+            AgentOperation::parse("start"),
+            "orders".into(),
+            None
+        )
+        .await,
         Err(HubError::NodeUnavailable)
     ));
     assert_eq!(hub.nodes().await[0].state, NodeConnectionState::Stale);
@@ -2793,7 +2801,7 @@ async fn unsupported_capability_is_rejected_before_dispatch() {
     .await
     .unwrap();
     assert!(matches!(
-        hub.enqueue("n1".into(), "start".into(), "orders".into(), None)
+        hub.enqueue("n1".into(), AgentOperation::parse("start"), "orders".into(), None)
             .await,
         Err(HubError::Invalid(message)) if message.contains("capability")
     ));
@@ -2908,7 +2916,7 @@ async fn reconciler_dispatches_persisted_intent_with_generation() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(operation.operation, "start");
+    assert_eq!(operation.operation.as_str(), "start");
     let commands = hub
         .commands(AgentAuth {
             node_id: "n1".into(),
@@ -2939,7 +2947,7 @@ async fn reconciler_dispatches_persisted_intent_with_generation() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(restart.operation, "restart");
+    assert_eq!(restart.operation.as_str(), "restart");
     let commands = hub
         .commands(AgentAuth {
             node_id: "n1".into(),
@@ -3034,13 +3042,23 @@ async fn command_queues_are_bounded_and_isolated_per_node() {
         .unwrap()
         .session_token;
     for index in 0..128 {
-        hub.enqueue("n1".into(), "start".into(), format!("stream-{index}"), None)
-            .await
-            .unwrap();
+        hub.enqueue(
+            "n1".into(),
+            AgentOperation::parse("start"),
+            format!("stream-{index}"),
+            None,
+        )
+        .await
+        .unwrap();
     }
     assert!(matches!(
-        hub.enqueue("n1".into(), "start".into(), "overflow".into(), None)
-            .await,
+        hub.enqueue(
+            "n1".into(),
+            AgentOperation::parse("start"),
+            "overflow".into(),
+            None
+        )
+        .await,
         Err(HubError::Capacity)
     ));
     let n2 = hub
@@ -3245,7 +3263,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
         .await
         .unwrap();
     assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].operation, "job_start");
+    assert_eq!(commands[0].operation.as_str(), "job_start");
     assert_eq!(commands[0].resource_id, "orders");
     assert_eq!(commands[0].generation, 7);
     assert_eq!(
@@ -3299,7 +3317,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
         .unwrap();
     assert!(!commands
         .iter()
-        .any(|command| command.operation == "job_start"));
+        .any(|command| command.operation.as_str() == "job_start"));
 
     hub.record_job_checkpoint(JobCheckpointRecord {
         job_id: "orders".into(),
@@ -3322,7 +3340,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
         .await
         .unwrap();
     assert!(commands.iter().any(|command| {
-        command.operation == "job_checkpoint"
+        command.operation.as_str() == "job_checkpoint"
             && command
                 .payload
                 .as_ref()
@@ -3332,7 +3350,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
     }));
     let checkpoint_command = commands
         .iter()
-        .find(|command| command.operation == "job_checkpoint")
+        .find(|command| command.operation.as_str() == "job_checkpoint")
         .unwrap();
     assert_eq!(
         hub.operation(&checkpoint_command.operation_id)
@@ -3377,7 +3395,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
         .unwrap();
     let commit_command = commands
         .iter()
-        .find(|command| command.operation == "job_checkpoint_commit")
+        .find(|command| command.operation.as_str() == "job_checkpoint_commit")
         .expect("checkpoint commit command");
     assert_eq!(
         commit_command
@@ -3451,7 +3469,7 @@ async fn running_job_is_dispatched_to_compatible_agent() {
         .unwrap();
     assert!(restart_commands
         .iter()
-        .any(|command| command.operation == "job_start"));
+        .any(|command| command.operation.as_str() == "job_start"));
 }
 
 /// Verification 2026-09-11 (harden-unified-streaming-runtime re-audit,
@@ -3543,7 +3561,7 @@ async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_pee
         .await
         .unwrap()
         .into_iter()
-        .find(|command| command.operation == "job_start")
+        .find(|command| command.operation.as_str() == "job_start")
         .expect("compute-1 receives a start assignment");
     hub.command_result(
         AgentAuth {
@@ -3590,7 +3608,7 @@ async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_pee
         .await
         .unwrap()
         .into_iter()
-        .find(|command| command.operation == "job_start")
+        .find(|command| command.operation.as_str() == "job_start")
         .expect("compute-2 receives a start assignment");
     hub.command_result(
         AgentAuth {
@@ -3636,7 +3654,7 @@ async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_pee
         .await
         .unwrap()
         .into_iter()
-        .find(|command| command.operation == "job_start")
+        .find(|command| command.operation.as_str() == "job_start")
         .expect("the timed-out peer receives a replacement start command");
     hub.command_result(
         AgentAuth {
@@ -3770,7 +3788,7 @@ async fn job_observed_state_reports_failed_when_a_peer_permanently_fails() {
             .await
             .unwrap()
             .into_iter()
-            .find(|command| command.operation == "job_start")
+            .find(|command| command.operation.as_str() == "job_start")
             .expect("each peer receives a start assignment");
         hub.command_result(
             AgentAuth {
@@ -3899,7 +3917,7 @@ async fn periodic_job_reconciliation_retries_a_failed_runtime() {
         .await
         .unwrap();
     assert!(commands.iter().any(|command| {
-        command.operation == "job_start"
+        command.operation.as_str() == "job_start"
             && command.generation == job.generation
             && command.id != first.id
     }));
@@ -3974,7 +3992,7 @@ async fn periodic_job_reconciliation_stops_persisted_divergence_after_recovery()
         .await
         .unwrap();
     assert!(commands.iter().any(|command| {
-        command.operation == "job_stop"
+        command.operation.as_str() == "job_stop"
             && command.resource_id == "orders"
             && command.generation == job.generation
     }));
@@ -4066,7 +4084,12 @@ async fn job_start_is_audited_without_configuration_bodies() {
 async fn job_stop_rejection_for_unknown_node_is_audited() {
     let (hub, _session) = audited_job_hub("irrelevant").await;
     let error = hub
-        .enqueue("ghost".into(), "job_stop".into(), "orders".into(), None)
+        .enqueue(
+            "ghost".into(),
+            AgentOperation::parse("job_stop"),
+            "orders".into(),
+            None,
+        )
         .await
         .unwrap_err();
     assert!(matches!(error, HubError::NodeUnavailable));
@@ -4095,7 +4118,7 @@ async fn command_metrics_track_enqueues_latency_and_rejections() {
         .await
         .unwrap()
         .into_iter()
-        .find(|command| command.operation == "job_start")
+        .find(|command| command.operation.as_str() == "job_start")
         .expect("compute-1 receives the start command");
     hub.command_result(
         AgentAuth {
@@ -4131,7 +4154,12 @@ async fn command_metrics_track_enqueues_latency_and_rejections() {
         .contains("arkflow_command_total{command=\"job_start\",outcome=\"acknowledged\"} 1"));
     // A dispatch to an unknown node counts the fixed outcome class.
     let _ = hub
-        .enqueue("ghost".into(), "job_stop".into(), "orders".into(), None)
+        .enqueue(
+            "ghost".into(),
+            AgentOperation::parse("job_stop"),
+            "orders".into(),
+            None,
+        )
         .await;
     assert!(hub
         .command_metrics()
@@ -4142,7 +4170,7 @@ async fn command_metrics_track_enqueues_latency_and_rejections() {
     let _ = hub
         .enqueue(
             "compute-1".into(),
-            "exotic-operation".into(),
+            AgentOperation::parse("exotic-operation"),
             "orders".into(),
             None,
         )
@@ -4172,7 +4200,7 @@ async fn expired_job_operations_retry_then_reach_the_terminal_cap() {
             .unwrap();
         let start = commands
             .iter()
-            .find(|command| command.operation == "job_start")
+            .find(|command| command.operation.as_str() == "job_start")
             .expect("the start command is queued");
         let operations = hub.operations.read().await;
         let queued = operations
@@ -4204,7 +4232,7 @@ async fn expired_job_operations_retry_then_reach_the_terminal_cap() {
         let replacement = hub
             .enqueue_with_metadata(
                 "compute-1".into(),
-                "job_start".into(),
+                AgentOperation::parse("job_start"),
                 "orders".into(),
                 None,
                 None,
@@ -4248,7 +4276,7 @@ async fn expired_job_operations_retry_then_reach_the_terminal_cap() {
     let error = hub
         .enqueue_with_metadata(
             "compute-1".into(),
-            "job_start".into(),
+            AgentOperation::parse("job_start"),
             "orders".into(),
             None,
             None,
@@ -4790,7 +4818,7 @@ async fn succeed_command(hub: &Hub, auth: &AgentAuth, operation: &str) -> Option
     let commands = hub.commands(auth.clone()).await.unwrap();
     let command = commands
         .into_iter()
-        .find(|command| command.operation == operation)?
+        .find(|command| command.operation.as_str() == operation)?
         .clone();
     hub.command_result(
         auth.clone(),
@@ -4822,7 +4850,7 @@ async fn succeed_all_starts(hub: &Hub, auth: &AgentAuth) -> usize {
     let mut completed = 0;
     for command in commands
         .iter()
-        .filter(|command| command.operation == "job_start")
+        .filter(|command| command.operation.as_str() == "job_start")
     {
         hub.command_result(
             auth.clone(),

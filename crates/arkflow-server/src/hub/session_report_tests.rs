@@ -622,7 +622,7 @@ async fn start_command_tasks(hub: &Hub, auth: &AgentAuth) -> Vec<String> {
         .await
         .unwrap()
         .into_iter()
-        .find(|command| command.operation == "job_start")
+        .find(|command| command.operation.as_str() == "job_start")
         .expect("job_start command")
         .payload
         .expect("job_start payload")["assignments"]
@@ -673,7 +673,8 @@ async fn start_operations(hub: &Hub, job_id: &str) -> Vec<HubOperation> {
         .await
         .into_iter()
         .filter(|operation_record| {
-            operation_record.resource_id == job_id && operation_record.operation == "job_start"
+            operation_record.resource_id == job_id
+                && operation_record.operation.as_str() == "job_start"
         })
         .collect()
 }
@@ -723,7 +724,7 @@ async fn poll_start_tasks_and_complete(
     };
     let mut tasks = Vec::new();
     for command in hub.commands(auth.clone()).await.unwrap() {
-        if command.operation == "job_start" {
+        if command.operation.as_str() == "job_start" {
             let mut command_tasks: Vec<String> = command
                 .payload
                 .as_ref()
@@ -1106,7 +1107,7 @@ async fn opt_in_pressure_rebalance_relocates_with_fencing() {
         .into_iter()
         .filter(|operation_record| {
             operation_record.resource_id == "orders"
-                && operation_record.operation == "job_stop"
+                && operation_record.operation.as_str() == "job_stop"
                 && operation_record.node_id == "node-a"
         })
         .count();
@@ -1160,7 +1161,7 @@ async fn default_off_policy_never_disturbs_a_pressured_placement() {
         .operations(None)
         .await
         .iter()
-        .all(|operation_record| operation_record.operation != "job_stop"));
+        .all(|operation_record| operation_record.operation.as_str() != "job_stop"));
 }
 
 #[tokio::test]
@@ -1209,7 +1210,7 @@ async fn single_node_fleet_skips_relocation_under_pressure() {
         .operations(None)
         .await
         .iter()
-        .all(|operation_record| operation_record.operation != "job_stop"));
+        .all(|operation_record| operation_record.operation.as_str() != "job_stop"));
 }
 
 #[tokio::test]
@@ -1277,7 +1278,7 @@ async fn stale_gauges_freeze_pressure_out_of_eviction() {
         hub.operations(None)
             .await
             .iter()
-            .all(|operation_record| operation_record.operation != "job_stop"),
+            .all(|operation_record| operation_record.operation.as_str() != "job_stop"),
         "a frozen streak on stale gauges must not evict the placement"
     );
     // One fresh pressuring report restores the streak's freshness: only
@@ -1290,7 +1291,7 @@ async fn stale_gauges_freeze_pressure_out_of_eviction() {
             .into_iter()
             .filter(|operation_record| {
                 operation_record.resource_id == "orders"
-                    && operation_record.operation == "job_stop"
+                    && operation_record.operation.as_str() == "job_stop"
                     && operation_record.node_id == "node-a"
             })
             .count(),
@@ -1523,7 +1524,7 @@ async fn eviction_keeps_the_placement_when_survivors_cannot_host_split() {
             .await
             .iter()
             .any(|operation_record| operation_record.node_id == "node-a"
-                && operation_record.operation == "job_stop"),
+                && operation_record.operation.as_str() == "job_stop"),
         "the evicted node must receive a stop command"
     );
     // node-plain never entered the target set: it holds no start of the
@@ -1750,7 +1751,7 @@ async fn checkpoint_payload_assignments_match_the_live_mapping() {
             .await
             .unwrap()
             .into_iter()
-            .find(|command| command.operation == "job_checkpoint")
+            .find(|command| command.operation.as_str() == "job_checkpoint")
             .expect("checkpoint command")
             .payload
             .expect("checkpoint payload")["assignments"]
@@ -1855,7 +1856,7 @@ async fn rebalance_cooldown_blocks_a_move_inside_the_window() {
         .operations(None)
         .await
         .iter()
-        .all(|operation_record| operation_record.operation != "job_stop"));
+        .all(|operation_record| operation_record.operation.as_str() != "job_stop"));
 }
 
 /// Partial node failure: only the failed node's tasks move. A replacement
@@ -1971,7 +1972,7 @@ async fn partial_node_failure_moves_only_the_failed_tasks() {
         assert!(
             !commands
                 .iter()
-                .any(|command| command.operation == "job_start"),
+                .any(|command| command.operation.as_str() == "job_start"),
             "survivor {node_id} must not be re-dispatched"
         );
     }
@@ -2152,7 +2153,7 @@ async fn lost_fingerprint_memory_supersedes_and_redispatches_once() {
     assert!(
         !commands
             .iter()
-            .any(|command| command.operation == "job_start"),
+            .any(|command| command.operation.as_str() == "job_start"),
         "after the confirmation the dispatch skip holds again"
     );
 }
@@ -2208,7 +2209,7 @@ async fn failed_observation_redispatches_the_nodes_start() {
         .await
         .unwrap()
         .iter()
-        .any(|command| command.operation == "job_start"));
+        .any(|command| command.operation.as_str() == "job_start"));
 
     // The kernel dies (for example a remote edge exhausted its reconnect
     // budget) and the agent reports the failure.
@@ -2235,7 +2236,7 @@ async fn failed_observation_redispatches_the_nodes_start() {
             .await
             .unwrap()
             .iter()
-            .any(|command| command.operation == "job_start"),
+            .any(|command| command.operation.as_str() == "job_start"),
         "the reconcile must re-dispatch the start after the runtime failure"
     );
 }

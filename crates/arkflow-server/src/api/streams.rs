@@ -5,6 +5,7 @@ use crate::api_contract::{
     AcceptedIntentResponse, DesiredStateRequest, OperatorAction, RestartActionRequest,
 };
 use crate::hub;
+use crate::hub::AgentOperation;
 use crate::storage::{self, DesiredMutation};
 use arkflow_core::control::Page;
 use arkflow_core::control_plane::ControlPlane;
@@ -216,7 +217,10 @@ pub(super) async fn hub_targeted_command(
             }
         }
     }
-    match hub.enqueue(node_id, action, id, correlation_id).await {
+    match hub
+        .enqueue(node_id, AgentOperation::parse(&action), id, correlation_id)
+        .await
+    {
         Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
         Err(hub::HubError::NodeUnavailable) => problem(
             StatusCode::CONFLICT,

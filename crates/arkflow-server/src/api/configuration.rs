@@ -3,6 +3,7 @@
 use super::{authorized, problem, require_operator_action, DiffQuery};
 use crate::api_contract::OperatorAction;
 use crate::hub;
+use crate::hub::AgentOperation;
 use crate::storage;
 use arkflow_core::configuration::{parse_and_validate, redacted_config, ConfigCandidate};
 use arkflow_core::control_plane::ControlPlane;
@@ -70,7 +71,7 @@ pub(super) async fn hub_readonly_configuration_command(
     match hub
         .enqueue_with_payload(
             node_id,
-            operation.into(),
+            AgentOperation::parse(operation),
             "configuration".into(),
             correlation_id,
             Some(payload),
@@ -255,7 +256,7 @@ pub(super) async fn hub_configuration_command<T: Serialize>(
     match hub
         .enqueue_with_payload(
             node_id,
-            operation.into(),
+            AgentOperation::parse(operation),
             "configuration".into(),
             correlation_id,
             Some(payload),
