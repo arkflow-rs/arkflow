@@ -20,7 +20,7 @@
 //! The decode side is dispatched on the registry's `schemaType` response.
 
 use crate::codec::avro_arrow::{avro_read_value, AvroArrowAccumulator};
-use crate::component::protobuf::{parse_proto_source, protobuf_to_arrow};
+use crate::component::protobuf::{parse_proto_source, ProtobufBatchConverter};
 use apache_avro::Schema as AvroSchema;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
@@ -299,11 +299,11 @@ impl Decoder for SchemaRegistryCodec {
         self.ensure_gate().await?;
         // Messages accumulate columnar per schema id (groups in
         // first-appearance order, rows in message order within a group);
-        // protobuf messages keep their per-message batches inside the same
-        // grouping so relative order is stable across kinds.
+        // protobuf groups accumulate columnar exactly like Avro groups, so
+        // relative order is stable across kinds.
         enum Group {
             Avro(Box<AvroArrowAccumulator>),
-            Protobuf(Vec<RecordBatch>),
+            Protobuf(ProtobufBatchConverter),
         }
         let mut groups: Vec<(u32, Group)> = Vec::new();
         for msg in b {
@@ -311,10 +311,14 @@ impl Decoder for SchemaRegistryCodec {
             let cached = self.resolve_cached(id).await?;
             match cached.as_ref() {
                 CachedSchema::Protobuf(descriptor) => {
-                    let batch = protobuf_to_arrow(descriptor, payload)?;
                     match groups.iter_mut().find(|(gid, _)| gid == &id) {
-                        Some((_, Group::Protobuf(batches))) => batches.push(batch),
-                        _ => groups.push((id, Group::Protobuf(vec![batch]))),
+                        Some((_, Group::Protobuf(converter))) => converter.push(payload)?,
+                        _ => {
+                            // `MessageDescriptor` clones are cheap Arc bumps.
+                            let mut converter = ProtobufBatchConverter::new(descriptor.clone());
+                            converter.push(payload)?;
+                            groups.push((id, Group::Protobuf(converter)));
+                        }
                     }
                 }
                 CachedSchema::Avro(schema) => {
@@ -331,10 +335,10 @@ impl Decoder for SchemaRegistryCodec {
             }
         }
         let mut batches = Vec::with_capacity(groups.len());
-        for (_, group) in &mut groups {
+        for (_, group) in groups {
             match group {
-                Group::Avro(accumulator) => batches.push(accumulator.finish()?),
-                Group::Protobuf(group_batches) => batches.append(group_batches),
+                Group::Avro(mut accumulator) => batches.push(accumulator.finish()?),
+                Group::Protobuf(converter) => batches.push(converter.finish()?),
             }
         }
         if batches.is_empty() {
@@ -1472,5 +1476,90 @@ mod tests {
             temporary: std::collections::HashMap::new(),
             input_names: std::cell::RefCell::new(vec![]),
         }
+    }
+
+    // ===== Protobuf 批级列式累积 =====
+
+    fn protobuf_payload(id: i64) -> Vec<u8> {
+        vec![0x08, id as u8]
+    }
+
+    #[tokio::test]
+    async fn protobuf_same_id_messages_accumulate_in_order() {
+        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([(
+            1u32,
+            FetchedSchema::Protobuf(TEST_SCHEMA.to_string()),
+        )])));
+        let codec = build_codec(resolver);
+        let batch = codec
+            .decode(vec![
+                wire(1, &protobuf_payload(11)),
+                wire(1, &protobuf_payload(22)),
+                wire(1, &protobuf_payload(33)),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 3);
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        let ids = batch
+            .record_batch()
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        assert_eq!(
+            (0..3).map(|i| ids.value(i)).collect::<Vec<_>>(),
+            vec![11, 22, 33]
+        );
+        // Descriptor-driven convention: every column nullable.
+        assert!(batch
+            .record_batch()
+            .schema()
+            .fields()
+            .iter()
+            .all(|f| f.is_nullable()));
+    }
+
+    #[tokio::test]
+    async fn fetch_error_precedes_later_bad_wire_header() {
+        // A missing schema id on the FIRST message must win over a corrupt
+        // header on the second — the sequential order the per-message path
+        // always had.
+        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([(
+            1u32,
+            FetchedSchema::Avro(avro_schema()),
+        )])));
+        let codec = avro_codec(resolver);
+        let err = codec
+            .decode(vec![wire(99, &[0x01]), vec![0x01, 0x00, 0x00, 0x00, 0x01]])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("schema id 99 not in test resolver"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn payload_decode_error_precedes_schema_shape_error() {
+        // The schema contains an unsupported nested field, but the payload
+        // itself fails to decode first — the accumulator is built only
+        // after a successful read.
+        let nested = AvroSchema::parse_str(
+            r#"{"type": "record", "name": "M", "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "tags", "type": {"type": "array", "items": "string"}}
+            ]}"#,
+        )
+        .unwrap();
+        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([(
+            1u32,
+            FetchedSchema::Avro(nested),
+        )])));
+        let codec = avro_codec(resolver);
+        let err = codec
+            .decode(vec![wire(1, &[0xDE, 0xAD])])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Avro decode failed"), "{msg}");
     }
 }
