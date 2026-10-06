@@ -1,0 +1,92 @@
+# Benchmark observability: run the public benchmark suite in release mode and
+# publish the results (job summary + JSON artifact) on every merge to main,
+# on demand, and for PRs that opt in via the `benchmark` label.
+#
+# This is observation, not a gate: numbers on GitHub-hosted runners vary with
+# hardware generation and tenant load, so nothing here asserts throughput
+# thresholds (the benchmark-suite spec's "never fail on machine speed"
+# contract). Regression judgement stays with the humans comparing reports.
+name: Benchmark
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  pull_request:
+    types: [ opened, synchronize, reopened, labeled ]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    # Only run for PRs carrying the `benchmark` label; pushes to main and
+    # manual dispatch always run.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'benchmark')
+    name: Benchmark (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Release builds need the same disk headroom the fast CI frees up.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+
+      - name: Set PROTOC Environment Variable
+        run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      # One measured run only: the summary table is rendered from the same
+      # JSON that becomes the artifact, so the two never disagree.
+      - name: Run benchmark suite
+        run: cargo run -p arkflow --release --example benchmark -- --json > benchmark.json
+
+      - name: Publish job summary
+        run: |
+          python3 - <<'PY'
+          import json, os
+          rows = json.load(open("benchmark.json"))
+          sha = os.environ["GITHUB_SHA"][:12]
+          lines = [
+              "# Benchmark report",
+              "",
+              f"Commit: `{sha}` — runner: ubuntu-latest (2 vCPU, hardware varies between runs).",
+              "Numbers are for observation only; compare across runs with care, never a gate.",
+              "",
+              "| scenario | workload | unit | operations | wall (ms) | throughput |",
+              "| --- | --- | --- | --- | --- | --- |",
+          ]
+          for r in rows:
+              lines.append(
+                  f"| {r['scenario']} | {r['description']} | {r['unit']} | {r['operations']} | {r['wall_ms']} | {r['per_second']} {r['unit']}/s |"
+              )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload JSON report
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.sha }}
+          path: benchmark.json
+          retention-days: 90
+          if-no-files-found: error
