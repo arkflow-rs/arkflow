@@ -125,26 +125,15 @@ When the object-store backend is in use, the WAL SHALL isolate its object namesp
 - **THEN** recovery uses the same configured `node_id` to locate the node's prior WAL in object storage
 
 ### Requirement: Object-store WAL survives node loss
-When the object-store backend is in use, every entry that has been flushed to a segment object SHALL be recoverable after the node (pod/host) is lost — not only after a process crash. Only entries still in the in-memory staging queue (not yet flushed to a segment) are at risk on node loss.
+When the object-store backend is in use, every entry that has been flushed to a segment object SHALL be recoverable after the node (pod/host) is lost — not only after a process crash. Entries not yet sealed into a segment object SHALL be re-delivered by their source after restart (the source acknowledgement for such entries cannot have completed), preserving at-least-once semantics; no acknowledged entry SHALL be lost on node loss.
 
 #### Scenario: Flushed entries survive pod disappearance
 - **WHEN** a node has flushed entries to segment objects and then the node/pod disappears
 - **THEN** on restart (same `node_id`) those flushed entries are present in object storage and are replayed during recovery
 
-#### Scenario: Un-flushed entries are the loss window
-- **WHEN** a node disappears with entries still in the in-memory staging queue
-- **THEN** those un-flushed entries are lost, while all previously flushed entries are recovered
-
-### Requirement: Segment-based batching with a bounded loss window
-The object-store backend SHALL persist entries as immutable segment objects written in batches. The loss window (entries at risk on node loss) SHALL be bounded by configurable segment flush triggers (`max_entries`, `max_bytes`, `flush_interval`). The `per-entry` sync policy SHALL be rejected for the object-store backend.
-
-#### Scenario: Loss window is configurable
-- **WHEN** the segment flush triggers are set
-- **THEN** the maximum number of entries at risk on node loss is bounded by those triggers
-
-#### Scenario: per-entry sync is rejected on the object-store backend
-- **WHEN** a stream is configured with `backend: s3` and `sync: per_entry`
-- **THEN** the configuration is rejected at load time with an error
+#### Scenario: Un-sealed entries are redelivered by the source
+- **WHEN** a node disappears with entries staged in memory but not yet sealed to a segment object
+- **THEN** those entries' source acknowledgements have not completed, and the source re-delivers them after restart (at-least-once), while all previously sealed entries are recovered from object storage
 
 ### Requirement: Recovery is consistent under partial writes
 Recovery from the object-store backend SHALL NOT rely solely on the manifest. It SHALL enumerate the actual segment objects (LIST) as a fallback, SHALL include segments present on the store but absent from the manifest, and SHALL verify each entry's checksum to discard a torn tail of a partially-written active segment.
@@ -310,3 +299,48 @@ The redb-backed local WAL store SHALL preserve its operator-facing durability co
 
 - **WHEN** a stream closes and a subsequent stream reopens the same WAL path
 - **THEN** the redb handle is released on close and the reopen succeeds, preserving the existing flock-based single-writer behavior
+
+### Requirement: WAL 驻留确认 SHALL 有界等待
+因更低序号未结算而驻留的 WAL 确认 SHALL 有界等待：非关闭场景下驻留超过有界租约（`WAL_ACK_PARK_TIMEOUT`，默认 60s）SHALL 返回可重试错误且不写入失败栅栏（不栅栏仅仅较慢的 gap 持有者；驻留条目保持注册、可重试，持有者结算后重试照常放行），使流以显式周期性错误失败而非静默停滞。关闭后的既有 `WAL_ACK_DRAIN_WINDOW` 语义保持不变。
+
+#### Scenario: gap 持有者静默死亡时流显式失败
+
+- **WHEN** 最低未结算序号的调用方死亡且未记录失败，后续序号的确认驻留等待
+- **THEN** 驻留者在租约超时后收到可重试错误（错误信息指明卡住的序号），流失败可见，不再无限等待
+
+#### Scenario: 正常排空不受影响
+
+- **WHEN** 更低序号在租约内正常结算
+- **THEN** 驻留者被唤醒并照常执行（既有行为，租约不引入额外延迟）
+
+#### Scenario: 关闭窗口语义不变
+
+- **WHEN** WAL 关闭且有驻留确认
+- **THEN** 既有 30s 排空窗口与显式失败路径原样保持
+
+### Requirement: Segment-based batching with a bounded replay window
+The object-store backend SHALL persist entries as immutable segment objects written in batches. A source acknowledgement SHALL complete only after the acknowledged entry's sequence is contained in a sealed segment object: un-sealed work is redone from source re-delivery on restart (replay window), never silently lost. The replay window SHALL be bounded by the configurable segment flush triggers (`max_entries`, `max_bytes`, `flush_interval`), which set the sealing cadence and thereby the gating contribution to acknowledgement latency; the completion time of each object-store write itself is governed by the storage client, not by these triggers. The `per-entry` sync policy SHALL be rejected for the object-store backend.
+
+#### Scenario: Acknowledged entries are always sealed
+- **WHEN** a source acknowledgement for sequence N completes on the object-store backend
+- **THEN** a sealed segment object containing sequence N exists in object storage, and a crash immediately after the acknowledgement replays at most from N (never loses N)
+
+#### Scenario: Replay window is configurable
+- **WHEN** the segment flush triggers are set
+- **THEN** the maximum number of entries redone on node loss is bounded by those triggers, and the seal-gating contribution to acknowledgement latency follows their cadence (object-store write completion time is not bounded by them)
+
+#### Scenario: per-entry sync is rejected on the object-store backend
+- **WHEN** a stream is configured with `backend: s3` and `sync: per_entry`
+- **THEN** the configuration is rejected at load time with an error
+
+### Requirement: WAL flusher failures SHALL be observable
+The WAL background flusher SHALL NOT silently swallow flush failures on its wake path: each failed flush SHALL be counted in a flush-failure counter and reported via a rate-limited warning, and a persistently failing flusher SHALL escalate to error-level logging. The counter is maintained inside the WAL (crate-visible to tests; exposing it through the metrics plane is a data-plane-observability follow-up), so today's production visibility is the warning/error log trail. The shutdown path SHALL continue to surface the final flush result through `close()` as today.
+
+#### Scenario: Persistent store failure is visible
+- **WHEN** the WAL flusher's store writes fail persistently on the wake path
+- **THEN** a flush-failure counter increments per failed attempt, warnings are emitted at a bounded rate, and sustained failure is logged at error level (no silent hot retry)
+
+#### Scenario: Graceful close still surfaces the final flush
+- **WHEN** the WAL is closed while the flusher has pending entries
+- **THEN** `close()` performs the final flush and propagates its error, unchanged from the existing behavior
+

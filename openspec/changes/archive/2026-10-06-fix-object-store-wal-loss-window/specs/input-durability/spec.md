@@ -38,3 +38,8 @@ The WAL background flusher SHALL NOT silently swallow flush failures on its wake
 #### Scenario: Graceful close still surfaces the final flush
 - **WHEN** the WAL is closed while the flusher has pending entries
 - **THEN** `close()` performs the final flush and propagates its error, unchanged from the existing behavior
+
+## RENAMED Requirements
+
+- FROM: `### Requirement: Segment-based batching with a bounded loss window`
+  TO: `### Requirement: Segment-based batching with a bounded replay window`

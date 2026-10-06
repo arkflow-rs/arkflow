@@ -97,6 +97,10 @@ refactoring is summarized rather than listed commit-by-commit.
   keeps its exact historical shape. (#1304)
 - Error classification tightened: input channel closure has a dedicated
   variant, config parse errors carry line/column locations. (#1207, #1301)
+- Schema-registry Avro decoding is ~20% faster: parsed schemas are cached
+  behind an `Arc` instead of being deep-cloned per message. The public
+  benchmark suite gained three `avro-decode-w5/w25/w100` scenarios that
+  exercise the real codec decode path offline. (#1309)
 
 ### Fixed
 

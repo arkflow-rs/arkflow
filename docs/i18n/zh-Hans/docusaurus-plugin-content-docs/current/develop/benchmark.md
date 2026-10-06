@@ -23,7 +23,7 @@ cargo run -p arkflow --release --example benchmark
 | `--warmup` | `1` | 不计时的预热轮。 |
 | `--json` | 关闭 | 输出机器可读报告而非 markdown。 |
 
-默认参数在笔记本上通常一分钟内跑完,输出一张 markdown 表:每个场景一行,含工作负载、操作数、耗时与吞吐。
+默认参数在笔记本上通常几分钟内跑完(耗时大头是持久化 state-backend 场景),输出一张 markdown 表:每个场景一行,含工作负载、操作数、耗时与吞吐。
 
 ## 场景
 
@@ -34,8 +34,9 @@ cargo run -p arkflow --release --example benchmark
 | `filter-project-sql` | generate → JSON 解码 → SQL 过滤 + 投影 → drop | rows/s |
 | `codec-json` | Arrow 批次 → NDJSON → Arrow 批次往返(1000 行/批) | batches/s |
 | `state-backend` | redb 状态后端持久化 put + get(逐写提交) | ops/s |
+| `avro-decode-w5` / `avro-decode-w25` / `avro-decode-w100` | schema-registry Avro 解码(Confluent wire format,1000 消息/批,5/25/100 字段 schema) | rows/s |
 
-流式场景走引擎自身的公开入口(`compile_stream` + `run_job`),测的就是生产执行路径,而非专用测试台。
+流式场景走引擎自身的公开入口(`compile_stream` + `run_job`),测的就是生产执行路径,而非专用测试台。Avro 场景同样走真实的 `schema_registry` codec(内存版 schema resolver)——消息在(不计时的)setup 阶段预编码,测量轮命中按 id 的 schema 缓存,即生产稳态路径。
 
 ## 方法学
 
