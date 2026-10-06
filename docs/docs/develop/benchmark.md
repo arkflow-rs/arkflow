@@ -39,10 +39,14 @@ and throughput.
 | `filter-project-sql` | generate → JSON decode → SQL filter + projection → drop | rows/s |
 | `codec-json` | Arrow batch → NDJSON → Arrow batch round trips (1000-row batches) | batches/s |
 | `state-backend` | redb state backend durable put + get (per-write commit) | ops/s |
+| `avro-decode-w5` / `avro-decode-w25` / `avro-decode-w100` | schema-registry Avro decode (Confluent wire format, 1000-message batches, 5/25/100-field schemas) | rows/s |
 
 Stream scenarios run through the same public entry points the engine itself
 uses (`compile_stream` + `run_job`), so the numbers describe the production
-execution path, not a special harness.
+execution path, not a special harness. The Avro scenarios likewise decode
+through the real `schema_registry` codec with an in-memory schema resolver —
+messages are pre-encoded during (untimed) setup and measured iterations hit
+the per-id schema cache, the steady-state production path.
 
 ## Methodology
 

@@ -24,13 +24,20 @@
 //! benchmark that fails on slow hardware is useless. Regression tracking is
 //! the caller's job (compare reports across commits on the same machine).
 
+use crate::codec::schema_registry::{FetchedSchema, SchemaRegistryCodec, SchemaResolver};
+use apache_avro::types::Value as AvroValue;
+use apache_avro::writer::datum::GenericDatumWriter;
+use apache_avro::Schema as AvroSchema;
+use arkflow_core::codec::Decoder;
 use arkflow_core::config::EngineConfig;
 use arkflow_core::executor::run_job;
 use arkflow_core::executor::stream_adapter::StreamJobAdapter;
 use arkflow_core::executor::stream_compiler::compile_stream;
 use arkflow_core::state::RedbStateBackend;
 use arkflow_core::state::StateBackend as _;
-use arkflow_core::{Error, MessageBatch, Resource};
+use arkflow_core::{Bytes, Error, MessageBatch, Resource};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -213,6 +220,160 @@ async fn state_backend(count: usize) -> Result<ScenarioResult, Error> {
     })
 }
 
+/// Offline schema resolver for the avro-decode scenarios: pre-registers the
+/// schemas the benchmark uses so the real `SchemaRegistryCodec` decode path
+/// runs without any network (suite-wide self-containment contract).
+struct InMemorySchemaResolver {
+    schemas: HashMap<u32, FetchedSchema>,
+}
+
+#[async_trait::async_trait]
+impl SchemaResolver for InMemorySchemaResolver {
+    async fn fetch_schema(&self, id: u32) -> Result<FetchedSchema, Error> {
+        self.schemas
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::Process(format!("benchmark resolver has no schema id {id}")))
+    }
+}
+
+/// Field types cycled by the wide-schema builder: the supported leaf kinds
+/// the flat Arrow mapping sees in real payloads (incl. one nullable union).
+const AVRO_FIELD_TYPES: [&str; 6] = [
+    r#""long""#,
+    r#""string""#,
+    r#""double""#,
+    r#""boolean""#,
+    r#"["null", "int"]"#,
+    r#"{"type": "int", "logicalType": "date"}"#,
+];
+
+fn wide_avro_schema(width: usize) -> AvroSchema {
+    let fields: Vec<String> = (0..width)
+        .map(|i| {
+            format!(
+                r#"{{"name": "f_{i}", "type": {}}}"#,
+                AVRO_FIELD_TYPES[i % AVRO_FIELD_TYPES.len()]
+            )
+        })
+        .collect();
+    let json = format!(
+        r#"{{"type": "record", "name": "BenchmarkW{width}", "fields": [{}]}}"#,
+        fields.join(",")
+    );
+    AvroSchema::parse_str(&json).expect("benchmark avro schema parses")
+}
+
+fn wide_avro_value(width: usize, i: u64) -> AvroValue {
+    AvroValue::Record(
+        (0..width)
+            .map(|f| {
+                let value = match f % AVRO_FIELD_TYPES.len() {
+                    0 => AvroValue::Long(i as i64),
+                    1 => AvroValue::String(format!("s_{}", i % 97)),
+                    2 => AvroValue::Double((i % 1000) as f64 * 0.5),
+                    3 => AvroValue::Boolean(i.is_multiple_of(2)),
+                    4 => AvroValue::Union(1, Box::new(AvroValue::Int((i % 1_000_000) as i32))),
+                    _ => AvroValue::Date((i % 30_000) as i32),
+                };
+                (format!("f_{f}"), value)
+            })
+            .collect(),
+    )
+}
+
+/// Encodes one Confluent wire-format message: `[0x00][4-byte BE id][payload]`.
+fn wire_message(schema: &AvroSchema, id: u32, value: AvroValue) -> Vec<u8> {
+    let payload = GenericDatumWriter::builder(schema)
+        .build()
+        .expect("benchmark writer builds")
+        .write_value_to_vec(value)
+        .expect("benchmark avro encode");
+    let mut message = Vec::with_capacity(5 + payload.len());
+    message.push(0x00);
+    message.extend_from_slice(&id.to_be_bytes());
+    message.extend_from_slice(&payload);
+    message
+}
+
+/// Avro decode through the real schema-registry codec path: each iteration
+/// decodes a 1000-message batch of pre-encoded wire-format messages. Setup
+/// (schema construction + encoding) and the schema-cache warm-up decode are
+/// untimed; iterations hit the per-id cache, which is the steady-state path.
+/// Iterations are scaled down from the stream row count and further scaled
+/// inversely with the schema width (per-message cost grows linearly in
+/// width), giving every width roughly the same time budget and keeping the
+/// whole suite bounded.
+async fn avro_decode(
+    name: &'static str,
+    description: &'static str,
+    width: usize,
+    count: usize,
+) -> Result<ScenarioResult, Error> {
+    const BATCH: usize = 1000;
+    let iterations = ((count / (BATCH * 2)) / (width / 5)).clamp(10, 100);
+    let id = 7000 + width as u32;
+    let schema = wide_avro_schema(width);
+    let mut messages = Vec::with_capacity(BATCH);
+    for i in 0..BATCH as u64 {
+        messages.push(Bytes::from(wire_message(
+            &schema,
+            id,
+            wide_avro_value(width, i),
+        )));
+    }
+    let mut schemas = HashMap::new();
+    schemas.insert(id, FetchedSchema::Avro(schema));
+    let codec = SchemaRegistryCodec::new(None, Arc::new(InMemorySchemaResolver { schemas }), None);
+    codec.decode(messages.clone()).await?;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        let _ = codec.decode(messages.clone()).await?;
+    }
+    let wall = started.elapsed();
+    Ok(ScenarioResult {
+        name,
+        description,
+        unit: "rows",
+        operations: (iterations * BATCH) as u64,
+        wall,
+    })
+}
+
+/// Avro decode, 5-field schema (narrow records).
+async fn avro_decode_w5(count: usize) -> Result<ScenarioResult, Error> {
+    avro_decode(
+        "avro-decode-w5",
+        "schema_registry avro decode, 5-field schema (1000-msg decode batches)",
+        5,
+        count,
+    )
+    .await
+}
+
+/// Avro decode, 25-field schema (medium records).
+async fn avro_decode_w25(count: usize) -> Result<ScenarioResult, Error> {
+    avro_decode(
+        "avro-decode-w25",
+        "schema_registry avro decode, 25-field schema (1000-msg decode batches)",
+        25,
+        count,
+    )
+    .await
+}
+
+/// Avro decode, 100-field schema (wide records — per-message cost scales
+/// with field count).
+async fn avro_decode_w100(count: usize) -> Result<ScenarioResult, Error> {
+    avro_decode(
+        "avro-decode-w100",
+        "schema_registry avro decode, 100-field schema (1000-msg decode batches)",
+        100,
+        count,
+    )
+    .await
+}
+
 /// Runs every scenario once (helper for measurement loops).
 async fn run_each(count: usize) -> Result<Vec<ScenarioResult>, Error> {
     Ok(vec![
@@ -221,6 +382,9 @@ async fn run_each(count: usize) -> Result<Vec<ScenarioResult>, Error> {
         filter_project_sql(count).await?,
         codec_json(count).await?,
         state_backend(count).await?,
+        avro_decode_w5(count).await?,
+        avro_decode_w25(count).await?,
+        avro_decode_w100(count).await?,
     ])
 }
 
@@ -309,7 +473,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn tiny_suite_completes_with_positive_throughput() {
         let results = run_suite(2_000, 0, 1).await.expect("suite completes");
-        assert_eq!(results.len(), 5);
+        assert_eq!(results.len(), 8);
         for result in &results {
             assert!(result.operations > 0, "{} missing workload", result.name);
             assert!(result.per_second() > 0.0, "{} zero throughput", result.name);
@@ -330,6 +494,9 @@ mod tests {
             "filter-project-sql",
             "codec-json",
             "state-backend",
+            "avro-decode-w5",
+            "avro-decode-w25",
+            "avro-decode-w100",
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }

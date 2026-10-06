@@ -163,7 +163,10 @@ impl CompatibilityGate {
 pub struct SchemaRegistryCodec {
     message_type: Option<String>,
     resolver: Arc<dyn SchemaResolver>,
-    cache: DashMap<u32, CachedSchema>,
+    /// Cached per schema id behind an `Arc`: the decode hot path hits the
+    /// cache per message, and cloning the schema tree per hit is a measurable
+    /// per-message cost (`apache_avro::Schema` has no interior sharing).
+    cache: DashMap<u32, Arc<CachedSchema>>,
     gate: Option<CompatibilityGate>,
     /// Gate state: a pass verdict is cached for the codec lifetime; a failure
     /// is retried on later decodes no sooner than `gate_retry_interval` so a
@@ -234,7 +237,7 @@ impl SchemaRegistryCodec {
         verdict.map_err(Error::Process)
     }
 
-    async fn resolve_cached(&self, id: u32) -> Result<CachedSchema, Error> {
+    async fn resolve_cached(&self, id: u32) -> Result<Arc<CachedSchema>, Error> {
         if let Some(cached) = self.cache.get(&id) {
             return Ok(cached.clone());
         }
@@ -265,6 +268,7 @@ impl SchemaRegistryCodec {
             }
             FetchedSchema::Avro(schema) => CachedSchema::Avro(schema),
         };
+        let cached = Arc::new(cached);
         self.cache.insert(id, cached.clone());
         Ok(cached)
     }
@@ -297,9 +301,9 @@ impl Decoder for SchemaRegistryCodec {
         for msg in b {
             let (id, payload) = parse_wire_format(&msg)?;
             let cached = self.resolve_cached(id).await?;
-            let batch = match cached {
-                CachedSchema::Protobuf(descriptor) => protobuf_to_arrow(&descriptor, payload)?,
-                CachedSchema::Avro(schema) => avro_to_arrow(&schema, payload)?,
+            let batch = match cached.as_ref() {
+                CachedSchema::Protobuf(descriptor) => protobuf_to_arrow(descriptor, payload)?,
+                CachedSchema::Avro(schema) => avro_to_arrow(schema, payload)?,
             };
             batches.push(batch);
         }
