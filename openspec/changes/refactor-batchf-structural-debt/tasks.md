@@ -23,5 +23,5 @@
 
 ## 4. 收尾验证
 
-- [ ] 4.1 `cargo test --workspace --all-targets` 全绿；`cargo clippy --workspace --all-targets` 无新告警；`cargo fmt --all`
-- [ ] 4.2 契约复核：三个 delta spec 的每个 Scenario 均有对应测试证据；tasks 勾选；PLANNING 9.3 批次 F「仍开放」三项划掉
+- [x] 4.1 `cargo test --workspace --all-targets` 全绿；`cargo clippy --workspace --all-targets` 无新告警；`cargo fmt --all`
+- [x] 4.2 契约复核：三个 delta spec 的每个 Scenario 均有对应测试证据；tasks 勾选；PLANNING 9.3 批次 F「仍开放」三项划掉
