@@ -7,7 +7,11 @@
 //! `HubHaConfig::default()` (disabled) every gate here is a no-op and
 //! single-instance behavior is unchanged.
 
-use super::*;
+use super::error::HubError;
+use super::wire::HubEvent;
+use super::{now_ms, Hub, MAX_EVENTS};
+use arkflow_core::control::ControlEvent;
+use std::sync::atomic::Ordering;
 
 /// HA election configuration. Default is disabled.
 #[derive(Debug, Clone)]

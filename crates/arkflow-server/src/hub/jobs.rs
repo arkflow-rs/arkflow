@@ -1,6 +1,8 @@
 //! Job record store: CRUD, versioned updates, desired-state edits.
 
-use super::*;
+use super::error::HubError;
+use super::{now_ms, Hub};
+use crate::storage::{JobRecord, JobVersionRecord, StorageError};
 
 impl Hub {
     pub async fn jobs(&self) -> Result<Vec<JobRecord>, HubError> {

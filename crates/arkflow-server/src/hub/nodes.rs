@@ -1,6 +1,22 @@
 //! Node registry and the Agent pull protocol: register, heartbeat, report, commands.
 
-use super::*;
+use super::error::HubError;
+use super::placement::node_under_pressure;
+use super::wire::{
+    default_protocol_version, AgentAuth, AgentCommand, HeartbeatRequest, HubEvent, HubNode,
+    HubOperation, HubOperationState, NodeConnectionState, NodeReport, RegisterRequest,
+    RegisterResponse,
+};
+use super::{
+    now_ms, persist_operation, Hub, NodeRecord, MAX_EVENTS, MAX_NODES, SUPPORTED_PROTOCOL_VERSION,
+};
+use crate::api_contract::{OperatorRole, ResourceScope};
+use crate::storage::{NodeMutation, ObservedMutation};
+use arkflow_core::control::NodeMaintenanceState;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
+use subtle::ConstantTimeEq;
 
 const ALLOWED_NODE_METRICS: &[&str] = &[
     "input_batches",
@@ -910,7 +926,8 @@ impl Hub {
 
 #[cfg(test)]
 mod credential_tests {
-    use super::*;
+    use super::parse_operator_credential;
+    use crate::api_contract::OperatorRole;
 
     /// Spec: a plain token (no '|') stays a valid Admin credential, and a
     /// structured credential that fails to parse is rejected instead of

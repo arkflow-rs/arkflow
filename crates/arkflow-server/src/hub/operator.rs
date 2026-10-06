@@ -1,6 +1,9 @@
 //! Operator credential and OIDC authorization checks.
 
-use super::*;
+use super::nodes::parse_operator_credential;
+use super::Hub;
+use crate::api_contract::{OperatorAction, OperatorPrincipal};
+use subtle::ConstantTimeEq;
 
 impl Hub {
     pub async fn operator_authorized(&self, supplied: Option<&str>) -> bool {

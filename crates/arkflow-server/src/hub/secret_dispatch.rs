@@ -80,7 +80,9 @@ pub(crate) fn resolve_candidate_payload(payload: String) -> Result<Option<String
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::resolve_candidate_payload;
+    use arkflow_core::secret;
+    use serde_json::Value;
 
     /// Unique per-test env var names: cargo runs tests in parallel threads
     /// sharing one process environment.

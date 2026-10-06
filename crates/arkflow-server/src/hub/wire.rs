@@ -1,6 +1,8 @@
 //! Hub<->Agent wire types: registration, heartbeat, report, commands, results.
 
-use super::*;
+use arkflow_core::control::{ControlEvent, NodeMaintenanceState, OperationRecord, StreamStatus};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
