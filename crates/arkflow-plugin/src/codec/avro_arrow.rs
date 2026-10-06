@@ -22,9 +22,9 @@ use apache_avro::types::Value as AvroValue;
 use apache_avro::Schema as AvroSchema;
 use arkflow_core::Error;
 use datafusion::arrow::array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, StringArray, Time32MillisecondArray, Time64MicrosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+    Float64Builder, Int32Builder, Int64Builder, StringBuilder, Time32MillisecondBuilder,
+    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -35,279 +35,443 @@ const UTC: &str = "UTC";
 /// Decodes one Avro binary datum against the writer `schema` and converts it
 /// to a single-row Arrow batch.
 pub fn avro_to_arrow(schema: &AvroSchema, payload: &[u8]) -> Result<RecordBatch, Error> {
+    let value = avro_read_value(schema, payload)?;
+    let mut accumulator = AvroArrowAccumulator::new(schema)?;
+    accumulator.push(&value)?;
+    accumulator.finish()
+}
+
+/// Decodes one Avro binary datum against the writer `schema` into its
+/// `Avro::Value` form (the per-message reader step of the codec hot path).
+pub fn avro_read_value(schema: &AvroSchema, payload: &[u8]) -> Result<AvroValue, Error> {
     let reader = GenericDatumReader::builder(schema)
         .build()
         .map_err(|e| Error::Process(format!("Avro reader build failed: {}", e)))?;
-    let value = reader
+    reader
         .read_value(&mut std::io::Cursor::new(payload))
-        .map_err(|e| Error::Process(format!("Avro decode failed: {}", e)))?;
-    avro_value_to_arrow(schema, &value)
+        .map_err(|e| Error::Process(format!("Avro decode failed: {}", e)))
 }
 
-/// Converts a decoded Avro record value into a single-row Arrow batch.
-pub fn avro_value_to_arrow(schema: &AvroSchema, value: &AvroValue) -> Result<RecordBatch, Error> {
-    let (record_schema, values) = match (schema, value) {
-        (AvroSchema::Record(r), AvroValue::Record(values)) => (r, values),
-        _ => {
+/// One column builder, mirroring the flat leaf mapping of the single-row
+/// conversion path: same Arrow types, same timezone and decimal constants.
+enum Column {
+    Boolean(BooleanBuilder),
+    Int32(Int32Builder),
+    Int64(Int64Builder),
+    Float32(Float32Builder),
+    Float64(Float64Builder),
+    Utf8(StringBuilder),
+    Binary(BinaryBuilder),
+    Date32(Date32Builder),
+    Time32Milli(Time32MillisecondBuilder),
+    Time64Micro(Time64MicrosecondBuilder),
+    TimestampMilliUtc(TimestampMillisecondBuilder),
+    TimestampMicroUtc(TimestampMicrosecondBuilder),
+    TimestampMilliLocal(TimestampMillisecondBuilder),
+    TimestampMicroLocal(TimestampMicrosecondBuilder),
+    Decimal128(Decimal128Builder, u8, i8),
+}
+
+impl Column {
+    /// Builder + Arrow type for one leaf schema. Nested records, arrays and
+    /// maps are rejected here (construction time) exactly like the flat
+    /// mapping rejects them at conversion time.
+    fn new(name: &str, schema: &AvroSchema) -> Result<(Column, DataType), Error> {
+        Ok(match schema {
+            AvroSchema::Boolean => (Column::Boolean(BooleanBuilder::new()), DataType::Boolean),
+            AvroSchema::Int => (Column::Int32(Int32Builder::new()), DataType::Int32),
+            AvroSchema::Long => (Column::Int64(Int64Builder::new()), DataType::Int64),
+            AvroSchema::Float => (Column::Float32(Float32Builder::new()), DataType::Float32),
+            AvroSchema::Double => (Column::Float64(Float64Builder::new()), DataType::Float64),
+            AvroSchema::String | AvroSchema::Enum(_) | AvroSchema::Uuid(_) => {
+                (Column::Utf8(StringBuilder::new()), DataType::Utf8)
+            }
+            AvroSchema::Bytes | AvroSchema::Fixed(_) => {
+                (Column::Binary(BinaryBuilder::new()), DataType::Binary)
+            }
+            AvroSchema::Date => (Column::Date32(Date32Builder::new()), DataType::Date32),
+            AvroSchema::TimeMillis => (
+                Column::Time32Milli(Time32MillisecondBuilder::new()),
+                DataType::Time32(TimeUnit::Millisecond),
+            ),
+            AvroSchema::TimeMicros => (
+                Column::Time64Micro(Time64MicrosecondBuilder::new()),
+                DataType::Time64(TimeUnit::Microsecond),
+            ),
+            AvroSchema::TimestampMillis => (
+                Column::TimestampMilliUtc(TimestampMillisecondBuilder::new()),
+                DataType::Timestamp(TimeUnit::Millisecond, Some(UTC.into())),
+            ),
+            AvroSchema::TimestampMicros => (
+                Column::TimestampMicroUtc(TimestampMicrosecondBuilder::new()),
+                DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
+            ),
+            AvroSchema::LocalTimestampMillis => (
+                Column::TimestampMilliLocal(TimestampMillisecondBuilder::new()),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+            ),
+            AvroSchema::LocalTimestampMicros => (
+                Column::TimestampMicroLocal(TimestampMicrosecondBuilder::new()),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            AvroSchema::Decimal(d) => {
+                let (precision, scale) = decimal_metadata(d, name)?;
+                (
+                    Column::Decimal128(Decimal128Builder::new(), precision, scale),
+                    DataType::Decimal128(precision, scale),
+                )
+            }
+            AvroSchema::Record(_) | AvroSchema::Array(_) | AvroSchema::Map(_) => {
+                return Err(Error::Process(format!(
+                    "Unsupported nested Avro type for field '{}': nested records/arrays/maps are not supported by the flat Arrow mapping",
+                    name
+                )));
+            }
+            other => {
+                return Err(Error::Process(format!(
+                    "Unsupported Avro type for field '{}': {:?}",
+                    name, other
+                )));
+            }
+        })
+    }
+
+    /// Appends one non-null leaf value. The catch-all arm keeps the
+    /// schema-vs-value mismatch rejection of the single-row path.
+    fn push_leaf(
+        &mut self,
+        name: &str,
+        schema: &AvroSchema,
+        value: &AvroValue,
+    ) -> Result<(), Error> {
+        match (schema, value) {
+            (AvroSchema::Boolean, AvroValue::Boolean(v)) => {
+                self.boolean().append_value(*v);
+            }
+            (AvroSchema::Int, AvroValue::Int(v)) => self.int32().append_value(*v),
+            (AvroSchema::Long, AvroValue::Long(v)) => self.int64().append_value(*v),
+            (AvroSchema::Float, AvroValue::Float(v)) => self.float32().append_value(*v),
+            (AvroSchema::Double, AvroValue::Double(v)) => self.float64().append_value(*v),
+            (AvroSchema::String, AvroValue::String(v)) => self.utf8().append_value(v),
+            (AvroSchema::Enum(_), AvroValue::Enum(_, symbol)) => {
+                self.utf8().append_value(symbol);
+            }
+            (AvroSchema::Uuid(_), AvroValue::Uuid(v)) => {
+                self.utf8().append_value(v.to_string());
+            }
+            // A Uuid-shaped plain string keeps the text form (widening branch).
+            (AvroSchema::Uuid(_), AvroValue::String(v)) => self.utf8().append_value(v),
+            (AvroSchema::Bytes, AvroValue::Bytes(v)) => self.binary().append_value(v),
+            (AvroSchema::Fixed(_), AvroValue::Fixed(_, v)) => self.binary().append_value(v),
+            (AvroSchema::Date, AvroValue::Date(v)) => self.date32().append_value(*v),
+            (AvroSchema::TimeMillis, AvroValue::TimeMillis(v)) => {
+                self.time32_milli().append_value(*v);
+            }
+            (AvroSchema::TimeMicros, AvroValue::TimeMicros(v)) => {
+                self.time64_micro().append_value(*v);
+            }
+            (AvroSchema::TimestampMillis, AvroValue::TimestampMillis(v)) => {
+                self.timestamp_milli_utc().append_value(*v);
+            }
+            (AvroSchema::TimestampMicros, AvroValue::TimestampMicros(v)) => {
+                self.timestamp_micro_utc().append_value(*v);
+            }
+            (AvroSchema::LocalTimestampMillis, AvroValue::LocalTimestampMillis(v)) => {
+                self.timestamp_milli_local().append_value(*v);
+            }
+            (AvroSchema::LocalTimestampMicros, AvroValue::LocalTimestampMicros(v)) => {
+                self.timestamp_micro_local().append_value(*v)
+            }
+            (AvroSchema::Decimal(_), AvroValue::Decimal(dec)) => {
+                let bytes = <Vec<u8>>::try_from(dec).map_err(|e| {
+                    Error::Process(format!(
+                        "Avro decimal conversion failed for field '{}': {}",
+                        name, e
+                    ))
+                })?;
+                let unscaled = decode_decimal_i128(&bytes).ok_or_else(|| {
+                    Error::Process(format!(
+                        "Avro decimal for field '{}' exceeds decimal128 range",
+                        name
+                    ))
+                })?;
+                match self {
+                    Column::Decimal128(builder, _, _) => builder.append_value(unscaled),
+                    _ => unreachable!("decimal metadata construction guarantees the builder kind"),
+                }
+            }
+            (s, v) => {
+                return Err(Error::Process(format!(
+                    "Unsupported Avro type for field '{}': schema {:?} with value {:?}",
+                    name, s, v
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn append_null(&mut self) {
+        match self {
+            Column::Boolean(b) => b.append_null(),
+            Column::Int32(b) => b.append_null(),
+            Column::Int64(b) => b.append_null(),
+            Column::Float32(b) => b.append_null(),
+            Column::Float64(b) => b.append_null(),
+            Column::Utf8(b) => b.append_null(),
+            Column::Binary(b) => b.append_null(),
+            Column::Date32(b) => b.append_null(),
+            Column::Time32Milli(b) => b.append_null(),
+            Column::Time64Micro(b) => b.append_null(),
+            Column::TimestampMilliUtc(b) => b.append_null(),
+            Column::TimestampMicroUtc(b) => b.append_null(),
+            Column::TimestampMilliLocal(b) => b.append_null(),
+            Column::TimestampMicroLocal(b) => b.append_null(),
+            Column::Decimal128(b, _, _) => b.append_null(),
+        }
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        match self {
+            Column::Boolean(b) => Arc::new(b.finish()),
+            Column::Int32(b) => Arc::new(b.finish()),
+            Column::Int64(b) => Arc::new(b.finish()),
+            Column::Float32(b) => Arc::new(b.finish()),
+            Column::Float64(b) => Arc::new(b.finish()),
+            Column::Utf8(b) => Arc::new(b.finish()),
+            Column::Binary(b) => Arc::new(b.finish()),
+            Column::Date32(b) => Arc::new(b.finish()),
+            Column::Time32Milli(b) => Arc::new(b.finish()),
+            Column::Time64Micro(b) => Arc::new(b.finish()),
+            Column::TimestampMilliUtc(b) => Arc::new(b.finish().with_timezone(Arc::from(UTC))),
+            Column::TimestampMicroUtc(b) => Arc::new(b.finish().with_timezone(Arc::from(UTC))),
+            // Local timestamps carry no timezone; stamping one would make the
+            // array type diverge from the declared column type.
+            Column::TimestampMilliLocal(b) => Arc::new(b.finish()),
+            Column::TimestampMicroLocal(b) => Arc::new(b.finish()),
+            Column::Decimal128(b, precision, scale) => Arc::new(
+                b.finish()
+                    .with_precision_and_scale(*precision, *scale)
+                    .expect("decimal metadata construction guarantees valid precision/scale"),
+            ),
+        }
+    }
+
+    // Typed accessors used by `push_leaf`; construction guarantees the kind.
+    fn boolean(&mut self) -> &mut BooleanBuilder {
+        match self {
+            Column::Boolean(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn int32(&mut self) -> &mut Int32Builder {
+        match self {
+            Column::Int32(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn int64(&mut self) -> &mut Int64Builder {
+        match self {
+            Column::Int64(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn float32(&mut self) -> &mut Float32Builder {
+        match self {
+            Column::Float32(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn float64(&mut self) -> &mut Float64Builder {
+        match self {
+            Column::Float64(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn utf8(&mut self) -> &mut StringBuilder {
+        match self {
+            Column::Utf8(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn binary(&mut self) -> &mut BinaryBuilder {
+        match self {
+            Column::Binary(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn date32(&mut self) -> &mut Date32Builder {
+        match self {
+            Column::Date32(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn time32_milli(&mut self) -> &mut Time32MillisecondBuilder {
+        match self {
+            Column::Time32Milli(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn time64_micro(&mut self) -> &mut Time64MicrosecondBuilder {
+        match self {
+            Column::Time64Micro(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn timestamp_milli_utc(&mut self) -> &mut TimestampMillisecondBuilder {
+        match self {
+            Column::TimestampMilliUtc(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn timestamp_micro_utc(&mut self) -> &mut TimestampMicrosecondBuilder {
+        match self {
+            Column::TimestampMicroUtc(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn timestamp_milli_local(&mut self) -> &mut TimestampMillisecondBuilder {
+        match self {
+            Column::TimestampMilliLocal(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+    fn timestamp_micro_local(&mut self) -> &mut TimestampMicrosecondBuilder {
+        match self {
+            Column::TimestampMicroLocal(b) => b,
+            _ => unreachable!("schema/builder kind mismatch"),
+        }
+    }
+}
+
+/// Columnar accumulator over one writer schema: values are appended straight
+/// into per-field builders, so a batch of N messages costs one builder per
+/// field instead of N×fields single-element arrays plus a concat copy.
+pub struct AvroArrowAccumulator {
+    fields: Vec<Field>,
+    /// Resolved (union-unwrapped) leaf schema per column, kept for the
+    /// schema-vs-value pairing checks of `push`.
+    leaf_schemas: Vec<AvroSchema>,
+    columns: Vec<Column>,
+    rows: usize,
+}
+
+impl AvroArrowAccumulator {
+    pub fn new(schema: &AvroSchema) -> Result<Self, Error> {
+        let AvroSchema::Record(record) = schema else {
             return Err(Error::Process(
                 "Avro payload must decode to a record to be mapped to Arrow columns".to_string(),
             ));
+        };
+        let mut fields = Vec::with_capacity(record.fields.len());
+        let mut leaf_schemas = Vec::with_capacity(record.fields.len());
+        let mut columns = Vec::with_capacity(record.fields.len());
+        for field in &record.fields {
+            let (schema, nullable) = match &field.schema {
+                AvroSchema::Union(u) => {
+                    let variants = u.variants();
+                    if variants.len() != 2
+                        || !variants.iter().any(|v| matches!(v, AvroSchema::Null))
+                    {
+                        return Err(Error::Process(format!(
+                            "Unsupported Avro union for field '{}': only [null, T] unions are supported (found {} branches)",
+                            field.name,
+                            variants.len()
+                        )));
+                    }
+                    let typed = variants
+                        .iter()
+                        .find(|v| !matches!(v, AvroSchema::Null))
+                        .expect("checked above: union contains a non-null branch");
+                    (typed.clone(), true)
+                }
+                other => (other.clone(), false),
+            };
+            let (column, data_type) = Column::new(&field.name, &schema)?;
+            fields.push(Field::new(&field.name, data_type, nullable));
+            leaf_schemas.push(schema);
+            columns.push(column);
         }
-    };
-    if record_schema.fields.len() != values.len() {
-        return Err(Error::Process(format!(
-            "Avro record field count mismatch: schema has {} fields, value has {}",
-            record_schema.fields.len(),
-            values.len()
-        )));
+        Ok(Self {
+            fields,
+            leaf_schemas,
+            columns,
+            rows: 0,
+        })
     }
-    let mut arrow_fields = Vec::with_capacity(values.len());
-    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(values.len());
-    for (field, (value_name, value)) in record_schema.fields.iter().zip(values.iter()) {
-        if field.name != *value_name {
+
+    /// Appends one decoded record value. Field count, order and union
+    /// nullability keep the single-row path's error messages.
+    pub fn push(&mut self, value: &AvroValue) -> Result<(), Error> {
+        let AvroValue::Record(values) = value else {
+            return Err(Error::Process(
+                "Avro payload must decode to a record to be mapped to Arrow columns".to_string(),
+            ));
+        };
+        if self.fields.len() != values.len() {
             return Err(Error::Process(format!(
-                "Avro record field order mismatch: schema field '{}' vs value field '{}'",
-                field.name, value_name
+                "Avro record field count mismatch: schema has {} fields, value has {}",
+                self.fields.len(),
+                values.len()
             )));
         }
-        let (f, arr) = field_to_arrow(&field.name, &field.schema, value)?;
-        arrow_fields.push(f);
-        columns.push(arr);
-    }
-    let arrow_schema = Arc::new(Schema::new(arrow_fields));
-    RecordBatch::try_new(arrow_schema, columns)
-        .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))
-}
-
-/// Converts one record field to an Arrow column. `[null, T]` unions unwrap
-/// into a nullable column of `T`.
-fn field_to_arrow(
-    name: &str,
-    schema: &AvroSchema,
-    value: &AvroValue,
-) -> Result<(Arc<Field>, Arc<dyn Array>), Error> {
-    let (schema, value, nullable) = match (schema, value) {
-        (AvroSchema::Union(u), AvroValue::Union(idx, inner)) => {
-            let variants = u.variants();
-            if variants.len() != 2 || !variants.iter().any(|v| matches!(v, AvroSchema::Null)) {
+        for (index, (value_name, value)) in values.iter().enumerate() {
+            let name = self.fields[index].name();
+            if name != value_name {
                 return Err(Error::Process(format!(
-                    "Unsupported Avro union for field '{}': only [null, T] unions are supported (found {} branches)",
-                    name,
-                    variants.len()
+                    "Avro record field order mismatch: schema field '{}' vs value field '{}'",
+                    name, value_name
                 )));
             }
-            if matches!(inner.as_ref(), AvroValue::Null) {
-                // A null entry still belongs to a nullable column of T.
-                let typed = variants
-                    .iter()
-                    .find(|v| !matches!(v, AvroSchema::Null))
-                    .expect("checked above: union contains a non-null branch");
-                let (dt, arr) = null_column(typed, name)?;
-                return Ok((Arc::new(Field::new(name, dt, true)), arr));
+            let leaf_schema = &self.leaf_schemas[index];
+            if self.fields[index].is_nullable() {
+                // Nullable ⇔ the writer field was a [null, T] union: the
+                // decoded value must be a union value (bare values keep the
+                // single-row path's fail-loud error).
+                match value {
+                    AvroValue::Union(_, inner) => {
+                        if matches!(inner.as_ref(), AvroValue::Null) {
+                            self.columns[index].append_null();
+                        } else {
+                            self.columns[index].push_leaf(name, leaf_schema, inner)?;
+                        }
+                    }
+                    _ => {
+                        return Err(Error::Process(format!(
+                            "Avro field '{}' does not hold a union value but its schema is a union",
+                            name
+                        )));
+                    }
+                }
+            } else {
+                match value {
+                    AvroValue::Null => {
+                        return Err(Error::Process(format!(
+                            "Avro field '{}' is null but its schema is not nullable",
+                            name
+                        )));
+                    }
+                    other => self.columns[index].push_leaf(name, leaf_schema, other)?,
+                }
             }
-            (&variants[*idx as usize], inner.as_ref(), true)
         }
-        (AvroSchema::Union(_), _) => {
-            return Err(Error::Process(format!(
-                "Avro field '{}' does not hold a union value but its schema is a union",
-                name
-            )));
-        }
-        (s, v) => (s, v, false),
-    };
-
-    if matches!(value, AvroValue::Null) {
-        return Err(Error::Process(format!(
-            "Avro field '{}' is null but its schema is not nullable",
-            name
-        )));
+        self.rows += 1;
+        Ok(())
     }
 
-    leaf_to_arrow(name, schema, value, nullable)
-}
+    pub fn finish(&mut self) -> Result<RecordBatch, Error> {
+        let schema = Arc::new(Schema::new(self.fields.clone()));
+        let columns: Vec<ArrayRef> = self.columns.iter_mut().map(Column::finish).collect();
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))
+    }
 
-/// A single null entry typed by the resolved schema (for nullable unions).
-fn null_column(schema: &AvroSchema, name: &str) -> Result<(DataType, Arc<dyn Array>), Error> {
-    let (dt, arr): (DataType, Arc<dyn Array>) = match schema {
-        AvroSchema::Boolean => (DataType::Boolean, Arc::new(BooleanArray::from(vec![None]))),
-        AvroSchema::Int => (DataType::Int32, Arc::new(Int32Array::from(vec![None]))),
-        AvroSchema::Long => (DataType::Int64, Arc::new(Int64Array::from(vec![None]))),
-        AvroSchema::Float => (DataType::Float32, Arc::new(Float32Array::from(vec![None]))),
-        AvroSchema::Double => (DataType::Float64, Arc::new(Float64Array::from(vec![None]))),
-        AvroSchema::Bytes | AvroSchema::Fixed(_) => (
-            DataType::Binary,
-            Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
-        ),
-        AvroSchema::String | AvroSchema::Enum(_) | AvroSchema::Uuid(_) => (
-            DataType::Utf8,
-            Arc::new(StringArray::from(vec![None::<String>])),
-        ),
-        AvroSchema::Date => (DataType::Date32, Arc::new(Date32Array::from(vec![None]))),
-        AvroSchema::TimeMillis => (
-            DataType::Time32(TimeUnit::Millisecond),
-            Arc::new(Time32MillisecondArray::from(vec![None])),
-        ),
-        AvroSchema::TimeMicros => (
-            DataType::Time64(TimeUnit::Microsecond),
-            Arc::new(Time64MicrosecondArray::from(vec![None])),
-        ),
-        AvroSchema::TimestampMillis => (
-            DataType::Timestamp(TimeUnit::Millisecond, Some(UTC.into())),
-            Arc::new(TimestampMillisecondArray::from(vec![None]).with_timezone(Arc::from(UTC))),
-        ),
-        AvroSchema::TimestampMicros => (
-            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
-            Arc::new(TimestampMicrosecondArray::from(vec![None]).with_timezone(Arc::from(UTC))),
-        ),
-        AvroSchema::LocalTimestampMillis => (
-            DataType::Timestamp(TimeUnit::Millisecond, None),
-            // Local timestamps carry no timezone; stamping one would make the
-            // array type diverge from the declared column type.
-            Arc::new(TimestampMillisecondArray::from(vec![None])),
-        ),
-        AvroSchema::LocalTimestampMicros => (
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            Arc::new(TimestampMicrosecondArray::from(vec![None])),
-        ),
-        AvroSchema::Decimal(d) => {
-            let (precision, scale) = decimal_metadata(d, name)?;
-            let arr = Decimal128Array::from(vec![None::<i128>])
-                .with_precision_and_scale(precision, scale)
-                .map_err(|e| {
-                    Error::Process(format!(
-                        "Avro decimal for field '{}' cannot set precision/scale: {}",
-                        name, e
-                    ))
-                })?;
-            (DataType::Decimal128(precision, scale), Arc::new(arr))
-        }
-        other => {
-            return Err(Error::Process(format!(
-                "Unsupported Avro type for field '{}': {:?}",
-                name, other
-            )));
-        }
-    };
-    Ok((dt, arr))
-}
+    pub fn len(&self) -> usize {
+        self.rows
+    }
 
-/// Maps a non-null leaf value to a typed single-entry Arrow array.
-fn leaf_to_arrow(
-    name: &str,
-    schema: &AvroSchema,
-    value: &AvroValue,
-    nullable: bool,
-) -> Result<(Arc<Field>, Arc<dyn Array>), Error> {
-    let (dt, arr): (DataType, Arc<dyn Array>) = match (schema, value) {
-        (AvroSchema::Boolean, AvroValue::Boolean(v)) => (
-            DataType::Boolean,
-            Arc::new(BooleanArray::from(vec![Some(*v)])),
-        ),
-        (AvroSchema::Int, AvroValue::Int(v)) => {
-            (DataType::Int32, Arc::new(Int32Array::from(vec![Some(*v)])))
-        }
-        (AvroSchema::Long, AvroValue::Long(v)) => {
-            (DataType::Int64, Arc::new(Int64Array::from(vec![Some(*v)])))
-        }
-        (AvroSchema::Float, AvroValue::Float(v)) => (
-            DataType::Float32,
-            Arc::new(Float32Array::from(vec![Some(*v)])),
-        ),
-        (AvroSchema::Double, AvroValue::Double(v)) => (
-            DataType::Float64,
-            Arc::new(Float64Array::from(vec![Some(*v)])),
-        ),
-        (AvroSchema::Bytes, AvroValue::Bytes(v)) => (
-            DataType::Binary,
-            Arc::new(BinaryArray::from(vec![Some(v.as_slice())])),
-        ),
-        (AvroSchema::Fixed(_), AvroValue::Fixed(_, v)) => (
-            DataType::Binary,
-            Arc::new(BinaryArray::from(vec![Some(v.as_slice())])),
-        ),
-        (AvroSchema::String, AvroValue::String(v)) => (
-            DataType::Utf8,
-            Arc::new(StringArray::from(vec![Some(v.as_str())])),
-        ),
-        (AvroSchema::Enum(_), AvroValue::Enum(_, symbol)) => (
-            DataType::Utf8,
-            Arc::new(StringArray::from(vec![Some(symbol.as_str())])),
-        ),
-        (AvroSchema::Uuid(_), AvroValue::Uuid(v)) => (
-            DataType::Utf8,
-            Arc::new(StringArray::from(vec![Some(v.to_string())])),
-        ),
-        (AvroSchema::Uuid(_), AvroValue::String(v)) => (
-            DataType::Utf8,
-            Arc::new(StringArray::from(vec![Some(v.as_str())])),
-        ),
-        (AvroSchema::Date, AvroValue::Date(v)) => (
-            DataType::Date32,
-            Arc::new(Date32Array::from(vec![Some(*v)])),
-        ),
-        (AvroSchema::TimeMillis, AvroValue::TimeMillis(v)) => (
-            DataType::Time32(TimeUnit::Millisecond),
-            Arc::new(Time32MillisecondArray::from(vec![Some(*v)])),
-        ),
-        (AvroSchema::TimeMicros, AvroValue::TimeMicros(v)) => (
-            DataType::Time64(TimeUnit::Microsecond),
-            Arc::new(Time64MicrosecondArray::from(vec![Some(*v)])),
-        ),
-        (AvroSchema::TimestampMillis, AvroValue::TimestampMillis(v)) => (
-            DataType::Timestamp(TimeUnit::Millisecond, Some(UTC.into())),
-            Arc::new(TimestampMillisecondArray::from(vec![Some(*v)]).with_timezone(Arc::from(UTC))),
-        ),
-        (AvroSchema::TimestampMicros, AvroValue::TimestampMicros(v)) => (
-            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
-            Arc::new(TimestampMicrosecondArray::from(vec![Some(*v)]).with_timezone(Arc::from(UTC))),
-        ),
-        (AvroSchema::LocalTimestampMillis, AvroValue::LocalTimestampMillis(v)) => (
-            DataType::Timestamp(TimeUnit::Millisecond, None),
-            // Local timestamps carry no timezone (mirrors null_column).
-            Arc::new(TimestampMillisecondArray::from(vec![Some(*v)])),
-        ),
-        (AvroSchema::LocalTimestampMicros, AvroValue::LocalTimestampMicros(v)) => (
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            Arc::new(TimestampMicrosecondArray::from(vec![Some(*v)])),
-        ),
-        (AvroSchema::Decimal(d), AvroValue::Decimal(dec)) => {
-            let (precision, scale) = decimal_metadata(d, name)?;
-            let bytes = <Vec<u8>>::try_from(dec).map_err(|e| {
-                Error::Process(format!(
-                    "Avro decimal conversion failed for field '{}': {}",
-                    name, e
-                ))
-            })?;
-            let unscaled = decode_decimal_i128(&bytes).ok_or_else(|| {
-                Error::Process(format!(
-                    "Avro decimal for field '{}' exceeds decimal128 range",
-                    name
-                ))
-            })?;
-            let arr = Decimal128Array::from(vec![Some(unscaled)])
-                .with_precision_and_scale(precision, scale)
-                .map_err(|e| {
-                    Error::Process(format!(
-                        "Avro decimal for field '{}' cannot set precision/scale: {}",
-                        name, e
-                    ))
-                })?;
-            (DataType::Decimal128(precision, scale), Arc::new(arr))
-        }
-        (AvroSchema::Record(_) | AvroSchema::Array(_) | AvroSchema::Map(_), _) => {
-            return Err(Error::Process(format!(
-                "Unsupported nested Avro type for field '{}': nested records/arrays/maps are not supported by the flat Arrow mapping",
-                name
-            )));
-        }
-        (s, v) => {
-            return Err(Error::Process(format!(
-                "Unsupported Avro type for field '{}': schema {:?} with value {:?}",
-                name, s, v
-            )));
-        }
-    };
-    Ok((Arc::new(Field::new(name, dt, nullable)), arr))
+    pub fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
 }
 
 fn decimal_metadata(d: &apache_avro::schema::DecimalSchema, name: &str) -> Result<(u8, i8), Error> {
@@ -345,6 +509,14 @@ mod tests {
     use apache_avro::types::Value;
     use apache_avro::writer::datum::GenericDatumWriter;
     use apache_avro::Decimal;
+
+    /// Push one raw value through the accumulator (no encoder round trip) —
+    /// the replacement for the removed single-row `avro_value_to_arrow`.
+    fn push_value(schema: &AvroSchema, value: &Value) -> Result<RecordBatch, Error> {
+        let mut accumulator = AvroArrowAccumulator::new(schema)?;
+        accumulator.push(value)?;
+        accumulator.finish()
+    }
 
     fn encode(schema: &AvroSchema, value: Value) -> Vec<u8> {
         GenericDatumWriter::builder(schema)
@@ -633,7 +805,7 @@ mod tests {
         // null-under-non-nullable branch is exercised without the encoder
         // refusing first.
         let value = Value::Record(vec![("x".into(), Value::Null)]);
-        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        let err = push_value(&schema, &value).unwrap_err();
         assert!(err.to_string().contains("not nullable"), "{err}");
     }
 
@@ -644,7 +816,7 @@ mod tests {
             r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": {"type": "array", "items": "int"}}]}"#,
         );
         let value = Value::Record(vec![("x".into(), Value::Array(vec![Value::Int(1)]))]);
-        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        let err = push_value(&schema, &value).unwrap_err();
         assert!(
             err.to_string().contains("Unsupported nested Avro type"),
             "{err}"
@@ -657,7 +829,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("k".to_string(), Value::Int(1));
         let value = Value::Record(vec![("x".into(), Value::Map(map))]);
-        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        let err = push_value(&schema, &value).unwrap_err();
         assert!(
             err.to_string().contains("Unsupported nested Avro type"),
             "{err}"
@@ -697,8 +869,8 @@ mod tests {
                 .map(|(name, value)| (name.to_string(), value.clone()))
                 .collect(),
         );
-        let batch = avro_value_to_arrow(&schema, &value)
-            .unwrap_or_else(|e| panic!("leaf mapping failed: {e}"));
+        let batch =
+            push_value(&schema, &value).unwrap_or_else(|e| panic!("leaf mapping failed: {e}"));
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), cases.len());
         // The uuid-as-string branch keeps text form.
@@ -717,7 +889,7 @@ mod tests {
         let schema =
             parse(r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": "long"}]}"#);
         let value = Value::Record(vec![("x".into(), Value::String("nope".into()))]);
-        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        let err = push_value(&schema, &value).unwrap_err();
         assert!(err.to_string().contains("Unsupported Avro type"), "{err}");
     }
 
@@ -727,7 +899,7 @@ mod tests {
             r#"{"type": "record", "name": "R", "fields": [{"name": "x", "type": ["null", "int"]}]}"#,
         );
         let value = Value::Record(vec![("x".into(), Value::Int(3))]);
-        let err = avro_value_to_arrow(&schema, &value).unwrap_err();
+        let err = push_value(&schema, &value).unwrap_err();
         assert!(
             err.to_string().contains("does not hold a union value"),
             "{err}"
@@ -776,5 +948,88 @@ mod tests {
         let payload = encode(&schema, Value::String("x".into()));
         let err = avro_to_arrow(&schema, &payload).unwrap_err();
         assert!(format!("{err}").contains("record"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_row_accumulation_matches_per_message_batches() {
+        // Same schema, heterogeneous rows (incl. nulls): the accumulated
+        // multi-row batch must equal the concat of per-message decodes.
+        let schema = parse(
+            r#"{
+                "type": "record", "name": "R", "fields": [
+                    {"name": "id", "type": "long"},
+                    {"name": "note", "type": ["null", "string"]},
+                    {"name": "score", "type": "double"}
+                ]
+            }"#,
+        );
+        let rows = [
+            (1i64, Some("a"), 1.5f64),
+            (2, None, 2.5),
+            (3, Some("c"), 3.5),
+        ];
+        let payloads: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|(id, note, score)| {
+                encode(
+                    &schema,
+                    Value::Record(vec![
+                        ("id".into(), Value::Long(*id)),
+                        (
+                            "note".into(),
+                            match note {
+                                Some(n) => Value::Union(1, Box::new(Value::String(n.to_string()))),
+                                None => Value::Union(0, Box::new(Value::Null)),
+                            },
+                        ),
+                        ("score".into(), Value::Double(*score)),
+                    ]),
+                )
+            })
+            .collect();
+
+        let mut accumulator = AvroArrowAccumulator::new(&schema).unwrap();
+        for payload in &payloads {
+            accumulator
+                .push(&avro_read_value(&schema, payload).unwrap())
+                .unwrap();
+        }
+        assert_eq!(accumulator.len(), 3);
+        let merged = accumulator.finish().unwrap();
+        assert_eq!(merged.num_rows(), 3);
+        assert_eq!(merged.num_columns(), 3);
+
+        // Columnar equivalence with the per-message path: row content and
+        // column order/types match; nullability now consistently reflects
+        // the writer schema (the union merge used to lose non-nullable flags
+        // on multi-message batches while single-message decodes kept them).
+        let per_message: Vec<RecordBatch> = payloads
+            .iter()
+            .map(|p| avro_to_arrow(&schema, p).unwrap())
+            .collect();
+        let expected = crate::component::batch_merge::normalize_and_concat(&per_message).unwrap();
+        assert_eq!(merged.num_rows(), expected.num_rows());
+        for index in 0..merged.num_columns() {
+            assert_eq!(
+                merged.schema().field(index).data_type(),
+                expected.schema().field(index).data_type(),
+                "column {index} type differs"
+            );
+            assert_eq!(
+                merged.column(index).to_data(),
+                expected.column(index).to_data(),
+                "column {index} differs"
+            );
+        }
+        assert!(
+            !merged.schema().field(0).is_nullable(),
+            "id is non-nullable"
+        );
+        assert!(merged.schema().field(1).is_nullable(), "note is nullable");
+
+        use datafusion::arrow::array::{Array, AsArray};
+        assert!(merged.column(1).as_string::<i32>().is_null(1));
+        assert_eq!(merged.column(1).as_string::<i32>().value(0), "a");
+        assert_eq!(merged.column(1).as_string::<i32>().value(2), "c");
     }
 }
