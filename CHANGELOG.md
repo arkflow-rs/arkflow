@@ -107,6 +107,12 @@ refactoring is summarized rather than listed commit-by-commit.
   Multi-version mixed batches still merge through the union schema (rows
   grouped by schema id in first-appearance order); column nullability now
   consistently reflects the writer schema. (#1310)
+- Protobuf schema-registry decoding gets the same columnar treatment:
+  messages sharing a schema id accumulate into one multi-row batch with
+  per-batch column plans and field-number value access, instead of one
+  single-row batch per message plus a concat copy. Output and error
+  behavior are unchanged; ~18x faster on a 26-field message timing run.
+  (#1312)
 
 ### Fixed
 
