@@ -3,9 +3,7 @@
 ## Purpose
 
 公开可复现的基准套件（issue #87）：一条命令覆盖内核主路径（线性 SQL 聚合、GROUP BY 有状态聚合、过滤投影）、JSON 编解码与状态后端，产出人类可读 markdown 与机器可读 JSON 两种报告。场景全部自包含（无网络、无外部服务）。（源自 `add-public-benchmark` 变更。）
-
 ## Requirements
-
 ### Requirement: 一条命令可复现的基准
 
 SHALL 提供公开入口 `cargo run -p arkflow --release --example benchmark`，可选参数 `--count`（行数）、`--runs`（测量次数）、`--warmup`（预热次数）、`--json`（机器可读输出）。默认参数 SHALL 在常规开发机上数十秒内完成。全部场景 SHALL 无外部依赖（无网络、无外部服务），任何克隆仓库的贡献者可复现。
@@ -37,3 +35,4 @@ SHALL 提供公开入口 `cargo run -p arkflow --release --example benchmark`，
 
 - **WHEN** 同一次运行分别输出两种格式
 - **THEN** 场景集合与吞吐数值一致
+

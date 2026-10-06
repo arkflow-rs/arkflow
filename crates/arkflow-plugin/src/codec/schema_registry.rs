@@ -19,8 +19,8 @@
 //! Schemas are cached per id so each schema version is fetched at most once.
 //! The decode side is dispatched on the registry's `schemaType` response.
 
-use crate::codec::avro_arrow::{avro_to_arrow, AvroBatchConverter};
-use crate::component::protobuf::{parse_proto_source, protobuf_to_arrow, ProtobufBatchConverter};
+use crate::codec::avro_arrow::{avro_read_value, AvroArrowAccumulator};
+use crate::component::protobuf::{parse_proto_source, ProtobufBatchConverter};
 use apache_avro::Schema as AvroSchema;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
@@ -297,84 +297,60 @@ impl Encoder for SchemaRegistryCodec {
 impl Decoder for SchemaRegistryCodec {
     async fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
         self.ensure_gate().await?;
-        // Single-schema-id fast path: the converter borrows the cached
-        // schema, so the Arc keeping it alive is declared first and dropped
-        // last.
-        let mut fast_schema: Option<Arc<CachedSchema>>;
-        let mut fast: Option<(u32, FastConverter<'_>)> = None;
-        // Fallback single-row batches (mixed schema ids — schema evolution).
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut fallback = false;
-        for msg in &b {
-            let (id, payload) = parse_wire_format(msg)?;
-            if fallback {
-                let cached = self.resolve_cached(id).await?;
-                batches.push(decode_single(cached.as_ref(), payload)?);
-                continue;
-            }
-            let same_id = fast.as_ref().map(|(fid, _)| *fid) == Some(id);
-            if !same_id {
-                if let Some((_, conv)) = fast.take() {
-                    // A second schema id mid-batch: seal the accumulated rows
-                    // as the leading batch and finish the rest through the
-                    // per-message path — the prefix keeps message order
-                    // because it heads the concat list.
-                    batches.push(match conv {
-                        FastConverter::Avro(c) => c.finish(false)?,
-                        FastConverter::Protobuf(c) => c.finish()?,
-                    });
-                    fallback = true;
-                    let cached = self.resolve_cached(id).await?;
-                    batches.push(decode_single(cached.as_ref(), payload)?);
-                    continue;
+        // Messages accumulate columnar per schema id (groups in
+        // first-appearance order, rows in message order within a group);
+        // protobuf groups accumulate columnar exactly like Avro groups, so
+        // relative order is stable across kinds.
+        enum Group {
+            Avro(Box<AvroArrowAccumulator>),
+            Protobuf(ProtobufBatchConverter),
+        }
+        let mut groups: Vec<(u32, Group)> = Vec::new();
+        for msg in b {
+            let (id, payload) = parse_wire_format(&msg)?;
+            let cached = self.resolve_cached(id).await?;
+            match cached.as_ref() {
+                CachedSchema::Protobuf(descriptor) => {
+                    match groups.iter_mut().find(|(gid, _)| gid == &id) {
+                        Some((_, Group::Protobuf(converter))) => converter.push(payload)?,
+                        _ => {
+                            // `MessageDescriptor` clones are cheap Arc bumps.
+                            let mut converter = ProtobufBatchConverter::new(descriptor.clone());
+                            converter.push(payload)?;
+                            groups.push((id, Group::Protobuf(converter)));
+                        }
+                    }
                 }
-                let cached = self.resolve_cached(id).await?;
-                fast_schema = Some(cached);
-                let conv = match fast_schema.as_ref().expect("just stored").as_ref() {
-                    CachedSchema::Protobuf(descriptor) => {
-                        FastConverter::Protobuf(ProtobufBatchConverter::new(descriptor))
+                CachedSchema::Avro(schema) => {
+                    let value = avro_read_value(schema, payload)?;
+                    match groups.iter_mut().find(|(gid, _)| gid == &id) {
+                        Some((_, Group::Avro(accumulator))) => accumulator.push(&value)?,
+                        _ => {
+                            let mut accumulator = Box::new(AvroArrowAccumulator::new(schema)?);
+                            accumulator.push(&value)?;
+                            groups.push((id, Group::Avro(accumulator)));
+                        }
                     }
-                    CachedSchema::Avro(schema) => {
-                        FastConverter::Avro(AvroBatchConverter::new(schema))
-                    }
-                };
-                fast = Some((id, conv));
-            }
-            match &mut fast.as_mut().expect("matched or established above").1 {
-                FastConverter::Avro(c) => c.push(payload)?,
-                FastConverter::Protobuf(c) => c.push(payload)?,
+                }
             }
         }
-        let batch = if fallback {
-            crate::component::batch_merge::normalize_and_concat(&batches)?
-        } else if let Some((_, conv)) = fast.take() {
-            match conv {
-                // N>=2 replicates the all-nullable promotion the union merge
-                // applies to multi-message batches; N=1 keeps the mapping.
-                FastConverter::Avro(c) => {
-                    let rows = c.rows();
-                    c.finish(rows >= 2)?
-                }
-                FastConverter::Protobuf(c) => c.finish()?,
+        let mut batches = Vec::with_capacity(groups.len());
+        for (_, group) in groups {
+            match group {
+                Group::Avro(mut accumulator) => batches.push(accumulator.finish()?),
+                Group::Protobuf(converter) => batches.push(converter.finish()?),
             }
-        } else {
-            RecordBatch::new_empty(Arc::new(Schema::empty()))
-        };
-        Ok(MessageBatch::new_arrow(batch))
-    }
-}
-
-/// The active single-schema converter, borrowing the schema held in
-/// `fast_schema` by `decode`.
-enum FastConverter<'a> {
-    Avro(AvroBatchConverter<'a>),
-    Protobuf(ProtobufBatchConverter<'a>),
-}
-
-fn decode_single(cached: &CachedSchema, payload: &[u8]) -> Result<RecordBatch, Error> {
-    match cached {
-        CachedSchema::Protobuf(descriptor) => protobuf_to_arrow(descriptor, payload),
-        CachedSchema::Avro(schema) => avro_to_arrow(schema, payload),
+        }
+        if batches.is_empty() {
+            return Ok(MessageBatch::new_arrow(RecordBatch::new_empty(Arc::new(
+                Schema::empty(),
+            ))));
+        }
+        // Groups decoded under different schema versions may legitimately
+        // carry different schemas (real schema evolution); normalize to the
+        // field union instead of failing the concat.
+        let merged = crate::component::batch_merge::normalize_and_concat(&batches)?;
+        Ok(MessageBatch::new_arrow(merged))
     }
 }
 
@@ -700,6 +676,18 @@ mod tests {
             .unwrap()
     }
 
+    fn avro_payload_v1(id: i64) -> Vec<u8> {
+        let schema = avro_schema();
+        GenericDatumWriter::builder(&schema)
+            .build()
+            .unwrap()
+            .write_value_to_vec(AvroValue::Record(vec![(
+                "id".to_string(),
+                AvroValue::Long(id),
+            )]))
+            .unwrap()
+    }
+
     fn wire(id: u32, payload: &[u8]) -> Vec<u8> {
         let mut m = vec![0x00];
         m.extend_from_slice(&id.to_be_bytes());
@@ -953,6 +941,84 @@ mod tests {
         let name = name_col.as_string::<i32>();
         assert_eq!(name.value(1), "seven");
         assert!(name.is_null(0), "v1 row's `name` must be null-filled");
+    }
+
+    #[tokio::test]
+    async fn test_avro_single_id_batch_accumulates_columnar() {
+        // Single-id batches accumulate into one multi-row batch whose schema
+        // keeps the writer's nullability (id is non-nullable).
+        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([(
+            1u32,
+            FetchedSchema::Avro(avro_schema()),
+        )])));
+        let codec = avro_codec(resolver.clone());
+        let batch = codec
+            .decode(vec![
+                wire(1, &avro_payload_v1(10)),
+                wire(1, &avro_payload_v1(11)),
+                wire(1, &avro_payload_v1(12)),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 3);
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        let rb = batch.record_batch();
+        assert_eq!(rb.num_columns(), 1);
+        assert!(
+            !rb.schema().field(0).is_nullable(),
+            "writer schema keeps `id` non-nullable"
+        );
+        let id_col = rb.column_by_name("id").expect("id column");
+        let ids = id_col.as_primitive::<Int64Type>();
+        assert_eq!((ids.value(0), ids.value(1), ids.value(2)), (10, 11, 12));
+    }
+
+    #[tokio::test]
+    async fn test_avro_mixed_id_batch_groups_by_first_appearance() {
+        // Interleaved ids: rows come out grouped by schema id in
+        // first-appearance order (group order, message order within a
+        // group); the union schema puts the first group's columns first.
+        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([
+            (1u32, FetchedSchema::Avro(avro_schema())),
+            (
+                2u32,
+                FetchedSchema::Avro(AvroSchema::parse_str(AVRO_SCHEMA_V2).unwrap()),
+            ),
+        ])));
+        let codec = avro_codec(resolver);
+        let batch = codec
+            .decode(vec![
+                wire(1, &avro_payload_v1(10)),
+                wire(2, &avro_payload_v2(20, "b")),
+                wire(1, &avro_payload_v1(11)),
+                wire(2, &avro_payload_v2(21, "c")),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 4);
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::datatypes::Int64Type;
+        let rb = batch.record_batch();
+        assert_eq!(
+            rb.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"],
+            "first group's columns first"
+        );
+        let ids = rb.column_by_name("id").unwrap().as_primitive::<Int64Type>();
+        assert_eq!(
+            (ids.value(0), ids.value(1), ids.value(2), ids.value(3)),
+            (10, 11, 20, 21),
+            "rows grouped by schema id, message order within a group"
+        );
+        let names = rb.column_by_name("name").unwrap().as_string::<i32>();
+        assert!(names.is_null(0) && names.is_null(1));
+        assert_eq!(names.value(2), "b");
+        assert_eq!(names.value(3), "c");
     }
 
     #[tokio::test]
@@ -1412,97 +1478,10 @@ mod tests {
         }
     }
 
-    // ===== 批级列式解码（动态分派与等价性） =====
-
-    fn avro_payload(id: i64) -> Vec<u8> {
-        let schema = avro_schema();
-        GenericDatumWriter::builder(&schema)
-            .build()
-            .unwrap()
-            .write_value_to_vec(AvroValue::Record(vec![(
-                "id".to_string(),
-                AvroValue::Long(id),
-            )]))
-            .unwrap()
-    }
+    // ===== Protobuf 批级列式累积 =====
 
     fn protobuf_payload(id: i64) -> Vec<u8> {
         vec![0x08, id as u8]
-    }
-
-    #[tokio::test]
-    async fn same_id_messages_accumulate_into_one_batch_with_legacy_semantics() {
-        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([(
-            1u32,
-            FetchedSchema::Avro(avro_schema()),
-        )])));
-        let codec = avro_codec(resolver.clone());
-        let batch = codec
-            .decode(vec![
-                wire(1, &avro_payload(11)),
-                wire(1, &avro_payload(22)),
-                wire(1, &avro_payload(33)),
-            ])
-            .await
-            .unwrap();
-        assert_eq!(batch.len(), 3);
-        // Row order = message order.
-        use datafusion::arrow::array::AsArray;
-        use datafusion::arrow::datatypes::Int64Type;
-        let id_col = batch.record_batch().column_by_name("id").unwrap();
-        let ids = id_col.as_primitive::<Int64Type>();
-        assert_eq!(
-            (0..3).map(|i| ids.value(i)).collect::<Vec<_>>(),
-            vec![11, 22, 33]
-        );
-        // N>=2 replicates the union merge's all-nullable promotion.
-        assert!(batch
-            .record_batch()
-            .schema()
-            .fields()
-            .iter()
-            .all(|f| f.is_nullable()));
-        // N=1 keeps the flat-mapping nullability (single-batch passthrough).
-        let single = codec.decode(vec![wire(1, &avro_payload(7))]).await.unwrap();
-        assert!(!single.record_batch().schema().field(0).is_nullable());
-    }
-
-    #[tokio::test]
-    async fn mixed_schema_ids_keep_message_row_order() {
-        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([
-            (1u32, FetchedSchema::Avro(avro_schema())),
-            (
-                2u32,
-                FetchedSchema::Avro(AvroSchema::parse_str(AVRO_SCHEMA_V2).unwrap()),
-            ),
-        ])));
-        let codec = avro_codec(resolver);
-        let batch = codec
-            .decode(vec![
-                wire(1, &avro_payload(11)),
-                wire(2, &avro_payload_v2(22, "b")),
-                wire(1, &avro_payload(33)),
-                wire(2, &avro_payload_v2(44, "d")),
-            ])
-            .await
-            .unwrap();
-        assert_eq!(batch.len(), 4);
-        use datafusion::arrow::array::AsArray;
-        use datafusion::arrow::datatypes::Int64Type;
-        let ids = batch
-            .record_batch()
-            .column_by_name("id")
-            .unwrap()
-            .as_primitive::<Int64Type>();
-        assert_eq!(
-            (0..4).map(|i| ids.value(i)).collect::<Vec<_>>(),
-            vec![11, 22, 33, 44]
-        );
-        let names = batch
-            .record_batch()
-            .column_by_name("name")
-            .expect("union column present");
-        assert_eq!(names.null_count(), 2);
     }
 
     #[tokio::test]
@@ -1532,13 +1511,20 @@ mod tests {
             (0..3).map(|i| ids.value(i)).collect::<Vec<_>>(),
             vec![11, 22, 33]
         );
+        // Descriptor-driven convention: every column nullable.
+        assert!(batch
+            .record_batch()
+            .schema()
+            .fields()
+            .iter()
+            .all(|f| f.is_nullable()));
     }
 
     #[tokio::test]
     async fn fetch_error_precedes_later_bad_wire_header() {
         // A missing schema id on the FIRST message must win over a corrupt
         // header on the second — the sequential order the per-message path
-        // always had (guards against any pre-scan regression).
+        // always had.
         let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([(
             1u32,
             FetchedSchema::Avro(avro_schema()),
@@ -1555,8 +1541,8 @@ mod tests {
     #[tokio::test]
     async fn payload_decode_error_precedes_schema_shape_error() {
         // The schema contains an unsupported nested field, but the payload
-        // itself fails to decode first — the plans must not front-run the
-        // reader error.
+        // itself fails to decode first — the accumulator is built only
+        // after a successful read.
         let nested = AvroSchema::parse_str(
             r#"{"type": "record", "name": "M", "fields": [
                 {"name": "id", "type": "long"},

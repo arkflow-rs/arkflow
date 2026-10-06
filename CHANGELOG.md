@@ -101,6 +101,12 @@ refactoring is summarized rather than listed commit-by-commit.
   behind an `Arc` instead of being deep-cloned per message. The public
   benchmark suite gained three `avro-decode-w5/w25/w100` scenarios that
   exercise the real codec decode path offline. (#1309)
+- Avro decoding is substantially faster again on wide schemas: messages
+  sharing a schema id now accumulate into one set of Arrow column builders
+  instead of one single-row batch per message plus a concat copy.
+  Multi-version mixed batches still merge through the union schema (rows
+  grouped by schema id in first-appearance order); column nullability now
+  consistently reflects the writer schema. (#1310)
 
 ### Fixed
 

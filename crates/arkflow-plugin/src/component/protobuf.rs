@@ -511,22 +511,24 @@ fn append_opt<T: datafusion::arrow::array::ArrowPrimitiveType>(
 }
 
 /// Columnar batch converter for Protobuf payloads sharing one descriptor.
+/// Owns its (cheaply cloneable, Arc-backed) `MessageDescriptor` so it can
+/// live inside decode-loop group states without borrow plumbing.
 ///
 /// The first `push` walks the descriptor's field set exactly like
 /// `protobuf_to_arrow` (same kind rejection text) and tees the mapping into
 /// per-column plans; later pushes append by field number without the
 /// per-message name lookups. Every column stays nullable, matching the
 /// descriptor-driven schema of the single-message path.
-pub struct ProtobufBatchConverter<'a> {
-    descriptor: &'a MessageDescriptor,
+pub struct ProtobufBatchConverter {
+    descriptor: MessageDescriptor,
     plans: Vec<ProtoColumnPlan>,
     builders: Vec<ProtoColumnBuilder>,
     started: bool,
     rows: usize,
 }
 
-impl<'a> ProtobufBatchConverter<'a> {
-    pub fn new(descriptor: &'a MessageDescriptor) -> Self {
+impl ProtobufBatchConverter {
+    pub fn new(descriptor: MessageDescriptor) -> Self {
         Self {
             descriptor,
             plans: Vec::new(),
@@ -1295,7 +1297,7 @@ message Y {
             sample_payload(None, 2),
             sample_payload(Some("c"), 3),
         ];
-        let mut conv = ProtobufBatchConverter::new(&descriptor);
+        let mut conv = ProtobufBatchConverter::new(descriptor.clone());
         for p in &payloads {
             conv.push(p).unwrap();
         }
@@ -1354,8 +1356,81 @@ message Holder { Nested inner = 1; }
         let err = protobuf_to_arrow(&descriptor, &encoded).unwrap_err();
         assert!(err.to_string().contains("Unsupported field type"), "{err}");
 
-        let mut conv = ProtobufBatchConverter::new(&descriptor);
+        let mut conv = ProtobufBatchConverter::new(descriptor.clone());
         let err = conv.push(&encoded).unwrap_err();
         assert!(err.to_string().contains("Unsupported field type"), "{err}");
+    }
+
+    /// Ad-hoc release timing (NOT run by CI): per-message batches +
+    /// normalize_and_concat vs the columnar batch converter on the same
+    /// payloads. Run with:
+    /// `cargo test --release -p arkflow-plugin --lib -- --ignored protobuf_batch_decode_timing --nocapture`
+    #[test]
+    #[ignore]
+    fn protobuf_batch_decode_timing() {
+        let wide = r#"syntax = "proto3";
+package bench;
+message Wide {
+  int64 f0 = 1; int64 f1 = 2; int64 f2 = 3; int64 f3 = 4; int64 f4 = 5;
+  int64 f5 = 6; int64 f6 = 7; int64 f7 = 8; int64 f8 = 9; int64 f9 = 10;
+  string s0 = 11; string s1 = 12; string s2 = 13; string s3 = 14; string s4 = 15;
+  double d0 = 16; double d1 = 17; bool b0 = 18; bool b1 = 19;
+  int32 i0 = 20; int32 i1 = 21; bytes by0 = 22; bytes by1 = 23;
+  uint64 u0 = 24; uint64 u1 = 25; uint32 u2 = 26;
+}"#;
+        let descriptor = parse_proto_source(wide, "bench.Wide").unwrap();
+        let batch_size = 1_000usize;
+        let batches = 200usize;
+        let mut payloads = Vec::with_capacity(batch_size * batches);
+        for i in 0..(batch_size * batches) {
+            let mut m = DynamicMessage::new(descriptor.clone());
+            m.set_field_by_name("f0", Value::I64(i as i64));
+            m.set_field_by_name("s0", Value::String("sensor-abc".to_string()));
+            m.set_field_by_name("d0", Value::F64(i as f64 * 0.5));
+            m.set_field_by_name("b0", Value::Bool(i % 2 == 0));
+            m.set_field_by_name("by0", Value::Bytes([0xABu8, 0xCD, 0xEF].repeat(4).into()));
+            payloads.push(m.encode_to_vec());
+        }
+
+        let time = |name: &str, f: &mut dyn FnMut() -> usize| {
+            let mut best = std::time::Duration::MAX;
+            let mut rows = 0;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                rows = f();
+                best = best.min(start.elapsed());
+            }
+            println!(
+                "{name}: {} rows in {:?} ({:.0} rows/s)",
+                rows,
+                best,
+                rows as f64 / best.as_secs_f64()
+            );
+        };
+
+        time("per-message + normalize_and_concat", &mut || {
+            let mut total = 0usize;
+            for chunk in payloads.chunks(batch_size) {
+                let batches: Vec<RecordBatch> = chunk
+                    .iter()
+                    .map(|p| protobuf_to_arrow(&descriptor, p).unwrap())
+                    .collect();
+                total += crate::component::batch_merge::normalize_and_concat(&batches)
+                    .unwrap()
+                    .num_rows();
+            }
+            total
+        });
+        time("columnar batch converter", &mut || {
+            let mut total = 0usize;
+            for chunk in payloads.chunks(batch_size) {
+                let mut conv = ProtobufBatchConverter::new(descriptor.clone());
+                for p in chunk {
+                    conv.push(p).unwrap();
+                }
+                total += conv.finish().unwrap().num_rows();
+            }
+            total
+        });
     }
 }
