@@ -311,7 +311,8 @@ async fn avro_decode(
     count: usize,
 ) -> Result<ScenarioResult, Error> {
     const BATCH: usize = 1000;
-    let iterations = ((count / (BATCH * 2)) / (width / 5)).clamp(10, 100);
+    // `max(1)`: widths below 5 would otherwise divide by zero.
+    let iterations = ((count / (BATCH * 2)) / (width / 5).max(1)).clamp(10, 100);
     let id = 7000 + width as u32;
     let schema = wide_avro_schema(width);
     let mut messages = Vec::with_capacity(BATCH);

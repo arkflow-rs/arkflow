@@ -23,7 +23,7 @@ cargo run -p arkflow --release --example benchmark
 | `--warmup` | `1` | 不计时的预热轮。 |
 | `--json` | 关闭 | 输出机器可读报告而非 markdown。 |
 
-默认参数在笔记本上通常一分钟内跑完,输出一张 markdown 表:每个场景一行,含工作负载、操作数、耗时与吞吐。
+默认参数在笔记本上通常几分钟内跑完(耗时大头是持久化 state-backend 场景),输出一张 markdown 表:每个场景一行,含工作负载、操作数、耗时与吞吐。
 
 ## 场景
 

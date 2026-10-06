@@ -26,9 +26,10 @@ not ArkFlow). Useful flags:
 | `--warmup` | `1` | Untimed passes discarded to warm caches. |
 | `--json` | off | Emit a machine-readable report instead of markdown. |
 
-A full default run finishes in well under a minute on a laptop and prints a
-markdown table: one row per scenario with workload, operations, wall time,
-and throughput.
+A full default run finishes in a few minutes on a laptop (the durable
+state-backend scenario dominates the wall time) and prints a markdown
+table: one row per scenario with workload, operations, wall time, and
+throughput.
 
 ## Scenarios
 
