@@ -268,6 +268,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_json_to_arrow_whole_batch_widens_types_and_keeps_late_fields() -> Result<(), Error>
+    {
+        // Regression: `json_to_arrow` joins the whole batch with '\n' and
+        // decodes it in one pass, so schema inference must cover ALL
+        // messages. First-record-only inference inferred `v` as Int64 and
+        // never saw `tag`, silently truncating `1.5`/`2.9` to integers and
+        // dropping the `tag` column.
+        let config = Some(json!({
+            "value_field": DEFAULT_BINARY_VALUE_FIELD,
+            "fields_to_include": null
+        }));
+        let processor = JsonToArrowProcessorBuilder.build(
+            None,
+            &config,
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )?;
+
+        let msg_batch = MessageBatch::new_binary(vec![
+            br#"{"v":1}"#.to_vec(),
+            br#"{"v":1.5}"#.to_vec(),
+            br#"{"v":2.9,"tag":"x"}"#.to_vec(),
+        ])?;
+
+        let result = processor.process(Arc::new(msg_batch)).await?;
+        let batch = match result {
+            ProcessResult::Single(batch) => batch,
+            _ => panic!("Expected single result"),
+        };
+
+        assert_eq!(batch.len(), 3);
+        let schema = batch.record_batch().schema();
+        assert_eq!(
+            schema.field_with_name("v").unwrap().data_type(),
+            &datafusion::arrow::datatypes::DataType::Float64,
+            "Int64 + Float64 across messages must widen to Float64, not truncate"
+        );
+        let tag_field = schema.field_with_name("tag").unwrap();
+        assert_eq!(
+            tag_field.data_type(),
+            &datafusion::arrow::datatypes::DataType::Utf8,
+            "fields first seen in later messages must still become columns"
+        );
+        assert!(tag_field.is_nullable());
+
+        use datafusion::arrow::array::AsArray;
+        let v = batch
+            .record_batch()
+            .column_by_name("v")
+            .unwrap()
+            .as_primitive::<datafusion::arrow::datatypes::Float64Type>();
+        assert_eq!(v.value(0), 1.0);
+        assert_eq!(v.value(1), 1.5);
+        assert_eq!(v.value(2), 2.9);
+
+        let tag_col = batch.record_batch().column_by_name("tag").unwrap();
+        assert!(tag_col.is_null(0));
+        assert!(tag_col.is_null(1));
+        assert!(!tag_col.is_null(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_to_arrow_whole_batch_all_int_stays_int64() -> Result<(), Error> {
+        // Full-batch inference widens only when needed: an all-integer
+        // column must stay Int64.
+        let config = Some(json!({
+            "value_field": DEFAULT_BINARY_VALUE_FIELD,
+            "fields_to_include": null
+        }));
+        let processor = JsonToArrowProcessorBuilder.build(
+            None,
+            &config,
+            &Resource {
+                temporary: Default::default(),
+                input_names: RefCell::new(Default::default()),
+            },
+        )?;
+
+        let msg_batch = MessageBatch::new_binary(vec![
+            br#"{"v":1}"#.to_vec(),
+            br#"{"v":2}"#.to_vec(),
+            br#"{"v":3}"#.to_vec(),
+        ])?;
+
+        let result = processor.process(Arc::new(msg_batch)).await?;
+        let batch = match result {
+            ProcessResult::Single(batch) => batch,
+            _ => panic!("Expected single result"),
+        };
+
+        assert_eq!(batch.len(), 3);
+        assert_eq!(
+            batch
+                .record_batch()
+                .schema()
+                .field_with_name("v")
+                .unwrap()
+                .data_type(),
+            &datafusion::arrow::datatypes::DataType::Int64
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_json_to_arrow_invalid_input() -> Result<(), Error> {
         let config = Some(json!({
             "value_field": "data",

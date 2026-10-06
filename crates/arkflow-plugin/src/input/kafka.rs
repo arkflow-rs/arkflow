@@ -119,10 +119,17 @@ impl KafkaInput {
         config: KafkaInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
+        let frontier = Arc::new(CommitFrontier::new());
         let txn_metadata = if config.transactional_offsets {
+            // The registry entry carries the SAME frontier instance the
+            // acknowledgements below advance: the paired transactional
+            // output clamps its offset commits to the contiguous
+            // acknowledged run it exposes, so unsettled records can never
+            // be skipped by a transactional commit.
             Some(crate::kafka_txn::register_group(
                 &config.consumer_group,
                 config.topics.clone(),
+                frontier.clone(),
             ))
         } else {
             None
@@ -132,7 +139,7 @@ impl KafkaInput {
             config,
             consumer: Arc::new(RwLock::new(None)),
             assigned_partition: Arc::new(RwLock::new(None)),
-            frontier: Arc::new(CommitFrontier::new()),
+            frontier,
             ack_lock: Arc::new(tokio::sync::Mutex::new(())),
             ack_notify: Arc::new(Notify::new()),
             close: CancellationToken::new(),
@@ -1017,12 +1024,6 @@ impl Ack for KafkaAck {
                 .map_err(|_| Error::Process("Kafka offset overflow".into()))?,
         };
         let _ack_guard = self.ack_lock.lock().await;
-        let consumer_guard = self.consumer.read().await;
-        let Some(consumer) = consumer_guard.as_ref() else {
-            return Err(Error::Connection(
-                "Kafka consumer is not connected; acknowledgement compensation is retryable".into(),
-            ));
-        };
         let current = self
             .frontier
             .next_offset_of(Some(&self.topic), self.partition.max(0) as u32)
@@ -1035,18 +1036,35 @@ impl Ack for KafkaAck {
                 "cannot compensate Kafka acknowledgement behind a later offset".into(),
             ));
         }
-        // `store_offset` also takes the exclusive next offset.  Restoring a
-        // message at offset N therefore stores N, so the broker can redeliver
-        // that message after compensation.
-        let restored_broker_offset = position.offset.saturating_sub(1);
-        consumer
-            .store_offset(
-                &self.topic,
-                self.partition,
-                i64::try_from(restored_broker_offset)
-                    .map_err(|_| Error::Process("Kafka offset overflow".into()))?,
-            )
-            .map_err(|error| Error::Process(format!("restore Kafka offset: {error}")))?;
+        if self.transactional_offsets {
+            // L3 (spec: 配对输入的 undo 不触 store_offset): the group's
+            // broker offset has exactly one writer — the paired output's
+            // producer transaction. A local `store_offset` here could be
+            // published by the periodic auto-commit and advance the group
+            // past a transaction that still rolls back. The in-memory
+            // frontier rewind below is what guarantees redelivery; it does
+            // not need a live consumer.
+        } else {
+            let consumer_guard = self.consumer.read().await;
+            let Some(consumer) = consumer_guard.as_ref() else {
+                return Err(Error::Connection(
+                    "Kafka consumer is not connected; acknowledgement compensation is retryable"
+                        .into(),
+                ));
+            };
+            // `store_offset` also takes the exclusive next offset.  Restoring a
+            // message at offset N therefore stores N, so the broker can redeliver
+            // that message after compensation.
+            let restored_broker_offset = position.offset.saturating_sub(1);
+            consumer
+                .store_offset(
+                    &self.topic,
+                    self.partition,
+                    i64::try_from(restored_broker_offset)
+                        .map_err(|_| Error::Process("Kafka offset overflow".into()))?,
+                )
+                .map_err(|error| Error::Process(format!("restore Kafka offset: {error}")))?;
+        }
         if !self.frontier.rewind_position(
             Some(&self.topic),
             self.partition.max(0) as u32,
@@ -2296,15 +2314,92 @@ mod tests {
         assert!(plain.supports_partitioning());
     }
 
-    /// Compensation without a live consumer is an explicit retryable error.
+    /// Compensation without a live consumer is an explicit retryable error
+    /// (reaching the broker store requires the frontier to stand at the
+    /// ack's next offset — the state undo actually compensates).
     #[tokio::test]
     async fn undo_without_a_consumer_is_retryable() {
         let input = input_with(base_config());
+        input.frontier.seed(&[SourcePosition {
+            topic: Some("orders".into()),
+            partition: 0,
+            offset: 42,
+        }]);
         let ack = ack_of(&input, "orders", 0, 41);
         let err = ack.undo().await.unwrap_err();
         assert!(
             err.to_string().contains("compensation is retryable"),
             "got: {err}"
+        );
+        // An unacknowledged delivery (empty frontier) has nothing to
+        // compensate: undo is a no-op success, not a consumer error.
+        let input = input_with(base_config());
+        let ack = ack_of(&input, "orders", 0, 41);
+        ack.undo().await.expect("nothing to compensate");
+    }
+
+    /// Spec "配对输入的 undo 不触 store_offset": with
+    /// `transactional_offsets` the undo compensates purely in memory — it
+    /// never touches the consumer (there is none here) and still rewinds
+    /// the frontier so the record is redelivered. The broker group offset
+    /// only ever moves inside the paired output's transaction.
+    #[tokio::test]
+    async fn undo_with_transactional_offsets_only_rewinds_the_frontier() {
+        let mut value = base_config();
+        // A unique group keeps the process-global pairing registry clean.
+        value["consumer_group"] = serde_json::json!(format!("undo-txn-{}", std::process::id()));
+        value["transactional_offsets"] = serde_json::json!(true);
+        let input = input_with(value);
+        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group);
+        // The acknowledged frontier stands at the ack's next offset.
+        input.frontier.seed(&[SourcePosition {
+            topic: Some("orders".into()),
+            partition: 0,
+            offset: 42,
+        }]);
+        let ack = KafkaAck {
+            consumer: input.consumer.clone(),
+            frontier: input.frontier.clone(),
+            ack_lock: input.ack_lock.clone(),
+            ack_notify: input.ack_notify.clone(),
+            close: input.close.clone(),
+            topic: "orders".to_string(),
+            partition: 0,
+            offset: 41,
+            transactional_offsets: true,
+        };
+        // No consumer is connected: a store_offset path would fail here
+        // with the retryable error — the L3 branch must succeed regardless.
+        ack.undo()
+            .await
+            .expect("L3 undo compensates in memory only");
+        let positions = input.current_positions().await.unwrap();
+        assert_eq!(
+            positions.len(),
+            1,
+            "the frontier still tracks the partition"
+        );
+        assert_eq!(
+            positions[0].offset, 41,
+            "the frontier rewound by one record"
+        );
+    }
+
+    /// The frontier registered for an L3 input is the input's own instance
+    /// — the one its acknowledgements advance (the output clamps against
+    /// exactly this object).
+    #[test]
+    fn transactional_offsets_register_the_inputs_own_frontier() {
+        let mut value = base_config();
+        value["consumer_group"] = serde_json::json!(format!("frontier-reg-{}", std::process::id()));
+        value["transactional_offsets"] = serde_json::json!(true);
+        let input = input_with(value);
+        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group);
+        let registered = crate::kafka_txn::group_frontier(&input.config.consumer_group)
+            .expect("transactional input registers its frontier");
+        assert!(
+            Arc::ptr_eq(&registered, &input.frontier),
+            "the registry must carry the frontier instance the acks advance"
         );
     }
 

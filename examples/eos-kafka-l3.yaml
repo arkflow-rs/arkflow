@@ -8,7 +8,10 @@
 #             only; broker group offsets advance exclusively via the output)
 #   output -> offset_commit_group: <group>  (requires exactly_once; commits the
 #             offsets derived from __meta_partition/__meta_offset inside the
-#             transaction)
+#             transaction, clamped per partition to the input's contiguous
+#             acknowledged frontier — unsettled records are never skipped, so
+#             the bound is at-least-once with at most one batch of tail
+#             duplication)
 #
 # Both sides MUST run in the same ArkFlow process and reference the same
 # consumer group; the input subscribes to a single topic. After an L3

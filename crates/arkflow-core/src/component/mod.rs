@@ -390,6 +390,11 @@ pub fn build_config_schema() -> serde_json::Value {
                     "liveness_path": {"type": "string", "default": "/liveness"},
                     "api_prefix": {"type": "string", "default": "/api/v1"},
                     "api_token": {"type": "string", "writeOnly": true},
+                    "insecure_local": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Explicit opt-in to run the standalone control API without a token on a non-loopback bind; the process logs a prominent warning."
+                    },
                     "cors_origins": {"type": "array", "items": {"type": "string"}, "default": []},
                     "hub_urls": {
                         "type": "array",

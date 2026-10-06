@@ -69,6 +69,11 @@
           "type": "string",
           "writeOnly": true
         },
+        "insecure_local": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit opt-in to run the standalone control API without a token on a non-loopback bind; the process logs a prominent warning."
+        },
         "cors_origins": {
           "type": "array",
           "items": {
@@ -4450,12 +4455,12 @@
         {
           "type": "object",
           "title": "batch",
-          "description": "Batches messages by count with an idle timeout before forwarding.",
+          "description": "Batches messages by row count with an idle timeout before forwarding.",
           "properties": {
             "type": {
               "type": "string",
               "const": "batch",
-              "description": "Batches messages by count with an idle timeout before forwarding."
+              "description": "Batches messages by row count with an idle timeout before forwarding."
             },
             "name": {
               "type": "string",
@@ -4524,7 +4529,7 @@
             "count": {
               "type": "integer",
               "minimum": 1,
-              "description": "Number of messages per batch."
+              "description": "Number of message rows to accumulate before flushing."
             },
             "timeout_ms": {
               "type": "integer",

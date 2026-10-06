@@ -103,6 +103,7 @@ incompatible artifact is rejected before restore instead of corrupting state.
 | Data lost after restart | Durability was not enabled for the stream | Enable durability; without a WAL the source commit is the only guarantee. |
 | Job stuck "recovering" | Checkpoint restore or source replay in progress | Inspect `detail`; large state or deep replay windows take time. |
 | Checkpoint rounds keep failing | A task cannot snapshot or checksums mismatch | Check node disk/object-store health; the last valid checkpoint is still in force. |
+| Repeating `WAL acknowledgement parked for >60s ...` errors | The lowest unacknowledged sequence's owner stalled or died without recording a failure | Inspect the task that owns the sequence named in the error; the delivery is retried or replayed once that owner settles or the stream restarts. |
 | Rollback rejected as incompatible | Savepoint belongs to another version or state format | Use an artifact from the compatible version history. |
 
 ## Graceful shutdown
@@ -110,11 +111,35 @@ incompatible artifact is rejected before restore instead of corrupting state.
 On a graceful shutdown, a durability-enabled stream's WAL close no longer
 fails the stream just because an acknowledgement was parked behind an
 earlier in-flight source commit: the parked acknowledgement gets a bounded
-drain window (15 seconds) to settle once the earlier delivery completes.
+drain window (30 seconds) to settle once the earlier delivery completes.
 If the window expires without settling, the stream surfaces the
 `WAL closed while acknowledgement was pending` error and the usual WAL
 replay covers the unacknowledged delivery on restart — at-least-once
 semantics are unchanged either way.
+
+## Parked acknowledgements while the stream runs
+
+The close-time drain window above has a running-time counterpart. While the
+stream is up, an acknowledgement for sequence N+1 whose predecessor N has
+not settled yet is *parked*: it waits instead of skipping the gap, so the
+durable cursor never moves past an unacknowledged sequence. That wait is
+bounded by a 60-second park lease. If the lease expires — the owner of the
+lowest unsettled sequence stalled or died without recording a failure —
+the parked acknowledgement surfaces an explicit retryable error instead of
+waiting forever:
+
+```text
+WAL acknowledgement parked for >60s waiting for sequence N; the gap owner appears stalled
+```
+
+The lease deliberately writes no failure fence: an owner that was merely
+slow (for example waiting out one object-store segment seal) is never
+blocked from settling, and once it does, a retry of the parked
+acknowledgement proceeds normally with no added delay. If the owner is
+truly dead, the error repeats on every retry — a visible periodic failure
+rather than a silent stall with no errors and no progress. Investigate the
+task that owns the sequence named in the error; on restart, the usual WAL
+replay covers the unsettled entries.
 
 ## TLS support matrix
 

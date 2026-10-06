@@ -245,6 +245,32 @@ fn binary_batch(payload: &[u8]) -> MessageBatchRef {
     Arc::new(MessageBatch::new_binary(vec![payload.to_vec()]).expect("binary batch"))
 }
 
+/// Read one delivery from an input, retrying the input's own retryable
+/// disconnections — exactly what the engine's source loop does. Freshly
+/// (re)started brokers routinely surface one `Disconnection` on the first
+/// read while the group join is still settling.
+async fn read_with_retry(
+    input: &std::sync::Arc<dyn arkflow_core::input::Input>,
+) -> (
+    MessageBatchRef,
+    std::sync::Arc<dyn arkflow_core::input::Ack>,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match input.read().await {
+            Ok(delivery) => return delivery,
+            Err(arkflow_core::Error::Disconnection) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "input read kept disconnecting for 30s"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => panic!("input read failed: {error}"),
+        }
+    }
+}
+
 /// Start a single-node KRaft Kafka broker on fixed host port 9092.
 async fn start_broker() -> ContainerAsync<GenericImage> {
     let image = GenericImage::new("confluentinc/cp-kafka", "7.5.0")
@@ -426,30 +452,40 @@ async fn subscribe_and_drain(consumer: &StreamConsumer, topic: &str, timeout: Du
     n
 }
 
-/// Smoke test: the broker starts, a non-transactional `write_batch` produces,
-/// and a `read_committed` consumer observes the messages. Validates the whole
-/// fixture before the transactional cases lean on it.
+/// L3 with frontier-clamped offsets: the group position advances inside the
+/// output's transactions, lagging one batch behind (a transaction may only
+/// commit the contiguous acknowledged frontier, never this batch's own
+/// still-unacknowledged offsets — the at-most-one-batch tail duplication
+/// bound). After two sequential consume→write→ack rounds the committed
+/// position covers the FIRST message: a fresh consumer of the same group
+/// redelivers at most the tail (second) message and never re-delivers the
+/// first — no skip, no full replay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
 async fn l3_transactional_offset_commit_advances_the_group() {
     ensure_init();
     let Some(_broker) = broker_lease().await else {
-        panic!("broker unavailable");
+        skip_without_docker("l3_transactional_offset_commit_advances_the_group");
+        return;
     };
     let source_topic = format!("l3-src-{}", l3_suffix());
     let sink_topic = format!("l3-dst-{}", l3_suffix());
     let group = format!("l3-group-{}", l3_suffix());
 
-    // Seed one source record through a committed transaction.
+    // Seed two source records (offsets 0 and 1) with distinct payloads
+    // through a committed transaction.
     let seeder = txn_producer(&format!("seeder-{}", l3_suffix()));
     let _ = txn_init(seeder.clone()).await;
     seeder.begin_transaction().expect("seed begin");
-    seeder
-        .send(
-            FutureRecord::<str, [u8]>::to(&source_topic).payload(b"l3-payload"),
-            rdkafka::util::Timeout::Never,
-        )
-        .await
-        .expect("seed send");
+    for payload in [&b"l3-payload-0"[..], &b"l3-payload-1"[..]] {
+        seeder
+            .send(
+                FutureRecord::<str, [u8]>::to(&source_topic).payload(payload),
+                rdkafka::util::Timeout::Never,
+            )
+            .await
+            .expect("seed send");
+    }
     seeder
         .commit_transaction(rdkafka::util::Timeout::After(Duration::from_secs(10)))
         .expect("seed commit");
@@ -470,9 +506,6 @@ async fn l3_transactional_offset_commit_advances_the_group() {
     .build(&resource())
     .expect("build l3 input");
     input.connect().await.expect("l3 input connect");
-    let (batch, ack) = input.read().await.expect("l3 read");
-
-    // The batch carries Kafka source metadata (partition + offset).
     let out = build_output_with_group(
         &sink_topic,
         true,
@@ -480,16 +513,96 @@ async fn l3_transactional_offset_commit_advances_the_group() {
         Some(&group),
     )
     .await;
-    out.write_batch(std::slice::from_ref(&batch))
-        .await
-        .expect("l3 write_batch commits source offsets in the transaction");
-    ack.ack()
-        .await
-        .expect("ack completes (frontier only, no local store)");
 
-    // The group's committed position advanced inside the transaction: a
-    // fresh consumer with the same group sees no re-delivery.
-    let verify = InputConfig {
+    // Round 1: read message 0, write (the transaction commits the clamped
+    // frontier — the anchor, covering everything before this batch), ack.
+    let (batch0, ack0) = read_with_retry(&input).await;
+    out.write_batch(std::slice::from_ref(&batch0))
+        .await
+        .expect("l3 write_batch 0 commits the clamped frontier");
+    ack0.ack()
+        .await
+        .expect("ack 0 completes (frontier only, no local store)");
+
+    // Round 2: read message 1, write — now the frontier covers message 0, so
+    // this transaction commits next=1.
+    let (batch1, _ack1) = read_with_retry(&input).await;
+    out.write_batch(std::slice::from_ref(&batch1))
+        .await
+        .expect("l3 write_batch 1 commits the settled frontier");
+
+    // The group's committed position advanced inside the transactions and
+    // covers message 0 (the one-batch lag: the tail message may replay, the
+    // settled prefix may not). Close the input first so the verification
+    // consumer actually receives the partition (a second member of the same
+    // group would otherwise get no assignment).
+    drop(out);
+    input.close().await.expect("close l3 input");
+    let consumer = read_committed_consumer(&group);
+    consumer.subscribe(&[&source_topic]).expect("subscribe");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut redelivered: Vec<String> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    while std::time::Instant::now() < deadline {
+        if let Ok(Ok(message)) =
+            tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await
+        {
+            if let Some(payload) = message.payload() {
+                redelivered.push(String::from_utf8_lossy(payload).into_owned());
+            }
+        }
+        if redelivered.len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        redelivered,
+        vec!["l3-payload-1".to_string()],
+        "committed position covers the settled prefix (message 0) and only the \
+         tail message may redeliver — empty means skipped, two means no commit"
+    );
+
+    drop(input);
+}
+
+/// Spec "位点钳制到连续前沿": a routed/split batch claims a high offset
+/// (10) while the input's contiguous frontier still stands at 8 — offsets
+/// 8..10 are in flight in other branches. The transaction commits 8, never
+/// 11: a fresh consumer of the group still delivers 8, 9, 10. Unclamped
+/// commits would skip them permanently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn l3_clamped_offsets_never_skip_in_flight_records() {
+    ensure_init();
+    let Some(_broker) = broker_lease().await else {
+        skip_without_docker("l3_clamped_offsets_never_skip_in_flight_records");
+        return;
+    };
+    let source_topic = format!("l3-clamp-src-{}", l3_suffix());
+    let sink_topic = format!("l3-clamp-dst-{}", l3_suffix());
+    let group = format!("l3-clamp-group-{}", l3_suffix());
+
+    // Seed 11 messages (offsets 0..=10), one payload per offset.
+    let seeder = txn_producer(&format!("clamp-seeder-{}", l3_suffix()));
+    let _ = txn_init(seeder.clone()).await;
+    seeder.begin_transaction().expect("seed begin");
+    for offset in 0..=10u32 {
+        seeder
+            .send(
+                FutureRecord::<str, [u8]>::to(&source_topic)
+                    .payload(format!("m-{offset}").as_bytes()),
+                rdkafka::util::Timeout::Never,
+            )
+            .await
+            .expect("seed send");
+    }
+    seeder
+        .commit_transaction(rdkafka::util::Timeout::After(Duration::from_secs(10)))
+        .expect("seed commit");
+
+    // L3 input: settle offsets 0..=8 (read + ack each; the frontier then
+    // stands at next=8 — offsets 8, 9, 10 remain "in flight").
+    let input = InputConfig {
         input_type: "kafka".into(),
         name: None,
         codec: None,
@@ -498,20 +611,164 @@ async fn l3_transactional_offset_commit_advances_the_group() {
             "topics": [source_topic],
             "consumer_group": group,
             "start_from_latest": false,
+            "transactional_offsets": true,
         })),
     }
     .build(&resource())
-    .expect("build verify consumer");
-    verify.connect().await.expect("verify connect");
-    let redelivery = tokio::time::timeout(Duration::from_secs(8), verify.read()).await;
-    assert!(
-        redelivery.is_err(),
-        "committed offsets inside the transaction must prevent re-delivery"
+    .expect("build l3 input");
+    input.connect().await.expect("l3 input connect");
+    for _ in 0..8 {
+        let (batch, ack) = read_with_retry(&input).await;
+        drop(batch);
+        ack.ack().await.expect("settle ack (frontier only)");
+    }
+
+    // A routed batch claiming partition 0 / offset 10 (next=11): the
+    // transaction must clamp to the frontier (8), not commit 11.
+    let out = build_output_with_group(
+        &sink_topic,
+        true,
+        Some(&format!("clamp-txn-{}", l3_suffix())),
+        Some(&group),
+    )
+    .await;
+    out.write_batch(&[routed_meta_batch(0, 10)])
+        .await
+        .expect("clamped transactional write");
+
+    // A fresh consumer of the same group must deliver exactly the in-flight
+    // tail 8, 9, 10 — an unclamped commit (11) would skip them forever.
+    // Close the input first so the fresh consumer receives the partition (a
+    // second member of the same group would otherwise get no assignment).
+    drop(out);
+    input.close().await.expect("close l3 input");
+    let consumer = read_committed_consumer(&group);
+    consumer.subscribe(&[&source_topic]).expect("subscribe");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut delivered: Vec<String> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if let Ok(Ok(message)) =
+            tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await
+        {
+            if let Some(payload) = message.payload() {
+                delivered.push(String::from_utf8_lossy(payload).into_owned());
+            }
+        }
+        if delivered.len() >= 3 && delivered.last().is_some_and(|p| p == "m-10") {
+            break;
+        }
+    }
+    assert_eq!(
+        delivered,
+        vec!["m-8".to_string(), "m-9".to_string(), "m-10".to_string()],
+        "the transaction committed the frontier (8): the in-flight records \
+         8..=10 must redeliver, not be skipped"
     );
 
-    drop(out);
     drop(input);
-    drop(verify);
+}
+
+/// Spec "配对输入的 undo 不触 store_offset": with `transactional_offsets`
+/// neither the ack nor its compensation writes the broker group position
+/// locally — only output transactions move it. After ack + undo and a full
+/// auto-commit window (5s default), the group still has NO committed
+/// offset. (A regressed undo calling `store_offset` would surface as a
+/// committed offset here once the periodic auto-commit published it.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn l3_undo_does_not_move_the_broker_group_offset() {
+    ensure_init();
+    let Some(_broker) = broker_lease().await else {
+        skip_without_docker("l3_undo_does_not_move_the_broker_group_offset");
+        return;
+    };
+    let source_topic = format!("l3-undo-src-{}", l3_suffix());
+    let group = format!("l3-undo-group-{}", l3_suffix());
+
+    // Seed one record through a committed transaction.
+    let seeder = txn_producer(&format!("undo-seeder-{}", l3_suffix()));
+    let _ = txn_init(seeder.clone()).await;
+    seeder.begin_transaction().expect("seed begin");
+    seeder
+        .send(
+            FutureRecord::<str, [u8]>::to(&source_topic).payload(b"undo-payload"),
+            rdkafka::util::Timeout::Never,
+        )
+        .await
+        .expect("seed send");
+    seeder
+        .commit_transaction(rdkafka::util::Timeout::After(Duration::from_secs(10)))
+        .expect("seed commit");
+
+    let input = InputConfig {
+        input_type: "kafka".into(),
+        name: None,
+        codec: None,
+        config: Some(serde_json::json!({
+            "brokers": ["localhost:9092"],
+            "topics": [source_topic],
+            "consumer_group": group,
+            "start_from_latest": false,
+            "transactional_offsets": true,
+        })),
+    }
+    .build(&resource())
+    .expect("build l3 input");
+    input.connect().await.expect("l3 input connect");
+    let (_batch, ack) = read_with_retry(&input).await;
+    // Ack (advances the in-memory frontier, no local store), then compensate
+    // it (rewinds the frontier; must also not store).
+    ack.ack().await.expect("ack (frontier only)");
+    ack.undo().await.expect("undo (frontier rewind only)");
+
+    // Outlive the consumer's periodic auto-commit window (default 5s): a
+    // local store_offset from either path would be published by now.
+    tokio::time::sleep(Duration::from_millis(6500)).await;
+
+    // Probe the group's committed offset with an assigned consumer (no group
+    // join, so the input's membership is untouched).
+    let probe: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", "localhost:9092")
+        .set("group.id", &group)
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .create()
+        .expect("probe consumer");
+    let mut assignment = rdkafka::topic_partition_list::TopicPartitionList::new();
+    assignment.add_partition(&source_topic, 0);
+    probe.assign(&assignment).expect("probe assign");
+    let committed = probe
+        .committed_offsets(assignment, Duration::from_secs(10))
+        .expect("committed offsets");
+    let elements = committed.elements();
+    let element = elements
+        .iter()
+        .find(|element| element.topic() == source_topic && element.partition() == 0)
+        .expect("the probed partition is present");
+    assert_eq!(
+        element.offset(),
+        rdkafka::topic_partition_list::Offset::Invalid,
+        "the group's broker position must be untouched by ack/undo (only \
+         output transactions may move it); got {:?}",
+        element.offset()
+    );
+
+    drop(input);
+}
+
+/// A single-row binary batch carrying L3 position metadata (`__meta_partition` /
+/// `__meta_offset`) — the shape a routed batch brings to `write_batch` when
+/// the rows claim positions beyond the input's settled frontier.
+fn routed_meta_batch(partition: u32, offset: u64) -> MessageBatchRef {
+    use arkflow_core::MessageBatch;
+    let batch = MessageBatch::new_binary(vec![b"routed".to_vec()]).expect("binary batch");
+    let record_batch: datafusion::arrow::record_batch::RecordBatch = batch.into();
+    let record_batch =
+        arkflow_core::metadata::with_partition(record_batch, partition).expect("partition meta");
+    let record_batch =
+        arkflow_core::metadata::with_offset(record_batch, offset).expect("offset meta");
+    Arc::new(MessageBatch::new_arrow(record_batch))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

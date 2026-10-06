@@ -268,6 +268,17 @@ pub(crate) struct S3Store {
     /// maintained by advance/rewind/flush. `cursor()` runs on every WAL
     /// acknowledgement, so it must not perform a manifest GET per call.
     cursor_mirror: AtomicU64,
+    /// Highest sequence contained in a sealed segment object (seal gating,
+    /// `fix-object-store-wal-loss-window` D2). Seeded from recovery — every
+    /// segment object recovery discovers is already durable — and advanced
+    /// by `seal_active_segment` only after the segment PUT *and* the
+    /// manifest update both succeed. A source acknowledgement completes
+    /// only once the acknowledged sequence is covered (replay window, not
+    /// a loss window).
+    sealed_seq: AtomicU64,
+    /// Fired after each `sealed_seq` advance; wakes acknowledgements parked
+    /// in the engine's `Wal::wait_for_sealed`.
+    seal_notify: Notify,
     flusher: StdMutex<Option<FlusherHandle>>,
 }
 
@@ -479,6 +490,8 @@ impl S3Store {
             max_written_seq: AtomicU64::new(0),
             rewind_floor: AtomicU64::new(u64::MAX),
             cursor_mirror: AtomicU64::new(0),
+            sealed_seq: AtomicU64::new(0),
+            seal_notify: Notify::new(),
             flusher: StdMutex::new(None),
         });
 
@@ -488,6 +501,15 @@ impl S3Store {
         store
             .cursor_mirror
             .store(manifest_cursor, Ordering::Release);
+        // Seed the sealed frontier from the recovery tail: every segment
+        // object recovery discovered (and checksum-verified) is durable on
+        // the store, so acknowledgements replaying those entries pass the
+        // seal gate immediately instead of waiting for — and timing out on —
+        // a seal that already happened in a prior process lifetime.
+        store.sealed_seq.store(
+            store.max_written_seq.load(Ordering::Acquire),
+            Ordering::Release,
+        );
 
         let handle = spawn_flusher(store.clone());
         *store.flusher.lock().unwrap() = Some(handle);
@@ -873,6 +895,14 @@ impl WalStore for S3Store {
             .max(1)
     }
 
+    fn sealed_seq(&self) -> Option<u64> {
+        Some(self.sealed_seq.load(Ordering::Acquire))
+    }
+
+    fn seal_notifier(&self) -> Option<&Notify> {
+        Some(&self.seal_notify)
+    }
+
     fn close(&self) -> Result<(), Error> {
         // Stop the background flusher.
         if let Some(handle) = self.flusher.lock().unwrap().take() {
@@ -1005,6 +1035,18 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
         }
     })
     .await?;
+
+    // D2: the segment object and the manifest both hold this range now —
+    // publish the sealed frontier and wake acknowledgements gated on it.
+    // The publish point is deliberately AFTER the manifest write: an
+    // acknowledgement that completes here implies the manifest already
+    // knows the segment, which tightens recovery determinism (the LIST
+    // fallback of `s3-wal-pipeline` D5 remains for a manifest write that
+    // crashed between the PUT and this point). `fetch_max` keeps the
+    // frontier monotonic across concurrent/out-of-order seals.
+    store.sealed_seq.fetch_max(last_seq, Ordering::AcqRel);
+    store.seal_notify.notify_waiters();
+
     let _ = first_seq; // (we track via sealed_segments index; could go into manifest for diagnostics)
     Ok(())
 }
@@ -2423,6 +2465,15 @@ mod tests {
             .rt()
             .block_on(async move { seal_active_segment(&inner).await });
         assert!(result.is_err(), "seal must surface the segment PUT failure");
+        // A failed seal must not publish the sealed frontier: an
+        // acknowledgement gated on it keeps waiting (and eventually fails
+        // retryably) instead of committing a source offset whose entry is
+        // not durable anywhere.
+        assert_eq!(
+            store.sealed_seq(),
+            Some(0),
+            "the sealed frontier must not advance on a failed seal"
+        );
 
         // The active segment must be fully restored (entries + next_index), so
         // the next seal attempt re-uploads the same data.
@@ -2432,6 +2483,66 @@ mod tests {
         assert_eq!(active.last_seq, 3);
         assert_eq!(active.next_index, 5, "next_index rolled back");
         assert!(!active.bytes.is_empty(), "bytes restored");
+    }
+
+    /// Seal gating (`fix-object-store-wal-loss-window` task 1.2): the sealed
+    /// frontier is published only after a successful seal (segment PUT +
+    /// manifest update), covers the sealed segment's tail, and never
+    /// regresses across seals. The trait exposes a notifier alongside it so
+    /// the engine can await seal progress instead of polling.
+    #[test]
+    fn sealed_seq_covers_segment_tail_and_advances_monotonically() {
+        // max_entries = 4 with a 1h flush_interval: seals fire only on the
+        // size trigger, deterministically inside `append_batch`.
+        let store = build_store_at(
+            "seal-gate-pod",
+            "seal-gate",
+            Arc::new(InMemory::new()),
+            4,
+            1000,
+        );
+        assert_eq!(
+            store.sealed_seq(),
+            Some(0),
+            "a fresh store has sealed nothing"
+        );
+        assert!(
+            store.seal_notifier().is_some(),
+            "the object-store backend must expose its seal notifier"
+        );
+
+        let payload = sample_payload(None);
+        // Three appends stay staged in the active segment: nothing is sealed,
+        // so acknowledgements for those sequences must remain gated.
+        for seq in 1..=3u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+            assert_eq!(
+                store.sealed_seq(),
+                Some(0),
+                "seq {seq} is staged, not sealed — the frontier must not advance yet"
+            );
+        }
+        // The fourth crosses segment.max_entries and seals [1..=4]
+        // synchronously inside `append_batch`.
+        store.append_batch(vec![(4, payload.clone())]).unwrap();
+        let first = store.sealed_seq().unwrap();
+        assert!(
+            first >= 4,
+            "the sealed frontier must cover the segment tail after the seal"
+        );
+
+        // A second seal advances the frontier monotonically.
+        for seq in 5..=8u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        let second = store.sealed_seq().unwrap();
+        assert!(second >= 8, "the second seal covers its own tail");
+        assert!(second >= first, "the sealed frontier never regresses");
+
+        // close() performs a final seal of anything staged; the frontier
+        // only grows.
+        store.close().unwrap();
+        assert!(store.sealed_seq().unwrap() >= second);
     }
 
     // ===== Coverage-gap tests (offline; in-memory object store only) =====

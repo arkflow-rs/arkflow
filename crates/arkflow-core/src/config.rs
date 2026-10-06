@@ -194,6 +194,12 @@ pub struct ControlApiConfig {
     /// Optional Bearer token for control-plane operations and configuration.
     #[serde(default)]
     pub api_token: Option<String>,
+    /// Explicitly acknowledge running the standalone control API without a
+    /// token on a non-loopback bind. Startup refuses that combination by
+    /// default; this opt-in keeps it possible on isolated networks while the
+    /// process logs a prominent warning.
+    #[serde(default)]
+    pub insecure_local: bool,
     /// Explicit browser origins allowed to call the control API. Empty denies cross-origin calls.
     #[serde(default)]
     pub cors_origins: Vec<String>,
@@ -444,6 +450,7 @@ impl Default for ControlApiConfig {
         Self {
             api_prefix: default_api_prefix(),
             api_token: None,
+            insecure_local: false,
             cors_origins: Vec::new(),
         }
     }
@@ -688,6 +695,7 @@ mod tests {
             control_api: ControlApiConfig {
                 api_prefix: "/api/v1".to_string(),
                 api_token: Some("test-token".to_string()),
+                insecure_local: false,
                 cors_origins: Vec::new(),
             },
             agent: AgentConfig::default(),

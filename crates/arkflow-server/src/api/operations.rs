@@ -1,5 +1,5 @@
 //! Operation list/get/cancel handlers for the local control plane and the Hub.
-use super::{authorized, problem, require_operator_action, OperationQuery};
+use super::{problem, require_operator_action, OperationQuery};
 use crate::api_contract::OperatorAction;
 use crate::hub;
 use arkflow_core::control::Page;
@@ -125,15 +125,7 @@ pub(super) async fn operation(State(cp): State<ControlPlane>, Path(id): Path<Str
 pub(super) async fn cancel_operation(
     State(cp): State<ControlPlane>,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Response {
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
     match cp.cancel_operation(&id).await {
         Some(value) => Json(value).into_response(),
         None => problem(

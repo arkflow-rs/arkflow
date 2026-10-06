@@ -153,7 +153,9 @@ impl ServerConfig {
             liveness_path: health.liveness_path.clone(),
             cors_origins: control_api.cors_origins.clone(),
             node_token: agent.node_token.clone(),
-            insecure_local: false,
+            // Standalone deployment-boundary opt-in (the Hub reads its own
+            // insecure_local from the environment in `arkflow-server`).
+            insecure_local: control_api.insecure_local,
             hub_storage: None,
             lease_ttl_ms: agent.agent_lease_ttl_ms,
             poll_interval_ms: default_poll_interval_ms(),
@@ -172,7 +174,7 @@ impl ServerConfig {
                 format!("invalid Hub bind address '{}': {error}", self.address),
             )
         })?;
-        if self.insecure_local && !address.ip().is_loopback() {
+        if self.insecure_local && !is_loopback_bind(address) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "insecure_local is only allowed when the Hub binds a loopback address",
@@ -223,6 +225,49 @@ impl Default for ServerConfig {
             observability: arkflow_core::config::ObservabilityConfig::default(),
         }
     }
+}
+
+/// Shared bind classification for both startup guards (Hub and standalone):
+/// a loopback bind is local-only by construction; anything else is
+/// externally reachable and requires credentials.
+fn is_loopback_bind(address: SocketAddr) -> bool {
+    address.ip().is_loopback()
+}
+
+/// Standalone control-plane startup guard, mirroring `validate_hub_startup`:
+/// a non-loopback bind requires a credential (`control_api.api_token`) or an
+/// explicit `insecure_local` opt-in, so a misconfigured `0.0.0.0` bind can
+/// never silently expose an unauthenticated configuration API. Loopback
+/// binds keep the zero-friction local-development default. The returned
+/// address is the exact socket address the caller may bind.
+fn validate_standalone_startup(
+    config: &ServerConfig,
+    control_plane: &ControlPlane,
+) -> Result<SocketAddr, arkflow_core::Error> {
+    let address: SocketAddr = config.address.parse().map_err(|error| {
+        arkflow_core::Error::Config(format!(
+            "invalid control API bind address '{}': {error}",
+            config.address
+        ))
+    })?;
+    if !is_loopback_bind(address) && control_plane.api_token().is_none() {
+        if !config.insecure_local {
+            return Err(arkflow_core::Error::Config(
+                "the control API refuses to start on a non-loopback address without a credential: \
+                 set health_check.api_token, or explicitly acknowledge the exposure with \
+                 health_check.insecure_local: true"
+                    .into(),
+            ));
+        }
+        tracing::error!(
+            %address,
+            "standalone control API is running WITHOUT an API token on a non-loopback address: \
+             every caller can read and replace the engine configuration. Set \
+             health_check.api_token or remove health_check.insecure_local before exposing \
+             this process beyond localhost."
+        );
+    }
+    Ok(address)
 }
 
 fn default_enabled() -> bool {
@@ -348,7 +393,16 @@ pub fn router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
         .route("/components/{kind}/{name}", get(component))
         .route("/schema", get(schema))
         .route("/metrics", get(metrics))
-        .with_state(control_plane.clone());
+        .with_state(control_plane.clone())
+        // Default-deny authentication for the whole nested API: read and
+        // write endpoints are protected identically (the old per-handler
+        // checks left reads unauthenticated). `route_layer` stays inside the
+        // nest, so the outer health/readiness/liveness probes and the
+        // top-level `/metrics` remain unauthenticated by design.
+        .route_layer(middleware::from_fn_with_state(
+            control_plane.clone(),
+            local_auth_middleware,
+        ));
 
     let mut app = Router::new()
         .route(&config.health_path, get(health))
@@ -382,7 +436,10 @@ pub async fn serve(
     if !config.enabled {
         return Ok(());
     }
-    let address: SocketAddr = config.address.parse()?;
+    // Deployment-boundary guard before the listener binds: a non-loopback
+    // bind without a token must fail loudly here instead of silently
+    // exposing an unauthenticated configuration API.
+    let address = validate_standalone_startup(&config, &control_plane)?;
     let listener = TcpListener::bind(address).await?;
     axum::serve(listener, router(control_plane, &config).into_make_service())
         .with_graceful_shutdown(cancellation.cancelled_owned())
@@ -477,6 +534,35 @@ async fn operator_auth_middleware(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "A valid operator token is required".into(),
+        )
+    }
+}
+
+/// Route-level authentication for the standalone (local) plane: every
+/// request under the versioned API prefix — read and write endpoints alike —
+/// requires a valid Bearer token once `control_api.api_token` is configured.
+/// With no token configured the middleware passes through; the startup guard
+/// (`validate_standalone_startup`) limits that combination to loopback binds
+/// or an explicit `insecure_local` opt-in. A new local route is protected
+/// automatically — the deleted per-handler checks let a forgotten one become
+/// an auth bypass, and never covered the read endpoints at all.
+async fn local_auth_middleware(
+    State(cp): State<ControlPlane>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let token = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if cp.authorized(token) {
+        next.run(req).await
+    } else {
+        problem(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "A valid Bearer token is required".into(),
         )
     }
 }
@@ -1115,14 +1201,6 @@ fn hub_problem(error: hub::HubError) -> Response {
         _ => "agent_request_rejected",
     };
     problem(status, code, error.to_string().chars().take(256).collect())
-}
-
-fn authorized(cp: &ControlPlane, headers: &HeaderMap) -> bool {
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    cp.authorized(token)
 }
 
 fn problem(status: StatusCode, code: &str, message: String) -> Response {

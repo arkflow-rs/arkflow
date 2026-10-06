@@ -2267,7 +2267,7 @@
     {
       "kind": "processor",
       "name": "batch",
-      "description": "Batches messages by count with an idle timeout before forwarding.",
+      "description": "Batches messages by row count with an idle timeout before forwarding.",
       "config_optional": true,
       "config_schema": {
         "type": "object",
@@ -2276,7 +2276,7 @@
           "count": {
             "type": "integer",
             "minimum": 1,
-            "description": "Number of messages per batch."
+            "description": "Number of message rows to accumulate before flushing."
           },
           "timeout_ms": {
             "type": "integer",

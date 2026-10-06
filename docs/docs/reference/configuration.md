@@ -63,7 +63,8 @@ API and the Hub agent when `hub_urls` is set (see
 | `readiness_path` | string | no | `/readiness` | Readiness endpoint path. |
 | `liveness_path` | string | no | `/liveness` | Liveness endpoint path. |
 | `api_prefix` | string | no | `/api/v1` | Prefix for the versioned control-plane API. |
-| `api_token` | string | no | — | Optional Bearer token protecting control-plane operations and configuration. |
+| `api_token` | string | no | — | Optional Bearer token protecting the versioned control-plane API: with it set, every `/api/v1` endpoint — reads included — answers `401` without a valid `Authorization: Bearer` header. |
+| `insecure_local` | boolean | no | `false` | Explicitly allow the standalone control API to bind a non-loopback `address` without `api_token`. Startup refuses that combination by default; when set, the process starts and logs an error-level warning. Never use this on shared networks. |
 | `cors_origins` | array&lt;string&gt; | no | `[]` | Browser origins allowed to call the control API. Empty denies cross-origin calls. |
 | `hub_urls` | array&lt;string&gt; | no | `[]` | Hub addresses for compute-node agent mode, tried in order as failover candidates (see [Agent multi-Hub failover](../operate/control-plane/deploy.md#agent-multi-hub-failover)). Empty ⇒ standalone mode. **Breaking change:** replaces the former single-string `hub_url` field; a config that still declares `hub_url` fails validation with a migration hint — rewrite `hub_url: "http://hub:8080"` as `hub_urls: ["http://hub:8080"]`. |
 | `node_id` | string | no | — | Stable identity this process reports to its Hub. |
@@ -80,8 +81,10 @@ Exports process-level observability endpoints. They stay available even when
 `health_check.enabled` is `false` — a pure data-plane deployment (no
 control-plane API, no Hub) still exposes metrics and probes. The listener
 binds loopback by default; for production, set an explicit address or rely on
-host/firewall policy. When the control-plane server is enabled, its router
-serves the same endpoints and no second listener is started.
+host/firewall policy. These endpoints are unauthenticated by design — do not
+expose this listener to untrusted networks. When the control-plane server is
+enabled, its router serves the same endpoints and no second listener is
+started.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -101,6 +104,14 @@ the Hub beyond loopback. For explicitly local development only, set
 loopback address; this permits volatile state and omitted credentials. The Hub
 restores durable state before binding its listener, so a recovery error leaves
 the server unavailable rather than serving a partial view.
+
+The standalone `arkflow` engine applies the same boundary to its local
+control API: a non-loopback `health_check.address` without
+`health_check.api_token` refuses to start. Set the token, or explicitly opt
+in with `health_check.insecure_local: true` (the engine then starts and logs
+an error-level warning). With a token configured, every `/api/v1` endpoint —
+reads included — requires the Bearer token; the health probes and the
+top-level `/metrics` stay open for probes and scrapers.
 
 :::note
 When the control-plane server is enabled, `/ready` and `/live` are also

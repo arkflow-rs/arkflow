@@ -358,24 +358,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_json_codec_merged_decode_widens_int_float_and_keeps_late_fields() {
+        // Regression: merged (whole-batch) decode must infer the schema from
+        // ALL records. Inference limited to the first record inferred `v` as
+        // Int64 and never saw `tag`, so `{"v":1.5}` was silently truncated
+        // to 1 and the `tag` column was silently dropped.
+        let codec = JsonCodec {
+            on_error: OnError::Fail,
+        };
+        let batch = codec
+            .decode(vec![
+                br#"{"v":1}"#.to_vec(),
+                br#"{"v":1.5}"#.to_vec(),
+                br#"{"v":2.9,"tag":"x"}"#.to_vec(),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(batch.len(), 3);
+        let schema = batch.record_batch().schema();
+        let v_field = schema.field_with_name("v").unwrap();
+        assert_eq!(
+            v_field.data_type(),
+            &arrow::datatypes::DataType::Float64,
+            "Int64 + Float64 across records must widen to Float64, not truncate"
+        );
+        let tag_field = schema.field_with_name("tag").unwrap();
+        assert_eq!(
+            tag_field.data_type(),
+            &arrow::datatypes::DataType::Utf8,
+            "fields first seen in later records must still become columns"
+        );
+        assert!(tag_field.is_nullable());
+
+        use datafusion::arrow::array::AsArray;
+        let v_col = batch.record_batch().column_by_name("v").unwrap();
+        let v = v_col.as_primitive::<datafusion::arrow::datatypes::Float64Type>();
+        assert_eq!(v.value(0), 1.0);
+        assert_eq!(v.value(1), 1.5);
+        assert_eq!(v.value(2), 2.9);
+
+        let tag_col = batch.record_batch().column_by_name("tag").unwrap();
+        assert!(tag_col.is_null(0));
+        assert!(tag_col.is_null(1));
+        assert!(!tag_col.is_null(2));
+    }
+
+    #[tokio::test]
+    async fn test_json_codec_merged_decode_all_int_stays_int64() {
+        // Full-batch inference widens only when needed: an all-integer
+        // column must stay Int64.
+        let codec = JsonCodec {
+            on_error: OnError::Fail,
+        };
+        let batch = codec
+            .decode(vec![
+                br#"{"v":1}"#.to_vec(),
+                br#"{"v":2}"#.to_vec(),
+                br#"{"v":3}"#.to_vec(),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(batch.len(), 3);
+        let schema = batch.record_batch().schema();
+        let v_field = schema.field_with_name("v").unwrap();
+        assert_eq!(v_field.data_type(), &arrow::datatypes::DataType::Int64);
+        use datafusion::arrow::array::AsArray;
+        let v_col = batch.record_batch().column_by_name("v").unwrap();
+        let v = v_col.as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        assert_eq!(v.value(0), 1);
+        assert_eq!(v.value(1), 2);
+        assert_eq!(v.value(2), 3);
+    }
+
+    #[tokio::test]
     async fn test_json_codec_skip_widens_types_like_fail_mode() {
-        // Regression (CR): skip mode must share schema inference with the
-        // fail path. Decoding each good message separately infers `{"v":1}`
-        // as Int64 and `{"v":1.5}` as Float64, and merging those schemas
-        // fails with a type conflict — a batch the fail mode would decode.
-        // Skip mode must decode the surviving messages in one pass and
-        // produce exactly what fail mode produces for the same messages.
+        // Regression: both modes share the same full-batch schema inference
+        // for the messages they decode, so an int/float mixture widens to
+        // Float64 (never truncated) in BOTH modes — the outputs below are
+        // Float64 [1.0, 1.5], asserted explicitly rather than by equality
+        // with a possibly-truncated reference.
+        //
+        // What actually differs is error isolation at the parse level:
+        // `skip` probes each message individually and drops the ones that
+        // fail to parse (here the middle `{invalid`), while `fail` rejects
+        // the whole batch on the same input.
         let fail = JsonCodec {
             on_error: OnError::Fail,
         };
         let skip = JsonCodec {
             on_error: OnError::Skip,
         };
+
+        // fail mode: one bad message fails the whole batch.
+        assert!(
+            fail.decode(vec![
+                br#"{"v":1}"#.to_vec(),
+                b"{invalid".to_vec(),
+                br#"{"v":1.5}"#.to_vec(),
+            ])
+            .await
+            .is_err(),
+            "fail mode must reject the whole batch on a parse error"
+        );
+
+        // fail mode reference on the good pair: full-batch inference widens
+        // Int64 + Float64 to Float64 without truncation.
         let reference = fail
             .decode(vec![br#"{"v":1}"#.to_vec(), br#"{"v":1.5}"#.to_vec()])
             .await
             .expect("fail mode decodes the good pair");
+        assert_eq!(reference.len(), 2);
+        {
+            use datafusion::arrow::array::AsArray;
+            let v = reference
+                .record_batch()
+                .column_by_name("v")
+                .unwrap()
+                .as_primitive::<datafusion::arrow::datatypes::Float64Type>();
+            assert_eq!(v.value(0), 1.0);
+            assert_eq!(v.value(1), 1.5);
+        }
 
+        // skip mode: the bad message is isolated (parse-level), the two good
+        // messages decode in one merged pass and widen exactly like fail.
         let batch = skip
             .decode(vec![
                 br#"{"v":1}"#.to_vec(),
@@ -383,14 +490,17 @@ mod tests {
                 br#"{"v":1.5}"#.to_vec(),
             ])
             .await
-            .expect("skip mode must not fail on a batch fail mode decodes");
-
-        assert_eq!(batch.len(), reference.len());
+            .expect("skip mode must not fail on a batch fail mode rejects");
+        assert_eq!(
+            batch.len(),
+            2,
+            "only the parse-level bad message is dropped"
+        );
         assert_eq!(batch.schema(), reference.schema());
         assert_eq!(
-            batch.record_batch().column(0),
-            reference.record_batch().column(0),
-            "skip mode must produce the same column as fail mode"
+            batch.record_batch().column_by_name("v").unwrap(),
+            reference.record_batch().column_by_name("v").unwrap(),
+            "skip mode must widen int/float mixtures exactly like fail mode"
         );
     }
 

@@ -40,7 +40,9 @@ output:
 
 ## Notes
 
-- In the default `fail` mode, multiple byte payloads are concatenated with `\n` and handed to the Arrow JSON reader in a single pass for schema inference; one malformed message fails the entire batch.
-- In `skip` mode each message decodes individually: bad messages are dropped with a warning (message index and error are logged) and the good messages are merged on the union schema — missing fields become null columns. A batch where every message fails still errors rather than returning an empty batch.
+- Schema inference covers **all records** of the batch being decoded, not just the first: numeric columns widen to the union type (a column mixing integers and floats decodes as `Float64` — values are never truncated), fields that first appear in later records still become columns (null-filled, nullable), and a column that is entirely integers stays `Int64`.
+- Downstream note: a mixed int/float column that older ArkFlow versions silently truncated to `Int64` now decodes as `Float64` with the correct values; SQL or output schemas that relied on the old (wrongly narrowed) type need to adapt.
+- In the default `fail` mode, multiple byte payloads are concatenated with `\n` and handed to the Arrow JSON reader in a single pass; one malformed message fails the entire batch.
+- In `skip` mode each message is probed individually: parse-level bad messages are dropped with a warning (message index and error are logged), then the good messages are decoded together in one pass sharing the same full-batch schema inference as `fail` mode. A batch where every message fails still errors rather than returning an empty batch.
 - Encoded output is newline-delimited JSON (one object per line), convenient for downstream line-by-line parsing.
 - This codec implements both `Encoder` and `Decoder`, so it can be reused on both the input (decode) and output (encode) sides.

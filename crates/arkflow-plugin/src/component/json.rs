@@ -23,9 +23,16 @@ pub(crate) fn try_to_arrow(
     content: &[u8],
     fields_to_include: Option<&HashSet<String>>,
 ) -> Result<RecordBatch, Error> {
+    // Infer the schema from ALL records in the batch (`None` = unbounded).
+    // arrow-json merges across records by union: Int64 + Float64 widen to
+    // Float64 (no silent truncation of later records), fields seen only in
+    // later records still become columns (no silent column loss), and nulls
+    // relax nullability. Sampling only the first record (`Some(1)`) would
+    // decode every later record against the first record's schema and
+    // silently truncate values / drop unknown fields.
     let mut cursor_for_inference = Cursor::new(content);
     let (mut inferred_schema, _) =
-        arrow_json::reader::infer_json_schema(&mut cursor_for_inference, Some(1))
+        arrow_json::reader::infer_json_schema(&mut cursor_for_inference, None)
             .map_err(|e| Error::Process(format!("Schema inference error: {}", e)))?;
     if let Some(set) = fields_to_include {
         inferred_schema = inferred_schema

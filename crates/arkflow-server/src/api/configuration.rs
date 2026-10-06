@@ -1,6 +1,6 @@
 //! Configuration report/draft/validate/diff/apply/rollback handlers for the
 //! local control plane and the Hub's node-targeted configuration API.
-use super::{authorized, problem, require_operator_action, DiffQuery};
+use super::{problem, require_operator_action, DiffQuery};
 use crate::api_contract::OperatorAction;
 use crate::hub;
 use crate::hub::AgentOperation;
@@ -303,14 +303,7 @@ pub(super) fn single_node_rollout_response(
     })
 }
 
-pub(super) async fn configuration(State(cp): State<ControlPlane>, headers: HeaderMap) -> Response {
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
+pub(super) async fn configuration(State(cp): State<ControlPlane>) -> Response {
     match redacted_config(&cp.configuration().await) {
         Ok(value) => Json(value).into_response(),
         Err(error) => problem(
@@ -321,17 +314,7 @@ pub(super) async fn configuration(State(cp): State<ControlPlane>, headers: Heade
     }
 }
 
-pub(super) async fn configuration_draft(
-    State(cp): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
+pub(super) async fn configuration_draft(State(cp): State<ControlPlane>) -> Response {
     match cp.draft().await {
         Some(value) => Json(value).into_response(),
         None => (StatusCode::NO_CONTENT, ()).into_response(),
@@ -340,31 +323,15 @@ pub(super) async fn configuration_draft(
 
 pub(super) async fn save_configuration_draft(
     State(cp): State<ControlPlane>,
-    headers: HeaderMap,
     Json(candidate): Json<ConfigCandidate>,
 ) -> Response {
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
     Json(cp.set_draft(candidate).await).into_response()
 }
 
 pub(super) async fn configuration_diff(
     State(cp): State<ControlPlane>,
-    headers: HeaderMap,
     Query(query): Query<DiffQuery>,
 ) -> Response {
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
     let from = match cp.version_store().load(&query.from) {
         Ok(value) => value,
         Err(error) => {
@@ -389,21 +356,17 @@ pub(super) async fn configuration_diff(
 }
 
 pub(super) async fn validate_configuration(
-    State(cp): State<ControlPlane>,
-    headers: HeaderMap,
+    // The state extractor stays so the route keeps the shared handler shape;
+    // validation itself is stateless (the auth decision lives in the route
+    // middleware, not the handler).
+    State(_cp): State<ControlPlane>,
     Json(candidate): Json<ConfigCandidate>,
 ) -> Response {
     // Validation parses and resolves secret references and constructs every
-    // component in the candidate, so it needs the same authorization as the
-    // apply path: an open endpoint would hand unauthenticated callers a
-    // node-local env/file oracle and a per-request construction load.
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
+    // component in the candidate, so it rides behind the same route-level
+    // authentication as every other API endpoint: an open endpoint would
+    // hand unauthenticated callers a node-local env/file oracle and a
+    // per-request construction load.
     match parse_and_validate(&candidate) {
         Ok(report) => Json(report).into_response(),
         Err(issue) => Json(arkflow_core::configuration::ConfigValidationReport {
@@ -414,17 +377,7 @@ pub(super) async fn validate_configuration(
     }
 }
 
-pub(super) async fn configuration_versions(
-    State(cp): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
+pub(super) async fn configuration_versions(State(cp): State<ControlPlane>) -> Response {
     match cp.versions() {
         Ok(value) => Json(value).into_response(),
         Err(error) => problem(
@@ -437,16 +390,8 @@ pub(super) async fn configuration_versions(
 
 pub(super) async fn apply_configuration(
     State(cp): State<ControlPlane>,
-    headers: HeaderMap,
     Json(candidate): Json<ConfigCandidate>,
 ) -> Response {
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
     match cp.apply_configuration(&candidate).await {
         Ok(value) => (StatusCode::ACCEPTED, Json(value)).into_response(),
         Err(error) => problem(
@@ -460,15 +405,7 @@ pub(super) async fn apply_configuration(
 pub(super) async fn rollback_configuration(
     State(cp): State<ControlPlane>,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Response {
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
     match cp.rollback_configuration(&id).await {
         Ok(value) => (StatusCode::ACCEPTED, Json(value)).into_response(),
         Err(error) => problem(

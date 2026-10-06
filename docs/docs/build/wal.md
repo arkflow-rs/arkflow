@@ -45,12 +45,45 @@ streams:
 This works for most workloads. To tune for higher throughput, lower cost,
 or faster recovery, continue reading.
 
+## Source acknowledgement is gated on sealing
+
+On the object-store backend, a source acknowledgement (for example the
+Kafka offset commit) completes **only after the acknowledged entry has
+been sealed into a segment object** — a PUT to object storage plus the
+manifest update. A completed acknowledgement therefore always means the
+entry is durable on the store: if the node disappears at any moment, no
+acknowledged entry can be lost.
+
+Entries that are staged in memory but not yet sealed are not lost either —
+they are the **replay window**: because their source acknowledgement has
+not completed, the source re-delivers them after a restart
+(at-least-once, so outputs must tolerate duplicates as usual).
+
+The same segment flush triggers that bound the replay window also bound
+the **acknowledgement latency** added by this gating: an acknowledgement
+waits at most one `flush_interval` (plus the segment PUT time) for its
+entry's segment to seal. With the default `balanced` preset that is about
+1s; the `aggressive` preset adds up to ~10s. Acknowledgements for many
+entries in the same segment share a single seal, so the wait amortizes
+across the batch. If acknowledgement latency matters more than PUT cost,
+lower `flush_interval` (and `max_entries`) — do not try to bypass the
+gate: it is what makes "acknowledged" imply "sealed". A flusher that
+stops sealing fails the acknowledgement retryably after a bounded wait
+instead of silently committing unsealed data, and sustained flusher
+failures are logged at error level (see
+[S3 WAL backend performance](../develop/s3-wal-performance.md)).
+
+The local (`redb`) backend is unaffected: its flush is already a durable
+commit, so acknowledgements complete exactly as before with no added
+latency.
+
 ## Dimension 1: Segment Tuning
 
 The `segment_tuning` block controls when the in-memory segment is sealed
 and uploaded to S3. Larger segments mean fewer PUT requests (lower cost)
-but a larger "loss window" — the number of unflushed messages at risk
-if the node disappears.
+but a larger replay window — more unsealed messages that the source must
+re-deliver if the node disappears — and longer acknowledgement latency
+(see above).
 
 ### Preset Strategies
 
@@ -92,13 +125,15 @@ durability:
       flush_interval: "30s"   # override default 10s
 ```
 
-### Crash Window Trade-off
+### Replay Window Trade-off
 
-The crash window is the number of messages at risk if the node vanishes
-between a write and the next segment flush. Approximate it as:
+The replay window is the number of messages the source must re-deliver if
+the node vanishes between a write and the next segment flush (they are
+replayed, not lost — acknowledgement gating keeps the source offset
+behind the seal frontier). Approximate it as:
 
 ```
-loss_window ≈ min(
+replay_window ≈ min(
     max_entries,
     max_bytes / avg_message_size,
     flush_interval × message_rate
@@ -107,11 +142,14 @@ loss_window ≈ min(
 
 At 10,000 msg/s with 1 KB average message size:
 
-| Strategy | Crash Window |
-|----------|--------------|
+| Strategy | Replay Window |
+|----------|---------------|
 | `aggressive` | ~100,000 messages |
 | `balanced` | ~10,000 messages |
 | `low_latency` | ~1,000 messages |
+
+The same triggers bound the acknowledgement latency added by seal gating
+(`flush_interval` dominates: 10s / 1s / 100ms for the presets above).
 
 ## Dimension 2: Parallel PUT Workers
 
@@ -203,7 +241,8 @@ storage-bound workloads.
 
 ### High-Throughput Batch Job
 
-Minimize S3 PUT requests; tolerate up to ~100K messages at risk.
+Minimize S3 PUT requests; tolerate up to ~100K messages re-delivered on
+node loss and an acknowledgement latency of up to ~10s.
 
 ```yaml validate=fragment wrap=durability
 durability:
@@ -223,9 +262,9 @@ durability:
       bucket: my-bucket
 ```
 
-### Real-Time Stream with Tight Loss Window
+### Real-Time Stream with Tight Replay Window
 
-Minimize crash window; throughput is secondary.
+Minimize replay window and acknowledgement latency; throughput is secondary.
 
 ```yaml validate=fragment wrap=durability
 durability:
@@ -246,7 +285,8 @@ durability:
 
 ### Cost-Sensitive Cold Storage
 
-Maximum compression, minimal PUTs, accept higher loss window.
+Maximum compression, minimal PUTs, accept a larger replay window and
+longer acknowledgement latency.
 
 ```yaml validate=fragment wrap=durability
 durability:
