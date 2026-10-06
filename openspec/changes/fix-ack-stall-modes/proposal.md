@@ -10,7 +10,7 @@
 ## What Changes
 
 - `TrackingAck` 增加 `aborted` 终态标记：`abort` 置位后 `undo` 为幂等 no-op（不触碰 tracker 计数）；对齐 `FanoutAckPart::undo` 的既有终态守卫。
-- WAL 驻留等待加有界租约：非 close 场景下的驻留等待超过 `WAL_ACK_PARK_TIMEOUT`（默认 60s）即返回可重试错误——沿既有失败栅栏（记 `last_error`、后续调用 fail-fast），流显式失败而非静默停滞。
+- WAL 驻留等待加有界租约：非 close 场景下的驻留等待超过 `WAL_ACK_PARK_TIMEOUT`（默认 60s）即返回可重试错误——不写 `last_error` 栅栏（不栅栏仅仅较慢的 gap 持有者），流以显式周期性错误失败而非静默停滞。
 - 修正 `state_journal.rs:2678` 测试使其断言 tracker 层计数（当前只断言 journal 层，放过了本缺陷）。
 
 ## Capabilities

@@ -455,6 +455,10 @@ impl KafkaOutput {
             return Err(e);
         }
 
+        // Clamped L3 offsets awaiting a successful commit before they may
+        // advance the producer's monotonic `last_sent_offsets` base.
+        let mut remember_after_commit: Option<Vec<(i32, i64)>> = None;
+
         // L3: fold the covered source offsets into the transaction before
         // committing. Offsets come from the batches' source metadata
         // columns (partition, consumed offset); commit positions are the
@@ -490,8 +494,8 @@ impl KafkaOutput {
                          process; the paired Kafka input must declare transactional_offsets"
                     ))
                 })?;
-                let offsets = {
-                    let mut last_sent = self
+                let clamped = {
+                    let last_sent = self
                         .last_sent_offsets
                         .lock()
                         .expect("kafka last_sent lock poisoned");
@@ -499,10 +503,10 @@ impl KafkaOutput {
                         offsets,
                         frontier.as_ref(),
                         group_topic.as_str(),
-                        &mut last_sent,
+                        &last_sent,
                     )
                 };
-                if let Some(offsets) = offsets {
+                if let Some((offsets, committed)) = clamped {
                     if let Err(e) = send_offsets_in_transaction(producer, offsets, metadata).await {
                         // Fail closed (spec: offset 发送异步失败 fail-closed):
                         // abort the transaction and return the error so the
@@ -513,6 +517,14 @@ impl KafkaOutput {
                         Self::abort_transaction(p).await;
                         return Err(e);
                     }
+                    // Remember the clamped values only after the broker
+                    // accepts the commit below — `committed` travels to the
+                    // commit match and folds into `last_sent_offsets` on
+                    // `Ok(Ok(()))`. A failed or aborted transaction leaves
+                    // the base untouched, so a frontier rewind followed by
+                    // a partial replay cannot re-commit never-committed
+                    // offsets (which would skip records).
+                    remember_after_commit = Some(committed);
                 }
             }
         }
@@ -525,7 +537,21 @@ impl KafkaOutput {
         })
         .await
         {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                if let Some(committed) = remember_after_commit.take() {
+                    let mut last_sent = self
+                        .last_sent_offsets
+                        .lock()
+                        .expect("kafka last_sent lock poisoned");
+                    for (partition, offset) in committed {
+                        last_sent
+                            .entry(partition)
+                            .and_modify(|value| *value = (*value).max(offset))
+                            .or_insert(offset);
+                    }
+                }
+                Ok(())
+            }
             Ok(Err(e)) => Err(map_kafka_txn_error(e, "commit_transaction")),
             Err(e) => Err(Error::Connection(format!(
                 "commit_transaction task join failed: {}",
@@ -823,13 +849,18 @@ fn transactional_offsets_for_batches(
 ///
 /// Returns `None` when nothing committable remains (the caller then skips
 /// `send_offsets_to_transaction` entirely). `last_sent` is this producer's
-/// monotonic base and is updated in place.
+/// monotonic base — read here, but only folded with the clamped values by
+/// the CALLER after `commit_transaction` succeeds: values from a failed or
+/// aborted transaction must not survive, or a frontier rewind followed by
+/// a partial replay would re-commit offsets that were never broker-committed
+/// (skipping records). Returns the wire list plus the clamped pairs to
+/// remember on success.
 fn clamp_transactional_offsets(
     offsets: rdkafka::TopicPartitionList,
     frontier: &arkflow_core::executor::commit::CommitFrontier,
     group_topic: &str,
-    last_sent: &mut std::collections::HashMap<i32, i64>,
-) -> Option<rdkafka::TopicPartitionList> {
+    last_sent: &std::collections::HashMap<i32, i64>,
+) -> Option<(rdkafka::TopicPartitionList, Vec<(i32, i64)>)> {
     // Frontier next-offsets for the group's topic, keyed by partition. Only
     // positions of the group topic apply (single-topic L3 inputs).
     let frontier_next: std::collections::HashMap<i32, i64> = frontier
@@ -856,7 +887,6 @@ fn clamp_transactional_offsets(
         };
         let previous_sent = last_sent.get(&partition).copied().unwrap_or(i64::MIN);
         let commit = (*frontier_next).min(batch_next).max(previous_sent);
-        last_sent.insert(partition, commit);
         let folded = clamped.get(&partition).copied().unwrap_or(i64::MIN);
         clamped.insert(partition, folded.max(commit));
     }
@@ -864,13 +894,13 @@ fn clamp_transactional_offsets(
         return None;
     }
     let mut result = rdkafka::TopicPartitionList::new();
-    for (partition, commit) in clamped {
+    for (partition, commit) in &clamped {
         // Both inputs are i64 next-offsets produced above; the add cannot
         // fail for a plain offset on a fresh list.
         let _ =
-            result.add_partition_offset(group_topic, partition, rdkafka::Offset::Offset(commit));
+            result.add_partition_offset(group_topic, *partition, rdkafka::Offset::Offset(*commit));
     }
-    Some(result)
+    Some((result, clamped.into_iter().collect()))
 }
 
 /// Send the clamped offsets into the open transaction (blocking broker
@@ -1844,9 +1874,10 @@ mod tests {
         let (offsets, covered) =
             transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
         assert!(covered);
-        let mut last_sent = std::collections::HashMap::new();
-        let clamped = clamp_transactional_offsets(offsets, &frontier, "orders", &mut last_sent)
-            .expect("both partitions clamp to the frontier");
+        let last_sent = std::collections::HashMap::new();
+        let (clamped, committed) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent)
+                .expect("both partitions clamp to the frontier");
         let commits: Vec<(i32, rdkafka::Offset)> = clamped
             .elements()
             .iter()
@@ -1860,14 +1891,19 @@ mod tests {
             ],
             "partition 0 clamps to the frontier; partition 1 keeps its batch max"
         );
-        // The monotonic base tracked what was sent.
-        assert_eq!(last_sent.get(&0), Some(&8));
-        assert_eq!(last_sent.get(&1), Some(&21));
+        // The clamp itself never mutates the monotonic base — the caller
+        // folds these pairs in only after a successful commit.
+        assert!(last_sent.is_empty());
+        assert_eq!(committed, vec![(0, 8), (1, 21)]);
     }
 
     /// Spec "位点钳制到连续前沿" + design D1: the commit sequence never
     /// rewinds — a later batch whose frontier slipped back (an undo rewound
     /// the in-memory frontier) still commits at least the last sent value.
+    /// CR follow-up: the base only advances through the caller's
+    /// post-commit fold, so values from a FAILED transaction never leak in
+    /// (a rewind + partial replay would otherwise re-commit never-committed
+    /// offsets and skip records).
     #[test]
     fn l3_commit_sequence_never_rewinds_below_last_sent() {
         use arkflow_core::checkpoint::SourcePosition;
@@ -1880,20 +1916,51 @@ mod tests {
             offset: 30,
         });
         let mut last_sent = std::collections::HashMap::new();
+        // Mirrors write_batch's post-commit fold.
+        let fold_after_commit = |last_sent: &mut std::collections::HashMap<i32, i64>,
+                                 committed: Vec<(i32, i64)>| {
+            for (partition, offset) in committed {
+                last_sent
+                    .entry(partition)
+                    .and_modify(|value| *value = (*value).max(offset))
+                    .or_insert(offset);
+            }
+        };
 
-        // First commit: batch to 31, frontier at 30 → clamp 30.
+        // First commit: batch to 31, frontier at 30 → clamp 30. The commit
+        // succeeds, so the fold advances the base.
         let batch = l3_meta_batch(vec![0], vec![30], None);
         let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
-        let clamped =
-            clamp_transactional_offsets(offsets, &frontier, "orders", &mut last_sent).unwrap();
+        let (clamped, committed) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).unwrap();
         assert_eq!(clamped.elements()[0].offset(), rdkafka::Offset::Offset(30));
+        fold_after_commit(&mut last_sent, committed);
 
-        // Undo rewound the frontier to 29; the next batch derives 30 again.
+        // A FAILED transaction must not advance the base: the clamp pairs
+        // are discarded, so a subsequent frontier rewind + partial replay
+        // cannot re-commit a value that was never broker-committed. (The
+        // frontier must advance CONTIGUOUSLY — acknowledging a higher
+        // offset directly would sit in the pending gap set instead.)
+        frontier.acknowledge(&SourcePosition {
+            topic: Some("orders".into()),
+            partition: 0,
+            offset: 31,
+        });
+        let batch = l3_meta_batch(vec![0], vec![30], None);
+        let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        let (_clamped, discarded) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).unwrap();
+        assert_eq!(discarded, vec![(0, 31)]);
+        // (transaction fails — nothing folded)
+        assert_eq!(last_sent.get(&0), Some(&30));
+
+        // Undo rewound the frontier to 29; the next batch derives 30 again —
+        // the monotonic guard keeps the commit at the (committed) last sent.
         frontier.rewind_position(Some("orders"), 0, 30);
         let batch = l3_meta_batch(vec![0], vec![29], None);
         let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
-        let clamped =
-            clamp_transactional_offsets(offsets, &frontier, "orders", &mut last_sent).unwrap();
+        let (clamped, _committed) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).unwrap();
         assert_eq!(
             clamped.elements()[0].offset(),
             rdkafka::Offset::Offset(30),
@@ -1917,12 +1984,12 @@ mod tests {
             partition: 0,
             offset: 5,
         });
-        let mut last_sent = std::collections::HashMap::new();
+        let last_sent = std::collections::HashMap::new();
 
         let batch = l3_meta_batch(vec![0, 3], vec![4, 100], None);
         let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
-        let clamped =
-            clamp_transactional_offsets(offsets, &frontier, "orders", &mut last_sent).unwrap();
+        let (clamped, _committed) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).unwrap();
         assert_eq!(clamped.count(), 1, "only the tracked partition commits");
         assert_eq!(clamped.elements()[0].partition(), 0);
 
@@ -1932,7 +1999,7 @@ mod tests {
             transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
         assert!(covered, "the derivation still sees the rows");
         assert!(
-            clamp_transactional_offsets(offsets, &frontier, "orders", &mut last_sent).is_none(),
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).is_none(),
             "no frontier → no committable position"
         );
     }
@@ -1953,9 +2020,9 @@ mod tests {
         });
         let batch = l3_meta_batch(vec![0], vec![10], None);
         let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
-        let mut last_sent = std::collections::HashMap::new();
+        let last_sent = std::collections::HashMap::new();
         assert!(
-            clamp_transactional_offsets(offsets, &frontier, "orders", &mut last_sent).is_none(),
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).is_none(),
             "the orders partition has no frontier entry"
         );
     }

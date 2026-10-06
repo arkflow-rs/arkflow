@@ -903,6 +903,10 @@ impl WalStore for S3Store {
         Some(&self.seal_notify)
     }
 
+    fn seal_interval(&self) -> Option<std::time::Duration> {
+        Some(self.segment_cfg.flush_interval)
+    }
+
     fn close(&self) -> Result<(), Error> {
         // Stop the background flusher.
         if let Some(handle) = self.flusher.lock().unwrap().take() {

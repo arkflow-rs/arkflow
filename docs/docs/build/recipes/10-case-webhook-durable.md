@@ -89,7 +89,7 @@ curl -X POST http://localhost:8080/webhooks \
 ## Trade-offs and variations
 
 - `sync: per_entry` instead of `group_commit` trades throughput for a
-  narrower loss window (see [WAL optimization](../wal.md)).
+  narrower replay window (see [WAL optimization](../wal.md)).
 - Swap the SQL processor for [VRL](/docs/components/processors/vrl) to
   redact fields before forwarding.
 - Exactly-once on the Kafka side is available with transactional output —

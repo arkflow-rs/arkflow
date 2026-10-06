@@ -721,6 +721,11 @@ impl KernelJobRunner {
         cancellation: CancellationToken,
     ) -> Result<KernelJobHandle, Error> {
         if connect_inputs {
+            // Startup validation precedes even the source pre-connection on
+            // this path (the guard's `connect` below re-runs it, but the
+            // preconnected inputs would otherwise violate the documented
+            // "validation precedes any connection" contract).
+            super::resource_guard::run_startup_validators()?;
             for input in &inputs {
                 if let Err(error) = input.connect().await {
                     for connected in inputs.iter().rev() {

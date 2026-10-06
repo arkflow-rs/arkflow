@@ -169,7 +169,7 @@ segment_tuning:
 - `max_bytes: 10MB`
 - `flush_interval: 10s`
 
-**重放窗口 @ 10K msg/s**:节点丢失时约 100,000 条消息需重新投递
+**重放窗口 @ 10K msg/s、平均 1 KB**:节点丢失时约 10,000 条消息需重新投递(`max_entries`/`max_bytes` 先于 10s 的 `flush_interval` 触发)
 **PUT 成本**:较均衡策略降低约 10 倍
 **吞吐**:最高 200 MB/s
 
@@ -187,7 +187,7 @@ segment_tuning:
 - `max_bytes: 1MB`
 - `flush_interval: 1s`
 
-**重放窗口 @ 10K msg/s**:约 10,000 条消息需重新投递
+**重放窗口 @ 10K msg/s、平均 1 KB**:约 1,000 条消息需重新投递(`max_entries`/`max_bytes` 先于 1s 的 `flush_interval` 触发)
 **吞吐**:100-150 MB/s
 
 ### 低延迟(Low-Latency)策略
@@ -204,7 +204,7 @@ segment_tuning:
 - `max_bytes: 100KB`
 - `flush_interval: 100ms`
 
-**重放窗口 @ 10K msg/s**:约 1,000 条消息需重新投递
+**重放窗口 @ 10K msg/s、平均 1 KB**:约 100 条消息需重新投递(`max_entries`/`max_bytes` 先于 100ms 的 `flush_interval` 触发)
 **吞吐**:因频繁刷写而较低
 
 ### 自定义覆盖

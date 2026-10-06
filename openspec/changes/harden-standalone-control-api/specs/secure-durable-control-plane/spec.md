@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: 独立引擎控制平面 SHALL 应用启动护栏与 default-deny 认证
-standalone 引擎的控制 API SHALL 在启动前校验绑定与凭据组合：绑定地址非回环且未配置 `api_token` 时 SHALL 拒绝启动，除非配置显式声明 `insecure_local`（沿用 Hub 既有语义）。运行期认证 SHALL default-deny：全部 API 端点（读与写）经统一认证中间件——配置了 `api_token` 时所有请求要求有效 Bearer token，未配置且回环绑定时中间件直通。handler 内散落的自查 SHALL 由中间件统一取代。
+standalone 引擎的控制 API SHALL 在启动前校验绑定与凭据组合：绑定地址非回环且未配置 `api_token` 时 SHALL 拒绝启动，除非配置显式声明 `insecure_local`（沿用 Hub 既有语义）。运行期认证 SHALL default-deny：全部 API 端点（读与写）经统一认证中间件——配置了 `api_token` 时所有请求要求有效 Bearer token，未配置且回环绑定时中间件直通。handler 内散落的自查 SHALL 由中间件统一取代。两类豁免是**有意的**且不属于"全部 API 端点"：健康探针（`/health`、`/readiness`、`/liveness` 及其短别名）与顶层 `/metrics`（Prometheus 抓取端点，区别于 `/api/v1/metrics`）保持无认证——后者文档中已注明"勿暴露到非受信网络"。
 
 #### Scenario: 非回环无 token 拒绝启动
 

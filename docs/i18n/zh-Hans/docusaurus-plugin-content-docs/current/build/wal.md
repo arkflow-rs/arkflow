@@ -108,11 +108,11 @@ replay_window ≈ min(
 
 | 策略 | 重放窗口 |
 |----------|--------------|
-| `aggressive` | 约 100,000 条消息 |
-| `balanced` | 约 10,000 条消息 |
-| `low_latency` | 约 1,000 条消息 |
+| `aggressive` | 约 10,000 条消息 |
+| `balanced` | 约 1,000 条消息 |
+| `low_latency` | 约 100 条消息 |
 
-同样的触发条件也限定了密封门控带来的确认延迟(`flush_interval` 占主导:上述预设分别为 10s / 1s / 100ms)。
+在该速率下 `max_entries` 与 `max_bytes` 会先于 `flush_interval` 触发,由它们主导重放条数;密封门控带来的确认延迟仍以 `flush_interval` 为上界(上述预设分别为 10s / 1s / 100ms)。速率更低时,`flush_interval × 消息速率` 一项成为约束项。
 
 ## 维度 2:并行 PUT 工作者
 
@@ -190,7 +190,7 @@ durability:
 
 ### 高吞吐批处理作业
 
-最小化 S3 PUT 请求;容忍节点丢失时最多约 10 万条消息的重新投递,以及最多约 10s 的确认延迟。
+最小化 S3 PUT 请求;在 10K msg/s 摄入下容忍节点丢失时最多约 1 万条消息的重新投递(`max_entries`/`max_bytes` 先触发),以及最多约 10s 的确认延迟。
 
 ```yaml validate=fragment wrap=durability
 durability:

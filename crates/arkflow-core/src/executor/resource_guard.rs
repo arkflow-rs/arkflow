@@ -75,7 +75,9 @@ fn startup_validators() -> &'static Mutex<Vec<StartupValidator>> {
 /// instance (Arc identity), so lazily re-registering from a component build
 /// path never accumulates duplicates.
 pub fn register_startup_validator(validator: StartupValidator) {
-    let mut validators = startup_validators().lock().unwrap();
+    let mut validators = startup_validators()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !validators
         .iter()
         .any(|registered| Arc::ptr_eq(registered, &validator))
@@ -84,8 +86,16 @@ pub fn register_startup_validator(validator: StartupValidator) {
     }
 }
 
-fn run_startup_validators() -> Result<(), Error> {
-    for validator in startup_validators().lock().unwrap().iter() {
+pub(crate) fn run_startup_validators() -> Result<(), Error> {
+    // Clone before invoking: a panicking validator must not poison the
+    // registry for every later connect in this process (and a validator
+    // that re-registers would deadlock on the held, non-reentrant lock).
+    // A poisoned lock still yields the (structurally intact) list.
+    let validators = startup_validators()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for validator in validators.iter() {
         validator()?;
     }
     Ok(())
@@ -95,7 +105,10 @@ fn run_startup_validators() -> Result<(), Error> {
 /// idempotent-registration property).
 #[cfg(test)]
 fn startup_validator_count() -> usize {
-    startup_validators().lock().unwrap().len()
+    startup_validators()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
 }
 
 /// Connects a Job's resources in dependency order and closes them in

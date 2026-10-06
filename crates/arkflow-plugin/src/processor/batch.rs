@@ -122,6 +122,24 @@ pub struct BatchProcessor {
     last_batch_time: Arc<Mutex<std::time::Instant>>,
 }
 
+/// Who owns the newest delivery's acknowledgement when a flush's merge
+/// fails. An `accept`-triggered flush returns the CURRENT delivery with
+/// the error — the executor aborts that delivery's ack on `Err`, so it
+/// must not stay buffered (otherwise the same ack is settled twice, and
+/// a persistently conflicting batch re-fails every arrival while the
+/// buffer grows without bound). `finish`/`on_tick` have no current
+/// input, so every delivery stays buffered for a later retry or the
+/// close abort path.
+#[derive(Clone, Copy, PartialEq)]
+enum FlushErrOwnership {
+    /// The delivery just pushed by `accept` leaves the buffer with the
+    /// error; only previously buffered deliveries are restored.
+    ReturnCurrent,
+    /// No current input: restore everything (a later flush or the
+    /// close abort path still owns the acknowledgements).
+    RestoreAll,
+}
+
 impl BatchProcessor {
     /// Create a new batch processor component
     fn new(config: BatchProcessorConfig) -> Result<Self, Error> {
@@ -156,15 +174,17 @@ impl BatchProcessor {
 
     /// Merge every buffered delivery into one output. The merge is
     /// schema-normalizing: fields are unioned by name, missing columns are
-    /// null-filled, and same-name type conflicts fail explicitly. On a merge
-    /// failure the buffer is restored so a retry sees the same content.
-    async fn flush_held(&self) -> Result<ProcessResult, Error> {
+    /// null-filled, and same-name type conflicts fail explicitly. On a
+    /// merge failure the buffered deliveries are restored (minus the
+    /// current one under [`FlushErrOwnership::ReturnCurrent`]) so a retry
+    /// sees the same content without double-owning an aborted ack.
+    async fn flush_held(&self, err_ownership: FlushErrOwnership) -> Result<ProcessResult, Error> {
         let mut held = self.held.write().await;
         if held.is_empty() {
             return Ok(ProcessResult::None);
         }
 
-        let deliveries = std::mem::take(&mut *held);
+        let mut deliveries = std::mem::take(&mut *held);
         let arrow_batches: Vec<datafusion::arrow::array::RecordBatch> = deliveries
             .iter()
             .map(|delivery| delivery.batch.record_batch().clone())
@@ -173,7 +193,12 @@ impl BatchProcessor {
             Ok(merged) => merged,
             Err(error) => {
                 // Keep the deliveries buffered: a later flush (or the close
-                // abort path) still owns their acknowledgements.
+                // abort path) still owns their acknowledgements. The
+                // current delivery (if any) leaves with the error — its
+                // ack is aborted by the executor, not by us.
+                if err_ownership == FlushErrOwnership::ReturnCurrent {
+                    deliveries.pop();
+                }
                 *held = deliveries;
                 return Err(error);
             }
@@ -228,7 +253,7 @@ impl BatchProcessor {
 
         // Check if the batch should be refreshed
         if self.should_flush().await {
-            self.flush_held().await
+            self.flush_held(FlushErrOwnership::ReturnCurrent).await
         } else if ack.is_some() {
             Ok(ProcessResult::Deferred)
         } else {
@@ -255,7 +280,7 @@ impl Processor for BatchProcessor {
     async fn finish(&self) -> Result<ProcessResult, Error> {
         // EOS: emit the partial batch so its acknowledgements settle through
         // the normal output path instead of dying in `close`.
-        self.flush_held().await
+        self.flush_held(FlushErrOwnership::RestoreAll).await
     }
 
     async fn on_tick(&self) -> Result<ProcessResult, Error> {
@@ -264,7 +289,7 @@ impl Processor for BatchProcessor {
         if !self.should_flush().await {
             return Ok(ProcessResult::None);
         }
-        self.flush_held().await
+        self.flush_held(FlushErrOwnership::RestoreAll).await
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -482,7 +507,10 @@ mod tests {
         })
         .unwrap();
 
-        let result = processor.flush_held().await.unwrap();
+        let result = processor
+            .flush_held(FlushErrOwnership::RestoreAll)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -506,7 +534,10 @@ mod tests {
         processor.close().await.unwrap();
 
         // Verify the batch is empty by checking that flush returns empty
-        let result = processor.flush_held().await.unwrap();
+        let result = processor
+            .flush_held(FlushErrOwnership::RestoreAll)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -585,13 +616,77 @@ mod tests {
         // The merge failure propagates...
         assert!(result.is_err());
 
-        // ...and the buffer retained both messages: retrying the merge
-        // fails again instead of reporting an empty buffer.
-        assert!(processor.finish().await.is_err());
+        // ...and the conflicting (current) delivery left the buffer with
+        // the error: only the previously buffered binary message remains,
+        // and flushing it alone succeeds — a single poisoned batch cannot
+        // block the whole buffer (CR ownership fix).
+        let drained = processor.finish().await.unwrap();
+        assert!(
+            matches!(drained, ProcessResult::Single(ref b) if b.len() == 1),
+            "the retained non-conflicting message must still drain: {drained:?}"
+        );
+        assert!(processor
+            .flush_held(FlushErrOwnership::RestoreAll)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
-        // After a failed flush the buffer is still occupied
-        let held = processor.held.read().await;
-        assert_eq!(held.len(), 2);
+    /// CR follow-up (ack path): on a merge failure the CURRENT delivery's
+    /// ack returns to the executor (which aborts it) and must not stay
+    /// buffered — otherwise the same ack is settled twice (executor abort +
+    /// later HeldAcksAck settle) and the poisoned buffer re-fails every
+    /// arrival.
+    #[tokio::test]
+    async fn test_flush_failure_returns_current_ack_to_executor() {
+        let processor = BatchProcessor::new(BatchProcessorConfig {
+            count: 2,
+            timeout_ms: 60_000,
+        })
+        .unwrap();
+
+        // First (binary) delivery stays buffered under its own ack.
+        let (first, first_ack) = recording_ack();
+        processor
+            .process_with_ack(binary_msg(&["a"]), first_ack)
+            .await
+            .unwrap();
+
+        // Second (int64) delivery triggers the flush and conflicts.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "__value__",
+            DataType::Int64,
+            false,
+        )]));
+        let arrow_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
+        let (second, second_ack) = recording_ack();
+        let result = processor
+            .process_with_ack(Arc::new(MessageBatch::new_arrow(arrow_batch)), second_ack)
+            .await;
+        assert!(result.is_err(), "conflicting merge must fail");
+
+        // Neither ack settled through the processor yet; the executor owns
+        // the second ack (it aborts it on Err) — so closing the processor
+        // may only settle the FIRST delivery's ack.
+        assert_eq!(first.acked.load(Ordering::SeqCst), 0);
+        assert_eq!(second.acked.load(Ordering::SeqCst), 0);
+        assert_eq!(first.aborted.load(Ordering::SeqCst), 0);
+        assert_eq!(second.aborted.load(Ordering::SeqCst), 0);
+
+        processor.close().await.unwrap();
+        assert_eq!(
+            first.aborted.load(Ordering::SeqCst),
+            1,
+            "the retained delivery's ack is aborted by close for replay"
+        );
+        assert_eq!(
+            second.aborted.load(Ordering::SeqCst),
+            0,
+            "the current delivery's ack belongs to the executor, not the buffer"
+        );
+        assert_eq!(first.acked.load(Ordering::SeqCst), 0);
+        assert_eq!(second.acked.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -762,7 +857,11 @@ mod tests {
         assert_eq!(second.acked.load(Ordering::SeqCst), 0);
 
         // The buffer is released.
-        assert!(processor.flush_held().await.unwrap().is_empty());
+        assert!(processor
+            .flush_held(FlushErrOwnership::RestoreAll)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

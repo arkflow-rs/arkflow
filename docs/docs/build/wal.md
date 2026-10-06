@@ -144,12 +144,15 @@ At 10,000 msg/s with 1 KB average message size:
 
 | Strategy | Replay Window |
 |----------|---------------|
-| `aggressive` | ~100,000 messages |
-| `balanced` | ~10,000 messages |
-| `low_latency` | ~1,000 messages |
+| `aggressive` | ~10,000 messages |
+| `balanced` | ~1,000 messages |
+| `low_latency` | ~100 messages |
 
-The same triggers bound the acknowledgement latency added by seal gating
-(`flush_interval` dominates: 10s / 1s / 100ms for the presets above).
+At that rate the `max_entries` and `max_bytes` triggers fire before
+`flush_interval` does, so they dominate the replay count; the
+acknowledgement latency added by seal gating is still bounded by
+`flush_interval` (10s / 1s / 100ms for the presets above). At lower rates
+the `flush_interval × message_rate` term becomes the binding one.
 
 ## Dimension 2: Parallel PUT Workers
 
@@ -241,8 +244,9 @@ storage-bound workloads.
 
 ### High-Throughput Batch Job
 
-Minimize S3 PUT requests; tolerate up to ~100K messages re-delivered on
-node loss and an acknowledgement latency of up to ~10s.
+Minimize S3 PUT requests; tolerate up to ~10K messages re-delivered on
+node loss at a 10K msg/s ingest (the `max_entries`/`max_bytes` caps bind
+first) and an acknowledgement latency of up to ~10s.
 
 ```yaml validate=fragment wrap=durability
 durability:

@@ -186,7 +186,7 @@ Defaults:
 - `max_bytes: 10MB`
 - `flush_interval: 10s`
 
-**Replay window @ 10K msg/s**: ~100,000 messages re-delivered on node loss
+**Replay window @ 10K msg/s, 1 KB avg**: ~10,000 messages re-delivered on node loss (`max_entries`/`max_bytes` fire before the 10s `flush_interval`)
 **PUT cost reduction**: ~10x vs balanced
 **Throughput**: Up to 200 MB/s
 
@@ -204,7 +204,7 @@ Defaults:
 - `max_bytes: 1MB`
 - `flush_interval: 1s`
 
-**Replay window @ 10K msg/s**: ~10,000 messages re-delivered
+**Replay window @ 10K msg/s, 1 KB avg**: ~1,000 messages re-delivered (`max_entries`/`max_bytes` fire before the 1s `flush_interval`)
 **Throughput**: 100-150 MB/s
 
 ### Low-Latency Strategy
@@ -221,7 +221,7 @@ Defaults:
 - `max_bytes: 100KB`
 - `flush_interval: 100ms`
 
-**Replay window @ 10K msg/s**: ~1,000 messages re-delivered
+**Replay window @ 10K msg/s, 1 KB avg**: ~100 messages re-delivered (`max_entries`/`max_bytes` fire before the 100ms `flush_interval`)
 **Throughput**: Lower due to frequent flushes
 
 ### Custom Overrides

@@ -214,6 +214,17 @@ pub trait WalStore: Send + Sync + 'static {
         None
     }
 
+    /// The cadence at which the backend's background flusher seals segments
+    /// (its `flush_interval`). Only meaningful together with
+    /// [`Self::sealed_seq`]: the WAL derives the seal-wait stall bound from
+    /// it (`4·interval + 5s`). A backend that reports a sealed frontier
+    /// without a cadence gets the fixed fallback bound. The engine's WAL
+    /// `SyncPolicy` interval is deliberately NOT consulted — it governs how
+    /// fast staged appends reach `append_batch`, not when segments seal.
+    fn seal_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Flush any in-flight writes and release held resources. After this
     /// returns the store must be safe to drop. For `redb`, this is implicit
     /// via `Database::drop` (fcntl flock release); object stores await their

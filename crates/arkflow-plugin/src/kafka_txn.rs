@@ -84,6 +84,22 @@ pub(crate) fn register_group(
     frontier: Arc<CommitFrontier>,
 ) -> SharedMetadata {
     ensure_pairing_validator_registered();
+    // A second input registering the same consumer group silently replaces
+    // the first's metadata/frontier slot — its partitions then never reach
+    // the output's clamp frontier (safe direction: replay), but that is a
+    // silent degradation, so warn loudly instead.
+    if registry()
+        .lock()
+        .expect("kafka txn registry lock")
+        .contains_key(group_id)
+    {
+        tracing::warn!(
+            group = group_id,
+            "a second Kafka input registered consumer group; the previous \
+             registration's frontier is replaced and its offsets will not be \
+             transactionally committed"
+        );
+    }
     let slot = Arc::new(RwLock::new(None));
     registry().lock().expect("kafka txn registry lock").insert(
         group_id.to_owned(),
@@ -161,12 +177,17 @@ pub(crate) fn declare_offset_committer(group_id: &str) {
 /// during the outage is skipped). The error names the group and both
 /// configuration keys so the operator can fix either side.
 pub(crate) fn validate_pairings() -> Result<(), Error> {
-    let groups = registry()
-        .lock()
-        .expect("kafka txn registry lock")
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
+    // Prune registrations whose input is gone before deciding: a dropped
+    // input (config dry build, rejected job, deleted stream) leaves its
+    // Weak frontier dead, and an immortal key would fail every later
+    // `connect` in this process — including unrelated jobs' — until
+    // restart. Liveness of an L3 input is exactly "its frontier still has
+    // a strong reference" (the input's acks advance that instance).
+    let groups = {
+        let mut registry = registry().lock().expect("kafka txn registry lock");
+        registry.retain(|_, registration| registration.frontier.strong_count() > 0);
+        registry.keys().cloned().collect::<Vec<_>>()
+    };
     if groups.is_empty() {
         return Ok(());
     }
@@ -251,11 +272,13 @@ mod tests {
     /// declared `offset_commit_group` claim removes it from the reported
     /// set. (The registry is process-global and other tests register their
     /// own groups, so the accept side asserts the claim rather than a
-    /// blanket Ok.)
+    /// blanket Ok. The frontier must stay alive here — validation prunes
+    /// registrations whose input is gone.)
     #[test]
     fn pairing_validation_rejects_unclaimed_groups() {
         let group = unique_group("ktx-unpaired");
         let frontier = Arc::new(CommitFrontier::new());
+        let _keep_alive = frontier.clone();
         let _slot = register_group(&group, vec!["orders".into()], frontier);
         let err = validate_pairings().expect_err("an unpaired group must fail validation");
         let message = err.to_string();
@@ -278,5 +301,32 @@ mod tests {
                 "the claim must remove the group from the reported set: {e}"
             ),
         }
+    }
+
+    /// CR follow-up: a dead registration (its input dropped without any
+    /// output ever claiming the group) must be pruned by validation instead
+    /// of poisoning every later `connect` in this process with the
+    /// "unpaired" error.
+    #[test]
+    fn pairing_validation_prunes_dead_registrations() {
+        let group = unique_group("ktx-dead-unclaimed");
+        let frontier = Arc::new(CommitFrontier::new());
+        let _slot = register_group(&group, vec!["orders".into()], frontier.clone());
+        // Live registration: reachable through the registry.
+        assert!(group_frontier(&group).is_some());
+
+        // Drop the input's frontier — nothing strong references it anymore,
+        // but the registry key survives until validation prunes it.
+        drop(frontier);
+        drop(_slot);
+
+        // The dead, unclaimed key must NOT fail validation...
+        validate_pairings()
+            .unwrap_or_else(|e| assert!(!e.to_string().contains(&group), "dead key poisoned: {e}"));
+        // ...and it must actually be gone from the registry.
+        assert!(
+            group_frontier(&group).is_none(),
+            "validation must prune the dead registration"
+        );
     }
 }

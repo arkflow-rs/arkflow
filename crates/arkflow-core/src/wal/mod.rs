@@ -317,13 +317,12 @@ const WAL_ACK_DRAIN_WINDOW: Duration = Duration::from_secs(30);
 /// merely-slow gap owner is never fenced and a settle inside the lease
 /// proceeds with zero added latency.
 ///
-/// Must stay above the seal-wait bound of [`Wal::seal_wait_timeout`]
-/// (`periodic(d)` → `4·d + 5s`; the 10s throughput preset → 45s): a parked
-/// caller can legitimately wait out one seal of the gap owner's entry, and
-/// 60s > 45s keeps the two bounds from firing on each other. Also far
-/// above normal source commits (ms–s) and far below the checkpoint round
-/// timeout (10 minutes). Tests override it through
-/// [`Wal::override_ack_park_timeout_for_tests`].
+/// Must stay above the stall-free bound of [`Wal::seal_wait_timeout`]
+/// (`seal_interval()` → `4·interval + 5s`; the 10s aggressive preset →
+/// 45s): 60s > 45s keeps the lease from firing while the store is merely
+/// sealing slowly. Also far above normal source commits (ms–s) and far
+/// below the checkpoint round timeout (10 minutes). Tests override it
+/// through [`Wal::override_ack_park_timeout_for_tests`].
 const WAL_ACK_PARK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Rate limit for background-flush failure logs (warn and the escalated
@@ -343,10 +342,12 @@ const WAL_FLUSH_ESCALATION_THRESHOLD: u64 = 8;
 /// busy loop.
 const WAL_SEAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Fallback bound for the seal wait when the sync policy carries no interval
-/// of its own (`group_commit`): three "aggressive" object-store flush
-/// intervals (10s each) plus headroom for one PUT retry.
-const WAL_SEAL_WAIT_GROUP_COMMIT_BOUND: Duration = Duration::from_secs(30);
+/// Fallback bound for the seal wait when the store reports no sealing
+/// cadence of its own (third-party backends): three "aggressive"
+/// object-store flush intervals (10s each) plus headroom for one PUT
+/// retry. The wait is progress-based, so this only trips on a store that
+/// stops sealing entirely.
+const WAL_SEAL_WAIT_FALLBACK_BOUND: Duration = Duration::from_secs(30);
 
 impl Wal {
     /// Open (or create) a WAL.
@@ -590,7 +591,12 @@ impl Wal {
         loop {
             // Pinned once per iteration so the parked branch can keep polling
             // the same future across both stages of the close drain window.
+            // Enabled before the lock acquisition below: a settle that runs
+            // `notify_waiters` between the pin and the first poll must not be
+            // missed (the same lost-wakeup window `wait_for_sealed` guards
+            // against); a spurious wake only re-runs the state check.
             let mut notified = std::pin::pin!(self.ack_notify.notified());
+            let _ = notified.as_mut().enable();
             let work = {
                 let mut acknowledgements = self.acknowledgements.lock().await;
                 let first_seq = acknowledgements.keys().next().copied();
@@ -774,27 +780,24 @@ impl Wal {
         self.store.sealed_seq().is_some_and(|sealed| sealed >= seq)
     }
 
-    /// Bound for [`Wal::wait_for_sealed`]. Derived from the sync policy when
-    /// it carries an interval (`periodic(d)` → `4·d + 5s`: one missed tick
-    /// plus retry headroom for the segment PUT); `group_commit` has no
-    /// interval of its own, so a fixed 30s bound covers the object-store
-    /// segment `flush_interval` presets (100ms / 1s / 10s) with room for a
-    /// PUT retry. Tests override this through
+    /// Bound for one stall-free interval of [`Wal::wait_for_sealed`].
+    /// Derived from the store's own sealing cadence when it reports one
+    /// ([`WalStore::seal_interval`] → `4·interval + 5s`: one missed seal
+    /// tick plus retry headroom for the segment PUT); a store without a
+    /// reported cadence falls back to a fixed bound. The wait additionally
+    /// resets its deadline on every advance of the sealed frontier (see
+    /// [`Wal::wait_for_sealed`]), so the bound only trips when the store
+    /// stops sealing entirely — a long `flush_interval` alone cannot cause
+    /// spurious timeouts. Tests override this through
     /// [`Wal::override_seal_wait_timeout_for_tests`].
-    ///
-    /// Cross-checked against [`WAL_ACK_PARK_TIMEOUT`] (fix-ack-stall-modes):
-    /// a parked acknowledgement can legitimately wait out one seal of the
-    /// gap owner's entry, so this bound must stay below the park lease —
-    /// the worst preset (`periodic(10s)` throughput) gives 45s < 60s. Bump
-    /// the two together if either derivation changes.
     fn seal_wait_timeout(&self) -> Duration {
         let override_ms = self.seal_wait_timeout_ms.load(Ordering::Acquire);
         if override_ms > 0 {
             return Duration::from_millis(override_ms);
         }
-        match &self.policy {
-            SyncPolicy::Periodic(d) => d.saturating_mul(4) + Duration::from_secs(5),
-            SyncPolicy::GroupCommit | SyncPolicy::PerEntry => WAL_SEAL_WAIT_GROUP_COMMIT_BOUND,
+        match self.store.seal_interval() {
+            Some(interval) => interval.saturating_mul(4) + Duration::from_secs(5),
+            None => WAL_SEAL_WAIT_FALLBACK_BOUND,
         }
     }
 
@@ -806,15 +809,27 @@ impl Wal {
     /// waiter. The waiter is registered (via `Notified::enable`) *before*
     /// the frontier check because `notify_waiters` stores no permit for
     /// waiters registered after the call — a bare check-then-await could
-    /// miss a seal that lands in between and stall until the timeout. Once
-    /// the WAL starts closing, the wait fails promptly (with one final
-    /// frontier re-check, since the store's close path seals anything still
-    /// staged): an entry that is not sealed must fail its acknowledgement
-    /// so recovery replays it, rather than block shutdown.
+    /// miss a seal that lands in between and stall until the timeout. The
+    /// deadline is progress-based: any advance of the sealed frontier
+    /// pushes it out, so a store that keeps sealing (even slowly) never
+    /// trips the bound — only a store that stops sealing entirely does.
+    /// Once the WAL starts closing, the wait fails promptly (with one
+    /// best-effort final frontier re-check — the close path cancels before
+    /// the final flush/seal, so an entry that is not sealed yet usually
+    /// fails here): an unsealed entry must fail its acknowledgement so
+    /// recovery replays it, rather than block shutdown.
     async fn wait_for_sealed(&self, seq: u64) -> Result<(), Error> {
         let timeout = self.seal_wait_timeout();
-        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_sealed = self.store.sealed_seq();
+        let mut deadline = tokio::time::Instant::now() + timeout;
         loop {
+            // Any sealed-frontier advance proves the flusher is alive: push
+            // the deadline out so only a fully stalled store times out.
+            let sealed_now = self.store.sealed_seq();
+            if sealed_now != last_sealed {
+                last_sealed = sealed_now;
+                deadline = tokio::time::Instant::now() + timeout;
+            }
             if let Some(notify) = self.store.seal_notifier() {
                 let mut notified = std::pin::pin!(notify.notified());
                 let _ = notified.as_mut().enable();
@@ -1131,13 +1146,17 @@ impl Wal {
     /// Total flush failures counted on the background flusher's wake path
     /// (observability: distinguishes a transient retry from a broken
     /// store; sustained failure also escalates to error-level logging).
-    pub fn flush_failures(&self) -> u64 {
+    /// Crate-visible for the in-crate regression tests; no external
+    /// consumer yet, per the core-api-surface spec's zero-reference rule.
+    #[cfg(test)]
+    pub(crate) fn flush_failures(&self) -> u64 {
         self.flush_failures.load(Ordering::Relaxed)
     }
 
     /// Current consecutive wake-path flush failures; reset by any
     /// successful flush.
-    pub fn flush_consecutive_failures(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn flush_consecutive_failures(&self) -> u64 {
         self.flush_failures_consecutive.load(Ordering::Relaxed)
     }
 
@@ -1768,11 +1787,13 @@ mod tests {
     /// test: `seal_to` publishes a sealed sequence (as the S3 backend does
     /// after a segment PUT + manifest update) and wakes gated
     /// acknowledgements. Everything else mirrors `ScriptedStore`.
+    /// `seal_interval` mirrors the S3 backend's reported sealing cadence.
     struct SealableStore {
         entries: StdMutex<BTreeMap<u64, Vec<u8>>>,
         cursor: AtomicU64,
         sealed: AtomicU64,
         seal_notify: Notify,
+        seal_interval: Option<Duration>,
     }
 
     impl SealableStore {
@@ -1793,6 +1814,9 @@ mod tests {
         }
         fn seal_notifier(&self) -> Option<&Notify> {
             Some(&self.seal_notify)
+        }
+        fn seal_interval(&self) -> Option<Duration> {
+            self.seal_interval
         }
         fn append_batch(&self, entries: Vec<(u64, Vec<u8>)>) -> Result<(), Error> {
             let mut map = self.entries.lock().unwrap();
@@ -2708,6 +2732,7 @@ mod tests {
             cursor: AtomicU64::new(0),
             sealed: AtomicU64::new(0),
             seal_notify: Notify::new(),
+            seal_interval: None,
         })
     }
 
@@ -2767,11 +2792,9 @@ mod tests {
         task.await.unwrap().unwrap();
         assert_eq!(*calls.lock().unwrap(), vec![1]);
         assert_eq!(wal.cursor().await.unwrap(), 1);
-        // Acknowledged implies sealed.
-        assert!(
-            store.sealed_seq().unwrap() >= 1,
-            "a completed acknowledgement implies sealed_seq >= its sequence"
-        );
+        // "Acknowledged implies sealed" is already proven above: the
+        // acknowledgement blocked while unsealed and only completed after
+        // `seal_to` — no further assertion needed here.
         wal.close().await.unwrap();
     }
 
@@ -2822,6 +2845,54 @@ mod tests {
             StdArc::new(WalAck::new(wal.clone(), 2, StdArc::new(NoopAck)));
         drained.ack().await.unwrap();
         assert_eq!(wal.cursor().await.unwrap(), 2);
+        wal.close().await.unwrap();
+    }
+
+    /// CR follow-up: the seal-wait stall bound derives from the STORE's
+    /// sealing cadence (not the engine sync policy) and is progress-based —
+    /// a store that keeps advancing its sealed frontier never trips the
+    /// bound even when each individual interval exceeds it, while a store
+    /// that stops sealing entirely does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seal_wait_bound_is_cadence_derived_and_progress_based() {
+        // Part 1: progress resets the deadline. Short override (200ms) but a
+        // background "flusher" sealing every 50ms: the frontier for the
+        // gated sequence must eventually be covered without a timeout —
+        // pre-fix (fixed deadline from the sync policy) this timed out.
+        let store = sealable_store();
+        let wal = sealing_wal(&store, SyncPolicy::GroupCommit);
+        wal.override_seal_wait_timeout_for_tests(Duration::from_millis(200));
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        let ack: StdArc<dyn Ack> = StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        let task = tokio::spawn(async move { ack.ack().await });
+        // Seal progressively below the gated sequence first, crossing the
+        // override window several times while the frontier advances.
+        for seq in 0..4 {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            store.seal_to(seq);
+        }
+        // The covering seal arrives well after 2x the override would have
+        // fired without progress resets.
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        store.seal_to(1);
+        task.await.unwrap().unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+        wal.close().await.unwrap();
+
+        // Part 2: no progress at all trips even the progress-reset bound.
+        let store = sealable_store();
+        let wal = sealing_wal(&store, SyncPolicy::GroupCommit);
+        wal.override_seal_wait_timeout_for_tests(Duration::from_millis(100));
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        let ack: StdArc<dyn Ack> = StdArc::new(WalAck::new(wal.clone(), 1, StdArc::new(NoopAck)));
+        let error = ack.ack().await.unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
         wal.close().await.unwrap();
     }
 

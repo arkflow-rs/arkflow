@@ -117,11 +117,29 @@ refactoring is summarized rather than listed commit-by-commit.
 - Kafka timestamp overflow/negative values (#1097); input reconnection logic
   (#1118); VRL/protobuf silent data loss (#1182); expression row-routing null
   handling fail-closed (#1284).
+- Deep-audit correctness batch: object-store WAL acknowledgements now gate on
+  segment sealing (the configured loss window becomes a replay window — no
+  acknowledged entry is lost on node loss; flusher failures are counted and
+  logged); JSON decoding infers its schema from the whole batch (no silent
+  int truncation or dropped late fields); the `batch` processor defers
+  acknowledgements until its merged emission is confirmed downstream and
+  merges by schema normalization (`count` now counts message rows); the
+  Kafka L3 offset bridge checks the synchronous `send_offsets` result,
+  clamps committed offsets to the paired input's contiguous frontier,
+  validates input/output pairing at startup, and no longer touches
+  `store_offset` on undo; `TrackingAck` undo-after-abort is a terminal no-op
+  and WAL parked acknowledgements carry a bounded 60s lease (silent-stall
+  modes become explicit errors). (#1308)
 
 ### Security
 
 - Lease fencing epochs enforced on the storage write path (stale leader
   writes rejected). (#1272)
+- Standalone engine control API hardened to Hub parity: a non-loopback bind
+  without a token refuses startup unless `insecure_local` is set explicitly
+  (a serve failure now fails the process loudly instead of running the
+  engine without its control API), and all local-plane endpoints — reads
+  included — sit behind the default-deny Bearer middleware. (#1308)
 - Console operator token excluded from image build context and repository;
   static-token mode documented as trusted-network-only with OIDC for
   production. (#1273)
