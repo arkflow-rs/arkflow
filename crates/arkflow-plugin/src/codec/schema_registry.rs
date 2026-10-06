@@ -19,7 +19,7 @@
 //! Schemas are cached per id so each schema version is fetched at most once.
 //! The decode side is dispatched on the registry's `schemaType` response.
 
-use crate::codec::avro_arrow::avro_to_arrow;
+use crate::codec::avro_arrow::{avro_read_value, AvroArrowAccumulator};
 use crate::component::protobuf::{parse_proto_source, protobuf_to_arrow};
 use apache_avro::Schema as AvroSchema;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
@@ -297,22 +297,52 @@ impl Encoder for SchemaRegistryCodec {
 impl Decoder for SchemaRegistryCodec {
     async fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
         self.ensure_gate().await?;
-        let mut batches = Vec::with_capacity(b.len());
+        // Messages accumulate columnar per schema id (groups in
+        // first-appearance order, rows in message order within a group);
+        // protobuf messages keep their per-message batches inside the same
+        // grouping so relative order is stable across kinds.
+        enum Group {
+            Avro(Box<AvroArrowAccumulator>),
+            Protobuf(Vec<RecordBatch>),
+        }
+        let mut groups: Vec<(u32, Group)> = Vec::new();
         for msg in b {
             let (id, payload) = parse_wire_format(&msg)?;
             let cached = self.resolve_cached(id).await?;
-            let batch = match cached.as_ref() {
-                CachedSchema::Protobuf(descriptor) => protobuf_to_arrow(descriptor, payload)?,
-                CachedSchema::Avro(schema) => avro_to_arrow(schema, payload)?,
-            };
-            batches.push(batch);
+            match cached.as_ref() {
+                CachedSchema::Protobuf(descriptor) => {
+                    let batch = protobuf_to_arrow(descriptor, payload)?;
+                    match groups.iter_mut().find(|(gid, _)| gid == &id) {
+                        Some((_, Group::Protobuf(batches))) => batches.push(batch),
+                        _ => groups.push((id, Group::Protobuf(vec![batch]))),
+                    }
+                }
+                CachedSchema::Avro(schema) => {
+                    let value = avro_read_value(schema, payload)?;
+                    match groups.iter_mut().find(|(gid, _)| gid == &id) {
+                        Some((_, Group::Avro(accumulator))) => accumulator.push(&value)?,
+                        _ => {
+                            let mut accumulator = Box::new(AvroArrowAccumulator::new(schema)?);
+                            accumulator.push(&value)?;
+                            groups.push((id, Group::Avro(accumulator)));
+                        }
+                    }
+                }
+            }
+        }
+        let mut batches = Vec::with_capacity(groups.len());
+        for (_, group) in &mut groups {
+            match group {
+                Group::Avro(accumulator) => batches.push(accumulator.finish()?),
+                Group::Protobuf(group_batches) => batches.append(group_batches),
+            }
         }
         if batches.is_empty() {
             return Ok(MessageBatch::new_arrow(RecordBatch::new_empty(Arc::new(
                 Schema::empty(),
             ))));
         }
-        // Batches decoded under different schema versions may legitimately
+        // Groups decoded under different schema versions may legitimately
         // carry different schemas (real schema evolution); normalize to the
         // field union instead of failing the concat.
         let merged = crate::component::batch_merge::normalize_and_concat(&batches)?;
@@ -642,6 +672,18 @@ mod tests {
             .unwrap()
     }
 
+    fn avro_payload_v1(id: i64) -> Vec<u8> {
+        let schema = avro_schema();
+        GenericDatumWriter::builder(&schema)
+            .build()
+            .unwrap()
+            .write_value_to_vec(AvroValue::Record(vec![(
+                "id".to_string(),
+                AvroValue::Long(id),
+            )]))
+            .unwrap()
+    }
+
     fn wire(id: u32, payload: &[u8]) -> Vec<u8> {
         let mut m = vec![0x00];
         m.extend_from_slice(&id.to_be_bytes());
@@ -895,6 +937,84 @@ mod tests {
         let name = name_col.as_string::<i32>();
         assert_eq!(name.value(1), "seven");
         assert!(name.is_null(0), "v1 row's `name` must be null-filled");
+    }
+
+    #[tokio::test]
+    async fn test_avro_single_id_batch_accumulates_columnar() {
+        // Single-id batches accumulate into one multi-row batch whose schema
+        // keeps the writer's nullability (id is non-nullable).
+        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([(
+            1u32,
+            FetchedSchema::Avro(avro_schema()),
+        )])));
+        let codec = avro_codec(resolver.clone());
+        let batch = codec
+            .decode(vec![
+                wire(1, &avro_payload_v1(10)),
+                wire(1, &avro_payload_v1(11)),
+                wire(1, &avro_payload_v1(12)),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 3);
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        let rb = batch.record_batch();
+        assert_eq!(rb.num_columns(), 1);
+        assert!(
+            !rb.schema().field(0).is_nullable(),
+            "writer schema keeps `id` non-nullable"
+        );
+        let id_col = rb.column_by_name("id").expect("id column");
+        let ids = id_col.as_primitive::<Int64Type>();
+        assert_eq!((ids.value(0), ids.value(1), ids.value(2)), (10, 11, 12));
+    }
+
+    #[tokio::test]
+    async fn test_avro_mixed_id_batch_groups_by_first_appearance() {
+        // Interleaved ids: rows come out grouped by schema id in
+        // first-appearance order (group order, message order within a
+        // group); the union schema puts the first group's columns first.
+        let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([
+            (1u32, FetchedSchema::Avro(avro_schema())),
+            (
+                2u32,
+                FetchedSchema::Avro(AvroSchema::parse_str(AVRO_SCHEMA_V2).unwrap()),
+            ),
+        ])));
+        let codec = avro_codec(resolver);
+        let batch = codec
+            .decode(vec![
+                wire(1, &avro_payload_v1(10)),
+                wire(2, &avro_payload_v2(20, "b")),
+                wire(1, &avro_payload_v1(11)),
+                wire(2, &avro_payload_v2(21, "c")),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 4);
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::datatypes::Int64Type;
+        let rb = batch.record_batch();
+        assert_eq!(
+            rb.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"],
+            "first group's columns first"
+        );
+        let ids = rb.column_by_name("id").unwrap().as_primitive::<Int64Type>();
+        assert_eq!(
+            (ids.value(0), ids.value(1), ids.value(2), ids.value(3)),
+            (10, 11, 20, 21),
+            "rows grouped by schema id, message order within a group"
+        );
+        let names = rb.column_by_name("name").unwrap().as_string::<i32>();
+        assert!(names.is_null(0) && names.is_null(1));
+        assert_eq!(names.value(2), "b");
+        assert_eq!(names.value(3), "c");
     }
 
     #[tokio::test]
