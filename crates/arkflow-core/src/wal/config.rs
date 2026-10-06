@@ -29,12 +29,12 @@ use crate::wal::SyncPolicy;
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum SegmentStrategy {
-    /// High throughput, large crash window (max_entries: 10000, max_bytes: 10MB, flush_interval: 10s)
+    /// High throughput, large replay window (max_entries: 10000, max_bytes: 10MB, flush_interval: 10s)
     Aggressive,
     /// Balanced trade-offs (max_entries: 1000, max_bytes: 1MB, flush_interval: 1s) - default
     #[default]
     Balanced,
-    /// Small crash window, high PUT frequency (max_entries: 100, max_bytes: 100KB, flush_interval: 100ms)
+    /// Small replay window, high PUT frequency (max_entries: 100, max_bytes: 100KB, flush_interval: 100ms)
     LowLatency,
 }
 

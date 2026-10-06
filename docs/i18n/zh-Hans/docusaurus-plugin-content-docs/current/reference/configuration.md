@@ -57,7 +57,8 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 | `readiness_path` | string | 否 | `/readiness` | 就绪端点路径。 |
 | `liveness_path` | string | 否 | `/liveness` | 存活端点路径。 |
 | `api_prefix` | string | 否 | `/api/v1` | 带版本的控制平面 API 前缀。 |
-| `api_token` | string | 否 | — | 保护控制平面操作与配置的可选 Bearer 令牌。 |
+| `api_token` | string | 否 | — | 保护带版本控制平面 API 的可选 Bearer 令牌。设置后,`/api/v1` 下的所有端点(含读端点)在没有有效 `Authorization: Bearer` 请求头时一律返回 `401`。 |
+| `insecure_local` | boolean | 否 | `false` | 显式允许独立控制 API 在不设 `api_token` 的情况下绑定非回环 `address`。默认拒绝该组合启动;设置后进程会启动并输出 error 级警告。切勿在共享网络中使用。 |
 | `cors_origins` | array&lt;string&gt; | 否 | `[]` | 允许调用控制 API 的浏览器来源。为空则拒绝跨域调用。 |
 | `hub_urls` | array&lt;string&gt; | 否 | `[]` | 计算节点 Agent 模式使用的 Hub 地址列表,按序作为故障转移候选(参见 [Agent 多 Hub 故障转移](/zh-Hans/docs/operate/control-plane/deploy#agent-multi-hub-failover))。空列表即为独立(standalone)模式。**破坏性变更:** 取代原先单字符串的 `hub_url` 字段;仍声明 `hub_url` 的配置会在校验时报错并附迁移指引——把 `hub_url: "http://hub:8080"` 改写为 `hub_urls: ["http://hub:8080"]`。 |
 | `node_id` | string | 否 | — | 本进程向其 Hub 上报的稳定身份。 |
@@ -70,7 +71,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 
 ### `health_check.observability`
 
-导出进程级可观测性端点。即使 `health_check.enabled` 为 `false`,它们依然可用——纯数据面部署(无控制平面 API、无 Hub)仍会暴露指标与探针。监听器默认绑定环回地址;生产环境请设置显式地址,或依赖主机/防火墙策略。启用控制平面服务器时,由其路由器提供相同端点,不会启动第二个监听器。
+导出进程级可观测性端点。即使 `health_check.enabled` 为 `false`,它们依然可用——纯数据面部署(无控制平面 API、无 Hub)仍会暴露指标与探针。监听器默认绑定环回地址;生产环境请设置显式地址,或依赖主机/防火墙策略。这些端点在设计上不做认证——不要把该监听器暴露给不受信任的网络。启用控制平面服务器时,由其路由器提供相同端点,不会启动第二个监听器。
 
 | 字段 | 类型 | 必填 | 默认值 | 描述 |
 |-------|------|----------|---------|-------------|
@@ -83,6 +84,8 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 ### 独立 Hub 的启动安全
 
 独立的 `arkflow-server` 控制平面默认 fail-closed。在把 Hub 绑定到环回地址之外之前,请将 `ARKFLOW_HUB_STORAGE` 设为持久化的 SQLite 路径,为操作员 API 设置 `ARKFLOW_OPERATOR_TOKEN`,为 Agent 注册设置 `ARKFLOW_NODE_TOKEN`。仅限明确的本地开发场景:在保持 `ARKFLOW_HUB_ADDRESS` 为环回地址的同时设置 `ARKFLOW_HUB_INSECURE_LOCAL=1`,这才允许易失状态与省略凭据。Hub 在绑定监听器之前会先恢复持久化状态,因此恢复错误会让服务器不可用,而不是提供一份残缺视图。
+
+独立的 `arkflow` 引擎对其本地控制 API 施加同样的边界:`health_check.address` 为非回环地址且未设置 `health_check.api_token` 时拒绝启动。请设置 token,或用 `health_check.insecure_local: true` 显式确认(引擎随后启动并输出 error 级警告)。配置了 token 后,`/api/v1` 下的所有端点——含读端点——都要求该 Bearer 令牌;健康探针与顶层 `/metrics` 保持开放,供探针与抓取器使用。
 
 :::note
 启用控制平面服务器时,`/ready` 与 `/live` 也会挂载在服务器地址上,与旧的 `/health`、`/readiness`、`/liveness` 端点并列(后者保持原有语义)。

@@ -119,6 +119,12 @@ struct KafkaOutput {
     inner_kafka_output: Arc<InnerKafkaOutput>,
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
+    /// L3 monotonic guard: the last transactional offset commit sent per
+    /// partition by the CURRENT producer (cleared when `connect` installs a
+    /// new producer). Keeps the commit sequence non-regressing even when
+    /// the paired input's frontier rewinds (an undo) — re-committing lower
+    /// offsets would churn replay loops.
+    last_sent_offsets: Arc<std::sync::Mutex<std::collections::HashMap<i32, i64>>>,
 }
 
 struct InnerKafkaOutput {
@@ -203,6 +209,7 @@ impl KafkaOutput {
             inner_kafka_output,
             cancellation_token,
             codec,
+            last_sent_offsets: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 }
@@ -249,6 +256,12 @@ impl Output for KafkaOutput {
         let producer_arc = self.inner_kafka_output.producer.clone();
         let mut producer_guard = producer_arc.write().await;
         *producer_guard = Some(producer);
+        // `last_sent` is per producer lifetime: a freshly installed producer
+        // starts with a clean monotonic base for the L3 offset commits.
+        self.last_sent_offsets
+            .lock()
+            .expect("kafka last_sent lock poisoned")
+            .clear();
 
         Ok(())
     }
@@ -389,6 +402,22 @@ impl Output for KafkaOutput {
     }
 }
 impl KafkaOutput {
+    /// Best-effort transaction abort (blocking broker round-trip →
+    /// spawn_blocking). The broker fences zombie producers on restart
+    /// anyway; both the join failure and the abort result are logged, never
+    /// fatal to the (already failing) write path.
+    async fn abort_transaction(producer: FutureProducer) {
+        match tokio::task::spawn_blocking(move || {
+            producer.abort_transaction(Timeout::After(Duration::from_secs(30)))
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("Kafka abort_transaction failed: {e}"),
+            Err(e) => error!("Kafka abort_transaction task join failed: {e}"),
+        }
+    }
+
     /// Transactional write: begin → send all → commit. On any failure, abort
     /// (best-effort) and return Err so the stream withholds the ack and
     /// replays the whole batch — which re-begins a fresh transaction. Zombie
@@ -422,20 +451,25 @@ impl KafkaOutput {
             // Best-effort abort; the broker fences zombies on restart anyway.
             let p = producer.clone();
             drop(producer_guard);
-            if let Err(ab) = tokio::task::spawn_blocking(move || {
-                p.abort_transaction(Timeout::After(Duration::from_secs(30)))
-            })
-            .await
-            {
-                error!("Kafka abort_transaction task join failed: {}", ab);
-            }
+            Self::abort_transaction(p).await;
             return Err(e);
         }
+
+        // Clamped L3 offsets awaiting a successful commit before they may
+        // advance the producer's monotonic `last_sent_offsets` base.
+        let mut remember_after_commit: Option<Vec<(i32, i64)>> = None;
 
         // L3: fold the covered source offsets into the transaction before
         // committing. Offsets come from the batches' source metadata
         // columns (partition, consumed offset); commit positions are the
-        // exclusive next offsets, matching librdkafka's convention.
+        // exclusive next offsets, matching librdkafka's convention. Each
+        // partition is CLAMPED to the paired input's contiguous
+        // acknowledged frontier (`min(batch max next, frontier next)`, then
+        // raised to this producer's last sent value) — an unsettled offset
+        // can never ride a transaction, so content-routing/fan-out
+        // topologies cannot skip records still in flight elsewhere; the
+        // lagging tail converges through later transactions (at-least-once
+        // lower bound: at most one batch of tail duplication).
         if let Some(group) = self.config.offset_commit_group.as_deref() {
             let group_topic = crate::kafka_txn::single_topic(group).ok_or_else(|| {
                 Error::Config(format!(
@@ -454,20 +488,43 @@ impl KafkaOutput {
                          the paired Kafka input must declare transactional_offsets"
                     ))
                     })?;
-                let p = producer.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    p.send_offsets_to_transaction(
-                        &offsets,
-                        &metadata,
-                        Timeout::After(Duration::from_secs(30)),
+                let frontier = crate::kafka_txn::group_frontier(group).ok_or_else(|| {
+                    Error::Config(format!(
+                        "Kafka offset commit group '{group}' has no live input frontier in this \
+                         process; the paired Kafka input must declare transactional_offsets"
+                    ))
+                })?;
+                let clamped = {
+                    let last_sent = self
+                        .last_sent_offsets
+                        .lock()
+                        .expect("kafka last_sent lock poisoned");
+                    clamp_transactional_offsets(
+                        offsets,
+                        frontier.as_ref(),
+                        group_topic.as_str(),
+                        &last_sent,
                     )
-                })
-                .await
-                {
-                    return Err(Error::Connection(format!(
-                        "Kafka send_offsets_to_transaction task join failed: {}",
-                        e
-                    )));
+                };
+                if let Some((offsets, committed)) = clamped {
+                    if let Err(e) = send_offsets_in_transaction(producer, offsets, metadata).await {
+                        // Fail closed (spec: offset 发送异步失败 fail-closed):
+                        // abort the transaction and return the error so the
+                        // batch replays — data and offsets must never diverge
+                        // with the data committed.
+                        let p = producer.clone();
+                        drop(producer_guard);
+                        Self::abort_transaction(p).await;
+                        return Err(e);
+                    }
+                    // Remember the clamped values only after the broker
+                    // accepts the commit below — `committed` travels to the
+                    // commit match and folds into `last_sent_offsets` on
+                    // `Ok(Ok(()))`. A failed or aborted transaction leaves
+                    // the base untouched, so a frontier rewind followed by
+                    // a partial replay cannot re-commit never-committed
+                    // offsets (which would skip records).
+                    remember_after_commit = Some(committed);
                 }
             }
         }
@@ -480,7 +537,21 @@ impl KafkaOutput {
         })
         .await
         {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                if let Some(committed) = remember_after_commit.take() {
+                    let mut last_sent = self
+                        .last_sent_offsets
+                        .lock()
+                        .expect("kafka last_sent lock poisoned");
+                    for (partition, offset) in committed {
+                        last_sent
+                            .entry(partition)
+                            .and_modify(|value| *value = (*value).max(offset))
+                            .or_insert(offset);
+                    }
+                }
+                Ok(())
+            }
             Ok(Err(e)) => Err(map_kafka_txn_error(e, "commit_transaction")),
             Err(e) => Err(Error::Connection(format!(
                 "commit_transaction task join failed: {}",
@@ -608,6 +679,13 @@ impl OutputBuilder for KafkaOutputBuilder {
                  commit inside the producer transaction)"
                     .into(),
             ));
+        }
+        // Pairing declaration (design D3): the startup validation then
+        // rejects an input that declares `transactional_offsets` for a group
+        // no output ever claims — such a group's broker offsets would never
+        // be committed by anyone.
+        if let Some(group) = &config.offset_commit_group {
+            crate::kafka_txn::declare_offset_committer(group);
         }
 
         // Fail before any stream starts on an inconsistent security block
@@ -753,6 +831,110 @@ fn transactional_offsets_for_batches(
         }
     }
     Ok((offsets, covered))
+}
+
+/// Clamp derived transactional offsets to the paired input's contiguous
+/// acknowledged frontier (L3, design D1). Per partition:
+///
+/// - `commit = min(batch max next, frontier next)` — everything the
+///   transaction commits is settled (its acknowledgement completed after the
+///   corresponding output confirmed the write), so records still in flight
+///   in other branches of the graph can never be transactionally skipped;
+/// - `commit = max(commit, last_sent)` — in-process monotonicity, so a
+///   frontier rewind (an undo) cannot re-commit lower offsets;
+/// - a partition the frontier does not track contributes NOTHING: nothing
+///   below its batch positions is settled, so any commit would skip
+///   unsettled records. Later transactions pick the partition up once its
+///   frontier anchors/settles.
+///
+/// Returns `None` when nothing committable remains (the caller then skips
+/// `send_offsets_to_transaction` entirely). `last_sent` is this producer's
+/// monotonic base — read here, but only folded with the clamped values by
+/// the CALLER after `commit_transaction` succeeds: values from a failed or
+/// aborted transaction must not survive, or a frontier rewind followed by
+/// a partial replay would re-commit offsets that were never broker-committed
+/// (skipping records). Returns the wire list plus the clamped pairs to
+/// remember on success.
+fn clamp_transactional_offsets(
+    offsets: rdkafka::TopicPartitionList,
+    frontier: &arkflow_core::executor::commit::CommitFrontier,
+    group_topic: &str,
+    last_sent: &std::collections::HashMap<i32, i64>,
+) -> Option<(rdkafka::TopicPartitionList, Vec<(i32, i64)>)> {
+    // Frontier next-offsets for the group's topic, keyed by partition. Only
+    // positions of the group topic apply (single-topic L3 inputs).
+    let frontier_next: std::collections::HashMap<i32, i64> = frontier
+        .contiguous_positions()
+        .into_iter()
+        .filter(|position| position.topic.as_deref() == Some(group_topic))
+        .map(|position| {
+            (
+                position.partition as i32,
+                i64::try_from(position.offset).unwrap_or(i64::MAX),
+            )
+        })
+        .collect();
+    // The derived list may carry duplicate partition entries (rdkafka's add
+    // appends one element per call), so fold per partition as we clamp.
+    let mut clamped: std::collections::BTreeMap<i32, i64> = std::collections::BTreeMap::new();
+    for element in offsets.elements() {
+        let partition = element.partition();
+        let rdkafka::Offset::Offset(batch_next) = element.offset() else {
+            continue;
+        };
+        let Some(frontier_next) = frontier_next.get(&partition) else {
+            continue;
+        };
+        let previous_sent = last_sent.get(&partition).copied().unwrap_or(i64::MIN);
+        let commit = (*frontier_next).min(batch_next).max(previous_sent);
+        let folded = clamped.get(&partition).copied().unwrap_or(i64::MIN);
+        clamped.insert(partition, folded.max(commit));
+    }
+    if clamped.is_empty() {
+        return None;
+    }
+    let mut result = rdkafka::TopicPartitionList::new();
+    for (partition, commit) in &clamped {
+        // Both inputs are i64 next-offsets produced above; the add cannot
+        // fail for a plain offset on a fresh list.
+        let _ =
+            result.add_partition_offset(group_topic, *partition, rdkafka::Offset::Offset(*commit));
+    }
+    Some((result, clamped.into_iter().collect()))
+}
+
+/// Send the clamped offsets into the open transaction (blocking broker
+/// round-trip → spawn_blocking).
+///
+/// rdkafka error-reporting finding (design D2, verified against rdkafka
+/// 0.38 / rdkafka-sys 4.8.0): `send_offsets_to_transaction` reports errors
+/// **synchronously** — the C wrapper converts the `rd_kafka_error_t*`
+/// returned by `rd_kafka_send_offsets_to_transaction` directly into
+/// `Err(KafkaError::Transaction(..))` (see rdkafka's `base_producer.rs`);
+/// there is no delivery-callback channel for offset-send failures in this
+/// version. The previous code matched only the `JoinError` of
+/// `spawn_blocking` and silently DISCARDED this inner result: a fenced
+/// producer (or any coordinator failure) failed the offset send while the
+/// data transaction still committed — EOS silently degraded to
+/// at-least-once. Both arms now fail the batch (abort + error + replay).
+async fn send_offsets_in_transaction(
+    producer: &FutureProducer,
+    offsets: rdkafka::TopicPartitionList,
+    metadata: std::sync::Arc<rdkafka::consumer::ConsumerGroupMetadata>,
+) -> Result<(), Error> {
+    let p = producer.clone();
+    match tokio::task::spawn_blocking(move || {
+        p.send_offsets_to_transaction(&offsets, &metadata, Timeout::After(Duration::from_secs(30)))
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(map_kafka_txn_error(e, "send_offsets_to_transaction")),
+        Err(e) => Err(Error::Connection(format!(
+            "Kafka send_offsets_to_transaction task join failed: {}",
+            e
+        ))),
+    }
 }
 
 /// Read `key` from the row's `__meta_ext` map entries, if the row carries
@@ -1663,6 +1845,228 @@ mod tests {
         let batch = Arc::new(MessageBatch::new_arrow(rb));
         let err = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap_err();
         assert!(err.to_string().contains("overflow"), "got: {err}");
+    }
+
+    /// Spec "位点钳制到连续前沿": the batch's max next-offset for a
+    /// partition clamps down to the paired input's contiguous frontier —
+    /// offsets still settling in other branches never ride the transaction.
+    #[test]
+    fn l3_clamps_batch_offsets_to_the_contiguous_frontier() {
+        use arkflow_core::checkpoint::SourcePosition;
+        use arkflow_core::executor::commit::CommitFrontier;
+
+        let frontier = CommitFrontier::new();
+        // Partition 0 settled contiguously to next=8 (offsets 8, 9 still in
+        // flight elsewhere); partition 1 settled to next=42 (≥ its batch).
+        frontier.acknowledge(&SourcePosition {
+            topic: Some("orders".into()),
+            partition: 0,
+            offset: 8,
+        });
+        frontier.acknowledge(&SourcePosition {
+            topic: Some("orders".into()),
+            partition: 1,
+            offset: 42,
+        });
+        // Batch rows: partition 0 up to offset 10 (next=11), partition 1 up
+        // to offset 20 (next=21).
+        let batch = l3_meta_batch(vec![0, 0, 1], vec![9, 10, 20], None);
+        let (offsets, covered) =
+            transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        assert!(covered);
+        let last_sent = std::collections::HashMap::new();
+        let (clamped, committed) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent)
+                .expect("both partitions clamp to the frontier");
+        let commits: Vec<(i32, rdkafka::Offset)> = clamped
+            .elements()
+            .iter()
+            .map(|e| (e.partition(), e.offset()))
+            .collect();
+        assert_eq!(
+            commits,
+            vec![
+                (0, rdkafka::Offset::Offset(8)),
+                (1, rdkafka::Offset::Offset(21)),
+            ],
+            "partition 0 clamps to the frontier; partition 1 keeps its batch max"
+        );
+        // The clamp itself never mutates the monotonic base — the caller
+        // folds these pairs in only after a successful commit.
+        assert!(last_sent.is_empty());
+        assert_eq!(committed, vec![(0, 8), (1, 21)]);
+    }
+
+    /// Spec "位点钳制到连续前沿" + design D1: the commit sequence never
+    /// rewinds — a later batch whose frontier slipped back (an undo rewound
+    /// the in-memory frontier) still commits at least the last sent value.
+    /// CR follow-up: the base only advances through the caller's
+    /// post-commit fold, so values from a FAILED transaction never leak in
+    /// (a rewind + partial replay would otherwise re-commit never-committed
+    /// offsets and skip records).
+    #[test]
+    fn l3_commit_sequence_never_rewinds_below_last_sent() {
+        use arkflow_core::checkpoint::SourcePosition;
+        use arkflow_core::executor::commit::CommitFrontier;
+
+        let frontier = CommitFrontier::new();
+        frontier.acknowledge(&SourcePosition {
+            topic: Some("orders".into()),
+            partition: 0,
+            offset: 30,
+        });
+        let mut last_sent = std::collections::HashMap::new();
+        // Mirrors write_batch's post-commit fold.
+        let fold_after_commit = |last_sent: &mut std::collections::HashMap<i32, i64>,
+                                 committed: Vec<(i32, i64)>| {
+            for (partition, offset) in committed {
+                last_sent
+                    .entry(partition)
+                    .and_modify(|value| *value = (*value).max(offset))
+                    .or_insert(offset);
+            }
+        };
+
+        // First commit: batch to 31, frontier at 30 → clamp 30. The commit
+        // succeeds, so the fold advances the base.
+        let batch = l3_meta_batch(vec![0], vec![30], None);
+        let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        let (clamped, committed) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).unwrap();
+        assert_eq!(clamped.elements()[0].offset(), rdkafka::Offset::Offset(30));
+        fold_after_commit(&mut last_sent, committed);
+
+        // A FAILED transaction must not advance the base: the clamp pairs
+        // are discarded, so a subsequent frontier rewind + partial replay
+        // cannot re-commit a value that was never broker-committed. (The
+        // frontier must advance CONTIGUOUSLY — acknowledging a higher
+        // offset directly would sit in the pending gap set instead.)
+        frontier.acknowledge(&SourcePosition {
+            topic: Some("orders".into()),
+            partition: 0,
+            offset: 31,
+        });
+        let batch = l3_meta_batch(vec![0], vec![30], None);
+        let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        let (_clamped, discarded) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).unwrap();
+        assert_eq!(discarded, vec![(0, 31)]);
+        // (transaction fails — nothing folded)
+        assert_eq!(last_sent.get(&0), Some(&30));
+
+        // Undo rewound the frontier to 29; the next batch derives 30 again —
+        // the monotonic guard keeps the commit at the (committed) last sent.
+        frontier.rewind_position(Some("orders"), 0, 30);
+        let batch = l3_meta_batch(vec![0], vec![29], None);
+        let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        let (clamped, _committed) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).unwrap();
+        assert_eq!(
+            clamped.elements()[0].offset(),
+            rdkafka::Offset::Offset(30),
+            "the monotonic guard keeps the commit at the last sent value"
+        );
+    }
+
+    /// A partition the frontier does not track contributes nothing: nothing
+    /// below its batch positions is settled, so committing anything would
+    /// skip unsettled records. When nothing remains committable the clamp
+    /// yields None (the caller skips send_offsets_to_transaction).
+    #[test]
+    fn l3_partitions_without_a_frontier_contribute_nothing() {
+        use arkflow_core::checkpoint::SourcePosition;
+        use arkflow_core::executor::commit::CommitFrontier;
+
+        let frontier = CommitFrontier::new();
+        // Only partition 0 settled; partition 3's branch is still in flight.
+        frontier.acknowledge(&SourcePosition {
+            topic: Some("orders".into()),
+            partition: 0,
+            offset: 5,
+        });
+        let last_sent = std::collections::HashMap::new();
+
+        let batch = l3_meta_batch(vec![0, 3], vec![4, 100], None);
+        let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        let (clamped, _committed) =
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).unwrap();
+        assert_eq!(clamped.count(), 1, "only the tracked partition commits");
+        assert_eq!(clamped.elements()[0].partition(), 0);
+
+        // A batch whose partitions are all untracked commits nothing at all.
+        let batch = l3_meta_batch(vec![7], vec![1], None);
+        let (offsets, covered) =
+            transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        assert!(covered, "the derivation still sees the rows");
+        assert!(
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).is_none(),
+            "no frontier → no committable position"
+        );
+    }
+
+    /// Frontier positions of OTHER topics never apply to the group topic
+    /// (L3 groups are single-topic; a partition number collision across
+    /// topics must not leak an offset).
+    #[test]
+    fn l3_frontier_of_foreign_topics_is_ignored() {
+        use arkflow_core::checkpoint::SourcePosition;
+        use arkflow_core::executor::commit::CommitFrontier;
+
+        let frontier = CommitFrontier::new();
+        frontier.acknowledge(&SourcePosition {
+            topic: Some("clickstream".into()),
+            partition: 0,
+            offset: 99,
+        });
+        let batch = l3_meta_batch(vec![0], vec![10], None);
+        let (offsets, _) = transactional_offsets_for_batches(&[batch], Some("orders")).unwrap();
+        let last_sent = std::collections::HashMap::new();
+        assert!(
+            clamp_transactional_offsets(offsets, &frontier, "orders", &last_sent).is_none(),
+            "the orders partition has no frontier entry"
+        );
+    }
+
+    /// rdkafka 0.38 reports `send_offsets_to_transaction` errors
+    /// synchronously; the previous code discarded the inner result. The
+    /// offline probe: an uninitialized transactional producer rejects the
+    /// offset send, and the helper must surface it as an error naming the
+    /// stage (the group metadata comes from an offline consumer construct).
+    #[tokio::test]
+    async fn l3_send_offsets_failure_surfaces_as_a_batch_error() {
+        use rdkafka::consumer::Consumer;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("transactional.id", "cov-offset-send-txn")
+            .create()
+            .expect("producer creation is offline");
+        let consumer: rdkafka::consumer::StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("group.id", "cov-offset-send-group")
+            .create()
+            .expect("consumer creation is offline");
+        let Some(metadata) = consumer.group_metadata() else {
+            // librdkafka hands out group metadata without a joined group on
+            // this build; without it the synchronous-error arm cannot be
+            // probed offline — the mapping stays covered by the transaction
+            // error-mapping test above.
+            return;
+        };
+        // A non-empty offset list is required: an empty list short-circuits
+        // in librdkafka without touching the transaction state machine.
+        let mut offsets = rdkafka::TopicPartitionList::new();
+        offsets
+            .add_partition_offset("orders", 0, rdkafka::Offset::Offset(1))
+            .expect("static offset entry");
+        let err = send_offsets_in_transaction(&producer, offsets, std::sync::Arc::new(metadata))
+            .await
+            .expect_err("an uninitialized producer cannot accept transactional offsets");
+        assert!(
+            err.to_string()
+                .contains("send_offsets_to_transaction failed"),
+            "got: {err}"
+        );
     }
 
     /// Duplicate rows for one partition fold to the max next-offset; a

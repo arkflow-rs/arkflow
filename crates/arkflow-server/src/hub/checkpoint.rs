@@ -1,6 +1,11 @@
 //! Distributed checkpoint orchestration and retention.
 
-use super::*;
+use super::error::HubError;
+use super::wire::{AgentOperation, HubOperation, HubOperationState, NodeConnectionState};
+use super::{now_ms, Hub};
+use crate::agent::delete_checkpoint_artifact;
+use crate::storage::{JobCheckpointRecord, JobRecord};
+use std::collections::BTreeSet;
 
 pub(crate) fn recovery_record_is_compatible(
     spec: &arkflow_core::job::JobSpec,
@@ -124,7 +129,7 @@ impl Hub {
                 .values()
                 .filter(|operation| {
                     operation.resource_id == job.job_id
-                        && operation.operation == "job_start"
+                        && operation.operation == AgentOperation::JobStart
                         && operation.generation == job.generation
                         && matches!(
                             operation.state,
@@ -165,9 +170,9 @@ impl Hub {
             .assignments_for_nodes(&targets, job.generation)
             .map_err(|error| HubError::Invalid(error.to_string()))?;
         let operation = if record.kind == "savepoint" {
-            "job_savepoint"
+            AgentOperation::JobSavepoint
         } else {
-            "job_checkpoint"
+            AgentOperation::JobCheckpoint
         };
         let mut dispatched = 0;
         for node_id in targets {
@@ -181,7 +186,7 @@ impl Hub {
             }
             self.enqueue_with_metadata(
                 node_id,
-                operation.into(),
+                operation.clone(),
                 job.job_id.clone(),
                 None,
                 Some(serde_json::json!({
@@ -493,7 +498,7 @@ impl Hub {
                 .values()
                 .filter(|candidate| {
                     candidate.resource_id == operation.resource_id
-                        && candidate.operation == "job_start"
+                        && candidate.operation == AgentOperation::JobStart
                         && candidate.generation == operation.generation
                         && !matches!(
                             candidate.state,

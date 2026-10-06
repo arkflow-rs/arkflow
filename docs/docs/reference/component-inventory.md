@@ -47,7 +47,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | output | `stdout` | Writes each message to the console. Useful for debugging and demos. | [reference](../components/outputs/stdout) |
 | processor | `arrow_to_json` | Converts an Arrow RecordBatch into JSON byte payloads (one per row). | [reference](../components/processors/json) |
 | processor | `arrow_to_protobuf` | Serializes Arrow RecordBatches into Protobuf wire-format bytes. | [reference](../components/processors/protobuf) |
-| processor | `batch` | Batches messages by count with an idle timeout before forwarding. | [reference](../components/processors/batch) |
+| processor | `batch` | Batches messages by row count with an idle timeout before forwarding. | [reference](../components/processors/batch) |
 | processor | `embedding` | Batch-embeds a text column through an OpenAI-compatible embeddings API and appends the vectors as a FixedSizeList(Float32) column. | [reference](../components/processors/embedding) |
 | processor | `json_to_arrow` | Parses JSON byte payloads into an Arrow RecordBatch with inferred schema. | [reference](../components/processors/json) |
 | processor | `llm` | Sends each row of a text column to an OpenAI-compatible chat completions API and appends the completion as a Utf8 column, with bounded ordered concurrency. | [reference](../components/processors/llm) |

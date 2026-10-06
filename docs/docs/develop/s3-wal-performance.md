@@ -54,12 +54,16 @@ channels and round-robin assign segments, increasing throughput up to
 2-3× for high-QPS workloads without changing the at-least-once
 contract. Watch for S3 per-prefix rate limits with 8 workers.
 
-### Crash Window
+### Replay Window
 
-The "loss window" is the number of entries at risk on node/pod disappearance:
+The "replay window" is the number of entries the source must re-deliver on
+node/pod disappearance. Unsealed entries are never silently lost: a source
+acknowledgement completes only after its entry is sealed into a segment
+object, so the source offset stays behind the seal frontier and unsealed
+work is re-delivered after a restart (at-least-once):
 
 ```
-loss_window = min(
+replay_window = min(
     segment.max_entries,           # entry count trigger
     segment.max_bytes / avg_msg_size,  # byte size trigger
     segment.flush_interval * msg_rate  # time trigger
@@ -71,6 +75,16 @@ loss_window = min(
 | 100ms | 100 msgs | 1,000 msgs | 10,000 msgs |
 | 1s | 1,000 msgs | 10,000 msgs | 100,000 msgs |
 | 5s | 5,000 msgs | 50,000 msgs | 500,000 msgs |
+
+The same triggers bound the **acknowledgement latency** added by seal
+gating: an acknowledgement waits at most one `flush_interval` (plus the
+segment PUT time) for its entry to seal; all acknowledgements covered by
+one segment share that single wait. If a seal does not land within a
+bounded window (`flush_interval × 4 + 5s` for `periodic`, 30s for
+`group_commit`), the acknowledgement fails retryably instead of committing
+an unsealed entry, and sustained flusher failures escalate to error-level
+logging with a failure counter — distinguishing a slow flusher from a
+dead one.
 
 ## Configuration Tuning
 
@@ -87,18 +101,18 @@ segment:
 
 **Trade-offs:**
 
-| Configuration | Latency | Crash Window | PUT Frequency |
-|---------------|---------|--------------|--------------|
-| Small segments (100, 100KB) | Lower PUT latency | Smaller window | Higher PUT rate |
-| Large segments (10000, 10MB) | Higher PUT latency | Larger window | Lower PUT rate |
-| Short interval (100ms) | Quick flush | Small window | High PUT rate |
-| Long interval (10s) | Delayed flush | Large window | Low PUT rate |
+| Configuration | Latency | Replay Window / Ack Latency | PUT Frequency |
+|---------------|---------|-----------------------------|---------------|
+| Small segments (100, 100KB) | Lower PUT latency | Smaller window, faster acks | Higher PUT rate |
+| Large segments (10000, 10MB) | Higher PUT latency | Larger window, slower acks | Lower PUT rate |
+| Short interval (100ms) | Quick flush | Small window, acks ≤ ~100ms | High PUT rate |
+| Long interval (10s) | Delayed flush | Large window, acks ≤ ~10s | Low PUT rate |
 
 **Recommendations:**
 
 - **High throughput, relaxed durability**: `max_entries: 10000`, `max_bytes: 10MB`, `flush_interval: 10s`
 - **Balanced**: defaults (`1000`, `1MB`, `1s`)
-- **Small crash window**: `max_entries: 100`, `max_bytes: 100KB`, `flush_interval: 100ms`
+- **Small replay window**: `max_entries: 100`, `max_bytes: 100KB`, `flush_interval: 100ms`
 
 ### Cursor Flushing (D6)
 
@@ -127,7 +141,8 @@ cursor:
 | append latency | ~1μs | ~50μs | 50x slower |
 | flush latency | ~2ms | ~50ms | 25x slower |
 | throughput | 500 MB/s | 150 MB/s | 3x slower |
-| crash window | ~100 msgs | ~1000 msgs | 10x larger |
+| replay window | ~100 msgs | ~1000 msgs | 10x larger |
+| added ack latency (seal gating) | none | ≤ flush_interval | N/A |
 | node recovery | ❌ No | ✅ Yes | N/A |
 
 ## Cost Considerations
@@ -158,7 +173,8 @@ The S3 WAL backend supports three preset strategies via `segment_tuning.strategy
 
 ### Aggressive Strategy
 
-For high throughput, low cost — tolerates a larger crash window.
+For high throughput, low cost — tolerates a larger replay window (and an
+acknowledgement latency of up to ~10s from seal gating).
 
 ```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
@@ -170,13 +186,13 @@ Defaults:
 - `max_bytes: 10MB`
 - `flush_interval: 10s`
 
-**Crash window @ 10K msg/s**: ~100,000 messages at risk on node loss
+**Replay window @ 10K msg/s, 1 KB avg**: ~10,000 messages re-delivered on node loss (`max_entries`/`max_bytes` fire before the 10s `flush_interval`)
 **PUT cost reduction**: ~10x vs balanced
 **Throughput**: Up to 200 MB/s
 
 ### Balanced Strategy (default)
 
-Default trade-off between throughput and crash window.
+Default trade-off between throughput and replay window.
 
 ```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
@@ -188,12 +204,12 @@ Defaults:
 - `max_bytes: 1MB`
 - `flush_interval: 1s`
 
-**Crash window @ 10K msg/s**: ~10,000 messages at risk
+**Replay window @ 10K msg/s, 1 KB avg**: ~1,000 messages re-delivered (`max_entries`/`max_bytes` fire before the 1s `flush_interval`)
 **Throughput**: 100-150 MB/s
 
 ### Low-Latency Strategy
 
-For minimal crash window — highest PUT frequency.
+For minimal replay window — highest PUT frequency.
 
 ```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
@@ -205,7 +221,7 @@ Defaults:
 - `max_bytes: 100KB`
 - `flush_interval: 100ms`
 
-**Crash window @ 10K msg/s**: ~1,000 messages at risk
+**Replay window @ 10K msg/s, 1 KB avg**: ~100 messages re-delivered (`max_entries`/`max_bytes` fire before the 100ms `flush_interval`)
 **Throughput**: Lower due to frequent flushes
 
 ### Custom Overrides
@@ -303,8 +319,8 @@ will be lower than these synthetic benchmarks but still substantial.
 
 ### Segment PUT Partial Failure
 
-- **Current**: Lost segment is skipped in recovery (D7). PUT worker logs error but continues processing
-- **Impact**: Data loss for that segment only
+- **Current**: A failed segment PUT restores the staged entries to the active segment and retries on the next flusher tick; the wake-path failures are counted and logged (rate-limited warn, escalating to error when sustained) instead of being silently swallowed. Recovery additionally skips a segment that was referenced but has since gone missing (D7)
+- **Impact**: Acknowledgements for the affected entries are delayed (seal gating) and fail retryably if the PUT keeps failing — the source re-delivers, so no acknowledged entry is lost
 - **Mitigation**: Enable S3 server-side encryption and versioning
 
 ## Monitoring

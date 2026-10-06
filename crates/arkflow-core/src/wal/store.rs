@@ -188,6 +188,43 @@ pub trait WalStore: Send + Sync + 'static {
         self.cursor().saturating_add(1)
     }
 
+    /// Highest sequence number guaranteed to be contained in a sealed (fully
+    /// persisted) segment. The default `None` marks a backend that makes
+    /// appends durable synchronously inside `append_batch` / the flush path
+    /// — the local `redb` backend commits (and fsyncs) its transaction
+    /// there, so the WAL's acknowledgement path needs no seal gating.
+    ///
+    /// Backends that seal asynchronously — the object-store backend PUTs
+    /// segment objects from a background flusher — return the sealed
+    /// frontier instead: a source acknowledgement completes only after the
+    /// acknowledged entry's sequence is covered by it (see
+    /// `Wal::wait_for_sealed`). The value is a one-way monotonic progress
+    /// hint: it never regresses and only advances once the covering segment
+    /// object (and the manifest referencing it) is durably written.
+    fn sealed_seq(&self) -> Option<u64> {
+        None
+    }
+
+    /// Notification fired after each successful seal. Only meaningful
+    /// together with [`Self::sealed_seq`]. Because `notify_waiters` stores
+    /// no permit for waiters registered after the call, waiters must
+    /// register their `Notified` future (via `Notified::enable`) *before*
+    /// checking `sealed_seq()` — see `Wal::wait_for_sealed`.
+    fn seal_notifier(&self) -> Option<&tokio::sync::Notify> {
+        None
+    }
+
+    /// The cadence at which the backend's background flusher seals segments
+    /// (its `flush_interval`). Only meaningful together with
+    /// [`Self::sealed_seq`]: the WAL derives the seal-wait stall bound from
+    /// it (`4·interval + 5s`). A backend that reports a sealed frontier
+    /// without a cadence gets the fixed fallback bound. The engine's WAL
+    /// `SyncPolicy` interval is deliberately NOT consulted — it governs how
+    /// fast staged appends reach `append_batch`, not when segments seal.
+    fn seal_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Flush any in-flight writes and release held resources. After this
     /// returns the store must be safe to drop. For `redb`, this is implicit
     /// via `Database::drop` (fcntl flock release); object stores await their

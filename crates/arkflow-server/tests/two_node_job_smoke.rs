@@ -309,7 +309,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
                 .iter()
                 .filter(|operation| {
                     operation.resource_id == job_id
-                        && operation.operation == "job_start"
+                        && operation.operation.as_str() == "job_start"
                         && operation.state == HubOperationState::Succeeded
                 })
                 .count()
@@ -406,7 +406,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         .into_iter()
         .filter(|operation| {
             operation.resource_id == job_id
-                && operation.operation == "job_start"
+                && operation.operation.as_str() == "job_start"
                 && operation.state == HubOperationState::Succeeded
         })
         .map(|operation| operation.id)
@@ -423,7 +423,7 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
             async move {
                 hub.operations(None).await.iter().any(|operation| {
                     operation.resource_id == job_id
-                        && operation.operation == "job_start"
+                        && operation.operation.as_str() == "job_start"
                         && operation.state == HubOperationState::Succeeded
                         && !initial_start_ids.contains(&operation.id)
                 })
@@ -604,7 +604,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
                 .iter()
                 .filter(|operation| {
                     operation.resource_id == job_id
-                        && operation.operation == "job_start"
+                        && operation.operation.as_str() == "job_start"
                         && operation.state == HubOperationState::Succeeded
                 })
                 .count()

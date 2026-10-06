@@ -422,6 +422,14 @@ pub(crate) struct TrackingAck {
     /// transitions between zero and non-zero.
     held: std::sync::atomic::AtomicUsize,
     completed: std::sync::atomic::AtomicBool,
+    /// Terminal marker set by a successful `abort`. A buffering operator's
+    /// compensation chain can reach its `undo` one step late — after the
+    /// error path already settled this delivery terminally — and that late
+    /// `undo` must not resurrect the barrier blocking count (mirrors the
+    /// terminal guard of `FanoutAckPart::undo` in `crate::input`). Guarded
+    /// entirely by `ack_lock`, so plain `Acquire`/`Release` ordering
+    /// suffices.
+    aborted: std::sync::atomic::AtomicBool,
     ack_lock: tokio::sync::Mutex<()>,
 }
 
@@ -433,6 +441,7 @@ impl TrackingAck {
             inner,
             held: std::sync::atomic::AtomicUsize::new(0),
             completed: std::sync::atomic::AtomicBool::new(false),
+            aborted: std::sync::atomic::AtomicBool::new(false),
             ack_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -494,6 +503,18 @@ impl Ack for TrackingAck {
         // can clear `completed` after a concurrent retry has already
         // committed the same delivery, corrupting the barrier counters.
         let _guard = self.ack_lock.lock().await;
+        // Abort is terminal. A late `undo` from a buffering operator's
+        // compensation chain (a held release, a `ConcurrentAck` /
+        // `CommitGroupOnAck` undo chain) must not swap `completed` back to
+        // false and decrement `tracker.completed`: that would re-count a
+        // terminally settled delivery as barrier-blocking forever, so every
+        // later checkpoint round times out while data keeps flowing. The
+        // guard sits at the entry — the inner acknowledgement's settlement
+        // was already given up with the abort and must not be disturbed
+        // either — matching `FanoutAckPart::undo`'s guard position.
+        if self.aborted.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let result = self.inner.undo().await;
         if result.is_ok() {
             self.settle_tracker_after_undo();
@@ -505,6 +526,10 @@ impl Ack for TrackingAck {
         let _guard = self.ack_lock.lock().await;
         let result = self.inner.abort().await;
         if result.is_ok() {
+            // The terminal marker is set exactly when the tracker settles:
+            // a failed inner abort leaves the delivery retryable, and a
+            // subsequent undo must keep its normal compensation semantics.
+            self.aborted.store(true, Ordering::Release);
             self.settle_tracker_after_abort();
         }
         result
@@ -768,6 +793,59 @@ mod tests {
         // Abort is terminal and idempotent from the tracker perspective.
         ack.abort().await.unwrap();
         assert_eq!(tracker.blocking(), 0);
+    }
+
+    /// Records which settlement calls reached the wrapped acknowledgement so
+    /// a test can prove a guarded `undo` never disturbs the inner chain.
+    struct RecordingInner {
+        undone: std::sync::atomic::AtomicBool,
+        aborted: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl Ack for RecordingInner {
+        async fn ack(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn undo(&self) -> Result<(), Error> {
+            self.undone.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn abort(&self) -> Result<(), Error> {
+            self.aborted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_after_abort_is_a_terminal_noop() {
+        let tracker = Arc::new(AckTracker::new());
+        let inner = Arc::new(RecordingInner {
+            undone: std::sync::atomic::AtomicBool::new(false),
+            aborted: std::sync::atomic::AtomicBool::new(false),
+        });
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(tracker.clone(), inner.clone()));
+        assert_eq!(tracker.blocking(), 1);
+
+        // The error path settles the delivery terminally.
+        ack.abort().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
+        assert!(inner.aborted.load(Ordering::SeqCst));
+
+        // A buffering operator's compensation chain can arrive one step
+        // late. The undo must be an idempotent no-op: the barrier blocking
+        // count stays at zero and the inner acknowledgement — whose
+        // settlement was already given up — is not disturbed again.
+        ack.undo().await.unwrap();
+        assert_eq!(
+            tracker.blocking(),
+            0,
+            "a late undo after abort must not resurrect the barrier blocking count"
+        );
+        assert!(
+            !inner.undone.load(Ordering::SeqCst),
+            "a late undo after abort must not call through to the inner acknowledgement"
+        );
     }
 
     #[test]

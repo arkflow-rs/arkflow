@@ -1,6 +1,15 @@
 //! Job lifecycle bookkeeping: observation, recovery, operational status.
 
-use super::*;
+use super::error::HubError;
+use super::wire::{
+    AgentOperation, CommandResult, HubOperation, HubOperationState, JobObservationRequest,
+};
+use super::{now_ms, persist_operation, Hub, MAX_OPERATIONS};
+use crate::storage::{DesiredMutation, IntentRecord, JobRecord, StorageError};
+use arkflow_core::control::{OperationalStatus, ReconciliationHealth};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use subtle::ConstantTimeEq;
 
 impl Hub {
     pub async fn observe_job(
@@ -137,7 +146,7 @@ impl Hub {
                 .filter(|operation| {
                     operation.node_id == node_id
                         && operation.resource_id == job_id
-                        && operation.operation == "job_start"
+                        && operation.operation == AgentOperation::JobStart
                         && operation.generation == generation
                         && operation.state == HubOperationState::Succeeded
                 })
@@ -451,7 +460,7 @@ impl Hub {
         if observed_nodes != expected_nodes {
             return Ok(None);
         }
-        let terminal_success = updated.operation == "job_stop";
+        let terminal_success = updated.operation == AgentOperation::JobStop;
         let succeeded = |state: &HubOperationState| {
             matches!(
                 state,

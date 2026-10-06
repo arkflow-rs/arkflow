@@ -54,3 +54,5 @@ JSON to Arrow type conversions:
 | string | Utf8 | |
 | array | Utf8 | Serialized as JSON string |
 | object | Utf8 | Serialized as JSON string |
+
+Type inference runs over the whole batch: a numeric column maps to `Int64` only when every message in the batch holds an integer for it; if any message holds a float, the column widens to `Float64` (values are never truncated). Fields that first appear in later messages still become columns, null-filled for earlier rows. Downstream SQL or output schemas that relied on the previously (wrongly) narrowed `Int64` type for a mixed column need to adapt to `Float64`.

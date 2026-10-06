@@ -7,7 +7,9 @@
 //! terminal branch is reached deterministically without racing a second
 //! Hub against the guarded writes.
 
-use super::*;
+use super::wire::RegisterRequest;
+use super::{default_session_ttl_ms, now_ms_for_metrics, Hub, HubConfig};
+use crate::storage::{JobRecord, StorageActor};
 
 fn config() -> HubConfig {
     HubConfig {

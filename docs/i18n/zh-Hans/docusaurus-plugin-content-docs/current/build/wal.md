@@ -38,9 +38,19 @@ streams:
 
 这对大多数负载都适用。要为更高吞吐、更低成本或更快恢复而调优,请继续阅读。
 
+## 源确认以段密封为门控
+
+在对象存储后端上,源确认(例如 Kafka 的 offset 提交)只有在被确认的条目**已被密封进段对象**——即 PUT 到对象存储并完成 manifest 更新——之后才会完成。因此"确认已完成"永远意味着该条目已持久化在存储上:无论节点何时消失,已确认的条目都不会丢失。
+
+仍暂存在内存、尚未密封的条目同样不会丢失——它们构成**重放窗口**:由于其源确认尚未完成,重启后由源重新投递(至少一次,输出仍需容忍重复,与既有契约一致)。
+
+限制重放窗口的段刷新触发条件,同时也限制了该门控带来的**确认延迟**:一次确认最多等待一个 `flush_interval`(外加段 PUT 时间)等其所在段密封。默认 `balanced` 预设约为 1s;`aggressive` 预设最多约 10s。同一段内多条记录的确认共享同一次密封,等待按批次摊销。如果确认延迟比 PUT 成本更重要,调低 `flush_interval`(以及 `max_entries`)——不要试图绕过门控:正是它保证了"已确认即已密封"。后台刷洗器停止密封时,确认会在有界等待后以可重试错误失败,而不是静默提交未密封数据;持续失败会升级为 error 级日志(参见 [S3 WAL 后端性能](../develop/s3-wal-performance.md))。
+
+本地(`redb`)后端不受影响:其 flush 本身就是持久提交,确认行为与之前完全一致,没有额外延迟。
+
 ## 维度 1:段调优
 
-`segment_tuning` 块控制内存中的段何时封存并上传到 S3。段越大,PUT 请求越少(成本更低),但"丢失窗口"越大——即节点消失时处于风险中的未刷新消息数。
+`segment_tuning` 块控制内存中的段何时封存并上传到 S3。段越大,PUT 请求越少(成本更低),但"重放窗口"越大——节点消失时需要源重新投递的未密封消息越多——确认延迟也越长(见上文)。
 
 ### 预设策略
 
@@ -82,12 +92,12 @@ durability:
       flush_interval: "30s"   # override default 10s
 ```
 
-### 崩溃窗口权衡
+### 重放窗口权衡
 
-崩溃窗口是节点在一次写入与下一段刷新之间消失时处于风险中的消息数。可近似为:
+重放窗口是节点在一次写入与下一段刷新之间消失时,需要源重新投递的消息数(它们会被重放,而不是丢失——确认门控使源游标始终落后于密封边界)。可近似为:
 
 ```
-loss_window ≈ min(
+replay_window ≈ min(
     max_entries,
     max_bytes / avg_message_size,
     flush_interval × message_rate
@@ -96,11 +106,13 @@ loss_window ≈ min(
 
 在 10,000 msg/s、平均消息 1 KB 时:
 
-| 策略 | 崩溃窗口 |
+| 策略 | 重放窗口 |
 |----------|--------------|
-| `aggressive` | 约 100,000 条消息 |
-| `balanced` | 约 10,000 条消息 |
-| `low_latency` | 约 1,000 条消息 |
+| `aggressive` | 约 10,000 条消息 |
+| `balanced` | 约 1,000 条消息 |
+| `low_latency` | 约 100 条消息 |
+
+在该速率下 `max_entries` 与 `max_bytes` 会先于 `flush_interval` 触发,由它们主导重放条数;密封门控带来的确认延迟仍以 `flush_interval` 为上界(上述预设分别为 10s / 1s / 100ms)。速率更低时,`flush_interval × 消息速率` 一项成为约束项。
 
 ## 维度 2:并行 PUT 工作者
 
@@ -178,7 +190,7 @@ durability:
 
 ### 高吞吐批处理作业
 
-最小化 S3 PUT 请求;容忍最多约 10 万条消息的风险敞口。
+最小化 S3 PUT 请求;在 10K msg/s 摄入下容忍节点丢失时最多约 1 万条消息的重新投递(`max_entries`/`max_bytes` 先触发),以及最多约 10s 的确认延迟。
 
 ```yaml validate=fragment wrap=durability
 durability:
@@ -198,9 +210,9 @@ durability:
       bucket: my-bucket
 ```
 
-### 丢失窗口紧凑的实时流
+### 重放窗口紧凑的实时流
 
-最小化崩溃窗口;吞吐次之。
+最小化重放窗口与确认延迟;吞吐次之。
 
 ```yaml validate=fragment wrap=durability
 durability:
@@ -221,7 +233,7 @@ durability:
 
 ### 成本敏感的冷存储
 
-最大压缩、最少 PUT,接受更高的丢失窗口。
+最大压缩、最少 PUT,接受更大的重放窗口与更长的确认延迟。
 
 ```yaml validate=fragment wrap=durability
 durability:

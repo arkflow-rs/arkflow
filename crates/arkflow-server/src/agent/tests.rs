@@ -1,5 +1,5 @@
 use super::*;
-use crate::hub::{AgentAuth, AgentCommand, CommandResult, HubOperationState};
+use crate::hub::{AgentAuth, AgentCommand, AgentOperation, CommandResult, HubOperationState};
 use crate::{hub_router, ServerConfig};
 use arkflow_core::checkpoint::{
     CheckpointRepository, CheckpointStatus, CheckpointStore, RecoveryArtifact,
@@ -676,7 +676,7 @@ async fn checkpoint_execution_failure_is_ready_for_terminal_result() {
         id: "cmd-checkpoint".into(),
         operation_id: "op-checkpoint".into(),
         node_id: "node-a".into(),
-        operation: "job_checkpoint".into(),
+        operation: AgentOperation::parse("job_checkpoint"),
         resource_id: "job-a".into(),
         expires_at_ms: now_ms().saturating_add(60_000),
         generation: 3,
@@ -3145,7 +3145,7 @@ fn test_command(
         id: format!("cmd-{operation}-{resource_id}"),
         operation_id: format!("op-{operation}-{resource_id}"),
         node_id: "node-a".into(),
-        operation: operation.into(),
+        operation: AgentOperation::parse(operation),
         resource_id: resource_id.into(),
         expires_at_ms,
         generation,

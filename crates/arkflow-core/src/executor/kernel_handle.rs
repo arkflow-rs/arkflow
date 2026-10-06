@@ -721,6 +721,11 @@ impl KernelJobRunner {
         cancellation: CancellationToken,
     ) -> Result<KernelJobHandle, Error> {
         if connect_inputs {
+            // Startup validation precedes even the source pre-connection on
+            // this path (the guard's `connect` below re-runs it, but the
+            // preconnected inputs would otherwise violate the documented
+            // "validation precedes any connection" contract).
+            super::resource_guard::run_startup_validators()?;
             for input in &inputs {
                 if let Err(error) = input.connect().await {
                     for connected in inputs.iter().rev() {
@@ -805,16 +810,20 @@ impl KernelJobRunner {
             }
             hooks.insert(
                 entry_task_id.clone(),
-                super::task::CheckpointHook {
-                    reporter: Some(report_tx.clone()),
-                    failure_reporter: Some(checkpoint_error_tx.clone()),
-                    barrier_rx,
-                    state,
-                    task_id: Some(entry_task_id),
-                    event_time_gate,
-                    partition: chain.source_partition,
+                super::task::ChainHooks {
+                    checkpoint: super::task::CheckpointHook {
+                        reporter: Some(report_tx.clone()),
+                        failure_reporter: Some(checkpoint_error_tx.clone()),
+                        barrier_rx,
+                        state,
+                        task_id: Some(entry_task_id),
+                        finished_reporter: Some(chain_finished_tx.clone()),
+                    },
+                    event_time: super::task::EventTimeBinding {
+                        gate: event_time_gate,
+                        partition: chain.source_partition,
+                    },
                     metrics: Some(runtime_metrics.clone()),
-                    finished_reporter: Some(chain_finished_tx.clone()),
                 },
             );
         }

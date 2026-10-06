@@ -1,6 +1,8 @@
 //! Hub<->Agent wire types: registration, heartbeat, report, commands, results.
 
-use super::*;
+use arkflow_core::control::{ControlEvent, NodeMaintenanceState, OperationRecord, StreamStatus};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -151,12 +153,117 @@ pub enum NodeConnectionState {
     Draining,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AgentOperation {
+    Start,
+    Stop,
+    Restart,
+    ValidateConfiguration,
+    DiffConfiguration,
+    ApplyConfiguration,
+    RollbackConfiguration,
+    JobStart,
+    JobRestart,
+    JobStop,
+    JobCheckpoint,
+    JobSavepoint,
+    JobCheckpointCommit,
+    JobSavepointCommit,
+    Reconcile,
+    Unknown(String),
+}
+
+impl AgentOperation {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::ValidateConfiguration => "validate_configuration",
+            Self::DiffConfiguration => "diff_configuration",
+            Self::ApplyConfiguration => "apply_configuration",
+            Self::RollbackConfiguration => "rollback_configuration",
+            Self::JobStart => "job_start",
+            Self::JobRestart => "job_restart",
+            Self::JobStop => "job_stop",
+            Self::JobCheckpoint => "job_checkpoint",
+            Self::JobSavepoint => "job_savepoint",
+            Self::JobCheckpointCommit => "job_checkpoint_commit",
+            Self::JobSavepointCommit => "job_savepoint_commit",
+            Self::Reconcile => "reconcile",
+            Self::Unknown(raw) => raw,
+        }
+    }
+
+    /// Parse a persisted or received operation name. Names outside the
+    /// closed set keep their original string instead of failing: dispatch
+    /// rejects them (fail closed) while persistence and audit records
+    /// round-trip losslessly.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "start" => Self::Start,
+            "stop" => Self::Stop,
+            "restart" => Self::Restart,
+            "validate_configuration" => Self::ValidateConfiguration,
+            "diff_configuration" => Self::DiffConfiguration,
+            "apply_configuration" => Self::ApplyConfiguration,
+            "rollback_configuration" => Self::RollbackConfiguration,
+            "job_start" => Self::JobStart,
+            "job_restart" => Self::JobRestart,
+            "job_stop" => Self::JobStop,
+            "job_checkpoint" => Self::JobCheckpoint,
+            "job_savepoint" => Self::JobSavepoint,
+            "job_checkpoint_commit" => Self::JobCheckpointCommit,
+            "job_savepoint_commit" => Self::JobSavepointCommit,
+            "reconcile" => Self::Reconcile,
+            other => Self::Unknown(other.to_owned()),
+        }
+    }
+
+    /// Whether this is a Job-plane operation (`job_*`): dispatched to the
+    /// local Job runtime instead of the stream lifecycle and configuration
+    /// paths. An unknown operation whose wire name carries the `job_`
+    /// prefix stays on the Job plane so dispatch fails closed inside the
+    /// Job path with the historical error wording.
+    pub fn is_job(&self) -> bool {
+        match self {
+            Self::JobStart
+            | Self::JobRestart
+            | Self::JobStop
+            | Self::JobCheckpoint
+            | Self::JobSavepoint
+            | Self::JobCheckpointCommit
+            | Self::JobSavepointCommit => true,
+            Self::Unknown(raw) => raw.starts_with("job_"),
+            _ => false,
+        }
+    }
+}
+
+impl Serialize for AgentOperation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentOperation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::parse(&String::deserialize(deserializer)?))
+    }
+}
+
+impl std::fmt::Display for AgentOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCommand {
     pub id: String,
     pub operation_id: String,
     pub node_id: String,
-    pub operation: String,
+    pub operation: AgentOperation,
     pub resource_id: String,
     pub expires_at_ms: u64,
     #[serde(default)]
@@ -228,7 +335,7 @@ pub struct HubOperation {
     pub intent_id: Option<String>,
     pub command_id: String,
     pub node_id: String,
-    pub operation: String,
+    pub operation: AgentOperation,
     pub resource_id: String,
     #[serde(default)]
     pub checkpoint_id: Option<String>,
@@ -277,4 +384,73 @@ pub struct HubOperation {
 
 pub(crate) fn default_protocol_version() -> String {
     "v1".into()
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use super::AgentOperation;
+
+    /// The wire contract is the historical free-form string: every known
+    /// variant MUST serialize to exactly the literal Agents and the storage
+    /// layer have always used, in both directions, or a mixed-version fleet
+    /// breaks.
+    #[test]
+    fn known_operations_round_trip_through_the_historical_strings() {
+        let cases = [
+            (AgentOperation::Start, "start"),
+            (AgentOperation::Stop, "stop"),
+            (AgentOperation::Restart, "restart"),
+            (
+                AgentOperation::ValidateConfiguration,
+                "validate_configuration",
+            ),
+            (AgentOperation::DiffConfiguration, "diff_configuration"),
+            (AgentOperation::ApplyConfiguration, "apply_configuration"),
+            (
+                AgentOperation::RollbackConfiguration,
+                "rollback_configuration",
+            ),
+            (AgentOperation::JobStart, "job_start"),
+            (AgentOperation::JobRestart, "job_restart"),
+            (AgentOperation::JobStop, "job_stop"),
+            (AgentOperation::JobCheckpoint, "job_checkpoint"),
+            (AgentOperation::JobSavepoint, "job_savepoint"),
+            (AgentOperation::JobCheckpointCommit, "job_checkpoint_commit"),
+            (AgentOperation::JobSavepointCommit, "job_savepoint_commit"),
+            (AgentOperation::Reconcile, "reconcile"),
+        ];
+        for (operation, literal) in cases {
+            assert_eq!(operation.as_str(), literal, "{operation:?}");
+            let json = serde_json::to_value(&operation).unwrap();
+            assert_eq!(json, serde_json::json!(literal), "{operation:?}");
+            let parsed: AgentOperation = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed, operation);
+            assert_eq!(AgentOperation::parse(literal), operation);
+        }
+    }
+
+    /// Unknown names (e.g. a newer Hub) deserialize losslessly and
+    /// round-trip back to the exact original string.
+    #[test]
+    fn unknown_operations_preserve_their_original_string() {
+        let json = serde_json::json!("job_teleport");
+        let parsed: AgentOperation = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, AgentOperation::Unknown("job_teleport".into()));
+        assert_eq!(parsed.as_str(), "job_teleport");
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reserialized, serde_json::json!("job_teleport"));
+        // A job_-prefixed unknown stays on the Job plane (fail closed inside
+        // the Job dispatch path); any other unknown does not.
+        assert!(parsed.is_job());
+        let other: AgentOperation = serde_json::from_value(serde_json::json!("future_op")).unwrap();
+        assert!(!other.is_job());
+    }
+
+    #[test]
+    fn job_plane_operations_are_recognized() {
+        assert!(AgentOperation::JobStart.is_job());
+        assert!(AgentOperation::JobSavepointCommit.is_job());
+        assert!(!AgentOperation::Start.is_job());
+        assert!(!AgentOperation::ApplyConfiguration.is_job());
+    }
 }

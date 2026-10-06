@@ -1,6 +1,18 @@
 //! Command queue: intent/attempt enqueue, results, operation listing.
 
-use super::*;
+use super::command_metrics::CommandMetrics;
+use super::error::HubError;
+use super::nodes::required_capabilities;
+use super::wire::{
+    AgentAuth, AgentCommand, AgentOperation, CommandResult, HubOperation, HubOperationState,
+    NodeConnectionState,
+};
+use super::{now_ms, persist_operation, Hub, HUB_SEQUENCE, MAX_COMMANDS_PER_NODE, MAX_OPERATIONS};
+use crate::storage::{AttemptRecord, IntentRecord};
+use arkflow_core::control::NodeMaintenanceState;
+use std::collections::BTreeSet;
+use std::sync::atomic::Ordering;
+use subtle::ConstantTimeEq;
 
 /// An operation whose (Job, generation, operation) key has been retried this
 /// many times by the expiry sweep reaches a terminal failed state and is no
@@ -44,7 +56,7 @@ fn operation_from_intent(intent: IntentRecord) -> HubOperation {
         intent_id: Some(intent_id.clone()),
         command_id: format!("intent:{intent_id}"),
         node_id: intent.node_id,
-        operation: "reconcile".into(),
+        operation: AgentOperation::Reconcile,
         resource_id: intent.stream_id,
         checkpoint_id: None,
         generation: intent.generation,
@@ -77,7 +89,7 @@ fn operation_from_intent(intent: IntentRecord) -> HubOperation {
 }
 
 pub(crate) fn is_durable_job_start(operation: &HubOperation) -> bool {
-    operation.operation == "job_start"
+    operation.operation == AgentOperation::JobStart
         && (operation.state == HubOperationState::Succeeded
             || operation.failure_class.as_deref() == Some("recovery_required"))
 }
@@ -86,7 +98,7 @@ impl Hub {
     pub async fn enqueue(
         &self,
         node_id: String,
-        operation: String,
+        operation: AgentOperation,
         resource_id: String,
         correlation_id: Option<String>,
     ) -> Result<HubOperation, HubError> {
@@ -97,7 +109,7 @@ impl Hub {
     pub async fn enqueue_with_payload(
         &self,
         node_id: String,
-        operation: String,
+        operation: AgentOperation,
         resource_id: String,
         correlation_id: Option<String>,
         payload: Option<serde_json::Value>,
@@ -121,7 +133,7 @@ impl Hub {
     pub async fn enqueue_intent(
         &self,
         node_id: String,
-        operation: String,
+        operation: AgentOperation,
         resource_id: String,
         generation: u64,
         action_id: Option<String>,
@@ -152,7 +164,7 @@ impl Hub {
         let mut operation = self
             .enqueue_with_metadata(
                 attempt.node_id,
-                attempt.operation,
+                AgentOperation::parse(&attempt.operation),
                 attempt.stream_id,
                 None,
                 payload,
@@ -187,7 +199,7 @@ impl Hub {
     pub(crate) async fn enqueue_with_metadata(
         &self,
         node_id: String,
-        operation: String,
+        operation: AgentOperation,
         resource_id: String,
         correlation_id: Option<String>,
         payload: Option<serde_json::Value>,
@@ -203,7 +215,7 @@ impl Hub {
         if !nodes.contains_key(&node_id) {
             drop(nodes);
             self.reject_enqueue(
-                &operation,
+                operation.as_str(),
                 &resource_id,
                 &node_id,
                 correlation_id.as_deref(),
@@ -222,7 +234,7 @@ impl Hub {
         {
             drop(nodes);
             self.reject_enqueue(
-                &operation,
+                operation.as_str(),
                 &resource_id,
                 &node_id,
                 correlation_id.as_deref(),
@@ -232,8 +244,9 @@ impl Hub {
             .await;
             return Err(HubError::NodeUnavailable);
         }
-        let required_capabilities = required_capabilities(&operation);
-        let rollout_id = if operation == "apply_configuration" && resource_id == "__configuration__"
+        let required_capabilities = required_capabilities(operation.as_str());
+        let rollout_id = if matches!(operation, AgentOperation::ApplyConfiguration)
+            && resource_id == "__configuration__"
         {
             self.rollouts
                 .read()
@@ -263,10 +276,11 @@ impl Hub {
         {
             let message = format!("node lacks capability for {operation}");
             drop(nodes);
-            self.command_metrics.record_outcome(&operation, "rejected");
-            if Self::job_audit_action(&operation).is_some() {
+            self.command_metrics
+                .record_outcome(operation.as_str(), "rejected");
+            if Self::job_audit_action(operation.as_str()).is_some() {
                 self.record_job_operation_audit(
-                    &operation,
+                    operation.as_str(),
                     &resource_id,
                     Some(&node_id),
                     correlation_id.as_deref(),
@@ -329,8 +343,8 @@ impl Hub {
                 && item.operation == operation
                 && item.generation == generation
                 && (item.checkpoint_id.as_deref() == requested_checkpoint_id
-                    || (!operation.starts_with("job_checkpoint")
-                        && !operation.starts_with("job_savepoint")))
+                    || (!operation.as_str().starts_with("job_checkpoint")
+                        && !operation.as_str().starts_with("job_savepoint")))
                 && matches!(
                     item.state,
                     HubOperationState::Queued
@@ -350,7 +364,7 @@ impl Hub {
             drop(nodes);
             drop(operations);
             self.reject_enqueue(
-                &operation,
+                operation.as_str(),
                 &resource_id,
                 &node_id,
                 correlation_id.as_deref(),
@@ -366,7 +380,7 @@ impl Hub {
         // the lifecycle of the logical command, not of one row. Job-scoped by
         // design: stream attempts keep their own reconciler retry semantics
         // and must never hit this cap.
-        let inherited_retry_count = if operation.starts_with("job_") {
+        let inherited_retry_count = if operation.is_job() {
             operations
                 .values()
                 .filter(|item| {
@@ -385,7 +399,7 @@ impl Hub {
             drop(nodes);
             drop(operations);
             self.reject_enqueue(
-                &operation,
+                operation.as_str(),
                 &resource_id,
                 &node_id,
                 correlation_id.as_deref(),
@@ -498,7 +512,7 @@ impl Hub {
                 .map_err(HubError::from)?;
         }
         self.command_metrics
-            .record_outcome(&operation_record.operation, "enqueued");
+            .record_outcome(operation_record.operation.as_str(), "enqueued");
         // Accepted-mutation audits cover the desired-state lifecycle only:
         // checkpoint/savepoint dispatches also flow through this funnel for
         // both operator triggers AND the periodic scheduler, so auditing
@@ -512,7 +526,7 @@ impl Hub {
             )
         {
             self.record_job_operation_audit(
-                &operation_record.operation,
+                operation_record.operation.as_str(),
                 &operation_record.resource_id,
                 Some(&operation_record.node_id),
                 operation_record.correlation_id.as_deref(),
@@ -630,15 +644,15 @@ impl Hub {
             // Enqueue-to-acknowledgement latency, the metric the spec
             // commits to; terminal outcomes settle the outcome counters.
             self.command_metrics.record_latency(
-                &operation.operation,
+                operation.operation.as_str(),
                 now.saturating_sub(operation.created_at_ms),
             );
             self.command_metrics
-                .record_outcome(&operation.operation, "acknowledged");
+                .record_outcome(operation.operation.as_str(), "acknowledged");
         }
         if let Some(outcome) = CommandMetrics::outcome_label(result.state) {
             self.command_metrics
-                .record_outcome(&operation.operation, outcome);
+                .record_outcome(operation.operation.as_str(), outcome);
         }
         let updated = operation.clone();
         let attempt_id = operation.attempt_id.clone();
@@ -659,10 +673,10 @@ impl Hub {
                 .await
                 .map_err(HubError::from)?;
         }
-        if updated.operation.starts_with("job_") {
+        if updated.operation.is_job() {
             if matches!(
-                updated.operation.as_str(),
-                "job_checkpoint" | "job_savepoint"
+                updated.operation,
+                AgentOperation::JobCheckpoint | AgentOperation::JobSavepoint
             ) {
                 let checkpoint_id = result.observed_checkpoint_id.as_deref();
                 let checkpoint_operations = self
@@ -706,11 +720,12 @@ impl Hub {
                         })
                         .cloned()
                         .collect::<Vec<_>>();
-                    let commit_operation = if updated.operation == "job_savepoint" {
-                        "job_savepoint_commit"
-                    } else {
-                        "job_checkpoint_commit"
-                    };
+                    let commit_operation =
+                        if matches!(updated.operation, AgentOperation::JobSavepoint) {
+                            AgentOperation::JobSavepointCommit
+                        } else {
+                            AgentOperation::JobCheckpointCommit
+                        };
                     let commit_exists = self.operations.read().await.values().any(|operation| {
                         operation.resource_id == updated.resource_id
                             && operation.operation == commit_operation
@@ -731,7 +746,7 @@ impl Hub {
                         })?;
                         self.enqueue_with_metadata(
                             coordinator.node_id.clone(),
-                            commit_operation.into(),
+                            commit_operation,
                             updated.resource_id.clone(),
                             updated.correlation_id.clone(),
                             Some(serde_json::json!({

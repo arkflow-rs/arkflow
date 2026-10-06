@@ -1,10 +1,11 @@
 //! Stream list/get/lifecycle handlers for the local plane, and the Hub's
 //! node-targeted stream command / desired-state handlers.
-use super::{authorized, problem, problem_with_details, require_operator_action, PageQuery};
+use super::{problem, problem_with_details, require_operator_action, PageQuery};
 use crate::api_contract::{
     AcceptedIntentResponse, DesiredStateRequest, OperatorAction, RestartActionRequest,
 };
 use crate::hub;
+use crate::hub::AgentOperation;
 use crate::storage::{self, DesiredMutation};
 use arkflow_core::control::Page;
 use arkflow_core::control_plane::ControlPlane;
@@ -216,7 +217,10 @@ pub(super) async fn hub_targeted_command(
             }
         }
     }
-    match hub.enqueue(node_id, action, id, correlation_id).await {
+    match hub
+        .enqueue(node_id, AgentOperation::parse(&action), id, correlation_id)
+        .await
+    {
         Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
         Err(hub::HubError::NodeUnavailable) => problem(
             StatusCode::CONFLICT,
@@ -412,13 +416,6 @@ pub(super) async fn lifecycle(
     action: &str,
     headers: HeaderMap,
 ) -> Response {
-    if !authorized(&cp, &headers) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "A valid Bearer token is required".into(),
-        );
-    }
     let correlation_id = headers
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())

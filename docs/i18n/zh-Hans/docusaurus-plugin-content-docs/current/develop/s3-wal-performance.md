@@ -50,12 +50,12 @@ Input → append_batch (μs, memory) → segment buffer → channel → PUT work
 
 **并行 PUT 的收益**:多个工作线程在相互独立的有界通道上运行并轮流分配段,在不改变 at-least-once 契约的前提下,为高 QPS 工作负载带来最高 2-3 倍的吞吐提升。使用 8 个工作线程时请注意 S3 的每前缀速率限制。
 
-### 崩溃窗口
+### 重放窗口
 
-"丢失窗口"(loss window)指节点/pod 消失时面临风险的条目数:
+"重放窗口"(replay window)指节点/pod 消失时需要源重新投递的条目数。未密封的条目不会被静默丢失:源确认只有在条目密封进段对象之后才会完成,因此源游标始终落后于密封边界,未密封的工作在重启后由源重新投递(至少一次):
 
 ```
-loss_window = min(
+replay_window = min(
     segment.max_entries,           # entry count trigger
     segment.max_bytes / avg_msg_size,  # byte size trigger
     segment.flush_interval * msg_rate  # time trigger
@@ -67,6 +67,8 @@ loss_window = min(
 | 100ms | 100 条 | 1,000 条 | 10,000 条 |
 | 1s | 1,000 条 | 10,000 条 | 100,000 条 |
 | 5s | 5,000 条 | 50,000 条 | 500,000 条 |
+
+同样的触发条件也限定了密封门控带来的**确认延迟**:一次确认最多等待一个 `flush_interval`(外加段 PUT 时间)等其条目密封;同一段覆盖的所有确认共享这一次等待。若密封在有界窗口(`periodic` 为 `flush_interval × 4 + 5s`,`group_commit` 为 30s)内未落地,确认以可重试错误失败,而不是提交未密封条目;刷洗器持续失败会升级为 error 级日志并计入失败计数——以此区分"刷洗器慢"与"刷洗器已死"。
 
 ## 配置调优
 
@@ -83,18 +85,18 @@ segment:
 
 **权衡:**
 
-| 配置 | 延迟 | 崩溃窗口 | PUT 频率 |
-|---------------|---------|--------------|--------------|
-| 小段(100, 100KB) | 更低的 PUT 延迟 | 更小的窗口 | 更高的 PUT 频率 |
-| 大段(10000, 10MB) | 更高的 PUT 延迟 | 更大的窗口 | 更低的 PUT 频率 |
-| 短间隔(100ms) | 快速刷写 | 小窗口 | 高 PUT 频率 |
-| 长间隔(10s) | 延迟刷写 | 大窗口 | 低 PUT 频率 |
+| 配置 | 延迟 | 重放窗口 / 确认延迟 | PUT 频率 |
+|---------------|---------|----------------------|--------------|
+| 小段(100, 100KB) | 更低的 PUT 延迟 | 更小的窗口、更快的确认 | 更高的 PUT 频率 |
+| 大段(10000, 10MB) | 更高的 PUT 延迟 | 更大的窗口、更慢的确认 | 更低的 PUT 频率 |
+| 短间隔(100ms) | 快速刷写 | 小窗口、确认 ≤ ~100ms | 高 PUT 频率 |
+| 长间隔(10s) | 延迟刷写 | 大窗口、确认 ≤ ~10s | 低 PUT 频率 |
 
 **建议:**
 
 - **高吞吐、放宽的持久性**:`max_entries: 10000`、`max_bytes: 10MB`、`flush_interval: 10s`
 - **均衡**:默认值(`1000`、`1MB`、`1s`)
-- **小崩溃窗口**:`max_entries: 100`、`max_bytes: 100KB`、`flush_interval: 100ms`
+- **小重放窗口**:`max_entries: 100`、`max_bytes: 100KB`、`flush_interval: 100ms`
 
 ### 游标刷写(D6)
 
@@ -123,7 +125,8 @@ cursor:
 | 追加延迟 | ~1μs | ~50μs | 慢 50 倍 |
 | 刷写延迟 | ~2ms | ~50ms | 慢 25 倍 |
 | 吞吐 | 500 MB/s | 150 MB/s | 慢 3 倍 |
-| 崩溃窗口 | ~100 条 | ~1000 条 | 大 10 倍 |
+| 重放窗口 | ~100 条 | ~1000 条 | 大 10 倍 |
+| 额外确认延迟(密封门控) | 无 | ≤ flush_interval | 不适用 |
 | 节点恢复 | ❌ 不支持 | ✅ 支持 | 不适用 |
 
 ## 成本考量
@@ -154,7 +157,7 @@ S3 WAL 后端通过 `segment_tuning.strategy` 支持三种预设策略:
 
 ### 激进(Aggressive)策略
 
-面向高吞吐、低成本——容忍更大的崩溃窗口。
+面向高吞吐、低成本——容忍更大的重放窗口(以及密封门控带来的最多约 10s 的确认延迟)。
 
 ```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
@@ -166,13 +169,13 @@ segment_tuning:
 - `max_bytes: 10MB`
 - `flush_interval: 10s`
 
-**崩溃窗口 @ 10K msg/s**:节点丢失时约 100,000 条消息面临风险
+**重放窗口 @ 10K msg/s、平均 1 KB**:节点丢失时约 10,000 条消息需重新投递(`max_entries`/`max_bytes` 先于 10s 的 `flush_interval` 触发)
 **PUT 成本**:较均衡策略降低约 10 倍
 **吞吐**:最高 200 MB/s
 
 ### 均衡(Balanced)策略(默认)
 
-吞吐与崩溃窗口之间的默认权衡。
+吞吐与重放窗口之间的默认权衡。
 
 ```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
@@ -184,12 +187,12 @@ segment_tuning:
 - `max_bytes: 1MB`
 - `flush_interval: 1s`
 
-**崩溃窗口 @ 10K msg/s**:约 10,000 条消息面临风险
+**重放窗口 @ 10K msg/s、平均 1 KB**:约 1,000 条消息需重新投递(`max_entries`/`max_bytes` 先于 1s 的 `flush_interval` 触发)
 **吞吐**:100-150 MB/s
 
 ### 低延迟(Low-Latency)策略
 
-面向最小崩溃窗口——PUT 频率最高。
+面向最小重放窗口——PUT 频率最高。
 
 ```yaml validate=foreign reason="WAL tuning option fragment"
 segment_tuning:
@@ -201,7 +204,7 @@ segment_tuning:
 - `max_bytes: 100KB`
 - `flush_interval: 100ms`
 
-**崩溃窗口 @ 10K msg/s**:约 1,000 条消息面临风险
+**重放窗口 @ 10K msg/s、平均 1 KB**:约 100 条消息需重新投递(`max_entries`/`max_bytes` 先于 100ms 的 `flush_interval` 触发)
 **吞吐**:因频繁刷写而较低
 
 ### 自定义覆盖
@@ -284,8 +287,8 @@ zstd-9: 50000 -> 276 bytes (ratio: 181.16x)
 
 ### 段 PUT 部分失败
 
-- **现状**:丢失的段在恢复时被跳过(D7)。PUT 工作线程记录错误但继续处理
-- **影响**:仅该段的数据丢失
+- **现状**:段 PUT 失败会把暂存条目恢复回活动段并在下一个刷洗节拍重试;唤醒路径上的失败会计数并输出日志(限速 warn,持续失败升级为 error),而不是被静默吞掉。恢复时另会跳过被 manifest 引用但已丢失的段(D7)
+- **影响**:受影响条目的确认被推迟(密封门控),PUT 持续失败时确认以可重试错误失败——由源重新投递,已确认的条目不会丢失
 - **缓解措施**:启用 S3 服务端加密与版本控制
 
 ## 监控

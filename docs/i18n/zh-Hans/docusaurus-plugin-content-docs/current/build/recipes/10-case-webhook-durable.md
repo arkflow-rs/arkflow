@@ -81,6 +81,6 @@ curl -X POST http://localhost:8080/webhooks \
 
 ## 权衡与变体
 
-- 用 `sync: per_entry` 替代 `group_commit`,以吞吐量换取更窄的丢失窗口(参见[WAL 优化](/zh-Hans/docs/build/wal))。
+- 用 `sync: per_entry` 替代 `group_commit`,以吞吐量换取更窄的重放窗口(参见[WAL 优化](/zh-Hans/docs/build/wal))。
 - 把 SQL 处理器换成 [VRL](/zh-Hans/docs/components/processors/vrl),在转发前抹除敏感字段。
 - Kafka 侧的精确一次(exactly-once)可通过事务性输出实现——参见[精确一次](/zh-Hans/docs/build/exactly-once)。

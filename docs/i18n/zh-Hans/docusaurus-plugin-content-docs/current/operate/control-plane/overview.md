@@ -11,8 +11,23 @@ ArkFlow 提供一个可选的控制平面,用于把多个计算节点当作机�
 
 控制平面与健康检查共用同一个 HTTP 服务。通过 `health_check.address` 与
 `health_check.api_prefix` 配置绑定地址和带版本前缀的路径;可选的 `health_check.api_token`
-为生命周期命令以及配置读写启用 Bearer 认证。请将该监听保持在本地,或置于经过认证的反向代理之后。
+为整个带版本前缀的控制 API 启用 Bearer 认证(读写端点一致,见下文)。请将该监听保持在本地,
+或置于经过认证的反向代理之后。
 当 `health_check.hub_urls` 为空(或缺省)时,ArkFlow 以独立(standalone)模式运行,只提供兼容性健康路由;列表非空即启用 Agent 模式并支持多 Hub 故障转移(参见[部署](/zh-Hans/docs/operate/control-plane/deploy#agent-multi-hub-failover))。
+
+## 独立引擎安全
+
+独立引擎与 Hub 一样默认关闭(fail-closed):当 `health_check.address` 为非回环地址且未设置
+`health_check.api_token` 时,启动直接失败。把控制 API 暴露到本机之外之前请先设置 token;
+也可以用 `health_check.insecure_local: true` 显式确认暴露——进程会启动并输出 error 级警告。
+回环绑定且不设 token 时保持本地开发的零摩擦默认。
+
+配置了 `api_token` 后,认证为默认拒绝(default-deny):`/api/v1` 下的**所有**端点——
+包括 `/streams`、`/events`、`/components`、`/schema`、`/api/v1/metrics` 等读端点,
+以及生命周期命令和配置写入——都要求有效的 `Authorization: Bearer <token>` 请求头,
+缺失时返回 `401`。抓取 `/api/v1/metrics` 的监控脚本必须携带 token(或改抓同一监听上的
+顶层 `/metrics`,它对抓取器保持免 token)。健康探针 `/health`、`/readiness`、`/liveness`
+同样保持免认证,以便编排系统探测。
 
 ## API 端点
 

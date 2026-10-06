@@ -4,23 +4,16 @@
 //! the transport-neutral state machine used by the HTTP handlers and Agent
 //! client protocol.
 
-use crate::agent::{delete_checkpoint_artifact, recovery_record_is_valid};
-use crate::api_contract::{OperatorAction, OperatorPrincipal, OperatorRole, ResourceScope};
+use crate::api_contract::OperatorPrincipal;
 use crate::storage::{
-    AttemptRecord, DesiredMutation, IntentRecord, JobCheckpointRecord, JobRecord, JobUpgradeRecord,
-    JobVersionRecord, NodeMutation, ObservedMutation, PersistedOperation, RolloutRecord,
-    RolloutTargetRecord, RolloutTargetUpdate, StorageActor, StorageError,
+    JobCheckpointRecord, JobRecord, JobUpgradeRecord, JobVersionRecord, PersistedOperation,
+    RolloutRecord, StorageActor, StorageError,
 };
-use arkflow_core::control::{
-    ControlEvent, NodeMaintenanceState, OperationRecord, OperationalStatus, ReconciliationHealth,
-    StreamStatus,
-};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use arkflow_core::control::{ControlEvent, OperationRecord, StreamStatus};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, RwLock};
 
 mod checkpoint;
@@ -49,25 +42,13 @@ mod tests;
 pub use command_metrics::CommandMetrics;
 pub use error::HubError;
 pub use leadership::{HubHaConfig, Leadership};
-pub(crate) use wire::default_protocol_version;
 pub use wire::{
-    AgentAuth, AgentCommand, CommandResult, HeartbeatRequest, HubEvent, HubNode, HubNodeMetrics,
-    HubOperation, HubOperationState, JobObservationRequest, NodeConnectionState, NodeReport,
-    RegisterRequest, RegisterResponse,
+    AgentAuth, AgentCommand, AgentOperation, CommandResult, HeartbeatRequest, HubEvent, HubNode,
+    HubNodeMetrics, HubOperation, HubOperationState, JobObservationRequest, NodeConnectionState,
+    NodeReport, RegisterRequest, RegisterResponse,
 };
 
-// Internal helpers referenced across submodules.
-pub(crate) use checkpoint::recovery_record_is_compatible;
-pub(crate) use nodes::{bounded_text, parse_operator_credential, required_capabilities};
-pub(crate) use operations::{is_durable_job_start, MAX_JOB_OPERATION_RETRIES};
-pub(crate) use placement::node_under_pressure;
-// Private helpers the module tests reach through the root glob.
-#[cfg(test)]
-pub(crate) use checkpoint::job_state_format_version;
-#[cfg(test)]
-pub(crate) use nodes::{sanitize_capabilities, sanitize_metrics};
-#[cfg(test)]
-pub(crate) use placement::{rank_candidates, NodeAllocations, RESOURCE_GAUGE_FRESH_MS};
+use nodes::parse_operator_credential;
 
 const MAX_NODES: usize = 256;
 const MAX_COMMANDS_PER_NODE: usize = 128;
@@ -208,7 +189,7 @@ async fn persist_operation(
             operation_id: operation.id.clone(),
             node_id: operation.node_id.clone(),
             resource_id: operation.resource_id.clone(),
-            operation: operation.operation.clone(),
+            operation: operation.operation.to_string(),
             state: serde_json::to_value(operation.state)
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_owned))

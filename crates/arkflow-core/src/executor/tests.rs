@@ -1716,7 +1716,7 @@ fn aligner_holds_buffered_acknowledgements_until_release() {
 // ---------- end-to-end barrier tests ----------
 
 use crate::executor::barrier::ChainSnapshot;
-use crate::executor::task::{run_graph_with_hooks, CheckpointHook};
+use crate::executor::task::{run_graph_with_hooks, ChainHooks, CheckpointHook, EventTimeBinding};
 
 #[tokio::test]
 async fn barrier_flows_to_sink_without_stalling_data() {
@@ -1789,16 +1789,20 @@ async fn barrier_flows_to_sink_without_stalling_data() {
     let mut hooks = std::collections::BTreeMap::new();
     hooks.insert(
         "source-0".to_string(),
-        CheckpointHook {
-            reporter: Some(report_tx),
-            failure_reporter: None,
-            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
-            partition: Some(0),
-            state: None,
-            task_id: Some("source-0".to_string()),
-            event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
+        ChainHooks {
+            checkpoint: CheckpointHook {
+                reporter: Some(report_tx),
+                failure_reporter: None,
+                barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+                state: None,
+                task_id: Some("source-0".to_string()),
+                finished_reporter: None,
+            },
+            event_time: EventTimeBinding {
+                gate: Arc::new(tokio::sync::Mutex::new(None)),
+                partition: Some(0),
+            },
             metrics: None,
-            finished_reporter: None,
         },
     );
 
@@ -4807,9 +4811,12 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
     for entry in ["map-0", "map-1"] {
         hooks.insert(
             entry.to_string(),
-            crate::executor::task::CheckpointHook {
-                reporter: Some(snapshot_tx.clone()),
-                task_id: Some(entry.to_string()),
+            crate::executor::task::ChainHooks {
+                checkpoint: crate::executor::task::CheckpointHook {
+                    reporter: Some(snapshot_tx.clone()),
+                    task_id: Some(entry.to_string()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
@@ -5451,16 +5458,20 @@ async fn barrier_carries_remote_trace_context_across_chains() {
     let mut hooks = std::collections::BTreeMap::new();
     hooks.insert(
         "source-0".to_string(),
-        CheckpointHook {
-            reporter: Some(report_tx),
-            failure_reporter: None,
-            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
-            partition: Some(0),
-            state: None,
-            task_id: Some("source-0".to_string()),
-            event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
+        ChainHooks {
+            checkpoint: CheckpointHook {
+                reporter: Some(report_tx),
+                failure_reporter: None,
+                barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+                state: None,
+                task_id: Some("source-0".to_string()),
+                finished_reporter: None,
+            },
+            event_time: EventTimeBinding {
+                gate: Arc::new(tokio::sync::Mutex::new(None)),
+                partition: Some(0),
+            },
             metrics: None,
-            finished_reporter: None,
         },
     );
 
@@ -7177,19 +7188,23 @@ fn source_hook(
     barrier_rx: flume::Receiver<Envelope>,
     state: Option<Arc<dyn crate::state::StateBackend>>,
     failure_tx: Option<tokio::sync::mpsc::UnboundedSender<Error>>,
-) -> BTreeMap<String, crate::executor::task::CheckpointHook> {
+) -> BTreeMap<String, crate::executor::task::ChainHooks> {
     BTreeMap::from([(
         "source-0".to_string(),
-        crate::executor::task::CheckpointHook {
-            reporter: None,
-            failure_reporter: failure_tx,
-            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
-            partition: Some(0),
-            state,
-            task_id: Some("source-0".to_string()),
-            event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
+        crate::executor::task::ChainHooks {
+            checkpoint: crate::executor::task::CheckpointHook {
+                reporter: None,
+                failure_reporter: failure_tx,
+                barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+                state,
+                task_id: Some("source-0".to_string()),
+                finished_reporter: None,
+            },
+            event_time: crate::executor::task::EventTimeBinding {
+                gate: Arc::new(tokio::sync::Mutex::new(None)),
+                partition: Some(0),
+            },
             metrics: None,
-            finished_reporter: None,
         },
     )])
 }
@@ -8332,17 +8347,17 @@ fn two_source_merge_job() -> JobSpec {
     }
 }
 
-fn barrier_hook_for(task_id: &str) -> crate::executor::task::CheckpointHook {
-    crate::executor::task::CheckpointHook {
-        reporter: None,
-        failure_reporter: None,
-        barrier_rx: None,
-        partition: None,
-        state: None,
-        task_id: Some(task_id.to_string()),
-        event_time_gate: Arc::new(tokio::sync::Mutex::new(None)),
-        metrics: None,
-        finished_reporter: None,
+fn barrier_hook_for(task_id: &str) -> crate::executor::task::ChainHooks {
+    crate::executor::task::ChainHooks {
+        checkpoint: crate::executor::task::CheckpointHook {
+            reporter: None,
+            failure_reporter: None,
+            barrier_rx: None,
+            state: None,
+            task_id: Some(task_id.to_string()),
+            finished_reporter: None,
+        },
+        ..Default::default()
     }
 }
 
@@ -8371,7 +8386,7 @@ async fn buffered_eos_envelopes_complete_an_in_flight_barrier() {
         .unwrap();
     let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
     let mut left_hook = barrier_hook_for("left-source-0");
-    left_hook.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
+    left_hook.checkpoint.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
     let hooks = BTreeMap::from([
         ("left-source-0".to_string(), left_hook),
         (
@@ -8440,9 +8455,9 @@ async fn barrier_alignment_overflow_releases_the_buffered_data() {
     let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
     let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut left_hook = barrier_hook_for("left-source-0");
-    left_hook.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
+    left_hook.checkpoint.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
     let mut merge_hook = barrier_hook_for("merge-0");
-    merge_hook.failure_reporter = Some(failure_tx);
+    merge_hook.checkpoint.failure_reporter = Some(failure_tx);
     let hooks = BTreeMap::from([
         ("left-source-0".to_string(), left_hook),
         ("merge-0".to_string(), merge_hook),
@@ -8526,10 +8541,10 @@ async fn interior_barrier_snapshot_failure_reports_and_forwards() {
     let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
     let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut source_hook = barrier_hook_for("source-0");
-    source_hook.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
+    source_hook.checkpoint.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
     let mut map_hook = barrier_hook_for("m-0");
-    map_hook.state = Some(Arc::new(FailingSnapshotBackend));
-    map_hook.failure_reporter = Some(failure_tx);
+    map_hook.checkpoint.state = Some(Arc::new(FailingSnapshotBackend));
+    map_hook.checkpoint.failure_reporter = Some(failure_tx);
     let hooks = BTreeMap::from([
         ("source-0".to_string(), source_hook),
         ("m-0".to_string(), map_hook),

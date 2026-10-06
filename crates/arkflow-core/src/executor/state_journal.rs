@@ -2020,6 +2020,7 @@ mod tests {
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
+    use crate::executor::commit::{AckTracker, TrackingAck};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn backend() -> Arc<dyn StateBackend> {
@@ -2686,6 +2687,41 @@ mod coverage_tests {
         // that still rewinds the wrapped acknowledgement.
         ack.undo().await.unwrap();
         assert!(inner.undone.load(Ordering::SeqCst));
+
+        // Tracker level — the exact regression trigger of fix-ack-stall-modes:
+        // a `TrackingAck` around this `CommitOnAck`, the error path aborts
+        // the delivery, and the buffering operator's compensation chain
+        // (held release / ConcurrentAck / CommitGroupOnAck undo chain) calls
+        // undo one step late. Before the terminal guard that late undo
+        // swapped `completed` back to false and decremented the tracker
+        // count, re-adding a terminally settled delivery to the barrier
+        // blocking count — every later checkpoint round then waited (and
+        // timed out) on a delivery that would never settle, while data kept
+        // flowing. The journal-level assertions above alone missed this.
+        let tracker = Arc::new(AckTracker::new());
+        let tracked_inner = RecordingAck::succeeding();
+        let tracked_txn = journal.begin().unwrap();
+        journal
+            .put(tracked_txn, "ns", b"k2", b"v".to_vec(), None)
+            .unwrap();
+        let tracked: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            Arc::new(CommitOnAck::new(
+                journal.clone(),
+                tracked_txn,
+                tracked_inner.clone(),
+            )),
+        ));
+        assert_eq!(tracker.blocking(), 1);
+        tracked.abort().await.unwrap();
+        assert_eq!(tracker.blocking(), 0);
+        assert!(tracked_inner.aborted.load(Ordering::SeqCst));
+        tracked.undo().await.unwrap();
+        assert_eq!(
+            tracker.blocking(),
+            0,
+            "a late undo after abort must not resurrect the barrier blocking count"
+        );
     }
 
     #[tokio::test]

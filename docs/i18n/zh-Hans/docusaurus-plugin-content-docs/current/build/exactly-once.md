@@ -88,11 +88,12 @@ output:
   offset_commit_group: orders-copy-group   # must name the input's consumer_group
 ```
 
-- **输入侧 `transactional_offsets: true`** 把消费者组元数据注册到进程内注册表,并把 `ack()` 改为只推进内存 frontier——输入不再自行提交偏移量;broker 组位点只随输出事务前进。
-- **输出侧 `offset_commit_group`**(要求 `exactly_once: true`)从各批次的 `__meta_partition`/`__meta_offset` 列推导覆盖位点(每分区取最大偏移量 +1),折入与写入相同的事务,因此源消费组的 `read_committed` 消费者原子地观察到写入与位点推进。事务回滚时组位点不变,该范围被重放。
+- **输入侧 `transactional_offsets: true`** 把消费者组元数据注册到进程内注册表,并把 `ack()` 改为只推进内存 frontier——输入不再自行提交偏移量(其 `undo()` 补偿也只回退该 frontier);broker 组位点只随输出事务前进。
+- **输出侧 `offset_commit_group`**(要求 `exactly_once: true`)从各批次的 `__meta_partition`/`__meta_offset` 列推导覆盖位点,折入与写入相同的事务。每分区的提交**钳制到配对输入的连续确认前沿**——逐分区 `min(批内最大偏移量 +1, 前沿 next)`,且不低于本生产者已发送过的值——图中其他分支(内容路由、扇出、过滤)仍在结算的位点因此**永远不会**被事务性跳过:任何时刻崩溃,至少重放未结算部分。钳制使位点提交比写入滞后一批(事务只能提交先前确认已结算的前沿),因此边界是**至少一次、尾部至多一批重复**:停机前最后写出的那批可能重放。源消费组的 `read_committed` 消费者仍然原子地观察到写入与位点推进;事务回滚时组位点不变,该范围被重放。
 
 L3 的边界以显式报错而非静默降级来执行:
 
+- **配对在启动期校验(fail-closed)**——声明了 `transactional_offsets: true` 的 Kafka 输入,其消费者组若从未被任何输出的 `offset_commit_group` 指名,组位点将静默无人提交(崩溃后组完全按 `auto.offset.reset` 重启,`latest` 会跳过期间生产的全部记录)。流/作业的全部组件构建完成后,启动校验以配置错误拒绝该配置,错误指名组与两侧配置键。
 - **进程内配对**——输出通过进程内注册表解析被指名的组;输入与输出必须运行在同一个 ArkFlow 进程内。输入与输出跨节点的分布式作业不在覆盖范围(独立变更)。`offset_commit_group` 指名的组没有声明 `transactional_offsets` 的活输入时,写入失败。
 - **单一输入主题**——批次元数据只带分区不带主题,注册表按输入的主题列表路由;多主题订阅会被拒绝。
 - **仅限 Kafka → Kafka**——不含 Kafka 源元数据列的批次不贡献位点(写入照常进行);非 Kafka 源无法与事务性输出配对。这类批次**不在 L3 保证之内**:声明 `transactional_offsets: true` 后输入不再自行提交位点,若后续没有携带元数据的事务推进组位点,重启会重放这些记录并造成重复输出——请保持 Kafka 输入与输出之间的管道不含丢弃元数据的处理器(如 `json_to_arrow` 这类重建批次的变换),否则在下游吸收重复。
@@ -104,6 +105,6 @@ L3 的边界以显式报错而非静默降级来执行:
 ## 要求摘要
 
 - `exactly_once: true` 要求非空的 `transactional_id`;否则校验失败并给出明确错误。
-- `offset_commit_group` 要求 `exactly_once: true`;否则 builder 拒绝该配置。被指名的组必须有同进程、声明了 `transactional_offsets: true` 的 Kafka 输入,否则写入以配置错误失败。
+- `offset_commit_group` 要求 `exactly_once: true`;否则 builder 拒绝该配置。被指名的组必须有同进程、声明了 `transactional_offsets: true` 的 Kafka 输入:事务性输入未被任何输出认领的配置**启动即失败**(配置错误);写入时组无活输入则以配置错误失败该次写入。
 - WAL 的对象存储 `node_id` 与 Kafka `transactional_id` 是**相互独立**的配置值——互不派生。
 - 事务性 Kafka 输出之外的其他输出保持当前默认的至少一次行为。其他 sink 的幂等适配器(SQL UPSERT 等)可在后续变更中添加。

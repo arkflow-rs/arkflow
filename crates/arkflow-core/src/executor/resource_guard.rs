@@ -16,6 +16,7 @@ use crate::temporary::Temporary;
 use crate::Error;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 /// One connected resource, closed in reverse connection order.
 enum Guarded {
@@ -55,6 +56,59 @@ fn source_name(source: &Arc<dyn Input>) -> &'static str {
     // `Input` exposes no type name; the label is only used for close logs.
     let _ = source;
     "input"
+}
+
+/// One startup validation callback. Registered by plugin layers (e.g. the
+/// Kafka L3 input/output pairing check) and invoked by
+/// [`JobResourceGuard::connect`] once every component of the graph is built
+/// and before any resource connects — a fail-closed gate for cross-
+/// component configuration contracts that neither side can check at its
+/// own build time (the other component may not exist yet).
+pub type StartupValidator = Arc<dyn Fn() -> Result<(), Error> + Send + Sync>;
+
+fn startup_validators() -> &'static Mutex<Vec<StartupValidator>> {
+    static VALIDATORS: OnceLock<Mutex<Vec<StartupValidator>>> = OnceLock::new();
+    VALIDATORS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a process-wide startup validator. Idempotent per validator
+/// instance (Arc identity), so lazily re-registering from a component build
+/// path never accumulates duplicates.
+pub fn register_startup_validator(validator: StartupValidator) {
+    let mut validators = startup_validators()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !validators
+        .iter()
+        .any(|registered| Arc::ptr_eq(registered, &validator))
+    {
+        validators.push(validator);
+    }
+}
+
+pub(crate) fn run_startup_validators() -> Result<(), Error> {
+    // Clone before invoking: a panicking validator must not poison the
+    // registry for every later connect in this process (and a validator
+    // that re-registers would deadlock on the held, non-reentrant lock).
+    // A poisoned lock still yields the (structurally intact) list.
+    let validators = startup_validators()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for validator in validators.iter() {
+        validator()?;
+    }
+    Ok(())
+}
+
+/// Number of registered startup validators (test observation for the
+/// idempotent-registration property).
+#[cfg(test)]
+fn startup_validator_count() -> usize {
+    startup_validators()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
 }
 
 /// Connects a Job's resources in dependency order and closes them in
@@ -106,6 +160,11 @@ impl JobResourceGuard {
         sinks: &[Arc<dyn Output>],
         states: &[(String, Arc<dyn StateBackend>)],
     ) -> Result<Self, Error> {
+        // Cross-component startup validation (all components of this graph
+        // are built; nothing is connected yet, so a rejection needs no
+        // cleanup). Plugin layers register their validators through
+        // `register_startup_validator`.
+        run_startup_validators()?;
         let guard = Self::new();
         let mut connected = Vec::new();
         // State backends open eagerly at construction; registering them first
@@ -636,5 +695,59 @@ mod tests {
         let _ = state.metrics().unwrap();
         state.close().unwrap();
         assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Startup validators run before anything connects: a rejecting
+    /// validator fails `connect` with nothing opened, and re-registering
+    /// the same validator instance (plugin build paths re-register lazily)
+    /// never duplicates it. The validator rejects only when the CALLING
+    /// thread armed it (validators run synchronously inside `connect`
+    /// before its first await, so sibling `connect` tests on other test
+    /// threads stay unaffected).
+    #[tokio::test]
+    #[allow(clippy::cloned_ref_to_slice_refs)]
+    async fn a_rejecting_startup_validator_fails_connect_before_opening_anything() {
+        thread_local! {
+            static REJECT_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        static VALIDATOR: std::sync::OnceLock<StartupValidator> = std::sync::OnceLock::new();
+        let validator = VALIDATOR.get_or_init(|| {
+            Arc::new(|| {
+                if REJECT_THIS_THREAD.with(|flag| flag.get()) {
+                    Err(Error::Config("injected pairing failure".into()))
+                } else {
+                    Ok(())
+                }
+            }) as StartupValidator
+        });
+        register_startup_validator(validator.clone());
+        register_startup_validator(validator.clone());
+        assert_eq!(
+            startup_validator_count(),
+            1,
+            "registration is idempotent per validator instance"
+        );
+
+        let temporary = recording_temporary(false, false);
+        REJECT_THIS_THREAD.with(|flag| flag.set(true));
+        let error = JobResourceGuard::connect(&[temporary.clone()], &[], &[], &[])
+            .await
+            .err()
+            .expect("a rejecting validator must fail connect");
+        REJECT_THIS_THREAD.with(|flag| flag.set(false));
+        assert!(
+            error.to_string().contains("injected pairing failure"),
+            "{error}"
+        );
+        assert_eq!(
+            temporary.connects.load(Ordering::SeqCst),
+            0,
+            "validation precedes any connection"
+        );
+        assert_eq!(
+            temporary.closes.load(Ordering::SeqCst),
+            0,
+            "nothing connected means nothing to close"
+        );
     }
 }

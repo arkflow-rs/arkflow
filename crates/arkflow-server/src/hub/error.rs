@@ -1,6 +1,6 @@
 //! Hub error surface: storage-unaware callers get a stable enum.
 
-use super::*;
+use crate::storage::StorageError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HubError {
@@ -67,7 +67,8 @@ impl From<StorageError> for HubError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::HubError;
+    use crate::storage::StorageError;
 
     /// Every variant lands in exactly one failure class: operators route on
     /// these strings, so an unknown variant must not silently invent one.

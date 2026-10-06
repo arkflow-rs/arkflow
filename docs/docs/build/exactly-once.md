@@ -123,22 +123,38 @@ output:
 
 - **Input `transactional_offsets: true`** registers the consumer group's
   metadata in a process-internal registry and changes `ack()` to advance only
-  the in-memory frontier — the input no longer commits offsets itself; broker
-  group offsets advance only with output transactions.
+  the in-memory frontier — the input no longer commits offsets itself (its
+  `undo()` compensation rewinds only that frontier); broker group offsets
+  advance only with output transactions.
 - **Output `offset_commit_group`** (requires `exactly_once: true`) derives the
   covered offsets from each batch's `__meta_partition`/`__meta_offset` columns
-  (max offset + 1 per partition) and folds them into the same transaction as
-  the writes, so a `read_committed` consumer of the source group observes
-  writes and offset advances atomically. A rolled-back transaction leaves the
-  group offsets unchanged and the range is replayed.
+  and folds them into the same transaction as the writes. Each partition's
+  commit is **clamped to the paired input's contiguous acknowledged frontier**
+  — `min(batch max offset + 1, frontier next)` per partition, never regressing
+  below what this producer already sent — so offsets still settling elsewhere
+  in the graph (content routing, fan-out, filtered branches) can never be
+  transactionally skipped: any crash replays at least the unsettled part. The
+  clamp makes the commit lag one batch behind the writes (a transaction may
+  only commit what previous acknowledgements settled), so the bound is
+  **at-least-once with at most one batch of tail duplication**: the last
+  written batch before a shutdown may replay. A `read_committed` consumer of
+  the source group still observes writes and offset advances atomically, and a
+  rolled-back transaction leaves the group offsets unchanged.
 
 L3 boundaries, enforced by explicit errors rather than silent degradation:
 
+- **Pairing is validated at startup (fail-closed)** — a Kafka input declaring
+  `transactional_offsets: true` whose consumer group is never named by any
+  output's `offset_commit_group` would silently never commit its group offsets
+  (a crash then restarts the group purely per `auto.offset.reset`, and
+  `latest` skips everything produced meanwhile). Once all components of a
+  stream/job are built, startup validation rejects such a configuration with
+  a configuration error naming the group and both keys.
 - **Process-internal pairing** — the output resolves the named group through
   the in-process registry; the input and output must run in the same ArkFlow
   process. Distributed jobs that split input and output across nodes are not
-  covered (independent change). An `offset_commit_group` naming a group with no
-  live `transactional_offsets` input fails the write.
+  covered (independent change). An `offset_commit_group` naming a group with
+  no live `transactional_offsets` input fails the write.
 - **Single input topic** — batch metadata carries partitions without topics, so
   the registry routes by the input's topic list; a multi-topic subscription is
   rejected.
@@ -162,8 +178,9 @@ A complete runnable L3 example is in
   with a clear error otherwise.
 - `offset_commit_group` requires `exactly_once: true`; the builder rejects the
   configuration otherwise. The named group must have a same-process Kafka input
-  with `transactional_offsets: true`, or the write fails with a configuration
-  error.
+  with `transactional_offsets: true`: a configuration whose transactional input
+  is never claimed by any output **fails startup** with a configuration error,
+  and a write against a group with no live input fails the write.
 - The WAL's object-store `node_id` and the Kafka `transactional_id` are
   **independent** configuration values — neither is derived from the other.
 - Outputs other than the transactional Kafka output keep today's default

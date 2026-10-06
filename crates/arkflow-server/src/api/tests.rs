@@ -21,6 +21,7 @@ async fn hub_problem_maps_stale_leader_to_503() {
 }
 
 use super::*;
+use crate::hub::AgentOperation;
 
 fn headers_with(authorization: Option<&str>) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -422,6 +423,171 @@ async fn hub_startup_policy_covers_local_external_storage_and_credentials() {
     assert!(secure.validate_hub_startup(&valid_hub).is_ok());
 }
 
+/// Standalone startup guard: non-loopback without a token refuses startup
+/// (naming both remedies), explicit `insecure_local` proceeds with a warning,
+/// and loopback keeps the zero-friction local-development default. A
+/// configured token lifts the guard for external binds.
+#[tokio::test]
+async fn standalone_startup_guard_covers_loopback_external_and_insecure_local() {
+    fn plain_node(token: Option<&str>) -> NodeConfig {
+        NodeConfig {
+            control_api: ControlApiConfig {
+                api_token: token.map(str::to_string),
+                ..Default::default()
+            },
+            ..NodeConfig::default()
+        }
+    }
+    let plain_config = |node: NodeConfig| EngineConfig {
+        streams: vec![],
+        jobs: Vec::new(),
+        logging: LoggingConfig::default(),
+        node,
+    };
+
+    let external = ServerConfig {
+        address: "0.0.0.0:8080".into(),
+        ..ServerConfig::default()
+    };
+    // Non-loopback, no token, no opt-in: refused with both remedies named.
+    let unguarded = Engine::new(plain_config(plain_node(None))).control_plane();
+    let message = validate_standalone_startup(&external, &unguarded)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("health_check.api_token"), "{message}");
+    assert!(message.contains("insecure_local"), "{message}");
+
+    // The same deployment through `serve` fails before the listener binds.
+    let error = serve(
+        unguarded.clone(),
+        external.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("non-loopback"), "{error}");
+
+    // Explicit opt-in proceeds on the external bind (with an error-level
+    // warning logged).
+    let insecure = ServerConfig {
+        insecure_local: true,
+        ..external.clone()
+    };
+    let address = validate_standalone_startup(&insecure, &unguarded)
+        .expect("insecure_local proceeds on an external bind");
+    assert_eq!(address.ip().to_string(), "0.0.0.0");
+
+    // Loopback keeps the zero-friction default.
+    let loopback = ServerConfig {
+        address: "127.0.0.1:8080".into(),
+        ..ServerConfig::default()
+    };
+    assert!(validate_standalone_startup(&loopback, &unguarded).is_ok());
+
+    // A configured token lifts the guard for external binds.
+    let credentialed = Engine::new(plain_config(plain_node(Some("token")))).control_plane();
+    assert!(validate_standalone_startup(&external, &credentialed).is_ok());
+}
+
+/// The default-deny middleware covers read and write endpoints uniformly:
+/// without a configured token every request passes through (the startup
+/// guard limits that to loopback binds); with a token every endpoint answers
+/// 401 for a missing or wrong Bearer and succeeds with the correct one.
+#[tokio::test]
+async fn local_plane_requires_bearer_auth_uniformly_across_read_and_write() {
+    fn local_app(token: Option<&str>) -> Router {
+        let engine = Engine::new(EngineConfig {
+            streams: vec![],
+            jobs: Vec::new(),
+            logging: LoggingConfig::default(),
+            node: NodeConfig {
+                control_api: ControlApiConfig {
+                    api_token: token.map(str::to_string),
+                    ..Default::default()
+                },
+                ..NodeConfig::default()
+            },
+        });
+        router(engine.control_plane(), &ServerConfig::default())
+    }
+
+    // Read endpoints (streams/events/metrics) and the mutating config apply
+    // share one auth matrix.
+    let requests = [
+        ("GET", "/api/v1/streams"),
+        ("POST", "/api/v1/config/apply"),
+        ("GET", "/api/v1/events"),
+        ("GET", "/api/v1/metrics"),
+    ];
+    let apply_body =
+        serde_json::json!({"format": "json", "content": "{\"streams\":[]}"}).to_string();
+
+    // No token configured: the middleware passes through (loopback context).
+    let open = local_app(None);
+    for (method, path) in requests {
+        let response = open
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(apply_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "no-token pass-through failed: {method} {path}"
+        );
+    }
+
+    let guarded = local_app(Some("secret"));
+    for (method, path) in requests {
+        for (label, credential) in [("missing", None), ("wrong", Some("Bearer wrong-token"))] {
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(value) = credential {
+                builder = builder.header("authorization", value);
+            }
+            let response = guarded
+                .clone()
+                .oneshot(
+                    builder
+                        .body(axum::body::Body::from(apply_body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{label} credential must be denied: {method} {path}"
+            );
+        }
+        let response = guarded
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer secret")
+                    .body(axum::body::Body::from(apply_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "correct credential must pass: {method} {path}"
+        );
+    }
+}
+
 /// The API-server-disabled process still exposes observability endpoints:
 /// `/metrics` returns a valid exposition and `/ready` flips from 503 to
 /// 200 once the engine runtime reports readiness.
@@ -586,10 +752,24 @@ async fn resource_api_integration_covers_routes_filters_redaction_and_aliases() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
+    // Default-deny middleware: with a token configured even reads answer
+    // 401 without credentials...
     let response = app
         .clone()
         .oneshot(
             axum::http::Request::get("/api/v1/streams/missing")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // ...while the authenticated call still reaches the handler's 404 arm.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/api/v1/streams/missing")
+                .header("authorization", auth)
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
@@ -702,6 +882,9 @@ async fn resource_api_integration_covers_routes_filters_redaction_and_aliases() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
+    // The public-catalogue exemption the Hub grants does not exist on the
+    // local plane: components read routes require the token like everything
+    // else under the versioned prefix.
     let response = app
         .clone()
         .oneshot(
@@ -711,11 +894,22 @@ async fn resource_api_integration_covers_routes_filters_redaction_and_aliases() 
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let response = app
         .clone()
         .oneshot(
             axum::http::Request::get("/api/v1/components/input/generate")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/api/v1/components/input/generate")
+                .header("authorization", auth)
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
@@ -1400,7 +1594,7 @@ async fn configuration_apply_persists_target_and_reconciles_offline_write() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(operation.operation, "apply_configuration");
+    assert_eq!(operation.operation.as_str(), "apply_configuration");
     assert_eq!(
         operation.config_version_id.as_deref(),
         Some(config_version.as_str())
@@ -1413,7 +1607,7 @@ async fn configuration_apply_persists_target_and_reconciles_offline_write() {
         .await;
     let commands = commands.unwrap();
     assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].operation, "apply_configuration");
+    assert_eq!(commands[0].operation.as_str(), "apply_configuration");
     assert_eq!(
         commands[0].config_version_id.as_deref(),
         Some(config_version.as_str())
@@ -2303,7 +2497,7 @@ async fn hub_configuration_validate_and_diff_round_trip_through_commands() {
     let commands: Vec<hub::AgentCommand> = serde_json::from_slice(&body).unwrap();
     let command = commands
         .iter()
-        .find(|command| command.operation == "validate_configuration")
+        .find(|command| command.operation.as_str() == "validate_configuration")
         .expect("validate command dispatched");
     assert!(command.payload.is_some());
 
@@ -6074,7 +6268,7 @@ async fn no_storage_hub_reports_enqueue_and_orchestration_limits() {
         let _ = hub
             .enqueue(
                 "node-caps".into(),
-                "validate_configuration".into(),
+                AgentOperation::parse("validate_configuration"),
                 format!("cap-{index}"),
                 None,
             )

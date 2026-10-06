@@ -1,6 +1,17 @@
 //! Job reconciliation and node placement: retention, fencing, ranking.
 
-use super::*;
+use super::checkpoint::recovery_record_is_compatible;
+use super::command_metrics::CommandMetrics;
+use super::error::HubError;
+use super::operations::{is_durable_job_start, MAX_JOB_OPERATION_RETRIES};
+use super::wire::{AgentOperation, HubOperation, HubOperationState, NodeConnectionState};
+use super::{now_ms, persist_operation, Hub, NodeRecord};
+use crate::agent::recovery_record_is_valid;
+use crate::storage::JobRecord;
+use arkflow_core::control::NodeMaintenanceState;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 
 const MAX_JOB_RECONCILIATIONS_PER_TICK: usize = 256;
 /// Fleet-level "node pressuring" judgment: memory used ratio or CPU above
@@ -178,7 +189,7 @@ impl Hub {
             .values()
             .filter(|operation| {
                 operation.resource_id == job_id
-                    && operation.operation == "job_start"
+                    && operation.operation == AgentOperation::JobStart
                     && operation.generation <= generation
                     && !matches!(
                         operation.state,
@@ -479,7 +490,7 @@ impl Hub {
             let mut latest_start_ms: Option<u64> = None;
             for operation_record in operations.values() {
                 if operation_record.resource_id != job.job_id
-                    || operation_record.operation != "job_start"
+                    || operation_record.operation != AgentOperation::JobStart
                     || operation_record.generation != job.generation
                 {
                     continue;
@@ -566,8 +577,8 @@ impl Hub {
         let plan = arkflow_core::job::JobPlan::compile(spec.clone())
             .map_err(|error| HubError::Invalid(error.to_string()))?;
         let operation = match job.desired_state.as_str() {
-            "running" => "job_start",
-            "stopped" => "job_stop",
+            "running" => AgentOperation::JobStart,
+            "stopped" => AgentOperation::JobStop,
             _ => return Ok(0),
         };
         // A durable state directory is not a disposable cache.  Once a Job
@@ -575,7 +586,7 @@ impl Hub {
         // restore a compatible completed checkpoint before any source is
         // started again.  The first start of a brand-new Job is exempt: no
         // prior committed state exists yet.
-        let persisted_job_starts = if operation == "job_start"
+        let persisted_job_starts = if operation == AgentOperation::JobStart
             && spec.state.as_ref().is_some_and(|state| {
                 state.durability == arkflow_core::job::StateDurability::Durable
             })
@@ -598,7 +609,7 @@ impl Hub {
         } else {
             Vec::new()
         };
-        let recovery_required = if operation == "job_start"
+        let recovery_required = if operation == AgentOperation::JobStart
             && spec.state.as_ref().is_some_and(|state| {
                 state.durability == arkflow_core::job::StateDurability::Durable
             })
@@ -624,7 +635,7 @@ impl Hub {
             let current_generation_requires_recovery =
                 operations.values().any(|operation_record| {
                     operation_record.resource_id == job.job_id
-                        && operation_record.operation == "job_start"
+                        && operation_record.operation == AgentOperation::JobStart
                         && operation_record.generation == job.generation
                         && (operation_record.failure_class.as_deref() == Some("recovery_required")
                             || (operation_record.state == HubOperationState::Succeeded
@@ -691,7 +702,7 @@ impl Hub {
         // Opt-in pressure rebalance: exclude nodes whose sustained-pressure
         // streak trips the Job's policy. The abandoned-placement fencing
         // below then supersedes their starts and dispatches their stops.
-        let evictions = if operation == "job_start" {
+        let evictions = if operation == AgentOperation::JobStart {
             self.rebalance_evictions(job, &spec, &targets).await
         } else {
             BTreeSet::new()
@@ -706,7 +717,7 @@ impl Hub {
             .values()
             .filter(|operation_record| {
                 operation_record.resource_id == job.job_id
-                    && operation_record.operation == "job_start"
+                    && operation_record.operation == AgentOperation::JobStart
                     // Keep starts from older generations in the placement
                     // history: a generation change may move a Job to another
                     // node, and the old node must receive a stop command.
@@ -727,7 +738,7 @@ impl Hub {
             .values()
             .filter(|operation_record| {
                 operation_record.resource_id == job.job_id
-                    && operation_record.operation == "job_start"
+                    && operation_record.operation == AgentOperation::JobStart
                     && operation_record.generation <= job.generation
                     && !matches!(
                         operation_record.state,
@@ -752,7 +763,7 @@ impl Hub {
                 break;
             }
         }
-        let retention_won = operation == "job_start"
+        let retention_won = operation == AgentOperation::JobStart
             && job.node_ids.is_empty()
             && previous_nodes_all_online
             && evictions.is_empty();
@@ -763,7 +774,9 @@ impl Hub {
             // drift between dispatches.
             self.retained_targets_in_dispatch_order(&job.job_id, &previous_nodes)
                 .await
-        } else if operation == "job_start" && job.node_ids.is_empty() && !previous_nodes.is_empty()
+        } else if operation == AgentOperation::JobStart
+            && job.node_ids.is_empty()
+            && !previous_nodes.is_empty()
         {
             // Incremental re-placement (partial node failure): replace only
             // the failed slots of the remembered dispatch order so every
@@ -785,7 +798,7 @@ impl Hub {
             } else {
                 merged
             }
-        } else if operation == "job_stop" {
+        } else if operation == AgentOperation::JobStop {
             // A stopped Job must reach every node that may still host an
             // older generation. Such a node is not necessarily part of
             // the current explicit placement (for example after a move
@@ -876,13 +889,13 @@ impl Hub {
         // reconcile that fails validation above dispatches nothing, and
         // recording its (never-dispatched) order here would corrupt the
         // retention memory for the still-live placement.
-        if operation == "job_start" && job.node_ids.is_empty() && !retention_won {
+        if operation == AgentOperation::JobStart && job.node_ids.is_empty() && !retention_won {
             self.placement_order
                 .write()
                 .await
                 .insert(job.job_id.clone(), targets.clone());
         }
-        if operation == "job_start" {
+        if operation == AgentOperation::JobStart {
             // Auto-placement fencing: when the reconciler re-places a Job
             // (its previous placement lost its lease or was partitioned), the
             // abandoned node's Succeeded start at THIS generation still
@@ -905,7 +918,7 @@ impl Hub {
                     .values()
                     .filter(|operation_record| {
                         if operation_record.resource_id != job.job_id
-                            || operation_record.operation != "job_start"
+                            || operation_record.operation != AgentOperation::JobStart
                             || operation_record.generation != job.generation
                             || operation_record.state != HubOperationState::Succeeded
                         {
@@ -978,7 +991,7 @@ impl Hub {
                     .any(|operation_record| {
                         operation_record.node_id == *node_id
                             && operation_record.resource_id == job.job_id
-                            && operation_record.operation == "job_stop"
+                            && operation_record.operation == AgentOperation::JobStop
                             && operation_record.generation == job.generation
                             && operation_record.state == HubOperationState::Succeeded
                     });
@@ -993,7 +1006,7 @@ impl Hub {
                 if is_online {
                     self.enqueue_with_metadata(
                         node_id.clone(),
-                        "job_stop".into(),
+                        AgentOperation::JobStop,
                         job.job_id.clone(),
                         None,
                         Some(serde_json::json!({"job_id": job.job_id})),
@@ -1060,7 +1073,7 @@ impl Hub {
             // recorded assignment fingerprint to match the computed
             // assignment: a Succeeded start must not suppress a start for a
             // mapping it was never dispatched with.
-            let fingerprint_matches = operation != "job_start"
+            let fingerprint_matches = operation != AgentOperation::JobStart
                 || self
                     .start_dispatch_fingerprints
                     .read()
@@ -1090,7 +1103,7 @@ impl Hub {
                 .filter(|assignment| assignment.node_id == node_id)
                 .cloned()
                 .collect::<Vec<_>>();
-            if operation == "job_start" && node_assignments.is_empty() {
+            if operation == AgentOperation::JobStart && node_assignments.is_empty() {
                 continue;
             }
             let mut payload_value = serde_json::json!({
@@ -1111,7 +1124,7 @@ impl Hub {
                 }
             }
             let payload = Some(payload_value);
-            let fingerprint = if operation == "job_start" {
+            let fingerprint = if operation == AgentOperation::JobStart {
                 Some((
                     node_id.clone(),
                     Self::assignment_fingerprint(&assignments, node_id.as_str()),
@@ -1121,7 +1134,7 @@ impl Hub {
             };
             self.enqueue_with_metadata(
                 node_id,
-                operation.into(),
+                operation.clone(),
                 job.job_id.clone(),
                 None,
                 payload.clone(),
@@ -1163,12 +1176,13 @@ impl Hub {
             operations
                 .values()
                 .filter(|record| {
-                    matches!(record.operation.as_str(), "job_start" | "job_stop")
-                        && matches!(
-                            record.state,
-                            HubOperationState::Queued | HubOperationState::Dispatched
-                        )
-                        && record.expires_at_ms.is_some_and(|expires| expires <= now)
+                    matches!(
+                        record.operation,
+                        AgentOperation::JobStart | AgentOperation::JobStop
+                    ) && matches!(
+                        record.state,
+                        HubOperationState::Queued | HubOperationState::Dispatched
+                    ) && record.expires_at_ms.is_some_and(|expires| expires <= now)
                 })
                 .map(|record| record.id.clone())
                 .collect()
@@ -1228,7 +1242,7 @@ impl Hub {
         }
         for record in &mutated {
             self.command_metrics.record_outcome(
-                &record.operation,
+                record.operation.as_str(),
                 CommandMetrics::outcome_label(record.state).unwrap_or("failed"),
             );
         }
