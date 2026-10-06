@@ -22,10 +22,10 @@
 
 ## Decisions
 
-1. **累积器形态：`AvroArrowAccumulator { fields: Vec<Field>, builders: Vec<Box<dyn ArrayBuilder>> }`，构造期从 writer schema 建好 builder，`push(schema-backed value) -> Result`，`finish(num_rows) -> RecordBatch`。**
+1. **累积器形态：`AvroArrowAccumulator { fields: Vec<Field>, leaf_schemas: Vec<AvroSchema>, columns: Vec<Column> }`（`Column` 为各具体 builder 的封闭枚举），构造期从 writer schema 建好 builder，`push(&AvroValue) -> Result`（内部计数行数），`finish() -> RecordBatch`。**
    备选：复用 arrow 的 `RecordBatchOptions`/窄化路径（无此机制）；或逐消息仍建单行批次但重用 builder（仍有一次 batch 构造 + 无法消除 concat 重拷，被否）。
 2. **类型分派复用现有映射表**：每个 leaf 臂（Boolean/Int32/Int64/Float32/Float64/Utf8/Binary/Date32/Time32/Time64/Timestamp(Micro/Milli, tz)/Decimal128 + `[null, T]` union）在累积器 `push` 内对应一个 builder 追加臂，类型集与 `leaf_to_arrow`/`null_column` 一一对应——新增映射或漏映射在构建期以与现有相同的错误文案拒绝。
-3. **codec 分组：decode 循环内 `HashMap<u32, (Arc<CachedSchema>, AccumulatorState)>`？否——顺序语义要求按首次出现分组。** 用 `Vec<(u32, 累积器)>` 保持首次出现顺序 + 小线性查找（schema id 数在批内通常为 1，线性查找零开销）；组顺序 = 首次出现顺序，喂给 `normalize_and_concat` 后列序语义即"跨分组首次出现"。
+3. **codec 分组：decode 循环内 `HashMap<u32, …>`？否——顺序语义要求按首次出现分组。** 用 `Vec<(u32, Group)>`（`Group` 枚举：`Avro(Box<AvroArrowAccumulator>)` / `Protobuf(Vec<RecordBatch>)`——protobuf 每消息批次进同构分组，保持相对顺序稳定）保持首次出现顺序 + 小线性查找（schema id 数在批内通常为 1，线性查找零开销）；组顺序 = 首次出现顺序，喂给 `normalize_and_concat` 后列序语义即"跨分组首次出现"。
 4. **`avro_to_arrow` 保留为薄封装**（构造累积器 → push 一条 → finish），既有 22 个 avro 测试零修改通过即证明映射等价。
 5. **空批与失败语义不变**：单条 push 失败整批报错（fail 模式）；skip 模式属 JSON codec 路径，与 Avro 无关。
 
