@@ -16,10 +16,10 @@
 
 ## 3. CheckpointHook 拆解（core）
 
-- [ ] 3.1 `task.rs`：定义 `EventTimeBinding`（gate/partition）、`ChainHooks`（checkpoint/event_time/metrics），`CheckpointHook` 收窄为 6 个纯 checkpoint 字段；`Default` 语义与今逐字段等价
-- [ ] 3.2 task.rs 内部全部签名与调用点迁移（hooks map 值类型 `ChainHooks`；单关注点函数按 D3 规则收窄，其余收 `&ChainHooks`）
-- [ ] 3.3 构造侧迁移：`kernel_handle.rs`（CheckpointHook 装配处）、`job_runner_adapter.rs`（hooks map 构建）、`executor/tests.rs` 测试构造器与全部 `CheckpointHook::default()`/字面量构造
-- [ ] 3.4 门禁：`cargo test -p arkflow-core` 全绿（~1,111 测试）；`cargo clippy -p arkflow-core` 无新告警
+- [x] 3.1 `task.rs`：定义 `EventTimeBinding`（gate/partition）、`ChainHooks`（checkpoint/event_time/metrics），`CheckpointHook` 收窄为 6 个纯 checkpoint 字段；`Default` 语义与今逐字段等价
+- [x] 3.2 task.rs 内部全部签名与调用点迁移（hooks map 值类型 `ChainHooks`；单关注点函数按 D3 规则收窄，其余收 `&ChainHooks`）
+- [x] 3.3 构造侧迁移：`kernel_handle.rs`（CheckpointHook 装配处）、`job_runner_adapter.rs`（hooks map 构建）、`executor/tests.rs` 测试构造器与全部 `CheckpointHook::default()`/字面量构造
+- [x] 3.4 门禁：`cargo test -p arkflow-core` 全绿（~1,111 测试）；`cargo clippy -p arkflow-core` 无新告警
 
 ## 4. 收尾验证
 

@@ -9,7 +9,7 @@ use crate::executor::graph::ExecutionGraphBuilder;
 use crate::executor::kernel_handle::KernelJobRunner;
 use crate::executor::task::run_graph_with_metrics_startup;
 #[cfg(test)]
-use crate::executor::task::CheckpointHook;
+use crate::executor::task::ChainHooks;
 #[cfg(test)]
 use crate::executor::task::{run_graph, run_graph_with_hooks};
 use crate::job::{JobComponentAdapter, JobPlan, JobSpec};
@@ -1160,7 +1160,7 @@ pub(crate) async fn run_job_with_hooks<A: JobComponentAdapter>(
     adapter: &A,
     resource: &mut Resource,
     cancellation: CancellationToken,
-    hooks: BTreeMap<String, CheckpointHook>,
+    hooks: BTreeMap<String, ChainHooks>,
 ) -> Result<(), Error> {
     let plan = JobPlan::compile(spec.clone())?;
     let state = local_state_backend(&plan)?;
@@ -2368,9 +2368,12 @@ mod runner_tests {
             .map(|task| {
                 (
                     task.id.clone(),
-                    crate::executor::task::CheckpointHook {
-                        task_id: Some(task.id.clone()),
-                        finished_reporter: Some(finished_tx.clone()),
+                    crate::executor::task::ChainHooks {
+                        checkpoint: crate::executor::task::CheckpointHook {
+                            task_id: Some(task.id.clone()),
+                            finished_reporter: Some(finished_tx.clone()),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
                 )
@@ -3373,7 +3376,7 @@ mod runner_tests {
             .map(|task| {
                 (
                     task.id.clone(),
-                    crate::executor::task::CheckpointHook::default(),
+                    crate::executor::task::ChainHooks::default(),
                 )
             })
             .collect::<BTreeMap<_, _>>();

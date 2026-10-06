@@ -76,6 +76,9 @@ pub(crate) fn override_sink_write_timeout_for_tests(timeout: std::time::Duration
 /// end-of-stream). Connects inputs/outputs first and closes them after.
 /// Optional per-chain checkpoint hook: barriers injected at sources are
 /// forwarded with data; chains report snapshots through the sender.
+/// Checkpoint-plane concerns of a chain's runtime hook set: where snapshots
+/// and snapshot failures are reported, where injected barriers arrive, which
+/// state backend to snapshot, and the task identity stamps those reports.
 #[derive(Clone, Default)]
 pub(crate) struct CheckpointHook {
     /// Report snapshots for this chain's entry task (source chains report
@@ -91,17 +94,33 @@ pub(crate) struct CheckpointHook {
     pub state: Option<Arc<dyn crate::state::StateBackend>>,
     /// Stable task identity for checkpoint reports.
     pub task_id: Option<String>,
-    /// Event-time gate for source chains (None = processing time).
-    pub event_time_gate: Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>,
-    /// Source partition bound to this chain (event-time observation).
-    pub partition: Option<u32>,
-    /// Runtime counters for control-plane snapshots (source chains bump
-    /// input counts; dispatch paths bump output/error counts).
-    pub metrics: Option<Arc<crate::runtime::RuntimeMetrics>>,
     /// Reports this chain's exit to the coordinator: a chain whose event loop
     /// returned can no longer process barriers or send checkpoint reports, so
     /// barrier rounds must exempt it from the required participant set.
     pub finished_reporter: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+/// Event-time concerns of a chain's runtime hook set: the watermark gate
+/// driving row-level hold/emit decisions on source chains (an absent gate
+/// means processing time) and the source partition the gate observes.
+#[derive(Clone, Default)]
+pub(crate) struct EventTimeBinding {
+    /// Event-time gate for source chains (None = processing time).
+    pub gate: Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>,
+    /// Source partition bound to this chain (event-time observation).
+    pub partition: Option<u32>,
+}
+
+/// The full runtime hook set handed to each chain's event loop: checkpoint
+/// reporting, event-time binding, and runtime counters, decomposed by
+/// concern. Constructed by the graph runner / kernel handle.
+#[derive(Clone, Default)]
+pub(crate) struct ChainHooks {
+    pub checkpoint: CheckpointHook,
+    pub event_time: EventTimeBinding,
+    /// Runtime counters for control-plane snapshots (source chains bump
+    /// input counts; dispatch paths bump output/error counts).
+    pub metrics: Option<Arc<crate::runtime::RuntimeMetrics>>,
 }
 
 #[cfg(test)]
@@ -140,7 +159,7 @@ pub(crate) async fn run_graph_with_metrics_startup(
         for chain in &graph.chains {
             hooks.insert(
                 chain.entry_task_id().to_owned(),
-                CheckpointHook {
+                ChainHooks {
                     metrics: Some(metrics.clone()),
                     ..Default::default()
                 },
@@ -155,7 +174,7 @@ pub(crate) async fn run_graph_with_metrics_startup(
 pub(crate) async fn run_graph_with_hooks(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
-    hooks: BTreeMap<String, CheckpointHook>,
+    hooks: BTreeMap<String, ChainHooks>,
 ) -> Result<(), Error> {
     run_graph_inner(graph, cancellation, hooks, false, None).await
 }
@@ -165,7 +184,7 @@ pub(crate) async fn run_graph_with_hooks(
 pub(crate) async fn run_graph_with_hooks_startup(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
-    hooks: BTreeMap<String, CheckpointHook>,
+    hooks: BTreeMap<String, ChainHooks>,
     sources_preconnected: bool,
     startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
@@ -175,7 +194,7 @@ pub(crate) async fn run_graph_with_hooks_startup(
 async fn run_graph_inner(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
-    hooks: BTreeMap<String, CheckpointHook>,
+    hooks: BTreeMap<String, ChainHooks>,
     sources_preconnected: bool,
     startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
@@ -191,7 +210,7 @@ async fn run_graph_inner(
 async fn run_graph_inner_instrumented(
     graph: ExecutionGraph,
     cancellation: CancellationToken,
-    hooks: BTreeMap<String, CheckpointHook>,
+    hooks: BTreeMap<String, ChainHooks>,
     sources_preconnected: bool,
     mut startup: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), Error> {
@@ -211,12 +230,15 @@ async fn run_graph_inner_instrumented(
         .collect();
     let mut states: Vec<(String, Arc<dyn crate::state::StateBackend>)> = Vec::new();
     for hook in hooks.values() {
-        if let Some(state) = &hook.state {
+        if let Some(state) = &hook.checkpoint.state {
             if !states
                 .iter()
                 .any(|(_, existing)| Arc::ptr_eq(existing, state))
             {
-                states.push((hook.task_id.clone().unwrap_or_default(), state.clone()));
+                states.push((
+                    hook.checkpoint.task_id.clone().unwrap_or_default(),
+                    state.clone(),
+                ));
             }
         }
     }
@@ -345,7 +367,7 @@ async fn run_graph_inner_instrumented(
 /// The event loop of one chain.
 async fn run_chain(
     chain: Chain,
-    hook: CheckpointHook,
+    hook: ChainHooks,
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
     // Catch a panicking event loop so the owned components are still closed:
@@ -368,8 +390,8 @@ async fn run_chain(
     // The event loop has returned: this chain can no longer process barriers
     // or send checkpoint reports. Tell the coordinator on every exit path so
     // barrier rounds stop requiring (and stop injecting barriers into) it.
-    if let Some(finished) = &hook.finished_reporter {
-        if let Some(task_id) = hook.task_id.as_deref() {
+    if let Some(finished) = &hook.checkpoint.finished_reporter {
+        if let Some(task_id) = hook.checkpoint.task_id.as_deref() {
             let _ = finished.send(task_id.to_owned());
         }
     }
@@ -403,7 +425,7 @@ async fn run_chain(
 
 async fn run_chain_inner(
     chain: &Chain,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
     cancellation: &CancellationToken,
 ) -> Result<(), Error> {
     match (&chain.source, chain.inputs.len()) {
@@ -431,11 +453,11 @@ async fn run_chain_inner(
 async fn run_source_chain(
     chain: &Chain,
     source: &Arc<dyn Input>,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
     cancellation: &CancellationToken,
 ) -> Result<(), Error> {
-    let mut barrier_rx = hook.barrier_rx.clone();
-    let event_gate = hook.event_time_gate.clone();
+    let mut barrier_rx = hook.checkpoint.barrier_rx.clone();
+    let event_gate = hook.event_time.gate.clone();
     // Seals each barrier's acknowledged cut: positions and watermark frozen
     // at injection time, before the barrier flows downstream.
     let frontier = super::commit::CommitFrontier::new();
@@ -505,7 +527,7 @@ async fn run_source_chain(
                         }
                         _ = drain => {}
                         _ = tokio::time::sleep(BARRIER_DRAIN_TIMEOUT) => {
-                            if let Some(reporter) = &hook.failure_reporter {
+                            if let Some(reporter) = &hook.checkpoint.failure_reporter {
                                 let _ = reporter.send(Error::Process(format!(
                                     "checkpoint barrier drain timed out with {} acknowledgements still in flight",
                                     tracker.blocking()
@@ -535,7 +557,7 @@ async fn run_source_chain(
                             // not sealed and not forwarded, like the drain
                             // timeout, so no cut can persist positions this chain
                             // cannot vouch for.
-                            if let Some(reporter) = &hook.failure_reporter {
+                            if let Some(reporter) = &hook.checkpoint.failure_reporter {
                                 let _ = reporter.send(error);
                             }
                             continue;
@@ -543,7 +565,8 @@ async fn run_source_chain(
                     },
                 };
                 let (watermark_ms, watermark_partitions) = hook
-                    .event_time_gate
+                    .event_time
+                    .gate
                     .lock()
                     .await
                     .as_ref()
@@ -565,7 +588,7 @@ async fn run_source_chain(
                 // The snapshot uses spawn_blocking internally, so this only
                 // yields this source loop and does not block the async
                 // runtime's worker threads.
-                let state = match hook.state.clone() {
+                let state = match hook.checkpoint.state.clone() {
                     Some(backend) => tokio::select! {
                         _ = cancellation.cancelled() => {
                             return shutdown_source_chain(chain, hook).await;
@@ -585,8 +608,9 @@ async fn run_source_chain(
                                 Envelope::Barrier(barrier.clone()),
                             ) => result?,
                         }
-                        if let Some(reporter) = &hook.reporter {
+                        if let Some(reporter) = &hook.checkpoint.reporter {
                             let task_id = hook
+                                .checkpoint
                                 .task_id
                                 .clone()
                                 .unwrap_or_else(|| chain.entry_task_id().to_owned());
@@ -601,7 +625,7 @@ async fn run_source_chain(
                         }
                     }
                     Err(error) => {
-                        if let Some(reporter) = &hook.failure_reporter {
+                        if let Some(reporter) = &hook.checkpoint.failure_reporter {
                             let _ = reporter.send(error);
                         }
                         tokio::select! {
@@ -625,7 +649,7 @@ async fn run_source_chain(
                 // partition participates in the minimum even before its
                 // first record arrives.
                 if let Err(error) = seed_event_time_partitions(source, &event_gate, hook).await {
-                    let _ = abort_event_time_held(hook).await;
+                    let _ = abort_event_time_held(&hook.event_time).await;
                     return Err(error);
                 }
                 // `refresh` is synchronous, but extracting its result first
@@ -643,7 +667,7 @@ async fn run_source_chain(
                     Ok(Some(decision)) => decision,
                     Ok(None) => continue,
                     Err(error) => {
-                        let _ = abort_event_time_held(hook).await;
+                        let _ = abort_event_time_held(&hook.event_time).await;
                         return Err(error);
                     }
                 };
@@ -816,7 +840,7 @@ async fn run_source_chain(
                 let partitions =
                     match super::event_time_gate::split_by_physical_partition_for_source(
                         &batch,
-                        hook.partition.unwrap_or(0),
+                        hook.event_time.partition.unwrap_or(0),
                         Some(chain.entry_task_id()),
                     ) {
                         Ok(partitions) => partitions,
@@ -859,7 +883,7 @@ async fn run_source_chain(
                     let decision = match decision_result {
                         Ok(decision) => decision,
                         Err(error) => {
-                            let _ = abort_event_time_held(hook).await;
+                            let _ = abort_event_time_held(&hook.event_time).await;
                             let _ = parent_ack.abort().await;
                             return Err(error);
                         }
@@ -895,9 +919,9 @@ async fn run_source_chain(
 async fn seed_event_time_partitions(
     source: &Arc<dyn Input>,
     event_gate: &Arc<tokio::sync::Mutex<Option<super::event_time_gate::EventTimeGate>>>,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
 ) -> Result<(), Error> {
-    let source_id = hook.task_id.as_deref().unwrap_or("source");
+    let source_id = hook.checkpoint.task_id.as_deref().unwrap_or("source");
     let mut assigned = source
         .watermark_partitions()
         .await?
@@ -905,7 +929,7 @@ async fn seed_event_time_partitions(
         .map(|partition| partition.with_source_identity(source_id))
         .collect::<Vec<_>>();
     if assigned.is_empty() {
-        if let Some(partition) = hook.partition {
+        if let Some(partition) = hook.event_time.partition {
             assigned.push(crate::event_time::EventTimePartition::for_source(
                 source_id, partition,
             ));
@@ -927,7 +951,7 @@ async fn seed_event_time_partitions(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_gate_outputs(
     chain: &Chain,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
     ready: Vec<(crate::MessageBatchRef, crate::event_time::WindowAction)>,
     ready_acks: Vec<Arc<dyn Ack>>,
     ready_invalid_timestamps: Vec<bool>,
@@ -937,8 +961,8 @@ async fn dispatch_gate_outputs(
     forward_watermark: bool,
     current_ready_start: Option<usize>,
 ) -> Result<(), Error> {
-    record_watermark_lag(hook, watermark);
-    record_late_event_rows(hook, late_rows);
+    record_watermark_lag(hook.metrics.as_deref(), watermark);
+    record_late_event_rows(hook.metrics.as_deref(), late_rows);
 
     if ready.len() != ready_acks.len() || ready.len() != ready_invalid_timestamps.len() {
         let error = Error::Process(format!(
@@ -949,7 +973,7 @@ async fn dispatch_gate_outputs(
         ));
         let mut acknowledgements = ready_acks;
         acknowledgements.extend(dropped_acks);
-        let _ = abort_event_time_held(hook).await;
+        let _ = abort_event_time_held(&hook.event_time).await;
         return Err(error_after_ack_abort(error, acknowledgements).await);
     }
 
@@ -974,7 +998,7 @@ async fn dispatch_gate_outputs(
                     acknowledgements.push(current_ack);
                     acknowledgements.extend(ready.map(|((_, ack), _)| ack));
                     acknowledgements.extend(dropped_acks);
-                    let _ = abort_event_time_held(hook).await;
+                    let _ = abort_event_time_held(&hook.event_time).await;
                     return Err(error_after_ack_abort(error, acknowledgements).await);
                 }
                 watermark_forwarded = true;
@@ -990,7 +1014,7 @@ async fn dispatch_gate_outputs(
             let mut acknowledgements = std::mem::take(&mut published);
             acknowledgements.extend(ready.map(|((_, ack), _)| ack));
             acknowledgements.extend(dropped_acks);
-            let _ = abort_event_time_held(hook).await;
+            let _ = abort_event_time_held(&hook.event_time).await;
             return Err(error_after_ack_abort(error, acknowledgements).await);
         }
         published.push(current_ack);
@@ -1005,7 +1029,7 @@ async fn dispatch_gate_outputs(
             if let Err(error) = send_downstream(chain, Envelope::Watermark(watermark)).await {
                 let mut acknowledgements = std::mem::take(&mut published);
                 acknowledgements.extend(dropped_acks);
-                let _ = abort_event_time_held(hook).await;
+                let _ = abort_event_time_held(&hook.event_time).await;
                 return Err(error_after_ack_abort(error, acknowledgements).await);
             }
             watermark_forwarded = true;
@@ -1021,7 +1045,7 @@ async fn dispatch_gate_outputs(
             acknowledgements.extend(std::mem::take(&mut dropped_published));
             acknowledgements.push(current_ack);
             acknowledgements.extend(dropped);
-            let _ = abort_event_time_held(hook).await;
+            let _ = abort_event_time_held(&hook.event_time).await;
             return Err(error_after_ack_abort(error, acknowledgements).await);
         }
         dropped_published.push(current_ack);
@@ -1032,7 +1056,7 @@ async fn dispatch_gate_outputs(
             if let Err(error) = send_downstream(chain, Envelope::Watermark(watermark)).await {
                 let mut acknowledgements = std::mem::take(&mut published);
                 acknowledgements.extend(dropped_published);
-                let _ = abort_event_time_held(hook).await;
+                let _ = abort_event_time_held(&hook.event_time).await;
                 return Err(error_after_ack_abort(error, acknowledgements).await);
             }
         }
@@ -1044,9 +1068,9 @@ async fn dispatch_gate_outputs(
 /// after a refresh or downstream dispatch failure.  The gate lock is released
 /// before awaiting acknowledgement futures so cleanup cannot deadlock with a
 /// connector or operator that needs another runtime lock.
-async fn abort_event_time_held(hook: &CheckpointHook) -> Result<(), Error> {
+async fn abort_event_time_held(event_time: &EventTimeBinding) -> Result<(), Error> {
     let held = {
-        let mut guard = hook.event_time_gate.lock().await;
+        let mut guard = event_time.gate.lock().await;
         guard
             .as_mut()
             .map(|gate| gate.take_held_acknowledgements())
@@ -1061,9 +1085,9 @@ async fn abort_event_time_held(hook: &CheckpointHook) -> Result<(), Error> {
     first_error.map_or(Ok(()), Err)
 }
 
-async fn shutdown_source_chain(chain: &Chain, hook: &CheckpointHook) -> Result<(), Error> {
+async fn shutdown_source_chain(chain: &Chain, hook: &ChainHooks) -> Result<(), Error> {
     let (ready, ready_acks, ready_invalid_timestamps, dropped_acks, late_rows, current_ready_start) = {
-        let mut guard = hook.event_time_gate.lock().await;
+        let mut guard = hook.event_time.gate.lock().await;
         match guard.as_mut() {
             Some(gate) => match gate.finish().await {
                 Ok(decision) => (
@@ -1143,11 +1167,11 @@ async fn shutdown_interior_chain(
     Ok(())
 }
 
-fn record_watermark_lag(hook: &CheckpointHook, watermark: Option<i64>) {
+fn record_watermark_lag(metrics: Option<&crate::runtime::RuntimeMetrics>, watermark: Option<i64>) {
     let Some(watermark) = watermark else { return };
     let now = crate::state::now_ms() as i64;
     let lag = now.saturating_sub(watermark).max(0);
-    if let Some(metrics) = &hook.metrics {
+    if let Some(metrics) = metrics {
         metrics
             .kernel
             .watermark_lag_ms
@@ -1155,11 +1179,11 @@ fn record_watermark_lag(hook: &CheckpointHook, watermark: Option<i64>) {
     }
 }
 
-fn record_late_event_rows(hook: &CheckpointHook, rows: u64) {
+fn record_late_event_rows(metrics: Option<&crate::runtime::RuntimeMetrics>, rows: u64) {
     if rows == 0 {
         return;
     }
-    if let Some(metrics) = &hook.metrics {
+    if let Some(metrics) = metrics {
         metrics
             .kernel
             .late_events
@@ -1172,7 +1196,7 @@ fn record_late_event_rows(hook: &CheckpointHook, rows: u64) {
 /// Emit/Hold-equivalent rows flow through the chain normally.
 async fn dispatch_gated(
     chain: &Chain,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
     batch: crate::MessageBatchRef,
     action: crate::event_time::WindowAction,
     ack: Arc<dyn crate::input::Ack>,
@@ -1257,7 +1281,7 @@ fn mark_event_batch(
 /// chain's inputs (`Aligner`), snapshot the chain's state, and flow onward.
 async fn run_interior_chain(
     chain: &Chain,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
     cancellation: &CancellationToken,
 ) -> Result<(), Error> {
     let mut pool = ProcessorWorkerPool::start(chain, hook, cancellation);
@@ -1284,7 +1308,7 @@ async fn run_interior_chain(
 
 async fn run_interior_chain_loop(
     chain: &Chain,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
     cancellation: &CancellationToken,
     pool: &mut Option<ProcessorWorkerPool>,
 ) -> Result<(), Error> {
@@ -1330,7 +1354,7 @@ async fn run_interior_chain_loop(
             let delta = current.saturating_sub(surfaced_late_rows);
             if delta > 0 {
                 surfaced_late_rows = current;
-                record_late_event_rows(hook, delta);
+                record_late_event_rows(hook.metrics.as_deref(), delta);
             }
         }
         let read = tokio::select! {
@@ -1500,7 +1524,7 @@ async fn run_interior_chain_loop(
             Err(error) => {
                 // Alignment overflow: release what was buffered and keep the
                 // data flowing; the barrier round fails upstream.
-                if let Some(reporter) = &hook.failure_reporter {
+                if let Some(reporter) = &hook.checkpoint.failure_reporter {
                     let _ = reporter.send(Error::Process(error.to_string()));
                 }
                 if let Some(pool) = pool.as_ref() {
@@ -1579,7 +1603,7 @@ fn barrier_span(chain: &Chain, barrier: &crate::checkpoint::CheckpointBarrier) -
 #[allow(clippy::too_many_arguments)]
 async fn handle_completed_barrier(
     chain: &Chain,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
     barrier: crate::checkpoint::CheckpointBarrier,
     aligner: &mut super::barrier::Aligner,
     ended_inputs: &mut BTreeSet<usize>,
@@ -1610,7 +1634,7 @@ async fn handle_completed_barrier(
 #[allow(clippy::too_many_arguments)]
 async fn handle_completed_barrier_inner(
     chain: &Chain,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
     barrier: crate::checkpoint::CheckpointBarrier,
     aligner: &mut super::barrier::Aligner,
     ended_inputs: &mut BTreeSet<usize>,
@@ -1628,15 +1652,16 @@ async fn handle_completed_barrier_inner(
     // Capture the committed state epoch BEFORE releasing buffered post-barrier
     // data. The snapshot therefore cannot observe a mutation from after this
     // barrier's cut.
-    let state = match hook.state.clone() {
+    let state = match hook.checkpoint.state.clone() {
         Some(backend) => super::barrier::snapshot_state(backend).await,
         None => Ok(crate::state::StateSnapshot::new(1, Vec::new())),
     };
     match state {
         Ok(state) => {
             send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
-            if let Some(reporter) = &hook.reporter {
+            if let Some(reporter) = &hook.checkpoint.reporter {
                 let task_id = hook
+                    .checkpoint
                     .task_id
                     .clone()
                     .unwrap_or_else(|| chain.entry_task_id().to_owned());
@@ -1651,7 +1676,7 @@ async fn handle_completed_barrier_inner(
             }
         }
         Err(error) => {
-            if let Some(reporter) = &hook.failure_reporter {
+            if let Some(reporter) = &hook.checkpoint.failure_reporter {
                 let _ = reporter.send(error);
             }
             send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
@@ -1766,7 +1791,7 @@ fn effective_watermark(
 #[allow(clippy::too_many_arguments)]
 async fn handle_envelope(
     chain: &Chain,
-    hook: &CheckpointHook,
+    hook: &ChainHooks,
     input_index: usize,
     envelope: Envelope,
     ended_inputs: &mut BTreeSet<usize>,
@@ -1903,11 +1928,7 @@ impl ProcessorWorkerPool {
     /// detached tasks bounded by the cancellation token; the reorder
     /// collector is joined on end-of-stream so ordered delivery finishes
     /// before the terminal control envelope flows downstream.
-    fn start(
-        chain: &Chain,
-        hook: &CheckpointHook,
-        cancellation: &CancellationToken,
-    ) -> Option<Self> {
+    fn start(chain: &Chain, hook: &ChainHooks, cancellation: &CancellationToken) -> Option<Self> {
         if chain.processor_parallelism <= 1 || chain.processors.is_empty() {
             return None;
         }
@@ -3318,12 +3339,9 @@ mod worker_pool_tests {
     async fn a_disconnected_failure_channel_is_a_failure_not_a_clean_shutdown() {
         let started = Arc::new(AtomicUsize::new(0));
         let chain = pool_chain(2, started.clone());
-        let pool = ProcessorWorkerPool::start(
-            &chain,
-            &CheckpointHook::default(),
-            &CancellationToken::new(),
-        )
-        .expect("a chain with parallelism > 1 owns a pool");
+        let pool =
+            ProcessorWorkerPool::start(&chain, &ChainHooks::default(), &CancellationToken::new())
+                .expect("a chain with parallelism > 1 owns a pool");
         // Retire the pool: every worker returns, then the collector drains and
         // exits, so the failure channel disconnects with no error recorded —
         // exactly the state a panicking worker leaves behind.
@@ -3348,12 +3366,9 @@ mod worker_pool_tests {
     async fn a_stalled_pool_fails_the_control_fence_within_its_bound() {
         let started = Arc::new(AtomicUsize::new(0));
         let chain = pool_chain(2, started.clone());
-        let pool = ProcessorWorkerPool::start(
-            &chain,
-            &CheckpointHook::default(),
-            &CancellationToken::new(),
-        )
-        .expect("a chain with parallelism > 1 owns a pool");
+        let pool =
+            ProcessorWorkerPool::start(&chain, &ChainHooks::default(), &CancellationToken::new())
+                .expect("a chain with parallelism > 1 owns a pool");
         pool.submit((
             Arc::new(crate::MessageBatch::new_arrow(
                 datafusion::arrow::array::RecordBatch::new_empty(std::sync::Arc::new(
@@ -3695,8 +3710,8 @@ mod task_dispatch_tests {
         chain
     }
 
-    fn hook() -> CheckpointHook {
-        CheckpointHook::default()
+    fn hook() -> ChainHooks {
+        ChainHooks::default()
     }
 
     // ---------- pure helpers ----------
@@ -5143,9 +5158,12 @@ mod task_loop_tests {
         chain.task_ids = vec!["src".into()];
         let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
         let (fail_tx, mut fail_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hook = CheckpointHook {
-            failure_reporter: Some(fail_tx),
-            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+        let hook = ChainHooks {
+            checkpoint: CheckpointHook {
+                failure_reporter: Some(fail_tx),
+                barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let source = ScriptSource::with_steps(vec![SourceStep::Batch(
@@ -5198,8 +5216,11 @@ mod task_loop_tests {
         chain.task_ids = vec!["src".into()];
         chain.source = Some(Arc::new(ParkingPositionsSource));
         let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
-        let hook = CheckpointHook {
-            barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+        let hook = ChainHooks {
+            checkpoint: CheckpointHook {
+                barrier_rx: Some(Arc::new(tokio::sync::Mutex::new(barrier_rx))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let token = CancellationToken::new();
@@ -5239,7 +5260,7 @@ mod task_loop_tests {
         chain.task_ids = vec!["src".into()];
         chain.source = Some(ScriptSource::with_steps(vec![SourceStep::Disconnection]));
         let token = CancellationToken::new();
-        let task = tokio::spawn(run_chain(chain, CheckpointHook::default(), token.clone()));
+        let task = tokio::spawn(run_chain(chain, ChainHooks::default(), token.clone()));
         // Let the chain park inside the reconnect backoff sleep, then cancel
         // well before the (fake) five-second timer can fire.
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -5275,8 +5296,11 @@ mod task_loop_tests {
         chain.task_ids = vec!["src".into()];
         chain.source_time = Some(event_time_spec());
         chain.source = Some(ScriptSource::idle());
-        let hook = CheckpointHook {
-            event_time_gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+        let hook = ChainHooks {
+            event_time: EventTimeBinding {
+                gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let error = settle(tokio::spawn(run_chain(
@@ -5299,8 +5323,11 @@ mod task_loop_tests {
         chain.task_ids = vec!["src".into()];
         chain.source_time = Some(event_time_spec());
         chain.source = Some(ScriptSource::idle());
-        let hook = CheckpointHook {
-            event_time_gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+        let hook = ChainHooks {
+            event_time: EventTimeBinding {
+                gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let token = CancellationToken::new();
@@ -5326,8 +5353,11 @@ mod task_loop_tests {
         chain.task_ids = vec!["src".into()];
         chain.source_time = Some(event_time_spec());
         chain.source = Some(ScriptSource::idle());
-        let hook = CheckpointHook {
-            event_time_gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+        let hook = ChainHooks {
+            event_time: EventTimeBinding {
+                gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let token = CancellationToken::new();
@@ -5348,11 +5378,14 @@ mod task_loop_tests {
         probe.fail_abort.store(true, Ordering::SeqCst);
         gate.observe_with_ack(0, ts_batch(1_000), probe.clone())
             .unwrap();
-        let hook = CheckpointHook {
-            event_time_gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+        let hook = ChainHooks {
+            event_time: EventTimeBinding {
+                gate: Arc::new(tokio::sync::Mutex::new(Some(gate))),
+                ..Default::default()
+            },
             ..Default::default()
         };
-        let error = abort_event_time_held(&hook).await.unwrap_err();
+        let error = abort_event_time_held(&hook.event_time).await.unwrap_err();
         assert!(error.to_string().contains("abort failed"), "{error}");
     }
 
@@ -5373,7 +5406,7 @@ mod task_loop_tests {
             .await
             .unwrap();
         let token = CancellationToken::new();
-        let task = tokio::spawn(run_chain(chain, CheckpointHook::default(), token));
+        let task = tokio::spawn(run_chain(chain, ChainHooks::default(), token));
         let error = settle(task).await.unwrap_err();
         assert!(
             error.to_string().contains("failed before control fence")
@@ -5405,7 +5438,7 @@ mod task_loop_tests {
             .await
             .unwrap();
         let token = CancellationToken::new();
-        let task = tokio::spawn(run_chain(chain, CheckpointHook::default(), token.clone()));
+        let task = tokio::spawn(run_chain(chain, ChainHooks::default(), token.clone()));
         tokio::time::sleep(Duration::from_millis(200)).await;
         // Close the inputs first so the shutdown drain of queued envelopes
         // terminates; the wedged worker is then released into a fatal
@@ -5434,12 +5467,7 @@ mod task_loop_tests {
         drop(senders.swap_remove(0));
         let token = CancellationToken::new();
         token.cancel();
-        let result = settle(tokio::spawn(run_chain(
-            chain,
-            CheckpointHook::default(),
-            token,
-        )))
-        .await;
+        let result = settle(tokio::spawn(run_chain(chain, ChainHooks::default(), token))).await;
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -5473,7 +5501,7 @@ mod task_loop_tests {
         drop(senders.swap_remove(0));
         let result = settle(tokio::spawn(run_chain(
             chain,
-            CheckpointHook::default(),
+            ChainHooks::default(),
             CancellationToken::new(),
         )))
         .await;
@@ -5517,7 +5545,7 @@ mod task_loop_tests {
         drop(senders.swap_remove(0));
         let error = tokio::time::timeout(
             4 * BUDGET,
-            run_chain(chain, CheckpointHook::default(), CancellationToken::new()),
+            run_chain(chain, ChainHooks::default(), CancellationToken::new()),
         )
         .await
         .expect("the bounded drain fails the chain")
@@ -5546,7 +5574,7 @@ mod task_loop_tests {
             GatedScriptProcessor::new(gate.clone(), 1, Some(Err(failure())), Some(Err(failure())));
         let (chain, _senders) = interior_chain(2, vec![processor], 1);
         let token = CancellationToken::new();
-        let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
+        let pool = ProcessorWorkerPool::start(&chain, &ChainHooks::default(), &token)
             .expect("pooled chain");
         let first = Arc::new(ProbeAck::default());
         let second = Arc::new(ProbeAck::default());
@@ -5574,7 +5602,7 @@ mod task_loop_tests {
         let processor = GatedScriptProcessor::passthrough(gate, 1);
         let (chain, _senders) = interior_chain(2, vec![processor], 1);
         let token = CancellationToken::new();
-        let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
+        let pool = ProcessorWorkerPool::start(&chain, &ChainHooks::default(), &token)
             .expect("pooled chain");
         let first = Arc::new(ProbeAck::default());
         let second = Arc::new(ProbeAck::default());
@@ -5607,7 +5635,7 @@ mod task_loop_tests {
         drop(senders.swap_remove(0));
         let error = settle(tokio::spawn(run_chain(
             chain,
-            CheckpointHook::default(),
+            ChainHooks::default(),
             CancellationToken::new(),
         )))
         .await
@@ -5632,7 +5660,7 @@ mod task_loop_tests {
         let processor = GatedScriptProcessor::passthrough(Arc::new(tokio::sync::Mutex::new(())), 1);
         let (chain, _senders) = interior_chain(2, vec![processor], 1);
         let token = CancellationToken::new();
-        let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
+        let pool = ProcessorWorkerPool::start(&chain, &ChainHooks::default(), &token)
             .expect("pooled chain");
         // Cancel first: the workers exit without claiming, so the submitted
         // delivery stays in the work queue for the drain to abort.
@@ -5660,7 +5688,7 @@ mod task_loop_tests {
         );
         let (chain, _senders) = interior_chain(2, vec![processor], 1);
         let token = CancellationToken::new();
-        let pool = ProcessorWorkerPool::start(&chain, &CheckpointHook::default(), &token)
+        let pool = ProcessorWorkerPool::start(&chain, &ChainHooks::default(), &token)
             .expect("pooled chain");
         let probe = Arc::new(ProbeAck::default());
         probe.fail_ack.store(true, Ordering::SeqCst);
@@ -5690,7 +5718,7 @@ mod task_loop_tests {
         let (mut chain, mut senders) = interior_chain(1, vec![], 1);
         chain.window_late_event_rows = Some(counter.clone());
         let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
-        let hook = CheckpointHook {
+        let hook = ChainHooks {
             metrics: Some(metrics.clone()),
             ..Default::default()
         };
@@ -5728,7 +5756,7 @@ mod task_loop_tests {
             .outputs
             .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
         let token = CancellationToken::new();
-        let task = tokio::spawn(run_chain(chain, CheckpointHook::default(), token));
+        let task = tokio::spawn(run_chain(chain, ChainHooks::default(), token));
         // Input 0: one data envelope, then the barrier, then the producer
         // drops; input 1 closes without a barrier. The data envelope's
         // processing is the deterministic ordering signal.
@@ -5778,8 +5806,11 @@ mod task_loop_tests {
             .outputs
             .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
         let (fail_tx, mut fail_rx) = tokio::sync::mpsc::unbounded_channel();
-        let hook = CheckpointHook {
-            failure_reporter: Some(fail_tx),
+        let hook = ChainHooks {
+            checkpoint: CheckpointHook {
+                failure_reporter: Some(fail_tx),
+                ..Default::default()
+            },
             ..Default::default()
         };
         // Input 1 aligns a barrier; input 0 floods enough data to exceed the
@@ -5841,7 +5872,7 @@ mod task_loop_tests {
             .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
         dispatch_gate_outputs(
             &chain,
-            &CheckpointHook::default(),
+            &ChainHooks::default(),
             vec![ready_slice(crate::event_time::WindowAction::Emit)],
             vec![probe()],
             vec![false],
@@ -5866,7 +5897,7 @@ mod task_loop_tests {
         let ack = probe();
         let error = dispatch_gate_outputs(
             &chain,
-            &CheckpointHook::default(),
+            &ChainHooks::default(),
             vec![ready_slice(crate::event_time::WindowAction::Emit)],
             vec![ack.clone()],
             vec![false],
@@ -5894,7 +5925,7 @@ mod task_loop_tests {
             .insert("m".into(), vec![EdgeTarget::Forward(tx)]);
         dispatch_gate_outputs(
             &chain,
-            &CheckpointHook::default(),
+            &ChainHooks::default(),
             vec![],
             vec![],
             vec![],
@@ -5916,7 +5947,7 @@ mod task_loop_tests {
             .insert("m".into(), vec![EdgeTarget::Forward(dead_tx)]);
         let error = dispatch_gate_outputs(
             &chain,
-            &CheckpointHook::default(),
+            &ChainHooks::default(),
             vec![],
             vec![],
             vec![],
@@ -5941,7 +5972,7 @@ mod task_loop_tests {
         let dropped = probe();
         let error = dispatch_gate_outputs(
             &chain,
-            &CheckpointHook::default(),
+            &ChainHooks::default(),
             vec![ready_slice(crate::event_time::WindowAction::Emit)],
             vec![ready.clone()],
             vec![false],
