@@ -62,6 +62,17 @@ the per-id schema cache, the steady-state production path.
 - The state-backend scenario measures durable writes (every put commits);
   its operation count is deliberately smaller than the stream row count.
 
+## CI
+
+The suite also runs automatically in CI (`.github/workflows/benchmark.yml`):
+on every merge to `main`, on manual dispatch, and for pull requests carrying
+the `benchmark` label. Results land in the workflow run's job summary as a
+markdown table, and the JSON report is uploaded as an artifact named after
+the commit SHA (retained for 90 days) for cross-run comparison. GitHub-hosted
+runner hardware varies between runs, so treat cross-run comparisons as
+directional — the workflow deliberately makes no pass/fail judgement on
+throughput numbers.
+
 ## Related
 
 - `crates/arkflow/examples/benchmark.rs` — the CLI wrapper.

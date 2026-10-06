@@ -45,6 +45,10 @@ cargo run -p arkflow --release --example benchmark
 - `--json` 输出与 markdown 相同的场景与吞吐数值,便于 CI 或仪表盘摄取。
 - state-backend 场景测的是持久化写(每次 put 都提交);其操作数刻意小于流行数。
 
+## CI
+
+基准套件也会在 CI 中自动运行(`.github/workflows/benchmark.yml`):每次合并到 `main`、手动触发、以及携带 `benchmark` 标签的 PR。结果以 markdown 表格呈现在 workflow 运行页的 job summary,JSON 报告作为以提交 SHA 命名的 artifact 上传(保留 90 天)供跨运行对比。GitHub 托管 runner 的硬件随代际波动,跨运行对比仅供参考——工作流刻意不对吞吐数值做通过/失败判定。
+
 ## 相关
 
 - `crates/arkflow/examples/benchmark.rs` —— CLI 入口。
