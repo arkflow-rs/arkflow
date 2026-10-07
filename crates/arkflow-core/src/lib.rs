@@ -3849,7 +3849,10 @@ mod metadata_tests {
         assert!(result.is_err());
     }
 
-    fn row_meta_owned_fixture() -> Vec<(u32, u64, Option<Vec<u8>>, Option<SystemTime>)> {
+    /// (partition, offset, key, timestamp) fixture row.
+    type RowFixture = (u32, u64, Option<Vec<u8>>, Option<SystemTime>);
+
+    fn row_meta_owned_fixture() -> Vec<RowFixture> {
         vec![
             (0, 10, Some(b"k1".to_vec()), Some(SystemTime::UNIX_EPOCH)),
             (0, 11, None, None),
@@ -3857,7 +3860,7 @@ mod metadata_tests {
         ]
     }
 
-    fn attach_fixture(rows: &[(u32, u64, Option<Vec<u8>>, Option<SystemTime>)]) -> RecordBatch {
+    fn attach_fixture(rows: &[RowFixture]) -> RecordBatch {
         let data: Vec<&str> = rows.iter().map(|_| "x").collect();
         let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(data))]).unwrap();
@@ -3965,8 +3968,7 @@ mod metadata_tests {
 
         // No row carries a key or timestamp: neither column exists, matching
         // the per-message helpers' column shape for absent values.
-        let absent: Vec<(u32, u64, Option<Vec<u8>>, Option<SystemTime>)> =
-            vec![(0, 1, None, None), (0, 2, None, None)];
+        let absent: Vec<RowFixture> = vec![(0, 1, None, None), (0, 2, None, None)];
         let batch = attach_fixture(&absent);
         assert!(batch.column_by_name(meta_columns::KEY).is_none());
         assert!(batch.column_by_name(meta_columns::TIMESTAMP).is_none());

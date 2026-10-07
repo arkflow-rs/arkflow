@@ -456,6 +456,15 @@ impl KafkaInput {
             .batch_max_bytes
             .unwrap_or(DEFAULT_BATCH_MAX_BYTES)
             .max(1);
+        if config.batch_max_rows.is_some_and(|rows| rows < 1)
+            || config.batch_max_bytes.is_some_and(|bytes| bytes < 1)
+        {
+            tracing::debug!(
+                batch_max_rows,
+                batch_max_bytes,
+                "Kafka input batch bounds below 1 are clamped to 1"
+            );
+        }
         Ok(Self {
             input_name: name.map(str::to_string),
             config,
