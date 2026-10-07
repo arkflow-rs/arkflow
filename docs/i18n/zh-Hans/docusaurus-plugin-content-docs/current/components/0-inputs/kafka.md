@@ -17,11 +17,11 @@ Kafka 输入(Input)使用消费者组(consumer group)从一个或多个 Apache K
 | consumer_group | string | yes | — | 消费者组 ID,用于偏移量协调与负载均衡 |
 | client_id | string | no | — | 客户端 ID,用于监控和日志 |
 | start_from_latest | boolean | no | `false` | 为 `true` 时忽略已提交的偏移量,从最新的消息开始消费 |
-| fetch_min_bytes | integer | no | — | broker 响应一次拉取请求所需的最小字节数 |
+| fetch_min_bytes | integer | no | — | broker 响应一次拉取请求所需的最小字节数。默认(`1`)对延迟友好:broker 一有数据立即返回。调大则让 broker 等数据凑量(最多等 `fetch_wait_max_ms`)——吞吐杠杆,但安静时段会给首条消息引入取数等待。 |
 | fetch_max_bytes | integer | no | — | 单次拉取请求返回的最大字节数 |
 | fetch_max_partition_bytes | integer | no | — | 单次拉取中每个分区返回的最大字节数 |
-| fetch_wait_max_ms | integer | no | — | broker 在响应前等待足够数据累积的最长时间(毫秒) |
-| batch_max_rows | integer | no | `1024` | 单次 read 聚合进一个批的最大消息数。小于 1 的值钳制为 1;`1` 恢复逐条出批。 |
+| fetch_wait_max_ms | integer | no | — | broker 为凑够 `fetch_min_bytes` 而等待的最长时间(毫秒)。仅在 `fetch_min_bytes` 大于 1 时有意义;`fetch_min_bytes: 1` 时 broker 立即响应,该设置不会触发。 |
+| batch_max_rows | integer | no | `1024` | 单次 read 聚合进一个批的最大消息数。小于 1 的值钳制为 1。调小它**不是**延迟优化——攒批从不等待;更小的值只是缩小失败后至少一次语义的重投单位。 |
 | batch_max_bytes | integer | no | `8388608` (8 MiB) | 单次 read 批内累计 payload 字节数上限;首条消息必定纳入(即使超出该上限)。小于 1 的值钳制为 1。 |
 | security | object | no | — | SASL 认证与 TLS 设置;完全省略即为明文。见[安全配置](#安全配置) |
 | transactional_offsets | boolean | no | `false` | L3 精确一次:为配对 Kafka 输出的 `offset_commit_group` 注册本消费者组以在事务内提交位点。此时 `ack()` 只推进内存 frontier——broker 组位点仅随输出的事务前进。 |
@@ -125,6 +125,44 @@ input:
   fetch_max_partition_bytes: 1048576
   fetch_wait_max_ms: 500
 ```
+
+## 吞吐 vs 延迟
+
+攒批本身对延迟是中性的:首条消息阻塞等待,已缓冲的消息立即排空——从不为凑批等待,低流量时批就是单条。吞吐/延迟的取舍在 **broker 侧 fetch 参数**与**批量上界**上:
+
+**延迟优先:保持默认即可。** `fetch_min_bytes` 默认 `1`,broker 一有数据立即响应(该设置下 `fetch_wait_max_ms` 不会触发);批量上界无需调小——更小的 `batch_max_rows` 只缩小失败后的重投单位,不会降低延迟。
+
+```yaml validate=fragment wrap=input
+input:
+  type: "kafka"
+  brokers:
+    - "localhost:9092"
+  topics:
+    - "events"
+  consumer_group: "latency-group"
+  start_from_latest: false
+  # Defaults are latency-friendly: fetch_min_bytes=1, batch_max_rows=1024
+```
+
+**吞吐优先:放大批量上界,让 broker 攒数据。** 更大的 `fetch_min_bytes` 让 broker 每次返回更多数据(最多等 `fetch_wait_max_ms`),本地队列被填满后一次 `read()` 能聚出更大的批。代价:安静时段的首条消息最多等 `fetch_wait_max_ms`;失败的批整段重投(至多 `batch_max_rows` 条);内存随 `batch_max_rows × 单条消息大小` 增长。
+
+```yaml validate=fragment wrap=input
+input:
+  type: "kafka"
+  brokers:
+    - "localhost:9092"
+  topics:
+    - "events"
+  consumer_group: "throughput-group"
+  start_from_latest: false
+  batch_max_rows: 8192
+  batch_max_bytes: 67108864
+  fetch_min_bytes: 1048576
+  fetch_max_bytes: 104857600
+  fetch_max_partition_bytes: 8388608
+```
+
+持续负载下,更大的批**不会**推高端到端延迟——排队等待占主导,更高的吞吐更快清空积压。真正变大的是单批处理步长(当前批处理完才开始下一次 `read()`),表现为单次分发处理时间变长,而不是到达→落库变慢。
 
 ## 说明
 
