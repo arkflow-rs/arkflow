@@ -37,7 +37,7 @@ loop {                                  // 同步循环，零挂起点 → 原�
 ```
 
 - 排空循环内**不得**出现可挂起的 await（含"实际会 yield"的 codec/元数据步骤）——整个认领要么全部完成要么未被 select! 打断。首个 `recv().await` 被 drop 时不认领任何消息，契约保持。
-- `retryable_receive_error` 复用：排空中途遇 retryable 错误时，已收集消息照常组批返回（错误留待下轮 read 的 recv 报出 `Disconnection` 触发重连）；遇致命错误立即返回（已认领消息的丢失窗口与现状 read() 出错路径一致）。
+- `retryable_receive_error` 复用：排空中途遇 retryable 错误时，已收集消息照常组批返回（错误不在本批上抛；队列排空后的后续 read 于阻塞认领处报 `Disconnection` 触发重连——期间已缓冲消息照常出批）；遇致命错误立即返回（已认领消息的丢失窗口与现状 read() 出错路径一致，仅按批大小放大）。
 - 排空条数上限：`batch_max_rows`（默认 1024，clamp ≥1）；字节上限 `batch_max_bytes`（默认 8 MiB，按 payload 累计，clamp ≥1）。两者任一满足即停止——控制大 payload 下的内存上界。
 
 ### D2 元数据：core 新增逐行批量助手，一次重建

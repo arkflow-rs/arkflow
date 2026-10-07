@@ -112,8 +112,7 @@ refactoring is summarized rather than listed commit-by-commit.
   batch-granular), codec decode runs once per batch with a per-payload
   fallback that preserves exact row↔metadata alignment, and acknowledgements
   settle per contiguous `(topic, partition)` segment whose compensation
-  replays the whole segment — at-least-once semantics unchanged. (openspec
-  `optimize-kafka-input-batching`)
+  replays the whole segment — at-least-once semantics unchanged. (#1314)
 - Avro decoding is substantially faster again on wide schemas: messages
   sharing a schema id now accumulate into one set of Arrow column builders
   instead of one single-row batch per message plus a concat copy.
