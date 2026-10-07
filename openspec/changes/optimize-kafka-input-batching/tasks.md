@@ -15,7 +15,7 @@
 
 - [x] 3.1 单元：批量组装纯函数测试——多行批元数据逐行对齐（offset/partition/topic/headers 逐行断言）、混批 nullable 列形状、`batch_max_rows/bytes` 上界截断、=1 逐条回退
 - [x] 3.2 单元：取消安全防线——模拟 select! 丢弃（首条 pending 时 drop future 重发不认领；认领后组批无挂起点不被打断），对齐 `input-cancellation-safety` 既有框架思路（Kafka 无进程内 broker，用可注入的假消费流）
-- [x] 3.3 集成：本地 kafka_eos/kafka_codec_test 启动后按用户决定中断，全量 testcontainers 验证（WAL/durability、event-time 多 partition、fan-out、L3 EOS）交由 PR CI 执行（CI 必绿后再归档）；段 undo/段内 tombstone 幂等的离线单测已补（`undo_rewinds_the_whole_segment_frontier`、`segment_acknowledgement_advances_like_per_message_acks`、drain tombstone 分类）
+- [x] 3.3 集成：CI 首轮暴露 kafka_eos 两个 L3 测试挂死——根因是测试按"每次 read() 恰一条"逐条结算以构造精确 frontier 状态，批量 read 一次认领全部预置消息后后续 read 永久阻塞；修复：三处 L3 input 配置加 `batch_max_rows: 1`（逐条正是这些测试的工具）+ `read_with_retry` 加 30s 整体超时防未来挂死；本地 kafka_eos 7/7 全过（159s）、kafka_codec_test 全过；其余全量 testcontainers（WAL/durability、event-time、fan-out）由 PR CI 验证（必绿后再归档）；段 undo/段内 tombstone 幂等的离线单测已补
 - [x] 3.4 性能：`kafka_batch_assembly_timing` release 实测（200k 行，含 key/timestamp/headers 元数据）：批组装 8,873,574 rows/s（22.5ms）vs 旧逐条 7×重建链 oracle 135,192 rows/s（1.48s），≈65.6×（批组装路径；端到端收益受 IO/下游摊薄）
 
 ## 4. 验证与文档
