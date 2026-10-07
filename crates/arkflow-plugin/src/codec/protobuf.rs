@@ -389,6 +389,18 @@ message TestMessage {
             .decode(vec![good1, b"garbage".to_vec(), good2])
             .await?;
         assert_eq!(decoded.len(), 2, "bad middle message must be skipped");
+        // The surviving rows must be exactly the good messages, in order:
+        // the converter accumulates pushes in input order, so the dropped
+        // message leaves no hole and no reordering.
+        let timestamps = decoded
+            .record_batch()
+            .column_by_name("timestamp")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>());
+        assert_eq!(
+            timestamps.map(|values| values.values().to_vec()),
+            Some(vec![1i64, 2]),
+            "surviving rows must be the good messages in order"
+        );
 
         Ok(())
     }
@@ -405,7 +417,13 @@ message TestMessage {
         let result = codec
             .decode(vec![b"garbage".to_vec(), b"more garbage".to_vec()])
             .await;
-        assert!(result.is_err(), "all-bad batch must error");
+        let error = result.expect_err("all-bad batch must error").to_string();
+        // The skip count is part of the observable outcome: the all-bad
+        // error names how many messages were skipped.
+        assert!(
+            error.contains("all 2 messages"),
+            "skip count must surface in the error: {error}"
+        );
         Ok(())
     }
 

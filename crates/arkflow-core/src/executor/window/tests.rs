@@ -4556,20 +4556,38 @@ async fn narrow_int_value_columns_match_int64_and_stay_linear() {
     assert_eq!(narrow_stats.0, vec![1, 2], "null values are skipped");
     assert_eq!(narrow_stats.1, vec![1, 10]);
 
-    // Linear-cost guard: 20_000 rows in one Int32 batch. The per-row
-    // full-column cast performed rows² ≈ 4·10⁸ element conversions plus
-    // rows 160 KiB allocations; the once-per-batch cast is ~instant. The
-    // bound is deliberately generous so slow CI machines never flake —
-    // only the quadratic behavior can approach it.
-    let big_rows: Vec<(i64, &str, Option<i32>)> = (0..20_000)
-        .map(|i| (1_000 + (i % 100), "k", Some((i % 1000) as i32)))
+    // Linear-cost guard. The timed rows target FRESH windows beyond the
+    // watermark so every row is admitted — rows landing in the already
+    // fired window would take the late-skip path and never reach
+    // accumulation. The ratio form is machine-independent: linear
+    // accumulation costs ~4x for 4x rows (20k vs 5k, one window each),
+    // while the old per-membership full-column cast made it ~16x
+    // (quadratic). The absolute cap stays as a belt-and-suspenders bound.
+    let small_rows: Vec<(i64, &str, Option<i32>)> = (0..5_000)
+        .map(|i| (100_000 + (i % 100), "g", Some((i % 1000) as i32)))
         .collect();
-    let big = int32_value_batch(big_rows, None);
+    let big_rows: Vec<(i64, &str, Option<i32>)> = (0..20_000)
+        .map(|i| (200_000 + (i % 100), "h", Some((i % 1000) as i32)))
+        .collect();
     let start = std::time::Instant::now();
-    narrow.process(big).await.unwrap();
-    let elapsed = start.elapsed();
+    narrow
+        .process(int32_value_batch(small_rows, None))
+        .await
+        .unwrap();
+    let small_elapsed = start.elapsed();
+    let start = std::time::Instant::now();
+    narrow
+        .process(int32_value_batch(big_rows, None))
+        .await
+        .unwrap();
+    let big_elapsed = start.elapsed();
     assert!(
-        elapsed.as_secs() < 10,
-        "20k-row Int32 batch took {elapsed:?}; narrow-int normalization must stay per-batch, not per-row"
+        big_elapsed.as_secs() < 10,
+        "20k-row Int32 batch took {big_elapsed:?}; narrow-int normalization must stay per-batch, not per-row"
+    );
+    assert!(
+        big_elapsed <= small_elapsed * 10,
+        "20k rows took {big_elapsed:?} vs 5k rows {small_elapsed:?}; \
+         linear cost expects ~4x — the per-row full-column cast was quadratic"
     );
 }
