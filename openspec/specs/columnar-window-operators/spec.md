@@ -21,7 +21,7 @@ by rebuilding a RecordBatch per row.
 
 ### Requirement: Keyed window aggregation state
 
-Window aggregates SHALL be keyed by `(namespace=operator_id, key=window_start||key)` in the state backend, SHALL survive restart by restore, SHALL NOT emit a fabricated aggregate row for a window with zero value observations, and SHALL use the widest numeric kind across the fired buffers (Int64 < Float32 < Float64) for the emitted `sum`/`min`/`max` columns. An aggregate buffer SHALL track integer and float observations independently, SHALL seed each representation's min/max only from that representation's own first observation, SHALL fold every observed contribution into the widened aggregate, and SHALL NOT derive a boundary from an untouched representation's default value. A buffer decoded from persisted state, including state written before the observation counters existed and buffers migrated from the legacy aggregate format, SHALL carry observation counters consistent with its accumulated `count` and min/max before the next observation is applied.
+Window aggregates SHALL be keyed by `(namespace=operator_id, key=window_start||key)` in the state backend, SHALL survive restart by restore, SHALL NOT emit a fabricated aggregate row for a window with zero value observations, and SHALL use the widest numeric kind across the fired buffers (Int64 < Float32 < Float64) for the emitted `sum`/`min`/`max` columns. An aggregate buffer SHALL track integer and float observations independently, SHALL seed each representation's min/max only from that representation's own first observation, SHALL fold every observed contribution into the widened aggregate, and SHALL NOT derive a boundary from an untouched representation's default value. A buffer decoded from persisted state, including state written before the observation counters existed and buffers migrated from the legacy aggregate format, SHALL carry observation counters consistent with its accumulated `count` and min/max before the next observation is applied. Narrow-integer value columns (Int8/Int16/Int32/UInt*) SHALL be normalized to Int64 at most once per batch (before the row loop), never by re-casting the whole column inside the per-row loop.
 
 #### Scenario: Aggregate across batches
 
@@ -57,6 +57,11 @@ Window aggregates SHALL be keyed by `(namespace=operator_id, key=window_start||k
 
 - **WHEN** a buffer in the legacy aggregate format carries a non-empty float sum next to an integer aggregate and is migrated to the typed format
 - **THEN** the migrated buffer retains that float contribution and its accumulated min/max when it later merges with new observations
+
+#### Scenario: Narrow integer value columns normalize once per batch
+
+- **WHEN** a window accumulation batch carries an Int32 value column with many rows (valid and null mixed)
+- **THEN** the column is cast to Int64 once for the whole batch, aggregates match per-row casting exactly (nulls skipped), and per-batch cost does not grow quadratically with row count
 
 ### Requirement: Dual trigger modes
 

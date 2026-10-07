@@ -53,11 +53,15 @@ codec SHALL 按 schema id 缓存已构建的 `MessageDescriptor`，使同一 id 
 - **THEN** 仅首次发起 registry 请求，后续命中缓存解码
 
 ### Requirement: 多版本 schema 解码
-codec SHALL 支持同一流中不同 schema id（不同 schema 版本）的消息，各自用对应版本的 descriptor 解码。同一 batch 内不同版本解码出的批次 schema 不一致（真实 schema 演进，如新增/缺失字段）时，codec SHALL 先把各批次归一到并集 schema（缺失列以 null 填充、列序取首批次顺序并追加新列）再合并；同名同列类型冲突（无法 null 填充消解）时 SHALL 返回指明列名与两个类型的错误。
+codec SHALL 支持同一流中不同 schema id（不同 schema 版本）的消息，各自用对应版本的 descriptor 解码。同 id 的消息 SHALL 列式累积为一个多行批次：行内容、列序、列类型均与逐消息解码后合并的结果一致；列 nullable 一致地按 writer schema（此前多消息批经并集合并会丢失非空标记，而单消息批保留——本变更消除该不一致）。同一 batch 内不同版本解码出的批次 schema 不一致（真实 schema 演进，如新增/缺失字段）时，codec SHALL 先把各分组批次归一到并集 schema（缺失列以 null 填充、列序取首个 schema id 分组内首条消息的字段顺序并追加后续分组的新列；行按 schema id 分组排列——组内保持消息顺序、组间按首次出现）再合并；同名同列类型冲突（无法 null 填充消解）时 SHALL 返回指明列名与两个类型的错误。
 
 #### Scenario: 同 batch 多版本
 - **WHEN** 一个 batch 含 schema id=1 与 schema id=2 的消息（两版 schema）
 - **THEN** 各自用对应 descriptor 解码，不互相干扰
+
+#### Scenario: 单版本批列式累积等价
+- **WHEN** 一个 batch 的全部消息共享同一 schema id
+- **THEN** 产出一个多行批次，字段顺序为该 schema 的声明顺序，行内容、列类型与"逐消息解码再合并"的既有结果一致；列 nullable 按 writer schema（非空列不再因合并被放宽为 nullable）
 
 #### Scenario: 真实 schema 演进合并
 - **WHEN** 一个 batch 混有 id=1（少一列）与 id=2（多一列）的消息，两版 schema 文本不同
@@ -134,4 +138,28 @@ codec SHALL 支持可选的 registry 认证（Basic auth 或 bearer token），�
 #### Scenario: 配置 Basic auth
 - **WHEN** codec 配置含 `auth: { type: "basic", username, password }`
 - **THEN** registry 请求携带 Basic Authorization 头
+
+### Requirement: Protobuf 批级列式解码
+
+一次 decode 调用内，同一 Protobuf schema id 的全部消息 SHALL 累积为单一多行 Arrow 批次（列式构造）：descriptor→Arrow 列映射（列集、类型、字段号）在该批内 SHALL 只计算一次，且 SHALL 在首条消息解码成功后的字段遍历中导出（kind 拒绝不先于消息解析错误）；codec SHALL NOT 为每条消息独立构造单行 RecordBatch 或独立的每消息列分配。列集 SHALL 为 descriptor 全字段集且全部 nullable。输出 SHALL 与既有"逐消息解码后归一合并"逐列一致：行序与组内消息序一致、proto3 隐式存在性的默认值语义不变（未设置标量字段取默认值而非 null）、错误类型、错误文案与首错归因不变。
+
+#### Scenario: 同 id 多消息累积为单一批次
+
+- **WHEN** 一次 decode 收到 N 条同一 Protobuf schema id 的消息
+- **THEN** 产出一个多行批次（行数 = N），行序与消息序一致，与逐消息解码加归一合并的输出逐列相等
+
+#### Scenario: 未设置字段保持 proto3 默认值语义
+
+- **WHEN** 某消息未设置 string 标量字段
+- **THEN** 该列为空字符串（默认值）而非 null，与既有逐消息路径一致
+
+#### Scenario: kind 拒绝文案与归因不变
+
+- **WHEN** descriptor 含不受支持的字段类型（嵌套 message/repeated/map/oneof）
+- **THEN** 返回的拒绝文案与既有逐消息路径逐字一致，且归因于首条消息
+
+#### Scenario: 混合组次序稳定
+
+- **WHEN** 一个 batch 混有不同 schema id 的 Protobuf 消息
+- **THEN** 各组按首次出现顺序参与归一合并，组内行序与消息序一致（与既有分组行为一致）
 
