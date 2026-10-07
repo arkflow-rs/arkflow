@@ -116,33 +116,51 @@ async fn agent_resource_gauges_reach_the_hub_metrics_export() {
     );
 
     // The export renders the gauges as arkflow_node_metric series with the
-    // node label, values passed through unchanged.
-    let body = metrics_export(&format!("http://{address}")).await;
-    let view = hub
-        .metrics_by_node(Some("node-a"))
-        .await
-        .into_iter()
-        .next()
-        .unwrap();
-    for key in [
-        "node_cpu_usage_percent",
-        "node_memory_used_bytes",
-        "node_memory_total_bytes",
-        "node_memory_available_bytes",
-    ] {
-        let value = view.metrics[key];
-        assert!(
-            body.contains(&format!(
-                "arkflow_node_metric{{node_id=\"node-a\",metric=\"{key}\"}} {value}"
-            )),
-            "export missing {key}={value}:\n{}",
-            body.lines()
-                .filter(|line| line.contains("node_metric"))
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
+    // node label, values passed through unchanged. The export body and the
+    // Hub-side view are two reads of a live pipeline: the sampler keeps
+    // publishing (CPU usage resamples every report), so a value landing
+    // between the body fetch and the view read makes a one-shot exact-match
+    // assertion flaky under load. Snapshot them as a pair and retry until
+    // the pair is consistent — a stable pair shows up within a report
+    // interval whenever the pipeline is actually wired.
+    let deadline = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let body = metrics_export(&format!("http://{address}")).await;
+            let view = hub
+                .metrics_by_node(Some("node-a"))
+                .await
+                .into_iter()
+                .next()
+                .unwrap();
+            let rendered = [
+                "node_cpu_usage_percent",
+                "node_memory_used_bytes",
+                "node_memory_total_bytes",
+                "node_memory_available_bytes",
+            ]
+            .map(|key| {
+                format!(
+                    "arkflow_node_metric{{node_id=\"node-a\",metric=\"{key}\"}} {}",
+                    view.metrics[key]
+                )
+            });
+            if rendered.iter().all(|line| body.contains(line)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        deadline.is_ok(),
+        "export never matched the Hub-side gauges:\n{}",
+        metrics_export(&format!("http://{address}"))
+            .await
+            .lines()
+            .filter(|line| line.contains("node_metric"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 
     agent_cancel.cancel();
     hub_cancel.cancel();
