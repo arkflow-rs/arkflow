@@ -101,6 +101,19 @@ refactoring is summarized rather than listed commit-by-commit.
   behind an `Arc` instead of being deep-cloned per message. The public
   benchmark suite gained three `avro-decode-w5/w25/w100` scenarios that
   exercise the real codec decode path offline. (#1309)
+- Kafka input aggregates buffered messages into multi-row read batches: the
+  first message is awaited (blocking, cancellation-safe) and already-buffered
+  messages drain without waiting, bounded by new `batch_max_rows` (default
+  1024) and `batch_max_bytes` (default 8 MiB) fields — `batch_max_rows: 1`
+  restores per-message batches. Metadata columns are attached in a single
+  RecordBatch rebuild with per-row `__meta_partition/__meta_offset/__meta_key/
+  __meta_timestamp/__meta_ext` values (key/timestamp appear as nullable
+  columns only when some row carries one; `__meta_ingest_time` is
+  batch-granular), codec decode runs once per batch with a per-payload
+  fallback that preserves exact row↔metadata alignment, and acknowledgements
+  settle per contiguous `(topic, partition)` segment whose compensation
+  replays the whole segment — at-least-once semantics unchanged. (openspec
+  `optimize-kafka-input-batching`)
 - Avro decoding is substantially faster again on wide schemas: messages
   sharing a schema id now accumulate into one set of Arrow column builders
   instead of one single-row batch per message plus a concat copy.

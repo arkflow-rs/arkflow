@@ -21,6 +21,8 @@ Kafka 输入(Input)使用消费者组(consumer group)从一个或多个 Apache K
 | fetch_max_bytes | integer | no | — | 单次拉取请求返回的最大字节数 |
 | fetch_max_partition_bytes | integer | no | — | 单次拉取中每个分区返回的最大字节数 |
 | fetch_wait_max_ms | integer | no | — | broker 在响应前等待足够数据累积的最长时间(毫秒) |
+| batch_max_rows | integer | no | `1024` | 单次 read 聚合进一个批的最大消息数。小于 1 的值钳制为 1;`1` 恢复逐条出批。 |
+| batch_max_bytes | integer | no | `8388608` (8 MiB) | 单次 read 批内累计 payload 字节数上限;首条消息必定纳入(即使超出该上限)。小于 1 的值钳制为 1。 |
 | security | object | no | — | SASL 认证与 TLS 设置;完全省略即为明文。见[安全配置](#安全配置) |
 | transactional_offsets | boolean | no | `false` | L3 精确一次:为配对 Kafka 输出的 `offset_commit_group` 注册本消费者组以在事务内提交位点。此时 `ack()` 只推进内存 frontier——broker 组位点仅随输出的事务前进。 |
 
@@ -126,7 +128,9 @@ input:
 
 ## 说明
 
-- 消息会自动携带 `__meta_source`、`__meta_partition`、`__meta_offset`、`__meta_key`、`__meta_timestamp`、`__meta_ingest_time` 等元数据列,以及扩展列 `__meta_ext.topic`。
+- 一次 `read()` 会把多条消息聚合成一个批:首条消息阻塞等待,随后**不等待**地排空客户端已缓冲的消息,受 `batch_max_rows` / `batch_max_bytes` 双上界约束。低流量时批为单条、零额外延迟——不会为凑批而等待。
+- 消息会自动携带 `__meta_source`、`__meta_partition`、`__meta_offset`、`__meta_key`、`__meta_timestamp`、`__meta_ingest_time` 等元数据列,以及扩展列 `__meta_ext.topic`。多消息批内每一行携带**各自消息**的 `__meta_partition`/`__meta_offset`/`__meta_key`/`__meta_timestamp`/`__meta_ext` 值;`__meta_ingest_time` 为整批一个时间戳。`__meta_key` 与 `__meta_timestamp` 仅在批内至少一行有值时以 nullable 列出现(缺值的行为 NULL)——全批皆无时不出现在 schema 中,与逐条路径形状一致。
 - 每条 Kafka record header 会作为 `header_<key>` 条目写入 `__meta_ext` 映射列。重复的 header key 会保留全部值:首次出现使用 `header_<key>`,后续出现附加位置后缀(`header_<key>_2`、`header_<key>_3`…)。值按 UTF-8 lossy 解码(非法字节替换为 U+FFFD),无值的 header 映射为空字符串。
+- 确认按 `(topic, partition)` 的连续 offset 段进行:批的 ack 把提交位点推进到段内最后一个 offset,补偿(`undo`)则回退到段首——至少一次语义下整批作为一个单元重投。墓碑消息(null payload,如 compacted topic)在批外结算,不进入数据批。
 - 只有在调用 `ack()` 时(下游写入成功后)才通过 `store_offset` 推进偏移量,并结合周期性自动提交,实现至少一次投递。
 - 声明 `transactional_offsets: true` 后,`ack()` 只推进内存 frontier 并跳过 `store_offset`:broker 组位点折入配对事务性 Kafka 输出的事务内提交(`offset_commit_group` 指名本输入的 `consumer_group`),消除「提交后崩溃」的重复窗口。输出把事务内提交钳制到该 frontier,其他分支仍在结算的记录不会被跳过。本输入的 `undo()` 补偿同样只回退内存 frontier——组的 broker 位点只有唯一写者:配对输出的事务。配对是进程内的,要求单主题订阅,且在启动期校验:没有任何输出认领本组的配置启动即失败(配置错误)——参见[精确一次处理](/zh-Hans/docs/build/exactly-once)。

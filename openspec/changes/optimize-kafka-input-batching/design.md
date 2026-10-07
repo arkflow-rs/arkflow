@@ -57,9 +57,10 @@ attach_row_source_metadata(batch, rows: &[RowSourceMetadata]) -> Result<RecordBa
 ### D3 Ack：按 (topic, partition) 段式 KafkaAck + ConcurrentAck
 
 - `KafkaAck` 增加字段 `segment_start: i64`（现单条路径即 `offset == segment_start`）。ack 语义不变：position = `offset+1`，frontier 连续推进、`store_offset` 存连续 next。
-- **undo 回退到段首**：`store_offset(segment_start)` + `frontier.rewind_position(next = segment_start)`——整段重投。现单条 undo（`kafka.rs:1019-1079`）是段长为 1 的特例。
+- **undo 回退到段首**：`store_offset(segment_start)` + `frontier.rewind_position` 逐格回退到 `segment_start`——整段重投。现单条 undo（`kafka.rs:1019-1079`）是段长为 1 的特例。
+- **段内逐 offset acknowledge（实施修正）**：`CommitFrontier.acknowledge` 只登记单个 next-offset（pending 集合），不自动填段内区间——`anchor(5)+ack(8)` 会留下永不闭合的 gap 6。段 ack 因此在 ack_lock 临界区内对 `first..=last` 逐 offset acknowledge（段内连续，仅首 offset 可能 `Pending`；frontier 的连续 drain 保证一次推进到 `last+1`，`store_offset` 仍只写最终连续值）。
 - `anchor_delivery`：每 partition 段锚定**首条** offset（与 WAL replay 的锚定语义一致，`kafka.rs:639-643`）；批内同 partition 连续（单消费组天然成立）时段 ack 即一次 `Advanced`。
-- 跨 (topic, partition) 组：1 组 → 直接 KafkaAck；n 组 → `ConcurrentAck`。fan-out 由内核 `fanout_ack` 逐组分发，现有乱序容忍不变。
+- 跨 (topic, partition) 组：1 组 → 直接 KafkaAck；n 组 → `VecAck`（**实施修正**：调研设想的 `ConcurrentAck` 是 arkflow-core 的 `pub(crate)` 类型，插件不可见；`VecAck` 顺序 ack 各组——各 partition frontier 相互独立，不存在跨分区 gap 等待，顺序执行无死锁风险，失败反向补偿语义相同）。fan-out 由内核 `fanout_ack` 逐组分发，现有乱序容忍不变。
 - **tombstone**：维持现状 spawn 后台结算（`kafka.rs:431-470`）。位于数据段内的 tombstone 位置会被段 ack 连续覆盖，双重结算经 frontier `AlreadyCovered` 幂等；段外/孤立 tombstone 仍自结算。**不引入新的等待路径**（spec：结算不得阻塞 source loop）。
 - `transactional_offsets`（L3）：段 ack 同样跳过本地 `store_offset`，只推进 frontier 供事务 output 按连续段提交——语义不变。
 
