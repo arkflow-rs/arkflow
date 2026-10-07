@@ -556,3 +556,38 @@ S3 WAL 异步路径必崩（tokio 嵌套 runtime panic，实测复现）｜租�
 
 > **发版决策（2026-10-04，维护者确认）**：不先发 0.6 中间版，v0.5.0 以来的全部积压随 v1.0 一次性释放。批次 E 中「发 0.6」一项作废，其余子项（release 自动化、CHANGELOG/SECURITY.md/版本策略、CI clippy/fmt 门禁、`arkflow-server` CLI 与 MAX_NODES 用户文档）不变；发布顺序变为：批次 E（除 0.6）→ 批次 C → 直接打 v1.0。
 > **修订（2026-10-06，维护者确认）**：撤销「直接打 v1.0」，**先发布 0.6.0**，v1.0 推后另行决策。批次 E 各子项（release 自动化、CHANGELOG/SECURITY.md/版本策略、CI 门禁、`arkflow-server` CLI 与 MAX_NODES 文档）保持有效；发布顺序变为：批次 A-F 已全部闭环 → workspace 版本 bump `0.6.0` + CHANGELOG `[Unreleased]` 定稿为 `[0.6.0]` → CI 形态全量验证 → 打 tag `v0.6.0`（release.yml 自动出四平台二进制与 GitHub Release）→ v1.0 时机与范围待后续决策。
+
+---
+
+## 十、热路径性能审计与分批优化（2026-10-07）
+
+> 源起：codec 解码栈闭环（Avro 列式 +4.7~8.7×、Protobuf ×18.5、Arc 缓存）后的四路热路径审计（codec / 执行内核 / processor+MessageBatch / input-output IO），结论按梯队沉淀于此，避免重复调研；各批落地后从对应条目划掉。
+
+### 10.1 审计基线（release，本机）
+
+linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往返 1.7M、avro-decode w5/w25/w100 = 1.05M/396K/109K。关键事实：Kafka input 每次 read() 只取一条消息（input/kafka.rs:413），Kafka→Kafka 下所有"每批"开销实际是"每条"频率（批粒度放大器）。
+
+### 10.2 优化点梯队清单
+
+**第一批（机械修复，change `optimize-hotpath-mechanical-batch`，2026-10-07 实施）**：
+1. ✅ 独立 protobuf codec/processor decode 接入现成 `ProtobufBatchConverter`（codec/protobuf.rs、processor/protobuf.rs；schema_registry 路径已实测 ×18.5）；
+2. ✅ 窗口算子行循环内整列 cast 的 O(n²)（operator.rs accumulate，Int8/16/32、UInt* value 列每行每窗口成员重 cast 整列）→ 批前一次 `BatchValueColumn` 规整；
+3. ❌（已实测剔除）SQL SessionContext `target_partitions=1`：审计初判千行小批可省 RepartitionExec+concat 固定开销，实施后同机四轮实测 groupby-sql -11%、filter-project -12%（linear 噪声内）——多分区给聚合提供**查询内跨核并行**（partial aggregate 并行），收益超过 spawn/concat 开销；已回退。**后续重估必须以 EXPLAIN 物理计划对比立项，不得直接改配置**；
+4. ✅ `ChainHooks.chain_metrics` 构建期解析一次（原每批 2 次 `KernelMetrics::chain()` = Mutex+String alloc+BTreeMap 查找；task.rs/kernel_handle.rs 两个 hook 构造点接线，worker pool 同步传）。
+
+**第二批候选（各自独立 change）**：
+- JSON 双遍解析 + 零 schema 缓存（component/json.rs try_to_arrow：infer+Reader 两趟全量解析、concat 拷贝、跨批不缓存 schema；Kafka input 逐条时 = 每条两趟）——影响全部 JSON 入口（json/debezium/schema_registry JSON 模式/HTTP input）；
+- Kafka input 逐条出批：7 个 `with_*` 元数据链 = 7 次 RecordBatch/schema 重建每条 + 3 次 topic String + 逐条 codec decode（两步：先合并元数据一次重建，再 read 内聚合多行成批）；
+- 窗口算子每批全量状态快照（operator.rs runtime_snapshot `buffers.clone()` ∝ 打开窗口数，高基数天花板）+ `extract_keys` 每行 String ×2-3 次/批 + accumulate 行循环 3-4 次 String clone/BTreeMap 查找；
+- event_time_gate：classify_row 每行 3-5 Vec 分配、collect_outcomes 全 Emit 仍全批深拷贝、split_by_physical_partition 每行 format!/to_owned；
+- SQL processor 物理计划每批重建（需 SwapBatchTable 自定义 ExecutionPlan 才能 cache；analyzed/optimized 已缓存）；
+- protobuf encode 逐 cell `set_field_by_name`（hash+HashMap+Arc bump ×cell；decode 侧已按字段号预解析，encode 对称补齐：每列预解析 FieldDescriptor）；
+- debezium 每消息 3 次 JSON 遍历 + before 深拷贝（先序列化再 move 可省 clone；列式累积进 builder 是终态）；
+- VRL 每行独立 MessageBatch + 每格 key String（合并单批输出）；
+- SQL output 逐 cell async 转换 + 三重深拷贝（列式转换）；
+- Kafka output 冗余 to_vec + 逐条 send_futures mutex + 事务路径每条两次 broker 往返；stdout 每行 2 syscall；
+- 小项：generate input 每条 clone 相同 context（benchmark 前端失真）、memory buffer 写锁内全队列求和、partitioned 路由 per-subtask 全批重扫、fanout_ack 状态机 3n+3 次分配、TrackingAck 每源批 tokio Mutex。
+
+### 10.3 已阻塞项
+
+- Avro L2 reader 复用：apache-avro 上游 API（`decode_internal` 私有、reader 只收借用型 `ResolvedSchema`），需上游 owned-reader PR。

@@ -811,6 +811,7 @@ impl KernelJobRunner {
             hooks.insert(
                 entry_task_id.clone(),
                 super::task::ChainHooks {
+                    chain_metrics: Some(runtime_metrics.kernel.chain(&entry_task_id)),
                     checkpoint: super::task::CheckpointHook {
                         reporter: Some(report_tx.clone()),
                         failure_reporter: Some(checkpoint_error_tx.clone()),

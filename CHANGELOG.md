@@ -113,6 +113,18 @@ refactoring is summarized rather than listed commit-by-commit.
   single-row batch per message plus a concat copy. Output and error
   behavior are unchanged; ~18x faster on a 26-field message timing run.
   (#1312)
+- Hot-path mechanical batch: the standalone protobuf codec and the
+  `protobuf_to_arrow` processor decode through the same columnar converter
+  (one multi-row batch per decode call, no per-message schema construction);
+  window aggregation normalizes narrow integer value columns (Int8/16/32,
+  UInt*) once per batch instead of re-casting the whole column per row —
+  wide batches were quadratic; and the kernel resolves per-chain
+  metrics once at chain startup instead of twice per batch (lock + string
+  alloc + map lookup). No observable behavior changes. (A fourth candidate,
+  pinning streaming SQL sessions to one DataFusion target partition, was
+  measured to regress GROUP BY throughput ~11% — multi-partition execution
+  gives the aggregate intra-query parallelism that outweighs its overhead —
+  and was dropped.)
 
 ### Fixed
 

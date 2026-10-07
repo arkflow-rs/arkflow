@@ -28,6 +28,16 @@ use std::sync::{Arc, Mutex};
 /// Minimum spacing between two `max_buffered_keys` eviction warn lines.
 const WINDOW_EVICTION_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The batch's (first) value column, resolved once per `accumulate` call:
+/// narrow integer columns are already normalized to Int64 (cast once per
+/// batch, never per row), and `Count` is the no-value-fields fallback.
+enum BatchValueColumn<'a> {
+    Count,
+    Int(&'a Int64Array),
+    Float(&'a datafusion::arrow::array::Float64Array),
+    Float32(&'a datafusion::arrow::array::Float32Array),
+}
+
 /// The columnar window operator. One instance per stateful operator task;
 /// state is namespaced under the operator id so parallel subtasks stay
 /// isolated.
@@ -703,6 +713,55 @@ impl ColumnarWindowOperator {
         // would make a degraded sliding batch quadratic.
         let mut protection_base: Option<BTreeSet<(i64, String)>> = None;
         let mut legacy_rows = BTreeMap::<(i64, String), Vec<usize>>::new();
+        // Normalize the (first) value column once per batch. Narrow integer
+        // columns used to be re-cast to Int64 inside the row loop — per row
+        // AND per window membership — which made wide batches quadratic.
+        // The cast preserves the validity bitmap, so null handling is
+        // identical to per-row casting.
+        let narrow_int_owned: Option<Int64Array>;
+        let value_column = match value_columns.first() {
+            None => BatchValueColumn::Count,
+            Some(column) => match column.data_type() {
+                DataType::Int64 => {
+                    BatchValueColumn::Int(column.as_any().downcast_ref::<Int64Array>().unwrap())
+                }
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64 => {
+                    let casted = cast(column, &DataType::Int64)
+                        .map_err(|error| Error::Process(format!("cast window value: {error}")))?;
+                    narrow_int_owned = Some(Int64Array::from(casted.to_data()));
+                    BatchValueColumn::Int(narrow_int_owned.as_ref().unwrap())
+                }
+                DataType::Float64 => BatchValueColumn::Float(
+                    column
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::Float64Array>()
+                        .unwrap(),
+                ),
+                DataType::Float32 => BatchValueColumn::Float32(
+                    column
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::Float32Array>()
+                        .unwrap(),
+                ),
+                other => {
+                    return Err(Error::Process(format!(
+                        "window value field '{}' has unsupported numeric type {other:?}; \
+                         expected an integer, Float32, or Float64 column",
+                        self.config
+                            .value_fields
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("?")
+                    )));
+                }
+            },
+        };
         for row in 0..batch.len() {
             let (Some(event_time), Some(key)) = (&timestamps[row], &keys[row]) else {
                 continue;
@@ -844,64 +903,25 @@ impl ColumnarWindowOperator {
                 if matches!(self.config.kind, WindowKind::Session { .. }) {
                     entry.session_end_ms = entry.session_end_ms.max(window_end);
                 }
-                if let Some(column) = value_columns.first() {
-                    match column.data_type() {
-                        DataType::Int64 => {
-                            let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
-                            if !values.is_null(row) {
-                                entry.observe_i64(values.value(row));
-                            }
-                        }
-                        DataType::Int8
-                        | DataType::Int16
-                        | DataType::Int32
-                        | DataType::UInt8
-                        | DataType::UInt16
-                        | DataType::UInt32
-                        | DataType::UInt64 => {
-                            let casted = cast(column, &DataType::Int64).map_err(|error| {
-                                Error::Process(format!("cast window value: {error}"))
-                            })?;
-                            let values = casted.as_any().downcast_ref::<Int64Array>().unwrap();
-                            if !values.is_null(row) {
-                                entry.observe_i64(values.value(row));
-                            }
-                        }
-                        DataType::Float64 => {
-                            let values = column
-                                .as_any()
-                                .downcast_ref::<datafusion::arrow::array::Float64Array>()
-                                .unwrap();
-                            if !values.is_null(row) {
-                                entry.observe_float(values.value(row), NumericKind::Float64);
-                            }
-                        }
-                        DataType::Float32 => {
-                            let values = column
-                                .as_any()
-                                .downcast_ref::<datafusion::arrow::array::Float32Array>()
-                                .unwrap();
-                            if !values.is_null(row) {
-                                entry.observe_float(
-                                    f64::from(values.value(row)),
-                                    NumericKind::Float32,
-                                );
-                            }
-                        }
-                        other => {
-                            return Err(Error::Process(format!(
-                                "window value field '{}' has unsupported numeric type {other:?}; \
-                                 expected an integer, Float32, or Float64 column",
-                                self.config
-                                    .value_fields
-                                    .first()
-                                    .map(String::as_str)
-                                    .unwrap_or("?")
-                            )));
+                match value_column {
+                    BatchValueColumn::Count => {
+                        entry.observe_i64(1);
+                    }
+                    BatchValueColumn::Int(values) => {
+                        if !values.is_null(row) {
+                            entry.observe_i64(values.value(row));
                         }
                     }
-                } else {
-                    entry.observe_i64(1);
+                    BatchValueColumn::Float(values) => {
+                        if !values.is_null(row) {
+                            entry.observe_float(values.value(row), NumericKind::Float64);
+                        }
+                    }
+                    BatchValueColumn::Float32(values) => {
+                        if !values.is_null(row) {
+                            entry.observe_float(f64::from(values.value(row)), NumericKind::Float32);
+                        }
+                    }
                 }
                 // Enforce the entry cap DURING accumulation (after this
                 // membership's mutation): a wide sliding batch can create

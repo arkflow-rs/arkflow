@@ -148,6 +148,11 @@ pub fn parse_proto_source(schema: &str, message_type: &str) -> Result<MessageDes
 /// The schema is driven by the message descriptor's full field set (every field
 /// nullable), so every decoded message yields the same schema regardless of
 /// which fields are present — making the per-message batches safe to concatenate.
+///
+/// Test-only reference path: production decode goes through
+/// [`ProtobufBatchConverter`]; this function stays as the per-message oracle
+/// the columnar output is asserted against.
+#[cfg(test)]
 pub fn protobuf_to_arrow(
     descriptor: &MessageDescriptor,
     data: &[u8],

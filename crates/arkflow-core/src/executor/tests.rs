@@ -1803,6 +1803,7 @@ async fn barrier_flows_to_sink_without_stalling_data() {
                 partition: Some(0),
             },
             metrics: None,
+            chain_metrics: None,
         },
     );
 
@@ -5472,6 +5473,7 @@ async fn barrier_carries_remote_trace_context_across_chains() {
                 partition: Some(0),
             },
             metrics: None,
+            chain_metrics: None,
         },
     );
 
@@ -7205,6 +7207,7 @@ fn source_hook(
                 partition: Some(0),
             },
             metrics: None,
+            chain_metrics: None,
         },
     )])
 }
