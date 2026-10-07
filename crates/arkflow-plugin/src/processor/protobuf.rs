@@ -25,7 +25,7 @@
 //! supported and produce an error.
 
 use crate::component::protobuf::{
-    arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
+    arrow_to_protobuf, parse_proto_file, ProtobufBatchConverter, ProtobufConfig,
 };
 use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
@@ -33,7 +33,6 @@ use arkflow_core::{
     Error, MessageBatch, MessageBatchRef, ProcessResult, Resource, DEFAULT_BINARY_VALUE_FIELD,
 };
 use async_trait::async_trait;
-use datafusion::arrow;
 use prost_reflect::MessageDescriptor;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -125,22 +124,19 @@ impl Processor for ProtobufProcessor {
                 Arc::new((*msg).new_binary_with_origin(proto_data)?)
             }
             ToType::ProtobufToArrow(ref c) => {
-                let mut batches = Vec::with_capacity(msg.len());
-                let result = (*msg).to_binary(
+                let payloads = (*msg).to_binary(
                     c.value_field
                         .as_deref()
                         .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
                 )?;
-                for x in result {
-                    // Convert Protobuf messages to Arrow format.
-                    let batch = protobuf_to_arrow(&self.descriptor, x)?;
-                    batches.push(batch)
+                // All payloads share the processor's single descriptor, so one
+                // columnar converter accumulates the whole batch without
+                // per-message schema construction or a concat pass.
+                let mut converter = ProtobufBatchConverter::new(self.descriptor.clone());
+                for x in payloads {
+                    converter.push(x)?;
                 }
-
-                let schema = batches[0].schema();
-                let batch = arrow::compute::concat_batches(&schema, &batches)
-                    .map_err(|e| Error::Process(format!("Batch merge failed: {}", e)))?;
-                Arc::new(MessageBatch::new_arrow(batch))
+                Arc::new(MessageBatch::new_arrow(converter.finish()?))
             }
         };
 

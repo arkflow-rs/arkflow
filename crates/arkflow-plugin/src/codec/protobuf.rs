@@ -25,14 +25,12 @@
 //! supported and produce an error.
 
 use crate::component::protobuf::{
-    arrow_to_protobuf, parse_proto_file, protobuf_to_arrow, ProtobufConfig,
+    arrow_to_protobuf, parse_proto_file, ProtobufBatchConverter, ProtobufConfig,
 };
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
 use arkflow_core::component::{register_codec_metadata, ComponentMetadata};
 use arkflow_core::{codec, Bytes, Error, MessageBatch, Resource};
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::Schema;
-use datafusion::arrow::record_batch::RecordBatch;
 use prost_reflect::MessageDescriptor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -114,12 +112,18 @@ impl Encoder for ProtobufCodec {
 #[async_trait]
 impl Decoder for ProtobufCodec {
     async fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
-        let mut batches = Vec::with_capacity(b.len());
+        // Every message shares this codec's single descriptor, so one
+        // columnar converter accumulates the whole batch: the first message
+        // tees the per-column plans, later messages append by field number,
+        // and finish() emits one multi-row batch — no per-message schema
+        // construction and no union-merge pass.
+        let mut converter = ProtobufBatchConverter::new(self.descriptor.clone());
+        let mut good = 0usize;
         let mut skipped = 0usize;
 
-        for (idx, data) in b.into_iter().enumerate() {
-            match protobuf_to_arrow(&self.descriptor, &data) {
-                Ok(record_batch) => batches.push(record_batch),
+        for (idx, data) in b.iter().enumerate() {
+            match converter.push(data) {
+                Ok(()) => good += 1,
                 Err(e) if self.on_error == OnError::Skip => {
                     warn!(
                         "protobuf codec: skipping message #{} ({} bytes): {}",
@@ -137,26 +141,20 @@ impl Decoder for ProtobufCodec {
             warn!(
                 "protobuf codec: skipped {} of {} messages in the batch",
                 skipped,
-                batches.len() + skipped
+                good + skipped
             );
         }
-        if batches.is_empty() {
+        if good == 0 {
             if skipped > 0 {
                 return Err(Error::Process(format!(
                     "protobuf codec: all {} messages in the batch failed to decode",
                     skipped
                 )));
             }
-            return Ok(MessageBatch::new_arrow(RecordBatch::new_empty(Arc::new(
-                Schema::empty(),
-            ))));
+            return Ok(MessageBatch::new_arrow(converter.finish()?));
         }
 
-        // Same descriptor for every message keeps schemas identical; the
-        // union-merge is used defensively in case a descriptor evolves.
-        let merged_batch = crate::component::batch_merge::normalize_and_concat(&batches)?;
-
-        Ok(MessageBatch::new_arrow(merged_batch))
+        Ok(MessageBatch::new_arrow(converter.finish()?))
     }
 }
 
@@ -204,7 +202,8 @@ pub(crate) fn init() -> Result<(), Error> {
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
     use tempfile::TempDir;
 
@@ -390,6 +389,18 @@ message TestMessage {
             .decode(vec![good1, b"garbage".to_vec(), good2])
             .await?;
         assert_eq!(decoded.len(), 2, "bad middle message must be skipped");
+        // The surviving rows must be exactly the good messages, in order:
+        // the converter accumulates pushes in input order, so the dropped
+        // message leaves no hole and no reordering.
+        let timestamps = decoded
+            .record_batch()
+            .column_by_name("timestamp")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>());
+        assert_eq!(
+            timestamps.map(|values| values.values().to_vec()),
+            Some(vec![1i64, 2]),
+            "surviving rows must be the good messages in order"
+        );
 
         Ok(())
     }
@@ -406,7 +417,13 @@ message TestMessage {
         let result = codec
             .decode(vec![b"garbage".to_vec(), b"more garbage".to_vec()])
             .await;
-        assert!(result.is_err(), "all-bad batch must error");
+        let error = result.expect_err("all-bad batch must error").to_string();
+        // The skip count is part of the observable outcome: the all-bad
+        // error names how many messages were skipped.
+        assert!(
+            error.contains("all 2 messages"),
+            "skip count must surface in the error: {error}"
+        );
         Ok(())
     }
 
@@ -420,6 +437,66 @@ message TestMessage {
         let codec = ProtobufCodecBuilder.build(None, &Some(config), &create_test_resource())?;
         let result = codec.decode(vec![b"garbage".to_vec()]).await;
         assert!(result.is_err(), "default policy must fail the batch");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_codec_columnar_batch_equals_per_message_merge() -> Result<(), Error> {
+        let (_x, proto_dir) = create_test_proto_file()?;
+        let config = serde_json::json!({
+            "proto_inputs": [proto_dir.to_string_lossy()],
+            "message_type": "test.TestMessage",
+        });
+        let config: ProtobufCodecConfig = serde_json::from_value(config)?;
+        let codec = ProtobufCodec::new(config)?;
+
+        // Three rows with heterogeneous field presence, encoded one-by-one.
+        let make_row = |t: i64, v: Option<f64>, s: Option<&str>| -> Result<MessageBatch, Error> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("timestamp", DataType::Int64, true),
+                Field::new("value", DataType::Float64, true),
+                Field::new("sensor", DataType::Utf8, true),
+            ]));
+            let rb = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(t)])),
+                    Arc::new(Float64Array::from(vec![v])),
+                    Arc::new(StringArray::from(vec![s])),
+                ],
+            )
+            .map_err(|e| Error::Process(e.to_string()))?;
+            Ok(MessageBatch::new_arrow(rb))
+        };
+        let mut encoded = Vec::with_capacity(3);
+        for row in [
+            make_row(1, Some(1.5), Some("a"))?,
+            make_row(2, None, None)?,
+            make_row(3, Some(3.5), Some("c"))?,
+        ] {
+            encoded.push(codec.encode(row).await.unwrap().into_iter().next().unwrap());
+        }
+
+        // New path: one converter, one multi-row batch.
+        let columnar = codec.decode(encoded.clone()).await?;
+        assert_eq!(columnar.len(), 3);
+
+        // Legacy path: per-message decode then union-merge, as a reference.
+        let per_message: Vec<RecordBatch> = encoded
+            .iter()
+            .map(|data| crate::component::protobuf::protobuf_to_arrow(&codec.descriptor, data))
+            .collect::<Result<_, _>>()?;
+        let merged = crate::component::batch_merge::normalize_and_concat(&per_message)?;
+
+        assert_eq!(columnar.schema().fields(), merged.schema().fields());
+        for i in 0..merged.num_columns() {
+            assert_eq!(
+                format!("{:?}", columnar.column(i)),
+                format!("{:?}", merged.column(i)),
+                "column {} must match the per-message-merge result",
+                merged.schema().field(i).name()
+            );
+        }
         Ok(())
     }
 }

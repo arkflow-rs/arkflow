@@ -121,6 +121,11 @@ pub(crate) struct ChainHooks {
     /// Runtime counters for control-plane snapshots (source chains bump
     /// input counts; dispatch paths bump output/error counts).
     pub metrics: Option<Arc<crate::runtime::RuntimeMetrics>>,
+    /// This chain's kernel counters, resolved once at hook construction.
+    /// The dispatch paths used to re-resolve them through
+    /// `KernelMetrics::chain` (Mutex + String alloc + BTreeMap lookup)
+    /// twice per batch.
+    pub chain_metrics: Option<Arc<super::metrics::ChainMetrics>>,
 }
 
 #[cfg(test)]
@@ -161,6 +166,7 @@ pub(crate) async fn run_graph_with_metrics_startup(
                 chain.entry_task_id().to_owned(),
                 ChainHooks {
                     metrics: Some(metrics.clone()),
+                    chain_metrics: Some(metrics.kernel.chain(chain.entry_task_id())),
                     ..Default::default()
                 },
             );
@@ -834,7 +840,14 @@ async fn run_source_chain(
             Arc::new(super::commit::TrackingAck::new(tracker.clone(), source_ack));
         match event_time_enabled {
             false => {
-                dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await?;
+                dispatch_data(
+                    chain,
+                    batch,
+                    ack,
+                    hook.metrics.as_ref(),
+                    hook.chain_metrics.as_ref(),
+                )
+                .await?;
             }
             true => {
                 let partitions =
@@ -1234,7 +1247,14 @@ async fn dispatch_gated(
             Ok(batch) => batch,
             Err(error) => return Err(error_after_ack_abort(error, vec![ack]).await),
         };
-        return dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await;
+        return dispatch_data(
+            chain,
+            batch,
+            ack,
+            hook.metrics.as_ref(),
+            hook.chain_metrics.as_ref(),
+        )
+        .await;
     }
     let batch = match action {
         crate::event_time::WindowAction::Update => {
@@ -1246,7 +1266,15 @@ async fn dispatch_gated(
         _ => batch,
     };
     let ack_for_error = ack.clone();
-    match dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await {
+    match dispatch_data(
+        chain,
+        batch,
+        ack,
+        hook.metrics.as_ref(),
+        hook.chain_metrics.as_ref(),
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = ack_for_error.abort().await;
@@ -1827,7 +1855,14 @@ async fn handle_envelope(
                     return Err(error);
                 }
             } else {
-                dispatch_data(chain, batch, ack, hook.metrics.as_ref()).await?;
+                dispatch_data(
+                    chain,
+                    batch,
+                    ack,
+                    hook.metrics.as_ref(),
+                    hook.chain_metrics.as_ref(),
+                )
+                .await?;
             }
             Ok(false)
         }
@@ -1935,6 +1970,7 @@ impl ProcessorWorkerPool {
         let parallelism = chain.processor_parallelism;
         let shared = Arc::new(chain.share_for_workers());
         let metrics = hook.metrics.clone();
+        let chain_metrics = hook.chain_metrics.clone();
         let (work_tx, work_rx) = flume::bounded::<(u64, PoolDelivery)>(64.min(parallelism * 8));
         // Bounded so a blocked reorder collector backpressures the workers
         // and, through the submit queue, the chain loop and the source. When
@@ -1951,6 +1987,7 @@ impl ProcessorWorkerPool {
         for _ in 0..parallelism {
             let shared = shared.clone();
             let metrics = metrics.clone();
+            let chain_metrics = chain_metrics.clone();
             let work_rx = work_rx.clone();
             let done_tx = done_tx.clone();
             let fail_tx = fail_tx.clone();
@@ -1967,7 +2004,15 @@ impl ProcessorWorkerPool {
                         },
                     };
                     let (sequence, (batch, ack)) = submit;
-                    match process_chain(&shared, batch, ack, metrics.as_ref()).await {
+                    match process_chain(
+                        &shared,
+                        batch,
+                        ack,
+                        metrics.as_ref(),
+                        chain_metrics.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(outputs) => {
                             // Publish asynchronously: a blocking send here
                             // would park a tokio worker thread and, once the
@@ -2606,9 +2651,9 @@ async fn dispatch_data(
     batch: crate::MessageBatchRef,
     ack: Arc<dyn crate::input::Ack>,
     metrics: Option<&Arc<crate::runtime::RuntimeMetrics>>,
+    chain_metrics: Option<&Arc<super::metrics::ChainMetrics>>,
 ) -> Result<(), Error> {
-    let chain_metrics = metrics.map(|metrics| metrics.kernel.chain(chain.entry_task_id()));
-    if let Some(chain_metrics) = &chain_metrics {
+    if let Some(chain_metrics) = chain_metrics {
         chain_metrics
             .in_flight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2618,7 +2663,7 @@ async fn dispatch_data(
     // tracing disabled the callsite is off and the span is never created.
     let rows = batch.len();
     let result = async {
-        match process_chain(chain, batch, ack, metrics).await {
+        match process_chain(chain, batch, ack, metrics, chain_metrics).await {
             Ok(outputs) => flush_outputs(chain, outputs).await,
             Err(ProcessChainError::Processor(failure)) => {
                 tracing::info!(
@@ -2665,10 +2710,10 @@ async fn process_chain(
     batch: crate::MessageBatchRef,
     ack: Arc<dyn crate::input::Ack>,
     metrics: Option<&Arc<crate::runtime::RuntimeMetrics>>,
+    chain_metrics: Option<&Arc<super::metrics::ChainMetrics>>,
 ) -> Result<Vec<ProcessedBatch>, ProcessChainError> {
-    let chain_metrics = metrics.map(|metrics| metrics.kernel.chain(chain.entry_task_id()));
     let started = Instant::now();
-    if let Some(chain_metrics) = &chain_metrics {
+    if let Some(chain_metrics) = chain_metrics {
         chain_metrics
             .batches_in
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4696,6 +4741,7 @@ mod task_dispatch_tests {
             utf8_batch(vec![Some("row")]),
             Arc::new(ProbeAck::default()),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -6033,7 +6079,7 @@ mod task_loop_tests {
         let chain = simple_chain(Arc::new(EmptyMultiple));
         let ack = probe();
         ack.fail_ack.store(true, Ordering::SeqCst);
-        let error = dispatch_data(&chain, ts_batch(1), ack.clone(), None)
+        let error = dispatch_data(&chain, ts_batch(1), ack.clone(), None, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("ack failed"), "{error}");
@@ -6044,7 +6090,7 @@ mod task_loop_tests {
         let chain = simple_chain(Arc::new(NoneProcessor { close_fails: false }));
         let ack = probe();
         ack.fail_ack.store(true, Ordering::SeqCst);
-        let error = dispatch_data(&chain, ts_batch(1), ack.clone(), None)
+        let error = dispatch_data(&chain, ts_batch(1), ack.clone(), None, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("ack failed"), "{error}");
@@ -6064,7 +6110,7 @@ mod task_loop_tests {
             }
         }
         let chain = simple_chain(Arc::new(Replacing));
-        dispatch_data(&chain, ts_batch(1), probe(), None)
+        dispatch_data(&chain, ts_batch(1), probe(), None, None)
             .await
             .unwrap();
     }
@@ -6073,15 +6119,21 @@ mod task_loop_tests {
     async fn processor_errors_bump_the_runtime_and_chain_metrics() {
         let chain = simple_chain(Arc::new(FailingProcessor));
         let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
-        let error = dispatch_data(&chain, ts_batch(1), probe(), Some(&metrics))
-            .await
-            .unwrap_err();
+        let chain_metrics = metrics.kernel.chain("m");
+        let error = dispatch_data(
+            &chain,
+            ts_batch(1),
+            probe(),
+            Some(&metrics),
+            Some(&chain_metrics),
+        )
+        .await
+        .unwrap_err();
         assert!(
             error.to_string().contains("injected processor failure"),
             "{error}"
         );
         assert_eq!(metrics.processing_errors.load(Ordering::SeqCst), 1);
-        let chain_metrics = metrics.kernel.chain("m");
         assert_eq!(chain_metrics.errors.load(Ordering::SeqCst), 1);
     }
 
@@ -6092,7 +6144,7 @@ mod task_loop_tests {
         chain.sink = Some(Arc::new(NullOutput));
         let ack = probe();
         ack.fail_ack.store(true, Ordering::SeqCst);
-        let error = dispatch_data(&chain, ts_batch(1), ack.clone(), None)
+        let error = dispatch_data(&chain, ts_batch(1), ack.clone(), None, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("ack failed"), "{error}");

@@ -4427,3 +4427,167 @@ mod coverage_gap_tests {
         );
     }
 }
+
+/// Batch whose value column is Int32 (narrow integer) with mixed nulls —
+/// the column kind that used to be re-cast to Int64 per row inside
+/// `accumulate`, making wide batches quadratic.
+fn int32_value_batch(
+    rows: Vec<(i64, &str, Option<i32>)>,
+    watermark: Option<i64>,
+) -> MessageBatchRef {
+    use datafusion::arrow::array::Int32Array;
+    let mut fields = vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, true),
+    ];
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(I64::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+        Arc::new(StringArray::from(
+            rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+        )),
+    ];
+    if let Some(watermark) = watermark {
+        fields.push(Field::new("__watermark_ms", DataType::Int64, false));
+        columns.push(Arc::new(I64::from(vec![watermark; rows.len()])));
+    }
+    Arc::new(crate::MessageBatch::new_arrow(
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
+    ))
+}
+
+/// Batch with the same logical rows but an Int64 value column, as the
+/// equivalence reference for the narrow-integer path.
+fn int64_value_batch(
+    rows: Vec<(i64, &str, Option<i32>)>,
+    watermark: Option<i64>,
+) -> MessageBatchRef {
+    let mut fields = vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, true),
+    ];
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(I64::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+        Arc::new(StringArray::from(
+            rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>(),
+        )),
+        Arc::new(I64::from(
+            rows.iter().map(|r| r.2.map(i64::from)).collect::<Vec<_>>(),
+        )),
+    ];
+    if let Some(watermark) = watermark {
+        fields.push(Field::new("__watermark_ms", DataType::Int64, false));
+        columns.push(Arc::new(I64::from(vec![watermark; rows.len()])));
+    }
+    Arc::new(crate::MessageBatch::new_arrow(
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(),
+    ))
+}
+
+fn fired_counts_sums(fired: &crate::MessageBatch) -> (Vec<u64>, Vec<i64>) {
+    let counts = fired
+        .record_batch()
+        .column_by_name("count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let sums = fired
+        .record_batch()
+        .column_by_name("sum")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    (counts.values().to_vec(), sums.values().to_vec())
+}
+
+/// Narrow-integer value columns normalize once per batch: aggregates match
+/// the Int64 path exactly (nulls skipped), and a large batch's cost stays
+/// linear — the per-row full-column cast made it quadratic.
+#[tokio::test]
+async fn narrow_int_value_columns_match_int64_and_stay_linear() {
+    let rows = vec![
+        (1_000, "a", Some(1)),
+        (2_000, "a", None),
+        (3_000, "b", Some(3)),
+        (4_000, "b", Some(7)),
+    ];
+
+    let backend: Arc<dyn StateBackend> =
+        Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+    let narrow = operator(WindowTrigger::Watermark, backend);
+    narrow
+        .process(int32_value_batch(rows.clone(), None))
+        .await
+        .unwrap();
+    let fired_narrow = narrow
+        .process(int32_value_batch(
+            vec![(11_000, "a", Some(5))],
+            Some(10_000),
+        ))
+        .await
+        .unwrap();
+    let ProcessResult::Single(fired_narrow) = fired_narrow else {
+        panic!("narrow-int window should fire");
+    };
+    // (window 0, key a): 1 non-null observation; (0, b): 2 observations.
+    let narrow_stats = fired_counts_sums(&fired_narrow);
+
+    let backend64: Arc<dyn StateBackend> =
+        Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+    let wide = operator(WindowTrigger::Watermark, backend64);
+    wide.process(int64_value_batch(rows, None)).await.unwrap();
+    let fired_wide = wide
+        .process(int64_value_batch(
+            vec![(11_000, "a", Some(5))],
+            Some(10_000),
+        ))
+        .await
+        .unwrap();
+    let ProcessResult::Single(fired_wide) = fired_wide else {
+        panic!("int64 window should fire");
+    };
+    assert_eq!(narrow_stats, fired_counts_sums(&fired_wide));
+    assert_eq!(narrow_stats.0, vec![1, 2], "null values are skipped");
+    assert_eq!(narrow_stats.1, vec![1, 10]);
+
+    // Linear-cost guard. The timed rows target FRESH windows beyond the
+    // watermark so every row is admitted — rows landing in the already
+    // fired window would take the late-skip path and never reach
+    // accumulation. The ratio form is machine-independent: linear
+    // accumulation costs ~4x for 4x rows (20k vs 5k, one window each),
+    // while the old per-membership full-column cast made it ~16x
+    // (quadratic). The absolute cap stays as a belt-and-suspenders bound.
+    let small_rows: Vec<(i64, &str, Option<i32>)> = (0..5_000)
+        .map(|i| (100_000 + (i % 100), "g", Some((i % 1000) as i32)))
+        .collect();
+    let big_rows: Vec<(i64, &str, Option<i32>)> = (0..20_000)
+        .map(|i| (200_000 + (i % 100), "h", Some((i % 1000) as i32)))
+        .collect();
+    let start = std::time::Instant::now();
+    narrow
+        .process(int32_value_batch(small_rows, None))
+        .await
+        .unwrap();
+    let small_elapsed = start.elapsed();
+    let start = std::time::Instant::now();
+    narrow
+        .process(int32_value_batch(big_rows, None))
+        .await
+        .unwrap();
+    let big_elapsed = start.elapsed();
+    assert!(
+        big_elapsed.as_secs() < 10,
+        "20k-row Int32 batch took {big_elapsed:?}; narrow-int normalization must stay per-batch, not per-row"
+    );
+    assert!(
+        big_elapsed <= small_elapsed * 10,
+        "20k rows took {big_elapsed:?} vs 5k rows {small_elapsed:?}; \
+         linear cost expects ~4x — the per-row full-column cast was quadratic"
+    );
+}
