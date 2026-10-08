@@ -827,6 +827,180 @@ pub mod metadata {
         add_map_column(batch, meta_columns::EXT, map_array)
     }
 
+    /// Per-row source metadata for [`attach_row_source_metadata`].
+    pub struct RowSourceMetadata<'a> {
+        /// Source partition of the record this row was decoded from.
+        pub partition: u32,
+        /// Source offset of the record this row was decoded from.
+        pub offset: u64,
+        /// Message key, when the source record carried one.
+        pub key: Option<&'a [u8]>,
+        /// Source event timestamp, when the record carried one.
+        pub timestamp: Option<SystemTime>,
+        /// Ordered extended-metadata entries for this row (e.g. `topic` plus
+        /// `header_<key>` pairs).
+        pub ext: &'a [(String, String)],
+    }
+
+    fn systemtime_to_nanos(timestamp: SystemTime) -> i64 {
+        timestamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0)
+    }
+
+    fn build_row_ext_map_array(entries: &[&[(String, String)]]) -> MapArray {
+        let mut all_keys = Vec::new();
+        let mut all_values = Vec::new();
+        let mut offsets = vec![0i32];
+
+        for row_entries in entries {
+            for (key, value) in *row_entries {
+                all_keys.push(key.as_str());
+                all_values.push(value.as_str());
+            }
+            offsets.push(all_keys.len() as i32);
+        }
+
+        let keys_array = StringArray::from(all_keys);
+        let values_array = StringArray::from(all_values);
+
+        let struct_array = datafusion::arrow::array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(keys_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", DataType::Utf8, false)),
+                Arc::new(values_array) as ArrayRef,
+            ),
+        ]);
+
+        let map_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, false)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+
+        let offsets_buffer = datafusion::arrow::buffer::OffsetBuffer::new(offsets.into());
+        MapArray::new(map_field, offsets_buffer, struct_array, None, false)
+    }
+
+    /// Attach every source metadata column for a multi-row source batch in a
+    /// single RecordBatch rebuild (the per-message `with_*` chain would
+    /// rebuild the batch once per column).
+    ///
+    /// Column shape mirrors the per-message helpers: `__meta_source` (Utf8),
+    /// `__meta_partition` (UInt32), `__meta_offset` (UInt64) and
+    /// `__meta_ingest_time` (Timestamp(ns)) are always attached with one
+    /// `ingest_time` for the whole batch; `__meta_key` (Binary) and
+    /// `__meta_timestamp` (Timestamp(ns)) are attached — as nullable columns,
+    /// null for rows without a value — only when at least one row carries
+    /// one, so an all-absent batch keeps the same schema shape as the
+    /// per-message path. `__meta_ext` is built per row from the ordered
+    /// `ext` entries.
+    pub fn attach_row_source_metadata(
+        batch: RecordBatch,
+        source: &str,
+        ingest_time: SystemTime,
+        rows: &[RowSourceMetadata<'_>],
+    ) -> Result<RecordBatch, Error> {
+        let row_count = batch.num_rows();
+        if row_count == 0 || rows.is_empty() {
+            return Ok(batch);
+        }
+        if rows.len() != row_count {
+            return Err(Error::Process(format!(
+                "Row metadata length ({}) must match batch row count ({})",
+                rows.len(),
+                row_count
+            )));
+        }
+
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        let mut columns = batch.columns().to_vec();
+
+        fields.push(Arc::new(Field::new(
+            meta_columns::SOURCE,
+            DataType::Utf8,
+            false,
+        )));
+        columns.push(Arc::new(StringArray::from(vec![source; row_count])));
+
+        fields.push(Arc::new(Field::new(
+            meta_columns::PARTITION,
+            DataType::UInt32,
+            false,
+        )));
+        columns.push(Arc::new(UInt32Array::from(
+            rows.iter().map(|row| row.partition).collect::<Vec<_>>(),
+        )));
+
+        fields.push(Arc::new(Field::new(
+            meta_columns::OFFSET,
+            DataType::UInt64,
+            false,
+        )));
+        columns.push(Arc::new(UInt64Array::from(
+            rows.iter().map(|row| row.offset).collect::<Vec<_>>(),
+        )));
+
+        if rows.iter().any(|row| row.key.is_some()) {
+            fields.push(Arc::new(Field::new(
+                meta_columns::KEY,
+                DataType::Binary,
+                true,
+            )));
+            columns.push(Arc::new(BinaryArray::from(
+                rows.iter()
+                    .map(|row| row.key)
+                    .collect::<Vec<Option<&[u8]>>>(),
+            )));
+        }
+
+        if rows.iter().any(|row| row.timestamp.is_some()) {
+            fields.push(Arc::new(Field::new(
+                meta_columns::TIMESTAMP,
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+                true,
+            )));
+            columns.push(Arc::new(TimestampNanosecondArray::from(
+                rows.iter()
+                    .map(|row| row.timestamp.map(systemtime_to_nanos))
+                    .collect::<Vec<Option<i64>>>(),
+            )));
+        }
+
+        fields.push(Arc::new(Field::new(
+            meta_columns::INGEST_TIME,
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+            false,
+        )));
+        columns.push(Arc::new(TimestampNanosecondArray::from(vec![
+            systemtime_to_nanos(ingest_time);
+            row_count
+        ])));
+
+        let ext_entries: Vec<&[(String, String)]> = rows.iter().map(|row| row.ext).collect();
+        let map_array = build_row_ext_map_array(&ext_entries);
+        fields.push(Arc::new(Field::new(
+            meta_columns::EXT,
+            map_array.data_type().clone(),
+            false,
+        )));
+        columns.push(Arc::new(map_array));
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("Failed to attach row source metadata: {}", e)))
+    }
+
     /// Add a MapArray column to the batch
     fn add_map_column(
         batch: RecordBatch,
@@ -3673,6 +3847,236 @@ mod metadata_tests {
         // Only 1 metadata for 2 rows should fail
         let result = metadata::with_ext_metadata_per_row(batch, &[meta.clone()]);
         assert!(result.is_err());
+    }
+
+    /// (partition, offset, key, timestamp) fixture row.
+    type RowFixture = (u32, u64, Option<Vec<u8>>, Option<SystemTime>);
+
+    fn row_meta_owned_fixture() -> Vec<RowFixture> {
+        vec![
+            (0, 10, Some(b"k1".to_vec()), Some(SystemTime::UNIX_EPOCH)),
+            (0, 11, None, None),
+            (1, 20, Some(b"k3".to_vec()), None),
+        ]
+    }
+
+    fn attach_fixture(rows: &[RowFixture]) -> RecordBatch {
+        let data: Vec<&str> = rows.iter().map(|_| "x").collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(data))]).unwrap();
+
+        let exts: Vec<Vec<(String, String)>> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (_, offset, _, _))| {
+                vec![
+                    ("topic".to_string(), format!("t{}", i % 2)),
+                    ("header_h".to_string(), format!("v{}", offset)),
+                ]
+            })
+            .collect();
+        let row_meta: Vec<metadata::RowSourceMetadata<'_>> = rows
+            .iter()
+            .zip(exts.iter())
+            .map(
+                |((partition, offset, key, timestamp), ext)| metadata::RowSourceMetadata {
+                    partition: *partition,
+                    offset: *offset,
+                    key: key.as_deref(),
+                    timestamp: *timestamp,
+                    ext,
+                },
+            )
+            .collect();
+        metadata::attach_row_source_metadata(batch, "kafka", SystemTime::UNIX_EPOCH, &row_meta)
+            .unwrap()
+    }
+
+    /// Per-row alignment: every metadata column carries the values of the
+    /// record its row was decoded from.
+    #[test]
+    fn test_attach_row_source_metadata_aligns_per_row() {
+        use datafusion::arrow::array::{BinaryArray, MapArray, UInt32Array, UInt64Array};
+
+        let rows = row_meta_owned_fixture();
+        let batch = attach_fixture(&rows);
+
+        let partitions = batch
+            .column_by_name(meta_columns::PARTITION)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(partitions.values(), &[0, 0, 1]);
+
+        let offsets = batch
+            .column_by_name(meta_columns::OFFSET)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(offsets.values(), &[10, 11, 20]);
+
+        let keys = batch
+            .column_by_name(meta_columns::KEY)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(keys.value(0), b"k1");
+        assert!(keys.is_null(1));
+        assert_eq!(keys.value(2), b"k3");
+
+        let ext = batch
+            .column_by_name(meta_columns::EXT)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        for (i, (_, offset, _, _)) in rows.iter().enumerate() {
+            let row_map = ext.value(i);
+            let keys = row_map
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StructArray>()
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(keys.value(0), "topic");
+            assert_eq!(keys.value(1), "header_h");
+            let _ = offset;
+        }
+        // Always-present columns.
+        assert!(batch.column_by_name(meta_columns::SOURCE).is_some());
+        assert!(batch.column_by_name(meta_columns::INGEST_TIME).is_some());
+    }
+
+    /// Presence rule: key/timestamp columns appear only when at least one row
+    /// carries a value, as nullable columns with nulls for absent rows.
+    #[test]
+    fn test_attach_row_source_metadata_conditional_columns() {
+        let rows = row_meta_owned_fixture();
+        let mixed = attach_fixture(&rows);
+        let mixed_schema = mixed.schema();
+        let mixed_key = mixed_schema.field_with_name(meta_columns::KEY).unwrap();
+        assert!(mixed_key.is_nullable());
+        let mixed_ts = mixed_schema
+            .field_with_name(meta_columns::TIMESTAMP)
+            .unwrap();
+        assert!(mixed_ts.is_nullable());
+
+        // No row carries a key or timestamp: neither column exists, matching
+        // the per-message helpers' column shape for absent values.
+        let absent: Vec<RowFixture> = vec![(0, 1, None, None), (0, 2, None, None)];
+        let batch = attach_fixture(&absent);
+        assert!(batch.column_by_name(meta_columns::KEY).is_none());
+        assert!(batch.column_by_name(meta_columns::TIMESTAMP).is_none());
+        assert!(batch.column_by_name(meta_columns::EXT).is_some());
+    }
+
+    /// The per-row ext map must be value-equivalent to
+    /// `with_ext_metadata_per_row` for the same entries.
+    #[test]
+    fn test_attach_row_source_metadata_ext_matches_per_row_helper() {
+        let rows = row_meta_owned_fixture();
+        let ours = attach_fixture(&rows);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .unwrap();
+        let exts: Vec<HashMap<String, String>> = [10u64, 11, 20]
+            .iter()
+            .enumerate()
+            .map(|(i, offset)| {
+                HashMap::from([
+                    ("topic".to_string(), format!("t{}", i % 2)),
+                    ("header_h".to_string(), format!("v{}", offset)),
+                ])
+            })
+            .collect();
+        let reference = metadata::with_ext_metadata_per_row(batch, &exts).unwrap();
+
+        let ours_ext = ours
+            .column_by_name(meta_columns::EXT)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::MapArray>()
+            .unwrap();
+        let reference_ext = reference
+            .column_by_name(meta_columns::EXT)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::MapArray>()
+            .unwrap();
+        for row in 0..3 {
+            let ours_row = row_ext_entries(ours_ext, row);
+            let reference_row = row_ext_entries(reference_ext, row);
+            assert_eq!(ours_row, reference_row, "row {row} ext entries differ");
+        }
+    }
+
+    fn row_ext_entries(
+        map: &datafusion::arrow::array::MapArray,
+        row: usize,
+    ) -> std::collections::BTreeMap<String, String> {
+        let entries = map.value(row);
+        let keys = entries
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = entries
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (0..entries.len())
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect()
+    }
+
+    /// Length mismatch and empty batches are explicit.
+    #[test]
+    fn test_attach_row_source_metadata_length_and_empty_guards() {
+        let rows = row_meta_owned_fixture();
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let two_row_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a", "b"]))])
+                .unwrap();
+        let exts: Vec<Vec<(String, String)>> = (0..3).map(|_| vec![]).collect();
+        let row_meta: Vec<metadata::RowSourceMetadata<'_>> = rows
+            .iter()
+            .zip(exts.iter())
+            .map(
+                |((partition, offset, key, timestamp), ext)| metadata::RowSourceMetadata {
+                    partition: *partition,
+                    offset: *offset,
+                    key: key.as_deref(),
+                    timestamp: *timestamp,
+                    ext,
+                },
+            )
+            .collect();
+        assert!(metadata::attach_row_source_metadata(
+            two_row_batch,
+            "kafka",
+            SystemTime::UNIX_EPOCH,
+            &row_meta
+        )
+        .is_err());
+
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let empty = RecordBatch::new_empty(schema);
+        let out = metadata::attach_row_source_metadata(empty, "kafka", SystemTime::UNIX_EPOCH, &[])
+            .unwrap();
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.num_columns(), 1);
     }
 }
 

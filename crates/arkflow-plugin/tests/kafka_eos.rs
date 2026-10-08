@@ -257,16 +257,17 @@ async fn read_with_retry(
 ) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        match input.read().await {
-            Ok(delivery) => return delivery,
-            Err(arkflow_core::Error::Disconnection) => {
+        match tokio::time::timeout(Duration::from_secs(30), input.read()).await {
+            Ok(Ok(delivery)) => return delivery,
+            Ok(Err(arkflow_core::Error::Disconnection)) => {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "input read kept disconnecting for 30s"
                 );
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            Err(error) => panic!("input read failed: {error}"),
+            Ok(Err(error)) => panic!("input read failed: {error}"),
+            Err(_) => panic!("input read blocked for 30s (no delivery arrived)"),
         }
     }
 }
@@ -501,6 +502,10 @@ async fn l3_transactional_offset_commit_advances_the_group() {
             "consumer_group": group,
             "start_from_latest": false,
             "transactional_offsets": true,
+            // These tests settle offsets one message at a time to construct
+            // exact frontier states (e.g. next=8 with 8..10 in flight);
+            // per-message batches are the precise tool for that.
+            "batch_max_rows": 1,
         })),
     }
     .build(&resource())
@@ -612,6 +617,10 @@ async fn l3_clamped_offsets_never_skip_in_flight_records() {
             "consumer_group": group,
             "start_from_latest": false,
             "transactional_offsets": true,
+            // These tests settle offsets one message at a time to construct
+            // exact frontier states (e.g. next=8 with 8..10 in flight);
+            // per-message batches are the precise tool for that.
+            "batch_max_rows": 1,
         })),
     }
     .build(&resource())
@@ -711,6 +720,10 @@ async fn l3_undo_does_not_move_the_broker_group_offset() {
             "consumer_group": group,
             "start_from_latest": false,
             "transactional_offsets": true,
+            // These tests settle offsets one message at a time to construct
+            // exact frontier states (e.g. next=8 with 8..10 in flight);
+            // per-message batches are the precise tool for that.
+            "batch_max_rows": 1,
         })),
     }
     .build(&resource())

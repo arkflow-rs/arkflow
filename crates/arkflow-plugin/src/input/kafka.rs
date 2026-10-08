@@ -22,9 +22,10 @@ use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::event_time::EventTimePartition;
 use arkflow_core::executor::commit::{AckAdvance, CommitFrontier};
-use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
-use arkflow_core::{metadata, Error, MessageBatch, MessageBatchRef, Resource};
+use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, VecAck};
+use arkflow_core::{metadata, Bytes, Error, MessageBatch, MessageBatchRef, Resource};
 use async_trait::async_trait;
+use futures::{FutureExt, StreamExt};
 
 use crate::kafka_security::KafkaSecurityConfig;
 use rdkafka::config::ClientConfig;
@@ -72,7 +73,19 @@ pub struct KafkaInputConfig {
     /// advances inside an output transaction.
     #[serde(default)]
     pub transactional_offsets: bool,
+    /// Maximum number of messages aggregated into one `read()` batch.
+    /// Values below 1 are clamped to 1 (per-message batches).
+    pub batch_max_rows: Option<u32>,
+    /// Maximum accumulated payload bytes aggregated into one `read()` batch
+    /// (the first message is always included). Values below 1 are clamped
+    /// to 1.
+    pub batch_max_bytes: Option<u64>,
 }
+
+/// Default row bound for one `read()` batch.
+const DEFAULT_BATCH_MAX_ROWS: u32 = 1024;
+/// Default payload-byte bound for one `read()` batch.
+const DEFAULT_BATCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Kafka input component
 pub struct KafkaInput {
@@ -95,13 +108,314 @@ pub struct KafkaInput {
     /// Cancels frontier waiters before the consumer is torn down.
     close: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
+    /// Resolved batch bounds for `read()` aggregation (clamped to >= 1).
+    batch_max_rows: usize,
+    batch_max_bytes: u64,
     /// L3 bridge slot: when `transactional_offsets` is enabled, the live
     /// consumer-group metadata lands here for transactional outputs to
     /// commit offsets inside their producer transactions.
     txn_metadata: Option<crate::kafka_txn::SharedMetadata>,
 }
 
+/// One Kafka message claimed from the consumer's queue, with everything the
+/// batch assembly needs copied to owned storage (the `BorrowedMessage` does
+/// not outlive the consumer read guard).
+struct ClaimedRecord {
+    payload: Bytes,
+    topic: String,
+    partition: i32,
+    offset: i64,
+    key: Option<Vec<u8>>,
+    timestamp: Option<SystemTime>,
+    /// Ordered extended-metadata entries (`topic` plus `header_<key>`).
+    ext: Vec<(String, String)>,
+}
+
+/// A tombstone (null payload) claimed from the queue: it carries no data
+/// row, so it is settled out-of-band instead of joining the batch.
+struct TombstoneSite {
+    topic: String,
+    partition: i32,
+    offset: i64,
+}
+
+/// The outcome of claiming one queue message.
+enum Claim {
+    Data(ClaimedRecord),
+    Tombstone(TombstoneSite),
+}
+
+/// Why a drain stopped pulling more messages.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainStop {
+    /// A batch bound (`batch_max_rows`/`batch_max_bytes`) was reached.
+    Complete,
+    /// No buffered message was available without blocking.
+    QueueEmpty,
+    /// A retryable receive error surfaced; already-claimed records are kept
+    /// and the next `read()` reports the disconnection through `recv()`.
+    Reconnect,
+}
+
+/// A contiguous per-(topic, partition) run of claimed offsets inside one
+/// `read()` batch. A single consumer's queue preserves per-partition offset
+/// order, so the claimed offsets of a partition form a contiguous run.
+struct AckSegment {
+    topic: String,
+    partition: i32,
+    first: i64,
+    last: i64,
+}
+
 impl KafkaInput {
+    /// Convert a claimed queue message into owned storage. Tombstones (null
+    /// payloads) become [`Claim::Tombstone`]; the caller settles them.
+    fn claim_message(message: &impl KafkaMessage) -> Claim {
+        let topic = message.topic().to_string();
+        let partition = message.partition();
+        let offset = message.offset();
+        let Some(payload) = message.payload() else {
+            return Claim::Tombstone(TombstoneSite {
+                topic,
+                partition,
+                offset,
+            });
+        };
+        let timestamp = if let Timestamp::CreateTime(millis_since_epoch) = message.timestamp() {
+            Self::convert_kafka_timestamp(millis_since_epoch)
+        } else {
+            None
+        };
+        let mut ext = Vec::with_capacity(2);
+        ext.push(("topic".to_string(), topic.clone()));
+        if let Some(headers) = message.headers() {
+            ext.extend(header_metadata(headers));
+        }
+        Claim::Data(ClaimedRecord {
+            payload: payload.to_vec(),
+            topic,
+            partition,
+            offset,
+            key: message.key().map(<[u8]>::to_vec),
+            timestamp,
+            ext,
+        })
+    }
+
+    /// Settle a tombstone out-of-band: anchor the frontier and hand the
+    /// acknowledgement to its own task, exactly as the per-message path
+    /// did. A settlement failure surfaces through the frontier failure
+    /// fence; blocking `read` here would stall records and control events.
+    fn settle_tombstone(&self, site: TombstoneSite) {
+        let TombstoneSite {
+            topic,
+            partition,
+            offset,
+        } = site;
+        let ack = self.ack_for_segment(&AckSegment {
+            topic: topic.clone(),
+            partition,
+            first: offset,
+            last: offset,
+        });
+        self.frontier.anchor_delivery(&SourcePosition {
+            topic: Some(topic),
+            partition: partition as u32,
+            offset: offset as u64,
+        });
+        let close_for_retry = self.close.clone();
+        // Retry inside the task: a settlement that leaves the frontier
+        // short of this offset blocks every later acknowledgement of the
+        // partition behind a gap that can no longer close, and no
+        // redelivery retries it (the tombstone is not forwarded).
+        tokio::spawn(async move {
+            for attempt in 0..4 {
+                if let Ok(()) = ack.ack().await {
+                    return;
+                }
+                if close_for_retry.is_cancelled() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+            }
+            tracing::warn!(
+                "Kafka tombstone settlement failed after retries; the frontier fence reports it to the next acknowledgement"
+            );
+        });
+    }
+
+    /// Aggregate already-claimed `first` with further buffered messages.
+    ///
+    /// MUST stay a non-async function: the engine's source loop may drop the
+    /// pending `read()` future at any select! branch, and the
+    /// cancellation-safety contract forbids a suspension point between the
+    /// first claim and the batch being returned. `next` returns `None` when
+    /// no message is buffered (non-blocking probe) — a `None` probes nothing
+    /// out of the queue.
+    fn drain_records(
+        first: ClaimedRecord,
+        max_rows: usize,
+        max_bytes: u64,
+        mut next: impl FnMut() -> Option<Result<Claim, KafkaError>>,
+        mut on_tombstone: impl FnMut(TombstoneSite),
+    ) -> Result<(Vec<ClaimedRecord>, DrainStop), KafkaError> {
+        let mut bytes = first.payload.len() as u64;
+        let mut records = Vec::with_capacity(1);
+        records.push(first);
+        loop {
+            if records.len() >= max_rows || bytes >= max_bytes {
+                return Ok((records, DrainStop::Complete));
+            }
+            let Some(claimed) = next() else {
+                return Ok((records, DrainStop::QueueEmpty));
+            };
+            match claimed {
+                Ok(Claim::Data(record)) => {
+                    bytes += record.payload.len() as u64;
+                    records.push(record);
+                }
+                Ok(Claim::Tombstone(site)) => on_tombstone(site),
+                Err(error) if Self::retryable_receive_error(&error) => {
+                    return Ok((records, DrainStop::Reconnect));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Group claimed records into per-(topic, partition) contiguous segments,
+    /// in first-seen order. One partition never appears in two segments of
+    /// the same batch.
+    fn group_ack_segments(records: &[ClaimedRecord]) -> Vec<AckSegment> {
+        let mut order: Vec<(String, i32)> = Vec::new();
+        let mut bounds: HashMap<(String, i32), (i64, i64)> = HashMap::new();
+        for record in records {
+            let key = (record.topic.clone(), record.partition);
+            match bounds.get_mut(&key) {
+                Some((first, last)) => {
+                    *first = (*first).min(record.offset);
+                    *last = (*last).max(record.offset);
+                }
+                None => {
+                    order.push(key.clone());
+                    bounds.insert(key, (record.offset, record.offset));
+                }
+            }
+        }
+        order
+            .into_iter()
+            .map(|(topic, partition)| {
+                let (first, last) = bounds
+                    .remove(&(topic.clone(), partition))
+                    .expect("every ordered key has bounds");
+                AckSegment {
+                    topic,
+                    partition,
+                    first,
+                    last,
+                }
+            })
+            .collect()
+    }
+
+    fn ack_for_segment(&self, segment: &AckSegment) -> KafkaAck {
+        KafkaAck {
+            consumer: self.consumer.clone(),
+            frontier: self.frontier.clone(),
+            ack_lock: self.ack_lock.clone(),
+            ack_notify: self.ack_notify.clone(),
+            close: self.close.clone(),
+            topic: segment.topic.clone(),
+            partition: segment.partition,
+            segment_start: segment.first,
+            offset: segment.last,
+            transactional_offsets: self.config.transactional_offsets,
+        }
+    }
+
+    /// Decode the claimed payloads and attach per-row source metadata in one
+    /// RecordBatch rebuild.
+    ///
+    /// Fast path: one codec call for the whole batch, used when it yields
+    /// exactly one row per payload — the shape every shipped codec produces
+    /// for one Kafka message per payload. Fallback: when the row count
+    /// disagrees (a skip-mode codec dropped a payload, or a payload decoded
+    /// to multiple rows), each payload is decoded individually so every row
+    /// maps back to its own message's metadata.
+    async fn decode_and_attach(
+        &self,
+        records: &[ClaimedRecord],
+    ) -> Result<datafusion::arrow::record_batch::RecordBatch, Error> {
+        let payloads: Vec<Bytes> = records
+            .iter()
+            .map(|record| record.payload.clone())
+            .collect();
+        let decoded =
+            crate::input::codec_helper::apply_codec_to_payloads(payloads, &self.codec).await?;
+        let decoded_batch: datafusion::arrow::record_batch::RecordBatch = decoded.into();
+        // One ingest timestamp for the whole batch (batch granularity).
+        let ingest_time = SystemTime::now();
+
+        if decoded_batch.num_rows() == records.len() {
+            let row_meta: Vec<metadata::RowSourceMetadata<'_>> = records
+                .iter()
+                .map(|record| metadata::RowSourceMetadata {
+                    partition: record.partition as u32,
+                    offset: record.offset as u64,
+                    key: record.key.as_deref(),
+                    timestamp: record.timestamp,
+                    ext: &record.ext,
+                })
+                .collect();
+            return metadata::attach_row_source_metadata(
+                decoded_batch,
+                "kafka",
+                ingest_time,
+                &row_meta,
+            );
+        }
+
+        // Fallback: per-payload decode for an exact row↔payload mapping.
+        let mut batches: Vec<datafusion::arrow::record_batch::RecordBatch> = Vec::new();
+        let mut row_records: Vec<&ClaimedRecord> = Vec::new();
+        for record in records {
+            match crate::input::codec_helper::apply_codec_to_payload(&record.payload, &self.codec)
+                .await
+            {
+                Ok(batch) => {
+                    let rows = batch.len();
+                    if rows == 0 {
+                        // A skip-mode codec dropped this payload: no row, no
+                        // metadata, no acknowledgement entry for it.
+                        continue;
+                    }
+                    row_records.extend(std::iter::repeat_n(record, rows));
+                    batches.push(batch.into());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let merged = if batches.is_empty() {
+            // Every payload was skipped: an empty batch carrying the fast
+            // path's schema (there are no rows to align metadata with).
+            let schema = decoded_batch.schema();
+            datafusion::arrow::record_batch::RecordBatch::new_empty(schema)
+        } else {
+            crate::component::batch_merge::normalize_and_concat(&batches)?
+        };
+        let row_meta: Vec<metadata::RowSourceMetadata<'_>> = row_records
+            .iter()
+            .map(|record| metadata::RowSourceMetadata {
+                partition: record.partition as u32,
+                offset: record.offset as u64,
+                key: record.key.as_deref(),
+                timestamp: record.timestamp,
+                ext: &record.ext,
+            })
+            .collect();
+        metadata::attach_row_source_metadata(merged, "kafka", ingest_time, &row_meta)
+    }
+
     fn validate_checkpoint_offset(offset: u64, low: i64, high: i64) -> Result<i64, Error> {
         let offset = i64::try_from(offset)
             .map_err(|_| Error::Config("Kafka checkpoint offset exceeds i64".into()))?;
@@ -134,6 +448,23 @@ impl KafkaInput {
         } else {
             None
         };
+        let batch_max_rows = config
+            .batch_max_rows
+            .unwrap_or(DEFAULT_BATCH_MAX_ROWS)
+            .max(1) as usize;
+        let batch_max_bytes = config
+            .batch_max_bytes
+            .unwrap_or(DEFAULT_BATCH_MAX_BYTES)
+            .max(1);
+        if config.batch_max_rows.is_some_and(|rows| rows < 1)
+            || config.batch_max_bytes.is_some_and(|bytes| bytes < 1)
+        {
+            tracing::debug!(
+                batch_max_rows,
+                batch_max_bytes,
+                "Kafka input batch bounds below 1 are clamped to 1"
+            );
+        }
         Ok(Self {
             input_name: name.map(str::to_string),
             config,
@@ -144,6 +475,8 @@ impl KafkaInput {
             ack_notify: Arc::new(Notify::new()),
             close: CancellationToken::new(),
             codec,
+            batch_max_rows,
+            batch_max_bytes,
             txn_metadata,
         })
     }
@@ -409,148 +742,23 @@ impl Input for KafkaInput {
         }
         let consumer = consumer_guard.as_ref().unwrap();
 
-        loop {
+        // Cancellation safety: the blocking `recv()` below is the ONLY
+        // suspension point before the batch is returned. Everything between
+        // the first claim and the return runs synchronously — the drain
+        // probes with non-blocking `now_or_never` (see `drain_records`) and
+        // the codec decode of every shipped codec completes without ever
+        // yielding. A `read()` future dropped before the claim loses
+        // nothing; after the claim it cannot be dropped mid-assembly.
+        let first = loop {
             match consumer.recv().await {
-                Ok(kafka_message) => {
+                Ok(kafka_message) => match Self::claim_message(&kafka_message) {
+                    Claim::Data(record) => break record,
                     // Compacted topics deliver deletion markers with a null
-                    // payload. They are ordinary Kafka data: settle them here.
-                    // Treating them as a fatal error re-delivers the same
-                    // tombstone after every restart and crashes the stream in
-                    // a loop; skipping without an acknowledgement would replay
-                    // it forever because the acknowledged frontier never moves
-                    // past it.
-                    //
-                    // The settlement is handed to its own task rather than
-                    // awaited inline: an acknowledgement can wait for a
-                    // partition (re)assignment, and `read` is this source's only
-                    // path for records AND injected control events, so blocking
-                    // it would stall checkpoints and watermarks. A settlement
-                    // failure still surfaces as the frontier failure fence that
-                    // the next acknowledged delivery reports, which is the same
-                    // retry contract a forwarded delivery gets.
-                    let Some(payload) = kafka_message.payload() else {
-                        let close_for_retry = self.close.clone();
-                        let ack = KafkaAck {
-                            consumer: self.consumer.clone(),
-                            frontier: self.frontier.clone(),
-                            ack_lock: self.ack_lock.clone(),
-                            ack_notify: self.ack_notify.clone(),
-                            close: self.close.clone(),
-                            topic: kafka_message.topic().to_string(),
-                            partition: kafka_message.partition(),
-                            offset: kafka_message.offset(),
-                            transactional_offsets: self.config.transactional_offsets,
-                        };
-                        self.frontier.anchor_delivery(&SourcePosition {
-                            topic: Some(kafka_message.topic().to_string()),
-                            partition: kafka_message.partition() as u32,
-                            offset: kafka_message.offset() as u64,
-                        });
-                        tokio::spawn(async move {
-                            // Retry inside the task: a settlement that leaves
-                            // the frontier short of this offset blocks every
-                            // later acknowledgement of the partition behind a
-                            // gap that can no longer close, and no redelivery
-                            // retries it (the tombstone is not forwarded).
-                            for attempt in 0..4 {
-                                if let Ok(()) = ack.ack().await {
-                                    return;
-                                }
-                                if close_for_retry.is_cancelled() {
-                                    return;
-                                }
-                                tokio::time::sleep(Duration::from_millis(200 * (attempt + 1)))
-                                    .await;
-                            }
-                            tracing::warn!(
-                                "Kafka tombstone settlement failed after retries; the frontier fence reports it to the next acknowledgement"
-                            );
-                        });
-                        continue;
-                    };
-
-                    // Apply codec if configured
-                    let mut msg_batch =
-                        crate::input::codec_helper::apply_codec_to_payload(payload, &self.codec)
-                            .await?;
-                    msg_batch.set_input_name(self.input_name.clone());
-
-                    // Convert to RecordBatch to add metadata
-                    let mut record_batch: datafusion::arrow::record_batch::RecordBatch =
-                        msg_batch.into();
-
-                    // Add core metadata
-                    record_batch = metadata::with_source(record_batch, "kafka")?;
-
-                    let partition = kafka_message.partition();
-                    record_batch = metadata::with_partition(record_batch, partition as u32)?;
-
-                    let offset = kafka_message.offset();
-                    record_batch = metadata::with_offset(record_batch, offset as u64)?;
-
-                    // Add key if present
-                    if let Some(key) = kafka_message.key() {
-                        record_batch = metadata::with_key(record_batch, key)?;
-                    }
-
-                    // Add timestamp if available
-                    let kafka_timestamp = kafka_message.timestamp();
-                    if let Timestamp::CreateTime(millis_since_epoch) = kafka_timestamp {
-                        if let Some(timestamp) = Self::convert_kafka_timestamp(millis_since_epoch) {
-                            record_batch = metadata::with_timestamp(record_batch, timestamp)?;
-                        }
-                    }
-                    // Add ingest time
-                    let ingest_time = SystemTime::now();
-                    record_batch = metadata::with_ingest_time(record_batch, ingest_time)?;
-
-                    // Add extended metadata (topic, headers)
-                    let topic = kafka_message.topic().to_string();
-
-                    // Anchor the partition's frontier at this delivery: an
-                    // out-of-order FIRST acknowledgement (fan-out completing a
-                    // later branch first) cannot then claim the earlier records
-                    // of this delivery were acknowledged.
-                    self.frontier.anchor_delivery(&SourcePosition {
-                        topic: Some(topic.clone()),
-                        partition: kafka_message.partition() as u32,
-                        offset: kafka_message.offset() as u64,
-                    });
-
-                    let mut ext_metadata = HashMap::new();
-                    ext_metadata.insert("topic".to_string(), topic);
-
-                    // Extract Kafka message headers into extended metadata.
-                    // Each header key becomes `header_<key>` in the metadata
-                    // map, preserving the original key inside the value's key
-                    // namespace for downstream routing/filtering.
-                    if let Some(headers) = kafka_message.headers() {
-                        for (key, value) in header_metadata(headers) {
-                            ext_metadata.insert(key, value);
-                        }
-                    }
-
-                    record_batch = metadata::with_ext_metadata(record_batch, &ext_metadata)?;
-
-                    // Convert back to MessageBatch
-                    let mut msg_batch = MessageBatch::new_arrow(record_batch);
-                    msg_batch.set_input_name(self.input_name.clone());
-
-                    // Create acknowledgment object
-                    let ack = KafkaAck {
-                        consumer: self.consumer.clone(),
-                        frontier: self.frontier.clone(),
-                        ack_lock: self.ack_lock.clone(),
-                        ack_notify: self.ack_notify.clone(),
-                        close: self.close.clone(),
-                        topic: kafka_message.topic().to_string(),
-                        partition,
-                        offset,
-                        transactional_offsets: self.config.transactional_offsets,
-                    };
-
-                    return Ok((Arc::new(msg_batch), Arc::new(ack)));
-                }
+                    // payload. They are ordinary Kafka data: settle them here,
+                    // never as a fatal error (a crash loop) and never as a
+                    // silent skip (the frontier would replay it forever).
+                    Claim::Tombstone(site) => self.settle_tombstone(site),
+                },
                 Err(e) if Self::retryable_receive_error(&e) => return Err(Error::Disconnection),
                 Err(e) => {
                     return Err(Error::Connection(format!(
@@ -559,7 +767,66 @@ impl Input for KafkaInput {
                     )))
                 }
             }
+        };
+
+        let (records, _stop) = Self::drain_records(
+            first,
+            self.batch_max_rows,
+            self.batch_max_bytes,
+            || {
+                let mut stream = consumer.stream();
+                match stream.next().now_or_never() {
+                    // Pending: nothing buffered right now — the probe claimed
+                    // nothing out of the consumer's queue.
+                    None => None,
+                    // Kafka streams never terminate; treat it as empty.
+                    Some(None) => None,
+                    Some(Some(outcome)) => {
+                        Some(outcome.map(|message| Self::claim_message(&message)))
+                    }
+                }
+            },
+            |site| self.settle_tombstone(site),
+        )
+        .map_err(|e| Error::Connection(format!("Error receiving Kafka message: {}", e)))?;
+
+        // Every claim is owned storage now: release the consumer read guard
+        // before the decode and assembly work.
+        drop(consumer_guard);
+
+        let record_batch = self.decode_and_attach(&records).await?;
+
+        // Anchor each segment's frontier at its first delivery: an
+        // out-of-order FIRST acknowledgement (fan-out completing a later
+        // branch first) cannot then claim the earlier records of this
+        // delivery were acknowledged.
+        let segments = Self::group_ack_segments(&records);
+        for segment in &segments {
+            self.frontier.anchor_delivery(&SourcePosition {
+                topic: Some(segment.topic.clone()),
+                partition: segment.partition as u32,
+                offset: segment.first as u64,
+            });
         }
+
+        let mut msg_batch = MessageBatch::new_arrow(record_batch);
+        msg_batch.set_input_name(self.input_name.clone());
+
+        // One ack per (topic, partition) segment; partitions are
+        // independent frontiers, so a VecAck composes them without
+        // cross-partition gap waits.
+        let ack: Arc<dyn Ack> = if segments.len() == 1 {
+            Arc::new(self.ack_for_segment(&segments[0]))
+        } else {
+            Arc::new(VecAck(
+                segments
+                    .iter()
+                    .map(|segment| Arc::new(self.ack_for_segment(segment)) as Arc<dyn Ack>)
+                    .collect(),
+            ))
+        };
+
+        Ok((Arc::new(msg_batch), ack))
     }
 
     async fn current_positions(&self) -> Result<Vec<SourcePosition>, Error> {
@@ -643,17 +910,12 @@ impl Input for KafkaInput {
         });
         let offset = i64::try_from(position.offset.saturating_sub(1))
             .map_err(|_| Error::Process("Kafka source position exceeds i64".into()))?;
-        Ok(Some(Arc::new(KafkaAck {
-            consumer: self.consumer.clone(),
-            frontier: self.frontier.clone(),
-            ack_lock: self.ack_lock.clone(),
-            ack_notify: self.ack_notify.clone(),
-            close: self.close.clone(),
+        Ok(Some(Arc::new(self.ack_for_segment(&AckSegment {
             topic,
             partition: position.partition as i32,
-            offset,
-            transactional_offsets: self.config.transactional_offsets,
-        })))
+            first: offset,
+            last: offset,
+        }))))
     }
 
     async fn restore_positions(&self, positions: &[SourcePosition]) -> Result<(), Error> {
@@ -807,6 +1069,12 @@ pub struct KafkaAck {
     close: CancellationToken,
     topic: String,
     partition: i32,
+    /// First offset of the contiguous delivery segment this ack settles
+    /// (equal to `offset` for a single-message segment). Undo rewinds the
+    /// whole segment to this offset — a batch is one delivery unit under
+    /// at-least-once.
+    segment_start: i64,
+    /// Last offset of the segment; the ack's position is `offset + 1`.
     offset: i64,
     /// L3: the broker offset commit rides the transactional output's
     /// producer transaction instead of this consumer's `store_offset`.
@@ -923,17 +1191,42 @@ impl Ack for KafkaAck {
                 let snapshot = self
                     .frontier
                     .snapshot_partition(Some(&self.topic), partition);
-                let next_offset = match self.frontier.acknowledge(&position) {
-                    AckAdvance::Pending { .. } => None,
-                    AckAdvance::Advanced { next_offset } => Some(next_offset),
-                    // A retry after a durable store failure: the frontier
-                    // already advanced, so the broker store only needs to
-                    // catch up to the current contiguous next offset.
-                    AckAdvance::AlreadyCovered => Some(
+                // Acknowledge every offset of the segment individually: the
+                // frontier tracks single next-offsets in a pending set, so
+                // one acknowledge(last+1) would leave a gap only the segment
+                // itself can close. The segment's offsets are consecutive,
+                // so only the first acknowledge can report Pending.
+                let mut advanced: Option<u64> = None;
+                let mut blocked_on_gap = false;
+                for record_offset in self.segment_start..=self.offset {
+                    debug_assert!(record_offset >= 0, "Kafka record offsets are non-negative");
+                    let step = SourcePosition {
+                        topic: Some(self.topic.clone()),
+                        partition,
+                        offset: (record_offset + 1) as u64,
+                    };
+                    match self.frontier.acknowledge(&step) {
+                        AckAdvance::Advanced { next_offset } => advanced = Some(next_offset),
+                        // A retry after a durable store failure or a
+                        // tombstone settlement already covered this offset.
+                        AckAdvance::AlreadyCovered => {}
+                        AckAdvance::Pending { .. } => {
+                            blocked_on_gap = true;
+                            break;
+                        }
+                    }
+                }
+                let next_offset = if blocked_on_gap {
+                    None
+                } else {
+                    Some(advanced.unwrap_or_else(|| {
+                        // Every offset was already covered: the broker store
+                        // only needs to catch up to the current contiguous
+                        // next offset.
                         self.frontier
                             .next_offset_of(Some(&self.topic), self.partition.max(0) as u32)
-                            .unwrap_or(position.offset),
-                    ),
+                            .unwrap_or(position.offset)
+                    }))
                 };
 
                 match next_offset {
@@ -1052,27 +1345,27 @@ impl Ack for KafkaAck {
                         .into(),
                 ));
             };
-            // `store_offset` also takes the exclusive next offset.  Restoring a
-            // message at offset N therefore stores N, so the broker can redeliver
-            // that message after compensation.
-            let restored_broker_offset = position.offset.saturating_sub(1);
+            // `store_offset` also takes the exclusive next offset: storing
+            // the segment's first offset redelivers the WHOLE segment after
+            // compensation — a batch is one delivery unit.
             consumer
-                .store_offset(
-                    &self.topic,
-                    self.partition,
-                    i64::try_from(restored_broker_offset)
-                        .map_err(|_| Error::Process("Kafka offset overflow".into()))?,
-                )
+                .store_offset(&self.topic, self.partition, self.segment_start)
                 .map_err(|error| Error::Process(format!("restore Kafka offset: {error}")))?;
         }
-        if !self.frontier.rewind_position(
-            Some(&self.topic),
-            self.partition.max(0) as u32,
-            position.offset,
-        ) {
-            return Err(Error::Process(
-                "Kafka acknowledgement frontier changed during compensation".into(),
-            ));
+        // Rewind the frontier one next-offset at a time down to the segment
+        // start, each step guarded by the value it must observe.
+        let mut expected = position.offset;
+        while expected > self.segment_start.max(0) as u64 {
+            if !self.frontier.rewind_position(
+                Some(&self.topic),
+                self.partition.max(0) as u32,
+                expected,
+            ) {
+                return Err(Error::Process(
+                    "Kafka acknowledgement frontier changed during compensation".into(),
+                ));
+            }
+            expected -= 1;
         }
         self.ack_notify.notify_waiters();
         Ok(())
@@ -1117,6 +1410,8 @@ pub fn init() -> Result<(), Error> {
                 "fetch_max_bytes": {"type": "integer", "minimum": 0, "description": "Maximum bytes for a fetch request."},
                 "fetch_max_partition_bytes": {"type": "integer", "minimum": 0, "description": "Maximum bytes per partition in a fetch request."},
                 "fetch_wait_max_ms": {"type": "integer", "minimum": 0, "description": "Maximum time to wait for fetch data in milliseconds."},
+                "batch_max_rows": {"type": "integer", "minimum": 1, "default": 1024, "description": "Maximum number of messages aggregated into one read batch (clamped to 1 minimum; 1 restores per-message batches)."},
+                "batch_max_bytes": {"type": "integer", "minimum": 1, "default": 8388608, "description": "Maximum accumulated payload bytes per read batch; the first message is always included (clamped to 1 minimum)."},
                 "security": crate::kafka_security::json_schema()
             },
             "required": ["brokers", "topics", "consumer_group"]
@@ -1410,6 +1705,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
 
@@ -1437,6 +1734,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
 
@@ -1465,6 +1764,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
 
@@ -1478,6 +1779,7 @@ mod tests {
             close: input.close.clone(),
             topic: "test-topic".to_string(),
             partition: 0,
+            segment_start: 100,
             offset: 100,
             transactional_offsets: false,
         };
@@ -1509,6 +1811,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
@@ -1563,6 +1867,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
@@ -1586,6 +1892,7 @@ mod tests {
             close: input.close.clone(),
             topic: "test-topic".to_string(),
             partition: 3,
+            segment_start: 42,
             offset: 42,
             transactional_offsets: false,
         };
@@ -1610,6 +1917,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
@@ -1652,6 +1961,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
@@ -1842,6 +2153,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
@@ -1858,6 +2171,7 @@ mod tests {
             close: input.close.clone(),
             topic: "test-topic".into(),
             partition: 0,
+            segment_start: 1,
             offset: 1,
             transactional_offsets: false,
         };
@@ -1887,6 +2201,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
@@ -1914,6 +2230,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: None,
         };
         let input = KafkaInput::new(None, config, None).unwrap();
@@ -1944,6 +2262,8 @@ mod tests {
             fetch_max_bytes: None,
             fetch_max_partition_bytes: None,
             fetch_wait_max_ms: None,
+            batch_max_rows: None,
+            batch_max_bytes: None,
             security: Some(crate::kafka_security::KafkaSecurityConfig {
                 protocol: None,
                 sasl: Some(crate::kafka_security::SaslConfig {
@@ -2034,6 +2354,8 @@ mod tests {
                 fetch_max_bytes: None,
                 fetch_max_partition_bytes: None,
                 fetch_wait_max_ms: None,
+                batch_max_rows: None,
+                batch_max_bytes: None,
                 security: None,
             }
         }
@@ -2082,6 +2404,7 @@ mod tests {
             close: input.close.clone(),
             topic: topic.to_string(),
             partition,
+            segment_start: offset,
             offset,
             transactional_offsets: false,
         }
@@ -2365,6 +2688,7 @@ mod tests {
             close: input.close.clone(),
             topic: "orders".to_string(),
             partition: 0,
+            segment_start: 41,
             offset: 41,
             transactional_offsets: true,
         };
@@ -2474,5 +2798,494 @@ mod tests {
             ),
             Ok(()) => panic!("an empty group id must fail consumer creation"),
         }
+    }
+
+    // ===== Batch read machinery (spec: kafka-input-batching) =====
+
+    use std::collections::VecDeque;
+
+    fn claimed_record(
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        payload: &[u8],
+        key: Option<&[u8]>,
+    ) -> ClaimedRecord {
+        ClaimedRecord {
+            payload: payload.to_vec(),
+            topic: topic.to_string(),
+            partition,
+            offset,
+            key: key.map(<[u8]>::to_vec),
+            timestamp: Some(SystemTime::UNIX_EPOCH),
+            ext: vec![
+                ("topic".to_string(), topic.to_string()),
+                ("header_trace".to_string(), format!("v{offset}")),
+            ],
+        }
+    }
+
+    /// The drain aggregates buffered messages up to the row bound and stops
+    /// with `Complete`; a single unclaimed queue is a one-record batch.
+    #[test]
+    fn drain_aggregates_up_to_the_row_bound() {
+        let source = |offsets: &[i64]| {
+            let mut pending: VecDeque<Result<Claim, KafkaError>> = offsets
+                .iter()
+                .map(|o| Ok(Claim::Data(claimed_record("t", 0, *o, b"x", None))))
+                .collect();
+            move || pending.pop_front()
+        };
+
+        let (records, stop) = KafkaInput::drain_records(
+            claimed_record("t", 0, 1, b"x", None),
+            3,
+            u64::MAX,
+            source(&[2, 3, 4, 5]),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(stop, DrainStop::Complete);
+
+        let (records, stop) = KafkaInput::drain_records(
+            claimed_record("t", 0, 1, b"x", None),
+            1024,
+            u64::MAX,
+            source(&[]),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(stop, DrainStop::QueueEmpty);
+    }
+
+    /// The byte bound stops the drain even when the row bound would allow
+    /// more (payloads of 10 bytes, bound 25 → three records accumulate 30).
+    #[test]
+    fn drain_stops_at_the_byte_bound() {
+        let mut pending: VecDeque<Result<Claim, KafkaError>> = (2..=6)
+            .map(|o| Ok(Claim::Data(claimed_record("t", 0, o, &[0u8; 10], None))))
+            .collect();
+        let (records, stop) = KafkaInput::drain_records(
+            claimed_record("t", 0, 1, &[0u8; 10], None),
+            1024,
+            25,
+            move || pending.pop_front(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(records.len(), 3, "bytes 10+10+10=30 crosses the 25 bound");
+        assert_eq!(stop, DrainStop::Complete);
+    }
+
+    /// Tombstones inside the drain are handed to the settlement callback and
+    /// never join the data batch; a retryable receive error keeps every
+    /// already-claimed record; a fatal error propagates.
+    #[test]
+    fn drain_settles_tombstones_and_classifies_errors() {
+        let mut settled: Vec<i64> = Vec::new();
+        let mut pending: VecDeque<Result<Claim, KafkaError>> = VecDeque::from(vec![
+            Ok(Claim::Data(claimed_record("t", 0, 2, b"x", None))),
+            Ok(Claim::Tombstone(TombstoneSite {
+                topic: "t".into(),
+                partition: 0,
+                offset: 3,
+            })),
+            Ok(Claim::Data(claimed_record("t", 0, 4, b"x", None))),
+        ]);
+        let (records, stop) = KafkaInput::drain_records(
+            claimed_record("t", 0, 1, b"x", None),
+            1024,
+            u64::MAX,
+            move || pending.pop_front(),
+            |site| settled.push(site.offset),
+        )
+        .unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            [1, 2, 4]
+        );
+        assert_eq!(stop, DrainStop::QueueEmpty);
+        assert_eq!(settled, [3]);
+
+        let mut retryable: VecDeque<Result<Claim, KafkaError>> = VecDeque::from(vec![
+            Ok(Claim::Data(claimed_record("t", 0, 2, b"x", None))),
+            Err(KafkaError::MessageConsumption(
+                RDKafkaErrorCode::AllBrokersDown,
+            )),
+        ]);
+        let (records, stop) = KafkaInput::drain_records(
+            claimed_record("t", 0, 1, b"x", None),
+            1024,
+            u64::MAX,
+            move || retryable.pop_front(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(records.len(), 2, "claimed records survive a reconnect");
+        assert_eq!(stop, DrainStop::Reconnect);
+
+        let mut fatal: VecDeque<Result<Claim, KafkaError>> = VecDeque::from(vec![Err(
+            KafkaError::MessageConsumption(RDKafkaErrorCode::Authentication),
+        )]);
+        assert!(KafkaInput::drain_records(
+            claimed_record("t", 0, 1, b"x", None),
+            1024,
+            u64::MAX,
+            move || fatal.pop_front(),
+            |_| {},
+        )
+        .is_err());
+    }
+
+    /// Segments group per (topic, partition) in first-seen order with
+    /// min/max offsets, so one partition never splits across two segments.
+    #[test]
+    fn segments_group_per_partition_in_first_seen_order() {
+        let records = vec![
+            claimed_record("t", 0, 5, b"x", None),
+            claimed_record("t", 0, 6, b"x", None),
+            claimed_record("t", 1, 9, b"x", None),
+            claimed_record("u", 0, 100, b"x", None),
+            claimed_record("t", 0, 7, b"x", None),
+        ];
+        let segments = KafkaInput::group_ack_segments(&records);
+        let shape: Vec<(&str, i32, i64, i64)> = segments
+            .iter()
+            .map(|s| (s.topic.as_str(), s.partition, s.first, s.last))
+            .collect();
+        assert_eq!(shape, [("t", 0, 5, 7), ("t", 1, 9, 9), ("u", 0, 100, 100)]);
+    }
+
+    #[tokio::test]
+    async fn decode_and_attach_aligns_fast_path_per_row() {
+        let input = input_with(base_config());
+        let records = vec![
+            claimed_record("orders", 0, 10, b"a", Some(b"k1")),
+            claimed_record("orders", 0, 11, b"b", None),
+            claimed_record("orders", 1, 20, b"c", Some(b"k3")),
+        ];
+        let batch = input.decode_and_attach(&records).await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        use datafusion::arrow::array::{
+            Array as _, BinaryArray, MapArray, StringArray, UInt32Array, UInt64Array,
+        };
+        let offsets = batch
+            .column_by_name("__meta_offset")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(offsets.values(), &[10, 11, 20]);
+        let partitions = batch
+            .column_by_name("__meta_partition")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(partitions.values(), &[0, 0, 1]);
+        let keys = batch
+            .column_by_name("__meta_key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(keys.value(0), b"k1");
+        assert!(keys.is_null(1));
+        assert_eq!(keys.value(2), b"k3");
+
+        let ext = batch
+            .column_by_name("__meta_ext")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        for (row, offset) in [10i64, 11, 20].iter().enumerate() {
+            let entries = ext.value(row);
+            let keys = entries
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = entries
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let map: Vec<(&str, &str)> = (0..entries.len())
+                .map(|i| (keys.value(i), values.value(i)))
+                .collect();
+            assert_eq!(
+                map,
+                vec![("topic", "orders"), ("header_trace", &format!("v{offset}"))],
+                "row {row}"
+            );
+        }
+    }
+
+    /// A codec that expands one payload into two rows trips the fast path's
+    /// row-count check; the fallback re-decodes per payload so every row
+    /// still carries its own message's offsets.
+    struct RowDoublingCodec;
+
+    #[async_trait]
+    impl arkflow_core::codec::Encoder for RowDoublingCodec {
+        async fn encode(&self, _messages: MessageBatch) -> Result<Vec<Bytes>, Error> {
+            Err(Error::Process("test codec does not encode".into()))
+        }
+    }
+
+    #[async_trait]
+    impl arkflow_core::codec::Decoder for RowDoublingCodec {
+        async fn decode(&self, payloads: Vec<Bytes>) -> Result<MessageBatch, Error> {
+            let doubled: Vec<Bytes> = payloads
+                .iter()
+                .flat_map(|p| [p.clone(), p.clone()])
+                .collect();
+            MessageBatch::new_binary(doubled)
+        }
+    }
+
+    /// A codec that drops payloads not starting with `b` (skip-mode shape):
+    /// the batch decode yields fewer rows than payloads, and the per-payload
+    /// fallback drops exactly the skipped payloads while keeping alignment.
+    struct OddOnlyCodec;
+
+    #[async_trait]
+    impl arkflow_core::codec::Encoder for OddOnlyCodec {
+        async fn encode(&self, _messages: MessageBatch) -> Result<Vec<Bytes>, Error> {
+            Err(Error::Process("test codec does not encode".into()))
+        }
+    }
+
+    #[async_trait]
+    impl arkflow_core::codec::Decoder for OddOnlyCodec {
+        async fn decode(&self, payloads: Vec<Bytes>) -> Result<MessageBatch, Error> {
+            let kept: Vec<Bytes> = payloads
+                .iter()
+                .filter(|payload| payload.first() == Some(&b'b'))
+                .cloned()
+                .collect();
+            MessageBatch::new_binary(kept)
+        }
+    }
+
+    fn input_with_codec(codec: Arc<dyn Codec>) -> KafkaInput {
+        KafkaInput::new(None, config_from_json(base_config()), Some(codec)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn decode_and_attach_fallback_maps_rows_to_their_payload() {
+        let input = input_with_codec(Arc::new(RowDoublingCodec));
+        let records = vec![
+            claimed_record("orders", 0, 10, b"a", None),
+            claimed_record("orders", 0, 11, b"b", None),
+        ];
+        let batch = input.decode_and_attach(&records).await.unwrap();
+        assert_eq!(batch.num_rows(), 4);
+        let offsets = batch
+            .column_by_name("__meta_offset")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(offsets.values(), &[10, 10, 11, 11]);
+    }
+
+    #[tokio::test]
+    async fn decode_and_attach_fallback_skipped_payload_keeps_alignment() {
+        let input = input_with_codec(Arc::new(OddOnlyCodec));
+        let records = vec![
+            claimed_record("orders", 0, 10, b"a", None),
+            claimed_record("orders", 0, 11, b"b", None),
+            claimed_record("orders", 0, 12, b"c", None),
+        ];
+        let batch = input.decode_and_attach(&records).await.unwrap();
+        assert_eq!(batch.num_rows(), 1, "only the odd-indexed payload survives");
+        let offsets = batch
+            .column_by_name("__meta_offset")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(offsets.values(), &[11]);
+    }
+
+    /// Cancellation safety (structural): the drain engine must stay a
+    /// synchronous function — an `async fn` here could suspend between the
+    /// first claim and the batch return, and the engine's select! would drop
+    /// the claimed messages. The read loop must probe with `now_or_never`.
+    #[test]
+    fn drain_engine_is_synchronous_and_probes_non_blocking() {
+        // Bound the scan at the test module: the assertion literals below
+        // would otherwise match their own text embedded by `include_str!`.
+        let source = include_str!("kafka.rs");
+        let (head, _) = source
+            .split_once("#[cfg(test)]")
+            .expect("the test module exists");
+        assert!(
+            !head.contains("async fn drain_records"),
+            "drain_records must stay non-async (cancellation-safety contract)"
+        );
+        assert!(head.contains("fn drain_records("));
+        assert!(
+            head.contains("stream.next().now_or_never()"),
+            "the drain must probe the consumer's queue non-blockingly"
+        );
+    }
+
+    /// L3 undo rewinds the frontier to the segment's FIRST offset — the
+    /// whole batch is one delivery unit and must be redelivered together.
+    #[tokio::test]
+    async fn undo_rewinds_the_whole_segment_frontier() {
+        let mut value = base_config();
+        value["consumer_group"] = serde_json::json!(format!("segment-undo-{}", std::process::id()));
+        value["transactional_offsets"] = serde_json::json!(true);
+        let input = input_with(value);
+        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group);
+        // The acknowledged frontier stands at the segment's next offset (8).
+        input.frontier.seed(&[SourcePosition {
+            topic: Some("orders".into()),
+            partition: 0,
+            offset: 8,
+        }]);
+        let ack = KafkaAck {
+            consumer: input.consumer.clone(),
+            frontier: input.frontier.clone(),
+            ack_lock: input.ack_lock.clone(),
+            ack_notify: input.ack_notify.clone(),
+            close: input.close.clone(),
+            topic: "orders".to_string(),
+            partition: 0,
+            segment_start: 5,
+            offset: 7,
+            transactional_offsets: true,
+        };
+        ack.undo().await.expect("L3 undo compensates in memory");
+        let positions = input.current_positions().await.unwrap();
+        assert_eq!(positions[0].offset, 5, "the whole segment replays");
+    }
+
+    /// Segment ack semantics against the frontier: anchoring at the segment
+    /// start and acknowledging every offset advances the contiguous frontier
+    /// exactly as per-message acknowledgements would.
+    #[test]
+    fn segment_acknowledgement_advances_like_per_message_acks() {
+        let input = input_with(base_config());
+        let frontier = &input.frontier;
+        frontier.anchor_delivery(&SourcePosition {
+            topic: Some("orders".into()),
+            partition: 0,
+            offset: 5,
+        });
+        for next_offset in [6u64, 7, 8] {
+            assert_eq!(
+                frontier.acknowledge(&SourcePosition {
+                    topic: Some("orders".into()),
+                    partition: 0,
+                    offset: next_offset,
+                }),
+                AckAdvance::Advanced { next_offset }
+            );
+        }
+        let positions = futures::executor::block_on(input.current_positions()).unwrap();
+        assert_eq!(positions[0].offset, 8);
+    }
+
+    /// Batch bounds resolution: defaults, and sub-1 values clamp to 1.
+    #[test]
+    fn batch_bounds_default_and_clamp() {
+        let plain = input_with(base_config());
+        assert_eq!(plain.batch_max_rows, DEFAULT_BATCH_MAX_ROWS as usize);
+        assert_eq!(plain.batch_max_bytes, DEFAULT_BATCH_MAX_BYTES);
+
+        let mut value = base_config();
+        value["batch_max_rows"] = serde_json::json!(0);
+        value["batch_max_bytes"] = serde_json::json!(0);
+        let clamped = input_with(value);
+        assert_eq!(clamped.batch_max_rows, 1, "0 rows clamps to per-message");
+        assert_eq!(clamped.batch_max_bytes, 1);
+
+        let mut value = base_config();
+        value["batch_max_rows"] = serde_json::json!(1);
+        let single = input_with(value);
+        assert_eq!(single.batch_max_rows, 1);
+    }
+
+    /// Ad-hoc release timing (NOT run by CI): batch assembly (one codec call
+    /// + one metadata rebuild) vs the historical per-message path (7 chained
+    /// `with_*` rebuilds per message). Run with:
+    /// `cargo test --release -p arkflow-plugin --lib -- --ignored kafka_batch_assembly_timing --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn kafka_batch_assembly_timing() {
+        let total = 200_000usize;
+        let batch_size = 1_000usize;
+        let ingest = SystemTime::now();
+        let records: Vec<ClaimedRecord> = (0..total)
+            .map(|offset| {
+                let mut record =
+                    claimed_record("bench", 0, offset as i64, b"payload-bytes", Some(b"key"));
+                record.timestamp = Some(SystemTime::UNIX_EPOCH);
+                record
+            })
+            .collect();
+
+        let time = |name: &str, f: &mut dyn FnMut() -> usize| {
+            let mut best = std::time::Duration::MAX;
+            let mut rows = 0;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                rows = f();
+                best = best.min(start.elapsed());
+            }
+            println!(
+                "{name}: {} rows in {:?} ({:.0} rows/s)",
+                rows,
+                best,
+                rows as f64 / best.as_secs_f64()
+            );
+        };
+
+        let input = input_with(base_config());
+        let mut batch_path = || {
+            let mut rows = 0;
+            for chunk in records.chunks(batch_size) {
+                let batch =
+                    futures::executor::block_on(input.decode_and_attach(chunk)).expect("assembly");
+                rows += batch.num_rows();
+            }
+            rows
+        };
+        time("batch assembly (decode_and_attach)", &mut batch_path);
+
+        let mut oracle_path = || {
+            let mut rows = 0;
+            for record in &records {
+                let batch = MessageBatch::new_binary(vec![record.payload.clone()]).unwrap();
+                let batch: datafusion::arrow::record_batch::RecordBatch = batch.into();
+                let batch = metadata::with_source(batch, "kafka").unwrap();
+                let batch = metadata::with_partition(batch, record.partition as u32).unwrap();
+                let batch = metadata::with_offset(batch, record.offset as u64).unwrap();
+                let batch = metadata::with_key(batch, &record.key.clone().unwrap()).unwrap();
+                let batch = metadata::with_timestamp(batch, record.timestamp.unwrap()).unwrap();
+                let batch = metadata::with_ingest_time(batch, ingest).unwrap();
+                let mut ext = HashMap::new();
+                for (key, value) in &record.ext {
+                    ext.insert(key.clone(), value.clone());
+                }
+                metadata::with_ext_metadata(batch, &ext).unwrap();
+                rows += 1;
+            }
+            rows
+        };
+        time("per-message metadata chain (oracle)", &mut oracle_path);
     }
 }

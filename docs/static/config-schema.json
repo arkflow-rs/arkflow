@@ -676,6 +676,18 @@
               "minimum": 0,
               "description": "Maximum time to wait for fetch data in milliseconds."
             },
+            "batch_max_rows": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1024,
+              "description": "Maximum number of messages aggregated into one read batch (clamped to 1 minimum; 1 restores per-message batches)."
+            },
+            "batch_max_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 8388608,
+              "description": "Maximum accumulated payload bytes per read batch; the first message is always included (clamped to 1 minimum)."
+            },
             "security": {
               "type": "object",
               "description": "SASL authentication and TLS settings. Omit entirely for plaintext.",

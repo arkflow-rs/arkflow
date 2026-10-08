@@ -577,7 +577,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 
 **第二批候选（各自独立 change）**：
 - JSON 双遍解析 + 零 schema 缓存（component/json.rs try_to_arrow：infer+Reader 两趟全量解析、concat 拷贝、跨批不缓存 schema；Kafka input 逐条时 = 每条两趟）——影响全部 JSON 入口（json/debezium/schema_registry JSON 模式/HTTP input）；
-- Kafka input 逐条出批：7 个 `with_*` 元数据链 = 7 次 RecordBatch/schema 重建每条 + 3 次 topic String + 逐条 codec decode（两步：先合并元数据一次重建，再 read 内聚合多行成批）；
+- ~~Kafka input 逐条出批~~ → ✅ `optimize-kafka-input-batching`（2026-10-07）：read() 改「阻塞 recv 首条 + `now_or_never` 无挂起点排空」（`batch_max_rows` 默认 1024 / `batch_max_bytes` 默认 8 MiB 双上界，=1 回退逐条），元数据一次重建（core 新增 `attach_row_source_metadata` 逐行助手），codec 每批一次解码 + 行数不符回退逐 payload 保对齐，ack 按 (topic,partition) 连续段（undo 整段重投）。release 计时（`kafka_batch_assembly_timing`，200k 行含 key/timestamp/headers 元数据）：批组装 8.87M rows/s vs 旧逐条 7×重建链 135K rows/s，**≈65.6×**（批组装路径；端到端收益受 IO/下游摊薄）；取消安全契约保持（排空为非 async 函数，编译器强制无挂起点）；
 - 窗口算子每批全量状态快照（operator.rs runtime_snapshot `buffers.clone()` ∝ 打开窗口数，高基数天花板）+ `extract_keys` 每行 String ×2-3 次/批 + accumulate 行循环 3-4 次 String clone/BTreeMap 查找；
 - event_time_gate：classify_row 每行 3-5 Vec 分配、collect_outcomes 全 Emit 仍全批深拷贝、split_by_physical_partition 每行 format!/to_owned；
 - SQL processor 物理计划每批重建（需 SwapBatchTable 自定义 ExecutionPlan 才能 cache；analyzed/optimized 已缓存）；
