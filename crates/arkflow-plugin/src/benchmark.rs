@@ -183,6 +183,31 @@ async fn codec_json(count: usize) -> Result<ScenarioResult, Error> {
     })
 }
 
+/// JSON decode only (NDJSON buffer → Arrow batch via `try_to_arrow`). Each
+/// iteration decodes a fixed 1000-row buffer, isolating the decode/inference
+/// cost that `codec-json` reports bundled with the encode step.
+async fn json_decode(count: usize) -> Result<ScenarioResult, Error> {
+    let iterations = (count / 100).clamp(20, 2_000);
+    let row = r#"{"value":10,"sensor":"temp_1"}"#;
+    let mut content = Vec::with_capacity(row.len() * 1000);
+    for _ in 0..1000 {
+        content.extend_from_slice(row.as_bytes());
+        content.push(b'\n');
+    }
+    let started = Instant::now();
+    for _ in 0..iterations {
+        let _ = crate::component::json::try_to_arrow(&content, None)?;
+    }
+    let wall = started.elapsed();
+    Ok(ScenarioResult {
+        name: "json-decode",
+        description: "NDJSON → Arrow batch decode (1000-row buffers, decode only)",
+        unit: "batches",
+        operations: iterations as u64,
+        wall,
+    })
+}
+
 fn sample_batch() -> Result<MessageBatch, Error> {
     let row = r#"{"value":10,"sensor":"temp_1"}"#;
     let mut content = Vec::with_capacity(row.len() * 1000);
@@ -382,6 +407,7 @@ async fn run_each(count: usize) -> Result<Vec<ScenarioResult>, Error> {
         groupby_sql(count).await?,
         filter_project_sql(count).await?,
         codec_json(count).await?,
+        json_decode(count).await?,
         state_backend(count).await?,
         avro_decode_w5(count).await?,
         avro_decode_w25(count).await?,
@@ -474,7 +500,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn tiny_suite_completes_with_positive_throughput() {
         let results = run_suite(2_000, 0, 1).await.expect("suite completes");
-        assert_eq!(results.len(), 8);
+        assert_eq!(results.len(), 9);
         for result in &results {
             assert!(result.operations > 0, "{} missing workload", result.name);
             assert!(result.per_second() > 0.0, "{} zero throughput", result.name);
@@ -494,6 +520,7 @@ mod tests {
             "groupby-sql",
             "filter-project-sql",
             "codec-json",
+            "json-decode",
             "state-backend",
             "avro-decode-w5",
             "avro-decode-w25",

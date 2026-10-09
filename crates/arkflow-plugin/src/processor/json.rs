@@ -185,12 +185,55 @@ pub fn init() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use crate::processor::json::{ArrowToJsonProcessorBuilder, JsonToArrowProcessorBuilder};
-    use arkflow_core::processor::ProcessorBuilder;
-    use arkflow_core::{Error, MessageBatch, ProcessResult, Resource, DEFAULT_BINARY_VALUE_FIELD};
+    use arkflow_core::processor::{Processor, ProcessorBuilder};
+    use arkflow_core::{
+        Error, MessageBatch, MessageBatchRef, ProcessResult, Resource, DEFAULT_BINARY_VALUE_FIELD,
+    };
     use serde_json::json;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    fn resource() -> Resource {
+        Resource {
+            temporary: Default::default(),
+            input_names: RefCell::new(Default::default()),
+        }
+    }
+
+    fn to_arrow_processor(include: Option<&[&str]>) -> Arc<dyn Processor> {
+        let config = Some(json!({
+            "value_field": DEFAULT_BINARY_VALUE_FIELD,
+            "fields_to_include": include.map(|f| f.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+        }));
+        JsonToArrowProcessorBuilder
+            .build(None, &config, &resource())
+            .expect("processor")
+    }
+
+    async fn process_json(processor: &Arc<dyn Processor>, line: &str) -> MessageBatchRef {
+        let msg_batch = MessageBatch::new_binary(vec![line.as_bytes().to_vec()]).unwrap();
+        let result: MessageBatchRef = Arc::new(msg_batch);
+        match processor.process(result).await.unwrap() {
+            ProcessResult::Single(batch) => batch,
+            _ => panic!("Expected single result"),
+        }
+    }
+
+    /// The unprojected path must keep picking up fields that first appear in
+    /// later batches — every batch is independently inferred.
+    #[tokio::test]
+    async fn unprojected_path_keeps_late_fields() -> Result<(), Error> {
+        let processor = to_arrow_processor(None);
+
+        let first = process_json(&processor, r#"{"a":1}"#).await;
+        assert!(first.schema().field_with_name("a").is_ok());
+        assert!(first.schema().field_with_name("late").is_err());
+
+        let second = process_json(&processor, r#"{"a":2,"late":"x"}"#).await;
+        assert!(second.schema().field_with_name("late").is_ok());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_json_to_arrow_basic_types() -> Result<(), Error> {

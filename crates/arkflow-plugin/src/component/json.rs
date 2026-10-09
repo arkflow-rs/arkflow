@@ -16,24 +16,21 @@ use arrow_json::ReaderBuilder;
 use datafusion::arrow;
 use datafusion::arrow::record_batch::RecordBatch;
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::sync::Arc;
+
+mod infer;
 
 pub(crate) fn try_to_arrow(
     content: &[u8],
     fields_to_include: Option<&HashSet<String>>,
 ) -> Result<RecordBatch, Error> {
-    // Infer the schema from ALL records in the batch (`None` = unbounded).
-    // arrow-json merges across records by union: Int64 + Float64 widen to
-    // Float64 (no silent truncation of later records), fields seen only in
-    // later records still become columns (no silent column loss), and nulls
-    // relax nullability. Sampling only the first record (`Some(1)`) would
-    // decode every later record against the first record's schema and
-    // silently truncate values / drop unknown fields.
-    let mut cursor_for_inference = Cursor::new(content);
-    let (mut inferred_schema, _) =
-        arrow_json::reader::infer_json_schema(&mut cursor_for_inference, None)
-            .map_err(|e| Error::Process(format!("Schema inference error: {}", e)))?;
+    // Infer the schema from ALL records in the batch. The streaming inferrer
+    // produces the byte-equal result of arrow-json's full-record
+    // `infer_json_schema` (union across records: Int64+Float64 widen to
+    // Float64, later-seen fields become columns, nulls relax nullability)
+    // without materializing a per-record serde_json Value tree — see
+    // `infer`'s differential tests.
+    let mut inferred_schema = infer::infer_json_schema_streaming(content)?;
     if let Some(set) = fields_to_include {
         inferred_schema = inferred_schema
             .project(
@@ -45,19 +42,197 @@ pub(crate) fn try_to_arrow(
     }
 
     let inferred_schema = Arc::new(inferred_schema);
-    let reader = ReaderBuilder::new(inferred_schema.clone())
-        .build(Cursor::new(content))
+    decode_with_schema(content, inferred_schema)
+}
+
+/// Decode newline-delimited JSON records into a single `RecordBatch` under a
+/// pre-computed schema.
+///
+/// The decoder's internal row threshold is sized to the input (one record per
+/// line for NDJSON, so newline count is an exact upper bound), letting one
+/// `Decoder::flush` at EOF yield the entire batch — the chunked `Reader` +
+/// `concat_batches` path (internal 1024-row flushes, one full column copy) is
+/// gone. EOF handling matches `arrow_json::Reader::read()` exactly, so a final
+/// record without a trailing newline still settles. Inputs packing several
+/// records per line may still trip the threshold; those fall back to flushing
+/// the blocked chunks and concatenating (output is still one batch).
+pub(crate) fn decode_with_schema(
+    content: &[u8],
+    schema: Arc<arrow::datatypes::Schema>,
+) -> Result<RecordBatch, Error> {
+    let estimated_rows = content.iter().filter(|&&b| b == b'\n').count() + 1;
+    let mut decoder = ReaderBuilder::new(schema.clone())
+        .with_batch_size(estimated_rows)
+        .build_decoder()
         .map_err(|e| Error::Process(format!("Arrow JSON Reader Builder Error: {}", e)))?;
 
-    let result = reader
-        .map(|batch| batch.map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e))))
-        .collect::<Result<Vec<RecordBatch>, Error>>()?;
-    if result.is_empty() {
-        return Ok(RecordBatch::new_empty(inferred_schema));
+    let mut rest = content;
+    let mut chunks: Vec<RecordBatch> = Vec::new();
+    while !rest.is_empty() {
+        match decoder
+            .decode(rest)
+            .map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?
+        {
+            0 => {
+                // Row threshold hit with bytes remaining: flush to unblock.
+                match decoder
+                    .flush()
+                    .map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?
+                {
+                    Some(batch) => chunks.push(batch),
+                    None => {
+                        return Err(Error::Process(
+                            "Arrow JSON decode stalled: consumed 0 bytes with an empty decoder"
+                                .to_string(),
+                        ))
+                    }
+                }
+            }
+            consumed => rest = &rest[consumed..],
+        }
     }
 
-    let new_batch = arrow::compute::concat_batches(&inferred_schema, &result)
-        .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))?;
+    let final_chunk = decoder
+        .flush()
+        .map_err(|e| Error::Process(format!("Arrow JSON Reader Error: {}", e)))?;
+    match (chunks.is_empty(), final_chunk) {
+        (true, None) => Ok(RecordBatch::new_empty(schema)),
+        (true, Some(batch)) => Ok(batch),
+        (false, trailing) => {
+            if let Some(batch) = trailing {
+                chunks.push(batch);
+            }
+            arrow::compute::concat_batches(&schema, &chunks)
+                .map_err(|e| Error::Process(format!("Merge batches failed: {}", e)))
+        }
+    }
+}
 
-    Ok(new_batch)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::AsArray;
+
+    fn ndjson(rows: usize) -> Vec<u8> {
+        let mut content = Vec::new();
+        for i in 0..rows {
+            content.extend_from_slice(format!(r#"{{"v":{i},"tag":"t{i}"}}"#).as_bytes());
+            content.push(b'\n');
+        }
+        content
+    }
+
+    /// The whole input must come out as ONE batch even when it spans several
+    /// internal decoder chunks (default batch size is 1024).
+    #[test]
+    fn decodes_multi_chunk_input_as_a_single_batch() {
+        for rows in [1usize, 1023, 1024, 1025, 5000] {
+            let batch = try_to_arrow(&ndjson(rows), None).expect("decode");
+            assert_eq!(batch.num_rows(), rows, "row count at {rows}");
+            let v = batch
+                .column_by_name("v")
+                .unwrap()
+                .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+            assert_eq!(v.value(rows - 1), (rows - 1) as i64);
+            let tag = batch.column_by_name("tag").unwrap().as_string::<i32>();
+            assert_eq!(tag.value(rows - 1), format!("t{}", rows - 1));
+        }
+    }
+
+    /// Codec paths join payloads with `\n` — no trailing newline. The final
+    /// record must settle, not surface as a truncated-record error.
+    #[test]
+    fn decodes_input_without_trailing_newline() {
+        let content = br#"{"v":1}
+{"v":2}"#;
+        let batch = try_to_arrow(content, None).expect("decode");
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    /// Empty (or whitespace-only) input yields an empty batch with the
+    /// inferred (empty) schema — unchanged from the concat-based path.
+    #[test]
+    fn empty_input_yields_empty_batch() {
+        for content in [&b""[..], &b" \n \n"[..]] {
+            let batch = try_to_arrow(content, None).expect("decode");
+            assert_eq!(batch.num_rows(), 0);
+            assert_eq!(batch.schema().fields().len(), 0);
+        }
+    }
+
+    /// Ad-hoc release timing (NOT run by CI): the new pipeline (streaming
+    /// inference + sized-decoder single flush) vs the historical path
+    /// (`infer_json_schema` Value-tree inference + chunked Reader +
+    /// `concat_batches`), kept inline as the oracle. Run with:
+    /// `cargo test --release -p arkflow-plugin --lib -- --ignored json_decode_timing --nocapture`
+    #[test]
+    #[ignore]
+    fn json_decode_timing() {
+        let total = 200_000usize;
+        let batch_rows = 1_000usize;
+        let mut content = Vec::new();
+        for i in 0..batch_rows {
+            content.extend_from_slice(
+                format!(
+                    r#"{{"value":{i},"sensor":"sensor_{:03}","active":true,"ratio":0.5}}"#,
+                    i % 100
+                )
+                .as_bytes(),
+            );
+            content.push(b'\n');
+        }
+
+        let time = |name: &str, f: &mut dyn FnMut() -> usize| {
+            let mut best = std::time::Duration::MAX;
+            let mut rows = 0;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                rows = f();
+                best = best.min(start.elapsed());
+            }
+            println!(
+                "{name}: {} rows in {:?} ({:.0} rows/s)",
+                rows,
+                best,
+                rows as f64 / best.as_secs_f64()
+            );
+        };
+
+        let mut new_path = || {
+            let mut rows = 0;
+            for _ in 0..total / batch_rows {
+                rows += try_to_arrow(&content, None).expect("new path").num_rows();
+            }
+            rows
+        };
+        time(
+            "new pipeline (streaming infer + single flush)",
+            &mut new_path,
+        );
+
+        let mut oracle_path = || {
+            let mut rows = 0;
+            for _ in 0..total / batch_rows {
+                let mut cursor = std::io::Cursor::new(&content);
+                let (schema, _) = arrow_json::reader::infer_json_schema(&mut cursor, None)
+                    .expect("oracle inference");
+                let schema = Arc::new(schema);
+                let reader = arrow_json::ReaderBuilder::new(schema.clone())
+                    .build(std::io::Cursor::new(&content))
+                    .expect("oracle reader");
+                let chunks = reader.map(|b| b.expect("oracle chunk")).collect::<Vec<_>>();
+                let batch = if chunks.is_empty() {
+                    RecordBatch::new_empty(schema)
+                } else {
+                    arrow::compute::concat_batches(&schema, &chunks).expect("oracle concat")
+                };
+                rows += batch.num_rows();
+            }
+            rows
+        };
+        time(
+            "old path (Value-tree infer + chunked Reader + concat)",
+            &mut oracle_path,
+        );
+    }
 }
