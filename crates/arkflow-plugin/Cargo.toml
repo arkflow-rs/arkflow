@@ -100,7 +100,7 @@ bytes = "1"
 hdfs-native-object-store = "0.16"
 
 # Compression (WAL segment optimization)
-zstd = "0.13"
+zstd = "0.14"
 lz4_flex = "0.11"
 
 # python
