@@ -24,3 +24,11 @@
 - [x] 4.2 `#[ignore]` release 计时测试 `json_decode_timing`：新管线 vs 内联旧实现（infer_json_schema + Reader + concat oracle），200k 行：4 列 **1.52M vs 0.98M rows/s ≈1.55×**、200 列宽记录 **31.6K vs 23.9K rows/s ≈1.33×**（初版纯 Vec 合并在 4 列测得 1.84×，coderabbit 复审指出宽记录 O(f²) 后改 IndexMap/IndexSet + Fx 哈希器并加宽记录用例）；数字已回填 PLANNING 10.2 勾销该第二批项（含 schema 缓存否决结论）
 - [x] 4.3 CHANGELOG `[Unreleased]` 已补条目（~1.8×、差分等价、单批出批、新场景）；确认无配置面/行为面变化 ⇒ 无 docs 页任务
 - [x] 4.4 门禁：`cargo test -p arkflow-plugin` 全量绿（redis_cluster 环境残留按 AGENTS.md 清理后 2/2）、触及 crate clippy/fmt 零告警、`openspec validate` 通过；全 workspace 测试与 clippy 交 PR CI 复核（与 kafka 变更同惯例）
+
+## 5. 复审修复（coderabbit 四条 + 自 CR 四条）
+
+- [x] 5.1 coderabbit：推断合并宽记录 O(f²) 字段查找 → `IndexMap`/`IndexSet` 键控查找（与上游容器对齐）+ `FxBuildHasher`（默认 SipHash 使 4 列用例 1.77M→0.97M，Fx 恢复至 1.52M）；`json_decode_timing` 增 200 列宽记录用例（31.6K vs 23.9K，≈1.33×）
+- [x] 5.2 coderabbit：kafka `DrainStop::Reconnect` 被 read() 丢弃（#1314 代码 bug，spec 场景早已要求浮现）→ `pending_reconnect: AtomicBool` + `pending_reconnect_first` 探测助手 + 单测；已缓冲消息先行出批、队列排空后首个阻塞认领点浮现 `Error::Disconnection`
+- [x] 5.3 coderabbit：kafka-input-batching spec 措辞——批量上界以认领记录为计量（输出行数限定 codec 展开/skip）、`batch_max_bytes` 软上界（按完整 payload 计数、单条可超限、首条恒认领）；en/zh docs 表格同步
+- [x] 5.4 自 CR：`decode_with_schema` 行数估计封顶 `MAX_ESTIMATED_ROWS = 65_536`（tape 预分配随行数×列数线性增长，HTTP 大 body 需有界 upfront 分配；超限回退既有 chunk+concat 兜底）；spec/design 同步措辞 + 新增「超出容量上限」场景
+- [x] 5.5 自 CR：chunk 兜底路径补 decode 侧直测（相邻对象 + 手工 schema，断言顺序）；`decode_with_schema` 收窄为私有；`pending_reconnect` Relaxed 序依据留注释

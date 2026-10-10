@@ -2,12 +2,17 @@
 
 ### Requirement: JSON→Arrow 解码 SHALL 单批产出
 
-`try_to_arrow` 对 NDJSON 输入的解码 SHALL 一次产出一个 `RecordBatch`：行数等于输入记录数；SHALL NOT 因解码器内部默认块大小（1024 行）分块后拼接——解码器容量 SHALL 按输入行数估计（NDJSON 每行恰一条记录时换行数即行数上界），常规输入无任何 `concat_batches` 中间拷贝；仅当输入记录密度超出估计（如多条记录挤在一行）时才允许回退块拼接，产出仍为一个 `RecordBatch`。输出 schema、值与行序 SHALL 与改造前完全一致。输入无尾换行时末条记录 SHALL 正常结算；空输入（或全空行）SHALL 返回以推断 schema 构造的空批。
+`try_to_arrow` 对 NDJSON 输入的解码 SHALL 一次产出一个 `RecordBatch`：行数等于输入记录数；SHALL NOT 因解码器内部默认块大小（1024 行）分块后拼接——解码器容量 SHALL 按输入行数估计（NDJSON 每行恰一条记录时换行数即行数上界）且 SHALL 设有实现定义的上限以约束预分配（tape 预分配随行数 × schema 列数增长），常规输入（行数在上限内）无任何 `concat_batches` 中间拷贝；仅当解码行数超出该容量上限时才回退块拼接，产出仍为一个 `RecordBatch`。输出 schema、值与行序 SHALL 与改造前完全一致。输入无尾换行时末条记录 SHALL 正常结算；空输入（或全空行）SHALL 返回以推断 schema 构造的空批。
 
 #### Scenario: 超过内部块大小的输入仍单批产出
 
-- **WHEN** 解码包含 5000 行 NDJSON 的输入
+- **WHEN** 解码包含 5000 行 NDJSON 的输入（在容量上限内）
 - **THEN** 产出恰一个 5000 行的 `RecordBatch`，schema 与值和逐行期望一致，不存在多块拼接步骤
+
+#### Scenario: 超出容量上限的输入回退拼接且产出仍为单批
+
+- **WHEN** 解码行数超过估计上限的输入
+- **THEN** 解码分多块 flush 后按顺序拼接，产出恰一个行数等于输入记录数的 `RecordBatch`，行序与值正确，预分配不随输入行数无界增长
 
 #### Scenario: 无尾换行的末条记录正常结算
 

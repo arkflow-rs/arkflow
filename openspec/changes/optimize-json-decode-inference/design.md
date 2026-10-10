@@ -33,7 +33,7 @@ let batch = decoder.flush()?;   // Some(整批) 或 None（0 行）
 ```
 
 - 与 `Reader::read()` 的 EOF 处理逐语句一致（无尾换行末条正常结算），仅去掉中途 flush——NDJSON 一次出**单批**，`concat_batches` 与中间 `Vec<RecordBatch>` 删除。
-- **实现期发现（修正 D1 初稿）**：`batch_size` 不只控制提前返回阈值，还按 `batch_size × num_fields` 控制 tape 预分配——直接取 `usize::MAX` 会按输入字节数放大预分配（不可行）。改为按换行数（NDJSON 行数上界）估计容量：容量与真实行数成正比；多记录挤一行超出估计时 decode 返回 0，回退「flush 已缓冲块 + concat」兜底，产出仍为一个 RecordBatch。
+- **实现期发现（修正 D1 初稿）**：`batch_size` 不只控制提前返回阈值，还按 `batch_size × num_fields` 控制 tape 预分配——直接取 `usize::MAX` 会按输入字节数放大预分配（不可行）。改为按换行数（NDJSON 行数上界）估计容量并封顶（`MAX_ESTIMATED_ROWS = 65_536`；自 CR 复审：预分配随行数×schema 列数线性增长，HTTP 大 body 等不受 batch_max_bytes 约束的入口需要有界的 upfront 分配）：行数在封顶内一次 flush 出单批；行数超出封顶（或直接喂 `decode_with_schema` 的非逐行打包输入）时 decode 返回 0，回退「flush 已缓冲块 + concat」兜底，产出仍为一个 RecordBatch。
 - 空输入/全空行保持现状：flush 返回 `None` ⇒ 返回 `RecordBatch::new_empty(schema)`（schema 仍来自推断，空 schema 列形状不变）。
 - **备选已否决**：`with_batch_size(usize::MAX)` 一把梭（预分配按字节放大）；维持默认 1024 + 无条件 concat（≤1024 行也无谓过一遍拼接）。
 

@@ -49,18 +49,29 @@ pub(crate) fn try_to_arrow(
 /// pre-computed schema.
 ///
 /// The decoder's internal row threshold is sized to the input (one record per
-/// line for NDJSON, so newline count is an exact upper bound), letting one
+/// line for NDJSON, so newline count is an exact upper bound — the inference
+/// pass rejects anything packing several records per line), letting one
 /// `Decoder::flush` at EOF yield the entire batch — the chunked `Reader` +
 /// `concat_batches` path (internal 1024-row flushes, one full column copy) is
 /// gone. EOF handling matches `arrow_json::Reader::read()` exactly, so a final
-/// record without a trailing newline still settles. Inputs packing several
-/// records per line may still trip the threshold; those fall back to flushing
-/// the blocked chunks and concatenating (output is still one batch).
-pub(crate) fn decode_with_schema(
+/// record without a trailing newline still settles. Inputs with more rows than
+/// the capacity cap below (the decoder pre-allocates tape proportional to
+/// rows × schema fields) — or records packed denser than one per line when
+/// this helper is fed a pre-built schema directly — trip the threshold; those
+/// fall back to flushing the blocked chunks and concatenating (output is still
+/// one batch).
+fn decode_with_schema(
     content: &[u8],
     schema: Arc<arrow::datatypes::Schema>,
 ) -> Result<RecordBatch, Error> {
-    let estimated_rows = content.iter().filter(|&&b| b == b'\n').count() + 1;
+    // Cap the row estimate: the decoder pre-allocates tape capacity
+    // proportional to rows × schema fields, so an uncapped newline-count
+    // estimate on a huge body (e.g. a large HTTP input POST) would commit
+    // gigabytes upfront. Estimates beyond the cap simply make the decoder
+    // block mid-buffer and fall back to chunked flush + concat below.
+    const MAX_ESTIMATED_ROWS: usize = 65_536;
+    let estimated_rows =
+        (content.iter().filter(|&&b| b == b'\n').count() + 1).min(MAX_ESTIMATED_ROWS);
     let mut decoder = ReaderBuilder::new(schema.clone())
         .with_batch_size(estimated_rows)
         .build_decoder()
@@ -158,6 +169,29 @@ mod tests {
             assert_eq!(batch.num_rows(), 0);
             assert_eq!(batch.schema().fields().len(), 0);
         }
+    }
+
+    /// The chunked fallback: records packed denser than the newline-count
+    /// row estimate (here: no newlines at all, estimate = 1) trip the decoder
+    /// threshold mid-buffer; the flushed chunks concatenate in order into one
+    /// batch. Fed directly through `decode_with_schema` — inference rejects
+    /// such lines, so `try_to_arrow` can only reach this path for inputs
+    /// exceeding the row-estimate cap.
+    #[test]
+    fn packed_records_fall_back_to_chunked_concat() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
+        ]));
+        let content = br#"{"v":1}{"v":2}{"v":3}"#;
+        let batch = decode_with_schema(content, schema).expect("decode");
+        assert_eq!(batch.num_rows(), 3);
+        let v = batch
+            .column_by_name("v")
+            .unwrap()
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        assert_eq!(v.value(0), 1);
+        assert_eq!(v.value(1), 2);
+        assert_eq!(v.value(2), 3);
     }
 
     /// Ad-hoc release timing (NOT run by CI): the new pipeline (streaming

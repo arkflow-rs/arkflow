@@ -781,7 +781,9 @@ impl Input for KafkaInput {
             // the reconnect through the existing Disconnection path. The flag
             // stays set while buffered messages flow out, so the reconnect
             // surfaces at the first claim that would otherwise block — the
-            // "queue drained" point the batching contract specifies.
+            // "queue drained" point the batching contract specifies. Relaxed
+            // ordering suffices: only the single source-loop task calling
+            // `read()` touches the flag — no cross-thread ordering to protect.
             if self.pending_reconnect.load(Ordering::Relaxed) {
                 match Self::pending_reconnect_first(
                     || {
