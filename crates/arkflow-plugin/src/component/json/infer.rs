@@ -20,12 +20,13 @@
 //! `serde_json::Value`, so inference pays one parse pass without
 //! materializing a per-record value tree.
 //!
-//! The merge state machine mirrors arrow-json's `reader/schema.rs` exactly:
-//! field order is first-seen across records (sorted within a record via
-//! `BTreeMap`, matching `serde_json::Map`), numbers classify as `Int64` iff
-//! `is_i64` else `Float64`, nulls lazily become `Any`, arrays classify by
-//! their first element, scalar⊕list coerces to a list, incompatible merges
-//! error. The differential tests at the bottom pin both implementations to
+//! The merge state machine mirrors arrow-json's `reader/schema.rs` exactly —
+//! down to the same `IndexMap`/`IndexSet` containers, so field order
+//! (first-seen across records, document order within a record), keyed lookups
+//! (no quadratic scans on wide records), number classification (`Int64` iff
+//! `is_i64` else `Float64`), lazy `Any` for nulls, first-element array
+//! classification, scalar⊕list coercion, and incompatible-merge errors all
+//! match. The differential tests at the bottom pin both implementations to
 //! byte-equal schemas on a boundary corpus and a randomized corpus.
 
 use std::borrow::Cow;
@@ -33,13 +34,21 @@ use std::sync::Arc;
 
 use arkflow_core::Error;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
+use indexmap::{IndexMap, IndexSet};
+use rustc_hash::FxBuildHasher;
+
+/// `IndexMap` with the Fx hasher: upstream-parity keyed lookups (iteration
+/// order is insertion-order regardless of hasher) without SipHash dominating
+/// small records.
+type ObjMap<K, V> = IndexMap<K, V, FxBuildHasher>;
+type ObjSet<V> = IndexSet<V, FxBuildHasher>;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
-/// A borrowed JSON tree. Objects are insertion-ordered key/value pairs with
-/// `serde_json::Map` (IndexMap under this workspace's `preserve_order`)
-/// semantics reproduced manually: first-seen position, last value wins. This
-/// matches the iteration order the upstream inference observes on
-/// `serde_json::Value`, without per-field `String` allocations.
+/// A borrowed JSON tree. Objects keep `serde_json::Map` (IndexMap under this
+/// workspace's `preserve_order`) semantics — insertion-ordered, last value
+/// wins — via `IndexMap` over borrowed keys, matching the iteration order the
+/// upstream inference observes on `serde_json::Value` without per-field
+/// `String` allocations.
 ///
 /// Scalar payloads are never consumed by the merge rules (they classify by
 /// variant only) but are kept so inference errors can render the offending
@@ -55,7 +64,7 @@ enum CowValue<'de> {
     Float(f64),
     Str(Cow<'de, str>),
     Array(Vec<CowValue<'de>>),
-    Object(Vec<(Cow<'de, str>, CowValue<'de>)>),
+    Object(ObjMap<Cow<'de, str>, CowValue<'de>>),
 }
 
 impl<'de> CowValue<'de> {
@@ -128,14 +137,10 @@ impl<'de> Deserialize<'de> for CowValue<'de> {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<CowValue<'de>, A::Error> {
-                let mut out: Vec<(Cow<'de, str>, CowValue<'de>)> = Vec::new();
+                let mut out = ObjMap::with_capacity_and_hasher(8, FxBuildHasher);
                 while let Some((k, v)) = map.next_entry::<Cow<'de, str>, CowValue<'de>>()? {
-                    match out.iter_mut().find(|(ek, _)| *ek == k) {
-                        // IndexMap::insert parity: keep the first-seen
-                        // position, replace the value.
-                        Some(slot) => slot.1 = v,
-                        None => out.push((k, v)),
-                    }
+                    // IndexMap::insert: first-seen position kept, value replaced.
+                    out.insert(k, v);
                 }
                 Ok(CowValue::Object(out))
             }
@@ -145,49 +150,31 @@ impl<'de> Deserialize<'de> for CowValue<'de> {
     }
 }
 
-/// Mirror of arrow-json's private `InferredType`, with `IndexMap`/`IndexSet`
-/// replaced by insertion-ordered `Vec`s (same iteration order, no new
-/// dependency at schema-sized cardinalities).
+/// Mirror of arrow-json's private `InferredType`, with the same
+/// `IndexMap`/`IndexSet` containers — keyed lookups (no quadratic scans on
+/// wide records) and identical iteration order to upstream.
 #[derive(Debug, Clone)]
 enum InferredType {
-    Scalar(Vec<DataType>),
+    Scalar(ObjSet<DataType>),
     Array(Box<InferredType>),
-    Object(Vec<(String, InferredType)>),
+    Object(ObjMap<String, InferredType>),
     Any,
 }
 
-fn push_unique(types: &mut Vec<DataType>, ty: DataType) {
-    if !types.contains(&ty) {
-        types.push(ty);
-    }
-}
-
-fn find_entry<'a>(
-    entries: &'a mut [(String, InferredType)],
-    key: &str,
-) -> Option<&'a mut InferredType> {
-    entries.iter_mut().find(|(ek, _)| ek == key).map(|(_, t)| t)
-}
-
 impl InferredType {
+    fn is_none_or_any(ty: Option<&Self>) -> bool {
+        matches!(ty, None | Some(InferredType::Any))
+    }
+
     fn merge(&mut self, other: InferredType) -> Result<(), Error> {
         match (self, other) {
             (InferredType::Array(s), InferredType::Array(o)) => s.merge(*o)?,
             (InferredType::Scalar(s), InferredType::Scalar(o)) => {
-                for v in o {
-                    push_unique(s, v);
-                }
+                s.extend(o);
             }
             (InferredType::Object(s), InferredType::Object(o)) => {
                 for (k, v) in o {
-                    match find_entry(s, &k) {
-                        Some(existing) => existing.merge(v)?,
-                        None => {
-                            let mut any = InferredType::Any;
-                            any.merge(v)?;
-                            s.push((k, any));
-                        }
-                    }
+                    s.entry(k).or_insert(InferredType::Any).merge(v)?;
                 }
             }
             (s @ InferredType::Any, v) => *s = v,
@@ -217,8 +204,8 @@ fn list_type_of(ty: DataType) -> DataType {
 /// * `Int64` and `Float64` should be `Float64`
 /// * Lists and scalars are coerced to a list of a compatible scalar
 /// * All other types are coerced to `Utf8`
-fn coerce_data_type(dt: Vec<DataType>) -> DataType {
-    let mut dt_iter = dt.into_iter();
+fn coerce_data_type(dt: Vec<&DataType>) -> DataType {
+    let mut dt_iter = dt.into_iter().cloned();
     let dt_init = dt_iter.next().unwrap_or(DataType::Utf8);
 
     dt_iter.fold(dt_init, |l, r| match (l, r) {
@@ -228,13 +215,12 @@ fn coerce_data_type(dt: Vec<DataType>) -> DataType {
         (DataType::Float64, DataType::Float64)
         | (DataType::Float64, DataType::Int64)
         | (DataType::Int64, DataType::Float64) => DataType::Float64,
-        (DataType::List(l), DataType::List(r)) => list_type_of(coerce_data_type(vec![
-            l.data_type().clone(),
-            r.data_type().clone(),
-        ])),
+        (DataType::List(l), DataType::List(r)) => {
+            list_type_of(coerce_data_type(vec![l.data_type(), r.data_type()]))
+        }
         // coerce scalar and scalar array into scalar array
         (DataType::List(e), not_list) | (not_list, DataType::List(e)) => {
-            list_type_of(coerce_data_type(vec![e.data_type().clone(), not_list]))
+            list_type_of(coerce_data_type(vec![e.data_type(), &not_list]))
         }
         _ => DataType::Utf8,
     })
@@ -242,41 +228,37 @@ fn coerce_data_type(dt: Vec<DataType>) -> DataType {
 
 fn generate_datatype(t: &InferredType) -> Result<DataType, Error> {
     Ok(match t {
-        InferredType::Scalar(hs) => coerce_data_type(hs.clone()),
+        InferredType::Scalar(hs) => coerce_data_type(hs.iter().collect()),
         InferredType::Object(spec) => DataType::Struct(generate_fields(spec)?),
         InferredType::Array(ele_type) => list_type_of(generate_datatype(ele_type)?),
         InferredType::Any => DataType::Null,
     })
 }
 
-fn generate_fields(spec: &[(String, InferredType)]) -> Result<Fields, Error> {
+fn generate_fields(spec: &ObjMap<String, InferredType>) -> Result<Fields, Error> {
     spec.iter()
         .map(|(k, types)| Ok(Field::new(k, generate_datatype(types)?, true)))
         .collect()
 }
 
 fn set_object_scalar_field_type(
-    field_types: &mut Vec<(String, InferredType)>,
+    field_types: &mut ObjMap<String, InferredType>,
     key: &str,
     ftype: DataType,
 ) -> Result<(), Error> {
-    if let Some(t) = find_entry(field_types, key) {
-        if matches!(t, InferredType::Any) {
-            *t = InferredType::Scalar(Vec::new());
-        }
-    } else {
-        field_types.push((key.to_string(), InferredType::Scalar(Vec::new())));
+    if InferredType::is_none_or_any(field_types.get(key)) {
+        field_types.insert(key.to_string(), InferredType::Scalar(ObjSet::default()));
     }
 
-    match find_entry(field_types, key).expect("entry was just inserted") {
+    match field_types.get_mut(key).expect("entry exists") {
         InferredType::Scalar(hs) => {
-            push_unique(hs, ftype);
+            hs.insert(ftype);
             Ok(())
         }
         // in case of column contains both scalar type and scalar array type,
         // we convert type of this column to scalar array.
         scalar_array @ InferredType::Array(_) => {
-            scalar_array.merge(InferredType::Scalar(vec![ftype]))
+            scalar_array.merge(InferredType::Scalar(ObjSet::from_iter([ftype])))
         }
         t => Err(Error::Process(format!(
             "Schema inference error: Expected scalar or scalar array JSON type, found: {t:?}"
@@ -285,16 +267,20 @@ fn set_object_scalar_field_type(
 }
 
 fn infer_scalar_array_type(array: &[CowValue]) -> Result<InferredType, Error> {
-    let mut hs: Vec<DataType> = Vec::new();
+    let mut hs = ObjSet::default();
 
     for v in array {
         match v {
             CowValue::Null => {}
             CowValue::Int(_) | CowValue::UInt(_) | CowValue::Float(_) => {
-                push_unique(&mut hs, v.numeric_type());
+                hs.insert(v.numeric_type());
             }
-            CowValue::Bool(_) => push_unique(&mut hs, DataType::Boolean),
-            CowValue::Str(_) => push_unique(&mut hs, DataType::Utf8),
+            CowValue::Bool(_) => {
+                hs.insert(DataType::Boolean);
+            }
+            CowValue::Str(_) => {
+                hs.insert(DataType::Utf8);
+            }
             CowValue::Array(_) | CowValue::Object(_) => {
                 return Err(Error::Process(format!(
                     "Schema inference error: Expected scalar value for scalar array, got: {v:?}"
@@ -326,7 +312,7 @@ fn infer_nested_array_type(array: &[CowValue]) -> Result<InferredType, Error> {
 }
 
 fn infer_struct_array_type(array: &[CowValue]) -> Result<InferredType, Error> {
-    let mut field_types: Vec<(String, InferredType)> = Vec::new();
+    let mut field_types = ObjMap::default();
 
     for v in array {
         match v {
@@ -354,8 +340,8 @@ fn infer_array_element_type(array: &[CowValue]) -> Result<InferredType, Error> {
 }
 
 fn collect_field_types_from_object(
-    field_types: &mut Vec<(String, InferredType)>,
-    map: &[(Cow<'_, str>, CowValue<'_>)],
+    field_types: &mut ObjMap<String, InferredType>,
+    map: &ObjMap<Cow<'_, str>, CowValue<'_>>,
 ) -> Result<(), Error> {
     for (k, v) in map {
         match v {
@@ -365,14 +351,13 @@ fn collect_field_types_from_object(
                 // `is_none_or_any` parity: a missing field AND an Any
                 // placeholder (seen only as null so far) both get replaced by
                 // the array-shaped initial state.
-                let existing = find_entry(field_types, k);
-                if matches!(existing, None | Some(InferredType::Any)) {
+                if InferredType::is_none_or_any(field_types.get(k.as_ref())) {
                     let init = match &ele_type {
                         InferredType::Scalar(_) => {
-                            InferredType::Array(Box::new(InferredType::Scalar(Vec::new())))
+                            InferredType::Array(Box::new(InferredType::Scalar(ObjSet::default())))
                         }
                         InferredType::Object(_) => {
-                            InferredType::Array(Box::new(InferredType::Object(Vec::new())))
+                            InferredType::Array(Box::new(InferredType::Object(ObjMap::default())))
                         }
                         InferredType::Any | InferredType::Array(_) => {
                             // set inner type to any for nested array as well
@@ -380,13 +365,10 @@ fn collect_field_types_from_object(
                             InferredType::Array(Box::new(InferredType::Any))
                         }
                     };
-                    match existing {
-                        Some(t) => *t = init,
-                        None => field_types.push((k.to_string(), init)),
-                    }
+                    field_types.insert(k.to_string(), init);
                 }
 
-                match find_entry(field_types, k).expect("entry exists") {
+                match field_types.get_mut(k.as_ref()).expect("entry exists") {
                     InferredType::Array(inner_type) => {
                         inner_type.merge(ele_type)?;
                     }
@@ -409,8 +391,8 @@ fn collect_field_types_from_object(
             CowValue::Null => {
                 // we treat json as nullable by default when inferring, so just
                 // mark existence of a field if it wasn't known before
-                if find_entry(field_types, k).is_none() {
-                    field_types.push((k.to_string(), InferredType::Any));
+                if !field_types.contains_key(k.as_ref()) {
+                    field_types.insert(k.to_string(), InferredType::Any);
                 }
             }
             CowValue::Int(_) | CowValue::UInt(_) | CowValue::Float(_) => {
@@ -420,16 +402,10 @@ fn collect_field_types_from_object(
                 set_object_scalar_field_type(field_types, k, DataType::Utf8)?;
             }
             CowValue::Object(inner_map) => {
-                let known = find_entry(field_types, k);
-                if matches!(known, None | Some(InferredType::Any)) {
-                    match known {
-                        // replace the Any placeholder with a fresh object
-                        Some(t @ InferredType::Any) => *t = InferredType::Object(Vec::new()),
-                        None => field_types.push((k.to_string(), InferredType::Object(Vec::new()))),
-                        _ => unreachable!("checked above"),
-                    }
+                if InferredType::is_none_or_any(field_types.get(k.as_ref())) {
+                    field_types.insert(k.to_string(), InferredType::Object(ObjMap::default()));
                 }
-                match find_entry(field_types, k).expect("entry exists") {
+                match field_types.get_mut(k.as_ref()).expect("entry exists") {
                     InferredType::Object(inner_field_types) => {
                         collect_field_types_from_object(inner_field_types, inner_map)?;
                     }
@@ -455,7 +431,7 @@ fn collect_field_types_from_object(
 /// byte-equal to `arrow_json::reader::infer_json_schema` (pinned by
 /// differential tests), including field ordering, nullability and failures.
 pub(super) fn infer_json_schema_streaming(content: &[u8]) -> Result<Schema, Error> {
-    let mut field_types: Vec<(String, InferredType)> = Vec::new();
+    let mut field_types = ObjMap::default();
 
     for line in content.split(|&b| b == b'\n') {
         let line = std::str::from_utf8(line).map_err(|e| {

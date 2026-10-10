@@ -7,17 +7,17 @@
 ## Requirements
 ### Requirement: Kafka input 一次 read SHALL 聚合多行为一批
 
-`KafkaInput::read()` SHALL 以「首条阻塞认领 + 无挂起点排空」的形式聚合多条 Kafka 消息为一个多行 `MessageBatch` 返回：首条消息经阻塞 `recv()` 认领（read 的首个 await，此前的取消不产生任何认领副作用）；其后 SHALL 仅以非阻塞方式取走客户端已缓冲的消息，认领与返回之间 SHALL NOT 引入新的可挂起 await 点。聚合 SHALL 受 `batch_max_rows`（默认 1024，最小 1）与 `batch_max_bytes`（默认 8 MiB，按 payload 字节累计，最小 1）约束，任一满足即停止排空。排空中途遇到可重试接收错误时，已认领消息 SHALL 照常组批返回；遇到不可重试错误 SHALL 立即上抛（与既有逐条路径的错误语义一致）。
+`KafkaInput::read()` SHALL 以「首条阻塞认领 + 无挂起点排空」的形式聚合多条 Kafka 消息为一个多行 `MessageBatch` 返回：首条消息经阻塞 `recv()` 认领（read 的首个 await，此前的取消不产生任何认领副作用）；其后 SHALL 仅以非阻塞方式取走客户端已缓冲的消息，认领与返回之间 SHALL NOT 引入新的可挂起 await 点。聚合 SHALL 受 `batch_max_rows`（默认 1024，最小 1）与 `batch_max_bytes`（默认 8 MiB，最小 1）约束，任一满足即停止排空。两个上界均以**认领的 Kafka 记录**为计量单位：`batch_max_rows` 限制认领记录数（输出批的行数由后续 codec 决定——无多行展开时等于认领记录数，多行展开可更多，`skip` 丢行可更少，含零行）；`batch_max_bytes` 按 payload 字节累计且为**软上界**——排空以完整 payload 为单位累计，使累计首次达到上限的那条 payload 照常计入，因此单条 payload 本身可超过上限、末条可使累计越过上限（首条 payload 恒被认领）。排空中途遇到可重试接收错误时，已认领消息 SHALL 照常组批返回，且该重连信号 SHALL 保留：其后已缓冲消息照常先行出批，队列排空后的首个阻塞认领点 SHALL 按既有 `Error::Disconnection` 重连路径浮现；遇到不可重试错误 SHALL 立即上抛（与既有逐条路径的错误语义一致）。
 
 #### Scenario: 积压时聚合多行
 
 - **WHEN** 消费者本地队列已缓冲多条消息且吞吐充足
-- **THEN** 一次 `read()` 返回包含至多 `batch_max_rows` 行、payload 累计至多 `batch_max_bytes` 的单批，而不是每条一批
+- **THEN** 一次 `read()` 认领至多 `batch_max_rows` 条记录组成单批（无 codec 多行展开时即至多同数行），而不是每条一批；payload 累计以完整 payload 为单位受 `batch_max_bytes` 软上界约束，使累计首次达到上限的那条 payload 照常计入
 
 #### Scenario: 低流量时无额外延迟
 
 - **WHEN** 队列中仅有一条消息（或为空）
-- **THEN** 批为单行（或阻塞等待首条），排空探测立即返回，不为凑批引入任何等待
+- **THEN** 批仅含该条记录（无 codec 多行展开时为单行）或阻塞等待首条，排空探测立即返回，不为凑批引入任何等待
 
 #### Scenario: 排空期间的取消不丢已认领消息
 
@@ -74,7 +74,7 @@
 
 ### Requirement: 批量边界 SHALL 可配置且可回退逐条
 
-`KafkaInputConfig` SHALL 提供 `batch_max_rows` 与 `batch_max_bytes` 字段：缺省分别为 1024 行与 8 MiB；小于 1 的取值 SHALL 在构建期被拒绝或钳制为 1（实现择一并写入文档）；`batch_max_rows: 1` SHALL 恢复逐条出批粒度（批内实现统一，无单独的逐条代码路径）。字段 SHALL 进入组件 JSON Schema 与组件文档（en/zh）。
+`KafkaInputConfig` SHALL 提供 `batch_max_rows` 与 `batch_max_bytes` 字段：缺省分别为 1024 条记录与 8 MiB；小于 1 的取值 SHALL 在构建期被拒绝或钳制为 1（实现择一并写入文档）；`batch_max_rows: 1` SHALL 恢复逐条出批粒度（批内实现统一，无单独的逐条代码路径）。字段 SHALL 进入组件 JSON Schema 与组件文档（en/zh）。
 
 #### Scenario: 默认配置聚合生效
 

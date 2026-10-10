@@ -163,24 +163,40 @@ mod tests {
     /// Ad-hoc release timing (NOT run by CI): the new pipeline (streaming
     /// inference + sized-decoder single flush) vs the historical path
     /// (`infer_json_schema` Value-tree inference + chunked Reader +
-    /// `concat_batches`), kept inline as the oracle. Run with:
+    /// `concat_batches`), kept inline as the oracle. Runs a narrow 4-column
+    /// workload and a wide 200-column workload (wide records stress the
+    /// per-field keyed lookups). Run with:
     /// `cargo test --release -p arkflow-plugin --lib -- --ignored json_decode_timing --nocapture`
     #[test]
     #[ignore]
     fn json_decode_timing() {
         let total = 200_000usize;
         let batch_rows = 1_000usize;
-        let mut content = Vec::new();
-        for i in 0..batch_rows {
-            content.extend_from_slice(
-                format!(
-                    r#"{{"value":{i},"sensor":"sensor_{:03}","active":true,"ratio":0.5}}"#,
-                    i % 100
-                )
-                .as_bytes(),
-            );
-            content.push(b'\n');
-        }
+
+        let narrow = {
+            let mut content = Vec::new();
+            for i in 0..batch_rows {
+                content.extend_from_slice(
+                    format!(
+                        r#"{{"value":{i},"sensor":"sensor_{:03}","active":true,"ratio":0.5}}"#,
+                        i % 100
+                    )
+                    .as_bytes(),
+                );
+                content.push(b'\n');
+            }
+            content
+        };
+        let wide = {
+            let fields: Vec<String> = (0..200).map(|f| format!(r#""f{f:03}":{f}"#)).collect();
+            let row = format!("{{{}}}", fields.join(","));
+            let mut content = Vec::new();
+            for _ in 0..batch_rows {
+                content.extend_from_slice(row.as_bytes());
+                content.push(b'\n');
+            }
+            content
+        };
 
         let time = |name: &str, f: &mut dyn FnMut() -> usize| {
             let mut best = std::time::Duration::MAX;
@@ -198,41 +214,37 @@ mod tests {
             );
         };
 
-        let mut new_path = || {
-            let mut rows = 0;
-            for _ in 0..total / batch_rows {
-                rows += try_to_arrow(&content, None).expect("new path").num_rows();
-            }
-            rows
-        };
-        time(
-            "new pipeline (streaming infer + single flush)",
-            &mut new_path,
-        );
+        for (label, content) in [("4-column", &narrow), ("200-column wide", &wide)] {
+            let mut new_path = || {
+                let mut rows = 0;
+                for _ in 0..total / batch_rows {
+                    rows += try_to_arrow(content, None).expect("new path").num_rows();
+                }
+                rows
+            };
+            time(&format!("new pipeline ({label})"), &mut new_path);
 
-        let mut oracle_path = || {
-            let mut rows = 0;
-            for _ in 0..total / batch_rows {
-                let mut cursor = std::io::Cursor::new(&content);
-                let (schema, _) = arrow_json::reader::infer_json_schema(&mut cursor, None)
-                    .expect("oracle inference");
-                let schema = Arc::new(schema);
-                let reader = arrow_json::ReaderBuilder::new(schema.clone())
-                    .build(std::io::Cursor::new(&content))
-                    .expect("oracle reader");
-                let chunks = reader.map(|b| b.expect("oracle chunk")).collect::<Vec<_>>();
-                let batch = if chunks.is_empty() {
-                    RecordBatch::new_empty(schema)
-                } else {
-                    arrow::compute::concat_batches(&schema, &chunks).expect("oracle concat")
-                };
-                rows += batch.num_rows();
-            }
-            rows
-        };
-        time(
-            "old path (Value-tree infer + chunked Reader + concat)",
-            &mut oracle_path,
-        );
+            let mut oracle_path = || {
+                let mut rows = 0;
+                for _ in 0..total / batch_rows {
+                    let mut cursor = std::io::Cursor::new(content);
+                    let (schema, _) = arrow_json::reader::infer_json_schema(&mut cursor, None)
+                        .expect("oracle inference");
+                    let schema = Arc::new(schema);
+                    let reader = arrow_json::ReaderBuilder::new(schema.clone())
+                        .build(std::io::Cursor::new(content))
+                        .expect("oracle reader");
+                    let chunks = reader.map(|b| b.expect("oracle chunk")).collect::<Vec<_>>();
+                    let batch = if chunks.is_empty() {
+                        RecordBatch::new_empty(schema)
+                    } else {
+                        arrow::compute::concat_batches(&schema, &chunks).expect("oracle concat")
+                    };
+                    rows += batch.num_rows();
+                }
+                rows
+            };
+            time(&format!("old path ({label})"), &mut oracle_path);
+        }
     }
 }

@@ -137,15 +137,17 @@ refactoring is summarized rather than listed commit-by-commit.
   measured to regress GROUP BY throughput ~11% — multi-partition execution
   gives the aggregate intra-query parallelism that outweighs its overhead —
   and was dropped.)
-- JSON decoding is ~1.8x faster: schema inference no longer materializes a
+- JSON decoding is ~1.5x faster on typical records (and ~1.3x faster on
+  200-column records): schema inference no longer materializes a
   `serde_json::Value` tree per record (a borrowed-tree streaming inferrer
-  produces the byte-identical schema, pinned by differential tests against
-  arrow-json's inference), and decode flushes one RecordBatch sized to the
-  input instead of internal 1024-row chunks re-joined with a concat copy.
-  Output schema, values, row order, and error behavior are unchanged for the
-  `json` codec, `debezium_json` codec, and `json_to_arrow` processor. The
-  public benchmark suite gained a `json-decode` scenario isolating the decode
-  step.
+  mirrors arrow-json's merge state machine — same IndexMap containers with a
+  fast hasher — and produces the byte-identical schema, pinned by differential
+  tests against arrow-json's inference), and decode flushes one RecordBatch
+  sized to the input instead of internal 1024-row chunks re-joined with a
+  concat copy. Output schema, values, row order, and error behavior are
+  unchanged for the `json` codec, `debezium_json` codec, and `json_to_arrow`
+  processor. The public benchmark suite gained a `json-decode` scenario
+  isolating the decode step.
 
 ### Fixed
 

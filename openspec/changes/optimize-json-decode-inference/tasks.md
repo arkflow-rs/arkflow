@@ -21,6 +21,6 @@
 ## 4. 基准、收尾与门禁
 
 - [x] 4.1 benchmark 新增 `json-decode` 场景（1000 行 NDJSON 仅计 `try_to_arrow`，markdown/JSON 两格式一致），场景名清单测试同步；`run_suite` smoke（`scenarios_produce_finite_positive_throughput`）通过
-- [x] 4.2 `#[ignore]` release 计时测试 `json_decode_timing`：新管线 vs 内联旧实现（infer_json_schema + Reader + concat oracle），200k 行 4 列：**1.77M rows/s（112.96ms）vs 0.96M rows/s（207.33ms）≈ 1.84×**；数字已回填 PLANNING 10.2 勾销该第二批项（含 schema 缓存否决结论）
+- [x] 4.2 `#[ignore]` release 计时测试 `json_decode_timing`：新管线 vs 内联旧实现（infer_json_schema + Reader + concat oracle），200k 行：4 列 **1.52M vs 0.98M rows/s ≈1.55×**、200 列宽记录 **31.6K vs 23.9K rows/s ≈1.33×**（初版纯 Vec 合并在 4 列测得 1.84×，coderabbit 复审指出宽记录 O(f²) 后改 IndexMap/IndexSet + Fx 哈希器并加宽记录用例）；数字已回填 PLANNING 10.2 勾销该第二批项（含 schema 缓存否决结论）
 - [x] 4.3 CHANGELOG `[Unreleased]` 已补条目（~1.8×、差分等价、单批出批、新场景）；确认无配置面/行为面变化 ⇒ 无 docs 页任务
 - [x] 4.4 门禁：`cargo test -p arkflow-plugin` 全量绿（redis_cluster 环境残留按 AGENTS.md 清理后 2/2）、触及 crate clippy/fmt 零告警、`openspec validate` 通过；全 workspace 测试与 clippy 交 PR CI 复核（与 kafka 变更同惯例）
