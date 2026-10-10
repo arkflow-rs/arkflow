@@ -22,7 +22,7 @@ The Kafka input consumes messages from one or more Apache Kafka topics using a c
 | fetch_max_partition_bytes | integer | no | — | Maximum bytes returned per partition in a single fetch |
 | fetch_wait_max_ms | integer | no | — | Maximum time (ms) the broker waits for `fetch_min_bytes` of data to accumulate before responding. Only relevant when `fetch_min_bytes` is greater than 1; with `fetch_min_bytes: 1` the broker responds immediately and this setting never triggers. |
 | batch_max_rows | integer | no | `1024` | Maximum number of messages aggregated into one read batch. Values below 1 are clamped to 1. Lowering this is **not** a latency optimization — batching never waits; smaller values only shrink the at-least-once replay unit after a failure. |
-| batch_max_bytes | integer | no | `8388608` (8 MiB) | Maximum accumulated payload bytes per read batch; the first message is always included even beyond this bound. Values below 1 are clamped to 1. |
+| batch_max_bytes | integer | no | `8388608` (8 MiB) | Soft cap on accumulated payload bytes per read batch, counted in whole payloads: the payload that first reaches the bound is still included, so a single payload can exceed the cap on its own, and the first message is always included. Values below 1 are clamped to 1. |
 | security | object | no | — | SASL authentication and TLS settings; omit entirely for plaintext. See [Security](#security) |
 | transactional_offsets | boolean | no | `false` | L3 exactly-once: register this consumer group for in-transaction offset commits by a paired Kafka output's `offset_commit_group`. `ack()` then advances only the in-memory frontier — broker group offsets advance exclusively inside the output's producer transactions. |
 

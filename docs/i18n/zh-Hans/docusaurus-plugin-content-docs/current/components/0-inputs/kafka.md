@@ -22,7 +22,7 @@ Kafka 输入(Input)使用消费者组(consumer group)从一个或多个 Apache K
 | fetch_max_partition_bytes | integer | no | — | 单次拉取中每个分区返回的最大字节数 |
 | fetch_wait_max_ms | integer | no | — | broker 为凑够 `fetch_min_bytes` 而等待的最长时间(毫秒)。仅在 `fetch_min_bytes` 大于 1 时有意义;`fetch_min_bytes: 1` 时 broker 立即响应,该设置不会触发。 |
 | batch_max_rows | integer | no | `1024` | 单次 read 聚合进一个批的最大消息数。小于 1 的值钳制为 1。调小它**不是**延迟优化——攒批从不等待;更小的值只是缩小失败后至少一次语义的重投单位。 |
-| batch_max_bytes | integer | no | `8388608` (8 MiB) | 单次 read 批内累计 payload 字节数上限;首条消息必定纳入(即使超出该上限)。小于 1 的值钳制为 1。 |
+| batch_max_bytes | integer | no | `8388608` (8 MiB) | 单次 read 批内累计 payload 字节数的**软上界**，按完整 payload 计数：使累计首次达到上限的那条 payload 照常计入，单条 payload 本身可以超过该上限；首条消息必定纳入。小于 1 的值钳制为 1。 |
 | security | object | no | — | SASL 认证与 TLS 设置;完全省略即为明文。见[安全配置](#安全配置) |
 | transactional_offsets | boolean | no | `false` | L3 精确一次:为配对 Kafka 输出的 `offset_commit_group` 注册本消费者组以在事务内提交位点。此时 `ack()` 只推进内存 frontier——broker 组位点仅随输出的事务前进。 |
 

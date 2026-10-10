@@ -35,6 +35,7 @@ use rdkafka::message::{Headers as KafkaHeaders, Message as KafkaMessage, Timesta
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Notify, RwLock};
@@ -111,6 +112,11 @@ pub struct KafkaInput {
     /// Resolved batch bounds for `read()` aggregation (clamped to >= 1).
     batch_max_rows: usize,
     batch_max_bytes: u64,
+    /// Set when a drain hit a retryable receive error: the drained batch is
+    /// still returned (at-least-once), and the NEXT `read()` must surface
+    /// `Error::Disconnection` at its blocking claim point once the queue has
+    /// drained — already-buffered messages come out first.
+    pending_reconnect: AtomicBool,
     /// L3 bridge slot: when `transactional_offsets` is enabled, the live
     /// consumer-group metadata lands here for transactional outputs to
     /// commit offsets inside their producer transactions.
@@ -279,6 +285,24 @@ impl KafkaInput {
                     return Ok((records, DrainStop::Reconnect));
                 }
                 Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// First claim for a `read()` that follows a drain which saw a retryable
+    /// receive error. Gives already-buffered messages one non-blocking chance
+    /// (tombstones settle out of band) before the reconnect is surfaced;
+    /// `Ok(None)` means nothing is buffered — surface the reconnect.
+    fn pending_reconnect_first(
+        mut next: impl FnMut() -> Option<Result<Claim, KafkaError>>,
+        mut on_tombstone: impl FnMut(TombstoneSite),
+    ) -> Result<Option<ClaimedRecord>, KafkaError> {
+        loop {
+            match next() {
+                None => return Ok(None),
+                Some(Ok(Claim::Data(record))) => return Ok(Some(record)),
+                Some(Ok(Claim::Tombstone(site))) => on_tombstone(site),
+                Some(Err(error)) => return Err(error),
             }
         }
     }
@@ -477,6 +501,7 @@ impl KafkaInput {
             codec,
             batch_max_rows,
             batch_max_bytes,
+            pending_reconnect: AtomicBool::new(false),
             txn_metadata,
         })
     }
@@ -750,15 +775,62 @@ impl Input for KafkaInput {
         // yielding. A `read()` future dropped before the claim loses
         // nothing; after the claim it cannot be dropped mid-assembly.
         let first = loop {
+            // A previous drain saw a retryable receive error: before blocking
+            // on `recv()` (which could wait out a dead connection), give
+            // already-buffered messages one non-blocking chance, then surface
+            // the reconnect through the existing Disconnection path. The flag
+            // stays set while buffered messages flow out, so the reconnect
+            // surfaces at the first claim that would otherwise block — the
+            // "queue drained" point the batching contract specifies. Relaxed
+            // ordering suffices: only the single source-loop task calling
+            // `read()` touches the flag — no cross-thread ordering to protect.
+            if self.pending_reconnect.load(Ordering::Relaxed) {
+                match Self::pending_reconnect_first(
+                    || {
+                        let mut stream = consumer.stream();
+                        match stream.next().now_or_never() {
+                            // Pending (or stream end): nothing buffered.
+                            None | Some(None) => None,
+                            Some(Some(outcome)) => {
+                                Some(outcome.map(|message| Self::claim_message(&message)))
+                            }
+                        }
+                    },
+                    |site| self.settle_tombstone(site),
+                ) {
+                    Ok(Some(record)) => break record,
+                    // Nothing buffered: the queue has drained — surface it.
+                    Ok(None) => {
+                        self.pending_reconnect.store(false, Ordering::Relaxed);
+                        return Err(Error::Disconnection);
+                    }
+                    Err(e) => {
+                        self.pending_reconnect.store(false, Ordering::Relaxed);
+                        if Self::retryable_receive_error(&e) {
+                            return Err(Error::Disconnection);
+                        }
+                        return Err(Error::Connection(format!(
+                            "Error receiving Kafka message: {}",
+                            e
+                        )));
+                    }
+                }
+            }
             match consumer.recv().await {
-                Ok(kafka_message) => match Self::claim_message(&kafka_message) {
-                    Claim::Data(record) => break record,
-                    // Compacted topics deliver deletion markers with a null
-                    // payload. They are ordinary Kafka data: settle them here,
-                    // never as a fatal error (a crash loop) and never as a
-                    // silent skip (the frontier would replay it forever).
-                    Claim::Tombstone(site) => self.settle_tombstone(site),
-                },
+                Ok(kafka_message) => {
+                    // A successful blocking receive proves the connection is
+                    // producing again; a stale reconnect signal no longer
+                    // applies.
+                    self.pending_reconnect.store(false, Ordering::Relaxed);
+                    match Self::claim_message(&kafka_message) {
+                        Claim::Data(record) => break record,
+                        // Compacted topics deliver deletion markers with a null
+                        // payload. They are ordinary Kafka data: settle them here,
+                        // never as a fatal error (a crash loop) and never as a
+                        // silent skip (the frontier would replay it forever).
+                        Claim::Tombstone(site) => self.settle_tombstone(site),
+                    }
+                }
                 Err(e) if Self::retryable_receive_error(&e) => return Err(Error::Disconnection),
                 Err(e) => {
                     return Err(Error::Connection(format!(
@@ -769,7 +841,7 @@ impl Input for KafkaInput {
             }
         };
 
-        let (records, _stop) = Self::drain_records(
+        let (records, stop) = Self::drain_records(
             first,
             self.batch_max_rows,
             self.batch_max_bytes,
@@ -789,6 +861,12 @@ impl Input for KafkaInput {
             |site| self.settle_tombstone(site),
         )
         .map_err(|e| Error::Connection(format!("Error receiving Kafka message: {}", e)))?;
+        if matches!(stop, DrainStop::Reconnect) {
+            // The drained batch is still returned below (at-least-once); the
+            // next `read()` surfaces the reconnect at its blocking claim
+            // point once the queue has drained.
+            self.pending_reconnect.store(true, Ordering::Relaxed);
+        }
 
         // Every claim is owned storage now: release the consumer read guard
         // before the decode and assembly work.
@@ -2940,6 +3018,45 @@ mod tests {
             |_| {},
         )
         .is_err());
+    }
+
+    /// After a drain saw a retryable disconnect, the reconnect probe gives
+    /// buffered messages one non-blocking chance first (tombstones settle out
+    /// of band), surfaces `Err(retryable)` on another receive error, and
+    /// reports `Ok(None)` — the "queue drained, surface the reconnect" point —
+    /// once nothing is buffered.
+    #[test]
+    fn pending_reconnect_probe_yields_buffered_first_then_none() {
+        let mut buffered: VecDeque<Result<Claim, KafkaError>> = VecDeque::from(vec![
+            Ok(Claim::Tombstone(TombstoneSite {
+                topic: "t".to_string(),
+                partition: 0,
+                offset: 2,
+            })),
+            Ok(Claim::Data(claimed_record("t", 0, 3, b"x", None))),
+        ]);
+        let settled = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = settled.clone();
+        let first = KafkaInput::pending_reconnect_first(
+            move || buffered.pop_front(),
+            move |site| sink.borrow_mut().push(site.offset),
+        )
+        .unwrap();
+        assert_eq!(first.unwrap().offset, 3, "buffered data comes out first");
+        assert_eq!(*settled.borrow(), [2], "tombstones settle out of band");
+
+        let mut empty: VecDeque<Result<Claim, KafkaError>> = VecDeque::new();
+        assert!(
+            KafkaInput::pending_reconnect_first(move || empty.pop_front(), |_| {})
+                .unwrap()
+                .is_none(),
+            "an empty queue is the reconnect surfacing point"
+        );
+
+        let mut errored: VecDeque<Result<Claim, KafkaError>> = VecDeque::from(vec![Err(
+            KafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown),
+        )]);
+        assert!(KafkaInput::pending_reconnect_first(move || errored.pop_front(), |_| {}).is_err());
     }
 
     /// Segments group per (topic, partition) in first-seen order with
