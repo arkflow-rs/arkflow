@@ -1793,7 +1793,14 @@ message Wide {
                 .map(|(column, field)| Field::new(field, column.data_type().clone(), true))
                 .collect();
             let record = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-            let batch = MessageBatch::new_arrow(record);
+            // The decode-side calibration: `batches` batches of `batch_size`
+            // rows (200k rows total), one encode call per batch.
+            let chunks: Vec<MessageBatch> = (0..batches)
+                .map(|b| {
+                    let sliced = record.slice(b * batch_size, batch_size);
+                    MessageBatch::new_arrow(sliced)
+                })
+                .collect();
 
             let time = |label: &str, f: &mut dyn FnMut() -> usize| {
                 let mut best = std::time::Duration::MAX;
@@ -1812,15 +1819,15 @@ message Wide {
             };
             time("per-cell set_field_by_name", &mut || {
                 let mut total = 0usize;
-                for _ in 0..batches {
-                    total += encode_baseline_by_name(&descriptor, &batch).unwrap().len();
+                for chunk in &chunks {
+                    total += encode_baseline_by_name(&descriptor, chunk).unwrap().len();
                 }
                 total
             });
             time("columnar field descriptors", &mut || {
                 let mut total = 0usize;
-                for _ in 0..batches {
-                    total += arrow_to_protobuf(&descriptor, &batch).unwrap().len();
+                for chunk in &chunks {
+                    total += arrow_to_protobuf(&descriptor, chunk).unwrap().len();
                 }
                 total
             });

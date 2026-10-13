@@ -217,6 +217,29 @@ impl KafkaOutput {
     }
 }
 
+/// Observe every outstanding delivery receipt concurrently, then report the
+/// first error in submission order. The previous serial loop stopped
+/// observing receipts after the first error even though librdkafka keeps
+/// delivering the rest; delivery behavior is unchanged — only the
+/// observation window widened, and the reported error is the first one by
+/// submission order.
+async fn observe_delivery_futures(pending: Vec<DeliveryFuture>) {
+    let results = futures::future::join_all(pending).await;
+    for result in results {
+        match result {
+            Ok(Ok(_)) => {} // Success
+            Ok(Err((e, _))) => {
+                error!("Kafka producer shut down: {:?}", e);
+                break;
+            }
+            Err(e) => {
+                error!("Future error during Kafka shutdown: {:?}", e);
+                break;
+            }
+        }
+    }
+}
+
 impl InnerKafkaOutput {
     async fn flush(&self) {
         // Drain synchronously first: the lock must never be held across the
@@ -228,17 +251,7 @@ impl InnerKafkaOutput {
                 .expect("kafka send_futures lock poisoned");
             send_futures.drain(..).collect()
         };
-        for future in pending {
-            match future.await {
-                Ok(Ok(_)) => {} // Success
-                Ok(Err((e, _))) => {
-                    error!("Kafka producer shut down: {:?}", e);
-                }
-                Err(e) => {
-                    error!("Future error during Kafka shutdown: {:?}", e);
-                }
-            }
-        }
+        observe_delivery_futures(pending).await;
     }
 }
 
@@ -396,17 +409,7 @@ impl Output for KafkaOutput {
                     .expect("kafka send_futures lock poisoned");
                 send_futures.drain(..).collect()
             };
-            for future in pending {
-                match future.await {
-                    Ok(Ok(_)) => {} // Success
-                    Ok(Err((e, _))) => {
-                        error!("Kafka producer shut down: {:?}", e);
-                    }
-                    Err(e) => {
-                        error!("Future error during Kafka shutdown: {:?}", e);
-                    }
-                }
-            }
+            observe_delivery_futures(pending).await;
 
             // Wait for all messages to be sent
             producer.flush(Duration::from_secs(30)).map_err(|e| {
