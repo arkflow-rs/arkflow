@@ -981,8 +981,7 @@ mod tests {
         inner.released.store(true, Ordering::SeqCst);
 
         // Race the abort against the parked acknowledgement's completion.
-        let (ack_result, abort_result) =
-            futures::future::join(pending_ack, ack.abort()).await;
+        let (ack_result, abort_result) = futures::future::join(pending_ack, ack.abort()).await;
         ack_result.expect("the released acknowledgement completes");
         abort_result.expect("abort after a settled ack still succeeds");
 
@@ -1021,8 +1020,7 @@ mod tests {
         assert!(early.is_none(), "the gated inner abort must park");
         inner.released.store(true, Ordering::SeqCst);
 
-        let (abort_result, ack_result) =
-            futures::future::join(pending_abort, ack.ack()).await;
+        let (abort_result, ack_result) = futures::future::join(pending_abort, ack.ack()).await;
         abort_result.expect("the released abort completes");
         ack_result.expect("an ack after a terminal abort succeeds vacuously");
         assert_eq!(inner.abort_calls.load(Ordering::SeqCst), 1);
@@ -1059,8 +1057,7 @@ mod tests {
         // The slot must already be free even before the gate opens.
         inner.released.store(true, Ordering::SeqCst);
 
-        let settled =
-            tokio::time::timeout(std::time::Duration::from_secs(5), ack.ack()).await;
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), ack.ack()).await;
         settled
             .expect("a fresh acknowledgement must not wait on the cancelled one")
             .expect("the fresh acknowledgement succeeds");

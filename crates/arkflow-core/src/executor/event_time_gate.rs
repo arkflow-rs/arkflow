@@ -14,7 +14,13 @@ use crate::event_time::{
 use crate::input::{fanout_ack, Ack, NoopAck};
 use crate::job::{LateEventPolicy, TimeSpec};
 use crate::Error;
+use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// Per-row window-end collections: membership cardinalities are 1-3 for the
+/// common bounded cases, so this stays on the stack and the per-row decision
+/// allocates nothing until a row genuinely spans many windows.
+type WindowEnds = SmallVec<[i64; 4]>;
 
 /// The part of a downstream window definition that affects when a source row
 /// is safe to release.  Keeping this separate from the window operator's
@@ -128,7 +134,7 @@ struct HeldBatch {
     /// Window ends that already passed while this row was held behind a later
     /// containing sliding window. They must not be reintroduced when the row
     /// is finally released.
-    expired_window_ends: Vec<Vec<i64>>,
+    expired_window_ends: Vec<WindowEnds>,
     ack: std::sync::Arc<dyn Ack>,
 }
 
@@ -136,15 +142,15 @@ struct HeldBatch {
 struct RowDecision {
     action: WindowAction,
     invalid_timestamp: bool,
-    excluded_window_ends: Vec<i64>,
+    excluded_window_ends: WindowEnds,
     /// A held row can have memberships that need a late side-output copy
     /// while its latest membership still belongs on the main path.
     route_late: bool,
     /// Window ends that should be corrected by a late Update. The window
     /// operator uses this row-local marker so other containing memberships can
     /// still be processed normally in the same delivery.
-    update_window_ends: Vec<i64>,
-    expired_window_ends: Vec<i64>,
+    update_window_ends: WindowEnds,
+    expired_window_ends: WindowEnds,
 }
 
 struct OutcomeGroup {
@@ -152,9 +158,9 @@ struct OutcomeGroup {
     invalid_timestamp: bool,
     keep: Vec<bool>,
     times: Vec<Option<i64>>,
-    exclusions: Vec<Vec<i64>>,
-    updates: Vec<Vec<i64>>,
-    expired: Vec<Vec<i64>>,
+    exclusions: Vec<WindowEnds>,
+    updates: Vec<WindowEnds>,
+    expired: Vec<WindowEnds>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -164,9 +170,9 @@ fn add_outcome_group(
     invalid_timestamp: bool,
     index: usize,
     event_time_ms: Option<i64>,
-    excluded_window_ends: Vec<i64>,
-    update_window_ends: Vec<i64>,
-    expired_window_ends: Vec<i64>,
+    excluded_window_ends: WindowEnds,
+    update_window_ends: WindowEnds,
+    expired_window_ends: WindowEnds,
     batch_len: usize,
 ) {
     if let Some(group) = groups
@@ -904,9 +910,9 @@ impl EventTimeGate {
                     row.invalid_timestamp,
                     index,
                     event_times_ms[index],
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
+                    WindowEnds::new(),
+                    WindowEnds::new(),
+                    WindowEnds::new(),
                     batch.len(),
                 );
             }
@@ -957,7 +963,7 @@ impl EventTimeGate {
         Ok(())
     }
 
-    fn window_ends_for(&self, event_time_ms: i64) -> Vec<i64> {
+    fn window_ends_for(&self, event_time_ms: i64) -> WindowEnds {
         self.window_timings
             .iter()
             .flat_map(|timing| timing.window_ends_for(event_time_ms))
@@ -986,10 +992,10 @@ impl EventTimeGate {
                     LateEventPolicy::Update | LateEventPolicy::Drop => WindowAction::Drop,
                 },
                 invalid_timestamp: true,
-                excluded_window_ends: Vec::new(),
+                excluded_window_ends: WindowEnds::new(),
                 route_late: false,
-                update_window_ends: Vec::new(),
-                expired_window_ends: Vec::new(),
+                update_window_ends: WindowEnds::new(),
+                expired_window_ends: WindowEnds::new(),
             };
         };
         let window_ends = self.window_ends_for(event_time_ms);
@@ -997,10 +1003,10 @@ impl EventTimeGate {
             return RowDecision {
                 action: WindowAction::Emit,
                 invalid_timestamp: false,
-                excluded_window_ends: Vec::new(),
+                excluded_window_ends: WindowEnds::new(),
                 route_late: false,
-                update_window_ends: Vec::new(),
-                expired_window_ends: Vec::new(),
+                update_window_ends: WindowEnds::new(),
+                expired_window_ends: WindowEnds::new(),
             };
         }
         let watermark = watermark_ms.unwrap_or(i64::MIN);
@@ -1008,9 +1014,9 @@ impl EventTimeGate {
             .iter()
             .copied()
             .filter(|end| *end <= watermark)
-            .collect::<Vec<_>>();
+            .collect::<WindowEnds>();
         if held {
-            let mut expired = previously_expired.to_vec();
+            let mut expired: WindowEnds = previously_expired.iter().copied().collect();
             for end in &closed {
                 if !expired.contains(end) {
                     expired.push(*end);
@@ -1029,10 +1035,10 @@ impl EventTimeGate {
                     return RowDecision {
                         action: WindowAction::Emit,
                         invalid_timestamp: false,
-                        excluded_window_ends: Vec::new(),
+                        excluded_window_ends: WindowEnds::new(),
                         route_late: false,
-                        update_window_ends: Vec::new(),
-                        expired_window_ends: Vec::new(),
+                        update_window_ends: WindowEnds::new(),
+                        expired_window_ends: WindowEnds::new(),
                     };
                 }
             } else if window_ends.iter().any(|end| *end > watermark) {
@@ -1049,10 +1055,10 @@ impl EventTimeGate {
                         // their membership-specific action can be decided at
                         // the final release.
                         LateEventPolicy::Drop => closed.clone(),
-                        LateEventPolicy::Route | LateEventPolicy::Update => Vec::new(),
+                        LateEventPolicy::Route | LateEventPolicy::Update => WindowEnds::new(),
                     },
                     route_late: false,
-                    update_window_ends: Vec::new(),
+                    update_window_ends: WindowEnds::new(),
                     expired_window_ends: expired,
                 };
             }
@@ -1067,8 +1073,8 @@ impl EventTimeGate {
                 // sliding ends in one observation, and all of those ends
                 // will be fired before the held row reaches the window.
                 let latest_end = window_ends.iter().copied().max();
-                let mut excluded_window_ends = Vec::new();
-                let mut update_window_ends = Vec::new();
+                let mut excluded_window_ends = WindowEnds::new();
+                let mut update_window_ends = WindowEnds::new();
                 let mut route_late = false;
                 for end in closed.iter().copied() {
                     if Some(end) == latest_end {
@@ -1103,7 +1109,7 @@ impl EventTimeGate {
                     excluded_window_ends,
                     route_late,
                     update_window_ends,
-                    expired_window_ends: Vec::new(),
+                    expired_window_ends: WindowEnds::new(),
                 };
             }
         }
@@ -1119,17 +1125,17 @@ impl EventTimeGate {
                     late_policy,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[WindowAction; 4]>>();
         if actions.contains(&WindowAction::Hold) {
             return RowDecision {
                 action: WindowAction::Hold,
                 invalid_timestamp: false,
                 excluded_window_ends: match late_policy {
                     LateEventPolicy::Drop => closed.clone(),
-                    LateEventPolicy::Route | LateEventPolicy::Update => Vec::new(),
+                    LateEventPolicy::Route | LateEventPolicy::Update => WindowEnds::new(),
                 },
                 route_late: false,
-                update_window_ends: Vec::new(),
+                update_window_ends: WindowEnds::new(),
                 expired_window_ends: closed,
             };
         }
@@ -1157,7 +1163,7 @@ impl EventTimeGate {
                 .zip(window_ends.iter())
                 .filter_map(|(action, end)| (*action == WindowAction::Update).then_some(*end))
                 .collect(),
-            expired_window_ends: Vec::new(),
+            expired_window_ends: WindowEnds::new(),
         }
     }
 }
@@ -1182,7 +1188,7 @@ fn filter_batch(
 /// is consumed only by the window operator.
 fn mark_window_exclusions(
     batch: crate::MessageBatchRef,
-    exclusions: &[Vec<i64>],
+    exclusions: &[impl AsRef<[i64]>],
 ) -> Result<crate::MessageBatchRef, Error> {
     use datafusion::arrow::array::{Array, ArrayRef, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -1197,12 +1203,12 @@ fn mark_window_exclusions(
     let mut values = exclusions
         .iter()
         .map(|ends| {
+            let ends = ends.as_ref();
             (!ends.is_empty()).then(|| {
-                let ends = ends
-                    .iter()
+                ends.iter()
                     .copied()
-                    .collect::<std::collections::BTreeSet<_>>();
-                ends.into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
                     .map(|end| end.to_string())
                     .collect::<Vec<_>>()
                     .join(",")
@@ -1226,7 +1232,7 @@ fn mark_window_exclusions(
                 }
             }
             if let Some(new_values) = exclusions.get(row) {
-                merged.extend(new_values.iter().copied());
+                merged.extend(new_values.as_ref().iter().copied());
             }
             *slot = (!merged.is_empty()).then(|| {
                 merged
@@ -1258,7 +1264,7 @@ fn mark_window_exclusions(
 /// latest containing window as a normal contribution.
 fn mark_window_updates(
     batch: crate::MessageBatchRef,
-    updates: &[Vec<i64>],
+    updates: &[impl AsRef<[i64]>],
 ) -> Result<crate::MessageBatchRef, Error> {
     use datafusion::arrow::array::{Array, ArrayRef, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -1273,12 +1279,12 @@ fn mark_window_updates(
     let mut values = updates
         .iter()
         .map(|ends| {
+            let ends = ends.as_ref();
             (!ends.is_empty()).then(|| {
-                let ends = ends
-                    .iter()
+                ends.iter()
                     .copied()
-                    .collect::<std::collections::BTreeSet<_>>();
-                ends.into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
                     .map(|end| end.to_string())
                     .collect::<Vec<_>>()
                     .join(",")
@@ -1302,7 +1308,7 @@ fn mark_window_updates(
                 }
             }
             if let Some(new_values) = updates.get(row) {
-                merged.extend(new_values.iter().copied());
+                merged.extend(new_values.as_ref().iter().copied());
             }
             *slot = (!merged.is_empty()).then(|| {
                 merged
