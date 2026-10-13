@@ -5,7 +5,7 @@ use super::aggregate::{
     decode_buffer, encode_buffer, numeric_array, AggregateBuffer, NumericKind, NumericValue,
 };
 use super::firing::{
-    PersistUndoImage, WindowFiredAck, WindowFiring, WindowKind, WindowOperatorConfig,
+    PersistUndoImage, WindowFiredAck, WindowFiring, WindowKey, WindowKind, WindowOperatorConfig,
     WindowRollback, WindowRuntimeSnapshot, WindowTrigger,
 };
 use crate::input::{fanout_ack, Ack, ConcurrentAck};
@@ -63,13 +63,13 @@ pub(crate) struct ColumnarWindowOperator {
     /// One journal transaction per open `(window_start, key)` group; a fired
     /// window's commit rides its emitted output's acknowledgement.
     pub(crate) window_txns:
-        Arc<Mutex<BTreeMap<(i64, String), crate::executor::state_journal::StateTxn>>>,
+        Arc<Mutex<BTreeMap<WindowKey, crate::executor::state_journal::StateTxn>>>,
     /// (window_start, key) -> buffer, mirroring the backend lazily.
-    pub(crate) buffers: Arc<Mutex<BTreeMap<(i64, String), AggregateBuffer>>>,
+    pub(crate) buffers: Arc<Mutex<BTreeMap<WindowKey, AggregateBuffer>>>,
     /// Source acknowledgements held until the corresponding aggregate is
     /// successfully written downstream.
     #[allow(clippy::type_complexity)]
-    pub(crate) pending_acks: Arc<Mutex<BTreeMap<(i64, String), Vec<Arc<dyn Ack>>>>>,
+    pub(crate) pending_acks: Arc<Mutex<BTreeMap<WindowKey, Vec<Arc<dyn Ack>>>>>,
     pub(crate) watermark_ms: Arc<Mutex<Option<i64>>>,
     pub(crate) last_processing_trigger_ms: Arc<Mutex<Option<i64>>>,
     pub(crate) last_processing_activity_ms: Arc<Mutex<Option<i64>>>,
@@ -252,7 +252,7 @@ impl ColumnarWindowOperator {
     /// The journal transaction owning one window group's staged state.
     fn window_txn(
         &self,
-        key: &(i64, String),
+        key: &WindowKey,
     ) -> Result<crate::executor::state_journal::StateTxn, Error> {
         let journal = self
             .journal
@@ -269,7 +269,7 @@ impl ColumnarWindowOperator {
 
     /// Discard a window group's staged transaction (its buffer merged into
     /// another session window or its output failed before firing).
-    fn rollback_window_txn(&self, key: &(i64, String)) {
+    fn rollback_window_txn(&self, key: &WindowKey) {
         if let Some(journal) = &self.journal {
             if let Some(txn) = self.window_txns.lock().unwrap().remove(key) {
                 journal.rollback(txn);
@@ -298,9 +298,9 @@ impl ColumnarWindowOperator {
     /// live batch).
     fn evict_overflowed_buffers(
         &self,
-        buffers: &mut BTreeMap<(i64, String), AggregateBuffer>,
-        protected: &BTreeSet<(i64, String)>,
-    ) -> BTreeSet<(i64, String)> {
+        buffers: &mut BTreeMap<WindowKey, AggregateBuffer>,
+        protected: &BTreeSet<WindowKey>,
+    ) -> BTreeSet<WindowKey> {
         let cap = self.config.max_buffered_keys;
         if buffers.len() <= cap {
             return BTreeSet::new();
@@ -348,7 +348,7 @@ impl ColumnarWindowOperator {
     /// The pending-acknowledgement half of the eviction protection. Callers
     /// merge in their own live keys (current-batch memberships / re-key
     /// targets) on top.
-    fn pending_protection(&self) -> BTreeSet<(i64, String)> {
+    fn pending_protection(&self) -> BTreeSet<WindowKey> {
         self.pending_acks
             .lock()
             .unwrap()
@@ -517,10 +517,10 @@ impl ColumnarWindowOperator {
         }
     }
 
-    fn extract_keys(&self, batch: &crate::MessageBatch) -> Result<Vec<Option<String>>, Error> {
+    fn extract_keys(&self, batch: &crate::MessageBatch) -> Result<Vec<Option<Arc<str>>>, Error> {
         let Some(column) = batch.record_batch().column_by_name(&self.config.key_field) else {
             if self.config.key_field == "__arkflow_window_all" {
-                return Ok(vec![Some("__all__".to_owned()); batch.len()]);
+                return Ok(vec![Some(Arc::from("__all__")); batch.len()]);
             }
             return Err(Error::Process(format!(
                 "window key field '{}' is missing",
@@ -536,7 +536,7 @@ impl ColumnarWindowOperator {
                     .downcast_ref::<datafusion::arrow::array::StringArray>()
                     .unwrap()
                     .iter()
-                    .map(|value| value.map(str::to_owned))
+                    .map(|value| value.map(Arc::from))
                     .collect())
             }
             DataType::Int8
@@ -554,7 +554,7 @@ impl ColumnarWindowOperator {
                     .downcast_ref::<datafusion::arrow::array::StringArray>()
                     .unwrap()
                     .iter()
-                    .map(|value| value.map(str::to_owned))
+                    .map(|value| value.map(Arc::from))
                     .collect())
             }
             _ => Err(Error::Process(format!(
@@ -672,7 +672,7 @@ impl ColumnarWindowOperator {
     }
 
     /// Merge one batch into the aggregate buffers (vectorized assignment).
-    fn accumulate(&self, batch: &crate::MessageBatchRef) -> Result<Vec<(i64, String)>, Error> {
+    fn accumulate(&self, batch: &crate::MessageBatchRef) -> Result<Vec<WindowKey>, Error> {
         let timestamps = self.extract_timestamps(batch)?;
         let keys = self.extract_keys(batch)?;
         let value_columns: Vec<&ArrayRef> = self
@@ -706,13 +706,13 @@ impl ColumnarWindowOperator {
         let current_watermark = *self.watermark_ms.lock().unwrap();
         let mut touched = BTreeSet::new();
         let mut session_rekeys = Vec::new();
-        let mut evicted_inline: BTreeSet<(i64, String)> = BTreeSet::new();
+        let mut evicted_inline: BTreeSet<WindowKey> = BTreeSet::new();
         // Pending-acknowledgement half of the eviction protection, built on
         // the first over-cap trigger only: it cannot change mid-batch (the
         // session re-key runs after the loop), and cloning it per membership
         // would make a degraded sliding batch quadratic.
-        let mut protection_base: Option<BTreeSet<(i64, String)>> = None;
-        let mut legacy_rows = BTreeMap::<(i64, String), Vec<usize>>::new();
+        let mut protection_base: Option<BTreeSet<WindowKey>> = None;
+        let mut legacy_rows = BTreeMap::<WindowKey, Vec<usize>>::new();
         // Normalize the (first) value column once per batch. Narrow integer
         // columns used to be re-cast to Int64 inside the row loop — per row
         // AND per window membership — which made wide batches quadratic.
@@ -999,8 +999,7 @@ impl ColumnarWindowOperator {
         // keys with no surviving buffer drop out of `touched` (their
         // acknowledgements must not be held for an aggregate that no longer
         // exists).
-        let survivors: BTreeSet<(i64, String)> =
-            self.buffers.lock().unwrap().keys().cloned().collect();
+        let survivors: BTreeSet<WindowKey> = self.buffers.lock().unwrap().keys().cloned().collect();
         let touched = touched
             .into_iter()
             .filter(|key| !evicted_keys.contains(key) || survivors.contains(key))
@@ -1121,7 +1120,7 @@ impl ColumnarWindowOperator {
             fired_keys.push((start, key.clone()));
             starts.push(start);
             ends.push(end_of(start, &buffer));
-            key_strings.push(key);
+            key_strings.push(key.to_string());
             counts.push(buffer.count);
             sum_values.push(match buffer.kind {
                 NumericKind::Int64 => NumericValue::Int(buffer.sum_i64),
@@ -1815,7 +1814,7 @@ impl ColumnarWindowOperator {
     /// after the aggregate result has been formed.
     async fn finish_processed_batch(
         &self,
-        touched: Vec<(i64, String)>,
+        touched: Vec<WindowKey>,
         ack: Option<Arc<dyn Ack>>,
         late_output: Option<(MessageBatchRef, Arc<dyn Ack>)>,
         has_ack_flow: bool,
@@ -1961,7 +1960,7 @@ impl ColumnarWindowOperator {
         Ok(())
     }
 
-    fn remember_acks(&self, keys: Vec<(i64, String)>, acks: Vec<Arc<dyn Ack>>) {
+    fn remember_acks(&self, keys: Vec<WindowKey>, acks: Vec<Arc<dyn Ack>>) {
         let mut pending = self.pending_acks.lock().unwrap();
         for (key, ack) in keys.into_iter().zip(acks) {
             // These acknowledgements stay pending until the window fires;
@@ -1972,7 +1971,7 @@ impl ColumnarWindowOperator {
         }
     }
 
-    fn take_acks(&self, keys: &[(i64, String)]) -> Vec<Arc<dyn Ack>> {
+    fn take_acks(&self, keys: &[WindowKey]) -> Vec<Arc<dyn Ack>> {
         let mut pending = self.pending_acks.lock().unwrap();
         keys.iter()
             .flat_map(|key| pending.remove(key).unwrap_or_default())
@@ -1985,7 +1984,7 @@ impl ColumnarWindowOperator {
     /// can be replayed.
     fn fired_ack(
         &self,
-        fired_keys: &[(i64, String)],
+        fired_keys: &[WindowKey],
         extra: Vec<Arc<dyn Ack>>,
         before: WindowRuntimeSnapshot,
         after: WindowRuntimeSnapshot,
@@ -2054,7 +2053,7 @@ impl ColumnarWindowOperator {
     /// output transaction when one exists. A cleanup transaction must not be
     /// committed independently: a source acknowledgement failure has to be
     /// able to roll back a session re-key or an expired-window deletion.
-    fn persist_buffers_for_fired(&self, fired_keys: &[(i64, String)]) -> Result<(), Error> {
+    fn persist_buffers_for_fired(&self, fired_keys: &[WindowKey]) -> Result<(), Error> {
         let current = self
             .buffers
             .lock()
@@ -2117,7 +2116,7 @@ impl ColumnarWindowOperator {
             // source delivery of their own.
             let fired_by_logical_key = fired_keys
                 .iter()
-                .map(|(start, key)| (key.as_str(), (*start, key.clone())))
+                .map(|(start, key)| (&**key, (*start, key.clone())))
                 .collect::<BTreeMap<_, _>>();
             let mut cleanup =
                 BTreeMap::<crate::executor::state_journal::StateTxn, Vec<Vec<u8>>>::new();
@@ -2126,14 +2125,15 @@ impl ColumnarWindowOperator {
             for raw in stale_keys {
                 let stale_key = Self::decode_state_key(&raw)?;
                 let has_replacement = current.keys().any(|(_, key)| key == &stale_key.1);
-                let transaction_key = fired_by_logical_key
-                    .get(stale_key.1.as_str())
-                    .cloned()
-                    .or_else(|| {
-                        (!has_replacement)
-                            .then(|| fired_keys.first().cloned())
-                            .flatten()
-                    });
+                let transaction_key =
+                    fired_by_logical_key
+                        .get(&*stale_key.1)
+                        .cloned()
+                        .or_else(|| {
+                            (!has_replacement)
+                                .then(|| fired_keys.first().cloned())
+                                .flatten()
+                        });
                 if let Some(transaction_key) = transaction_key {
                     let txn = self.window_txn(&transaction_key)?;
                     cleanup.entry(txn).or_default().push(raw);
@@ -2207,7 +2207,7 @@ impl ColumnarWindowOperator {
         Ok(())
     }
 
-    fn decode_state_key(raw: &[u8]) -> Result<(i64, String), Error> {
+    fn decode_state_key(raw: &[u8]) -> Result<WindowKey, Error> {
         let window_start = raw
             .get(..8)
             .ok_or_else(|| Error::Process("corrupt window state key".into()))?
@@ -2215,7 +2215,12 @@ impl ColumnarWindowOperator {
             .map(i64::from_be_bytes)
             .map_err(|_| Error::Process("corrupt window state key".into()))?;
         let key = String::from_utf8(raw[8..].to_vec())
-            .map_err(|_| Error::Process("window state key is not utf8".into()))?;
+            .map_err(|_| Error::Process("window state key is not utf8".into()))
+            .and_then(|key| {
+                std::str::from_utf8(key.as_bytes())
+                    .map(Arc::from)
+                    .map_err(|_| Error::Process("window state key is not utf8".into()))
+            })?;
         Ok((window_start, key))
     }
 
@@ -2238,7 +2243,7 @@ impl ColumnarWindowOperator {
                 return Err(Error::Process("corrupt window state key".into()));
             }
             let window_start = i64::from_be_bytes(entry.key[..8].try_into().unwrap());
-            let key = String::from_utf8_lossy(&entry.key[8..]).into_owned();
+            let key: Arc<str> = Arc::from(String::from_utf8_lossy(&entry.key[8..]).as_ref());
             buffers.insert((window_start, key), buffer);
             restored += 1;
         }

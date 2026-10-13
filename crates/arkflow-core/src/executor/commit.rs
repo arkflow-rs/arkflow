@@ -1048,11 +1048,10 @@ mod tests {
         // the future exactly like a lost select! branch.
         {
             let mut pending_ack = std::pin::pin!(ack.ack());
-            let early = tokio::select! {
+            tokio::select! {
                 _ = &mut pending_ack => panic!("the gated inner acknowledgement must park"),
                 _ = inner.wait_entered() => {}
-            };
-            let _ = early;
+            }
         }
         // The slot must already be free even before the gate opens.
         inner.released.store(true, Ordering::SeqCst);

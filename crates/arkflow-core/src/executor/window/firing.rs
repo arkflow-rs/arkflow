@@ -182,16 +182,21 @@ fn default_watermark_field() -> String {
 /// one non-journal persistence captures for a failed fired acknowledgement.
 pub(crate) type PersistUndoImage = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
+/// In-memory window key: the string half is ARC-shared so per-membership
+/// cloning is a reference-count bump (the persisted `state_key` byte layout
+/// is unchanged).
+pub(crate) type WindowKey = (i64, Arc<str>);
+
 #[derive(Clone)]
 pub(crate) struct WindowRuntimeSnapshot {
-    pub(crate) buffers: BTreeMap<(i64, String), AggregateBuffer>,
+    pub(crate) buffers: BTreeMap<WindowKey, AggregateBuffer>,
     pub(crate) watermark_ms: Option<i64>,
     pub(crate) last_processing_trigger_ms: Option<i64>,
     pub(crate) last_processing_activity_ms: Option<i64>,
 }
 
 pub(crate) struct WindowRollback {
-    pub(crate) buffers: Arc<Mutex<BTreeMap<(i64, String), AggregateBuffer>>>,
+    pub(crate) buffers: Arc<Mutex<BTreeMap<WindowKey, AggregateBuffer>>>,
     pub(crate) watermark_ms: Arc<Mutex<Option<i64>>>,
     pub(crate) last_processing_trigger_ms: Arc<Mutex<Option<i64>>>,
     pub(crate) last_processing_activity_ms: Arc<Mutex<Option<i64>>>,
@@ -330,9 +335,9 @@ impl Ack for WindowFiredAck {
 /// The outcome of one window firing round.
 pub(crate) struct WindowFiring {
     /// Aggregate rows to emit together with the window keys they belong to.
-    pub(crate) output: Option<(MessageBatchRef, Vec<(i64, String)>)>,
+    pub(crate) output: Option<(MessageBatchRef, Vec<WindowKey>)>,
     /// Groups that emit nothing — expired windows and empty (never-observed)
     /// buffers — but whose staged transactions were discarded and whose
     /// delivery acknowledgements the caller must still settle.
-    pub(crate) dropped_keys: Vec<(i64, String)>,
+    pub(crate) dropped_keys: Vec<WindowKey>,
 }

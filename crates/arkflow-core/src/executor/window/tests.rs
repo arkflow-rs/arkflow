@@ -159,7 +159,7 @@ async fn evicted_window_does_not_emit_on_later_watermark() {
         .lock()
         .unwrap()
         .keys()
-        .any(|(start, key)| *start == 0 && key == "a"));
+        .any(|(start, key)| *start == 0 && &**key == "a"));
     // A watermark past the first two windows fires only the survivors.
     let result = op
         .process(batch(vec![(2_500, "c", 0)], Some(2_100)))
@@ -231,7 +231,7 @@ async fn session_merge_under_entry_cap_never_strands_acknowledgements() {
         "every acknowledged key must still have a buffer (stranded: {stranded:?})"
     );
     assert!(
-        buffers.contains_key(&(50, "a".to_string())),
+        buffers.contains_key(&(50, "a".into())),
         "the merged session with in-flight acknowledgements survives eviction"
     );
 }
@@ -836,7 +836,7 @@ async fn non_journal_fired_ack_failure_rolls_back_backend_state() {
     // The in-memory buffer is restored to the unemitted pre-fire state.
     let (restored_emitted, restored_count) = {
         let buffers = op.buffers.lock().unwrap();
-        let buffer = buffers.get(&(0, "a".to_string())).unwrap();
+        let buffer = buffers.get(&(0, "a".into())).unwrap();
         (buffer.emitted, buffer.count)
     };
     assert!(!restored_emitted);
@@ -904,7 +904,12 @@ async fn expired_session_rows_are_dropped_without_opening_a_new_session() {
         op.process(batch(vec![(100, "a", 99)], None)).await.unwrap(),
         ProcessResult::None
     ));
-    assert!(!op.buffers.lock().unwrap().keys().any(|(_, key)| key == "a"));
+    assert!(!op
+        .buffers
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|(_, key)| &**key == "a"));
 }
 
 #[tokio::test]
@@ -1348,7 +1353,7 @@ async fn emitted_windows_are_retained_until_the_deadline_then_cleaned() {
     // Within the deadline the buffer is retained.
     {
         let buffers = op.buffers.lock().unwrap();
-        assert!(buffers.contains_key(&(0, "a".to_string())));
+        assert!(buffers.contains_key(&(0, "a".into())));
     }
     // Far past the deadline (watermark 7000 > 1000 + 5000): cleanup.
     op.process(batch(vec![(8_000, "b", 0)], Some(7_000)))
@@ -1356,7 +1361,7 @@ async fn emitted_windows_are_retained_until_the_deadline_then_cleaned() {
         .unwrap();
     let buffers = op.buffers.lock().unwrap();
     assert!(
-        !buffers.contains_key(&(0, "a".to_string())),
+        !buffers.contains_key(&(0, "a".into())),
         "past-deadline buffers are cleaned up"
     );
 }
@@ -1579,7 +1584,7 @@ async fn empty_null_window_settles_its_source_acknowledgement() {
         op.pending_acks
             .lock()
             .unwrap()
-            .contains_key(&(0, "a".to_string())),
+            .contains_key(&(0, "a".into())),
         "the delivery is held by the open window"
     );
     assert_eq!(journal.pending_transactions(), 1);
@@ -1607,7 +1612,7 @@ async fn empty_null_window_settles_its_source_acknowledgement() {
         !op.window_txns
             .lock()
             .unwrap()
-            .contains_key(&(0, "a".to_string())),
+            .contains_key(&(0, "a".into())),
         "the empty window's transaction must be discarded"
     );
     // The still-open window for key "b" keeps its staged transaction.
@@ -1615,11 +1620,11 @@ async fn empty_null_window_settles_its_source_acknowledgement() {
     {
         let pending = op.pending_acks.lock().unwrap();
         assert!(
-            !pending.contains_key(&(0, "a".to_string())),
+            !pending.contains_key(&(0, "a".into())),
             "the NULL-only window's acknowledgement must not strand"
         );
         // The open "b" window legitimately holds its delivery.
-        assert!(pending.contains_key(&(2_000, "b".to_string())));
+        assert!(pending.contains_key(&(2_000, "b".into())));
     }
 }
 
@@ -3412,11 +3417,7 @@ mod coverage_gap_tests {
         );
         let out = op.process(marked).await.unwrap();
         assert!(matches!(out, ProcessResult::None));
-        assert!(!op
-            .buffers
-            .lock()
-            .unwrap()
-            .contains_key(&(0, "a".to_string())));
+        assert!(!op.buffers.lock().unwrap().contains_key(&(0, "a".into())));
     }
 
     #[tokio::test]
@@ -3456,11 +3457,7 @@ mod coverage_gap_tests {
         );
         let out = op.process(marked).await.unwrap();
         assert!(matches!(out, ProcessResult::None));
-        assert!(!op
-            .buffers
-            .lock()
-            .unwrap()
-            .contains_key(&(0, "a".to_string())));
+        assert!(!op.buffers.lock().unwrap().contains_key(&(0, "a".into())));
     }
 
     #[tokio::test]
@@ -3521,12 +3518,12 @@ mod coverage_gap_tests {
             .pending_acks
             .lock()
             .unwrap()
-            .contains_key(&(100, "a".to_string())));
+            .contains_key(&(100, "a".into())));
         assert!(op
             .pending_acks
             .lock()
             .unwrap()
-            .contains_key(&(2_500, "a".to_string())));
+            .contains_key(&(2_500, "a".into())));
 
         // The bridging row merges both sessions into [100, 4500).
         op.process(std_batch(vec![(2_000, "a", 3)], None))
@@ -3535,11 +3532,11 @@ mod coverage_gap_tests {
         {
             let pending = op.pending_acks.lock().unwrap();
             assert!(
-                !pending.contains_key(&(2_500, "a".to_string())),
+                !pending.contains_key(&(2_500, "a".into())),
                 "the merged-away session's delivery moved to the merged key"
             );
             assert_eq!(
-                pending.get(&(100, "a".to_string())).map(Vec::len),
+                pending.get(&(100, "a".into())).map(Vec::len),
                 Some(2),
                 "both held deliveries live under the merged session"
             );
@@ -3548,7 +3545,7 @@ mod coverage_gap_tests {
             !op.window_txns
                 .lock()
                 .unwrap()
-                .contains_key(&(2_500, "a".to_string())),
+                .contains_key(&(2_500, "a".into())),
             "the obsolete transaction is discarded"
         );
 
@@ -3851,7 +3848,7 @@ mod coverage_gap_tests {
         // Force the lazy backend load first so the injected buffer survives.
         op.restore_buffers().unwrap();
         op.buffers.lock().unwrap().insert(
-            (0, "__all__".to_string()),
+            (0, "__all__".into()),
             AggregateBuffer {
                 count: 3,
                 ..Default::default()
@@ -3881,7 +3878,7 @@ mod coverage_gap_tests {
         // Load eagerly so the injected corrupt buffer survives.
         op.restore_buffers().unwrap();
         op.buffers.lock().unwrap().insert(
-            (0, "__all__".to_string()),
+            (0, "__all__".into()),
             AggregateBuffer {
                 count: 3,
                 legacy_batches: vec![b"garbage".to_vec()],
@@ -3958,7 +3955,7 @@ mod coverage_gap_tests {
             .pending_acks
             .lock()
             .unwrap()
-            .contains_key(&(0, "a".to_string())));
+            .contains_key(&(0, "a".into())));
     }
 
     #[tokio::test]
@@ -4126,7 +4123,7 @@ mod coverage_gap_tests {
         assert!(matches!(out, ProcessResult::None));
         let buffers = op.buffers.lock().unwrap();
         let buffer = buffers
-            .get(&(0, "a".to_string()))
+            .get(&(0, "a".into()))
             .expect("the timestamped row aggregated");
         assert_eq!(buffer.count, 1);
         assert_eq!(buffer.sum_i64, 2);
@@ -4232,10 +4229,7 @@ mod coverage_gap_tests {
             .unwrap();
         assert!(matches!(out, ProcessResult::Deferred));
         assert!(
-            op.buffers
-                .lock()
-                .unwrap()
-                .contains_key(&(0, "a".to_string())),
+            op.buffers.lock().unwrap().contains_key(&(0, "a".into())),
             "the accepted row keyed the synthetic legacy group"
         );
     }
