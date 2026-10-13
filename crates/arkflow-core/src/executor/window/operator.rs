@@ -847,56 +847,64 @@ impl ColumnarWindowOperator {
                 if excluded {
                     continue;
                 }
-                // A membership whose window already closed behind this
-                // operator's watermark frontier and whose buffer was already
-                // fired and cleaned must not be re-opened as a fresh
-                // aggregate: the next fire would duplicate an already
-                // emitted window result. The gate marks known-late
-                // memberships with exclusion markers; this guard covers the
-                // release race where an unmarked row reaches the operator
-                // after the frontier moved past its window. Session timing
-                // is excluded: its dynamic per-key lateness is owned by
-                // `session_late_masks`, and bridged sessions legitimately
-                // re-key closed windows.
-                if !self.config.legacy_payload
-                    && !matches!(self.config.kind, WindowKind::Session { .. })
-                    && !late_update_flags.is_some_and(|flags| flags.value(row))
-                    && current_watermark.is_some_and(|watermark| window_end <= watermark)
-                    && !buffers.contains_key(&(window_start, key.clone()))
-                {
-                    continue;
-                }
-                // A late Update corrects an already retained aggregate. Do
-                // not create a new partial buffer for a window that has
-                // already been cleaned up after its lateness deadline.
-                if late_update_flags.is_some_and(|flags| flags.value(row))
-                    && !buffers.contains_key(&(window_start, key.clone()))
-                {
-                    // A targeted late update may share a row with a still
-                    // open sliding membership. Only the explicitly marked
-                    // closed memberships require an existing aggregate; the
-                    // unmarked memberships must be admitted normally.
-                    let targeted = late_update_window_ends.is_some_and(|values| {
-                        values.is_valid(row)
-                            && values.value(row).split(',').any(|value| {
-                                value
-                                    .parse::<i64>()
-                                    .map(|end| end == window_end)
-                                    .unwrap_or(false)
-                            })
-                    });
-                    if late_update_window_ends.is_none() || targeted {
-                        continue;
+                // One probe of the buffer map drives both the admission
+                // guards and the accumulation: the guards below only reject
+                // an ABSENT slot — a retained buffer (late-Update
+                // correction, release-race re-admission) is always admitted
+                // — so they live in the Vacant arm of the entry match
+                // instead of preceding a separate `contains_key`.
+                let slot = (window_start, key.clone());
+                let entry = match buffers.entry(slot.clone()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(vacant) => {
+                        // A membership whose window already closed behind this
+                        // operator's watermark frontier and whose buffer was
+                        // already fired and cleaned must not be re-opened as a
+                        // fresh aggregate: the next fire would duplicate an
+                        // already emitted window result. The gate marks
+                        // known-late memberships with exclusion markers; this
+                        // guard covers the release race where an unmarked row
+                        // reaches the operator after the frontier moved past
+                        // its window. Session timing is excluded: its dynamic
+                        // per-key lateness is owned by `session_late_masks`,
+                        // and bridged sessions legitimately re-key closed
+                        // windows.
+                        if !self.config.legacy_payload
+                            && !matches!(self.config.kind, WindowKind::Session { .. })
+                            && !late_update_flags.is_some_and(|flags| flags.value(row))
+                            && current_watermark.is_some_and(|watermark| window_end <= watermark)
+                        {
+                            continue;
+                        }
+                        // A late Update corrects an already retained
+                        // aggregate. Do not create a new partial buffer for a
+                        // window that has already been cleaned up after its
+                        // lateness deadline. A targeted late update may share
+                        // a row with a still open sliding membership: only
+                        // the explicitly marked closed memberships require an
+                        // existing aggregate; the unmarked memberships are
+                        // admitted normally.
+                        if late_update_flags.is_some_and(|flags| flags.value(row)) {
+                            let targeted = late_update_window_ends.is_some_and(|values| {
+                                values.is_valid(row)
+                                    && values.value(row).split(',').any(|value| {
+                                        value
+                                            .parse::<i64>()
+                                            .map(|end| end == window_end)
+                                            .unwrap_or(false)
+                                    })
+                            });
+                            if late_update_window_ends.is_none() || targeted {
+                                continue;
+                            }
+                        }
+                        vacant.insert(AggregateBuffer::default())
                     }
-                }
-                touched.insert((window_start, key.clone()));
+                };
+                touched.insert(slot.clone());
                 if self.config.legacy_payload {
-                    legacy_rows
-                        .entry((window_start, key.clone()))
-                        .or_default()
-                        .push(row);
+                    legacy_rows.entry(slot).or_default().push(row);
                 }
-                let entry = buffers.entry((window_start, key.clone())).or_default();
                 if let Some(seed) = session_seed.take() {
                     entry.merge(&seed);
                 }
