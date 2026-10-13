@@ -187,9 +187,23 @@ pub(crate) type PersistUndoImage = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 /// is unchanged).
 pub(crate) type WindowKey = (i64, Arc<str>);
 
-#[derive(Clone)]
-pub(crate) struct WindowRuntimeSnapshot {
-    pub(crate) buffers: BTreeMap<WindowKey, AggregateBuffer>,
+/// Before-image (or after-image) of one touched buffer slot: the exact
+/// buffer state the operation saw before mutating it, or `None` when the
+/// slot did not exist (so restoring removes the slot the operation created).
+pub(crate) type SlotImage = Option<AggregateBuffer>;
+
+/// Images for exactly the slots one window operation (an accumulation batch
+/// or a firing round) touches, plus the runtime scalars as they were.
+/// Accumulation captures a slot's image on first touch; a firing captures
+/// images for the slots it removes or marks — including windows filled by
+/// earlier batches that this batch never touched, because a watermark
+/// triggers exactly those. Applying the images restores state identical to
+/// a whole-map snapshot restore — the operation never mutated a slot without
+/// first recording its image — and per-batch snapshot cost no longer grows
+/// with the number of open windows.
+#[derive(Clone, Default)]
+pub(crate) struct TouchedSnapshot {
+    pub(crate) slots: BTreeMap<WindowKey, SlotImage>,
     pub(crate) watermark_ms: Option<i64>,
     pub(crate) last_processing_trigger_ms: Option<i64>,
     pub(crate) last_processing_activity_ms: Option<i64>,
@@ -206,13 +220,25 @@ pub(crate) struct WindowRollback {
     /// fired buffers. Journal-backed operators compensate through their
     /// transactions and leave this as `None`.
     pub(crate) backend: Option<(Arc<dyn StateBackend>, String, Mutex<PersistUndoImage>)>,
-    pub(crate) before: WindowRuntimeSnapshot,
-    pub(crate) after: WindowRuntimeSnapshot,
+    pub(crate) before: TouchedSnapshot,
+    pub(crate) after: TouchedSnapshot,
 }
 
 impl WindowRollback {
-    fn restore(&self, snapshot: &WindowRuntimeSnapshot) {
-        *self.buffers.lock().unwrap() = snapshot.buffers.clone();
+    fn restore(&self, snapshot: &TouchedSnapshot) {
+        {
+            let mut buffers = self.buffers.lock().unwrap();
+            for (key, image) in &snapshot.slots {
+                match image {
+                    Some(buffer) => {
+                        buffers.insert(key.clone(), buffer.clone());
+                    }
+                    None => {
+                        buffers.remove(key);
+                    }
+                }
+            }
+        }
         *self.watermark_ms.lock().unwrap() = snapshot.watermark_ms;
         *self.last_processing_trigger_ms.lock().unwrap() = snapshot.last_processing_trigger_ms;
         *self.last_processing_activity_ms.lock().unwrap() = snapshot.last_processing_activity_ms;
