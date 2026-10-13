@@ -33,7 +33,7 @@
 
 JSON 解码的 schema 推断 SHALL 采用不物化逐条 Value 树的流式推断器，其输出（字段名与**字段序**、数据类型、nullable 标记）与错误行为 SHALL 与 arrow-json `infer_json_schema`（全量记录扫描）**完全相等**，从而原样保持 `codec-error-isolation` 钉死的全量 union 语义：Int64/Float64 跨记录取宽、仅后续记录出现的字段成列、出现 null 的列 nullable、全整数列保持 Int64。等价性 SHALL 由差分测试承载：固定边界语料与随机生成语料上，两实现对该语料的推断结果（含失败判定）逐项断言相等。
 
-#### Scenario: 边界语料逐字节等价
+#### Scenario: 边界语料逐例等价
 
 - **WHEN** 差分测试跑固定语料（mixed arrays、嵌套 struct、struct-in-list、嵌套 list、null 矩阵、>i64::MAX 数值、非法 JSON、非对象顶层记录）
 - **THEN** 流式推断器与 `infer_json_schema` 的输出 schema 完全相等（含字段首现序与全列 nullable），非法输入双方同为 Err
