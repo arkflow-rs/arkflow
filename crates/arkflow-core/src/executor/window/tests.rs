@@ -4585,3 +4585,129 @@ async fn narrow_int_value_columns_match_int64_and_stay_linear() {
          linear cost expects ~4x — the per-row full-column cast was quadratic"
     );
 }
+
+/// Spec "Failed accumulation leaves untouched windows untouched": the
+/// rollback applies exactly the touched-slot images an accumulation
+/// captured — windows C and D that the batch never referenced keep their
+/// prior state bit-for-bit, and the applied-images result equals a
+/// whole-map snapshot restore. Mirrors what `process_internal` does when
+/// `accumulate` returns an error (the white-box form: the injection points
+/// for a mid-accumulate error are journal-only, but the rollback it
+/// triggers is this exact call sequence).
+#[tokio::test]
+async fn failed_accumulation_rollback_leaves_untouched_windows_bit_identical() {
+    let backend: Arc<dyn StateBackend> =
+        Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+    let op = ColumnarWindowOperator::new(
+        eviction_config(default_max_buffered_keys()),
+        backend,
+        "accumulate-rollback-test",
+    );
+    // Windows C [0,1000) and D [3000,4000) pre-exist; the later batch
+    // touches only A [0,1000) and B [5000,6000) (distinct keys).
+    op.process(batch(vec![(100, "c", 7), (3_100, "d", 9)], None))
+        .await
+        .unwrap();
+    let (whole_map_before, c_buffer, d_buffer) = {
+        let buffers = op.buffers.lock().unwrap();
+        (
+            buffers.clone(),
+            buffers.get(&(0, "c".into())).unwrap().clone(),
+            buffers.get(&(3_000, "d".into())).unwrap().clone(),
+        )
+    };
+
+    let mut before = op.open_touched_snapshot();
+    op.accumulate(
+        &batch(vec![(150, "a", 1), (5_100, "b", 2)], None),
+        &mut before.slots,
+    )
+    .unwrap();
+    // The error-path rollback: applying the images captured during the call.
+    op.restore_runtime(&before);
+
+    let buffers = op.buffers.lock().unwrap();
+    // Untouched windows keep their prior state bit-for-bit.
+    assert_eq!(buffers.get(&(0, "c".into())), Some(&c_buffer));
+    assert_eq!(buffers.get(&(3_000, "d".into())), Some(&d_buffer));
+    // Touched windows are rewound out of existence (Absent images).
+    assert!(!buffers.contains_key(&(0, "a".into())));
+    assert!(!buffers.contains_key(&(5_000, "b".into())));
+    // Applying the touched images yields the whole-map snapshot result.
+    assert_eq!(*buffers, whole_map_before);
+}
+
+/// Spec "Fired-ack compensation rewinds only touched windows": the fired
+/// window "a" was filled by an EARLIER batch and never touched by the
+/// failing delivery's accumulation — its rewind must come from the firing's
+/// own before-image, the failing delivery's freshly accumulated slot is
+/// removed, and the still-open window "c" keeps its state bit-for-bit.
+#[tokio::test]
+async fn failed_fired_ack_rewinds_only_fire_touched_windows() {
+    let backend: Arc<dyn StateBackend> =
+        Arc::new(crate::state::InMemoryStateBackend::new(1).unwrap());
+    let op = ColumnarWindowOperator::new(
+        eviction_config(default_max_buffered_keys()),
+        backend,
+        "fire-rollback-only-test",
+    );
+    // Window "c" [3000,4000) exists from an ack-less delivery and stays
+    // open — untouched by the second batch and by the fire.
+    op.process(batch(vec![(3_100, "c", 30)], None))
+        .await
+        .unwrap();
+    // The failing source acknowledgement belongs to "a" alone (a single
+    // touched window rides the source ack directly, no fan-out split): it
+    // is held pending on "a" and rides the fired output when the watermark
+    // fires.
+    let source_ack = Arc::new(FailOnceAck {
+        fail: AtomicBool::new(true),
+    });
+    op.process_with_ack(batch(vec![(100, "a", 10)], None), source_ack)
+        .await
+        .unwrap();
+    let (whole_map_before, a_pre_fire, c_buffer) = {
+        let buffers = op.buffers.lock().unwrap();
+        (
+            buffers.clone(),
+            buffers.get(&(0, "a".into())).unwrap().clone(),
+            buffers.get(&(3_000, "c".into())).unwrap().clone(),
+        )
+    };
+
+    // The second delivery accumulates "b" into [2000,3000) and its
+    // watermark fires the earlier-batch window "a".
+    let fired = op
+        .process_with_ack(
+            batch(vec![(2_100, "b", 0)], Some(1_000)),
+            Arc::new(crate::input::NoopAck),
+        )
+        .await
+        .unwrap();
+    let ProcessResult::SingleWithAck(_, output_ack) = fired else {
+        panic!("the watermark must produce an acknowledged window output");
+    };
+
+    // The fired output's downstream acknowledgement fails: the compensation
+    // rewinds "a" (from the firing's own image — the accumulation never
+    // touched it) and removes this delivery's "b" slot.
+    assert!(output_ack.ack().await.is_err());
+
+    let buffers = op.buffers.lock().unwrap();
+    assert_eq!(
+        buffers.get(&(0, "a".into())),
+        Some(&a_pre_fire),
+        "the fired window rewinds to its pre-firing image"
+    );
+    assert!(
+        !buffers.contains_key(&(2_000, "b".into())),
+        "the failing delivery's own accumulation is rewound"
+    );
+    assert_eq!(
+        buffers.get(&(3_000, "c".into())),
+        Some(&c_buffer),
+        "a window untouched by both the batch and the fire keeps its state"
+    );
+    // Compensation via touched images equals the whole-map snapshot restore.
+    assert_eq!(*buffers, whole_map_before);
+}

@@ -94,7 +94,7 @@ impl ColumnarWindowOperator {
     /// Open a window operation's image set: the runtime scalars as they are
     /// now (buffers are imaged lazily, on first touch) replace the old
     /// whole-map `buffers.clone()` per batch.
-    fn open_touched_snapshot(&self) -> TouchedSnapshot {
+    pub(crate) fn open_touched_snapshot(&self) -> TouchedSnapshot {
         TouchedSnapshot {
             slots: BTreeMap::new(),
             watermark_ms: *self.watermark_ms.lock().unwrap(),
@@ -137,7 +137,7 @@ impl ColumnarWindowOperator {
     /// them twice. Applying the touched-slot images restores exactly what a
     /// whole-map snapshot restore would: every slot the operation mutated
     /// has an image, and untouched slots were never modified.
-    fn restore_runtime(&self, snapshot: &TouchedSnapshot) {
+    pub(crate) fn restore_runtime(&self, snapshot: &TouchedSnapshot) {
         {
             let mut buffers = self.buffers.lock().unwrap();
             for (key, image) in &snapshot.slots {
@@ -720,7 +720,7 @@ impl ColumnarWindowOperator {
     }
 
     /// Merge one batch into the aggregate buffers (vectorized assignment).
-    fn accumulate(
+    pub(crate) fn accumulate(
         &self,
         batch: &crate::MessageBatchRef,
         images: &mut BTreeMap<WindowKey, SlotImage>,
