@@ -736,10 +736,7 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field(
-                                &proto_field,
-                                Value::String(value.value(j).to_string()),
-                            );
+                            msg.set_field(&proto_field, Value::String(value.value(j).to_string()));
                         }
                     }
                 }
@@ -1440,5 +1437,393 @@ message Wide {
             }
             total
         });
+    }
+
+    /// The pre-columnar-descriptor encode shape: per-cell
+    /// `set_field_by_name`, kept as the byte-equality and timing oracle for
+    /// `arrow_to_protobuf`. Mirrors the production kind dispatch over
+    /// well-typed inputs (the production error paths have their own tests).
+    fn encode_baseline_by_name(
+        descriptor: &MessageDescriptor,
+        batch: &MessageBatch,
+    ) -> Result<Vec<Bytes>, Error> {
+        macro_rules! cells_by_name {
+            ($vec:expr, $column:expr, $name:expr, $array:ty, $make:expr) => {{
+                let values = $column.as_any().downcast_ref::<$array>().unwrap();
+                for (j, msg) in $vec.iter_mut().enumerate() {
+                    if values.is_null(j) {
+                        continue;
+                    }
+                    let value = $make(values.value(j));
+                    msg.set_field_by_name($name, value);
+                }
+            }};
+        }
+
+        let mut vec = Vec::with_capacity(batch.len());
+        for _ in 0..batch.len() {
+            vec.push(DynamicMessage::new(descriptor.clone()));
+        }
+        let schema = batch.schema();
+        for (i, field) in schema.fields().iter().enumerate() {
+            let field_name = field.name();
+            let Some(proto_field) = descriptor.get_field_by_name(field_name) else {
+                continue;
+            };
+            let column = batch.column(i);
+            match proto_field.kind() {
+                prost_reflect::Kind::Bool => {
+                    cells_by_name!(vec, column, field_name, BooleanArray, |v: bool| {
+                        Value::Bool(v)
+                    })
+                }
+                prost_reflect::Kind::Int32
+                | prost_reflect::Kind::Sint32
+                | prost_reflect::Kind::Sfixed32 => {
+                    cells_by_name!(vec, column, field_name, Int32Array, |v: i32| {
+                        Value::I32(v)
+                    })
+                }
+                prost_reflect::Kind::Int64
+                | prost_reflect::Kind::Sint64
+                | prost_reflect::Kind::Sfixed64 => {
+                    cells_by_name!(vec, column, field_name, Int64Array, |v: i64| {
+                        Value::I64(v)
+                    })
+                }
+                prost_reflect::Kind::Uint32 | prost_reflect::Kind::Fixed32 => {
+                    cells_by_name!(vec, column, field_name, UInt32Array, |v: u32| {
+                        Value::U32(v)
+                    })
+                }
+                prost_reflect::Kind::Uint64 | prost_reflect::Kind::Fixed64 => {
+                    cells_by_name!(vec, column, field_name, UInt64Array, |v: u64| {
+                        Value::U64(v)
+                    })
+                }
+                prost_reflect::Kind::Float => {
+                    cells_by_name!(vec, column, field_name, Float32Array, |v: f32| {
+                        Value::F32(v)
+                    })
+                }
+                prost_reflect::Kind::Double => {
+                    cells_by_name!(vec, column, field_name, Float64Array, |v: f64| {
+                        Value::F64(v)
+                    })
+                }
+                prost_reflect::Kind::String => {
+                    cells_by_name!(vec, column, field_name, StringArray, |v: &str| {
+                        Value::String(v.to_string())
+                    })
+                }
+                prost_reflect::Kind::Bytes => {
+                    cells_by_name!(vec, column, field_name, BinaryArray, |v: &[u8]| {
+                        Value::Bytes(v.to_vec().into())
+                    })
+                }
+                prost_reflect::Kind::Enum(_) => {
+                    cells_by_name!(vec, column, field_name, Int32Array, |v: i32| {
+                        Value::EnumNumber(v)
+                    })
+                }
+                _ => unreachable!("baseline mirrors the supported production kinds"),
+            }
+        }
+        vec.into_iter()
+            .map(|msg| {
+                let mut buf = Vec::new();
+                msg.encode(&mut buf)
+                    .map_err(|e| Error::Process(format!("Protobuf encoding failed: {}", e)))?;
+                Ok(buf)
+            })
+            .collect()
+    }
+
+    /// Spec: encoded output is byte-identical to the per-cell
+    /// name-resolution baseline, including null-to-absence mapping and
+    /// field order.
+    #[test]
+    fn encode_columnar_descriptors_are_byte_identical_to_per_cell_baseline() {
+        let schema = r#"syntax = "proto3";
+package t;
+enum Level { LOW = 0; HIGH = 1; }
+message All {
+  int64 a = 1; string b = 2; bool c = 3; double d = 4; float e = 5;
+  int32 f = 6; uint32 g = 7; uint64 h = 8; bytes i = 9;
+  sint64 j = 10; fixed32 k = 11; Level level = 12;
+}"#;
+        let descriptor = parse_proto_source(schema, "t.All").unwrap();
+        let rows = 64usize;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(
+                (0..rows)
+                    .map(|i| (i % 7 != 0).then_some(i as i64))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (0..rows)
+                    .map(|i| (i % 5 != 0).then(|| format!("row-{i}")))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                (0..rows)
+                    .map(|i| (i % 3 != 0).then_some(i % 2 == 0))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                (0..rows)
+                    .map(|i| (i % 11 != 0).then_some(i as f64 * 0.25))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float32Array::from(
+                (0..rows)
+                    .map(|i| (i % 13 != 0).then_some(i as f32 * 0.5))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                (0..rows)
+                    .map(|i| (i % 4 != 0).then_some(i as i32))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                (0..rows)
+                    .map(|i| (i % 6 != 0).then_some(i as u32))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                (0..rows)
+                    .map(|i| (i % 8 != 0).then_some(i as u64))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new({
+                let values: Vec<Option<Vec<u8>>> = (0..rows)
+                    .map(|i| (i % 9 != 0).then(|| vec![0xAB, 0xCD, i as u8]))
+                    .collect();
+                BinaryArray::from_iter(values.iter().map(|v| v.as_deref()))
+            }),
+            Arc::new(Int64Array::from(
+                (0..rows)
+                    .map(|i| (i % 10 != 0).then_some(i as i64 * 3))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                (0..rows)
+                    .map(|i| (i % 12 != 0).then_some(i as u32 + 7))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                (0..rows)
+                    .map(|i| (i % 2 != 0).then_some((i % 2) as i32))
+                    .collect::<Vec<_>>(),
+            )),
+        ];
+        let fields: Vec<_> = [
+            ("a", DataType::Int64),
+            ("b", DataType::Utf8),
+            ("c", DataType::Boolean),
+            ("d", DataType::Float64),
+            ("e", DataType::Float32),
+            ("f", DataType::Int32),
+            ("g", DataType::UInt32),
+            ("h", DataType::UInt64),
+            ("i", DataType::Binary),
+            ("j", DataType::Int64),
+            ("k", DataType::UInt32),
+            ("level", DataType::Int32),
+        ]
+        .into_iter()
+        .map(|(name, ty)| Field::new(name, ty, true))
+        .collect();
+        let record = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let batch = MessageBatch::new_arrow(record);
+
+        let fast = arrow_to_protobuf(&descriptor, &batch).unwrap();
+        let baseline = encode_baseline_by_name(&descriptor, &batch).unwrap();
+        assert_eq!(fast.len(), baseline.len());
+        for (index, (fast, baseline)) in fast.iter().zip(baseline.iter()).enumerate() {
+            assert_eq!(fast, baseline, "message {index} differs");
+        }
+    }
+
+    /// Ad-hoc release timing (NOT run by CI): per-cell `set_field_by_name`
+    /// baseline vs the columnar-descriptor path on the same Arrow batch,
+    /// narrow and wide shapes. Run with:
+    /// `cargo test --release -p arkflow-plugin --lib -- --ignored protobuf_batch_encode_timing --nocapture`
+    #[test]
+    #[ignore]
+    fn protobuf_batch_encode_timing() {
+        let narrow = r#"syntax = "proto3";
+package bench;
+message Narrow { int64 f0 = 1; string s0 = 2; double d0 = 3; bool b0 = 4; }"#;
+        let wide = r#"syntax = "proto3";
+package bench;
+message Wide {
+  int64 f0 = 1; int64 f1 = 2; int64 f2 = 3; int64 f3 = 4; int64 f4 = 5;
+  int64 f5 = 6; int64 f6 = 7; int64 f7 = 8; int64 f8 = 9; int64 f9 = 10;
+  string s0 = 11; string s1 = 12; string s2 = 13; string s3 = 14; string s4 = 15;
+  double d0 = 16; double d1 = 17; bool b0 = 18; bool b1 = 19;
+  int32 i0 = 20; int32 i1 = 21; bytes by0 = 22; bytes by1 = 23;
+  uint64 u0 = 24; uint64 u1 = 25; uint32 u2 = 26;
+}"#;
+        let batch_size = 1_000usize;
+        let batches = 200usize;
+        for (name, source, type_name) in [
+            ("narrow", narrow, "bench.Narrow"),
+            ("wide", wide, "bench.Wide"),
+        ] {
+            let descriptor = parse_proto_source(source, type_name).unwrap();
+            let rows = batch_size * batches;
+            let columns: Vec<ArrayRef> = match name {
+                "narrow" => vec![
+                    Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+                    Arc::new(StringArray::from(
+                        (0..rows)
+                            .map(|_| "sensor-abc".to_string())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Float64Array::from(
+                        (0..rows).map(|i| i as f64 * 0.5).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(BooleanArray::from(
+                        (0..rows).map(|i| i % 2 == 0).collect::<Vec<_>>(),
+                    )),
+                ],
+                _ => vec![
+                    Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (i as i64) * 2).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (i as i64) * 3).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (i as i64) * 4).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (i as i64) * 5).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (i as i64) * 6).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (i as i64) * 7).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (i as i64) * 8).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (i as i64) * 9).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (i as i64) * 10).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (0..rows)
+                            .map(|_| "sensor-abc".to_string())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (0..rows)
+                            .map(|_| "region-x".to_string())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (0..rows).map(|_| "host-1".to_string()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (0..rows)
+                            .map(|_| "tag-blue".to_string())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (0..rows).map(|_| "unit-c".to_string()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Float64Array::from(
+                        (0..rows).map(|i| i as f64 * 0.5).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Float64Array::from(
+                        (0..rows).map(|i| i as f64 * 1.5).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(BooleanArray::from(
+                        (0..rows).map(|i| i % 2 == 0).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(BooleanArray::from(
+                        (0..rows).map(|i| i % 3 == 0).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        (0..rows).map(|i| (i % 100) as i32).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        (0..rows).map(|i| (i % 250) as i32).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(BinaryArray::from_iter_values(
+                        (0..rows).map(|_| [0xABu8, 0xCD, 0xEF].repeat(4)),
+                    )),
+                    Arc::new(BinaryArray::from_iter_values(
+                        (0..rows).map(|_| vec![0x01u8, 0x02, 0x03]),
+                    )),
+                    Arc::new(UInt64Array::from(
+                        (0..rows).map(|i| i as u64 * 11).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(UInt64Array::from(
+                        (0..rows).map(|i| i as u64 * 12).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(UInt32Array::from(
+                        (0..rows).map(|i| (i % 5000) as u32).collect::<Vec<_>>(),
+                    )),
+                ],
+            };
+            let names: Vec<String> = match name {
+                "narrow" => ["f0", "s0", "d0", "b0"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                _ => (0..10)
+                    .map(|i| format!("f{i}"))
+                    .chain(["s0", "s1", "s2", "s3", "s4"].iter().map(|s| s.to_string()))
+                    .chain(["d0", "d1", "b0", "b1"].iter().map(|s| s.to_string()))
+                    .chain(["i0", "i1"].iter().map(|s| s.to_string()))
+                    .chain(["by0", "by1"].iter().map(|s| s.to_string()))
+                    .chain(["u0", "u1", "u2"].iter().map(|s| s.to_string()))
+                    .collect(),
+            };
+            let fields: Vec<_> = columns
+                .iter()
+                .zip(names.iter())
+                .map(|(column, field)| Field::new(field, column.data_type().clone(), true))
+                .collect();
+            let record = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            let batch = MessageBatch::new_arrow(record);
+
+            let time = |label: &str, f: &mut dyn FnMut() -> usize| {
+                let mut best = std::time::Duration::MAX;
+                let mut encoded = 0;
+                for _ in 0..3 {
+                    let start = std::time::Instant::now();
+                    encoded = f();
+                    best = best.min(start.elapsed());
+                }
+                println!(
+                    "{name} {label}: {} rows in {:?} ({:.0} rows/s)",
+                    encoded,
+                    best,
+                    encoded as f64 / best.as_secs_f64()
+                );
+            };
+            time("per-cell set_field_by_name", &mut || {
+                let mut total = 0usize;
+                for _ in 0..batches {
+                    total += encode_baseline_by_name(&descriptor, &batch).unwrap().len();
+                }
+                total
+            });
+            time("columnar field descriptors", &mut || {
+                let mut total = 0usize;
+                for _ in 0..batches {
+                    total += arrow_to_protobuf(&descriptor, &batch).unwrap().len();
+                }
+                total
+            });
+        }
     }
 }
