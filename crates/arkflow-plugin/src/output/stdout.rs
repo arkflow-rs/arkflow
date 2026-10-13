@@ -23,7 +23,7 @@ use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Stdout, Write};
+use std::io::{self, BufWriter, Write};
 use std::string::String;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -35,18 +35,24 @@ struct StdoutOutputConfig {
     pub append_newline: Option<bool>,
 }
 
+/// Buffered writer handle. `writeln!` on a plain `Stdout` goes through a
+/// `LineWriter` that flushes (one syscall) per line; wrapping in `BufWriter`
+/// keeps a whole batch's lines in the buffer so the explicit flush at the
+/// end of `write` is the only trip to the underlying writer.
+type BufferedStdWriter = BufWriter<Box<dyn Write + Send>>;
+
 /// Standard output components
-struct StdoutOutput<T> {
+struct StdoutOutput {
     config: StdoutOutputConfig,
-    writer: Mutex<T>,
+    writer: Mutex<BufferedStdWriter>,
     codec: Option<Arc<dyn Codec>>,
 }
 
-impl<T: StdWriter> StdoutOutput<T> {
+impl StdoutOutput {
     /// Create a new standard output component
     pub fn new(
         config: StdoutOutputConfig,
-        writer: T,
+        writer: BufferedStdWriter,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         Ok(Self {
@@ -58,10 +64,7 @@ impl<T: StdWriter> StdoutOutput<T> {
 }
 
 #[async_trait]
-impl<T> Output for StdoutOutput<T>
-where
-    T: StdWriter,
-{
+impl Output for StdoutOutput {
     async fn connect(&self) -> Result<(), Error> {
         Ok(())
     }
@@ -70,7 +73,8 @@ where
         // Apply codec encoding if configured
         let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
 
-        // Write each payload to stdout
+        // Write each payload to stdout; the buffer coalesces the batch's
+        // lines and the flush below is the single per-batch write.
         let mut writer_std = self.writer.lock().await;
         for payload in payloads {
             let s = String::from_utf8_lossy(&payload);
@@ -102,7 +106,11 @@ impl OutputBuilder for StdoutOutputBuilder {
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         let config: StdoutOutputConfig = parse_config(config, "StdoutOutput input")?;
-        Ok(Arc::new(StdoutOutput::new(config, io::stdout(), codec)?))
+        Ok(Arc::new(StdoutOutput::new(
+            config,
+            BufWriter::new(Box::new(io::stdout())),
+            codec,
+        )?))
     }
 }
 
@@ -121,15 +129,12 @@ pub fn init() -> Result<(), Error> {
     ).with_optional().with_example(serde_json::json!({"append_newline": true})))
 }
 
-trait StdWriter: Write + Send + Sync {}
-
-impl StdWriter for Stdout {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arkflow_core::MessageBatch;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock writer for testing
     struct MockWriter(Cursor<Vec<u8>>);
@@ -150,15 +155,54 @@ mod tests {
         }
     }
 
-    impl StdWriter for MockWriter {}
+    fn mock_output(append_newline: bool) -> StdoutOutput {
+        StdoutOutput::new(
+            StdoutOutputConfig {
+                append_newline: Some(append_newline),
+            },
+            BufWriter::new(Box::new(MockWriter::new())),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Shared state of a [`CountingWriter`]: how many write calls reached the
+    /// underlying layer, and every byte those calls carried.
+    #[derive(Default)]
+    struct WriteTally {
+        writes: AtomicUsize,
+        bytes: std::sync::Mutex<Vec<u8>>,
+    }
+
+    impl WriteTally {
+        fn snapshot(&self) -> (usize, Vec<u8>) {
+            (
+                self.writes.load(Ordering::SeqCst),
+                self.bytes.lock().unwrap().clone(),
+            )
+        }
+    }
+
+    /// Underlying writer that counts its write calls: the batch-coalescing
+    /// guarantee is one write per batch, not one per line.
+    struct CountingWriter(Arc<WriteTally>);
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.writes.fetch_add(1, Ordering::SeqCst);
+            self.0.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     /// Test basic functionality of StdoutOutput
     #[tokio::test]
     async fn test_basic_functionality() {
-        let config = StdoutOutputConfig {
-            append_newline: Some(true),
-        };
-        let output = StdoutOutput::new(config, MockWriter::new(), None).unwrap();
+        let output = mock_output(true);
 
         // Test connect
         assert!(output.connect().await.is_ok());
@@ -174,10 +218,7 @@ mod tests {
     /// Test handling of different data types (Arrow and Binary)
     #[tokio::test]
     async fn test_data_type_handling() {
-        let config = StdoutOutputConfig {
-            append_newline: Some(true),
-        };
-        let output = StdoutOutput::new(config, MockWriter::new(), None).unwrap();
+        let output = mock_output(true);
 
         // Test binary data
         let binary_msg = Arc::new(MessageBatch::from_string("binary test").unwrap());
@@ -185,5 +226,66 @@ mod tests {
 
         // Test Arrow data (would need more complex setup)
         // TODO: Add Arrow data type test cases
+    }
+
+    /// A batch's many rows coalesce into a single write at the underlying
+    /// writer: without the `BufWriter` wrapper each `writeln!` reached the
+    /// line-buffered stdout as its own write.
+    #[tokio::test]
+    async fn test_batch_multiple_rows_flush_once() {
+        let tally = Arc::new(WriteTally::default());
+        let output = StdoutOutput::new(
+            StdoutOutputConfig {
+                append_newline: Some(true),
+            },
+            BufWriter::new(Box::new(CountingWriter(tally.clone()))),
+            None,
+        )
+        .unwrap();
+
+        let rows: Vec<String> = (0..200).map(|i| format!("row-{i}")).collect();
+        let batch =
+            MessageBatch::new_binary(rows.clone().into_iter().map(String::into_bytes).collect())
+                .unwrap();
+        output.write(Arc::new(batch)).await.unwrap();
+
+        let (writes, bytes) = tally.snapshot();
+        let observed = String::from_utf8(bytes).unwrap();
+        let expected: String = rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(observed, expected);
+        assert_eq!(
+            writes, 1,
+            "one batch of 200 short rows must reach the underlying writer as a single write"
+        );
+    }
+
+    /// Without newlines the batch still lands as one buffered write.
+    #[tokio::test]
+    async fn test_batch_without_newline_still_coalesces() {
+        let tally = Arc::new(WriteTally::default());
+        let output = StdoutOutput::new(
+            StdoutOutputConfig {
+                append_newline: Some(false),
+            },
+            BufWriter::new(Box::new(CountingWriter(tally.clone()))),
+            None,
+        )
+        .unwrap();
+
+        let rows: Vec<String> = (0..100).map(|i| format!("row-{i};")).collect();
+        let batch =
+            MessageBatch::new_binary(rows.clone().into_iter().map(String::into_bytes).collect())
+                .unwrap();
+        output.write(Arc::new(batch)).await.unwrap();
+
+        let (writes, bytes) = tally.snapshot();
+        let observed = String::from_utf8(bytes).unwrap();
+        let expected: String = rows.concat();
+        assert_eq!(observed, expected);
+        assert_eq!(writes, 1);
     }
 }
