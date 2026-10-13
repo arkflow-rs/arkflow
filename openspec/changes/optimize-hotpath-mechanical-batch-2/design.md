@@ -66,7 +66,7 @@
 
 - **键类型**：`extract_keys` 仍每行物化一次（从数组取值不可避免），改 `Arc<str>::from` 单次分配；buffers/touched/legacy 的 `(i64, String)` 键全改 `(i64, Arc<str>)`——BTreeMap 序 = str 字典序不变，`state_key` 字节布局（`window_start.to_be_bytes() ++ key.as_bytes()`，operator.rs:411-415）不变 ⇒ 持久化状态向后兼容。收益点在 accumulate：每 membership 3 次 `key.clone()` 从堆分配变引用计数 bump。
 - **entry 单趟**：865/873/892/895/899 的 contains_key+entry 双查改单次 `entry()`（Vacant 即首次触达，顺带记 touched）；873 行 late-update 路径保留条件检查。session 桥接路径（792-829）同形处理。
-- **touched-only 快照**：`runtime_snapshot()` 全量克隆（94-101，process_internal 每批调用于 1508；用途 = 错误回滚镜像 + fired-ack 补偿的 before/after，**不是 checkpoint**）。**决策**：accumulate 在首次触碰某 `(window,key)` 槽位时抓取该槽 before-image（AggregateBuffer 为扁平小结构，clone 廉价；vacant 槽记 Absent），过程快照 = `Vec<((i64,Arc<str>), SlotImage)>` 仅含 touched；`restore_runtime`/`rollback_state` 改为按 touched 集合施加镜像，结果与全量快照逐字节等价（未触碰槽位本就未被修改）。firing 侧 `WindowRollback`（firing.rs:193+）改为携带 touched before/after。window/tests.rs 的回滚/恢复场景为安全网；新增场景：失败 accumulate 后未触碰窗口不受影响、fired-ack 补偿只回退触碰窗口。
+- **touched-only 快照**：`runtime_snapshot()` 全量克隆（94-101，process_internal 每批调用于 1508；用途 = 错误回滚镜像 + fired-ack 补偿的 before/after，**不是 checkpoint**）。**决策**：before-image 抓取**按操作各自独立**：① accumulate 在首次触碰某 `(window,key)` 槽位时抓取该槽 before-image（AggregateBuffer 为扁平小结构，clone 廉价；vacant 槽记 Absent），错误回滚（`restore_runtime`）按该镜像集施加；② **fire 路径（on_watermark/on_tick/finish 及 process_internal 内 watermark 触发的 fire）独立抓取**——在 drain/缩减/删除每个槽位前抓其 before-image，**不依赖本次 accumulate 的镜像集**：被 fire 的窗口可能由更早批次填充、本批从未触碰（watermark 触发正是常态），其镜像在 accumulate 集里不存在。fired-ack 补偿的 `WindowRollback`（firing.rs:193+）携带 fire 侧自身抓取的 before/after。两类镜像施加结果与全量快照路径逐字节等价（未被该操作触碰的槽位本就未被其修改）。window/tests.rs 的回滚/恢复场景为安全网；新增场景：失败 accumulate 后未触碰窗口不受影响、fired-ack 补偿只回退 fire 改动的窗口（含本批 accumulate 未触碰的窗口）。
   alternatives：①COW/persistent map——依赖面与复杂度不值；②保留全量快照但延迟到出错才取——不可能，回滚需要变更前镜像。
 
 ### D10 event_time_gate：SmallVec 行内决策 + distinct 分区身份
@@ -77,7 +77,7 @@
 ## Risks / Trade-offs
 
 - [内核四件（D6/D7/D8/D9/D10）并发正确性] → 既有测试面不改通过为硬门槛；D7/D8 各加并发交错测试；任一项测试改不动即回退该项（各项独立 commit，可单独 revert）。
-- [D9 touched-only 快照的等价性] → 回滚/恢复语义由 ≈4.6k 行 window 测试覆盖；新增"未触碰窗口不受失败影响"场景；AggregateBuffer 含 legacy 序列化批时 before-image 仍整槽克隆（该路径本就重，不在本 change 放大）。
+- [D9 touched-only 快照的等价性] → 回滚/恢复语义由 ≈4.6k 行 window 测试覆盖；fire 侧独立抓取镜像（不与 accumulate 镜像集混用）消除"fire 了本批未触碰窗口却无镜像"缺口；新增"未触碰窗口不受失败影响"场景；AggregateBuffer 含 legacy 序列化批时 before-image 仍整槽克隆（该路径本就重，不在本 change 放大）。
 - [D4 take 复制对宽表的物化成本] → 与逐条解码的物化同量级，净收益为解析消除；等价测试双分支（codec 开/关）覆盖。
 - [D2 join_all 改变错误观察时点] → 投递行为不变（librdkafka 后台），仅首错归因更完整；flush 返回 Result 语义不变。
 - [smallvec 新直接依赖] → 传递依赖升级为直接声明，无版本冲突面（arrow 已携带）；若评审否决，D10 退化为 scratch-buffer 复用重构（决策备胎，工作量 +1 天）。

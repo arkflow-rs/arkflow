@@ -32,8 +32,8 @@
 
 - [ ] 5.1 窗口键类型：buffers/touched/legacy 与相关签名 `(i64, String)` → `(i64, Arc<str>)`，`extract_keys` 改 `Arc<str>::from` 单次分配；`state_key` 字节布局不变；window/ 全量既有测试不改通过
 - [ ] 5.2 accumulate 单趟：865/892/899 的 contains_key+entry 双查改单次 `entry()`（Vacant 记 touched），late-update 与 session 桥接路径同形处理；既有 accumulate 测试不改通过
-- [ ] 5.3 touched-only 快照：accumulate 首触槽位抓 before-image（含 Absent 标记），`restore_runtime`/`rollback_state`/firing 侧 `WindowRollback` 改按 touched 集合施加/携带镜像；删除 process_internal 每批的全量 `runtime_snapshot` 克隆
-- [ ] 5.4 新增回滚等价测试：失败 accumulate 后未触碰窗口逐字节不受影响、fired-ack 补偿只回退贡献窗口、恢复结果与全量快照路径一致
+- [ ] 5.3 touched-only 快照：before-image 按操作独立抓取——accumulate 首触槽位抓镜像（含 Absent 标记）供 `restore_runtime` 错误回滚；fire 路径（on_watermark/on_tick/finish 及 process_internal 内 watermark 触发的 fire）在改动每个槽位前独立抓镜像，**含本批 accumulate 未触碰的槽位**（如更早批次填充、本批才被 watermark 触发 fire 的窗口），fired-ack 补偿的 `WindowRollback` 携带 fire 侧自身镜像；删除 process_internal 每批的全量 `runtime_snapshot` 克隆
+- [ ] 5.4 新增回滚等价测试：失败 accumulate 后未触碰窗口逐字节不受影响、fired-ack 补偿只回退 fire 改动的窗口（含本批 accumulate 未触碰、由更早批次填充的窗口）、恢复结果与全量快照路径一致
 
 ## 6. 收尾验证
 
