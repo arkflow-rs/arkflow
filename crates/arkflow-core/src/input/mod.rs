@@ -104,19 +104,39 @@ pub(crate) fn fanout_ack(parent: Arc<dyn Ack>, branches: usize) -> Vec<Arc<dyn A
         parent_lock: tokio::sync::Mutex::new(()),
         parent_acked: AtomicBool::new(false),
         aborted: AtomicBool::new(false),
-        children: std::sync::Mutex::new(Vec::with_capacity(branches)),
+        // One allocation carries every branch's flags; the old shape spent
+        // an `Arc<AtomicBool>` acknowledged flag plus an `Arc<AtomicBool>`
+        // held flag per branch (≈3n+3 allocations for a fan-out of n).
+        slots: (0..branches).map(|_| BranchSlot::default()).collect(),
     });
     (0..branches)
-        .map(|_| {
-            let acknowledged = Arc::new(AtomicBool::new(false));
-            state.children.lock().unwrap().push(acknowledged.clone());
-            Arc::new(FanoutAckPart {
+        .map(|index| {
+            Arc::new(FanoutAckChild {
                 state: state.clone(),
-                acknowledged,
-                held: Arc::new(AtomicBool::new(false)),
+                index,
             }) as Arc<dyn Ack>
         })
         .collect()
+}
+
+/// Per-branch acknowledgement flags, packed into the shared state.
+struct BranchSlot {
+    acknowledged: AtomicBool,
+    /// Per-branch hold state. Siblings of one fan-out hold and release
+    /// independently (for example a gate dispatch splits one delivery into a
+    /// held window group and ready groups), so the shared parent must only
+    /// observe hold *transitions* of each branch, never a branch's release
+    /// of a hold it does not own.
+    held: AtomicBool,
+}
+
+impl Default for BranchSlot {
+    fn default() -> Self {
+        Self {
+            acknowledged: AtomicBool::new(false),
+            held: AtomicBool::new(false),
+        }
+    }
 }
 
 struct FanoutAckState {
@@ -127,22 +147,20 @@ struct FanoutAckState {
     parent_lock: tokio::sync::Mutex<()>,
     parent_acked: AtomicBool,
     aborted: AtomicBool,
-    children: std::sync::Mutex<Vec<Arc<AtomicBool>>>,
+    /// Fixed at construction: one slot per branch, addressed by index.
+    slots: Box<[BranchSlot]>,
 }
 
-struct FanoutAckPart {
+/// One branch's handle into the shared [`FanoutAckState`]. The `Arc<dyn Ack>`
+/// fat pointer requires one allocation per branch; everything else lives in
+/// the shared state.
+struct FanoutAckChild {
     state: Arc<FanoutAckState>,
-    acknowledged: Arc<AtomicBool>,
-    /// Per-branch hold state. Siblings of one fan-out hold and release
-    /// independently (for example a gate dispatch splits one delivery into a
-    /// held window group and ready groups), so the shared parent must only
-    /// observe hold *transitions* of each branch, never a branch's release of
-    /// a hold it does not own.
-    held: Arc<AtomicBool>,
+    index: usize,
 }
 
 #[async_trait]
-impl Ack for FanoutAckPart {
+impl Ack for FanoutAckChild {
     async fn ack(&self) -> Result<(), Error> {
         // Serialize the child state transition with abort.  A sibling may
         // already be queued in a channel when another send fails; it must see
@@ -158,15 +176,16 @@ impl Ack for FanoutAckPart {
                 "fan-out acknowledgement was aborted".to_owned(),
             ));
         }
+        let slot = &self.state.slots[self.index];
         // A downstream retry or a duplicated control path must not decrement
         // the group more than once.
-        if self.acknowledged.swap(true, Ordering::AcqRel) {
+        if slot.acknowledged.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         // A branch that completes while still marked held (its operator acked
         // without an explicit release) must not leave the shared tracker
         // excluding it from barrier draining forever.
-        if self.held.swap(false, Ordering::AcqRel) {
+        if slot.held.swap(false, Ordering::AcqRel) {
             self.state.parent.release_held();
         }
         if self.state.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -181,7 +200,7 @@ impl Ack for FanoutAckPart {
                     // caller can retry this child without losing the source
                     // acknowledgement.
                     self.state.remaining.fetch_add(1, Ordering::AcqRel);
-                    self.acknowledged.store(false, Ordering::Release);
+                    slot.acknowledged.store(false, Ordering::Release);
                     Err(error)
                 }
             }
@@ -200,13 +219,12 @@ impl Ack for FanoutAckPart {
             self.state.parent.undo().await?;
             self.state.parent_acked.store(false, Ordering::Release);
         }
-        let children = self.state.children.lock().unwrap();
-        for child in children.iter() {
-            child.store(false, Ordering::Release);
+        for slot in self.state.slots.iter() {
+            slot.acknowledged.store(false, Ordering::Release);
         }
         self.state
             .remaining
-            .store(children.len(), Ordering::Release);
+            .store(self.state.slots.len(), Ordering::Release);
         Ok(())
     }
 
@@ -225,13 +243,12 @@ impl Ack for FanoutAckPart {
         } else {
             self.state.parent.abort().await
         };
-        let children = self.state.children.lock().unwrap();
-        for child in children.iter() {
-            child.store(false, Ordering::Release);
+        for slot in self.state.slots.iter() {
+            slot.acknowledged.store(false, Ordering::Release);
         }
         self.state
             .remaining
-            .store(children.len(), Ordering::Release);
+            .store(self.state.slots.len(), Ordering::Release);
         parent_result
     }
 
@@ -240,13 +257,15 @@ impl Ack for FanoutAckPart {
         // group's source-side tracker excludes it from barrier draining. Only
         // this branch's first hold transitions the parent — a sibling's hold
         // or release must not consume it.
-        if !self.held.swap(true, Ordering::AcqRel) {
+        let slot = &self.state.slots[self.index];
+        if !slot.held.swap(true, Ordering::AcqRel) {
             self.state.parent.mark_held();
         }
     }
 
     fn release_held(&self) {
-        if self.held.swap(false, Ordering::AcqRel) {
+        let slot = &self.state.slots[self.index];
+        if slot.held.swap(false, Ordering::AcqRel) {
             self.state.parent.release_held();
         }
     }

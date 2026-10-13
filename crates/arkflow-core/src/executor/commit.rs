@@ -426,7 +426,7 @@ pub(crate) struct TrackingAck {
     /// compensation chain can reach its `undo` one step late — after the
     /// error path already settled this delivery terminally — and that late
     /// `undo` must not resurrect the barrier blocking count (mirrors the
-    /// terminal guard of `FanoutAckPart::undo` in `crate::input`). Guarded
+    /// terminal guard of `FanoutAckChild::undo` in `crate::input`). Guarded
     /// entirely by `ack_lock`, so plain `Acquire`/`Release` ordering
     /// suffices.
     aborted: std::sync::atomic::AtomicBool,
@@ -511,7 +511,7 @@ impl Ack for TrackingAck {
         // later checkpoint round times out while data keeps flowing. The
         // guard sits at the entry — the inner acknowledgement's settlement
         // was already given up with the abort and must not be disturbed
-        // either — matching `FanoutAckPart::undo`'s guard position.
+        // either — matching `FanoutAckChild::undo`'s guard position.
         if self.aborted.load(Ordering::Acquire) {
             return Ok(());
         }
