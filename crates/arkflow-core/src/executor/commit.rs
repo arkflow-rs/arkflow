@@ -426,11 +426,28 @@ pub(crate) struct TrackingAck {
     /// compensation chain can reach its `undo` one step late — after the
     /// error path already settled this delivery terminally — and that late
     /// `undo` must not resurrect the barrier blocking count (mirrors the
-    /// terminal guard of `FanoutAckChild::undo` in `crate::input`). Guarded
-    /// entirely by `ack_lock`, so plain `Acquire`/`Release` ordering
-    /// suffices.
+    /// terminal guard of `FanoutAckChild::undo` in `crate::input`).
     aborted: std::sync::atomic::AtomicBool,
-    ack_lock: tokio::sync::Mutex<()>,
+    /// Settlement slot: true while one caller's inner `ack`/`undo`/`abort`
+    /// is in flight. This replaces the old `tokio::sync::Mutex<()>` (one
+    /// allocation per source batch): the inner calls still never overlap —
+    /// contenders cooperate via `yield_now` instead of queueing on an async
+    /// lock, and a cancelled future drops its [`SettleGuard`], releasing the
+    /// slot exactly like a dropped async-mutex guard did. Because every
+    /// transition of `completed`/`aborted` happens while the slot is held,
+    /// no further mutex is needed for the flag transitions; plain
+    /// `Acquire`/`Release` ordering suffices.
+    settling: std::sync::atomic::AtomicBool,
+}
+
+/// Releases the [`TrackingAck::settling`] slot on drop, so a settlement
+/// future cancelled mid-await cannot wedge the delivery.
+struct SettleGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for SettleGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl TrackingAck {
@@ -442,8 +459,20 @@ impl TrackingAck {
             held: std::sync::atomic::AtomicUsize::new(0),
             completed: std::sync::atomic::AtomicBool::new(false),
             aborted: std::sync::atomic::AtomicBool::new(false),
-            ack_lock: tokio::sync::Mutex::new(()),
+            settling: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Acquire the settlement slot: exactly one of this delivery's
+    /// `ack`/`undo`/`abort` inner calls runs at a time. Contenders yield
+    /// cooperatively — blocking a worker on a synchronous lock here could
+    /// deadlock a current-thread runtime, since the holder parks inside an
+    /// await that only the blocked thread could poll.
+    async fn settlement_slot(&self) -> SettleGuard<'_> {
+        while self.settling.swap(true, Ordering::AcqRel) {
+            tokio::task::yield_now().await;
+        }
+        SettleGuard(&self.settling)
     }
 
     /// Make a compensated acknowledgement retryable.  A successful `ack`
@@ -480,7 +509,7 @@ impl TrackingAck {
 #[async_trait]
 impl Ack for TrackingAck {
     async fn ack(&self) -> Result<(), Error> {
-        let _guard = self.ack_lock.lock().await;
+        let _slot = self.settlement_slot().await;
         if self.completed.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -499,17 +528,18 @@ impl Ack for TrackingAck {
     }
 
     async fn undo(&self) -> Result<(), Error> {
-        // Serialize compensation with ack.  Without this guard a late undo
-        // can clear `completed` after a concurrent retry has already
-        // committed the same delivery, corrupting the barrier counters.
-        let _guard = self.ack_lock.lock().await;
+        // The settlement slot serializes compensation with ack.  Without it
+        // a late undo can clear `completed` after a concurrent retry has
+        // already committed the same delivery, corrupting the barrier
+        // counters.
+        let _slot = self.settlement_slot().await;
         // Abort is terminal. A late `undo` from a buffering operator's
         // compensation chain (a held release, a `ConcurrentAck` /
         // `CommitGroupOnAck` undo chain) must not swap `completed` back to
         // false and decrement `tracker.completed`: that would re-count a
         // terminally settled delivery as barrier-blocking forever, so every
         // later checkpoint round times out while data keeps flowing. The
-        // guard sits at the entry — the inner acknowledgement's settlement
+        // check sits at the entry — the inner acknowledgement's settlement
         // was already given up with the abort and must not be disturbed
         // either — matching `FanoutAckChild::undo`'s guard position.
         if self.aborted.load(Ordering::Acquire) {
@@ -523,7 +553,7 @@ impl Ack for TrackingAck {
     }
 
     async fn abort(&self) -> Result<(), Error> {
-        let _guard = self.ack_lock.lock().await;
+        let _slot = self.settlement_slot().await;
         let result = self.inner.abort().await;
         if result.is_ok() {
             // The terminal marker is set exactly when the tracker settles:
@@ -853,6 +883,189 @@ mod tests {
         let frontier = CommitFrontier::default();
         assert!(frontier.contiguous_positions().is_empty());
         assert!(frontier.next_offset_of(None, 0).is_none());
+    }
+
+    /// A gated inner acknowledgement parks inside its calls, so a test can
+    /// race settlements against each other for real: the settlement slot
+    /// must keep the inner calls serialized and settle the tracker exactly
+    /// once no matter how the interleaving lands.
+    struct GatedSettlementInner {
+        entered: std::sync::atomic::AtomicBool,
+        released: std::sync::atomic::AtomicBool,
+        ack_calls: std::sync::atomic::AtomicUsize,
+        undo_calls: std::sync::atomic::AtomicUsize,
+        abort_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Default for GatedSettlementInner {
+        fn default() -> Self {
+            Self {
+                entered: std::sync::atomic::AtomicBool::new(false),
+                released: std::sync::atomic::AtomicBool::new(false),
+                ack_calls: std::sync::atomic::AtomicUsize::new(0),
+                undo_calls: std::sync::atomic::AtomicUsize::new(0),
+                abort_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl GatedSettlementInner {
+        async fn park_until_released(&self) {
+            self.entered.store(true, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !self.released.load(Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "gated settlement was never released"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        async fn wait_entered(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !self.entered.load(Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "settlement never entered the gate"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Ack for GatedSettlementInner {
+        async fn ack(&self) -> Result<(), Error> {
+            self.ack_calls.fetch_add(1, Ordering::SeqCst);
+            self.park_until_released().await;
+            Ok(())
+        }
+
+        async fn undo(&self) -> Result<(), Error> {
+            self.undo_calls.fetch_add(1, Ordering::SeqCst);
+            self.park_until_released().await;
+            Ok(())
+        }
+
+        async fn abort(&self) -> Result<(), Error> {
+            self.abort_calls.fetch_add(1, Ordering::SeqCst);
+            self.park_until_released().await;
+            Ok(())
+        }
+    }
+
+    /// `join!` an in-flight acknowledgement against an abort: the inner ack
+    /// runs once, the abort still reaches the inner chain (mirroring the
+    /// serialized ack-then-abort order of the async-mutex implementation),
+    /// and the tracker settles exactly once.
+    #[tokio::test]
+    async fn concurrent_ack_and_abort_settle_the_delivery_exactly_once() {
+        let tracker = Arc::new(AckTracker::new());
+        let inner = Arc::new(GatedSettlementInner::default());
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            inner.clone() as Arc<dyn Ack>,
+        ));
+
+        // Park the acknowledgement inside its inner call.
+        let mut pending_ack = std::pin::pin!(ack.ack());
+        let early = tokio::select! {
+            outcome = &mut pending_ack => Some(outcome),
+            _ = inner.wait_entered() => None,
+        };
+        assert!(
+            early.is_none(),
+            "the gated inner acknowledgement must park, not complete"
+        );
+        inner.released.store(true, Ordering::SeqCst);
+
+        // Race the abort against the parked acknowledgement's completion.
+        let (ack_result, abort_result) =
+            futures::future::join(pending_ack, ack.abort()).await;
+        ack_result.expect("the released acknowledgement completes");
+        abort_result.expect("abort after a settled ack still succeeds");
+
+        assert_eq!(inner.ack_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.abort_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tracker.blocking(),
+            0,
+            "the delivery must be counted as settled exactly once"
+        );
+
+        // A duplicate acknowledgement after the terminal abort adds nothing.
+        ack.ack().await.unwrap();
+        assert_eq!(inner.ack_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tracker.blocking(), 0);
+    }
+
+    /// An acknowledgement racing an in-flight abort must wait for the
+    /// terminal settlement and then succeed vacuously without ever reaching
+    /// the inner acknowledgement.
+    #[tokio::test]
+    async fn ack_racing_an_in_flight_abort_never_reaches_the_inner_ack() {
+        let tracker = Arc::new(AckTracker::new());
+        let inner = Arc::new(GatedSettlementInner::default());
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            inner.clone() as Arc<dyn Ack>,
+        ));
+
+        // Park the abort inside its inner call.
+        let mut pending_abort = std::pin::pin!(ack.abort());
+        let early = tokio::select! {
+            outcome = &mut pending_abort => Some(outcome),
+            _ = inner.wait_entered() => None,
+        };
+        assert!(early.is_none(), "the gated inner abort must park");
+        inner.released.store(true, Ordering::SeqCst);
+
+        let (abort_result, ack_result) =
+            futures::future::join(pending_abort, ack.ack()).await;
+        abort_result.expect("the released abort completes");
+        ack_result.expect("an ack after a terminal abort succeeds vacuously");
+        assert_eq!(inner.abort_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            inner.ack_calls.load(Ordering::SeqCst),
+            0,
+            "an acknowledgement settled by the abort must not call the inner ack"
+        );
+        assert_eq!(tracker.blocking(), 0);
+    }
+
+    /// A settlement future cancelled mid-await (the engine's select! drops
+    /// pending futures) must release the slot — a later acknowledgement
+    /// cannot wedge forever behind a cancelled one.
+    #[tokio::test]
+    async fn cancelled_settlement_releases_the_slot() {
+        let tracker = Arc::new(AckTracker::new());
+        let inner = Arc::new(GatedSettlementInner::default());
+        let ack: Arc<dyn Ack> = Arc::new(TrackingAck::new(
+            tracker.clone(),
+            inner.clone() as Arc<dyn Ack>,
+        ));
+
+        // Start an acknowledgement, park it inside the inner call, then drop
+        // the future exactly like a lost select! branch.
+        {
+            let mut pending_ack = std::pin::pin!(ack.ack());
+            let early = tokio::select! {
+                _ = &mut pending_ack => panic!("the gated inner acknowledgement must park"),
+                _ = inner.wait_entered() => {}
+            };
+            let _ = early;
+        }
+        // The slot must already be free even before the gate opens.
+        inner.released.store(true, Ordering::SeqCst);
+
+        let settled =
+            tokio::time::timeout(std::time::Duration::from_secs(5), ack.ack()).await;
+        settled
+            .expect("a fresh acknowledgement must not wait on the cancelled one")
+            .expect("the fresh acknowledgement succeeds");
+        assert_eq!(inner.ack_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tracker.blocking(), 0);
     }
 
     #[test]
