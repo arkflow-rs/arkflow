@@ -638,6 +638,9 @@ pub fn arrow_to_protobuf(
     // Get the Arrow schema.
     let schema = batch.schema();
 
+    // Each column resolves its `FieldDescriptor` once (below) and the row
+    // loop sets through the resolved descriptor: per-cell name resolution
+    // paid a name hash + descriptor-map probe for every value.
     for (i, field) in schema.fields().iter().enumerate() {
         let field_name = field.name();
 
@@ -652,7 +655,7 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(field_name, Value::Bool(value.value(j)));
+                            msg.set_field(&proto_field, Value::Bool(value.value(j)));
                         }
                     }
                 }
@@ -665,7 +668,7 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(field_name, Value::I32(value.value(j)));
+                            msg.set_field(&proto_field, Value::I32(value.value(j)));
                         }
                     }
                 }
@@ -678,7 +681,7 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(field_name, Value::I64(value.value(j)));
+                            msg.set_field(&proto_field, Value::I64(value.value(j)));
                         }
                     }
                 }
@@ -689,7 +692,7 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(field_name, Value::U32(value.value(j)));
+                            msg.set_field(&proto_field, Value::U32(value.value(j)));
                         }
                     }
                 }
@@ -700,7 +703,7 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(field_name, Value::U64(value.value(j)));
+                            msg.set_field(&proto_field, Value::U64(value.value(j)));
                         }
                     }
                 }
@@ -711,7 +714,7 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(field_name, Value::F32(value.value(j)));
+                            msg.set_field(&proto_field, Value::F32(value.value(j)));
                         }
                     }
                 }
@@ -722,7 +725,7 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(field_name, Value::F64(value.value(j)));
+                            msg.set_field(&proto_field, Value::F64(value.value(j)));
                         }
                     }
                 }
@@ -733,8 +736,8 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(
-                                field_name,
+                            msg.set_field(
+                                &proto_field,
                                 Value::String(value.value(j).to_string()),
                             );
                         }
@@ -747,8 +750,8 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(
-                                field_name,
+                            msg.set_field(
+                                &proto_field,
                                 Value::Bytes(value.value(j).to_vec().into()),
                             );
                         }
@@ -761,7 +764,7 @@ pub fn arrow_to_protobuf(
                             if value.is_null(j) {
                                 continue;
                             }
-                            msg.set_field_by_name(field_name, Value::EnumNumber(value.value(j)));
+                            msg.set_field(&proto_field, Value::EnumNumber(value.value(j)));
                         }
                     }
                 }
