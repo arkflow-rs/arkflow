@@ -1334,7 +1334,7 @@ fn mark_window_updates(
     Ok(Arc::new(marked))
 }
 
-fn topic_for_row(batch: &crate::MessageBatchRef, row: usize) -> Option<String> {
+fn topic_for_row(batch: &crate::MessageBatchRef, row: usize) -> Option<&str> {
     use datafusion::arrow::array::{Array, MapArray, StringArray};
 
     let column = batch
@@ -1347,8 +1347,7 @@ fn topic_for_row(batch: &crate::MessageBatchRef, row: usize) -> Option<String> {
     let offsets = map.offsets();
     let start = offsets.get(row).copied()? as usize;
     let end = offsets.get(row + 1).copied()? as usize;
-    (start..end)
-        .find_map(|index| (keys.value(index) == "topic").then(|| values.value(index).to_owned()))
+    (start..end).find_map(|index| (keys.value(index) == "topic").then(|| values.value(index)))
 }
 
 /// Split one source delivery while preserving a stable identity for
@@ -1361,9 +1360,9 @@ pub(crate) fn split_by_physical_partition_for_source(
     source_id: Option<&str>,
 ) -> Result<Vec<(EventTimePartition, crate::MessageBatchRef)>, Error> {
     use datafusion::arrow::array::{Array, UInt32Array};
-    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::compute::{cast, take_record_batch};
     use datafusion::arrow::datatypes::DataType;
-    use std::collections::BTreeMap;
+    use std::collections::HashMap;
 
     let fallback = |partition: u32| {
         source_id.map_or_else(
@@ -1390,25 +1389,48 @@ pub(crate) fn split_by_physical_partition_for_source(
         .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
         .or_else(|| column.as_any().downcast_ref::<UInt32Array>())
         .ok_or_else(|| Error::Process("physical partition metadata is not UInt32".into()))?;
-    let mut groups = BTreeMap::<EventTimePartition, Vec<bool>>::new();
+
+    // Single pass over borrowed (topic, partition) keys: each distinct
+    // partition constructs its identity exactly once (the source-derived
+    // identity formatting included — it used to run per row), and row
+    // indices bucket in row order.
+    let mut slot_of: HashMap<(Option<&str>, u32), usize> = HashMap::new();
+    let mut groups: Vec<(EventTimePartition, Vec<u32>)> = Vec::new();
     for row in 0..batch.len() {
         let partition = if values.is_null(row) {
             fallback_partition
         } else {
             values.value(row)
         };
-        let physical = EventTimePartition::new(topic_for_row(batch, row), partition);
-        let physical = source_id.map_or(physical.clone(), |source_id| {
-            physical.with_source_identity(source_id)
+        let borrowed = (topic_for_row(batch, row), partition);
+        let slot = *slot_of.entry(borrowed).or_insert_with(|| {
+            let identity = match borrowed.0 {
+                // `with_source_identity` semantics: a connector-provided
+                // topic wins; connector-neutral partitions get the stable
+                // source namespace.
+                Some(topic) => EventTimePartition::new(Some(topic.to_string()), partition),
+                None => fallback(partition),
+            };
+            groups.push((identity, Vec::new()));
+            groups.len() - 1
         });
-        let keep = groups
-            .entry(physical)
-            .or_insert_with(|| vec![false; batch.len()]);
-        keep[row] = true;
+        groups[slot].1.push(row as u32);
     }
+    // The previous BTreeMap keyed the groups by their final identity, so the
+    // output order is the identity-sorted order; sorting the (now tiny) list
+    // of distinct partitions preserves it exactly.
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
     groups
         .into_iter()
-        .map(|(partition, keep)| filter_batch(batch, &keep).map(|batch| (partition, batch)))
+        .map(|(partition, indices)| {
+            take_record_batch(batch.record_batch(), &UInt32Array::from(indices))
+                .map_err(|error| Error::Process(format!("split event-time partition: {error}")))
+                .map(|gathered| {
+                    let mut gathered_batch = crate::MessageBatch::new_arrow(gathered);
+                    gathered_batch.set_input_name(batch.get_input_name());
+                    (partition, Arc::new(gathered_batch))
+                })
+        })
         .collect()
 }
 
