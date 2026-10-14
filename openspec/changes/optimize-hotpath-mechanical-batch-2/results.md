@@ -51,7 +51,7 @@
 ## 与设计的偏差记录
 
 1. **D8 实现形态**：std Mutex 跨 await 持有会死锁 current-thread 运行时（测试运行时即此类），undo/abort 无法"全程 guard 内"。落地形态为 settlement 槽位（AtomicBool + yield 协作竞争 + Drop 守卫释放），内层调用互斥语义与旧异步锁一致，且消除了每批的 Mutex 分配（设计目标本身）。
-2. **D10b 排序语义**：见上，按 spec 的"identical order"落地为身份排序而非首现序。
+2. **D10b 排序语义**：设计文档原述"首现序"与旧 BTreeMap 身份排序实现有出入；落地保持原身份排序（对 distinct 组排序一次，排序面从行数降为分区数），delta spec 与 tasks.md 措辞已同步修正为"与旧实现一致的身份排序"。
 3. **5.1 测试适配**：键类型 String→Arc<str> 波及 tests.rs 约 30 处构造点做 `.to_string()`→`.into()` 机械适配（断言语义不变）；stdout MockWriter 装箱、kafka 测试 1 处 std::sync::Mutex 构造适配同类。
 
 ## 附录：delta spec 场景 ↔ 测试对照（任务 6.3）

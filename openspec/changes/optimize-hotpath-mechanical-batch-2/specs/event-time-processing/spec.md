@@ -22,7 +22,7 @@ The gate SHALL evaluate current rows against a watermark that is consistent with
 
 ### Requirement: Physical partition splitting SHALL assign rows identically with per-distinct-partition identity
 
-The event-time gate's physical partition split SHALL build each distinct partition's identity (topic or source-derived identifier) at most once per batch instead of formatting per row, SHALL group row indices in a single pass preserving each partition's first-appearance order, and SHALL materialize each non-empty partition's rows with one gather; row-to-partition assignment, the partition identities, and the output group order SHALL be identical to the previous per-row construction.
+The event-time gate's physical partition split SHALL build each distinct partition's identity (topic or source-derived identifier) at most once per batch instead of formatting per row, SHALL group row indices in a single pass, and SHALL materialize each non-empty partition's rows with one gather; row-to-partition assignment, the partition identities, and the output group order SHALL be identical to the previous per-row construction (the identity-sorted order the BTreeMap-keyed implementation produced).
 
 #### Scenario: Split output equals the per-row baseline
 

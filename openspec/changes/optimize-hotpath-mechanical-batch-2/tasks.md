@@ -26,7 +26,7 @@
 ## 4. 内核 crate：event_time_gate（D10）
 
 - [x] 4.1 `RowDecision` 集合字段改 `SmallVec<[T; 4]>`（`smallvec = "1"` 入 `[workspace.dependencies]`，crate 以 `workspace = true` 引用），classify_row 常见基数零堆分配；决策结果与顺序不变，gate 既有测试不改通过
-- [x] 4.2 `split_by_physical_partition_for_source` 改单趟 `HashMap<&str, usize>` 借用键分桶，每 distinct (topic, source) 仅构造一次 owned 身份（source 格式化一次），每分区一次 take gather，输出保持首现序；gate/task.rs 既有测试不改通过
+- [x] 4.2 `split_by_physical_partition_for_source` 改单趟 `HashMap<&str, usize>` 借用键分桶，每 distinct (topic, source) 仅构造一次 owned 身份（source 格式化一次），每分区一次 take gather，输出保持原 BTreeMap 身份排序（与旧实现一致）；gate/task.rs 既有测试不改通过
 
 ## 5. 内核 crate：窗口算子（D9）
 
