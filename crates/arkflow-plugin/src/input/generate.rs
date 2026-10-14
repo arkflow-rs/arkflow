@@ -47,6 +47,14 @@ impl GenerateInput {
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let batch_size = config.batch_size.unwrap_or(1);
+        // The schema documents `minimum: 1` (serde does not enforce it); a
+        // zero batch size has no meaningful semantics and used to silently
+        // return empty batches.
+        if batch_size == 0 {
+            return Err(Error::Config(
+                "generate input 'batch_size' must be at least 1".to_string(),
+            ));
+        }
         Ok(Self {
             input_name: name.map(str::to_string),
             config,
@@ -79,18 +87,29 @@ impl Input for GenerateInput {
                 return Err(Error::EOF);
             }
         }
-        let mut msgs = Vec::with_capacity(self.batch_size);
-        for _ in 0..self.batch_size {
-            let s = self.config.context.clone();
-            msgs.push(s.into_bytes())
-        }
 
+        // One read's payloads are byte-identical copies of the template, so
+        // decoding the template once and replicating its complete row set
+        // `batch_size` times produces exactly the rows that `batch_size`
+        // decodes would (values and row metadata are constants within the
+        // read; a multi-record template contributes every record to every
+        // copy) — without the redundant per-row clone and parse. This is
+        // also the benchmark suite's front end, so the per-row decode used
+        // to distort every generate-fed scenario.
+        //
         // Decode BEFORE advancing the counter: the decode await above is
         // the only droppable point in this read, and a dropped read must
         // not consume quota it never delivered (Input::read
         // cancellation-safety contract).
-        let mut message_batch =
-            crate::input::codec_helper::apply_codec_to_payloads(msgs, &self.codec).await?;
+        let mut message_batch = crate::input::codec_helper::apply_codec_to_payload(
+            self.config.context.as_bytes(),
+            &self.codec,
+        )
+        .await?;
+
+        if self.batch_size > 1 {
+            message_batch = replicate_rows(&message_batch, self.batch_size)?;
+        }
 
         self.count
             .fetch_add(self.batch_size as i64, Ordering::SeqCst);
@@ -121,6 +140,43 @@ impl InputBuilder for GenerateInputBuilder {
             serde_json::from_value::<GenerateInputConfig>(config.clone().unwrap())?;
         Ok(Arc::new(GenerateInput::new(name, config, codec)?))
     }
+}
+
+/// Replicate the template batch `copies` times with one columnar gather
+/// (`take` on a tiled index: the template's rows repeated `copies` times in
+/// order). Equivalent to decoding `copies` identical payloads: a codec may
+/// decode one payload into SEVERAL rows (a multi-record NDJSON template),
+/// and every record must appear in every copy. The single-row case
+/// collapses to the all-zero index.
+fn replicate_rows(
+    template: &arkflow_core::MessageBatch,
+    copies: usize,
+) -> Result<arkflow_core::MessageBatch, Error> {
+    use datafusion::arrow::array::UInt32Array;
+    use datafusion::arrow::compute::take;
+    use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+
+    let record = template.record_batch();
+    let template_rows = record.num_rows();
+    let indices: UInt32Array = (0..template_rows as u32)
+        .cycle()
+        .take(template_rows.saturating_mul(copies))
+        .collect();
+    let mut columns = Vec::with_capacity(record.num_columns());
+    for column in record.columns() {
+        let taken = take(column, &indices, None)
+            .map_err(|e| Error::Process(format!("replicating generate rows failed: {e}")))?;
+        columns.push(taken);
+    }
+    let replicated = RecordBatch::try_new_with_options(
+        record.schema(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(indices.len())),
+    )
+    .map_err(|e| Error::Process(format!("replicating generate rows failed: {e}")))?;
+    let mut replicated = arkflow_core::MessageBatch::new_arrow(replicated);
+    replicated.set_input_name(template.get_input_name());
+    Ok(replicated)
 }
 
 pub fn init() -> Result<(), Error> {
@@ -318,5 +374,94 @@ mod tests {
             ),
             Err(Error::Config(_))
         ));
+    }
+
+    use arkflow_core::codec::CodecBuilder;
+
+    fn json_test_codec() -> Arc<dyn Codec> {
+        let resource = Resource {
+            temporary: Default::default(),
+            input_names: RefCell::new(Vec::new()),
+        };
+        crate::codec::json::JsonCodecBuilder
+            .build(None, &None, &resource)
+            .unwrap()
+    }
+
+    /// A zero batch size is rejected at construction (the schema documents
+    /// `minimum: 1`).
+    #[tokio::test]
+    async fn test_zero_batch_size_rejected() {
+        let error = GenerateInput::new(
+            None,
+            GenerateInputConfig {
+                context: "x".to_string(),
+                interval: Duration::from_millis(1),
+                count: None,
+                batch_size: Some(0),
+            },
+            None,
+        )
+        .err()
+        .expect("zero batch_size must be rejected");
+        assert!(error.to_string().contains("batch_size"));
+    }
+
+    /// The take-replication read path must equal the per-payload decode
+    /// reference (the pre-optimization shape) column by column, row by row —
+    /// with the codec on and off, and for single-record AND multi-record
+    /// templates (one payload can decode to several rows).
+    #[tokio::test]
+    async fn test_replication_matches_per_payload_decode() {
+        let batch_size = 7;
+        let multi_record =
+            [r#"{"sensor":"a","value":1}"#, r#"{"sensor":"b","value":2}"#].join("\n");
+        let templates = [
+            r#"{"sensor":"abc","value":42,"ok":true}"#.to_string(),
+            multi_record,
+        ];
+        for context in &templates {
+            let codecs: Vec<Option<Arc<dyn Codec>>> = vec![None, Some(json_test_codec())];
+            for codec in codecs {
+                let input = GenerateInput::new(
+                    Some("gen"),
+                    GenerateInputConfig {
+                        context: context.to_string(),
+                        interval: Duration::from_millis(1),
+                        count: None,
+                        batch_size: Some(batch_size),
+                    },
+                    codec.clone(),
+                )
+                .unwrap();
+                let (replicated, _) = input.read().await.unwrap();
+
+                let msgs: Vec<Vec<u8>> = (0..batch_size)
+                    .map(|_| context.as_bytes().to_vec())
+                    .collect();
+                let reference = crate::input::codec_helper::apply_codec_to_payloads(msgs, &codec)
+                    .await
+                    .unwrap();
+
+                assert_eq!(replicated.len(), reference.len());
+                assert_eq!(
+                    replicated.schema().as_ref(),
+                    reference.schema().as_ref(),
+                    "schemas differ for codec={}",
+                    codec.is_some()
+                );
+                let left = replicated.record_batch();
+                let right = reference.record_batch();
+                for column in 0..left.num_columns() {
+                    assert!(
+                        left.column(column) == right.column(column),
+                        "column {} ({}) differs (codec={})",
+                        column,
+                        left.schema().field(column).name(),
+                        codec.is_some()
+                    );
+                }
+            }
+        }
     }
 }

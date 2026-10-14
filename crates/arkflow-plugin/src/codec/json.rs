@@ -118,7 +118,7 @@ impl JsonCodec {
     }
 }
 
-struct JsonCodecBuilder;
+pub(crate) struct JsonCodecBuilder;
 impl CodecBuilder for JsonCodecBuilder {
     fn build(
         &self,

@@ -35,7 +35,7 @@ use rdkafka::util::Timeout;
 use rdkafka_sys::RDKafkaErrorCode;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
@@ -129,7 +129,10 @@ struct KafkaOutput {
 
 struct InnerKafkaOutput {
     producer: Arc<RwLock<Option<FutureProducer>>>,
-    send_futures: Arc<Mutex<Vec<DeliveryFuture>>>,
+    /// Delivery receipts awaiting observation. Producers only push here
+    /// (never awaiting while holding the lock), so a std mutex suffices;
+    /// flush/close drain it synchronously before awaiting the receipts.
+    send_futures: Arc<std::sync::Mutex<Vec<DeliveryFuture>>>,
 }
 
 impl KafkaOutput {
@@ -185,7 +188,7 @@ impl KafkaOutput {
         let cancellation_token = CancellationToken::new();
         let inner_kafka_output = Arc::new(InnerKafkaOutput {
             producer: Arc::new(RwLock::new(None)),
-            send_futures: Arc::new(Mutex::new(vec![])),
+            send_futures: Arc::new(std::sync::Mutex::new(vec![])),
         });
 
         let output_p = Arc::clone(&inner_kafka_output);
@@ -214,20 +217,41 @@ impl KafkaOutput {
     }
 }
 
-impl InnerKafkaOutput {
-    async fn flush(&self) {
-        let mut send_futures = self.send_futures.lock().await;
-        for future in send_futures.drain(..) {
-            match future.await {
-                Ok(Ok(_)) => {} // Success
-                Ok(Err((e, _))) => {
-                    error!("Kafka producer shut down: {:?}", e);
-                }
-                Err(e) => {
-                    error!("Future error during Kafka shutdown: {:?}", e);
-                }
+/// Observe every outstanding delivery receipt concurrently, then report the
+/// first error in submission order. The previous serial loop stopped
+/// observing receipts after the first error even though librdkafka keeps
+/// delivering the rest; delivery behavior is unchanged — only the
+/// observation window widened, and the reported error is the first one by
+/// submission order.
+async fn observe_delivery_futures(pending: Vec<DeliveryFuture>) {
+    let results = futures::future::join_all(pending).await;
+    for result in results {
+        match result {
+            Ok(Ok(_)) => {} // Success
+            Ok(Err((e, _))) => {
+                error!("Kafka producer shut down: {:?}", e);
+                break;
+            }
+            Err(e) => {
+                error!("Future error during Kafka shutdown: {:?}", e);
+                break;
             }
         }
+    }
+}
+
+impl InnerKafkaOutput {
+    async fn flush(&self) {
+        // Drain synchronously first: the lock must never be held across the
+        // receipt awaits below.
+        let pending: Vec<_> = {
+            let mut send_futures = self
+                .send_futures
+                .lock()
+                .expect("kafka send_futures lock poisoned");
+            send_futures.drain(..).collect()
+        };
+        observe_delivery_futures(pending).await;
     }
 }
 
@@ -275,14 +299,11 @@ impl Output for KafkaOutput {
 
         // Payload selection: an explicit `value_field` takes the named
         // column's value per row, otherwise the codec encoding applies.
+        // `apply_codec_encode` already returns owned `Vec<u8>` payloads.
         let payloads: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
             crate::output::payload::field_payloads("kafka", &msg, field)?
         } else {
-            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)
-                .await?
-                .into_iter()
-                .map(|p| p.to_vec())
-                .collect()
+            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?
         };
         if payloads.is_empty() {
             return Ok(());
@@ -330,7 +351,7 @@ impl Output for KafkaOutput {
                         self.inner_kafka_output
                             .send_futures
                             .lock()
-                            .await
+                            .expect("kafka send_futures lock poisoned")
                             .push(future);
                         debug!("Kafka record sent");
                         break;
@@ -378,17 +399,17 @@ impl Output for KafkaOutput {
 
         if let Some(producer) = producer_guard.take() {
             producer.poll(Timeout::After(Duration::ZERO));
-            for future in self.inner_kafka_output.send_futures.lock().await.drain(..) {
-                match future.await {
-                    Ok(Ok(_)) => {} // Success
-                    Ok(Err((e, _))) => {
-                        error!("Kafka producer shut down: {:?}", e);
-                    }
-                    Err(e) => {
-                        error!("Future error during Kafka shutdown: {:?}", e);
-                    }
-                }
-            }
+            // Drain synchronously first: the lock must never be held across
+            // the receipt awaits below.
+            let pending: Vec<_> = {
+                let mut send_futures = self
+                    .inner_kafka_output
+                    .send_futures
+                    .lock()
+                    .expect("kafka send_futures lock poisoned");
+                send_futures.drain(..).collect()
+            };
+            observe_delivery_futures(pending).await;
 
             // Wait for all messages to be sent
             producer.flush(Duration::from_secs(30)).map_err(|e| {
@@ -570,11 +591,7 @@ impl KafkaOutput {
         let payloads: Vec<Vec<u8>> = if let Some(field) = &self.config.value_field {
             crate::output::payload::field_payloads("kafka", &msg, field)?
         } else {
-            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec)
-                .await?
-                .into_iter()
-                .map(|p| p.to_vec())
-                .collect()
+            crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?
         };
         if payloads.is_empty() {
             return Ok(());
@@ -2199,7 +2216,7 @@ mod tests {
             .expect("enqueue");
         let inner = InnerKafkaOutput {
             producer: Arc::new(RwLock::new(None)),
-            send_futures: Arc::new(Mutex::new(vec![future])),
+            send_futures: Arc::new(std::sync::Mutex::new(vec![future])),
         };
         // Dropping the producer cancels its outstanding delivery callbacks.
         drop(producer);

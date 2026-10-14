@@ -53,6 +53,11 @@ struct MemoryBuffer {
     /// Thread-safe queue to store message batches and their acknowledgments
     #[allow(clippy::type_complexity)]
     queue: Arc<RwLock<VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>>,
+    /// Total retained rows, maintained incrementally at every queue mutation
+    /// point while the queue's write lock is held (an O(1) capacity check in
+    /// `write` instead of a whole-queue sum). Relaxed ordering suffices
+    /// because every read and write of the counter happens under that lock.
+    total_rows: std::sync::atomic::AtomicUsize,
     /// Notification mechanism for signaling between threads
     notify: Arc<Notify>,
     /// Token for cancellation of background tasks
@@ -97,6 +102,7 @@ impl MemoryBuffer {
             notify,
             config,
             queue: Arc::new(Default::default()),
+            total_rows: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -133,6 +139,8 @@ impl MemoryBuffer {
             .collect();
 
         queue_lock.clear();
+        self.total_rows
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         // Capacity released: wake writers that are waiting for room.
         self.notify.notify_waiters();
         drop(queue_lock);
@@ -169,11 +177,15 @@ impl Buffer for MemoryBuffer {
             notified.as_mut().enable();
             {
                 let mut queue_lock = self.queue.write().await;
-                // Calculate the total number of messages in the buffer
-                let cnt: usize = queue_lock.iter().map(|x| x.0.len()).sum();
+                // Retained row count, maintained at every mutation point
+                // under this write lock: the O(1) capacity check replaces the
+                // whole-queue per-write sum.
+                let cnt = self.total_rows.load(std::sync::atomic::Ordering::Relaxed);
 
                 if cnt < self.config.capacity as usize {
                     queue_lock.push_front((Arc::clone(&msg), Arc::clone(&arc)));
+                    self.total_rows
+                        .fetch_add(msg.len(), std::sync::atomic::Ordering::Relaxed);
                     // If capacity threshold is reached, notify readers to process the batch
                     if cnt + msg.len() >= self.config.capacity as usize {
                         self.notify.notify_waiters();
@@ -600,5 +612,97 @@ mod tests {
         }
         handle.await.unwrap();
         assert_eq!(total, 10);
+    }
+
+    /// The incremental row counter must always agree with a whole-queue sum.
+    /// Sampling holds the queue's read lock, which excludes the writers (the
+    /// counter is only mutated under the write lock), so every sample is a
+    /// consistent cut of both values.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_memory_buffer_row_count_matches_queue_sum_under_stress() {
+        let buf = Arc::new(
+            MemoryBuffer::new(MemoryBufferConfig {
+                capacity: 32,
+                timeout: time::Duration::from_millis(2),
+            })
+            .unwrap(),
+        );
+
+        const WRITERS: usize = 4;
+        const WRITES: usize = 60;
+        let expected_total: usize = (0..WRITERS)
+            .map(|w| (0..WRITES).map(|i| (i + w) % 3 + 1).sum::<usize>())
+            .sum();
+
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let buf = buf.clone();
+                tokio::spawn(async move {
+                    for i in 0..WRITES {
+                        let rows = (i + w) % 3 + 1;
+                        let payloads: Vec<Vec<u8>> = (0..rows)
+                            .map(|r| format!("w{w}-{i}-{r}").into_bytes())
+                            .collect();
+                        buf.write(
+                            Arc::new(MessageBatch::new_binary(payloads).unwrap()),
+                            Arc::new(NoopAck),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        let sampler_buf = buf.clone();
+        let sampler = tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + time::Duration::from_millis(400);
+            let mut samples = 0usize;
+            while std::time::Instant::now() < deadline {
+                let queue = sampler_buf.queue.read().await;
+                let sum: usize = queue.iter().map(|(msg, _)| msg.len()).sum();
+                let counted = sampler_buf
+                    .total_rows
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(
+                    sum, counted,
+                    "incremental row counter diverged from the queue sum mid-flight"
+                );
+                samples += 1;
+            }
+            samples
+        });
+
+        let reader_buf = buf.clone();
+        let reader = tokio::spawn(async move {
+            let mut total = 0usize;
+            while total < expected_total {
+                match reader_buf.read().await {
+                    Ok(Some((batch, _))) => total += batch.len(),
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            total
+        });
+
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        let read_total = tokio::time::timeout(time::Duration::from_secs(10), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        sampler.abort();
+        assert_eq!(read_total, expected_total);
+
+        // Quiescent: everything drained, so the counter is back to zero and
+        // agrees with the (empty) queue.
+        {
+            let queue = buf.queue.read().await;
+            let sum: usize = queue.iter().map(|(msg, _)| msg.len()).sum();
+            assert_eq!(sum, 0);
+            assert_eq!(buf.total_rows.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
     }
 }

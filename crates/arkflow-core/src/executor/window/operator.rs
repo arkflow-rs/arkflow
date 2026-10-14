@@ -5,8 +5,8 @@ use super::aggregate::{
     decode_buffer, encode_buffer, numeric_array, AggregateBuffer, NumericKind, NumericValue,
 };
 use super::firing::{
-    PersistUndoImage, WindowFiredAck, WindowFiring, WindowKind, WindowOperatorConfig,
-    WindowRollback, WindowRuntimeSnapshot, WindowTrigger,
+    PersistUndoImage, SlotImage, TouchedSnapshot, WindowFiredAck, WindowFiring, WindowKey,
+    WindowKind, WindowOperatorConfig, WindowRollback, WindowTrigger,
 };
 use crate::input::{fanout_ack, Ack, ConcurrentAck};
 use crate::job::LateEventPolicy;
@@ -63,13 +63,13 @@ pub(crate) struct ColumnarWindowOperator {
     /// One journal transaction per open `(window_start, key)` group; a fired
     /// window's commit rides its emitted output's acknowledgement.
     pub(crate) window_txns:
-        Arc<Mutex<BTreeMap<(i64, String), crate::executor::state_journal::StateTxn>>>,
+        Arc<Mutex<BTreeMap<WindowKey, crate::executor::state_journal::StateTxn>>>,
     /// (window_start, key) -> buffer, mirroring the backend lazily.
-    pub(crate) buffers: Arc<Mutex<BTreeMap<(i64, String), AggregateBuffer>>>,
+    pub(crate) buffers: Arc<Mutex<BTreeMap<WindowKey, AggregateBuffer>>>,
     /// Source acknowledgements held until the corresponding aggregate is
     /// successfully written downstream.
     #[allow(clippy::type_complexity)]
-    pub(crate) pending_acks: Arc<Mutex<BTreeMap<(i64, String), Vec<Arc<dyn Ack>>>>>,
+    pub(crate) pending_acks: Arc<Mutex<BTreeMap<WindowKey, Vec<Arc<dyn Ack>>>>>,
     pub(crate) watermark_ms: Arc<Mutex<Option<i64>>>,
     pub(crate) last_processing_trigger_ms: Arc<Mutex<Option<i64>>>,
     pub(crate) last_processing_activity_ms: Arc<Mutex<Option<i64>>>,
@@ -91,22 +91,66 @@ pub(crate) struct ColumnarWindowOperator {
 }
 
 impl ColumnarWindowOperator {
-    fn runtime_snapshot(&self) -> WindowRuntimeSnapshot {
-        WindowRuntimeSnapshot {
-            buffers: self.buffers.lock().unwrap().clone(),
+    /// Open a window operation's image set: the runtime scalars as they are
+    /// now (buffers are imaged lazily, on first touch) replace the old
+    /// whole-map `buffers.clone()` per batch.
+    pub(crate) fn open_touched_snapshot(&self) -> TouchedSnapshot {
+        TouchedSnapshot {
+            slots: BTreeMap::new(),
             watermark_ms: *self.watermark_ms.lock().unwrap(),
             last_processing_trigger_ms: *self.last_processing_trigger_ms.lock().unwrap(),
             last_processing_activity_ms: *self.last_processing_activity_ms.lock().unwrap(),
         }
     }
 
-    /// Roll the in-memory runtime back to `snapshot` after a failed
-    /// accumulation or firing. Journal transactions stay staged — their
-    /// overlays are idempotent across a retry — but the working buffers and
-    /// watermark must not keep partially applied rows, or a replay would
-    /// aggregate them twice.
-    fn restore_runtime(&self, snapshot: &WindowRuntimeSnapshot) {
-        *self.buffers.lock().unwrap() = snapshot.buffers.clone();
+    /// Close the image set after a successful operation: the after-images
+    /// for exactly the touched keys, with the scalars as they are now.
+    fn close_touched_snapshot(&self, before: &TouchedSnapshot) -> TouchedSnapshot {
+        let buffers = self.buffers.lock().unwrap();
+        TouchedSnapshot {
+            slots: before
+                .slots
+                .keys()
+                .map(|key| (key.clone(), buffers.get(key).cloned()))
+                .collect(),
+            watermark_ms: *self.watermark_ms.lock().unwrap(),
+            last_processing_trigger_ms: *self.last_processing_trigger_ms.lock().unwrap(),
+            last_processing_activity_ms: *self.last_processing_activity_ms.lock().unwrap(),
+        }
+    }
+
+    /// Record a slot's before-image on first touch only — the first capture
+    /// wins, so a slot touched by both the accumulation and the firing of
+    /// one operation keeps its pre-accumulation image.
+    fn capture_slot(
+        images: &mut BTreeMap<WindowKey, SlotImage>,
+        key: &WindowKey,
+        current: impl FnOnce() -> Option<AggregateBuffer>,
+    ) {
+        images.entry(key.clone()).or_insert_with(current);
+    }
+
+    /// Roll the in-memory runtime back after a failed accumulation or
+    /// firing. Journal transactions stay staged — their overlays are
+    /// idempotent across a retry — but the working buffers and watermark
+    /// must not keep partially applied rows, or a replay would aggregate
+    /// them twice. Applying the touched-slot images restores exactly what a
+    /// whole-map snapshot restore would: every slot the operation mutated
+    /// has an image, and untouched slots were never modified.
+    pub(crate) fn restore_runtime(&self, snapshot: &TouchedSnapshot) {
+        {
+            let mut buffers = self.buffers.lock().unwrap();
+            for (key, image) in &snapshot.slots {
+                match image {
+                    Some(buffer) => {
+                        buffers.insert(key.clone(), buffer.clone());
+                    }
+                    None => {
+                        buffers.remove(key);
+                    }
+                }
+            }
+        }
         *self.watermark_ms.lock().unwrap() = snapshot.watermark_ms;
         *self.last_processing_trigger_ms.lock().unwrap() = snapshot.last_processing_trigger_ms;
         *self.last_processing_activity_ms.lock().unwrap() = snapshot.last_processing_activity_ms;
@@ -114,8 +158,8 @@ impl ColumnarWindowOperator {
 
     fn rollback_state(
         &self,
-        before: WindowRuntimeSnapshot,
-        after: WindowRuntimeSnapshot,
+        before: TouchedSnapshot,
+        after: TouchedSnapshot,
     ) -> Arc<WindowRollback> {
         // Only non-journal operators persist before the acknowledgement; the
         // pre-persist image captured by the last persistence call is the
@@ -252,7 +296,7 @@ impl ColumnarWindowOperator {
     /// The journal transaction owning one window group's staged state.
     fn window_txn(
         &self,
-        key: &(i64, String),
+        key: &WindowKey,
     ) -> Result<crate::executor::state_journal::StateTxn, Error> {
         let journal = self
             .journal
@@ -269,7 +313,7 @@ impl ColumnarWindowOperator {
 
     /// Discard a window group's staged transaction (its buffer merged into
     /// another session window or its output failed before firing).
-    fn rollback_window_txn(&self, key: &(i64, String)) {
+    fn rollback_window_txn(&self, key: &WindowKey) {
         if let Some(journal) = &self.journal {
             if let Some(txn) = self.window_txns.lock().unwrap().remove(key) {
                 journal.rollback(txn);
@@ -298,9 +342,10 @@ impl ColumnarWindowOperator {
     /// live batch).
     fn evict_overflowed_buffers(
         &self,
-        buffers: &mut BTreeMap<(i64, String), AggregateBuffer>,
-        protected: &BTreeSet<(i64, String)>,
-    ) -> BTreeSet<(i64, String)> {
+        buffers: &mut BTreeMap<WindowKey, AggregateBuffer>,
+        protected: &BTreeSet<WindowKey>,
+        images: &mut BTreeMap<WindowKey, SlotImage>,
+    ) -> BTreeSet<WindowKey> {
         let cap = self.config.max_buffered_keys;
         if buffers.len() <= cap {
             return BTreeSet::new();
@@ -314,6 +359,9 @@ impl ColumnarWindowOperator {
             else {
                 break;
             };
+            // An evicted buffer is a mutation this operation made: record its
+            // before-image so a failed operation restores it.
+            Self::capture_slot(images, &victim, || buffers.get(&victim).cloned());
             buffers.remove(&victim);
             self.rollback_window_txn(&victim);
             evicted_keys.insert(victim);
@@ -348,7 +396,7 @@ impl ColumnarWindowOperator {
     /// The pending-acknowledgement half of the eviction protection. Callers
     /// merge in their own live keys (current-batch memberships / re-key
     /// targets) on top.
-    fn pending_protection(&self) -> BTreeSet<(i64, String)> {
+    fn pending_protection(&self) -> BTreeSet<WindowKey> {
         self.pending_acks
             .lock()
             .unwrap()
@@ -517,10 +565,10 @@ impl ColumnarWindowOperator {
         }
     }
 
-    fn extract_keys(&self, batch: &crate::MessageBatch) -> Result<Vec<Option<String>>, Error> {
+    fn extract_keys(&self, batch: &crate::MessageBatch) -> Result<Vec<Option<Arc<str>>>, Error> {
         let Some(column) = batch.record_batch().column_by_name(&self.config.key_field) else {
             if self.config.key_field == "__arkflow_window_all" {
-                return Ok(vec![Some("__all__".to_owned()); batch.len()]);
+                return Ok(vec![Some(Arc::from("__all__")); batch.len()]);
             }
             return Err(Error::Process(format!(
                 "window key field '{}' is missing",
@@ -536,7 +584,7 @@ impl ColumnarWindowOperator {
                     .downcast_ref::<datafusion::arrow::array::StringArray>()
                     .unwrap()
                     .iter()
-                    .map(|value| value.map(str::to_owned))
+                    .map(|value| value.map(Arc::from))
                     .collect())
             }
             DataType::Int8
@@ -554,7 +602,7 @@ impl ColumnarWindowOperator {
                     .downcast_ref::<datafusion::arrow::array::StringArray>()
                     .unwrap()
                     .iter()
-                    .map(|value| value.map(str::to_owned))
+                    .map(|value| value.map(Arc::from))
                     .collect())
             }
             _ => Err(Error::Process(format!(
@@ -672,7 +720,11 @@ impl ColumnarWindowOperator {
     }
 
     /// Merge one batch into the aggregate buffers (vectorized assignment).
-    fn accumulate(&self, batch: &crate::MessageBatchRef) -> Result<Vec<(i64, String)>, Error> {
+    pub(crate) fn accumulate(
+        &self,
+        batch: &crate::MessageBatchRef,
+        images: &mut BTreeMap<WindowKey, SlotImage>,
+    ) -> Result<Vec<WindowKey>, Error> {
         let timestamps = self.extract_timestamps(batch)?;
         let keys = self.extract_keys(batch)?;
         let value_columns: Vec<&ArrayRef> = self
@@ -706,13 +758,13 @@ impl ColumnarWindowOperator {
         let current_watermark = *self.watermark_ms.lock().unwrap();
         let mut touched = BTreeSet::new();
         let mut session_rekeys = Vec::new();
-        let mut evicted_inline: BTreeSet<(i64, String)> = BTreeSet::new();
+        let mut evicted_inline: BTreeSet<WindowKey> = BTreeSet::new();
         // Pending-acknowledgement half of the eviction protection, built on
         // the first over-cap trigger only: it cannot change mid-batch (the
         // session re-key runs after the loop), and cloning it per membership
         // would make a degraded sliding batch quadratic.
-        let mut protection_base: Option<BTreeSet<(i64, String)>> = None;
-        let mut legacy_rows = BTreeMap::<(i64, String), Vec<usize>>::new();
+        let mut protection_base: Option<BTreeSet<WindowKey>> = None;
+        let mut legacy_rows = BTreeMap::<WindowKey, Vec<usize>>::new();
         // Normalize the (first) value column once per batch. Narrow integer
         // columns used to be re-cast to Int64 inside the row loop — per row
         // AND per window membership — which made wide batches quadratic.
@@ -800,6 +852,13 @@ impl ColumnarWindowOperator {
                         for ((start, window_key), buffer) in matching {
                             merged_start = merged_start.min(start);
                             merged_end = merged_end.max(Self::session_end(start, &buffer, gap_ms));
+                            // A merged-away session is removed from the map:
+                            // record its before-image so a failed operation
+                            // restores it (the buffer here is already the
+                            // pre-removal clone).
+                            Self::capture_slot(images, &(start, window_key.clone()), || {
+                                Some(buffer.clone())
+                            });
                             buffers.remove(&(start, window_key.clone()));
                             matched_keys.push((start, window_key));
                             merged.merge(&buffer);
@@ -847,56 +906,69 @@ impl ColumnarWindowOperator {
                 if excluded {
                     continue;
                 }
-                // A membership whose window already closed behind this
-                // operator's watermark frontier and whose buffer was already
-                // fired and cleaned must not be re-opened as a fresh
-                // aggregate: the next fire would duplicate an already
-                // emitted window result. The gate marks known-late
-                // memberships with exclusion markers; this guard covers the
-                // release race where an unmarked row reaches the operator
-                // after the frontier moved past its window. Session timing
-                // is excluded: its dynamic per-key lateness is owned by
-                // `session_late_masks`, and bridged sessions legitimately
-                // re-key closed windows.
-                if !self.config.legacy_payload
-                    && !matches!(self.config.kind, WindowKind::Session { .. })
-                    && !late_update_flags.is_some_and(|flags| flags.value(row))
-                    && current_watermark.is_some_and(|watermark| window_end <= watermark)
-                    && !buffers.contains_key(&(window_start, key.clone()))
-                {
-                    continue;
-                }
-                // A late Update corrects an already retained aggregate. Do
-                // not create a new partial buffer for a window that has
-                // already been cleaned up after its lateness deadline.
-                if late_update_flags.is_some_and(|flags| flags.value(row))
-                    && !buffers.contains_key(&(window_start, key.clone()))
-                {
-                    // A targeted late update may share a row with a still
-                    // open sliding membership. Only the explicitly marked
-                    // closed memberships require an existing aggregate; the
-                    // unmarked memberships must be admitted normally.
-                    let targeted = late_update_window_ends.is_some_and(|values| {
-                        values.is_valid(row)
-                            && values.value(row).split(',').any(|value| {
-                                value
-                                    .parse::<i64>()
-                                    .map(|end| end == window_end)
-                                    .unwrap_or(false)
-                            })
-                    });
-                    if late_update_window_ends.is_none() || targeted {
-                        continue;
+                // One probe of the buffer map drives both the admission
+                // guards and the accumulation: the guards below only reject
+                // an ABSENT slot — a retained buffer (late-Update
+                // correction, release-race re-admission) is always admitted
+                // — so they live in the Vacant arm of the entry match
+                // instead of preceding a separate `contains_key`.
+                let slot = (window_start, key.clone());
+                let entry = match buffers.entry(slot.clone()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        Self::capture_slot(images, &slot, || Some(entry.get().clone()));
+                        entry.into_mut()
                     }
-                }
-                touched.insert((window_start, key.clone()));
+                    std::collections::btree_map::Entry::Vacant(vacant) => {
+                        // A membership whose window already closed behind this
+                        // operator's watermark frontier and whose buffer was
+                        // already fired and cleaned must not be re-opened as a
+                        // fresh aggregate: the next fire would duplicate an
+                        // already emitted window result. The gate marks
+                        // known-late memberships with exclusion markers; this
+                        // guard covers the release race where an unmarked row
+                        // reaches the operator after the frontier moved past
+                        // its window. Session timing is excluded: its dynamic
+                        // per-key lateness is owned by `session_late_masks`,
+                        // and bridged sessions legitimately re-key closed
+                        // windows.
+                        if !self.config.legacy_payload
+                            && !matches!(self.config.kind, WindowKind::Session { .. })
+                            && !late_update_flags.is_some_and(|flags| flags.value(row))
+                            && current_watermark.is_some_and(|watermark| window_end <= watermark)
+                        {
+                            continue;
+                        }
+                        // A late Update corrects an already retained
+                        // aggregate. Do not create a new partial buffer for a
+                        // window that has already been cleaned up after its
+                        // lateness deadline. A targeted late update may share
+                        // a row with a still open sliding membership: only
+                        // the explicitly marked closed memberships require an
+                        // existing aggregate; the unmarked memberships are
+                        // admitted normally.
+                        if late_update_flags.is_some_and(|flags| flags.value(row)) {
+                            let targeted = late_update_window_ends.is_some_and(|values| {
+                                values.is_valid(row)
+                                    && values.value(row).split(',').any(|value| {
+                                        value
+                                            .parse::<i64>()
+                                            .map(|end| end == window_end)
+                                            .unwrap_or(false)
+                                    })
+                            });
+                            if late_update_window_ends.is_none() || targeted {
+                                continue;
+                            }
+                        }
+                        // The slot did not exist before this operation.
+                        Self::capture_slot(images, &slot, || None);
+                        vacant.insert(AggregateBuffer::default())
+                    }
+                };
+                touched.insert(slot.clone());
                 if self.config.legacy_payload {
-                    legacy_rows
-                        .entry((window_start, key.clone()))
-                        .or_default()
-                        .push(row);
+                    legacy_rows.entry(slot).or_default().push(row);
                 }
-                let entry = buffers.entry((window_start, key.clone())).or_default();
                 if let Some(seed) = session_seed.take() {
                     entry.merge(&seed);
                 }
@@ -936,7 +1008,11 @@ impl ColumnarWindowOperator {
                     let base = protection_base.get_or_insert_with(|| self.pending_protection());
                     let mut protection = base.clone();
                     protection.extend(touched.iter().cloned());
-                    evicted_inline.extend(self.evict_overflowed_buffers(&mut buffers, &protection));
+                    evicted_inline.extend(self.evict_overflowed_buffers(
+                        &mut buffers,
+                        &protection,
+                        images,
+                    ));
                 }
             }
         }
@@ -992,15 +1068,18 @@ impl ColumnarWindowOperator {
                 let base = protection_base.get_or_insert_with(|| self.pending_protection());
                 let mut protection = base.clone();
                 protection.extend(touched.iter().cloned());
-                evicted_keys.extend(self.evict_overflowed_buffers(&mut buffers, &protection));
+                evicted_keys.extend(self.evict_overflowed_buffers(
+                    &mut buffers,
+                    &protection,
+                    images,
+                ));
             }
         }
         // A key evicted mid-batch can be re-created by a later row; only
         // keys with no surviving buffer drop out of `touched` (their
         // acknowledgements must not be held for an aggregate that no longer
         // exists).
-        let survivors: BTreeSet<(i64, String)> =
-            self.buffers.lock().unwrap().keys().cloned().collect();
+        let survivors: BTreeSet<WindowKey> = self.buffers.lock().unwrap().keys().cloned().collect();
         let touched = touched
             .into_iter()
             .filter(|key| !evicted_keys.contains(key) || survivors.contains(key))
@@ -1020,7 +1099,11 @@ impl ColumnarWindowOperator {
     /// Emit aggregates for windows whose end has passed the trigger
     /// threshold, persisting nothing (buffers are the working state; the
     /// barrier snapshot serializes them on demand).
-    fn fire_ready(&self, threshold: i64) -> Result<WindowFiring, Error> {
+    fn fire_ready(
+        &self,
+        threshold: i64,
+        images: &mut BTreeMap<WindowKey, SlotImage>,
+    ) -> Result<WindowFiring, Error> {
         let window_size = match self.config.kind {
             WindowKind::Tumbling { size_ms } | WindowKind::Sliding { size_ms, .. } => size_ms,
             WindowKind::Session { gap_ms } => gap_ms,
@@ -1057,6 +1140,10 @@ impl ColumnarWindowOperator {
         // `pending_acks` forever and freezes the checkpoint frontier.
         let mut dropped_keys = expired;
         for key in &dropped_keys {
+            // A fired-and-expired window can predate this batch entirely:
+            // the firing captures its own before-image rather than relying
+            // on the accumulation's image set.
+            Self::capture_slot(images, key, || buffers.get(key).cloned());
             buffers.remove(key);
             self.rollback_window_txn(key);
         }
@@ -1080,6 +1167,11 @@ impl ColumnarWindowOperator {
         let mut fired_keys = Vec::new();
         let journal = self.journal.clone();
         for ((start, key), buffer) in ready {
+            // `ready` carries the pre-mutation clone, so the first touch of
+            // this firing records the buffer exactly as it stood before the
+            // emitted flags below flip (or-insert keeps an earlier
+            // accumulation image of the same slot).
+            Self::capture_slot(images, &(start, key.clone()), || Some(buffer.clone()));
             // A buffer that never observed a value carries no aggregate: its
             // rows held only NULL values (or none at all). Drop it instead of
             // emitting a fabricated count=0/sum=0 sentinel row. Legacy
@@ -1121,7 +1213,7 @@ impl ColumnarWindowOperator {
             fired_keys.push((start, key.clone()));
             starts.push(start);
             ends.push(end_of(start, &buffer));
-            key_strings.push(key);
+            key_strings.push(key.to_string());
             counts.push(buffer.count);
             sum_values.push(match buffer.kind {
                 NumericKind::Int64 => NumericValue::Int(buffer.sum_i64),
@@ -1338,9 +1430,9 @@ impl Processor for ColumnarWindowOperator {
     async fn finish(&self) -> Result<ProcessResult, Error> {
         let operation_guard = self.operation_lock.clone().lock_owned().await;
         self.load_from_backend()?;
-        let before = self.runtime_snapshot();
+        let mut before = self.open_touched_snapshot();
         let firing = self
-            .fire_ready(i64::MAX)
+            .fire_ready(i64::MAX, &mut before.slots)
             .inspect_err(|_error| self.restore_runtime(&before))?;
         self.persist_buffers_for_fired(
             firing
@@ -1353,7 +1445,7 @@ impl Processor for ColumnarWindowOperator {
         let dropped_acks = self.take_acks(&firing.dropped_keys);
         Ok(match firing.output {
             Some((emitted, fired_keys)) => {
-                let after = self.runtime_snapshot();
+                let after = self.close_touched_snapshot(&before);
                 ProcessResult::SingleWithAck(
                     emitted,
                     self.fired_ack(&fired_keys, dropped_acks, before, after, operation_guard),
@@ -1377,7 +1469,7 @@ impl Processor for ColumnarWindowOperator {
         }
         let operation_guard = self.operation_lock.clone().lock_owned().await;
         self.load_from_backend()?;
-        let before = self.runtime_snapshot();
+        let mut before = self.open_touched_snapshot();
         let now = crate::state::now_ms() as i64;
         let due = if self.config.legacy_payload
             && matches!(self.config.kind, WindowKind::Session { .. })
@@ -1415,7 +1507,7 @@ impl Processor for ColumnarWindowOperator {
         // it must not prevent an idle timer from emitting old or future-dated
         // records.
         let firing = self
-            .fire_ready(i64::MAX)
+            .fire_ready(i64::MAX, &mut before.slots)
             .inspect_err(|_error| self.restore_runtime(&before))?;
         self.persist_buffers_for_fired(
             firing
@@ -1428,7 +1520,7 @@ impl Processor for ColumnarWindowOperator {
         let dropped_acks = self.take_acks(&firing.dropped_keys);
         Ok(match firing.output {
             Some((emitted, fired_keys)) => {
-                let after = self.runtime_snapshot();
+                let after = self.close_touched_snapshot(&before);
                 ProcessResult::SingleWithAck(
                     emitted,
                     self.fired_ack(&fired_keys, dropped_acks, before, after, operation_guard),
@@ -1449,7 +1541,7 @@ impl Processor for ColumnarWindowOperator {
     async fn on_watermark(&self, watermark_ms: i64) -> Result<ProcessResult, Error> {
         let operation_guard = self.operation_lock.clone().lock_owned().await;
         self.load_from_backend()?;
-        let before = self.runtime_snapshot();
+        let mut before = self.open_touched_snapshot();
         {
             let mut watermark = self.watermark_ms.lock().unwrap();
             *watermark = Some(watermark.map_or(watermark_ms, |current| current.max(watermark_ms)));
@@ -1459,7 +1551,7 @@ impl Processor for ColumnarWindowOperator {
             return Ok(ProcessResult::None);
         }
         let firing = self
-            .fire_ready(watermark_ms)
+            .fire_ready(watermark_ms, &mut before.slots)
             .inspect_err(|_error| self.restore_runtime(&before))?;
         self.persist_buffers_for_fired(
             firing
@@ -1472,7 +1564,7 @@ impl Processor for ColumnarWindowOperator {
         let dropped_acks = self.take_acks(&firing.dropped_keys);
         Ok(match firing.output {
             Some((emitted, fired_keys)) => {
-                let after = self.runtime_snapshot();
+                let after = self.close_touched_snapshot(&before);
                 ProcessResult::SingleWithAck(
                     emitted,
                     self.fired_ack(&fired_keys, dropped_acks, before, after, operation_guard),
@@ -1505,7 +1597,7 @@ impl ColumnarWindowOperator {
     ) -> Result<ProcessResult, Error> {
         let operation_guard = self.operation_lock.clone().lock_owned().await;
         self.load_from_backend()?;
-        let before = self.runtime_snapshot();
+        let mut before = self.open_touched_snapshot();
         // A Route action is delivered to the explicitly configured late-event
         // branch by the source gate. If a route batch reaches a window (for
         // example through a compatibility graph without a synthetic branch),
@@ -1629,7 +1721,7 @@ impl ColumnarWindowOperator {
                         None,
                         late_output,
                         has_ack_flow,
-                        before,
+                        &mut before,
                         operation_guard,
                     )
                     .await
@@ -1638,7 +1730,7 @@ impl ColumnarWindowOperator {
                     Err(error) => Err(compensate_window_acks(error, owned_acks).await),
                 };
             };
-            let touched = match self.accumulate(&accepted_batch) {
+            let touched = match self.accumulate(&accepted_batch, &mut before.slots) {
                 Ok(touched) => touched,
                 Err(error) => {
                     // Rows already folded into buffers before the failure
@@ -1655,7 +1747,7 @@ impl ColumnarWindowOperator {
                     ack,
                     late_output,
                     has_ack_flow,
-                    before.clone(),
+                    &mut before,
                     operation_guard,
                 )
                 .await
@@ -1668,7 +1760,7 @@ impl ColumnarWindowOperator {
             };
         }
 
-        let touched = match self.accumulate(&batch) {
+        let touched = match self.accumulate(&batch, &mut before.slots) {
             Ok(touched) => touched,
             Err(error) => {
                 // Drop partially applied rows before the delivery is
@@ -1716,7 +1808,7 @@ impl ColumnarWindowOperator {
         let Some(ack) = ack else {
             let fired = match threshold {
                 Some(threshold) => self
-                    .fire_ready(threshold)
+                    .fire_ready(threshold, &mut before.slots)
                     .inspect_err(|_error| self.restore_runtime(&before))?,
                 None => WindowFiring {
                     output: None,
@@ -1755,13 +1847,16 @@ impl ColumnarWindowOperator {
         }
 
         let fired = match threshold {
-            Some(threshold) => self.fire_ready(threshold).inspect_err(|_error| {
-                // A half-fired round (some buffers already marked emitted)
-                // must not keep that memory state: the error surfaces as a
-                // replay, and `emitted`-but-never-emitted windows would
-                // never fire again.
-                self.restore_runtime(&before);
-            })?,
+            Some(threshold) => {
+                self.fire_ready(threshold, &mut before.slots)
+                    .inspect_err(|_error| {
+                        // A half-fired round (some buffers already marked emitted)
+                        // must not keep that memory state: the error surfaces as a
+                        // replay, and `emitted`-but-never-emitted windows would
+                        // never fire again.
+                        self.restore_runtime(&before);
+                    })?
+            }
             None => WindowFiring {
                 output: None,
                 dropped_keys: Vec::new(),
@@ -1802,7 +1897,7 @@ impl ColumnarWindowOperator {
         // their deliveries alongside the aggregate commit keeps one
         // settlement boundary.
         extra.extend(dropped_acks);
-        let after = self.runtime_snapshot();
+        let after = self.close_touched_snapshot(&before);
         Ok(ProcessResult::SingleWithAck(
             emitted,
             self.fired_ack(&fired_keys, extra, before, after, operation_guard),
@@ -1815,11 +1910,11 @@ impl ColumnarWindowOperator {
     /// after the aggregate result has been formed.
     async fn finish_processed_batch(
         &self,
-        touched: Vec<(i64, String)>,
+        touched: Vec<WindowKey>,
         ack: Option<Arc<dyn Ack>>,
         late_output: Option<(MessageBatchRef, Arc<dyn Ack>)>,
         has_ack_flow: bool,
-        before: WindowRuntimeSnapshot,
+        before: &mut TouchedSnapshot,
         operation_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<ProcessResult, Error> {
         let threshold = match self.config.trigger {
@@ -1869,11 +1964,14 @@ impl ColumnarWindowOperator {
         }
 
         let fired = match threshold {
-            Some(threshold) => self.fire_ready(threshold).inspect_err(|_error| {
-                // Same rollback contract as the direct path: a half-fired
-                // round must not survive as emitted-but-unemitted memory.
-                self.restore_runtime(&before);
-            })?,
+            Some(threshold) => {
+                self.fire_ready(threshold, &mut before.slots)
+                    .inspect_err(|_error| {
+                        // Same rollback contract as the direct path: a half-fired
+                        // round must not survive as emitted-but-unemitted memory.
+                        self.restore_runtime(before);
+                    })?
+            }
             None => WindowFiring {
                 output: None,
                 dropped_keys: Vec::new(),
@@ -1886,7 +1984,7 @@ impl ColumnarWindowOperator {
                 .map(|(_, keys)| keys.as_slice())
                 .unwrap_or(&[]),
         )
-        .inspect_err(|_error| self.restore_runtime(&before))?;
+        .inspect_err(|_error| self.restore_runtime(before))?;
 
         let dropped_acks = self.take_acks(&fired.dropped_keys);
         match fired.output {
@@ -1929,11 +2027,11 @@ impl ColumnarWindowOperator {
                 // Dropped groups settle together with the fired output so a
                 // source failure rolls the whole round back consistently.
                 extra.extend(dropped_acks);
-                let after = self.runtime_snapshot();
+                let after = self.close_touched_snapshot(before);
                 Ok(append_late_session_output(
                     ProcessResult::SingleWithAck(
                         emitted,
-                        self.fired_ack(&fired_keys, extra, before, after, operation_guard),
+                        self.fired_ack(&fired_keys, extra, before.clone(), after, operation_guard),
                     ),
                     late_output,
                 ))
@@ -1961,7 +2059,7 @@ impl ColumnarWindowOperator {
         Ok(())
     }
 
-    fn remember_acks(&self, keys: Vec<(i64, String)>, acks: Vec<Arc<dyn Ack>>) {
+    fn remember_acks(&self, keys: Vec<WindowKey>, acks: Vec<Arc<dyn Ack>>) {
         let mut pending = self.pending_acks.lock().unwrap();
         for (key, ack) in keys.into_iter().zip(acks) {
             // These acknowledgements stay pending until the window fires;
@@ -1972,7 +2070,7 @@ impl ColumnarWindowOperator {
         }
     }
 
-    fn take_acks(&self, keys: &[(i64, String)]) -> Vec<Arc<dyn Ack>> {
+    fn take_acks(&self, keys: &[WindowKey]) -> Vec<Arc<dyn Ack>> {
         let mut pending = self.pending_acks.lock().unwrap();
         keys.iter()
             .flat_map(|key| pending.remove(key).unwrap_or_default())
@@ -1985,10 +2083,10 @@ impl ColumnarWindowOperator {
     /// can be replayed.
     fn fired_ack(
         &self,
-        fired_keys: &[(i64, String)],
+        fired_keys: &[WindowKey],
         extra: Vec<Arc<dyn Ack>>,
-        before: WindowRuntimeSnapshot,
-        after: WindowRuntimeSnapshot,
+        before: TouchedSnapshot,
+        after: TouchedSnapshot,
         operation_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Arc<dyn Ack> {
         let fired_txns = self.journal.as_ref().map(|journal| {
@@ -2054,7 +2152,7 @@ impl ColumnarWindowOperator {
     /// output transaction when one exists. A cleanup transaction must not be
     /// committed independently: a source acknowledgement failure has to be
     /// able to roll back a session re-key or an expired-window deletion.
-    fn persist_buffers_for_fired(&self, fired_keys: &[(i64, String)]) -> Result<(), Error> {
+    fn persist_buffers_for_fired(&self, fired_keys: &[WindowKey]) -> Result<(), Error> {
         let current = self
             .buffers
             .lock()
@@ -2117,7 +2215,7 @@ impl ColumnarWindowOperator {
             // source delivery of their own.
             let fired_by_logical_key = fired_keys
                 .iter()
-                .map(|(start, key)| (key.as_str(), (*start, key.clone())))
+                .map(|(start, key)| (&**key, (*start, key.clone())))
                 .collect::<BTreeMap<_, _>>();
             let mut cleanup =
                 BTreeMap::<crate::executor::state_journal::StateTxn, Vec<Vec<u8>>>::new();
@@ -2126,14 +2224,15 @@ impl ColumnarWindowOperator {
             for raw in stale_keys {
                 let stale_key = Self::decode_state_key(&raw)?;
                 let has_replacement = current.keys().any(|(_, key)| key == &stale_key.1);
-                let transaction_key = fired_by_logical_key
-                    .get(stale_key.1.as_str())
-                    .cloned()
-                    .or_else(|| {
-                        (!has_replacement)
-                            .then(|| fired_keys.first().cloned())
-                            .flatten()
-                    });
+                let transaction_key =
+                    fired_by_logical_key
+                        .get(&*stale_key.1)
+                        .cloned()
+                        .or_else(|| {
+                            (!has_replacement)
+                                .then(|| fired_keys.first().cloned())
+                                .flatten()
+                        });
                 if let Some(transaction_key) = transaction_key {
                     let txn = self.window_txn(&transaction_key)?;
                     cleanup.entry(txn).or_default().push(raw);
@@ -2207,7 +2306,7 @@ impl ColumnarWindowOperator {
         Ok(())
     }
 
-    fn decode_state_key(raw: &[u8]) -> Result<(i64, String), Error> {
+    fn decode_state_key(raw: &[u8]) -> Result<WindowKey, Error> {
         let window_start = raw
             .get(..8)
             .ok_or_else(|| Error::Process("corrupt window state key".into()))?
@@ -2215,7 +2314,12 @@ impl ColumnarWindowOperator {
             .map(i64::from_be_bytes)
             .map_err(|_| Error::Process("corrupt window state key".into()))?;
         let key = String::from_utf8(raw[8..].to_vec())
-            .map_err(|_| Error::Process("window state key is not utf8".into()))?;
+            .map_err(|_| Error::Process("window state key is not utf8".into()))
+            .and_then(|key| {
+                std::str::from_utf8(key.as_bytes())
+                    .map(Arc::from)
+                    .map_err(|_| Error::Process("window state key is not utf8".into()))
+            })?;
         Ok((window_start, key))
     }
 
@@ -2238,7 +2342,7 @@ impl ColumnarWindowOperator {
                 return Err(Error::Process("corrupt window state key".into()));
             }
             let window_start = i64::from_be_bytes(entry.key[..8].try_into().unwrap());
-            let key = String::from_utf8_lossy(&entry.key[8..]).into_owned();
+            let key: Arc<str> = Arc::from(String::from_utf8_lossy(&entry.key[8..]).as_ref());
             buffers.insert((window_start, key), buffer);
             restored += 1;
         }

@@ -182,16 +182,35 @@ fn default_watermark_field() -> String {
 /// one non-journal persistence captures for a failed fired acknowledgement.
 pub(crate) type PersistUndoImage = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
-#[derive(Clone)]
-pub(crate) struct WindowRuntimeSnapshot {
-    pub(crate) buffers: BTreeMap<(i64, String), AggregateBuffer>,
+/// In-memory window key: the string half is ARC-shared so per-membership
+/// cloning is a reference-count bump (the persisted `state_key` byte layout
+/// is unchanged).
+pub(crate) type WindowKey = (i64, Arc<str>);
+
+/// Before-image (or after-image) of one touched buffer slot: the exact
+/// buffer state the operation saw before mutating it, or `None` when the
+/// slot did not exist (so restoring removes the slot the operation created).
+pub(crate) type SlotImage = Option<AggregateBuffer>;
+
+/// Images for exactly the slots one window operation (an accumulation batch
+/// or a firing round) touches, plus the runtime scalars as they were.
+/// Accumulation captures a slot's image on first touch; a firing captures
+/// images for the slots it removes or marks — including windows filled by
+/// earlier batches that this batch never touched, because a watermark
+/// triggers exactly those. Applying the images restores state identical to
+/// a whole-map snapshot restore — the operation never mutated a slot without
+/// first recording its image — and per-batch snapshot cost no longer grows
+/// with the number of open windows.
+#[derive(Clone, Default)]
+pub(crate) struct TouchedSnapshot {
+    pub(crate) slots: BTreeMap<WindowKey, SlotImage>,
     pub(crate) watermark_ms: Option<i64>,
     pub(crate) last_processing_trigger_ms: Option<i64>,
     pub(crate) last_processing_activity_ms: Option<i64>,
 }
 
 pub(crate) struct WindowRollback {
-    pub(crate) buffers: Arc<Mutex<BTreeMap<(i64, String), AggregateBuffer>>>,
+    pub(crate) buffers: Arc<Mutex<BTreeMap<WindowKey, AggregateBuffer>>>,
     pub(crate) watermark_ms: Arc<Mutex<Option<i64>>>,
     pub(crate) last_processing_trigger_ms: Arc<Mutex<Option<i64>>>,
     pub(crate) last_processing_activity_ms: Arc<Mutex<Option<i64>>>,
@@ -201,13 +220,25 @@ pub(crate) struct WindowRollback {
     /// fired buffers. Journal-backed operators compensate through their
     /// transactions and leave this as `None`.
     pub(crate) backend: Option<(Arc<dyn StateBackend>, String, Mutex<PersistUndoImage>)>,
-    pub(crate) before: WindowRuntimeSnapshot,
-    pub(crate) after: WindowRuntimeSnapshot,
+    pub(crate) before: TouchedSnapshot,
+    pub(crate) after: TouchedSnapshot,
 }
 
 impl WindowRollback {
-    fn restore(&self, snapshot: &WindowRuntimeSnapshot) {
-        *self.buffers.lock().unwrap() = snapshot.buffers.clone();
+    fn restore(&self, snapshot: &TouchedSnapshot) {
+        {
+            let mut buffers = self.buffers.lock().unwrap();
+            for (key, image) in &snapshot.slots {
+                match image {
+                    Some(buffer) => {
+                        buffers.insert(key.clone(), buffer.clone());
+                    }
+                    None => {
+                        buffers.remove(key);
+                    }
+                }
+            }
+        }
         *self.watermark_ms.lock().unwrap() = snapshot.watermark_ms;
         *self.last_processing_trigger_ms.lock().unwrap() = snapshot.last_processing_trigger_ms;
         *self.last_processing_activity_ms.lock().unwrap() = snapshot.last_processing_activity_ms;
@@ -330,9 +361,9 @@ impl Ack for WindowFiredAck {
 /// The outcome of one window firing round.
 pub(crate) struct WindowFiring {
     /// Aggregate rows to emit together with the window keys they belong to.
-    pub(crate) output: Option<(MessageBatchRef, Vec<(i64, String)>)>,
+    pub(crate) output: Option<(MessageBatchRef, Vec<WindowKey>)>,
     /// Groups that emit nothing — expired windows and empty (never-observed)
     /// buffers — but whose staged transactions were discarded and whose
     /// delivery acknowledgements the caller must still settle.
-    pub(crate) dropped_keys: Vec<(i64, String)>,
+    pub(crate) dropped_keys: Vec<WindowKey>,
 }

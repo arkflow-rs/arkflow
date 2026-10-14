@@ -3097,8 +3097,8 @@ fn partition_batch_by_key_hash(
     key_group_ranges: &[crate::job::KeyGroupRange],
     max_parallelism: u32,
 ) -> Result<Vec<Option<crate::MessageBatchRef>>, Error> {
-    use datafusion::arrow::array::BooleanArray;
-    use datafusion::arrow::compute::filter_record_batch;
+    use datafusion::arrow::array::UInt32Array;
+    use datafusion::arrow::compute::take_record_batch;
 
     if key_field.is_empty() {
         return Ok((0..subtasks)
@@ -3118,21 +3118,43 @@ fn partition_batch_by_key_hash(
         )));
     };
     let key_groups = hash_column(column.as_ref(), max_parallelism)?;
+    // Key-group -> owning subtask, built once per call: the key groups live
+    // in [0, max_parallelism) and the ranges partition that space (a group
+    // claimed by no range — or a row with no group — lands nowhere, exactly
+    // like the previous per-subtask membership filter).
+    let no_owner = u32::MAX;
+    let mut owner_by_group = vec![no_owner; max_parallelism as usize];
+    for (subtask, range) in key_group_ranges.iter().take(subtasks).enumerate() {
+        for group in range.start..=range.end {
+            if (group as usize) < owner_by_group.len() {
+                owner_by_group[group as usize] = subtask as u32;
+            }
+        }
+    }
+    // One pass buckets each row into its owning subtask (row order
+    // preserved); each non-empty subtask then gathers once, replacing the
+    // previous per-subtask full-batch mask + filter (O(subtasks × rows)).
+    let mut buckets: Vec<Vec<u32>> = (0..subtasks).map(|_| Vec::new()).collect();
+    for (row, group) in key_groups.iter().enumerate() {
+        let Some(group) = group else {
+            continue;
+        };
+        let owner = owner_by_group[*group as usize];
+        if owner != no_owner {
+            buckets[owner as usize].push(row as u32);
+        }
+    }
     let mut result = Vec::with_capacity(subtasks);
-    for key_group_range in key_group_ranges.iter().take(subtasks) {
-        let keep: BooleanArray = key_groups
-            .iter()
-            .map(|key_group| key_group.is_some_and(|key_group| key_group_range.contains(key_group)))
-            .collect();
-        if keep.false_count() == keep.len() {
+    for indices in buckets {
+        if indices.is_empty() {
             result.push(None);
             continue;
         }
-        let filtered = filter_record_batch(batch.record_batch(), &keep)
+        let gathered = take_record_batch(batch.record_batch(), &UInt32Array::from(indices))
             .map_err(|error| Error::Process(format!("partition batch: {error}")))?;
-        let mut filtered_batch = crate::MessageBatch::new_arrow(filtered);
-        filtered_batch.set_input_name(batch.get_input_name());
-        result.push(Some(Arc::new(filtered_batch)));
+        let mut gathered_batch = crate::MessageBatch::new_arrow(gathered);
+        gathered_batch.set_input_name(batch.get_input_name());
+        result.push(Some(Arc::new(gathered_batch)));
     }
     Ok(result)
 }
