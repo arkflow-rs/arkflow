@@ -431,22 +431,29 @@ pub(crate) struct TrackingAck {
     /// Settlement slot: true while one caller's inner `ack`/`undo`/`abort`
     /// is in flight. This replaces the old `tokio::sync::Mutex<()>` (one
     /// allocation per source batch): the inner calls still never overlap —
-    /// contenders cooperate via `yield_now` instead of queueing on an async
-    /// lock, and a cancelled future drops its [`SettleGuard`], releasing the
-    /// slot exactly like a dropped async-mutex guard did. Because every
+    /// contenders park on `settle_notify` until the holder's guard drops,
+    /// and a cancelled future drops its [`SettleGuard`], releasing the slot
+    /// exactly like a dropped async-mutex guard did. Because every
     /// transition of `completed`/`aborted` happens while the slot is held,
     /// no further mutex is needed for the flag transitions; plain
     /// `Acquire`/`Release` ordering suffices.
     settling: std::sync::atomic::AtomicBool,
+    /// Wakes settlement contenders parked in `settlement_slot` when the
+    /// slot is released.
+    settle_notify: tokio::sync::Notify,
 }
 
 /// Releases the [`TrackingAck::settling`] slot on drop, so a settlement
 /// future cancelled mid-await cannot wedge the delivery.
-struct SettleGuard<'a>(&'a std::sync::atomic::AtomicBool);
+struct SettleGuard<'a> {
+    slot: &'a std::sync::atomic::AtomicBool,
+    notify: &'a tokio::sync::Notify,
+}
 
 impl Drop for SettleGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        self.slot.store(false, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
     }
 }
 
@@ -460,19 +467,31 @@ impl TrackingAck {
             completed: std::sync::atomic::AtomicBool::new(false),
             aborted: std::sync::atomic::AtomicBool::new(false),
             settling: std::sync::atomic::AtomicBool::new(false),
+            settle_notify: tokio::sync::Notify::new(),
         }
     }
 
     /// Acquire the settlement slot: exactly one of this delivery's
-    /// `ack`/`undo`/`abort` inner calls runs at a time. Contenders yield
-    /// cooperatively — blocking a worker on a synchronous lock here could
-    /// deadlock a current-thread runtime, since the holder parks inside an
-    /// await that only the blocked thread could poll.
+    /// `ack`/`undo`/`abort` inner calls runs at a time. Contenders park on
+    /// the notification — blocking a worker on a synchronous lock here
+    /// could deadlock a current-thread runtime, and spinning on the flag
+    /// would burn the worker for as long as the holder parks inside
+    /// `inner.ack()`/friends.
     async fn settlement_slot(&self) -> SettleGuard<'_> {
-        while self.settling.swap(true, Ordering::AcqRel) {
-            tokio::task::yield_now().await;
+        loop {
+            // Register for the release notification BEFORE checking the
+            // slot: a release between the check and the wait must not be
+            // lost.
+            let mut notified = std::pin::pin!(self.settle_notify.notified());
+            notified.as_mut().enable();
+            if !self.settling.swap(true, Ordering::AcqRel) {
+                return SettleGuard {
+                    slot: &self.settling,
+                    notify: &self.settle_notify,
+                };
+            }
+            notified.await;
         }
-        SettleGuard(&self.settling)
     }
 
     /// Make a compensated acknowledgement retryable.  A successful `ack`
