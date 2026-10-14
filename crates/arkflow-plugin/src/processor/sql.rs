@@ -27,13 +27,18 @@ use datafusion::arrow::array::AsArray;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::DataFusionError;
-use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::common::stats::Precision;
+use datafusion::common::{DataFusionError, Statistics};
+use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::datasource::TableType;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan};
 use datafusion::optimizer::OptimizerConfig;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_expr::projection::ProjectionExprs;
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::parser::Statement;
@@ -99,28 +104,35 @@ struct TemporaryConfig {
 /// logical plan only depends on the batch schema. Caching that plan removes
 /// per-batch re-analysis and re-optimization; the cached plan's table scans
 /// resolve back to this provider, so execution always reads the freshly
-/// swapped batch.
+/// swapped batch. The batch lives in a shared inner slot so the lazy
+/// [`SwapBatchSource`] handed to the physical planner reads the same storage
+/// the processor swaps: the resulting physical plan captures no data at
+/// planning time and is safe to cache and re-execute across batch swaps.
 #[derive(Debug)]
 struct SwapBatchTable {
-    current: RwLock<RecordBatch>,
+    slot: Arc<RwLock<RecordBatch>>,
 }
 
 impl SwapBatchTable {
     fn new(batch: RecordBatch) -> Self {
         Self {
-            current: RwLock::new(batch),
+            slot: Arc::new(RwLock::new(batch)),
         }
     }
 
     fn swap(&self, batch: RecordBatch) {
-        *self.current.write().unwrap() = batch;
+        *self.slot.write().unwrap() = batch;
+    }
+
+    fn slot(&self) -> Arc<RwLock<RecordBatch>> {
+        Arc::clone(&self.slot)
     }
 }
 
 #[async_trait]
 impl TableProvider for SwapBatchTable {
     fn schema(&self) -> SchemaRef {
-        self.current.read().unwrap().schema()
+        self.slot.read().unwrap().schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -134,10 +146,131 @@ impl TableProvider for SwapBatchTable {
         _filters: &[LogicalExpr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let batch = self.current.read().unwrap().clone();
-        let exec: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_exec(&[vec![batch]], self.schema(), projection.cloned())?;
-        Ok(exec)
+        let schema = self.slot.read().unwrap().schema();
+        let source = SwapBatchSource::new(self.slot(), schema, projection.cloned())?;
+        Ok(DataSourceExec::from_data_source(source))
+    }
+}
+
+/// Lazy scan source over [`SwapBatchTable`]'s shared batch slot.
+///
+/// Planning captures only the slot handle, the planning-time schema, and the
+/// projection — never batch data. The current batch is read when the stream
+/// is produced (`open`), so a physical plan containing this node stays valid
+/// for every later batch swapped in under the same schema; that is what
+/// makes the physical plan cacheable.
+#[derive(Debug)]
+struct SwapBatchSource {
+    slot: Arc<RwLock<RecordBatch>>,
+    /// Schema captured at planning time. A batch swapped in under a
+    /// different schema fails closed at `open` instead of feeding misaligned
+    /// columns to a plan built for this schema (defensive: the cache is
+    /// schema-keyed, so a mismatch indicates a broken invariant).
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    projected_schema: SchemaRef,
+}
+
+impl SwapBatchSource {
+    fn new(
+        slot: Arc<RwLock<RecordBatch>>,
+        schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+    ) -> Result<Self, DataFusionError> {
+        let projected_schema = match &projection {
+            Some(indices) => Arc::new(schema.project(indices)?),
+            None => schema.clone(),
+        };
+        Ok(Self {
+            slot,
+            schema,
+            projection,
+            projected_schema,
+        })
+    }
+}
+
+impl DataSource for SwapBatchSource {
+    fn open(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "SwapBatchSource has a single partition, requested partition {partition}"
+            )));
+        }
+        let batch = self.slot.read().unwrap().clone();
+        if batch.schema() != self.schema {
+            return Err(DataFusionError::Internal(
+                "SwapBatchSource executed with a batch whose schema differs from the schema its plan was built for".to_string(),
+            ));
+        }
+        let projected = match &self.projection {
+            Some(indices) => batch.project(indices)?,
+            None => batch,
+        };
+        let stream = MemoryStream::try_new(vec![projected], self.projected_schema.clone(), None)?;
+        Ok(Box::pin(stream))
+    }
+
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "SwapBatchSource: projection={:?}",
+            self.projection
+                .as_ref()
+                .map(|p| format!(
+                    "[{}]",
+                    p.iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .unwrap_or_else(|| "none".to_string())
+        )
+    }
+
+    fn output_partitioning(&self) -> Partitioning {
+        Partitioning::UnknownPartitioning(1)
+    }
+
+    fn eq_properties(&self) -> EquivalenceProperties {
+        EquivalenceProperties::new(self.projected_schema.clone())
+    }
+
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> Result<Arc<Statistics>, DataFusionError> {
+        // Exact row count from the planning-time batch: the physical planner
+        // consumes statistics when the cached plan is first built, and this
+        // keeps that plan-shape input identical to the eager MemorySource it
+        // replaces. Only called at planning time, so no per-batch cost.
+        let num_rows = self.slot.read().unwrap().num_rows();
+        Ok(Arc::new(Statistics {
+            num_rows: Precision::Exact(num_rows),
+            ..Statistics::new_unknown(&self.projected_schema)
+        }))
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        // Limits stay in the plan above (same as the eager source before).
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExprs,
+    ) -> Result<Option<Arc<dyn DataSource>>, DataFusionError> {
+        // The planning-time column projection is applied in `open`; no
+        // further projection pushdown into the source.
+        Ok(None)
     }
 }
 
@@ -167,6 +300,74 @@ fn plan_folds_time(plan: &LogicalPlan) -> bool {
         || plan.inputs().iter().any(|p| plan_folds_time(p))
 }
 
+/// Recursive queries compile to a `RecursiveQuery` plan whose work-table
+/// scan holds one-shot execution state in the physical plan; per
+/// `reset_plan_states`' documented limitations such plans are not
+/// re-executable, so they must not enter the physical-plan cache.
+fn plan_is_recursive(plan: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut found = false;
+    let _ = plan.apply(&mut |p: &LogicalPlan| {
+        if matches!(p, LogicalPlan::RecursiveQuery(_)) {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+/// Exec nodes that hold one-shot per-execution state inside the node
+/// itself: repartition distribution channels, join build futures and
+/// materialized build sides, TopK dynamic filters. Every other node
+/// streams its state per `execute` call and is safe to share across
+/// executions. The set mirrors the DataFusion nodes that override
+/// `reset_state` (plus `RepartitionExec`, whose state resets through
+/// `with_new_children`). The general `reset_plan_states` helper rebuilds
+/// EVERY node, which measurably costs more than the physical planning
+/// this cache exists to avoid.
+fn carries_execution_state(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::physical_plan::joins::{
+        CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PiecewiseMergeJoinExec, SortMergeJoinExec,
+        SymmetricHashJoinExec,
+    };
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    let any: &dyn std::any::Any = plan.as_ref();
+    any.downcast_ref::<RepartitionExec>().is_some()
+        || any.downcast_ref::<SortExec>().is_some()
+        || any.downcast_ref::<CrossJoinExec>().is_some()
+        || any.downcast_ref::<HashJoinExec>().is_some()
+        || any.downcast_ref::<NestedLoopJoinExec>().is_some()
+        || any.downcast_ref::<PiecewiseMergeJoinExec>().is_some()
+        || any.downcast_ref::<SortMergeJoinExec>().is_some()
+        || any.downcast_ref::<SymmetricHashJoinExec>().is_some()
+}
+
+/// Prepare a cached physical plan for re-execution: bottom-up, rebuild the
+/// state-carrying nodes with fresh state, relink their ancestors, and
+/// share every other node unchanged — the targeted equivalent of
+/// `reset_plan_states` for plan trees over the lazy swap source.
+fn refresh_for_reexecution(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let old_children = plan.children();
+    let mut changed = false;
+    let mut children = Vec::with_capacity(old_children.len());
+    for child in old_children {
+        let refreshed = refresh_for_reexecution(child)?;
+        changed |= !Arc::ptr_eq(&refreshed, child);
+        children.push(refreshed);
+    }
+    if carries_execution_state(plan) {
+        return Arc::clone(plan).with_new_children(children)?.reset_state();
+    }
+    if !changed {
+        return Ok(Arc::clone(plan));
+    }
+    Arc::clone(plan).with_new_children(children)
+}
+
 /// Per pooled-context fast-path state: the swap table registered under the
 /// configured table name plus the plans cached for its schema.
 struct ContextPlanCache {
@@ -177,6 +378,10 @@ struct ContextPlanCache {
     /// Optimized plan; reused only when the query has no time-folding
     /// functions, which the optimizer would otherwise freeze at cache time.
     optimized: Option<(SchemaRef, Arc<LogicalPlan>)>,
+    /// Physical plan; the scan reads the shared batch slot lazily, so the
+    /// plan captures no data and is reusable under the same schema. Time-
+    /// folding queries are excluded for the same reason as `optimized`.
+    physical: Option<(SchemaRef, Arc<dyn ExecutionPlan>)>,
 }
 
 /// SQL processor component
@@ -220,6 +425,13 @@ struct SqlProcessor {
     /// Set once from the first analyzed plan; queries that fold time
     /// expressions must re-optimize every batch to keep now() fresh.
     time_dependent: std::sync::OnceLock<bool>,
+    /// Set once from the first analyzed plan; recursive queries' physical
+    /// plans hold one-shot work-table state and are never cached.
+    recursive_query: std::sync::OnceLock<bool>,
+    /// Fast-path physical plan builds; stops growing once every pooled
+    /// context holds a plan for the current schema (the cache invariant
+    /// tests assert this).
+    physical_plan_builds: std::sync::atomic::AtomicUsize,
 }
 
 impl SqlProcessor {
@@ -259,6 +471,8 @@ impl SqlProcessor {
             context_pool,
             context_caches: std::sync::Mutex::new(HashMap::new()),
             time_dependent: std::sync::OnceLock::new(),
+            recursive_query: std::sync::OnceLock::new(),
+            physical_plan_builds: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -333,9 +547,11 @@ impl SqlProcessor {
     /// Fast path without temporary tables: swap the batch into a provider
     /// registered on the context and reuse cached plans whenever the batch
     /// schema is unchanged. The analyzed plan is always cached; the optimized
-    /// plan is cached only when the query cannot fold time expressions into
-    /// the plan (now/current_date/current_time), which would otherwise freeze
-    /// the first batch's timestamp.
+    /// and physical plans are cached only when the query cannot fold time
+    /// expressions into the plan (now/current_date/current_time), which would
+    /// otherwise freeze the first batch's timestamp. The physical plan's scan
+    /// reads the shared batch slot lazily, so a cached plan serves every
+    /// later batch swapped in under the same schema.
     async fn execute_with_cached_plan(
         &self,
         ctx: &Arc<SessionContext>,
@@ -360,6 +576,7 @@ impl SqlProcessor {
                             table: table.clone(),
                             analyzed: None,
                             optimized: None,
+                            physical: None,
                         },
                     );
                     table
@@ -392,6 +609,7 @@ impl SqlProcessor {
                     .verify_plan(&plan)
                     .map_err(|e| Error::Process(format!("SQL verification error: {}", e)))?;
                 let _ = self.time_dependent.set(plan_folds_time(&plan));
+                let _ = self.recursive_query.set(plan_is_recursive(&plan));
                 let plan = Arc::new(plan);
                 let mut caches = self.context_caches.lock().unwrap();
                 if let Some(cache) = caches.get_mut(&key) {
@@ -424,18 +642,52 @@ impl SqlProcessor {
                 if !time_dependent {
                     let mut caches = self.context_caches.lock().unwrap();
                     if let Some(cache) = caches.get_mut(&key) {
-                        cache.optimized = Some((schema, optimized.clone()));
+                        cache.optimized = Some((schema.clone(), optimized.clone()));
                     }
                 }
                 optimized
             }
         };
 
-        let physical = state
-            .query_planner()
-            .create_physical_plan(&plan, &state)
-            .await
-            .map_err(|e| Error::Process(format!("Physical planning error: {}", e)))?;
+        // The cached physical plan's scan reads the shared batch slot at
+        // execution time, so reuse needs the optimized plan's guards (schema
+        // match, no time-folding functions) plus the recursive-query guard:
+        // a reused plan is refreshed with `reset_plan_states` because some
+        // exec nodes (repartition channels, join build futures) hold
+        // one-shot per-execution state inside the node.
+        let recursive = self.recursive_query.get().copied().unwrap_or(false);
+        let cacheable = !time_dependent && !recursive;
+        let cached_physical = if cacheable {
+            let caches = self.context_caches.lock().unwrap();
+            caches
+                .get(&key)
+                .and_then(|cache| cache.physical.as_ref())
+                .filter(|(cached_schema, _)| *cached_schema == schema)
+                .map(|(_, plan)| plan.clone())
+        } else {
+            None
+        };
+
+        let physical = match cached_physical {
+            Some(plan) => refresh_for_reexecution(&plan)
+                .map_err(|e| Error::Process(format!("Physical plan reset error: {}", e)))?,
+            None => {
+                self.physical_plan_builds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let physical = state
+                    .query_planner()
+                    .create_physical_plan(&plan, &state)
+                    .await
+                    .map_err(|e| Error::Process(format!("Physical planning error: {}", e)))?;
+                if cacheable {
+                    let mut caches = self.context_caches.lock().unwrap();
+                    if let Some(cache) = caches.get_mut(&key) {
+                        cache.physical = Some((schema, physical.clone()));
+                    }
+                }
+                physical
+            }
+        };
         datafusion::physical_plan::collect(physical, ctx.task_ctx())
             .await
             .map_err(|e| Error::Process(format!("Collection query results error: {}", e)))
@@ -1169,6 +1421,394 @@ mod tests {
         );
 
         println!("10 queries completed in {:?}", duration);
+    }
+
+    fn empty_resource() -> Resource {
+        Resource {
+            temporary: Default::default(),
+            input_names: RefCell::new(Default::default()),
+        }
+    }
+
+    fn int_string_batch(ids: Vec<i64>, names: Vec<&str>) -> MessageBatchRef {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap();
+        Arc::new(MessageBatch::new_arrow(batch))
+    }
+
+    /// Spec "Physical planning happens once per schema": the build counter
+    /// rises at most once per pooled context for a fixed schema and then
+    /// stops, and a schema drift re-triggers exactly one rebuild per used
+    /// context.
+    #[tokio::test]
+    async fn physical_plan_built_at_most_once_per_schema() {
+        let processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT id FROM flow WHERE id > 0".to_string(),
+                table_name: None,
+                temporary_list: None,
+            },
+            &empty_resource(),
+        )
+        .unwrap();
+
+        let builds = || {
+            processor
+                .physical_plan_builds
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let ids_batch = |n: i64| int_string_batch(vec![n], vec!["a"]);
+
+        for i in 0..12 {
+            processor.process(ids_batch(i)).await.unwrap();
+        }
+        let after_first_round = builds();
+        assert!(
+            (1..=4).contains(&after_first_round),
+            "expected 1..=4 builds (pool size 4), got {after_first_round}"
+        );
+
+        // More same-schema batches must not build any further plan.
+        for i in 0..12 {
+            processor.process(ids_batch(i)).await.unwrap();
+        }
+        assert_eq!(builds(), after_first_round, "cache must stop rebuilding");
+
+        // A schema drift invalidates the cache: at least one new build, then
+        // stable again under the new schema.
+        let drifted = {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64]))]).unwrap();
+            Arc::new(MessageBatch::new_arrow(batch))
+        };
+        let drift_processor = SqlProcessor::new(
+            SqlProcessorConfig {
+                query: "SELECT sum(v) AS total FROM flow".to_string(),
+                table_name: None,
+                temporary_list: None,
+            },
+            &empty_resource(),
+        )
+        .unwrap();
+        let drift_builds = || {
+            drift_processor
+                .physical_plan_builds
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        for _ in 0..3 {
+            drift_processor.process(drifted.clone()).await.unwrap();
+        }
+        let drifted_builds = drift_builds();
+        assert_eq!(drifted_builds, 1, "one build for one schema");
+        for _ in 0..3 {
+            drift_processor.process(drifted.clone()).await.unwrap();
+        }
+        assert_eq!(drift_builds(), drifted_builds);
+    }
+
+    /// Spec "Mismatched execution batch errors instead of misreading
+    /// columns": the lazy source fails closed on an execution-time schema
+    /// mismatch instead of feeding misaligned columns to the plan.
+    #[tokio::test]
+    async fn swap_source_fails_closed_on_schema_mismatch() {
+        let slot = Arc::new(RwLock::new(
+            int_string_batch(vec![1], vec!["a"]).record_batch().clone(),
+        ));
+        let plan_schema = slot.read().unwrap().schema();
+
+        // Happy path: matching schema streams the projected batch.
+        let source = SwapBatchSource::new(
+            slot.clone(),
+            plan_schema.clone(),
+            Some(vec![1, 0]), // reversed projection exercises column mapping
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let stream = source.open(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(stream).await.unwrap();
+        assert_eq!(batches.len(), 1);
+        let out_schema = batches[0].schema();
+        assert_eq!(
+            out_schema.field(0),
+            plan_schema.field(1),
+            "projection must reorder columns"
+        );
+        assert_eq!(
+            out_schema.field(1),
+            plan_schema.field(0),
+            "projection must reorder columns"
+        );
+        assert_eq!(batches[0].num_rows(), 1);
+
+        // Mismatch: a batch of a different schema swapped into the slot
+        // errors at open, naming the schema mismatch.
+        *slot.write().unwrap() = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)])),
+            vec![Arc::new(datafusion::arrow::array::Float64Array::from(
+                vec![1.5],
+            ))],
+        )
+        .unwrap();
+        let err = match source.open(0, ctx.task_ctx()) {
+            Ok(_) => panic!("a swapped-in schema mismatch must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("schema"),
+            "error must name the schema mismatch, got: {err}"
+        );
+    }
+
+    /// Spec "Cached plan serves each batch's own data" (equivalence leg):
+    /// for every batch, the cached-physical-plan path must produce exactly
+    /// what a fully independent re-plan (fresh processor, no caches at all)
+    /// produces — schema, column order, and values.
+    #[tokio::test]
+    async fn cached_physical_plan_matches_full_replan() {
+        let queries: Vec<(&str, bool)> = vec![
+            ("SELECT name, id FROM flow WHERE id % 2 = 0", false),
+            (
+                "SELECT name, count(*) AS n, sum(id) AS total FROM flow GROUP BY name",
+                false,
+            ),
+            (
+                "SELECT name, sum(id) AS t FROM flow GROUP BY name HAVING sum(id) > 1",
+                false,
+            ),
+            (
+                "SELECT a.id, b.name FROM flow a JOIN flow b ON a.id = b.id",
+                false,
+            ),
+            (
+                "SELECT b.name FROM flow a JOIN flow b ON a.id = b.id WHERE a.id > 0",
+                false,
+            ),
+            // TopK carries a dynamic filter inside SortExec; alternating
+            // value ranges make a stale threshold from the previous batch
+            // visibly wrong instead of merely slower.
+            ("SELECT id FROM flow ORDER BY id DESC LIMIT 2", true),
+            ("SELECT DISTINCT name FROM flow", false),
+            (
+                "SELECT id, row_number() OVER (PARTITION BY name ORDER BY id) AS rn FROM flow",
+                false,
+            ),
+        ];
+        for (query, alternating) in queries {
+            let make = || {
+                SqlProcessor::new(
+                    SqlProcessorConfig {
+                        query: query.to_string(),
+                        table_name: None,
+                        temporary_list: None,
+                    },
+                    &empty_resource(),
+                )
+                .unwrap()
+            };
+            let cached = make();
+            for round in 0..4i64 {
+                let ids = if alternating {
+                    match round % 2 {
+                        0 => vec![10 * (round + 1), 10 * (round + 1) + 1, 10 * (round + 1) + 2],
+                        _ => vec![round, round + 1],
+                    }
+                } else {
+                    vec![round, round + 1]
+                };
+                let names: Vec<&str> = vec!["x"; ids.len()];
+                let batch = int_string_batch(ids.clone(), names);
+                let cached_out = cached.process(batch.clone()).await.unwrap();
+                let fresh_out = make().process(batch).await.unwrap();
+                let (ProcessResult::Single(cached_batch), ProcessResult::Single(fresh_batch)) =
+                    (cached_out, fresh_out)
+                else {
+                    panic!("expected single results for {query}");
+                };
+                assert_eq!(
+                    cached_batch.record_batch().schema(),
+                    fresh_batch.record_batch().schema(),
+                    "query {query} round {round} (ids {ids:?}): schema differs"
+                );
+                assert_eq!(
+                    cached_batch.record_batch(),
+                    fresh_batch.record_batch(),
+                    "query {query} round {round} (ids {ids:?}): values differ"
+                );
+            }
+        }
+    }
+
+    /// Recursive queries must bypass the physical-plan cache: their
+    /// work-table state is one-shot per execution. A leaked cache would
+    /// return drained (empty) recursion results from the second batch on;
+    /// equivalence with a fresh processor per batch pins the guard.
+    #[tokio::test]
+    async fn recursive_query_bypasses_physical_cache() {
+        let query = "WITH RECURSIVE seq AS (\
+                     SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq WHERE n < 4\
+                     ) SELECT n FROM seq ORDER BY n";
+        let make = || {
+            SqlProcessor::new(
+                SqlProcessorConfig {
+                    query: query.to_string(),
+                    table_name: None,
+                    temporary_list: None,
+                },
+                &empty_resource(),
+            )
+            .unwrap()
+        };
+        assert!(
+            make().recursive_query.get().is_none() || *make().recursive_query.get().unwrap(),
+            "detection must classify the WITH RECURSIVE plan"
+        );
+
+        let cached = make();
+        for round in 0..3 {
+            let batch = int_string_batch(vec![round], vec!["x"]);
+            let cached_out = cached.process(batch.clone()).await.unwrap();
+            let fresh_out = make().process(batch).await.unwrap();
+            let (ProcessResult::Single(cached_batch), ProcessResult::Single(fresh_batch)) =
+                (cached_out, fresh_out)
+            else {
+                panic!("expected single results");
+            };
+            assert_eq!(
+                cached_batch.record_batch(),
+                fresh_batch.record_batch(),
+                "recursive query round {round} differs from full replan"
+            );
+            assert_eq!(cached_batch.len(), 4, "round {round} must keep all rows");
+        }
+        // Sequential processing reuses one pooled context; every batch must
+        // have re-planned (the cache never engages for recursive queries).
+        assert_eq!(
+            cached
+                .physical_plan_builds
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    /// Ad-hoc release timing (NOT run by CI): cached physical plan vs a
+    /// per-batch physical re-plan on the same pooled context, analyzed and
+    /// optimized plans cached in both. Run with:
+    /// `cargo test --release -p arkflow-plugin --lib -- --ignored sql_physical_plan_timing --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn sql_physical_plan_timing() {
+        fn drop_physical_cache(processor: &SqlProcessor) {
+            let mut caches = processor.context_caches.lock().unwrap();
+            for cache in caches.values_mut() {
+                cache.physical = None;
+            }
+        }
+
+        let batch_rows = 1_000usize;
+        let batches = 200usize;
+        let rounds = 5usize;
+
+        let shapes = [
+            ("aggregate", "SELECT sum(value) AS total FROM flow"),
+            (
+                "filter-project",
+                "SELECT value * 2 AS doubled FROM flow WHERE value >= 0",
+            ),
+        ];
+        for (label, query) in shapes {
+            let make = || {
+                SqlProcessor::new(
+                    SqlProcessorConfig {
+                        query: query.to_string(),
+                        table_name: None,
+                        temporary_list: None,
+                    },
+                    &empty_resource(),
+                )
+                .unwrap()
+            };
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new("tag", DataType::Utf8, false),
+            ]));
+            let make_batch = |round: usize| {
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(
+                            (0..batch_rows as i64)
+                                .map(|i| i + round as i64)
+                                .collect::<Vec<_>>(),
+                        )),
+                        Arc::new(StringArray::from(
+                            (0..batch_rows)
+                                .map(|i| format!("tag-{i}"))
+                                .collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .unwrap();
+                Arc::new(MessageBatch::new_arrow(batch))
+            };
+
+            async fn time_run(
+                processor: &SqlProcessor,
+                make_batch: impl Fn(usize) -> MessageBatchRef,
+                drop_cache: bool,
+                rounds: usize,
+                batches: usize,
+            ) -> std::time::Duration {
+                let mut best = std::time::Duration::MAX;
+                for _ in 0..rounds {
+                    let started = std::time::Instant::now();
+                    for i in 0..batches {
+                        if drop_cache {
+                            drop_physical_cache(processor);
+                        }
+                        processor.process(make_batch(i)).await.unwrap();
+                    }
+                    best = best.min(started.elapsed());
+                }
+                best
+            }
+
+            // Warm up code paths before measuring.
+            let warm = make();
+            for i in 0..4 {
+                warm.process(make_batch(i)).await.unwrap();
+            }
+
+            let rows = batches * batch_rows;
+            let cached_processor = make();
+            let cached_time = time_run(&cached_processor, make_batch, false, rounds, batches).await;
+            println!(
+                "{label} cached-physical-plan: {rows} rows in {:?} ({:.0} rows/s)",
+                cached_time,
+                rows as f64 / cached_time.as_secs_f64()
+            );
+            let replan_processor = make();
+            let replan_time = time_run(&replan_processor, make_batch, true, rounds, batches).await;
+            println!(
+                "{label} per-batch-replan:     {rows} rows in {:?} ({:.0} rows/s)",
+                replan_time,
+                rows as f64 / replan_time.as_secs_f64()
+            );
+            println!(
+                "{label} planning overhead removed: {:.2}x",
+                replan_time.as_secs_f64() / cached_time.as_secs_f64()
+            );
+        }
     }
 
     #[tokio::test]
