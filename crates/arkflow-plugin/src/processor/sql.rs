@@ -652,9 +652,10 @@ impl SqlProcessor {
         // The cached physical plan's scan reads the shared batch slot at
         // execution time, so reuse needs the optimized plan's guards (schema
         // match, no time-folding functions) plus the recursive-query guard:
-        // a reused plan is refreshed with `reset_plan_states` because some
-        // exec nodes (repartition channels, join build futures) hold
-        // one-shot per-execution state inside the node.
+        // a reused plan is refreshed with `refresh_for_reexecution` (targeted
+        // rebuild of the nodes in `carries_execution_state`) because some
+        // exec nodes (repartition channels, join build futures, TopK filters)
+        // hold one-shot per-execution state inside the node.
         let recursive = self.recursive_query.get().copied().unwrap_or(false);
         let cacheable = !time_dependent && !recursive;
         let cached_physical = if cacheable {
@@ -1669,11 +1670,6 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(
-            make().recursive_query.get().is_none() || *make().recursive_query.get().unwrap(),
-            "detection must classify the WITH RECURSIVE plan"
-        );
-
         let cached = make();
         for round in 0..3 {
             let batch = int_string_batch(vec![round], vec!["x"]);
@@ -1691,6 +1687,15 @@ mod tests {
             );
             assert_eq!(cached_batch.len(), 4, "round {round} must keep all rows");
         }
+        // The detection ran on the first analyzed plan: this query must be
+        // classified recursive (asserted AFTER the batches above, where the
+        // OnceLock is guaranteed set — a fresh processor's would still be
+        // unset and the check vacuous).
+        assert_eq!(
+            cached.recursive_query.get(),
+            Some(&true),
+            "detection must classify the WITH RECURSIVE plan"
+        );
         // Sequential processing reuses one pooled context; every batch must
         // have re-planned (the cache never engages for recursive queries).
         assert_eq!(
