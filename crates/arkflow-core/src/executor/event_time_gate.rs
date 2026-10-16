@@ -1420,6 +1420,24 @@ pub(crate) fn split_by_physical_partition_for_source(
     // output order is the identity-sorted order; sorting the (now tiny) list
     // of distinct partitions preserves it exactly.
     groups.sort_by(|a, b| a.0.cmp(&b.0));
+    // Two borrowed keys can construct the SAME identity: a connector topic
+    // literally named `__arkflow_source__:{source_id}` equals the
+    // connector-neutral fallback identity. The identity-keyed BTreeMap kept
+    // one group per identity, so merge such groups and restore in-group row
+    // order (each bucket's indices are row-ordered, their concatenation is
+    // not). Zero cost on the common no-collision path.
+    let mut merged: Vec<(EventTimePartition, Vec<u32>)> = Vec::with_capacity(groups.len());
+    for (identity, mut indices) in groups {
+        if let Some(last) = merged.last_mut() {
+            if last.0 == identity {
+                last.1.append(&mut indices);
+                last.1.sort_unstable();
+                continue;
+            }
+        }
+        merged.push((identity, indices));
+    }
+    groups = merged;
     groups
         .into_iter()
         .map(|(partition, indices)| {
@@ -2305,6 +2323,79 @@ mod tests {
                 .to_string()
                 .contains("read physical partition metadata"),
             "{error}"
+        );
+    }
+
+    /// A connector topic literally named `__arkflow_source__:{source_id}`
+    /// constructs the same identity as the connector-neutral fallback. The
+    /// identity-keyed (pre-single-pass) implementation kept ONE group for
+    /// that identity with rows in row order; the borrowed-key bucketing
+    /// must merge the two buckets rather than emitting duplicate groups.
+    #[test]
+    fn physical_partition_split_merges_colliding_reserved_topic_identity() {
+        let ext = {
+            let mut builder = datafusion::arrow::array::MapBuilder::new(
+                None,
+                datafusion::arrow::array::StringBuilder::new(),
+                datafusion::arrow::array::StringBuilder::new(),
+            );
+            // Row 0 and row 2 carry the colliding topic; rows 1 and 3 are
+            // connector-neutral (same partition).
+            for topic in [
+                Some("__arkflow_source__:s"),
+                None,
+                Some("__arkflow_source__:s"),
+                None,
+            ] {
+                if let Some(topic) = topic {
+                    builder.keys().append_value("topic");
+                    builder.values().append_value(topic);
+                }
+                builder.append(true).unwrap();
+            }
+            Arc::new(builder.finish()) as datafusion::arrow::array::ArrayRef
+        };
+        let ext_type = ext.data_type().clone();
+        let marked = Arc::new(crate::MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("ts", DataType::Int64, false),
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new(crate::meta_columns::PARTITION, DataType::UInt32, true),
+                    Field::new(crate::meta_columns::EXT, ext_type, true),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(vec![10, 11, 12, 13])),
+                    Arc::new(StringArray::from(vec!["a", "a", "a", "a"])),
+                    Arc::new(UInt32Array::from(vec![Some(0); 4])),
+                    ext,
+                ],
+            )
+            .unwrap(),
+        ));
+
+        let groups = split_by_physical_partition_for_source(&marked, 0, Some("s")).unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "colliding identities must merge to one group"
+        );
+        assert_eq!(
+            groups[0].0,
+            EventTimePartition::for_source("s", 0),
+            "the shared identity is the namespaced source partition"
+        );
+        let times = groups[0]
+            .1
+            .record_batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            times.values(),
+            &[10, 11, 12, 13],
+            "merged rows keep original row order"
         );
     }
 

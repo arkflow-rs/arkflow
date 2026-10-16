@@ -580,7 +580,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 - ~~Kafka input 逐条出批~~ → ✅ `optimize-kafka-input-batching`（2026-10-07）：read() 改「阻塞 recv 首条 + `now_or_never` 无挂起点排空」（`batch_max_rows` 默认 1024 / `batch_max_bytes` 默认 8 MiB 双上界，=1 回退逐条），元数据一次重建（core 新增 `attach_row_source_metadata` 逐行助手），codec 每批一次解码 + 行数不符回退逐 payload 保对齐，ack 按 (topic,partition) 连续段（undo 整段重投）。release 计时（`kafka_batch_assembly_timing`，200k 行含 key/timestamp/headers 元数据）：批组装 8.87M rows/s vs 旧逐条 7×重建链 135K rows/s，**≈65.6×**（批组装路径；端到端收益受 IO/下游摊薄）；取消安全契约保持（排空为非 async 函数，编译器强制无挂起点）；
 - 窗口算子每批全量状态快照（operator.rs runtime_snapshot `buffers.clone()` ∝ 打开窗口数，高基数天花板）+ `extract_keys` 每行 String ×2-3 次/批 + accumulate 行循环 3-4 次 String clone/BTreeMap 查找；
 - event_time_gate：classify_row 每行 3-5 Vec 分配、collect_outcomes 全 Emit 仍全批深拷贝、split_by_physical_partition 每行 format!/to_owned；
-- SQL processor 物理计划每批重建（需 SwapBatchTable 自定义 ExecutionPlan 才能 cache；analyzed/optimized 已缓存）；
+- ~~SQL processor 物理计划每批重建~~ → ✅ `cache-sql-physical-plan`（2026-10-14）：SwapBatchTable 改懒 `DataSource`（执行期读槽），physical 按池化上下文+schema 缓存；重执行经定向刷新（仅重建带一次性态节点：repartition/join/sort 家族，0.4μs/批 vs create_physical_plan 74.5μs/批），`now()` 时间折叠与 WITH RECURSIVE 排除。隔离 1.59x/1.34x（aggregate/filter-project），端到端 linear/groupby/filter-project +1.7%/+1.8%/+6.8%。坑：二次执行必须刷新（RepartitionExec 通道态 panic）；TopK 动态过滤由 SortExec::reset_state 重建；官方 reset_plan_states 全树重建慢于定向刷新；计时臂标签传反曾致假阴性，阶段分解计时定位；
 - protobuf encode 逐 cell `set_field_by_name`（hash+HashMap+Arc bump ×cell；decode 侧已按字段号预解析，encode 对称补齐：每列预解析 FieldDescriptor）；
 - debezium 每消息 3 次 JSON 遍历 + before 深拷贝（先序列化再 move 可省 clone；列式累积进 builder 是终态）；
 - VRL 每行独立 MessageBatch + 每格 key String（合并单批输出）；
