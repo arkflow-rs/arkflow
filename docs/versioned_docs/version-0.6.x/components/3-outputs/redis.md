@@ -1,0 +1,155 @@
+---
+components: [output/redis]
+description: ArkFlow documentation page.
+---
+
+# Redis
+
+The Redis output writes messages to Redis using one of four data-structure operations: Pub/Sub publish, List push, Hash set, or String set. It supports single-node and cluster connections.
+
+## Configuration
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"redis"` |
+| mode | object | yes | — | Connection mode (see below). |
+| redis_type | object | yes | — | Redis operation to perform (see below). |
+| value_field | string | no | — | Binary or string column whose per-row value becomes that message's payload (a null value or a missing column is an error). When unset, the codec encoding of the batch applies. |
+
+### mode
+
+`mode` is a tagged object (selected by its `type` field).
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | `single` or `cluster`. |
+| url | string | yes (`single`) | — | Redis server URL (e.g. `redis://localhost:6379`). |
+| urls | `array<string>` | yes (`cluster`) | — | Redis cluster node URLs. |
+
+### redis_type
+
+`redis_type` is a tagged object (selected by its `type` field). All keys/fields/channels are `Expr<String>` (see [Expression objects](#expression-objects)).
+
+#### publish
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `publish`. |
+| channel | object | yes | Pub/Sub channel to publish to (expression). |
+
+#### list
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `list`. |
+| key | object | yes | List key; values are appended with `RPUSH` (expression). |
+
+#### hashes
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `hashes`. |
+| key | object | yes | Hash key (expression). |
+| field | object | yes | Hash field name (expression). |
+
+#### strings
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `strings`. |
+| key | object | yes | String key (expression). |
+
+### Expression objects
+
+`channel`, `key`, and `field` are `Expr<String>` objects:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `value` (static) or `expr` (SQL expression). |
+| value | string | yes (`value`) | Static value. |
+| expr | string | yes (`expr`) | SQL expression evaluated per message. |
+
+An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
+
+## Examples
+
+### Publish to a channel
+
+```yaml validate=fragment wrap=output
+output:
+  type: "redis"
+  mode:
+    type: "single"
+    url: "redis://localhost:6379"
+  redis_type:
+    type: "publish"
+    channel:
+      type: "value"
+      value: "notifications"
+```
+
+### Push to a List
+
+```yaml validate=fragment wrap=output
+output:
+  type: "redis"
+  mode:
+    type: "single"
+    url: "redis://localhost:6379"
+  redis_type:
+    type: "list"
+    key:
+      type: "value"
+      value: "events"
+```
+
+### Set a Hash field
+
+```yaml validate=fragment wrap=output
+output:
+  type: "redis"
+  mode:
+    type: "single"
+    url: "redis://localhost:6379"
+  redis_type:
+    type: "hashes"
+    key:
+      type: "value"
+      value: "user:1"
+    field:
+      type: "value"
+      value: "status"
+```
+
+### Set a String
+
+```yaml validate=fragment wrap=output
+output:
+  type: "redis"
+  mode:
+    type: "single"
+    url: "redis://localhost:6379"
+  redis_type:
+    type: "strings"
+    key:
+      type: "expr"
+      expr: "concat('key:', id)"
+```
+
+### Cluster connection
+
+```yaml validate=fragment wrap=output
+output:
+  type: "redis"
+  mode:
+    type: "cluster"
+    urls:
+      - "redis://redis-1:6379"
+      - "redis://redis-2:6379"
+      - "redis://redis-3:6379"
+  redis_type:
+    type: "list"
+    key:
+      type: "value"
+      value: "logs"
+```

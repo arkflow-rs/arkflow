@@ -1,0 +1,60 @@
+---
+components: [input/http]
+sidebar_label: HTTP
+---
+
+# HTTP
+
+The HTTP input runs as an Axum HTTP server and accepts POST requests sent to `address`+`path`. The request body (JSON) is decoded and forwarded into the stream processing pipeline. Optional CORS and Basic/Bearer authentication are supported. Bind failures surface synchronously: if the listen address cannot be bound (for example, the port is already in use), `connect` fails with an explicit error instead of starting silently; if the listener stops at runtime, reads report a disconnection so the engine can re-bind. As a channel-based input it follows the engine's cancellation-safety contract: dropping a pending read never loses an already-decoded message (see [Input Delivery Semantics](../../build/delivery-semantics.md#cancellation-safety)).
+
+## Configuration
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | Constant value `"http"` |
+| address | string | yes | — | Listen address, e.g. `0.0.0.0:8080` |
+| path | string | yes | — | URL path that receives messages, e.g. `/data` |
+| cors_enabled | boolean | no | `false` | Whether to enable CORS |
+| auth | object | no | — | Authentication configuration, see table below |
+
+### auth
+
+`auth` is a tagged enum (distinguished by the `type` field) with two mutually exclusive forms:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `"basic"` or `"bearer"` |
+| username | string | yes (basic) | Basic auth username |
+| password | string | yes (basic) | Basic auth password |
+| token | string | yes (bearer) | Bearer token |
+
+## Examples
+
+```yaml validate=fragment wrap=input
+input:
+  type: "http"
+  address: "0.0.0.0:8080"
+  path: "/data"
+  cors_enabled: true
+```
+
+```yaml validate=fragment wrap=input
+input:
+  type: "http"
+  address: "0.0.0.0:8080"
+  path: "/data"
+  auth:
+    type: "basic"
+    username: "user"
+    password: "pass"
+```
+
+```yaml validate=fragment wrap=input
+input:
+  type: "http"
+  address: "0.0.0.0:8080"
+  path: "/data"
+  auth:
+    type: "bearer"
+    token: "your-token"
+```

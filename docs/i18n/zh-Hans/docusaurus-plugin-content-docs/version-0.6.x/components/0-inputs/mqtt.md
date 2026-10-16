@@ -1,0 +1,64 @@
+---
+components: [input/mqtt]
+sidebar_label: MQTT
+---
+
+# MQTT
+
+MQTT 输入(Input)连接到 MQTT broker,订阅一个或多个主题(Topic),并接收实时消息。作为通道型输入,它遵循引擎的取消安全契约:取消一次未完成的 read 不会丢失已解码的消息(参见[输入投递语义](../../build/delivery-semantics.md))。
+
+## 配置
+
+| Field | Type | Required | Default | 描述 |
+|-------|------|----------|---------|-------------|
+| type | string | yes | — | 常量值 `"mqtt"` |
+| host | string | yes | — | MQTT broker 地址 |
+| port | integer | yes | — | MQTT broker 端口 |
+| client_id | string | yes | — | 唯一的客户端标识符 |
+| topics | array&lt;string&gt; | yes | — | 要订阅的主题列表(支持通配符) |
+| username | string | no | — | 认证用户名 |
+| password | string | no | — | 认证密码 |
+| qos | integer | no | — | QoS 等级(0、1、2) |
+| clean_session | boolean | no | — | 是否使用干净会话(clean session) |
+| keep_alive | integer | no | — | 保活间隔(秒) |
+
+
+## TLS
+
+设置 `tls` 块以通过 TLS 连接(MQTT 通常为端口 8883):
+
+```yaml validate=fragment wrap=input
+input:
+  type: "mqtt"
+  host: "localhost"
+  port: 8883
+  client_id: "tls-client"
+  topics: ["demo"]
+  tls:
+    enabled: true
+    ca: "/etc/arkflow/certs/ca.pem"
+```
+
+`enabled` 在块存在时默认为 true(可设 `enabled: false` 仅作文档说明);`ca`
+用于校验 broker 证书;`client_cert`/`client_key` 启用 mTLS 且必须成对配置。
+`ca` 在 mTLS 下可省略:省略时 broker 证书由平台信任库校验(例如使用系统
+签发证书的公共 broker)。只配 `client_cert` 不配 `client_key`(或反之)
+属于配置错误。省略 `tls` 块则保持明文 TCP。`client_id` 对每个连接必须唯一。
+
+## 示例
+
+```yaml validate=fragment wrap=input
+input:
+  type: "mqtt"
+  host: "localhost"
+  port: 1883
+  client_id: "my_client"
+  username: "user"
+  password: "pass"
+  topics:
+    - "sensors/temperature"
+    - "sensors/humidity"
+  qos: 1
+  clean_session: true
+  keep_alive: 60
+```

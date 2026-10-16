@@ -1,0 +1,8 @@
+{
+  "label": "Processors",
+  "link": {
+    "title": "Processors",
+    "type": "generated-index",
+    "description": "A processor is a function applied to messages passed through a pipeline. "
+  }
+}
