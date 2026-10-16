@@ -5,11 +5,15 @@ All notable changes to ArkFlow are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — accumulating toward v1.0
+## [Unreleased]
 
-Everything below has landed since v0.5.0 (2025-10-19) and will ship together in
-the next tagged release. Entries are grouped by user-perceivable area; internal
-refactoring is summarized rather than listed commit-by-commit.
+Nothing yet.
+
+## [0.6.0] — 2026-10-16
+
+Everything below landed between v0.5.0 (2025-10-19) and this release. Entries
+are grouped by user-perceivable area; internal refactoring is summarized
+rather than listed commit-by-commit.
 
 ### Added — Engine and data plane
 

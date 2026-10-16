@@ -250,7 +250,7 @@ checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
 
 [[package]]
 name = "arkflow"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arkflow-core",
  "arkflow-plugin",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "arkflow-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "arkflow-plugin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "apache-avro",
  "arkflow-core",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "arkflow-server"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arkflow-core",
  "arkflow-plugin",
