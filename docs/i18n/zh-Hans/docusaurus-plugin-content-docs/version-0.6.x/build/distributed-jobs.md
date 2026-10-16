@@ -1,0 +1,312 @@
+---
+sidebar_position: 7
+---
+
+# 分布式作业
+
+ArkFlow 作业(Job)是有状态流处理的新运行时契约,与现有 YAML 流 API 并存。一个作业是带有稳定 ID 的算子与边的图;提交一个作业会生成不可变的 `JobVersion` 与一份物理任务计划。
+
+## 架构
+
+Hub 是纯控制平面:它持久化意图(SQLite)、做出放置决策并聚合观测。Agent 是数据面(data plane),各自运行统一内核的一个子图。默认情况下,端点落在不同节点上的边是放置错误:Agent 之间只共享对象存储(恢复工件)与外部系统(源/sink)。选择 `placement: split` 的作业——要求每个参与节点运行 shuffle 数据面——还会额外用直连的有界 TCP 通道把各 Agent 连接起来(参见下文[放置模式](#放置模式))。
+
+```mermaid
+flowchart TB
+    C["Console (Vite web app)<br/>DAG orchestrator · workbench · runtime views"]
+    subgraph HUB["Hub — single control plane"]
+        direction TB
+        API["HTTP API /api/v1<br/>jobs · nodes · streams · checkpoints"]
+        DB[("SQLite storage actor<br/>intents · outbox · observed · catalog")]
+        REC["reconcile_once()<br/>outbox claim-lease dispatch · retry · expire"]
+        PL["Placement + fencing<br/>assignments_for_nodes(generation)<br/>completeness gate"]
+        API --> DB
+        DB --> REC
+        REC --> PL
+    end
+    subgraph NA["Agent node-a"]
+        KA["JobRuntime → kernel<br/>co-located subgraph"]
+    end
+    subgraph NB["Agent node-b"]
+        KB["JobRuntime → kernel<br/>co-located subgraph"]
+    end
+    OS[("Object store (file:// or s3://)<br/>manifests · state snapshots · artifacts")]
+    EXT[("External systems<br/>Kafka · SQL · MQTT · HTTP …<br/>the cross-node bridge in colocated placement")]
+    DP[("Shuffle data plane (split placement)<br/>bounded TCP edges · key-group routing")]
+
+    C -- "Bearer (operator)" --> API
+    PL -- "commands (agent poll, session token)" --> NA
+    PL --> NB
+    NA -- "heartbeat · report" --> PL
+    NB -- "heartbeat · report" --> PL
+    NA -- "artifacts" --> OS
+    NB -- "artifacts" --> OS
+    NA -- "data" --> EXT
+    NB -- "data" --> EXT
+    NA <-. "remote edges (split only)" .-> DP
+    NB <-. "remote edges (split only)" .-> DP
+```
+
+控制流自上而下(写意图 → outbox 认领租约派发 → Agent 轮询命令);观测自下而上(心跳续租、单调递增的报告,作业代数(generation)隔离(fencing)拒绝陈旧的 generation)。
+
+## 事件时间语义
+
+作业可以声明事件时间字段、每分区水印(Watermark)、空闲分区超时与允许迟到时间。水印由活跃分区之间的最小进度聚合而来;超出窗口边界的事件由 `drop`、`route` 或 `update` 策略处理。
+
+事件时间字段接受 Int64(毫秒)以及以秒、毫秒、微秒或纳秒为单位的 Arrow `Timestamp` 列——全部归一化为毫秒;负时间戳与窗口边界一样按 `div_euclid` 规则取整,溢出则返回字段级错误而不是静默回绕。**Null 时间戳不会被无限期持有**:配置了 `route` 时,它们随迟到事件进入侧输出,否则被丢弃并确认。
+
+在一个批次内,水印先于当前行的分类而推进:在 `[2100, 100]` 批次中,`100` 会立即由迟到策略处理,只有真正属于未来的行才被保持。窗口聚合保留输入数值类型——`Float64` 求和以 `Float64` 输出,`Float32` 以 `Float32` 输出且 schema 兼容;`sum`/`min`/`max` 不再退化为整数哨兵值(**BREAKING** 变更;整数输入仍为 Int64)。非整数滑动窗口(`size=5, slide=2`)会枚举包含事件时间戳的每个窗口起点,而不是用整数除法截断。
+
+已触发的窗口会在允许迟到期内保留:该期间内迟到的 `Update` 会修订同一个 `(operator, key, window)` 聚合,并附带 `__arkflow_window_update` 标记列重新发出完整的修正结果;缓冲只在期限过期后才清理。
+
+keyed 聚合缓冲受 `max_buffered_keys` 约束(默认 65536 个存活 `(window, key)` 条目)。达到上限时——watermark 停滞或 key 基数极高——最老窗口的聚合会被驱逐(以节流 `warn` 日志显式记录驱逐数量);被驱逐的窗口在其触发条件最终到达时不再发射任何结果。
+
+## 内嵌状态与检查点(Checkpoint)
+
+热路径状态位于 Compute 节点本地的内嵌 KV 存储中,按作业、算子与键命名空间隔离,带 TTL、容量计量与格式版本。检查点把包含状态快照、源位置与水印的带校验和保护的 manifest 写入共享对象存储;恢复在任何输入读取之前先恢复状态与源位置。
+
+在单节点上,命令驱动的执行与检查点流程如下:
+
+```mermaid
+flowchart TB
+    CMD["poll → StartJob(assignments, generation, recovery?)"] --> SP["spawn_kernel_job(plan, task_ids)<br/>build_subgraph — chain co-location · bounded flume (cap 1024)<br/>restore BEFORE read: state · positions · per-partition watermarks"]
+    SP --> DP
+    subgraph DP["data path (unified kernel)"]
+        direction LR
+        SRC["[Source]"] --> GATE["EventTimeGate"] --> OPS["fused operator chain"] --> SINK["[Sink]"]
+        ALI["Aligner: buffers the fast input,<br/>holds acks until every barrier aligned"]
+    end
+    DP --> ST["StateBackend (redb · namespace · TTL)"]
+    ST -- "snapshot" --> ACK["TaskCheckpointAck<br/>positions · per-partition watermarks · state refs"]
+    ACK --> HG["Hub completeness gate<br/>seal manifest only if EVERY planned task is in the cut"]
+    HG --> MAN[("manifest: checksum · format_version<br/>checkpoint / savepoint artifacts")]
+```
+
+### 已确认切面
+
+检查点的源位置、水印、算子状态与屏障(Barrier)必须全部来自同一个**已确认边界**:注入屏障之前,源链先排空在途(非持有)的确认——每个 ack 先提交到状态日志,再推进 WAL 游标,最后提交源侧偏移量(offset)——之后才封存包含位置与水印的不可变切面。有状态算子的变更先进入执行本地的日志,只有在其输出被确认之后才提交到状态后端;输出或任务失败时回滚,因此重放不会重复应用。多输入链在屏障对齐之后、放行屏障后数据之前捕获已提交 epoch 的快照。窗口缓冲中持有的确认不会阻塞屏障:其状态保持暂存,恢复时通过从源位置重放来重建。
+
+Kafka 检查点位置是每个 topic-partition 的**最高连续已确认偏移量**:完成顺序乱序的扇出分支无法跳过间隙中未确认的记录。单一源任务保持连接器的全分区订阅;只有多个物理任务才执行显式分区分配。恢复时,检查点位置被合并进完整的已配置分配——没有记录位置的分区保持其配置的起点,恢复出的位置成为下一次检查点的游标。
+
+启用 WAL 的输入在 `read()` 返回前完成持久刷盘;ack 时 WAL 游标先前进,然后才提交数据源的原生偏移量。恢复会把检查点已覆盖的 WAL 连续前缀折入本地游标,因此过滤后的重放不会留下确认缺口。关闭、重连与处理器并发池都监听取消信号;停止时,先 join 工作者与收集器,再关闭源、sink 与 WAL。
+
+只有携带完整计划任务集的 manifest 才会封存为 Completed:缺失、重复或多余的任务条目都会被拒绝,而节点离线期间会保留最后一个有效恢复点。**状态格式匹配时允许升级到更新的作业版本**(新版本可以恢复旧的 savepoint);降级与格式变更没有迁移路径,双方都会拒绝。
+
+#### 恢复期扩缩容
+
+恢复会在还原状态**之前**校验恢复工件记录的任务集与当前编译计划的任务集。不一致——变更了 `parallelism` 或算子拓扑——会保守失败,给出指明任务集差异(移除/新增任务)的配置错误,并提供两条出路:恢复原并行度,或用新的 checkpoint/savepoint 重置状态。绝不会带着空状态静默继续。无状态作业完全不产出恢复工件——manifest 封存校验拒绝空状态快照,本地恢复选择也仅作用于带持久状态的计划——因此无状态作业直接按新并行度编译运行。
+
+在 JobSpec 上声明 `rescale: true` 即选择重分布而非失败——仅支持保存状态中涉及的算子在新计划中全部保留的任务集变更(并行度调整符合;移除有状态算子不符合,会显式失败):
+
+```yaml validate=fragment wrap=engine
+jobs:
+  - id: orders-rollup
+    version: 1
+    rescale: true
+    parallelism: 4        # was 1 when the checkpoint was written
+    max_parallelism: 128  # keep unchanged so key-group ownership stays stable
+    operators:
+      - id: source
+        kind: source
+      - id: sink
+        kind: sink
+    edges:
+      - id: e1
+        from: source
+        to: sink
+        partitioned: true
+    sources:
+      - operator_id: source
+        input_type: kafka
+        config:
+          type: kafka
+          brokers: ["localhost:9092"]
+          topics: ["orders"]
+          consumer_group: orders-rollup
+          start_from_latest: false
+        codec:
+          type: json
+        time:
+          mode: processing_time
+    sinks:
+      - operator_id: sink
+        output_type: stdout
+    state:
+      backend: embedded_kv
+      format_version: 1
+    recovery: latest_checkpoint
+```
+
+`rescale: true` 时,工件中的 keyed 状态条目跨新任务集重分布:路由键从每个条目的编码键还原(窗口条目跳过 8 字节窗口起点;有状态算子条目剥除类型前缀),归属按 `key_group_for_key(key, max_parallelism)` 计算,条目被改写进新计划中拥有该键组的任务的命名空间。键与值逐字节保留;键编码无法识别的条目会让恢复显式失败,而不是猜测性归属。同一套重分布适用于本地 Job 与 Hub–Agent 分布式部署:分布式路径下每个节点读取完整工件、重分布全部条目,但只恢复新归属属于自己的那部分——每个条目恰好落在一个节点上。扩缩容期间保持 `max_parallelism` 不变,键组归属才稳定。扩缩容是恢复期操作——只在恢复路径上生效(停机 → 修改 `parallelism` → 启动),不作用于运行中作业的拓扑变更(那要用[资源感知再均衡](#资源感知放置与再均衡))。
+
+## 控制平面与兼容性
+
+Hub 持久化作业、版本、任务分配与恢复记录,并使用 generation 防止陈旧的任务报告覆盖更新的意图。Agent 通过能力声明确认作业运行时、状态后端与检查点协议版本。旧式 `Stream` YAML API 既不转换也不移除,继续在原有路径上运行。
+
+作业的观测状态派生自**同一 (generation, action) 下全部预期分配**的聚合:只有每个分配都成功时才报告 running/stopped;仍在 pending 或可重试降级的部分会让作业保持收敛,单个节点的瞬时失败绝不会覆盖健康节点。检查点提交同样要求预期分配的完整集合;离线节点的部分结果永远不会作为可恢复工件发布。Agent 使用稳定的**进程启动标识**区分真实重启,并用注册的会话令牌保护请求;每次重新注册都把报告序列重置为 0,旧会话的迟到报告会被拒绝,而不会回滚新会话的观测快照。长时间的检查点在后台运行,心跳、报告与取消轮询继续进行;命令失败返回带关联元数据的终态 `Failed` 结果。
+
+**部分节点故障是增量重放置。**自动放置的作业在多个派发节点之一离线(或被 opt-in 再均衡策略驱逐)时,调和器保持既有派发顺序,仅原位替换失效槽位:每个存活节点的任务集逐位不变——不重启、不重派——替换候选节点(split 放置需具备 shuffle 能力)恰好继承失效节点的任务。无候选可用时,由存活节点收敛承接失效槽位的任务,而不是把全部任务在缩小的节点集上重排。两道守卫保证其诚实性:成功的 start 只有在其记录的 assignment 与当前映射一致时才满足派发跳过(漂移的声明会被 superseded 并重派——这同时覆盖 Hub 重启场景,重启后重派一次作为 assignment 确认);节点上报 **failed 观测会使其成功 start 失效**,崩溃的内核(例如远程边重连预算耗尽后)从恢复工件自动重启,无需运维驱动的重启。`placement: colocated`(默认)下存活节点的内核完全不受对端故障影响;`placement: split` 下存活节点通往失效节点的远程边仍按 fail-closed 线协议处理(有界透明重连,然后失败),之后由上述守卫以稳定映射重启。
+
+分区边按 JobPlan 的键组范围选择下游任务,而不是对物理源子任务取模,因此来自不同源分区的相同键仍会落在同一下游所有者上。旧式 YAML 流的滚动/会话缓冲保持"先聚合后流水线"的顺序并输出原始 schema/行;旧式按行数的 `sliding_window` 不会被误读为时间窗口,不兼容的配置在编译期失败并给出迁移提示。
+
+### 放置模式
+
+**任务放置有两种模式**,由作业规格的 `placement` 字段选择。
+
+默认的 `placement: colocated` 下,一次分配绝不会把一条边拆到两个节点,Hub 放置保证相邻算子位于同一 Compute 节点:中间数据从不离开其所在节点,水平扩展来自源分区拆分(例如把 Kafka 分区摊到多个节点)与独立子任务。需要跨整条流 shuffle 的计算应当经由外部系统串联两个作业(例如一个按键重新分区的 Kafka topic)——或者选择 `split`。
+
+`placement: split` 下,Hub 按确定性的计划顺序把计划的物理任务轮转分配到目标节点,因此同一算子的子任务可能落在不同节点。端点落在不同节点上的边被物化为**远程网络边**:分区边按键组范围把记录路由到拥有它的子任务,每个 (子任务对, 算子对) 一条有界 TCP 通道,具备与本地有界通道相同的 FIFO、屏障、水印与确认语义——上游源 ack 只有在每个下游副本都确认之后才完成,窗口持有的批次与本地完全一样地被排除在屏障排空之外。旁路边——错误 sink 与迟到事件路由——必须保持同位共置;如果计划会把某条旁路边拆到跨节点,整个放置会在派发前被拒绝。Hub 只把 `split` 放置派发给运行数据面的节点(配置了 `health_check.data_port` 且 `health_check.data_host` 可路由,并以 `network_shuffle` 能力宣告);否则放置直接失败(fail closed),不做部分派发。从不设置这些字段的部署保持共置行为不变——没有额外监听器、没有能力宣告、放置结果逐字节相同。
+
+#### 资源感知放置与再均衡
+
+当作业未用 `node_ids` 固定目标节点时,Hub 在每次放置前按资源余量为候选节点排序:有最新资源指标的节点优先(内存可用量降序、CPU 余量降序、节点 ID 升序),未上报指标的节点按 ID 序排在最后。排序后的集合仍走同一套确定性轮转,且被保留的放置总是按最初派发顺序重新分发,因此作业的 task→node 映射不会在多次派发之间漂移。
+
+默认情况下,放置成功后永不再移动。作业可通过 `rebalance` 策略显式开启再均衡:当所在节点的资源压力(内存占用或 CPU 超过阈值)连续多个上报周期持续存在、且作业级冷却期已过时,Hub 会把作业迁移走——迁移复用与节点闪断相同的 fencing 重放置路径:被弃节点的 start 被置为 superseded 并收到 stop 命令,剩余最优节点上始终只有一个运行实例。迁移与其余重放置一样从最近 checkpoint 恢复;固定 `node_ids` 的作业不能与 `rebalance: auto` 组合。
+
+```yaml validate=full
+streams: []
+jobs:
+  - id: rebalanced-orders
+    version: 1
+    placement: split
+    rebalance:
+      mode: auto            # off (default) | auto
+      pressure_streak: 3    # consecutive pressuring reports before a move
+      cooldown_ms: 300000   # minimum delay between relocations
+    operators:
+      - id: source
+        kind: source
+      - id: sink
+        kind: sink
+    edges:
+      - id: source-sink
+        from: source
+        to: sink
+    sources:
+      - operator_id: source
+        input_type: memory
+        time:
+          mode: processing_time
+    sinks:
+      - operator_id: sink
+        output_type: drop
+```
+
+### 失败与就绪语义
+
+每个校验入口(`--validate`、配置 API、YAML 中声明的本地作业以及编译后的流)都执行与真实启动相同的无副作用深度构建:未知组件、不支持的状态后端与非法图边在校验期失败,而不是在运行时。dry run 打开的 WAL 会在其返回前关闭,同一 redb 路径可以立即被真实运行时重新打开。进入 `Starting` 之后,dry run、图构建或资源连接失败的运行时会在错误返回前转换为 `Failed`;本地作业构建失败会让引擎启动失败,而不是在损坏状态下宣告就绪。临时资源、源与 sink 按依赖顺序在任何任务循环启动之前连接,部分启动则以相反顺序关闭已连接的资源。
+
+### 网络边:透明重连与保守失败
+
+跨节点(网络 shuffle)边按契约保守失败(fail-closed):连接断开、协议或认证失败、资源上限溢出都会使受影响的作业 attempt 失败并清理边的两端——attempt 随后在世代围栏(generation fencing)下被重新放置,绝不会停留在半开状态继续产出或丢弃数据。
+
+瞬时网络故障会先被吸收。在有界重拨预算内(默认 5 次、带退避),上游侧重拨对端并重放全部尚未回执的数据帧;接收侧按投递序号去重(序号不大于已投递最大 seq 的重放帧被丢弃并补发 Acked,两侧均为幂等),因此作业继续运行而不产生失败上报。确定性错误(非法帧、认证失败)在预算内同样会被重拨——重放必然复现,因此它们只是消耗预算,耗尽后该边才转为保守失败。
+
+两道界限保证这套机制在压力下保持诚实。重放缓存同时受条数上限与近似字节预算(默认 256 MiB,按未回执帧的 Arrow 批次内存估算)约束:重放注册超过任一上限的发送走正常发送失败路径,而不是让缓存无界增长。回执读循环的空闲预算是分级的:空闲连接 30 秒无入站帧即判定死连接;而仍有批次等待回执的连接获得 10 分钟预算——因背压而暂扣回执的慢下游不会被误判为死对端。
+
+确认(ack)跨远程边镜像:源 ack 只有在**所有**下游副本回执齐备后才完成;下游处理失败会回发 `Failed` 回执,上游立即中止对应的 fan-out 分支(走与本地分支相同的补偿路径),而不是等待屏障排空超时。若回执彻底丢失——下游节点在处理完成与回执发出之间崩溃——挂起的 ack 永不完成,该轮检查点保守失败,恢复时从上一个封存切面重放(至少一次)。
+
+### 双流 join
+
+Job DAG 支持 keyed interval join 算子。`Join` 算子声明恰好两条入边,并以生产者声明侧别(`left_from`/`right_from` 上游算子 id——通道顺序是内核内部细节)。配置含 `left_key`/`right_key`、`window_ms`,可选 `left_timestamp`/`right_timestamp`(默认 `__meta_timestamp`)、`ttl_ms`、`max_per_key`,以及 `join_type`(默认 `inner`;`left_outer`/`right_outer`/`full_outer` 保留 outer 侧的未匹配行):
+
+```yaml validate=fragment wrap=engine
+jobs:
+  - id: join-orders-profiles
+    version: 1
+    parallelism: 1
+    max_parallelism: 128
+    operators:
+      - id: orders
+        kind: source
+      - id: profiles
+        kind: source
+      - id: join-orders
+        kind: join
+        config:
+          join_type: left_outer
+          left_from: orders
+          right_from: profiles
+          left_key: customer_id
+          right_key: customer_id
+          window_ms: 5000
+      - id: sink
+        kind: sink
+    edges:
+      - { id: left, from: orders, to: join-orders }
+      - { id: right, from: profiles, to: join-orders }
+      - { id: out, from: join-orders, to: sink }
+    sources:
+      - operator_id: orders
+        input_type: generate
+        config:
+          type: generate
+          context: '{ "customer_id": "c-1", "amount": 42, "ts": 1757000000000 }'
+          interval: 500ms
+          batch_size: 1
+        codec:
+          type: json
+        time:
+          mode: event_time
+          timestamp_field: ts
+          watermark:
+            strategy: bounded_out_of_orderness
+            out_of_orderness_ms: 2000
+            idle_timeout_ms: 60000
+      - operator_id: profiles
+        input_type: generate
+        config:
+          type: generate
+          context: '{ "customer_id": "c-1", "tier": "gold", "ts": 1757000000000 }'
+          interval: 700ms
+          batch_size: 1
+        codec:
+          type: json
+        time:
+          mode: event_time
+          timestamp_field: ts
+          watermark:
+            strategy: bounded_out_of_orderness
+            out_of_orderness_ms: 2000
+            idle_timeout_ms: 60000
+    sinks:
+      - operator_id: sink
+        output_type: stdout
+```
+
+语义与边界:
+
+- 左右行在 key 相等且事件时间差 ≤ `window_ms` 时匹配。匹配即时发射,与 `join_type` 无关(at-least-once——恢复后重放要求下游容忍重复)。
+- 输出列为原始左列加前缀 `l_`、右列加前缀 `r_`,外加 `join_key`。outer 模式下,可能在未匹配发射中全为 null 的侧在输出 schema 中声明为 nullable(`left_outer` 为 `r_*`,`right_outer` 为 `l_*`,`full_outer` 两侧);`inner` 输出 schema 保持不变。
+- `left_outer`/`right_outer`/`full_outer` 下,outer 侧从未匹配的行在链级 watermark 越过 `timestamp + window_ms + ttl_ms` 时发射,对侧列全为 null。匹配过的行不会再作为未匹配发射。发射需要对侧 schema:对侧尚无数据时,被逐出行暂存于有界队列(每侧 `max_per_key`,超限丢最旧),schema 已知后补发。无 watermark 的 processing-time 源永不发射未匹配行——outer join 建议使用事件时间源。
+- 状态有界:watermark 越过 `timestamp + window_ms + ttl_ms` 后逐出;每 key 每侧最多保留 `max_per_key` 行(最旧先逐出)。outer 模式下容量逐出同样把被逐出行作为未匹配发射——无 watermark 保证,其后的匹配可能双发(at-least-once 附属语义)。无 watermark 的 processing-time 源只能靠容量上限——join 建议使用事件时间源。容量逐出可观测:每次容量逐出会发出节流后的 `warn` 日志(含侧别、key、缓冲深度、`max_per_key` 与节流窗口内的累计次数)。inner 侧容量逐出直接丢弃该行,warn 是这些落在 join 之外的数据的唯一痕迹——热点 key 上持续出现该 warn 意味着 `max_per_key`(或 window/ttl 界)对倾斜度而言过小。
+- 恢复时缓冲(含逐行 matched 标记)由 checkpoint 重放重建,无独立 join 快照。链级 watermark 取两侧最小值,除既有迟到契约外,重放不会产生「假未匹配」。
+- 每侧 schema 必须在流生命周期内保持稳定;每侧上游算子必须以单子任务喂入 join——多子任务侧在图构建期即失败,并指引把上游并行度设为 1。
+- 不支持:temporal(维表)join、非 equi-join、跨节点 shuffle join(join 算子与两条上游边共置单节点)。
+
+流式配置的 legacy `join` buffer(含带 legacy `join` 字段的窗口 buffer)仍编译失败,指引指向 Job DAG join 算子。
+
+## 运营上限
+
+单个 Hub 支持最多 **256 个 Agent** 的舰队(`MAX_NODES`):超出上限的节点注册会被拒绝而非静默降级,因此超容量的舰队会在接入时显式失败。超出 256 节点/Hub 的部署规模未经测试——规划更大舰队前请先联系维护者(借助 Agent 多 Hub 发现把舰队拆到多个 Hub 是一条路径)。
+
+该上限有生产就绪 harness 的实测证据支撑(in-memory 存储、单机环境):
+
+- **规模阶梯 25 → 64 → 128 → 256 节点满员:**命令轮次 p99 稳定在 1044–1051 ms,与舰队规模无关(未观察到拐点);256 节点满员时 Hub 进程 RSS 约 441 MB。
+- **一小时长稳(64 节点、session TTL 30s、Hub 重启风暴 ×10、全舰队 rebirth):**2859 轮命令,round p99 1055 → 1193 ms(+13%,无漂移),RSS 增长斜率 38.5 KB/s(低于 50 KB/s 门限),全部有界历史表收敛于保留界。
+
+## API 示例
+
+```http
+POST /api/v1/jobs/validate
+POST /api/v1/jobs
+PUT  /api/v1/jobs/{job_id}/desired-state
+GET  /api/v1/jobs/{job_id}
+GET  /api/v1/jobs/{job_id}/detail
+GET  /api/v1/jobs/{job_id}/versions
+POST /api/v1/jobs/{job_id}/checkpoints
+POST /api/v1/jobs/{job_id}/savepoints
+POST /api/v1/jobs/{job_id}/upgrades
+POST /api/v1/jobs/{job_id}/upgrades/{upgrade_id}/rollback
+```
+
+工作台与 API 客户端都应先调用 `validate` 检查编译计划与节点能力,再以 `stopped` 提交并查看 `detail`;确认之后才切换到 `running`。版本升级要求作业已停止且收敛,并持有状态格式兼容的已完成 savepoint;升级失败时作业保持停止,由操作者显式恢复旧版本。检查点/savepoint 生命周期绑定到作业版本与状态格式版本。

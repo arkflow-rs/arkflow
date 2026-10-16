@@ -1,0 +1,8 @@
+{
+  "label": "Temporary",
+  "link": {
+    "title": "Temporary",
+    "type": "generated-index",
+    "description": "Temporary components provide temporary storage capabilities for data processing pipelines. They can be used to store intermediate results, cache data, or provide lookup tables for SQL queries."
+  }
+}

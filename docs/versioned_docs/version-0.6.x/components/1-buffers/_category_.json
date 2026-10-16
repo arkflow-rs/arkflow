@@ -1,0 +1,8 @@
+{
+  "label": "Buffers",
+  "link": {
+    "title": "Buffers",
+    "type": "generated-index",
+    "description": "A buffer is an optional component type that immediately follows the input layer and can be used as a way to decouple the transaction model from downstream components such as processing layers and outputs. This is considered a high-level component, as most users may not benefit from buffers, but they allow you to group messages using windowing algorithms. "
+  }
+}

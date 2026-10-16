@@ -1,0 +1,122 @@
+---
+sidebar_position: 1
+---
+
+# Control plane overview
+
+ArkFlow has an optional control plane for operating many compute nodes as a
+fleet: a **Hub** (the authoritative registry and command broker), per-node
+**Agents** that report runtime state and execute commands, and a web **console**.
+Agents declare their capabilities at registration — for example, a node
+configured with a shuffle data plane advertises `network_shuffle` plus a
+routable data address, which placement uses to decide which jobs it can
+accept.
+
+The control plane shares the same HTTP server as the health checks. Configure
+its bind address and versioned prefix with `health_check.address` and
+`health_check.api_prefix`; an optional `health_check.api_token` enables Bearer
+authentication for the versioned control-plane API (read and write endpoints
+alike — see below). Keep the listener local or behind an authenticated reverse
+proxy. When `health_check.hub_urls`
+is empty (or absent), ArkFlow runs in standalone mode and only the
+compatibility health routes are served; a non-empty list enables Agent mode
+with multi-Hub failover (see
+[deployment](deploy.md#agent-multi-hub-failover)).
+
+## Standalone engine security
+
+The standalone engine is fail-closed like the Hub: startup refuses a
+non-loopback `health_check.address` when `health_check.api_token` is unset.
+Set the token before binding the control API beyond localhost, or explicitly
+acknowledge the exposure with `health_check.insecure_local: true` — the
+process then starts and logs an error-level warning. A loopback bind with no
+token keeps the zero-friction local-development default.
+
+When `api_token` is configured, authentication is default-deny: **every**
+endpoint under `/api/v1` — reads such as `/streams`, `/events`,
+`/components`, `/schema`, and `/api/v1/metrics`, as well as lifecycle commands
+and configuration writes — requires a valid `Authorization: Bearer <token>`
+header and answers `401` without one. Monitoring scripts that scrape
+`/api/v1/metrics` must send the token (or scrape the top-level `/metrics` on
+the same listener, which stays token-less for scrapers). The health probes
+`/health`, `/readiness`, and `/liveness` also stay unauthenticated so
+orchestrators can probe them.
+
+## API endpoints
+
+Resource endpoints include `/api/v1/system`, `/nodes`, paginated `/streams`,
+`/operations`, `/events`, `/configuration`, `/components`, and `/schema`.
+`/metrics` exposes Prometheus text exposition. Job endpoints include job
+CRUD, check­points and savepoints, version history, and upgrades — the
+upgrade endpoint's atomic mode orchestrates savepoint → version commit →
+recovery start behind one call (see
+[Atomic job upgrades](./job-upgrades.md)).
+
+Lifecycle commands return `202 Accepted` with an operation ID; poll
+`/api/v1/operations/{id}` until it reaches a terminal state. Each command is
+idempotent for the same resource/action while an equivalent operation is
+active. Lifecycle commands target
+`/api/v1/nodes/{node_id}/streams/{stream_id}/{action}`.
+
+The compatibility health routes `/health`, `/readiness`, `/liveness`, `/metrics`,
+and the legacy `/api/v1/config*` aliases remain available.
+
+## Configuration reconciliation
+
+Configuration changes are parsed and validated before reconciliation:
+
+- **unchanged** streams keep their running task;
+- **changed or removed** streams are stopped; new/changed streams are built
+  before they are started;
+- versions are written atomically under `.arkflow/config-history`
+  (override with the `ARKFLOW_CONFIG_HISTORY_DIR` environment variable, for
+  example to keep history on a persistent volume), and rollback creates a new
+  child version rather than rewriting history. A version whose runtime
+  application fails is retracted, so the history only contains versions that
+  were actually active.
+
+Stream IDs must contain only ASCII letters, digits, `-`, or `_`; legacy
+configurations receive deterministic `stream-0`, `stream-1`, … IDs.
+
+Node configuration is read from `/api/v1/nodes/{node_id}/configuration`; apply
+and rollback are dispatched through the selected node's Agent session.
+Configuration snapshots are redacted before they are retained by the Hub.
+
+## Node sessions and leases
+
+The Hub issues every Agent session a hard expiry (`session_ttl_ms`, one hour by
+default) on top of the node lease. An expired session stops authenticating, and
+the Agent treats the rejection like any session loss: it re-registers with its
+stable boot identity, preserving queued commands and reported resources. A
+stale node remains visible
+but cannot receive new commands; a node marked stale shows its last-seen time,
+and mutating actions that require Agent dispatch are disabled or explained
+rather than silently queued.
+
+If a compute node cannot reach the Hub, it keeps its local data-plane policy,
+retries registration and heartbeats with bounded backoff, and surfaces a
+disconnected status locally; its in-flight streams keep running against their
+configured inputs and outputs. The WAL remains at-least-once — restarting a
+stream replays unacknowledged entries according to its configured WAL cursor
+semantics (see [Delivery semantics](/docs/build/delivery-semantics)).
+
+## Reconciliation model
+
+The Hub reconciles **desired versus observed** state at two levels:
+
+- the **node** — registered capabilities and lease status versus the last
+  reported runtime snapshot;
+- each **stream** — configured spec versus running task.
+
+Reconciliation is driven by the durable desired state, so a node that reconnects
+after a disconnect resumes toward the same desired configuration rather than a
+stale one. The console presents fleet health and per-node summaries first;
+select a node to scope runtime, configuration, events, and operations views to
+it.
+
+## Next steps
+
+- [Deploy](./deploy.md) — run the Hub, compute nodes, and console.
+- [Operations](./operations.md) — day-2 operations runbook.
+- [HTTP API v1](../../reference/api.md) — endpoint reference.
+- [Reconciliation rollout & recovery](./reconciliation.md).

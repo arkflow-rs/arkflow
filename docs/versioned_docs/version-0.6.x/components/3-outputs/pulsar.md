@@ -1,0 +1,98 @@
+---
+components: [output/pulsar]
+description: ArkFlow documentation page.
+---
+
+# Pulsar
+
+The Pulsar output publishes messages to an Apache Pulsar topic. It supports token and OAuth2 authentication and builds one producer per destination topic (reused across writes). Writes are reliable: each message is confirmed by a broker receipt before the write returns, and a lost broker surfaces as a bounded error rather than a hang or a fire-and-forget success.
+
+## Configuration
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| type  | string | yes | — | Fixed value `"pulsar"` |
+| service_url | string | yes | — | Pulsar service URL (e.g. `pulsar://localhost:6650`). |
+| topic | object | yes | — | Destination topic (expression; see below). |
+| auth | object | no | — | Authentication configuration (see below). |
+| value_field | string | no | — | Record field used as the message payload (binary or string column; takes precedence over `codec` when set). |
+
+### topic
+
+`topic` is an `Expr<String>` object with one of these shapes:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `value` (static) or `expr` (SQL expression). |
+| value | string | yes (`value`) | Static topic name (e.g. `persistent://tenant/namespace/topic`). |
+| expr | string | yes (`expr`) | SQL expression evaluated per message. |
+
+An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
+
+### auth
+
+`auth` is a tagged object (selected by its `type` field). Supported variants: `token` and `o_auth2`.
+
+#### token
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `token`. |
+| token | string | yes | Authentication token. |
+
+#### o_auth2
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | yes | `o_auth2`. |
+| issuer_url | string | yes | OAuth2 issuer URL. |
+| credentials_url | string | yes | URL to the client credentials file. |
+| audience | string | yes | OAuth2 audience. |
+
+## Examples
+
+### Basic Pulsar Producer
+
+```yaml validate=fragment wrap=output
+output:
+  type: "pulsar"
+  service_url: "pulsar://localhost:6650"
+  topic:
+    type: "value"
+    value: "persistent://public/default/my-topic"
+```
+
+### With Token Authentication
+
+```yaml validate=fragment wrap=output
+output:
+  type: "pulsar"
+  service_url: "pulsar+ssl://secure-pulsar:6651"
+  topic:
+    type: "value"
+    value: "persistent://public/default/secure-topic"
+  auth:
+    type: "token"
+    token: "${PULSAR_TOKEN}"
+```
+
+### With OAuth2 Authentication
+
+```yaml validate=fragment wrap=output
+output:
+  type: "pulsar"
+  service_url: "pulsar+ssl://secure-pulsar:6651"
+  topic:
+    type: "value"
+    value: "persistent://public/default/events"
+  auth:
+    type: "o_auth2"
+    issuer_url: "https://auth.example.com/oauth2"
+    credentials_url: "https://auth.example.com/credentials.json"
+    audience: "urn:pulsar:cluster"
+```
+
+## Notes
+
+- The output validates the service URL and auth fields at build and connect time; misconfiguration fails fast.
+- Pulsar authentication supports `token` and `o_auth2` (client credentials). Basic username/password authentication is not supported.

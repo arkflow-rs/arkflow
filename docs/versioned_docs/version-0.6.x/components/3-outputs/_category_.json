@@ -1,0 +1,8 @@
+{
+  "label": "Outputs",
+  "link": {
+    "title": "Outputs",
+    "type": "generated-index",
+    "description": "The output is the receiving point where we want to send consumed data after applying an optional processor array. "
+  }
+}
