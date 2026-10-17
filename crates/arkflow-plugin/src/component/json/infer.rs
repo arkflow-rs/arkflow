@@ -40,9 +40,10 @@ use rustc_hash::FxBuildHasher;
 /// `IndexMap` with the Fx hasher: upstream-parity keyed lookups (iteration
 /// order is insertion-order regardless of hasher) without SipHash dominating
 /// small records.
-type ObjMap<K, V> = IndexMap<K, V, FxBuildHasher>;
+pub(super) type ObjMap<K, V> = IndexMap<K, V, FxBuildHasher>;
 type ObjSet<V> = IndexSet<V, FxBuildHasher>;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{Serialize, SerializeMap, Serializer};
 
 /// A borrowed JSON tree. Objects keep `serde_json::Map` (IndexMap under this
 /// workspace's `preserve_order`) semantics — insertion-ordered, last value
@@ -54,8 +55,7 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 /// variant only) but are kept so inference errors can render the offending
 /// value like upstream's `{v:?}` messages.
 #[derive(Debug)]
-#[allow(dead_code)]
-enum CowValue<'de> {
+pub(crate) enum CowValue<'de> {
     Null,
     Bool(bool),
     Int(i64),
@@ -147,6 +147,32 @@ impl<'de> Deserialize<'de> for CowValue<'de> {
         }
 
         deserializer.deserialize_any(CowValueVisitor)
+    }
+}
+
+/// Borrowed serialization: strings and keys serialize without allocation and
+/// objects keep insertion order, so `serde_json::to_string(&CowValue)` is
+/// byte-identical to serializing the equivalent `serde_json::Value` under
+/// this workspace's `preserve_order` `serde_json` (numbers go through the
+/// same serializer paths: integers as digits, floats via ryu).
+impl Serialize for CowValue<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CowValue::Null => serializer.serialize_unit(),
+            CowValue::Bool(v) => serializer.serialize_bool(*v),
+            CowValue::Int(v) => serializer.serialize_i64(*v),
+            CowValue::UInt(v) => serializer.serialize_u64(*v),
+            CowValue::Float(v) => serializer.serialize_f64(*v),
+            CowValue::Str(v) => serializer.serialize_str(v),
+            CowValue::Array(items) => serializer.collect_seq(items),
+            CowValue::Object(map) => {
+                let mut out = serializer.serialize_map(Some(map.len()))?;
+                for (k, v) in map {
+                    out.serialize_entry(k, v)?;
+                }
+                out.end()
+            }
+        }
     }
 }
 
@@ -455,6 +481,21 @@ pub(super) fn infer_json_schema_streaming(content: &[u8]) -> Result<Schema, Erro
         }
     }
 
+    Ok(Schema::new(generate_fields(&field_types)?))
+}
+
+/// Infer the schema of already-parsed record objects, sharing the exact merge
+/// rules of [`infer_json_schema_streaming`] (first-seen field order, numeric
+/// widening, null relaxation, incompatible-merge failures) without going
+/// through a byte round-trip. Used by callers that hold [`CowValue`] trees
+/// from a single upstream parse (e.g. the debezium codec).
+pub(super) fn infer_schema_from_objects(
+    rows: &[ObjMap<Cow<'_, str>, CowValue<'_>>],
+) -> Result<Schema, Error> {
+    let mut field_types = ObjMap::default();
+    for row in rows {
+        collect_field_types_from_object(&mut field_types, row)?;
+    }
     Ok(Schema::new(generate_fields(&field_types)?))
 }
 

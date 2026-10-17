@@ -34,7 +34,7 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{Connection, MySqlConnection, PgConnection, QueryBuilder};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum SqlValue {
     String(String),
     Int64(i64),
@@ -80,12 +80,12 @@ impl DatabaseConnection {
     async fn execute_insert(
         &mut self,
         output_config: &SqlOutputConfig,
-        columns: Vec<String>,
-        rows: Vec<Vec<SqlValue>>,
+        columns: &[String],
+        rows: &[Vec<SqlValue>],
     ) -> Result<(), Error> {
         match self {
             DatabaseConnection::Mysql(conn) => {
-                build_mysql_insert(output_config, &columns, rows)
+                build_mysql_insert(output_config, columns, rows)
                     .build()
                     .execute(conn)
                     .await
@@ -93,7 +93,7 @@ impl DatabaseConnection {
                 Ok(())
             }
             DatabaseConnection::Postgres(conn) => {
-                build_postgres_insert(output_config, &columns, rows)
+                build_postgres_insert(output_config, columns, rows)
                     .build()
                     .execute(conn)
                     .await
@@ -123,7 +123,7 @@ async fn execute_insert_transactional(
                 .await
                 .map_err(|e| Error::Process(format!("Failed to begin MySQL transaction: {}", e)))?;
             for (columns, rows) in batches {
-                build_mysql_insert(output_config, columns, rows.clone())
+                build_mysql_insert(output_config, columns, rows)
                     .build()
                     .execute(&mut *transaction)
                     .await
@@ -139,7 +139,7 @@ async fn execute_insert_transactional(
                 Error::Process(format!("Failed to begin Postgres transaction: {}", e))
             })?;
             for (columns, rows) in batches {
-                build_postgres_insert(output_config, columns, rows.clone())
+                build_postgres_insert(output_config, columns, rows)
                     .build()
                     .execute(&mut *transaction)
                     .await
@@ -190,7 +190,7 @@ fn postgres_upsert_clause(columns: &[String], keys: &[String]) -> String {
 fn build_mysql_insert(
     output_config: &SqlOutputConfig,
     columns: &[String],
-    rows: Vec<Vec<SqlValue>>,
+    rows: &[Vec<SqlValue>],
 ) -> QueryBuilder<sqlx::MySql> {
     let mut query_builder = QueryBuilder::<sqlx::MySql>::new(format!(
         "INSERT INTO {} ({})",
@@ -201,14 +201,17 @@ fn build_mysql_insert(
             .collect::<Vec<_>>()
             .join(", "),
     ));
-    query_builder.push_values(rows, |mut b, row| {
+    // Rows are borrowed: strings bind as `&str` (same wire encoding as an
+    // owned `String`), so the transactional path binds every batch without
+    // cloning the whole row table.
+    query_builder.push_values(rows.iter(), |mut b, row| {
         for value in row {
             match value {
-                SqlValue::String(s) => b.push_bind(s),
-                SqlValue::Int64(i) => b.push_bind(i),
-                SqlValue::UInt64(u) => b.push_bind(u),
-                SqlValue::Float64(f) => b.push_bind(f),
-                SqlValue::Boolean(bool) => b.push_bind(bool),
+                SqlValue::String(s) => b.push_bind(s.as_str()),
+                SqlValue::Int64(i) => b.push_bind(*i),
+                SqlValue::UInt64(u) => b.push_bind(*u),
+                SqlValue::Float64(f) => b.push_bind(*f),
+                SqlValue::Boolean(bool) => b.push_bind(*bool),
                 SqlValue::Null => b.push_bind(None::<String>),
             };
         }
@@ -224,7 +227,7 @@ fn build_mysql_insert(
 fn build_postgres_insert(
     output_config: &SqlOutputConfig,
     columns: &[String],
-    rows: Vec<Vec<SqlValue>>,
+    rows: &[Vec<SqlValue>],
 ) -> QueryBuilder<sqlx::Postgres> {
     let mut query_builder = QueryBuilder::<sqlx::Postgres>::new(format!(
         "INSERT INTO {} ({})",
@@ -235,14 +238,14 @@ fn build_postgres_insert(
             .collect::<Vec<_>>()
             .join(", "),
     ));
-    query_builder.push_values(rows, |mut b, row| {
+    query_builder.push_values(rows.iter(), |mut b, row| {
         for value in row {
             match value {
-                SqlValue::String(s) => b.push_bind(s),
-                SqlValue::Int64(i) => b.push_bind(i),
-                SqlValue::UInt64(u) => b.push_bind(u as i64),
-                SqlValue::Float64(f) => b.push_bind(f),
-                SqlValue::Boolean(bool) => b.push_bind(bool),
+                SqlValue::String(s) => b.push_bind(s.as_str()),
+                SqlValue::Int64(i) => b.push_bind(*i),
+                SqlValue::UInt64(u) => b.push_bind(*u as i64),
+                SqlValue::Float64(f) => b.push_bind(*f),
+                SqlValue::Boolean(bool) => b.push_bind(*bool),
                 SqlValue::Null => b.push_bind(None::<String>),
             };
         }
@@ -270,6 +273,148 @@ fn validate_upsert_keys(output_config: &SqlOutputConfig, columns: &[String]) -> 
         }
     }
     Ok(())
+}
+
+/// Convert a batch into `(column names, row-major values)` for binding.
+///
+/// Columnar conversion: every column is downcast exactly once and converted
+/// in a tight loop ([`column_values`]), then the per-column vectors are
+/// transposed into rows by moving each value once — no flat intermediate
+/// buffer, no per-row re-clone, no per-cell dispatch.
+fn batch_rows(
+    output_config: &SqlOutputConfig,
+    msg: &MessageBatch,
+) -> Result<(Vec<String>, Vec<Vec<SqlValue>>), Error> {
+    let schema = msg.schema();
+    let num_rows = msg.len();
+    let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    validate_upsert_keys(output_config, &columns)?;
+
+    let mut rows: Vec<Vec<SqlValue>> = (0..num_rows)
+        .map(|_| Vec::with_capacity(columns.len()))
+        .collect();
+    for (col_index, column_name) in columns.iter().enumerate() {
+        let values = column_values(column_name, msg.column(col_index))?;
+        for (row, value) in rows.iter_mut().zip(values) {
+            row.push(value);
+        }
+    }
+    Ok((columns, rows))
+}
+
+/// Convert one Arrow column to SQL parameter values. The column name is
+/// included in type errors so the offending column is identifiable.
+///
+/// Narrow integer widths widen to i64/u64, Float32 to f64, temporal values
+/// to ISO strings; complex types are rejected with context. Null slots stay
+/// SQL NULL (the temporal branches consult the null bitmap explicitly:
+/// `value_as_date`/`value_as_datetime` read the raw slot, which usually
+/// stores 0 and would otherwise insert the epoch instead of NULL).
+fn column_values(name: &str, column: &dyn Array) -> Result<Vec<SqlValue>, Error> {
+    use datafusion::arrow::array::{
+        Float32Array, Int16Array, Int32Array, Int8Array, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+        UInt32Array, UInt8Array,
+    };
+    // One concrete array: null stays SQL NULL; otherwise the closure
+    // converts (and optionally widens) the native value.
+    macro_rules! primitive {
+        ($arr_ty:ty, $conv:expr) => {{
+            let a = column.as_any().downcast_ref::<$arr_ty>().unwrap();
+            Ok(a.iter()
+                .map(|v| match v {
+                    Some(v) => ($conv)(v),
+                    None => SqlValue::Null,
+                })
+                .collect())
+        }};
+    }
+    let column_type = column.data_type();
+    match column_type {
+        DataType::Utf8 => {
+            let a = column.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok(a.iter()
+                .map(|v| match v {
+                    Some(s) => SqlValue::String(s.to_string()),
+                    None => SqlValue::Null,
+                })
+                .collect())
+        }
+        DataType::Int64 => primitive!(Int64Array, SqlValue::Int64),
+        DataType::Int32 => primitive!(Int32Array, |v| SqlValue::Int64(v as i64)),
+        DataType::Int16 => primitive!(Int16Array, |v| SqlValue::Int64(v as i64)),
+        DataType::Int8 => primitive!(Int8Array, |v| SqlValue::Int64(v as i64)),
+        DataType::UInt64 => primitive!(UInt64Array, SqlValue::UInt64),
+        DataType::UInt32 => primitive!(UInt32Array, |v| SqlValue::UInt64(v as u64)),
+        DataType::UInt16 => primitive!(UInt16Array, |v| SqlValue::UInt64(v as u64)),
+        DataType::UInt8 => primitive!(UInt8Array, |v| SqlValue::UInt64(v as u64)),
+        DataType::Float64 => primitive!(Float64Array, SqlValue::Float64),
+        DataType::Float32 => primitive!(Float32Array, |v| SqlValue::Float64(v as f64)),
+        DataType::Boolean => primitive!(BooleanArray, SqlValue::Boolean),
+        DataType::Date32 => {
+            let a = column.as_any().downcast_ref::<Date32Array>().unwrap();
+            Ok((0..a.len())
+                .map(|i| {
+                    if a.is_null(i) {
+                        return SqlValue::Null;
+                    }
+                    match a.value_as_date(i) {
+                        Some(d) => SqlValue::String(d.to_string()),
+                        None => SqlValue::Null,
+                    }
+                })
+                .collect())
+        }
+        DataType::Date64 => {
+            let a = column.as_any().downcast_ref::<Date64Array>().unwrap();
+            Ok((0..a.len())
+                .map(|i| {
+                    if a.is_null(i) {
+                        return SqlValue::Null;
+                    }
+                    match a.value_as_date(i) {
+                        Some(d) => SqlValue::String(d.to_string()),
+                        None => SqlValue::Null,
+                    }
+                })
+                .collect())
+        }
+        DataType::Timestamp(_, _) => {
+            // Any unit formats as an RFC3339 string parameter.
+            macro_rules! timestamps {
+                ($arr_ty:ty) => {{
+                    let a = column.as_any().downcast_ref::<$arr_ty>().unwrap();
+                    (0..a.len())
+                        .map(|i| {
+                            if a.is_null(i) {
+                                return SqlValue::Null;
+                            }
+                            match a.value_as_datetime(i) {
+                                Some(dt) => SqlValue::String(dt.and_utc().to_rfc3339()),
+                                None => SqlValue::Null,
+                            }
+                        })
+                        .collect()
+                }};
+            }
+            let values: Vec<SqlValue> = if column.as_any().is::<TimestampSecondArray>() {
+                timestamps!(TimestampSecondArray)
+            } else if column.as_any().is::<TimestampMillisecondArray>() {
+                timestamps!(TimestampMillisecondArray)
+            } else if column.as_any().is::<TimestampMicrosecondArray>() {
+                timestamps!(TimestampMicrosecondArray)
+            } else if column.as_any().is::<TimestampNanosecondArray>() {
+                timestamps!(TimestampNanosecondArray)
+            } else {
+                vec![SqlValue::Null; column.len()]
+            };
+            Ok(values)
+        }
+        _ => Err(Error::Process(format!(
+            "Unsupported data type for column `{}`: {} (supported: Utf8, Boolean, Int8-64, UInt8-64, Float32/64, Date32/64, Timestamp)",
+            name, column_type
+        ))),
+    }
 }
 
 /// Configuration for SQL output
@@ -419,29 +564,16 @@ impl Output for SqlOutput {
         let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
         let mut batches = Vec::with_capacity(msgs.len());
         for msg in msgs {
-            let processed: MessageBatch = (**msg).clone();
-            let schema = processed.schema();
-            let num_rows = processed.len();
-            let num_columns = schema.fields().len();
-            let columns: Vec<String> = (0..num_columns)
-                .map(|i| schema.field(i).name().clone())
-                .collect();
-            validate_upsert_keys(&self.sql_config, &columns)?;
-            let mut rows = Vec::with_capacity(num_columns * num_rows);
-            for row_index in 0..num_rows {
-                for (col_index, column_name) in columns.iter().enumerate() {
-                    let column = processed.column(col_index);
-                    let value = self
-                        .matching_data_type(column_name, column, row_index)
-                        .await?;
-                    rows.push(value);
-                }
+            // A batch with no rows has nothing to insert; binding it anyway
+            // would generate a syntactically invalid `INSERT ... VALUES`
+            // with no tuples. Skip it and succeed if nothing remains.
+            if msg.is_empty() {
+                continue;
             }
-            let rows: Vec<Vec<SqlValue>> = rows
-                .chunks(num_columns)
-                .map(|chunk| chunk.to_vec())
-                .collect();
-            batches.push((columns, rows));
+            batches.push(batch_rows(&self.sql_config, msg)?);
+        }
+        if batches.is_empty() {
+            return Ok(());
         }
         execute_insert_transactional(conn, &self.sql_config, &batches).await
     }
@@ -469,204 +601,34 @@ impl SqlOutput {
 
     /// Processes a batch of Arrow data and inserts it into the database
     /// 1. Extracts schema and column names
-    /// 2. Converts each row to SQL-compatible values
+    /// 2. Converts the typed columns to SQL-compatible values (one downcast per column)
     /// 3. Executes the insert query with proper batching
     async fn insert_row(
         &self,
         conn: &mut DatabaseConnection,
         msg: &MessageBatch,
     ) -> Result<(), Error> {
-        let schema = msg.schema();
-        let num_rows = msg.len();
-        let num_columns = schema.fields().len();
-        let columns: Vec<String> = (0..num_columns)
-            .map(|i| schema.field(i).name().clone())
-            .collect();
-
-        validate_upsert_keys(&self.sql_config, &columns)?;
-
-        let mut rows = Vec::with_capacity(num_columns * num_rows);
-        for row_index in 0..num_rows {
-            for (col_index, column_name) in columns.iter().enumerate() {
-                let column = msg.column(col_index);
-
-                let value = self
-                    .matching_data_type(column_name, column, row_index)
-                    .await?;
-                rows.push(value);
-            }
+        // Same no-rows skip as `write_batch`: an empty batch has nothing to
+        // insert and would only produce invalid SQL.
+        if msg.is_empty() {
+            return Ok(());
         }
-        let rows: Vec<Vec<SqlValue>> = rows
-            .chunks(num_columns)
-            .map(|chunk| chunk.to_vec())
-            .collect();
-
-        conn.execute_insert(&self.sql_config, columns, rows).await?;
+        let (columns, rows) = batch_rows(&self.sql_config, msg)?;
+        conn.execute_insert(&self.sql_config, &columns, &rows)
+            .await?;
         Ok(())
     }
 
-    // Convert one Arrow cell to a SQL parameter value. The column name is
-    // included in type errors so the offending column is identifiable.
-    async fn matching_data_type(
+    /// Convert one Arrow cell to a SQL parameter value (test-facing single-cell
+    /// view of `column_values`; production paths convert whole columns).
+    #[cfg(test)]
+    fn matching_data_type(
         &self,
         name: &str,
         column: &dyn Array,
         row_index: usize,
     ) -> Result<SqlValue, Error> {
-        // One cell: null stays SQL NULL; otherwise the call-site closure
-        // converts (and optionally widens) the native value.
-        macro_rules! cell {
-            ($arr:expr, $i:expr, $conv:expr) => {
-                if $arr.is_null($i) {
-                    Ok(SqlValue::Null)
-                } else {
-                    Ok(($conv)($arr.value($i)))
-                }
-            };
-        }
-        let column_type = column.data_type();
-        // Narrow integer widths up to i64/u64, Float32 to f64, temporal
-        // values to ISO strings; complex types are rejected with context.
-        match column_type {
-            DataType::Utf8 => {
-                let utf8_array = column.as_any().downcast_ref::<StringArray>().unwrap();
-                if utf8_array.is_null(row_index) {
-                    Ok(SqlValue::Null)
-                } else {
-                    Ok(SqlValue::String(utf8_array.value(row_index).to_string()))
-                }
-            }
-            // Narrow integer/float widths widen losslessly to i64/u64/f64
-            // parameter values; each width reads its own concrete array.
-            DataType::Int64 => {
-                let a = column.as_any().downcast_ref::<Int64Array>().unwrap();
-                cell!(a, row_index, SqlValue::Int64)
-            }
-            DataType::Int32 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::Int32Array>()
-                    .unwrap();
-                cell!(a, row_index, |v| SqlValue::Int64(v as i64))
-            }
-            DataType::Int16 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::Int16Array>()
-                    .unwrap();
-                cell!(a, row_index, |v| SqlValue::Int64(v as i64))
-            }
-            DataType::Int8 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::Int8Array>()
-                    .unwrap();
-                cell!(a, row_index, |v| SqlValue::Int64(v as i64))
-            }
-            DataType::UInt64 => {
-                let a = column.as_any().downcast_ref::<UInt64Array>().unwrap();
-                cell!(a, row_index, SqlValue::UInt64)
-            }
-            DataType::UInt32 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-                    .unwrap();
-                cell!(a, row_index, |v| SqlValue::UInt64(v as u64))
-            }
-            DataType::UInt16 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::UInt16Array>()
-                    .unwrap();
-                cell!(a, row_index, |v| SqlValue::UInt64(v as u64))
-            }
-            DataType::UInt8 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::UInt8Array>()
-                    .unwrap();
-                cell!(a, row_index, |v| SqlValue::UInt64(v as u64))
-            }
-            DataType::Float64 => {
-                let a = column.as_any().downcast_ref::<Float64Array>().unwrap();
-                cell!(a, row_index, SqlValue::Float64)
-            }
-            DataType::Float32 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::Float32Array>()
-                    .unwrap();
-                cell!(a, row_index, |v| SqlValue::Float64(v as f64))
-            }
-            DataType::Boolean => {
-                let bool_array = column.as_any().downcast_ref::<BooleanArray>().unwrap();
-                if bool_array.is_null(row_index) {
-                    Ok(SqlValue::Null)
-                } else {
-                    Ok(SqlValue::Boolean(bool_array.value(row_index)))
-                }
-            }
-            DataType::Date32 | DataType::Date64 => {
-                // value_as_date reads the raw slot without consulting the
-                // null bitmap: a null slot usually stores 0 and would
-                // insert 1970-01-01 instead of NULL.
-                if column.is_null(row_index) {
-                    return Ok(SqlValue::Null);
-                }
-                let date = if let Some(arr) = column.as_any().downcast_ref::<Date32Array>() {
-                    arr.value_as_date(row_index)
-                } else if let Some(arr) = column.as_any().downcast_ref::<Date64Array>() {
-                    arr.value_as_date(row_index)
-                } else {
-                    None
-                };
-                match date {
-                    Some(d) => Ok(SqlValue::String(d.to_string())),
-                    None => Ok(SqlValue::Null),
-                }
-            }
-            DataType::Timestamp(_, _) => Self::timestamp_value(column, row_index),
-            _ => Err(Error::Process(format!(
-                "Unsupported data type for column `{}`: {} (supported: Utf8, Boolean, Int8-64, UInt8-64, Float32/64, Date32/64, Timestamp)",
-                name, column_type
-            ))),
-        }
-    }
-
-    /// Format a timestamp cell of any unit as an RFC3339 string parameter.
-    fn timestamp_value(column: &dyn Array, row_index: usize) -> Result<SqlValue, Error> {
-        // Same null-bitmap caveat as the Date branch: value_as_datetime
-        // would turn a null slot into 1970-01-01T00:00:00+00:00.
-        if column.is_null(row_index) {
-            return Ok(SqlValue::Null);
-        }
-        use datafusion::arrow::array::{
-            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-            TimestampSecondArray,
-        };
-        let dt = match column.data_type() {
-            DataType::Timestamp(_, _) => {
-                if let Some(a) = column.as_any().downcast_ref::<TimestampSecondArray>() {
-                    a.value_as_datetime(row_index)
-                } else if let Some(a) = column.as_any().downcast_ref::<TimestampMillisecondArray>()
-                {
-                    a.value_as_datetime(row_index)
-                } else if let Some(a) = column.as_any().downcast_ref::<TimestampMicrosecondArray>()
-                {
-                    a.value_as_datetime(row_index)
-                } else if let Some(a) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
-                    a.value_as_datetime(row_index)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        match dt {
-            Some(dt) => Ok(SqlValue::String(dt.and_utc().to_rfc3339())),
-            None => Ok(SqlValue::Null),
-        }
+        column_values(name, column).map(|mut v| v.swap_remove(row_index))
     }
 
     /// Generates MySQL SSL connection options based on configuration
@@ -812,7 +774,7 @@ mod tests {
 
     #[test]
     fn postgres_plain_insert_has_no_conflict_clause() {
-        let sql = build_postgres_insert(&postgres_config(false, None), &columns(), rows())
+        let sql = build_postgres_insert(&postgres_config(false, None), &columns(), &rows())
             .build()
             .sql()
             .as_str()
@@ -823,12 +785,15 @@ mod tests {
 
     #[test]
     fn postgres_upsert_uses_on_conflict_do_update() {
-        let sql =
-            build_postgres_insert(&postgres_config(true, Some(vec!["id"])), &columns(), rows())
-                .build()
-                .sql()
-                .as_str()
-                .to_string();
+        let sql = build_postgres_insert(
+            &postgres_config(true, Some(vec!["id"])),
+            &columns(),
+            &rows(),
+        )
+        .build()
+        .sql()
+        .as_str()
+        .to_string();
         assert!(sql.contains("ON CONFLICT (\"id\") DO UPDATE SET"));
         assert!(sql.contains("\"name\" = EXCLUDED.\"name\""));
         // key columns are not assigned in the update set
@@ -844,7 +809,7 @@ mod tests {
             }),
             ..postgres_config(true, Some(vec!["id"]))
         };
-        let sql = build_mysql_insert(&config, &columns(), rows())
+        let sql = build_mysql_insert(&config, &columns(), &rows())
             .build()
             .sql()
             .as_str()
@@ -861,7 +826,7 @@ mod tests {
         let sql = build_postgres_insert(
             &postgres_config(true, Some(vec!["id", "name"])),
             &columns(),
-            rows(),
+            &rows(),
         )
         .build()
         .sql()
@@ -956,25 +921,25 @@ mod tests {
 
         let i32s = Int32Array::from(vec![Some(-7)]);
         assert!(matches!(
-            output.matching_data_type("narrow", &i32s, 0).await.unwrap(),
+            output.matching_data_type("narrow", &i32s, 0).unwrap(),
             SqlValue::Int64(-7)
         ));
 
         let f32s = Float32Array::from(vec![Some(1.5f32)]);
         assert!(matches!(
-            output.matching_data_type("f", &f32s, 0).await.unwrap(),
+            output.matching_data_type("f", &f32s, 0).unwrap(),
             SqlValue::Float64(v) if (v - 1.5f64).abs() < f64::EPSILON
         ));
 
         let dates = Date32Array::from(vec![Some(0)]);
         assert!(matches!(
-            output.matching_data_type("d", &dates, 0).await.unwrap(),
+            output.matching_data_type("d", &dates, 0).unwrap(),
             SqlValue::String(ref s) if s == "1970-01-01"
         ));
 
         let ts = TimestampNanosecondArray::from(vec![Some(0)]);
         assert!(matches!(
-            output.matching_data_type("ts", &ts, 0).await.unwrap(),
+            output.matching_data_type("ts", &ts, 0).unwrap(),
             SqlValue::String(ref s) if s.starts_with("1970-01-01T00:00:00")
         ));
     }
@@ -989,13 +954,13 @@ mod tests {
 
         let dates = Date32Array::from(vec![Some(0), None]);
         assert!(matches!(
-            output.matching_data_type("d", &dates, 1).await.unwrap(),
+            output.matching_data_type("d", &dates, 1).unwrap(),
             SqlValue::Null
         ));
 
         let ts = TimestampNanosecondArray::from(vec![None]);
         assert!(matches!(
-            output.matching_data_type("ts", &ts, 0).await.unwrap(),
+            output.matching_data_type("ts", &ts, 0).unwrap(),
             SqlValue::Null
         ));
     }
@@ -1016,12 +981,361 @@ mod tests {
         let batch = arkflow_core::MessageBatch::new_arrow(rb);
         let err = output
             .matching_data_type("tags", batch.column(0), 0)
-            .await
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("`tags`"),
             "error must name the column, got: {msg}"
+        );
+    }
+
+    // ---- columnar conversion equivalence vs. the historical per-cell path ----
+
+    /// The previous implementation: one cell conversion per (row, column)
+    /// with a downcast per cell, then a flat buffer chunked into rows. Kept
+    /// inline as the oracle for the columnar `batch_rows`.
+    fn batch_rows_oracle(msg: &MessageBatch) -> Vec<Vec<SqlValue>> {
+        use datafusion::arrow::array::{
+            Float32Array, Int16Array, Int32Array, Int8Array, TimestampMicrosecondArray,
+            TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+            UInt32Array, UInt8Array,
+        };
+        fn cell(column: &dyn Array, row_index: usize) -> SqlValue {
+            macro_rules! cell {
+                ($arr:expr, $i:expr, $conv:expr) => {{
+                    let a = $arr;
+                    if a.is_null($i) {
+                        SqlValue::Null
+                    } else {
+                        ($conv)(a.value($i))
+                    }
+                }};
+            }
+            match column.data_type() {
+                DataType::Utf8 => cell!(
+                    column.as_any().downcast_ref::<StringArray>().unwrap(),
+                    row_index,
+                    |v: &str| SqlValue::String(v.to_string())
+                ),
+                DataType::Int64 => cell!(
+                    column.as_any().downcast_ref::<Int64Array>().unwrap(),
+                    row_index,
+                    SqlValue::Int64
+                ),
+                DataType::Int32 => cell!(
+                    column.as_any().downcast_ref::<Int32Array>().unwrap(),
+                    row_index,
+                    |v| SqlValue::Int64(v as i64)
+                ),
+                DataType::Int16 => cell!(
+                    column.as_any().downcast_ref::<Int16Array>().unwrap(),
+                    row_index,
+                    |v| SqlValue::Int64(v as i64)
+                ),
+                DataType::Int8 => cell!(
+                    column.as_any().downcast_ref::<Int8Array>().unwrap(),
+                    row_index,
+                    |v| SqlValue::Int64(v as i64)
+                ),
+                DataType::UInt64 => cell!(
+                    column.as_any().downcast_ref::<UInt64Array>().unwrap(),
+                    row_index,
+                    SqlValue::UInt64
+                ),
+                DataType::UInt32 => cell!(
+                    column.as_any().downcast_ref::<UInt32Array>().unwrap(),
+                    row_index,
+                    |v| SqlValue::UInt64(v as u64)
+                ),
+                DataType::UInt16 => cell!(
+                    column.as_any().downcast_ref::<UInt16Array>().unwrap(),
+                    row_index,
+                    |v| SqlValue::UInt64(v as u64)
+                ),
+                DataType::UInt8 => cell!(
+                    column.as_any().downcast_ref::<UInt8Array>().unwrap(),
+                    row_index,
+                    |v| SqlValue::UInt64(v as u64)
+                ),
+                DataType::Float64 => cell!(
+                    column.as_any().downcast_ref::<Float64Array>().unwrap(),
+                    row_index,
+                    SqlValue::Float64
+                ),
+                DataType::Float32 => cell!(
+                    column.as_any().downcast_ref::<Float32Array>().unwrap(),
+                    row_index,
+                    |v| SqlValue::Float64(v as f64)
+                ),
+                DataType::Boolean => cell!(
+                    column.as_any().downcast_ref::<BooleanArray>().unwrap(),
+                    row_index,
+                    SqlValue::Boolean
+                ),
+                DataType::Date32 | DataType::Date64 => {
+                    if column.is_null(row_index) {
+                        return SqlValue::Null;
+                    }
+                    let date = if let Some(arr) = column.as_any().downcast_ref::<Date32Array>() {
+                        arr.value_as_date(row_index)
+                    } else if let Some(arr) = column.as_any().downcast_ref::<Date64Array>() {
+                        arr.value_as_date(row_index)
+                    } else {
+                        None
+                    };
+                    match date {
+                        Some(d) => SqlValue::String(d.to_string()),
+                        None => SqlValue::Null,
+                    }
+                }
+                DataType::Timestamp(_, _) => {
+                    if column.is_null(row_index) {
+                        return SqlValue::Null;
+                    }
+                    let dt = if let Some(a) = column.as_any().downcast_ref::<TimestampSecondArray>()
+                    {
+                        a.value_as_datetime(row_index)
+                    } else if let Some(a) =
+                        column.as_any().downcast_ref::<TimestampMillisecondArray>()
+                    {
+                        a.value_as_datetime(row_index)
+                    } else if let Some(a) =
+                        column.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                    {
+                        a.value_as_datetime(row_index)
+                    } else if let Some(a) =
+                        column.as_any().downcast_ref::<TimestampNanosecondArray>()
+                    {
+                        a.value_as_datetime(row_index)
+                    } else {
+                        None
+                    };
+                    match dt {
+                        Some(dt) => SqlValue::String(dt.and_utc().to_rfc3339()),
+                        None => SqlValue::Null,
+                    }
+                }
+                other => panic!("oracle: unsupported {other}"),
+            }
+        }
+        let schema = msg.schema();
+        let num_rows = msg.len();
+        let num_columns = schema.fields().len();
+        let mut rows = Vec::with_capacity(num_columns * num_rows);
+        for row_index in 0..num_rows {
+            for col_index in 0..num_columns {
+                rows.push(cell(msg.column(col_index), row_index));
+            }
+        }
+        rows.chunks(num_columns).map(|c| c.to_vec()).collect()
+    }
+
+    /// Every supported column type with nulls sprinkled in.
+    fn wide_typed_batch(rows: usize) -> MessageBatch {
+        use datafusion::arrow::array::{
+            Date32Array, Date64Array, Float32Array, Int16Array, Int32Array, Int8Array,
+            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+            TimestampSecondArray, UInt16Array, UInt32Array, UInt8Array,
+        };
+        use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
+        let present = |i: usize| i % 3 != 1;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("i64", DataType::Int64, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("i16", DataType::Int16, true),
+            Field::new("i8", DataType::Int8, true),
+            Field::new("u64", DataType::UInt64, true),
+            Field::new("u32", DataType::UInt32, true),
+            Field::new("u16", DataType::UInt16, true),
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("b", DataType::Boolean, true),
+            Field::new("d32", DataType::Date32, true),
+            Field::new("d64", DataType::Date64, true),
+            Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+        let columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(StringArray::from(
+                (0..rows)
+                    .map(|i| present(i).then(|| format!("row_{i}")))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as i64 - 5))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as i32 - 5))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int16Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as i16 - 5))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int8Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some((i % 100) as i8 - 5))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(u64::MAX - i as u64))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as u32 * 7))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt16Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as u16))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt8Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some((i % 256) as u8))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as f64 * 0.25))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float32Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as f32 * 0.5))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i % 2 == 0))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Date32Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as i32))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Date64Array::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as i64 * 86_400_000))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampSecondArray::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as i64))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampMillisecondArray::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as i64 * 1_500))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampMicrosecondArray::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as i64 * 1_000))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampNanosecondArray::from(
+                (0..rows)
+                    .map(|i| present(i).then_some(i as i64 * 1_000_000))
+                    .collect::<Vec<_>>(),
+            )),
+        ];
+        let rb = datafusion::arrow::array::RecordBatch::try_new(schema, columns).unwrap();
+        MessageBatch::new_arrow(rb)
+    }
+
+    #[test]
+    fn columnar_rows_match_per_cell_oracle_exactly() {
+        for rows in [0usize, 1, 3, 7, 64] {
+            let batch = wide_typed_batch(rows);
+            let (columns, got) = batch_rows(&postgres_config(false, None), &batch).unwrap();
+            assert_eq!(columns.len(), 18);
+            let want = batch_rows_oracle(&batch);
+            assert_eq!(
+                got, want,
+                "rows={rows}: columnar vs per-cell conversion diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn columnar_rows_validate_upsert_keys_before_converting() {
+        let batch = wide_typed_batch(2);
+        let err = batch_rows(&postgres_config(true, Some(vec!["missing"])), &batch).unwrap_err();
+        assert!(format!("{err}").contains("missing"));
+    }
+
+    /// Ad-hoc release timing (NOT run by CI): columnar conversion vs the
+    /// historical per-cell dispatch + flat-buffer chunking. Run with:
+    /// `cargo test --release -p arkflow-plugin --lib -- --ignored sql_output_conversion_timing --nocapture`
+    #[test]
+    #[ignore]
+    fn sql_output_conversion_timing() {
+        let batch = wide_typed_batch(1_000);
+        let batches = 200usize;
+        let config = postgres_config(false, None);
+
+        let time = |name: &str, f: &mut dyn FnMut() -> usize| {
+            let mut best = std::time::Duration::MAX;
+            let mut cells = 0;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                cells = f();
+                best = best.min(start.elapsed());
+            }
+            println!(
+                "{name}: {cells} cells in {best:?} ({:.0} cells/s)",
+                cells as f64 / best.as_secs_f64()
+            );
+        };
+
+        let mut columnar = || {
+            let mut n = 0usize;
+            for _ in 0..batches {
+                let (_, rows) = batch_rows(&config, &batch).unwrap();
+                n += rows.iter().map(Vec::len).sum::<usize>();
+            }
+            n
+        };
+        time(
+            "columnar (one downcast per column + transpose)",
+            &mut columnar,
+        );
+
+        let mut per_cell = || {
+            let mut n = 0usize;
+            for _ in 0..batches {
+                let rows = batch_rows_oracle(&batch);
+                n += rows.iter().map(Vec::len).sum::<usize>();
+            }
+            n
+        };
+        time(
+            "per-cell dispatch + chunk re-clone (historical)",
+            &mut per_cell,
         );
     }
 
@@ -1332,6 +1646,36 @@ mod tests {
         assert!(output.close().await.is_ok());
     }
 
+    #[tokio::test]
+    async fn empty_batches_are_skipped_without_masking_disconnection() {
+        // A zero-row batch has nothing to insert (binding it would generate
+        // `INSERT ... VALUES` with no tuples — invalid SQL), so the write
+        // paths skip it. The skip must NOT mask a missing connection: an
+        // unconnected output still reports Disconnection.
+        let empty = MessageBatch::new_arrow(datafusion::arrow::array::RecordBatch::new_empty(
+            Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new("id", DataType::Int64, true),
+            ])),
+        ));
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        let err = output.write(Arc::new(empty.clone())).await.unwrap_err();
+        assert!(matches!(err, Error::Disconnection), "{err:?}");
+        let err = output
+            .write_batch(&[Arc::new(empty.clone()), Arc::new(empty)])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Disconnection), "{err:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "No value being pushed")]
+    fn empty_row_set_panics_in_the_query_builder_why_we_skip() {
+        // Pins the reason `write_batch`/`insert_row` skip zero-row batches:
+        // sqlx's `push_values` debug-asserts (and would emit a dangling
+        // `VALUES` clause in release) when handed no rows.
+        build_postgres_insert(&postgres_config(false, None), &columns(), &[]);
+    }
+
     // ---- remaining matching_data_type conversions ----
 
     #[tokio::test]
@@ -1343,32 +1687,32 @@ mod tests {
 
         let u8s = UInt8Array::from(vec![Some(250u8)]);
         assert!(matches!(
-            output.matching_data_type("u8", &u8s, 0).await.unwrap(),
+            output.matching_data_type("u8", &u8s, 0).unwrap(),
             SqlValue::UInt64(250)
         ));
         let u16s = UInt16Array::from(vec![Some(65_535u16)]);
         assert!(matches!(
-            output.matching_data_type("u16", &u16s, 0).await.unwrap(),
+            output.matching_data_type("u16", &u16s, 0).unwrap(),
             SqlValue::UInt64(65_535)
         ));
         let u32s = UInt32Array::from(vec![Some(4_000_000_000u32)]);
         assert!(matches!(
-            output.matching_data_type("u32", &u32s, 0).await.unwrap(),
+            output.matching_data_type("u32", &u32s, 0).unwrap(),
             SqlValue::UInt64(4_000_000_000)
         ));
         let u64s = UInt64Array::from(vec![Some(u64::MAX)]);
         assert!(matches!(
-            output.matching_data_type("u64", &u64s, 0).await.unwrap(),
+            output.matching_data_type("u64", &u64s, 0).unwrap(),
             SqlValue::UInt64(u64::MAX)
         ));
         let i8s = Int8Array::from(vec![Some(-128i8)]);
         assert!(matches!(
-            output.matching_data_type("i8", &i8s, 0).await.unwrap(),
+            output.matching_data_type("i8", &i8s, 0).unwrap(),
             SqlValue::Int64(-128)
         ));
         let i16s = Int16Array::from(vec![Some(-32_768i16)]);
         assert!(matches!(
-            output.matching_data_type("i16", &i16s, 0).await.unwrap(),
+            output.matching_data_type("i16", &i16s, 0).unwrap(),
             SqlValue::Int64(-32_768)
         ));
     }
@@ -1382,51 +1726,39 @@ mod tests {
 
         let bools = BooleanArray::from(vec![Some(true)]);
         assert!(matches!(
-            output.matching_data_type("b", &bools, 0).await.unwrap(),
+            output.matching_data_type("b", &bools, 0).unwrap(),
             SqlValue::Boolean(true)
         ));
         let null_bools = BooleanArray::from(vec![None::<bool>]);
         assert!(matches!(
-            output
-                .matching_data_type("b", &null_bools, 0)
-                .await
-                .unwrap(),
+            output.matching_data_type("b", &null_bools, 0).unwrap(),
             SqlValue::Null
         ));
 
         let floats = Float64Array::from(vec![Some(2.25)]);
         assert!(matches!(
-            output.matching_data_type("f", &floats, 0).await.unwrap(),
+            output.matching_data_type("f", &floats, 0).unwrap(),
             SqlValue::Float64(v) if (v - 2.25).abs() < f64::EPSILON
         ));
         let null_floats = Float64Array::from(vec![None::<f64>]);
         assert!(matches!(
-            output
-                .matching_data_type("f", &null_floats, 0)
-                .await
-                .unwrap(),
+            output.matching_data_type("f", &null_floats, 0).unwrap(),
             SqlValue::Null
         ));
 
         let null_ints = Int64Array::from(vec![None::<i64>]);
         assert!(matches!(
-            output.matching_data_type("i", &null_ints, 0).await.unwrap(),
+            output.matching_data_type("i", &null_ints, 0).unwrap(),
             SqlValue::Null
         ));
         let null_uints = UInt64Array::from(vec![None::<u64>]);
         assert!(matches!(
-            output
-                .matching_data_type("u", &null_uints, 0)
-                .await
-                .unwrap(),
+            output.matching_data_type("u", &null_uints, 0).unwrap(),
             SqlValue::Null
         ));
         let null_strings = StringArray::from(vec![None::<&str>]);
         assert!(matches!(
-            output
-                .matching_data_type("s", &null_strings, 0)
-                .await
-                .unwrap(),
+            output.matching_data_type("s", &null_strings, 0).unwrap(),
             SqlValue::Null
         ));
     }
@@ -1440,31 +1772,28 @@ mod tests {
 
         let dates = Date64Array::from(vec![Some(86_400_000i64)]);
         assert!(matches!(
-            output.matching_data_type("d", &dates, 0).await.unwrap(),
+            output.matching_data_type("d", &dates, 0).unwrap(),
             SqlValue::String(ref s) if s == "1970-01-02"
         ));
         let null_dates = Date64Array::from(vec![None::<i64>]);
         assert!(matches!(
-            output
-                .matching_data_type("d", &null_dates, 0)
-                .await
-                .unwrap(),
+            output.matching_data_type("d", &null_dates, 0).unwrap(),
             SqlValue::Null
         ));
 
         let seconds = TimestampSecondArray::from(vec![Some(1i64)]);
         assert!(matches!(
-            output.matching_data_type("ts", &seconds, 0).await.unwrap(),
+            output.matching_data_type("ts", &seconds, 0).unwrap(),
             SqlValue::String(ref s) if s.starts_with("1970-01-01T00:00:01")
         ));
         let millis = TimestampMillisecondArray::from(vec![Some(1_500i64)]);
         assert!(matches!(
-            output.matching_data_type("ts", &millis, 0).await.unwrap(),
+            output.matching_data_type("ts", &millis, 0).unwrap(),
             SqlValue::String(ref s) if s.starts_with("1970-01-01T00:00:01.500")
         ));
         let micros = TimestampMicrosecondArray::from(vec![Some(1_000i64)]);
         assert!(matches!(
-            output.matching_data_type("ts", &micros, 0).await.unwrap(),
+            output.matching_data_type("ts", &micros, 0).unwrap(),
             SqlValue::String(ref s) if s.starts_with("1970-01-01T00:00:00.001")
         ));
     }
