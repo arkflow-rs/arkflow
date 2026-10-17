@@ -15,10 +15,17 @@ use arkflow_core::Error;
 use arrow_json::ReaderBuilder;
 use datafusion::arrow;
 use datafusion::arrow::record_batch::RecordBatch;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 mod infer;
+mod values;
+
+pub(crate) use infer::CowValue;
+
+/// A parsed record object in the value domain (see [`infer`]'s `CowValue`).
+pub(crate) type RecordObject<'de> = infer::ObjMap<Cow<'de, str>, CowValue<'de>>;
 
 pub(crate) fn try_to_arrow(
     content: &[u8],
@@ -43,6 +50,16 @@ pub(crate) fn try_to_arrow(
 
     let inferred_schema = Arc::new(inferred_schema);
     decode_with_schema(content, inferred_schema)
+}
+
+/// Infer a schema across already-parsed record objects and decode them into a
+/// single `RecordBatch` — the value-domain counterpart of `try_to_arrow` for
+/// callers that parsed their payloads exactly once (debezium envelopes).
+/// Schema rules are shared with the byte-domain path (same merge machinery);
+/// value conversion mirrors arrow-json's default tape decoder (see `values`).
+pub(crate) fn values_to_arrow(rows: &[RecordObject<'_>]) -> Result<RecordBatch, Error> {
+    let schema = infer::infer_schema_from_objects(rows)?;
+    values::decode_object_rows(rows, &schema)
 }
 
 /// Decode newline-delimited JSON records into a single `RecordBatch` under a

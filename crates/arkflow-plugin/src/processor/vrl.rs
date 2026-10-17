@@ -58,11 +58,16 @@ struct VrlProcessor {
 #[async_trait]
 impl Processor for VrlProcessor {
     async fn process(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
-        let result = message_batch_to_vrl_values((*msg_batch).clone())?;
+        let result = message_batch_to_vrl_values(&msg_batch)?;
 
         let mut state = RuntimeState::default();
         let timezone = self.timezone;
-        let mut output: Vec<Vec<VrlValue>> = Vec::with_capacity(result.len());
+        // Every program result row across the whole input batch lands in ONE
+        // output vector: one input batch → one output batch (see the
+        // `vrl-processor` spec's batch-granularity requirement). A row whose
+        // program returns an array contributes its elements as consecutive
+        // rows, in input order.
+        let mut output: Vec<VrlValue> = Vec::with_capacity(result.len());
 
         for x in result {
             let mut target = TargetValue {
@@ -80,28 +85,20 @@ impl Processor for VrlProcessor {
                 Error::Process(format!("VRL statement evaluation failed: {:?}", e))
             })?;
             match v {
-                VrlValue::Array(vv) => output.push(vv),
-                _ => output.push(vec![v]),
+                VrlValue::Array(vv) => {
+                    for item in vv {
+                        output.push(require_row_object(item)?);
+                    }
+                }
+                _ => output.push(require_row_object(v)?),
             }
         }
 
-        let batches = output
-            .into_iter()
-            .map(vrl_values_to_message_batch)
-            .collect::<Result<Vec<MessageBatch>, Error>>()?;
-
-        // Convert to ProcessResult
-        if batches.is_empty() {
-            Ok(ProcessResult::None)
-        } else if batches.len() == 1 {
-            Ok(ProcessResult::Single(Arc::new(
-                batches.into_iter().next().unwrap(),
-            )))
-        } else {
-            Ok(ProcessResult::Multiple(
-                batches.into_iter().map(Arc::new).collect(),
-            ))
+        if output.is_empty() {
+            return Ok(ProcessResult::None);
         }
+        let batch = vrl_values_to_message_batch(output)?;
+        Ok(ProcessResult::Single(Arc::new(batch)))
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -161,7 +158,21 @@ fn downcast_failure(
     ))
 }
 
-fn message_batch_to_vrl_values(message_batch: MessageBatch) -> Result<Vec<VrlValue>, Error> {
+/// Every program result row must be an object. Rows are merged into one
+/// output batch, so this is checked per row up front: a non-object result in
+/// the middle of a batch must fail loudly (D4) rather than decay into an
+/// all-null row after the first row has fixed the field set.
+fn require_row_object(v: VrlValue) -> Result<VrlValue, Error> {
+    match v {
+        VrlValue::Object(_) => Ok(v),
+        other => Err(Error::Process(format!(
+            "VRL statement must return a row object (or an array of row objects) per row; got {}",
+            other.kind_str()
+        ))),
+    }
+}
+
+fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlValue>, Error> {
     let rows = message_batch.num_rows();
     let num_columns = message_batch.num_columns();
     let schema = message_batch.schema();
@@ -440,24 +451,73 @@ fn vrl_values_to_message_batch(mut vrl_values: Vec<VrlValue>) -> Result<MessageB
     };
 
     // D4: a non-object result (scalar, etc.) is an error, not a silent empty batch.
-    let first_obj = match first_value {
-        VrlValue::Object(obj) => obj,
-        other => {
-            return Err(Error::Process(format!(
-                "VRL statement must return a row object (or an array of row objects) per row; got {}",
-                other.kind_str()
-            )));
-        }
-    };
+    if !matches!(first_value, VrlValue::Object(_)) {
+        return Err(Error::Process(format!(
+            "VRL statement must return a row object (or an array of row objects) per row; got {}",
+            first_value.kind_str()
+        )));
+    }
 
-    let fields = first_obj
-        .iter()
-        .map(|(k, v)| {
-            let field_name = k.to_string();
-            match get_arrow_data_type(v, field_name.as_str(), &vrl_values) {
-                Ok(data_type) => Ok(FieldRef::new(Field::new(field_name, data_type, true))),
-                Err(e) => Err(e),
+    // Field set = union across every row in first-seen order; a field's
+    // column type comes from its first non-null value (nulls carry no type),
+    // so heterogeneous rows merge into one schema with nulls for the gaps
+    // instead of dropping fields that the first row happened not to have.
+    //
+    // A field whose non-null values differ in kind across rows cannot share a
+    // column. Before batches were merged such a field simply produced one
+    // batch per row (each with its own type); merging would silently null the
+    // minority values, so it fails loudly instead (D1/D4: no silent data
+    // loss). The fix is in the program: make the field's type consistent.
+    let mut field_order: Vec<String> = Vec::new();
+    let mut typing_value: BTreeMap<String, Option<(&VrlValue, usize)>> = BTreeMap::new();
+    for (row_index, row) in vrl_values.iter().enumerate() {
+        let VrlValue::Object(obj) = row else {
+            continue;
+        };
+        for (k, v) in obj {
+            let name = k.as_str();
+            let incoming = (!matches!(v, VrlValue::Null)).then_some((v, row_index));
+            match typing_value.get_mut(name) {
+                None => {
+                    field_order.push(name.to_string());
+                    typing_value.insert(name.to_string(), incoming);
+                }
+                Some(slot) => {
+                    // `Option<(&VrlValue, usize)>` is Copy: read the current
+                    // typing value without holding a borrow on the slot.
+                    if let Some((prev, prev_row)) = *slot {
+                        if let Some((v, row_index)) = incoming {
+                            if prev.kind_str() != v.kind_str() {
+                                return Err(Error::Process(format!(
+                                    "VRL processor: field `{}` has conflicting types across rows ({} at row {}, {} at row {}); a merged batch needs one column type per field — make the field consistent, e.g. with to_float()/to_string()",
+                                    name,
+                                    prev.kind_str(),
+                                    prev_row,
+                                    v.kind_str(),
+                                    row_index,
+                                )));
+                            }
+                        }
+                    } else if incoming.is_some() {
+                        *slot = incoming;
+                    }
+                }
             }
+        }
+    }
+
+    let fields = field_order
+        .iter()
+        .map(|field_name| {
+            let data_type = match typing_value.get(field_name).copied().flatten() {
+                Some((v, _)) => get_arrow_data_type(v, field_name.as_str(), &vrl_values)?,
+                None => DataType::Null,
+            };
+            Ok(FieldRef::new(Field::new(
+                field_name.clone(),
+                data_type,
+                true,
+            )))
         })
         .collect::<Result<Vec<FieldRef>, Error>>()?;
 
@@ -1060,7 +1120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn array_output_splits_into_rows_and_multiple_batches() -> Result<(), Error> {
+    async fn array_output_and_multi_row_input_merge_into_one_batch() -> Result<(), Error> {
         // One input row whose statement yields an array of two objects:
         // the output becomes two rows (single batch).
         let processor = build_processor("[{ \"v\": .v }, { \"v\": .v }]")?;
@@ -1078,7 +1138,9 @@ mod tests {
             other => panic!("expected single split batch, got {other:?}"),
         }
 
-        // Two input rows each keeping their own object: Multiple batches.
+        // Two input rows each keeping their own object: ONE batch of two
+        // rows in input order (batch granularity is preserved end to end;
+        // the historical per-row `Multiple` result is gone).
         let processor = build_processor(".")?;
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
         let arr = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
@@ -1088,10 +1150,263 @@ mod tests {
             .process(Arc::new(MessageBatch::new_arrow(rb)))
             .await?
         {
-            ProcessResult::Multiple(batches) => assert_eq!(batches.len(), 2),
-            other => panic!("expected multiple batches, got {other:?}"),
+            ProcessResult::Single(b) => {
+                assert_eq!(b.num_rows(), 2);
+                let v = b
+                    .column_by_name("v")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!((v.value(0), v.value(1)), (1, 2), "input order preserved");
+            }
+            other => panic!("expected one merged batch, got {other:?}"),
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn array_rows_and_object_rows_interleave_into_one_batch() -> Result<(), Error> {
+        // Row 1 (v=1) expands to two rows, row 2 (v=2) stays one row: a
+        // single 3-row batch, array elements first and in order.
+        let processor = build_processor(
+            "if .v == 1 { [{ \"v\": .v, \"k\": \"a\" }, { \"v\": .v, \"k\": \"b\" }] } else { { \"v\": .v, \"k\": \"c\" } }",
+        )?;
+        use datafusion::arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let arr = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let ProcessResult::Single(b) = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?
+        else {
+            panic!("expected one merged batch");
+        };
+        assert_eq!(b.num_rows(), 3);
+        let k = b
+            .column_by_name("k")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!((k.value(0), k.value(1), k.value(2)), ("a", "b", "c"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heterogeneous_rows_merge_as_field_union_with_null_gaps() -> Result<(), Error> {
+        // Row 1 emits {a}, row 2 emits {b}: the batch has both columns (first
+        // seen order a, b) with nulls where a row lacks the field.
+        let processor = build_processor("if .v == 1 { { \"a\": \"x\" } } else { { \"b\": 7 } }")?;
+        use datafusion::arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let arr = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let ProcessResult::Single(b) = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?
+        else {
+            panic!("expected one merged batch");
+        };
+        assert_eq!(b.num_rows(), 2);
+        let schema = b.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["a", "b"], "union in first-seen order");
+        let a = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let bcol = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(a.value(0), "x");
+        assert!(a.is_null(1), "row 2 lacks `a`");
+        assert!(bcol.is_null(0), "row 1 lacks `b`");
+        assert_eq!(bcol.value(1), 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn null_first_occurrence_does_not_fix_a_null_column_type() -> Result<(), Error> {
+        // Row 1 sets .x = null, row 2 sets .x = 5: the column is typed from
+        // the first NON-null value (Int64), not frozen as a Null column
+        // that would drop row 2's value.
+        let processor = build_processor("if .v == 1 { { \"x\": null } } else { { \"x\": 5 } }")?;
+        use datafusion::arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let arr = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let ProcessResult::Single(b) = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?
+        else {
+            panic!("expected one merged batch");
+        };
+        assert_eq!(b.column(0).data_type(), &DataType::Int64);
+        let x = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(x.is_null(0));
+        assert_eq!(x.value(1), 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_object_result_mid_batch_fails_loudly() -> Result<(), Error> {
+        // Row 1 returns an object, row 2 returns a scalar: merging must not
+        // turn row 2 into a silent all-null row — the D4 loud failure holds
+        // for every row, not only the first.
+        let processor = build_processor("if .v == 1 { { \"a\": 1 } } else { 42 }")?;
+        use datafusion::arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let arr = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let err = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await
+            .expect_err("scalar row must fail loudly");
+        assert!(
+            format!("{err}").contains("row object"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflicting_field_types_across_rows_fail_loudly() -> Result<(), Error> {
+        // Merging batches means one column type per field. Before the merge
+        // each row was its own batch, so `x` could be an integer in row 1 and
+        // a string in row 2 without loss; after merging, silently nulling one
+        // side would be invisible data loss — it must error instead.
+        for statement in [
+            "if .v == 1 { { \"x\": 1 } } else { { \"x\": \"s\" } }",
+            "if .v == 1 { { \"x\": 1 } } else { { \"x\": 1.5 } }",
+            "if .v == 1 { { \"x\": true } } else { { \"x\": 1 } }",
+        ] {
+            let processor = build_processor(statement)?;
+            use datafusion::arrow::array::Int64Array;
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+            let arr = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
+            let rb = RecordBatch::try_new(schema, vec![arr])
+                .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+            let err = processor
+                .process(Arc::new(MessageBatch::new_arrow(rb)))
+                .await
+                .expect_err("conflicting field types must fail loudly");
+            let message = format!("{err}");
+            assert!(
+                message.contains("`x`") && message.contains("conflicting types"),
+                "error must name the field and the conflict, got: {message}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn null_on_one_row_does_not_conflict_with_a_typed_field() -> Result<(), Error> {
+        // nulls carry no type, so they never conflict: [null, 5] is an Int64
+        // column with a null first row, not an error.
+        let processor = build_processor("if .v == 1 { { \"x\": null } } else { { \"x\": 5 } }")?;
+        use datafusion::arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let arr = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        let ProcessResult::Single(batch) = processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?
+        else {
+            panic!("expected a single merged batch");
+        };
+        assert_eq!(batch.column(0).data_type(), &DataType::Int64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn statement_yielding_only_empty_arrays_produces_none() -> Result<(), Error> {
+        // A program that fans every row out to zero rows emits nothing: with
+        // merged batches that is `None` (previously: one empty batch per row).
+        let processor = build_processor("[]")?;
+        use datafusion::arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let arr = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
+        let rb = RecordBatch::try_new(schema, vec![arr])
+            .map_err(|e| Error::Process(format!("arrow: {e}")))?;
+        match processor
+            .process(Arc::new(MessageBatch::new_arrow(rb)))
+            .await?
+        {
+            ProcessResult::None => Ok(()),
+            other => panic!("expected None, got {other:?}"),
+        }
+    }
+
+    /// Ad-hoc release timing (NOT run by CI): merged single-batch output vs
+    /// the historical per-input-row batch construction, kept inline as the
+    /// oracle (both paths share the row conversion; the oracle builds one
+    /// `MessageBatch` per input row). Run with:
+    /// `cargo test --release -p arkflow-plugin --lib -- --ignored vrl_merge_timing --nocapture`
+    #[test]
+    #[ignore]
+    fn vrl_merge_timing() {
+        use datafusion::arrow::array::{Float64Array, Int64Array};
+        let rows = 1_000usize;
+        let batches = 200usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..rows).map(|i| format!("user_{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    (0..rows).map(|i| i as f64 * 0.5).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let batch = MessageBatch::new_arrow(rb);
+
+        let time = |name: &str, f: &mut dyn FnMut() -> usize| {
+            let mut best = std::time::Duration::MAX;
+            let mut out_rows = 0;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                out_rows = f();
+                best = best.min(start.elapsed());
+            }
+            println!(
+                "{name}: {out_rows} rows in {best:?} ({:.0} rows/s)",
+                out_rows as f64 / best.as_secs_f64()
+            );
+        };
+
+        // New path: convert once, build ONE batch.
+        let mut merged = || {
+            let mut n = 0usize;
+            for _ in 0..batches {
+                let values = message_batch_to_vrl_values(&batch).unwrap();
+                n += vrl_values_to_message_batch(values).unwrap().num_rows();
+            }
+            n
+        };
+        time("merged single batch", &mut merged);
+
+        // Oracle: the historical shape — clone the input batch, convert, then
+        // one MessageBatch per input row.
+        let mut per_row = || {
+            let mut n = 0usize;
+            for _ in 0..batches {
+                let values = message_batch_to_vrl_values(&batch.clone()).unwrap();
+                for v in values {
+                    n += vrl_values_to_message_batch(vec![v]).unwrap().num_rows();
+                }
+            }
+            n
+        };
+        time("per-row batches (historical)", &mut per_row);
     }
 
     #[tokio::test]
