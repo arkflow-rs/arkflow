@@ -489,7 +489,7 @@ fn vrl_values_to_message_batch(mut vrl_values: Vec<VrlValue>) -> Result<MessageB
                         if let Some((v, row_index)) = incoming {
                             if prev.kind_str() != v.kind_str() {
                                 return Err(Error::Process(format!(
-                                    "VRL processor: field `{}` has conflicting types across rows ({} at row {}, {} at row {}); a merged batch needs one column type per field — make the field consistent, e.g. with to_float()/to_string()",
+                                    "VRL processor: field `{}` has conflicting types across result rows ({} at result row {}, {} at result row {}; rows are 0-based over the merged output, so array fan-out shifts them off the input rows); a merged batch needs one column type per field — make the field consistent, e.g. with to_float()/to_string()",
                                     name,
                                     prev.kind_str(),
                                     prev_row,

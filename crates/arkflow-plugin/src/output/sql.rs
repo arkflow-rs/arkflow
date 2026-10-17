@@ -564,7 +564,16 @@ impl Output for SqlOutput {
         let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
         let mut batches = Vec::with_capacity(msgs.len());
         for msg in msgs {
+            // A batch with no rows has nothing to insert; binding it anyway
+            // would generate a syntactically invalid `INSERT ... VALUES`
+            // with no tuples. Skip it and succeed if nothing remains.
+            if msg.is_empty() {
+                continue;
+            }
             batches.push(batch_rows(&self.sql_config, msg)?);
+        }
+        if batches.is_empty() {
+            return Ok(());
         }
         execute_insert_transactional(conn, &self.sql_config, &batches).await
     }
@@ -599,6 +608,11 @@ impl SqlOutput {
         conn: &mut DatabaseConnection,
         msg: &MessageBatch,
     ) -> Result<(), Error> {
+        // Same no-rows skip as `write_batch`: an empty batch has nothing to
+        // insert and would only produce invalid SQL.
+        if msg.is_empty() {
+            return Ok(());
+        }
         let (columns, rows) = batch_rows(&self.sql_config, msg)?;
         conn.execute_insert(&self.sql_config, &columns, &rows)
             .await?;
@@ -1630,6 +1644,36 @@ mod tests {
         assert!(matches!(err, Error::Disconnection), "{err:?}");
         // close stays a no-op success whether or not a connection existed
         assert!(output.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn empty_batches_are_skipped_without_masking_disconnection() {
+        // A zero-row batch has nothing to insert (binding it would generate
+        // `INSERT ... VALUES` with no tuples — invalid SQL), so the write
+        // paths skip it. The skip must NOT mask a missing connection: an
+        // unconnected output still reports Disconnection.
+        let empty = MessageBatch::new_arrow(datafusion::arrow::array::RecordBatch::new_empty(
+            Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new("id", DataType::Int64, true),
+            ])),
+        ));
+        let output = SqlOutput::new(postgres_config(false, None)).unwrap();
+        let err = output.write(Arc::new(empty.clone())).await.unwrap_err();
+        assert!(matches!(err, Error::Disconnection), "{err:?}");
+        let err = output
+            .write_batch(&[Arc::new(empty.clone()), Arc::new(empty)])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Disconnection), "{err:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "No value being pushed")]
+    fn empty_row_set_panics_in_the_query_builder_why_we_skip() {
+        // Pins the reason `write_batch`/`insert_row` skip zero-row batches:
+        // sqlx's `push_values` debug-asserts (and would emit a dangling
+        // `VALUES` clause in release) when handed no rows.
+        build_postgres_insert(&postgres_config(false, None), &columns(), &[]);
     }
 
     // ---- remaining matching_data_type conversions ----

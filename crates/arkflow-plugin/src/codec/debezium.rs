@@ -171,10 +171,13 @@ fn flatten_envelope<'de>(
     // and this way one parse serves both consumers without a deep copy.
     let before_json = to_string(&before).unwrap_or_else(|_| "null".to_string());
     let source_json = to_string(&source).unwrap_or_else(|_| "null".to_string());
-    let (source_db, source_table) = match &source {
-        CowValue::Object(s) => (
-            s.get("db").map(detach_value).unwrap_or(CowValue::Null),
-            s.get("table").map(detach_value).unwrap_or(CowValue::Null),
+    // `source` is already serialized above and never lands in the row itself,
+    // so consume it: the promoted scalars keep their borrowed strings instead
+    // of being deep-copied per envelope.
+    let (source_db, source_table) = match source {
+        CowValue::Object(mut s) => (
+            s.shift_remove("db").unwrap_or(CowValue::Null),
+            s.shift_remove("table").unwrap_or(CowValue::Null),
         ),
         _ => (CowValue::Null, CowValue::Null),
     };
@@ -209,27 +212,6 @@ fn flatten_envelope<'de>(
     );
 
     row
-}
-
-/// Owned deep copy of a (small) sub-value — the `CowValue` counterpart of
-/// `serde_json::Value::clone`, used for the two promoted `source` scalars
-/// (`db`/`table`) which outlive the borrowed `source` object's move into the
-/// row. Any type is preserved so schema inference sees what the payload had.
-fn detach_value(v: &CowValue<'_>) -> CowValue<'static> {
-    match v {
-        CowValue::Null => CowValue::Null,
-        CowValue::Bool(b) => CowValue::Bool(*b),
-        CowValue::Int(i) => CowValue::Int(*i),
-        CowValue::UInt(u) => CowValue::UInt(*u),
-        CowValue::Float(f) => CowValue::Float(*f),
-        CowValue::Str(s) => CowValue::Str(Cow::Owned(s.to_string())),
-        CowValue::Array(items) => CowValue::Array(items.iter().map(detach_value).collect()),
-        CowValue::Object(map) => CowValue::Object(
-            map.iter()
-                .map(|(k, v)| (Cow::Owned(k.to_string()), detach_value(v)))
-                .collect(),
-        ),
-    }
 }
 
 /// The row produced by a non-object envelope (or one with no fields): only
