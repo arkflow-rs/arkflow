@@ -266,7 +266,11 @@ impl LookupCache {
 
     fn get(&self, key: &str) -> Option<Option<Arc<LookupRow>>> {
         let inner = &mut *self.inner.lock().unwrap();
-        let CacheInner { map, order, next_gen } = inner;
+        let CacheInner {
+            map,
+            order,
+            next_gen,
+        } = inner;
         let entry = map.get_mut(key)?;
         if Instant::now() >= entry.expires_at {
             map.remove(key);
@@ -285,7 +289,11 @@ impl LookupCache {
             self.negative_ttl
         };
         let inner = &mut *self.inner.lock().unwrap();
-        let CacheInner { map, order, next_gen } = inner;
+        let CacheInner {
+            map,
+            order,
+            next_gen,
+        } = inner;
         let gen = *next_gen;
         *next_gen += 1;
         order.push_back((key.clone(), gen));
@@ -394,9 +402,10 @@ impl LookupBackend for HttpBackend {
             Error::Process(format!("lookup processor: request for key failed: {e}"))
         })?;
         let status = response.status();
-        let body = response.text().await.map_err(|e| {
-            Error::Process(format!("lookup processor: response read failed: {e}"))
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| Error::Process(format!("lookup processor: response read failed: {e}")))?;
         if !status.is_success() {
             // 404 is the conventional "no record" signal for a dimension
             // lookup; it participates in negative caching. Any other
@@ -429,9 +438,7 @@ fn value_at_path<'a>(record: &'a Value, path: &str) -> Option<&'a Value> {
     for segment in path.split('.') {
         current = match current {
             Value::Object(map) => map.get(segment)?,
-            Value::Array(items) => {
-                items.get(segment.parse::<usize>().ok()?)?
-            }
+            Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
             _ => return None,
         };
     }
@@ -530,13 +537,13 @@ impl Processor for LookupProcessor {
         };
 
         let mut fields: Vec<Arc<Field>> = msg_batch.schema().fields().iter().cloned().collect();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len() + self.config.columns.len());
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(fields.len() + self.config.columns.len());
         for index in 0..msg_batch.num_columns() {
             let column = msg_batch.column(index).clone();
             if keep.len() != rows {
-                let indices = UInt32Array::from(
-                    keep.iter().map(|row| *row as u32).collect::<Vec<_>>(),
-                );
+                let indices =
+                    UInt32Array::from(keep.iter().map(|row| *row as u32).collect::<Vec<_>>());
                 let taken = take(&column, &indices, None).map_err(|e| {
                     Error::Process(format!("lookup processor: row selection failed: {e}"))
                 })?;
@@ -692,7 +699,8 @@ impl LookupProcessor {
             .columns
             .iter()
             .map(|column| {
-                value_at_path(record, &column.path).and_then(|value| coerce(value, column.column_type))
+                value_at_path(record, &column.path)
+                    .and_then(|value| coerce(value, column.column_type))
             })
             .collect())
     }
@@ -802,7 +810,10 @@ impl ProcessorBuilder for LookupProcessorBuilder {
                     .ok()
                     .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
                     .map(|host| {
-                        host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+                        host == "localhost"
+                            || host == "127.0.0.1"
+                            || host == "::1"
+                            || host == "[::1]"
                     })
                     .unwrap_or(false);
                 let mut builder =
@@ -957,8 +968,7 @@ mod tests {
     }
 
     fn record_body(name: &str, age: i64) -> String {
-        serde_json::json!({"profile": {"name": name, "age": age}})
-            .to_string()
+        serde_json::json!({"profile": {"name": name, "age": age}}).to_string()
     }
 
     fn build_processor(config: Value) -> Arc<dyn Processor> {
@@ -989,8 +999,7 @@ mod tests {
 
     fn users_batch_with_meta(values: Vec<Option<i64>>, with_meta: bool) -> MessageBatchRef {
         let mut fields = vec![Field::new("user_id", DataType::Int64, true)];
-        let mut columns: Vec<ArrayRef> =
-            vec![Arc::new(Int64Array::from(values))];
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(values))];
         if with_meta {
             fields.push(Field::new("__meta_source", DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(vec!["kafka"; columns[0].len()])));
@@ -1027,10 +1036,7 @@ mod tests {
             let key = path.rsplit('/').next().unwrap();
             (200, record_body(&format!("name-{key}"), key.len() as i64))
         });
-        let processor = build_processor(base_config(
-            mock.addr,
-            serde_json::json!({}),
-        ));
+        let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
         let batch = users_batch_with_meta(vec![Some(1), Some(2), Some(1)], true);
         let output = process_single(&processor, batch).await;
 
@@ -1139,10 +1145,7 @@ mod tests {
     #[tokio::test]
     async fn expired_entry_re_resolves() {
         let mock = MockDimService::spawn(|_path| (200, record_body("x", 1)));
-        let processor = build_processor(base_config(
-            mock.addr,
-            serde_json::json!({"ttl_ms": 20}),
-        ));
+        let processor = build_processor(base_config(mock.addr, serde_json::json!({"ttl_ms": 20})));
         process_single(&processor, users_batch(vec![Some(9)])).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         process_single(&processor, users_batch(vec![Some(9)])).await;
@@ -1151,13 +1154,12 @@ mod tests {
 
     #[test]
     fn cache_bounded_under_distinct_key_flood() {
-        let cache = LookupCache::new(
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-            10,
-        );
+        let cache = LookupCache::new(Duration::from_secs(60), Duration::from_secs(60), 10);
         for i in 0..100 {
-            cache.insert(Arc::from(format!("key-{i}").as_str()), Some(Arc::new(vec![])));
+            cache.insert(
+                Arc::from(format!("key-{i}").as_str()),
+                Some(Arc::new(vec![])),
+            );
         }
         assert!(
             cache.len() <= 10,
@@ -1309,11 +1311,7 @@ mod tests {
     async fn missing_key_keeps_row_with_nulls_and_discard_drops_it() {
         let mock = MockDimService::spawn(|_path| (404, "{}".to_string()));
         let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
-        let output = process_single(
-            &processor,
-            users_batch(vec![Some(1), Some(2), Some(3)]),
-        )
-        .await;
+        let output = process_single(&processor, users_batch(vec![Some(1), Some(2), Some(3)])).await;
         assert_eq!(output.num_rows(), 3, "default keeps the row with nulls");
 
         let mock = MockDimService::spawn(|_path| (404, "{}".to_string()));
@@ -1321,11 +1319,7 @@ mod tests {
             mock.addr,
             serde_json::json!({"on_missing": "discard"}),
         ));
-        let output = process_single(
-            &processor,
-            users_batch(vec![Some(1), Some(2), Some(3)]),
-        )
-        .await;
+        let output = process_single(&processor, users_batch(vec![Some(1), Some(2), Some(3)])).await;
         assert_eq!(output.num_rows(), 0, "all rows missed");
     }
 
@@ -1343,11 +1337,7 @@ mod tests {
             mock.addr,
             serde_json::json!({"on_missing": "discard"}),
         ));
-        let output = process_single(
-            &processor,
-            users_batch(vec![Some(1), Some(2), Some(3)]),
-        )
-        .await;
+        let output = process_single(&processor, users_batch(vec![Some(1), Some(2), Some(3)])).await;
         assert_eq!(output.num_rows(), 2);
         let ids = column_by_name(&output, "user_id")
             .as_any()
@@ -1403,7 +1393,11 @@ mod tests {
                 "encode_key": false
             }}}),
         ));
-        let schema = Arc::new(Schema::new(vec![Field::new("user_id", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Utf8,
+            true,
+        )]));
         let batch = Arc::new(MessageBatch::new_arrow(
             RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a/b"]))]).unwrap(),
         ));
