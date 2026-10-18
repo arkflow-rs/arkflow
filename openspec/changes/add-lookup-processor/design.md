@@ -36,9 +36,9 @@ processor 链的组件契约：`Processor::process(&self, msg: MessageBatchRef) 
 
 缓存键与 URL 模板替换统一用字符串形态（`i64→"42"` 可逆无损；浮点显式配置报错，避免 `1.5` 的 locale/精度歧义）。多 key 列按列序以 `\u{1f}` 连接为复合键。**替代方案**（`LookupKey` 枚举携带原始类型传后端）被否：HTTP 模板替换终归是字符串，枚举徒增后端实现负担。
 
-### D3 — 缓存：手写 TTL + 容量近似 LRU，不引新依赖
+### D3 — 缓存：手写 TTL + 近似 LRU，不引新依赖
 
-`Mutex<HashMap<Arc<str>, (Instant, Option<Arc<Value>>)>>` + 插入序 `VecDeque` 驱逐队列：读命中把键移到队尾（近似 LRU），容量超限时从队首驱逐，驱逐前先清扫已过期项。`max_entries` 默认 100_000，`ttl_ms` 默认 60_000，负缓存与命中同 TTL（`negative_ttl_ms` 可单独调小）。**替代方案**（引入 moka）被否：依赖面与其 async 特性（需要 tokio runtime 把手）对 v1 过重；spec 只钉语义（TTL 内命中、容量上界、未命中缓存）不钉算法，后续可无痛换实现。
+`Mutex<HashMap<Arc<str>, (Instant, Option<Arc<Value>>)>>` + 生成序 LRU（读命中 push `(key, gen)` 到 `VecDeque` 队尾，驱逐时跳过 stale 对）+ 最早过期索引（`BinaryHeap<Reverse<(Instant, key)>>`）。`max_entries` 默认 100_000，`ttl_ms` 默认 60_000，负缓存与命中同 TTL（`negative_ttl_ms` 可单独调小）。**过界驱逐**：堆顶即全局最早过期项——已过期则驱逐它（满足 spec「先清过期」），未过期则证明全表无过期项，直接走 LRU 队首，避免持锁全表扫描。**索引防膨胀**：热键路径每次命中都会追加 order 对、重插会留下 stale 堆记录，两个索引在「stale 对显著多于活条目」时批量 retain 压缩（`len > 2×map.len()+64`），保证工作集低于容量时索引不随进程生命周期增长。**替代方案**（引入 moka）被否：依赖面与其 async 特性（需要 tokio runtime 把手）对 v1 过重；spec 只钉语义（TTL 内命中、容量上界、未命中缓存）不钉算法，后续可无痛换实现。
 
 ### D4 — HTTP 后端：URL 模板 + `columns` 类型化映射
 

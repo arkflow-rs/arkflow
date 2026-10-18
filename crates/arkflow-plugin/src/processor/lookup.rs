@@ -23,7 +23,7 @@
 //! without caching); unresolved keys emit null lookup columns by default
 //! (`on_missing: discard` drops the rows instead).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -238,9 +238,18 @@ struct LookupCache {
 
 struct CacheInner {
     map: HashMap<Arc<str>, CacheEntry>,
-    /// Access order as (key, generation); stale pairs are skipped on
-    /// eviction so reads can promote an entry without a deque removal.
+    /// LRU access order as (key, generation). Stale pairs (re-accessed or
+    /// removed keys) are skipped during eviction and compacted in bulk once
+    /// they dominate the live entries — the hot-key path appends on every
+    /// hit, so without compaction the deque would grow for process lifetime
+    /// when the working set stays below the capacity bound.
     order: VecDeque<(Arc<str>, u64)>,
+    /// Earliest-expiry index as (expires_at, key). The front is the globally
+    /// earliest-expiring live record: if it is not yet expired, no entry is,
+    /// so eviction can go straight to LRU without a full-map scan. Stale
+    /// records (key replaced or lazily expired) are skipped during eviction
+    /// and compacted like `order`.
+    expiry: BinaryHeap<std::cmp::Reverse<(Instant, Arc<str>)>>,
     next_gen: u64,
 }
 
@@ -259,6 +268,7 @@ impl LookupCache {
             inner: Mutex::new(CacheInner {
                 map: HashMap::new(),
                 order: VecDeque::new(),
+                expiry: BinaryHeap::new(),
                 next_gen: 0,
             }),
         }
@@ -269,17 +279,29 @@ impl LookupCache {
         let CacheInner {
             map,
             order,
+            expiry,
             next_gen,
         } = inner;
-        let entry = map.get_mut(key)?;
-        if Instant::now() >= entry.expires_at {
+        let expired = map
+            .get(key)
+            .map(|entry| Instant::now() >= entry.expires_at)
+            .unwrap_or(false);
+        if expired {
             map.remove(key);
             return None;
         }
-        entry.gen = *next_gen;
-        *next_gen += 1;
-        order.push_back((Arc::from(key), entry.gen));
-        Some(entry.value.clone())
+        // Clone the map's canonical key so the order pair does not allocate
+        // a fresh Arc on every hit.
+        let canonical = map.get_key_value(key).map(|(k, _)| k.clone())?;
+        let (value, gen) = {
+            let entry = map.get_mut(key).expect("checked present above");
+            entry.gen = *next_gen;
+            *next_gen += 1;
+            (entry.value.clone(), entry.gen)
+        };
+        order.push_back((canonical, gen));
+        Self::compact(map, order, expiry);
+        Some(value)
     }
 
     fn insert(&self, key: Arc<str>, value: Option<Arc<LookupRow>>) {
@@ -292,47 +314,108 @@ impl LookupCache {
         let CacheInner {
             map,
             order,
+            expiry,
             next_gen,
         } = inner;
         let gen = *next_gen;
         *next_gen += 1;
         order.push_back((key.clone(), gen));
+        let expires_at = Instant::now() + ttl;
+        expiry.push(std::cmp::Reverse((expires_at, key.clone())));
         map.insert(
             key,
             CacheEntry {
-                expires_at: Instant::now() + ttl,
+                expires_at,
                 value,
                 gen,
             },
         );
         while map.len() > self.max_entries {
-            // Sweep expired entries first, then drop the least recently
-            // used. Stale order pairs (key re-accessed later) are skipped.
-            let now = Instant::now();
-            if let Some(expired) = map
-                .iter()
-                .find(|(_, entry)| now >= entry.expires_at)
-                .map(|(key, _)| key.clone())
+            if !Self::evict_one(map, order, expiry) {
+                break;
+            }
+        }
+        Self::compact(map, order, expiry);
+    }
+
+    /// Removes one entry per the bound contract: expired entries first, the
+    /// least recently used otherwise. Returns false when nothing is
+    /// removable.
+    fn evict_one(
+        map: &mut HashMap<Arc<str>, CacheEntry>,
+        order: &mut VecDeque<(Arc<str>, u64)>,
+        expiry: &mut BinaryHeap<std::cmp::Reverse<(Instant, Arc<str>)>>,
+    ) -> bool {
+        // Drop stale heap records from the front until the top reflects a
+        // live entry.
+        loop {
+            let front = expiry
+                .peek()
+                .map(|std::cmp::Reverse((instant, key))| (*instant, key.clone()));
+            let Some((instant, key)) = front else {
+                break;
+            };
+            if map
+                .get(&key)
+                .is_some_and(|entry| entry.expires_at == instant)
             {
-                map.remove(&expired);
-                continue;
+                break;
             }
-            match order.pop_front() {
-                Some((key, gen)) => {
-                    if let Some(entry) = map.get(&key) {
-                        if entry.gen == gen {
-                            map.remove(&key);
-                        }
-                    }
-                }
-                None => break,
+            expiry.pop();
+        }
+        // The heap front is the earliest-expiring live entry: if it is not
+        // expired, nothing in the map is, so expired-first is satisfied by
+        // going straight to LRU.
+        let front = expiry
+            .peek()
+            .map(|std::cmp::Reverse((instant, key))| (*instant, key.clone()));
+        if let Some((instant, key)) = front {
+            if Instant::now() >= instant {
+                expiry.pop();
+                map.remove(&key);
+                return true;
             }
+        }
+        while let Some((key, gen)) = order.pop_front() {
+            if map.get(&key).is_some_and(|entry| entry.gen == gen) {
+                map.remove(&key);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drops stale index records once they dominate the live entries so
+    /// both indices stay a constant factor above the map size.
+    fn compact(
+        map: &HashMap<Arc<str>, CacheEntry>,
+        order: &mut VecDeque<(Arc<str>, u64)>,
+        expiry: &mut BinaryHeap<std::cmp::Reverse<(Instant, Arc<str>)>>,
+    ) {
+        if order.len() > 2 * map.len() + 64 {
+            order.retain(|(key, gen)| map.get(key).is_some_and(|entry| entry.gen == *gen));
+        }
+        if expiry.len() > 2 * map.len() + 64 {
+            expiry.retain(|std::cmp::Reverse((instant, key))| {
+                map.get(key)
+                    .is_some_and(|entry| entry.expires_at == *instant)
+            });
         }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().unwrap().map.len()
+    }
+
+    #[cfg(test)]
+    fn order_len(&self) -> usize {
+        self.inner.lock().unwrap().order.len()
+    }
+
+    #[cfg(test)]
+    fn expiry_len(&self) -> usize {
+        self.inner.lock().unwrap().expiry.len()
     }
 }
 
@@ -1166,6 +1249,58 @@ mod tests {
             "cache exceeded capacity bound: {}",
             cache.len()
         );
+    }
+
+    #[test]
+    fn hot_key_access_keeps_order_deque_bounded() {
+        let cache = LookupCache::new(Duration::from_secs(60), Duration::from_secs(60), 1000);
+        cache.insert(Arc::from("hot"), Some(Arc::new(vec![])));
+        for _ in 0..1000 {
+            assert!(cache.get("hot").is_some(), "hot key must stay cached");
+        }
+        // Every hit appends an order pair; compaction must keep the deque
+        // within a constant factor of the live entry count.
+        assert!(
+            cache.order_len() <= 2 + 64,
+            "order deque grew unbounded: {}",
+            cache.order_len()
+        );
+    }
+
+    #[test]
+    fn repeated_reinsertion_keeps_expiry_index_bounded() {
+        let cache = LookupCache::new(Duration::from_secs(60), Duration::from_secs(60), 1000);
+        for _ in 0..500 {
+            cache.insert(Arc::from("same"), Some(Arc::new(vec![])));
+        }
+        // Each insert pushes an expiry record; the replaced record is stale
+        // and compaction must keep the heap near the live entry count.
+        assert!(
+            cache.expiry_len() <= 2 + 64,
+            "expiry heap grew unbounded: {}",
+            cache.expiry_len()
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn expired_entry_evicted_before_lru_live_entry() {
+        // k1 gets the short negative TTL; k2..k4 the long positive one.
+        // After k1 lapses, inserting k5 over capacity must evict the
+        // expired k1 — not the least-recently-used live k2.
+        let cache = LookupCache::new(Duration::from_secs(60), Duration::from_millis(20), 4);
+        cache.insert(Arc::from("k1"), None);
+        cache.insert(Arc::from("k2"), Some(Arc::new(vec![])));
+        cache.insert(Arc::from("k3"), Some(Arc::new(vec![])));
+        cache.insert(Arc::from("k4"), Some(Arc::new(vec![])));
+        std::thread::sleep(Duration::from_millis(50));
+        cache.insert(Arc::from("k5"), Some(Arc::new(vec![])));
+        assert!(
+            cache.get("k2").is_some(),
+            "expired k1 must be evicted before the live LRU entry k2"
+        );
+        assert!(cache.get("k1").is_none(), "k1 must be gone");
+        assert!(cache.len() <= 4);
     }
 
     #[tokio::test]
