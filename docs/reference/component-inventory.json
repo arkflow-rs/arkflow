@@ -2477,6 +2477,166 @@
     },
     {
       "kind": "processor",
+      "name": "lookup",
+      "description": "Resolves each row's lookup key against an external dimension service and appends the configured result columns, with an in-process TTL cache, negative caching, and bounded ordered concurrency.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Input column(s) forming the lookup key (Utf8/Int64/UInt64/Boolean). Multiple columns join into a composite key in configured order; a null key cell follows the missing-key semantics."
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "Appended output column name."
+                },
+                "path": {
+                  "type": "string",
+                  "description": "Dot path of the value inside the backend's JSON record, e.g. 'profile.age'."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "utf8",
+                    "int64",
+                    "float64",
+                    "bool"
+                  ],
+                  "description": "Output column type. A value that is absent or not coercible yields a null cell. Defaults to 'utf8'."
+                }
+              },
+              "required": [
+                "name",
+                "path"
+              ]
+            },
+            "minItems": 1,
+            "description": "Result columns appended to the batch. Names must not collide with existing input columns."
+          },
+          "backend": {
+            "type": "object",
+            "description": "Dimension service backend. Currently only 'http' is available.",
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "http": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "url": {
+                        "type": "string",
+                        "description": "URL template containing '{{key}}', substituted per lookup key."
+                      },
+                      "method": {
+                        "type": "string",
+                        "description": "HTTP method. Defaults to 'GET'."
+                      },
+                      "headers": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "description": "Extra HTTP headers."
+                      },
+                      "encode_key": {
+                        "type": "boolean",
+                        "description": "Percent-encode the substituted key (RFC 3986 unreserved set kept literal). Defaults to true."
+                      }
+                    },
+                    "required": [
+                      "url"
+                    ]
+                  }
+                },
+                "required": [
+                  "http"
+                ]
+              }
+            ]
+          },
+          "ttl_ms": {
+            "type": "integer",
+            "description": "Cache TTL for resolved records in milliseconds. Defaults to 60000."
+          },
+          "negative_ttl_ms": {
+            "type": "integer",
+            "description": "Cache TTL for misses (negative caching) in milliseconds. Defaults to ttl_ms."
+          },
+          "max_entries": {
+            "type": "integer",
+            "description": "Cache capacity bound; expired entries are swept first, then the least recently used are evicted. Defaults to 100000."
+          },
+          "concurrency": {
+            "type": "integer",
+            "description": "Maximum in-flight backend requests. Defaults to 8."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+          },
+          "on_missing": {
+            "type": "string",
+            "enum": [
+              "null",
+              "discard"
+            ],
+            "description": "Unresolved key handling: keep the row with null lookup columns (default) or drop the row."
+          },
+          "on_backend_error": {
+            "type": "string",
+            "enum": [
+              "fail",
+              "null"
+            ],
+            "description": "Backend failure handling: fail the batch (default) or degrade the affected keys to uncached misses."
+          }
+        },
+        "required": [
+          "key_columns",
+          "columns",
+          "backend"
+        ]
+      },
+      "config_example": {
+        "key_columns": [
+          "user_id"
+        ],
+        "columns": [
+          {
+            "name": "user_name",
+            "path": "profile.name",
+            "type": "utf8"
+          },
+          {
+            "name": "tier",
+            "path": "profile.tier",
+            "type": "utf8"
+          }
+        ],
+        "backend": {
+          "http": {
+            "url": "http://dim-service/users/{{key}}"
+          }
+        },
+        "ttl_ms": 60000
+      }
+    },
+    {
+      "kind": "processor",
       "name": "milvus_search",
       "description": "Searches a Milvus collection for the top-k nearest neighbors of each row's vector and appends the matches as a JSON array text column. Rows are searched with bounded, order-preserving concurrency.",
       "config_optional": false,

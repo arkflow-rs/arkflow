@@ -229,6 +229,11 @@
       "kind": "yaml"
     },
     {
+      "name": "lookup-processor",
+      "path": "../examples/lookup_processor.yaml",
+      "kind": "yaml"
+    },
+    {
       "name": "embedding-pgvector-pipeline",
       "path": "../examples/embedding_pgvector_pipeline.yaml",
       "kind": "yaml"
