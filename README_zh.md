@@ -160,6 +160,7 @@ ArkFlow提供多种数据处理器：
 - **Vector Search** (`vector_search`)：在 Qdrant 集合中检索每行向量的 top-k 近邻并以 JSON 追加匹配结果
 - **Milvus Search** (`milvus_search`)：以单次批量请求在 Milvus 集合中检索每行向量的 top-k 近邻
 - **pgvector Search** (`pgvector_search`)：在启用了 pgvector 扩展的 PostgreSQL 表中检索每行向量的 top-k 近邻
+- **Lookup** (`lookup`)：用外部维表服务解析的列 enrich 每一行，带 TTL 缓存与有界保序并发
 
 <!-- README_COMPONENTS:processor END -->
 

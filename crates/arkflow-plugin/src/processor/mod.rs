@@ -22,6 +22,7 @@ pub mod batch;
 pub mod embedding;
 pub mod json;
 pub mod llm;
+pub mod lookup;
 pub mod milvus_search;
 pub mod pgvector_search;
 pub mod protobuf;
@@ -34,6 +35,7 @@ fn register_components() -> Result<(), Error> {
     batch::init()?;
     json::init()?;
     llm::init()?;
+    lookup::init()?;
     pgvector_search::init()?;
     protobuf::init()?;
     sql::init()?;

@@ -4260,6 +4260,7 @@
             null,
             null,
             null,
+            null,
             null
           ],
           "description": "processor component type."
@@ -4920,6 +4921,230 @@
               "field": "text",
               "system_prompt": "You classify support tickets with one word.",
               "concurrency": 4
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "lookup",
+          "description": "Resolves each row's lookup key against an external dimension service and appends the configured result columns, with an in-process TTL cache, negative caching, and bounded ordered concurrency.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "lookup",
+              "description": "Resolves each row's lookup key against an external dimension service and appends the configured result columns, with an in-process TTL cache, negative caching, and bounded ordered concurrency."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "codec": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "title": "debezium_json",
+                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "debezium_json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "json",
+                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "json"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "protobuf",
+                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "protobuf"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "title": "schema_registry",
+                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "schema_registry"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                }
+              ]
+            },
+            "key_columns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "description": "Input column(s) forming the lookup key (Utf8/Int64/UInt64/Boolean). Multiple columns join into a composite key in configured order; a null key cell follows the missing-key semantics."
+            },
+            "columns": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "Appended output column name."
+                  },
+                  "path": {
+                    "type": "string",
+                    "description": "Dot path of the value inside the backend's JSON record, e.g. 'profile.age'."
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "utf8",
+                      "int64",
+                      "float64",
+                      "bool"
+                    ],
+                    "description": "Output column type. A value that is absent or not coercible yields a null cell. Defaults to 'utf8'."
+                  }
+                },
+                "required": [
+                  "name",
+                  "path"
+                ]
+              },
+              "minItems": 1,
+              "description": "Result columns appended to the batch. Names must not collide with existing input columns."
+            },
+            "backend": {
+              "type": "object",
+              "description": "Dimension service backend. Currently only 'http' is available.",
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "http": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "url": {
+                          "type": "string",
+                          "description": "URL template containing '{{key}}', substituted per lookup key."
+                        },
+                        "method": {
+                          "type": "string",
+                          "description": "HTTP method. Defaults to 'GET'."
+                        },
+                        "headers": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "string"
+                          },
+                          "description": "Extra HTTP headers."
+                        },
+                        "encode_key": {
+                          "type": "boolean",
+                          "description": "Percent-encode the substituted key (RFC 3986 unreserved set kept literal). Defaults to true."
+                        }
+                      },
+                      "required": [
+                        "url"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "http"
+                  ]
+                }
+              ]
+            },
+            "ttl_ms": {
+              "type": "integer",
+              "description": "Cache TTL for resolved records in milliseconds. Defaults to 60000."
+            },
+            "negative_ttl_ms": {
+              "type": "integer",
+              "description": "Cache TTL for misses (negative caching) in milliseconds. Defaults to ttl_ms."
+            },
+            "max_entries": {
+              "type": "integer",
+              "description": "Cache capacity bound; expired entries are swept first, then the least recently used are evicted. Defaults to 100000."
+            },
+            "concurrency": {
+              "type": "integer",
+              "description": "Maximum in-flight backend requests. Defaults to 8."
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "description": "HTTP request timeout in milliseconds. Defaults to 30000."
+            },
+            "on_missing": {
+              "type": "string",
+              "enum": [
+                "null",
+                "discard"
+              ],
+              "description": "Unresolved key handling: keep the row with null lookup columns (default) or drop the row."
+            },
+            "on_backend_error": {
+              "type": "string",
+              "enum": [
+                "fail",
+                "null"
+              ],
+              "description": "Backend failure handling: fail the batch (default) or degrade the affected keys to uncached misses."
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "examples": [
+            {
+              "key_columns": [
+                "user_id"
+              ],
+              "columns": [
+                {
+                  "name": "user_name",
+                  "path": "profile.name",
+                  "type": "utf8"
+                },
+                {
+                  "name": "tier",
+                  "path": "profile.tier",
+                  "type": "utf8"
+                }
+              ],
+              "backend": {
+                "http": {
+                  "url": "http://dim-service/users/{{key}}"
+                }
+              },
+              "ttl_ms": 60000
             }
           ]
         },

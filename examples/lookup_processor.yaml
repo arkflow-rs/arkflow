@@ -1,0 +1,40 @@
+# Enrich each row with dimension-table columns looked up over HTTP.
+# The lookup key is taken from the `user_id` column; on a cache miss the
+# processor GETs the URL template with the key substituted and appends the
+# configured columns. Point `url` at your dimension service (or a local
+# mock); resolved records are cached for 60s, misses for the same TTL.
+logging:
+  level: info
+streams:
+  - id: enrich-users
+    input:
+      type: memory
+      messages:
+        - '{"user_id": 42}'
+        - '{"user_id": 7}'
+        - '{"user_id": 42}'
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: lookup
+          key_columns:
+            - user_id
+          columns:
+            - name: user_name
+              path: profile.name
+              type: utf8
+            - name: tier
+              path: profile.tier
+              type: utf8
+          backend:
+            http:
+              url: "http://localhost:8090/users/{{key}}"
+          ttl_ms: 60000
+          max_entries: 100000
+          concurrency: 8
+        - type: arrow_to_json
+
+    output:
+      type: stdout
