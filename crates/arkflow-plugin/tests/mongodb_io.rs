@@ -187,12 +187,31 @@ fn resource() -> Resource {
 }
 
 async fn start_server() -> ContainerAsync<GenericImage> {
-    let image = GenericImage::new("mongo", "7")
-        .with_mapped_port(MONGO_HOST_PORT, MONGO_HOST_PORT.tcp())
-        .with_startup_timeout(Duration::from_secs(180));
-    let container = image.start().await.expect("mongo container start");
-    wait_for_server().await;
-    container
+    // Docker Hub intermittently truncates the mongo:7 pull mid-stream
+    // ("bytes remaining on stream"); a resumed attempt succeeds because the
+    // already-downloaded layers are cached (observed on CI as one test
+    // failing at start while its siblings pass seconds later). Bounded
+    // retry rides out that flake without masking real container failures.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let image = GenericImage::new("mongo", "7")
+            .with_mapped_port(MONGO_HOST_PORT, MONGO_HOST_PORT.tcp())
+            .with_startup_timeout(Duration::from_secs(180));
+        match image.start().await {
+            Ok(container) => {
+                wait_for_server().await;
+                return container;
+            }
+            Err(error) if attempts < 3 => {
+                eprintln!(
+                    "mongodb_io: mongo container start attempt {attempts} failed ({error}); retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => panic!("mongo container start: {error}"),
+        }
+    }
 }
 
 /// Poll until the wire protocol answers a ping command.

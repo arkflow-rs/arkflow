@@ -19,7 +19,7 @@
 //! Schemas are cached per id so each schema version is fetched at most once.
 //! The decode side is dispatched on the registry's `schemaType` response.
 
-use crate::codec::avro_arrow::{avro_read_value, AvroArrowAccumulator};
+use crate::codec::avro_arrow::{AvroArrowAccumulator, AvroValueReader};
 use crate::component::protobuf::{parse_proto_source, ProtobufBatchConverter};
 use apache_avro::Schema as AvroSchema;
 use arkflow_core::codec::{Codec, CodecBuilder, Decoder, Encoder};
@@ -34,6 +34,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use prost_reflect::MessageDescriptor;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Characters percent-encoded when a registry subject is placed into the URL
@@ -297,6 +298,28 @@ impl Encoder for SchemaRegistryCodec {
 impl Decoder for SchemaRegistryCodec {
     async fn decode(&self, b: Vec<Bytes>) -> Result<MessageBatch, Error> {
         self.ensure_gate().await?;
+        // Pass 1: the historical per-message pipeline up to schema
+        // resolution — wire-format parse and schema fetch of message k
+        // abort before message k+1 is touched, preserving the sequential
+        // error order the codec always had. Schema Arcs are stashed per id.
+        let mut cached_by_id: HashMap<u32, Arc<CachedSchema>> = HashMap::new();
+        let mut staged: Vec<(u32, &[u8])> = Vec::with_capacity(b.len());
+        for msg in &b {
+            let (id, payload) = parse_wire_format(msg)?;
+            // Vacant-only resolve: `or_insert` would eagerly evaluate the
+            // resolve (a cache lookup) for every repeated id.
+            if let std::collections::hash_map::Entry::Vacant(entry) = cached_by_id.entry(id) {
+                let cached = self.resolve_cached(id).await?;
+                entry.insert(cached);
+            }
+            staged.push((id, payload));
+        }
+        // Pass 2: decode in message order through per-id readers built once
+        // and reused across messages (`read_value` takes `&self`), so the
+        // reader's name tables amortize over the batch instead of rebuilding
+        // per message. The readers borrow from `cached_by_id`, which stays
+        // immutable for the whole pass — that is what lets them outlive a
+        // single message without self-referential storage.
         // Messages accumulate columnar per schema id (groups in
         // first-appearance order, rows in message order within a group);
         // protobuf groups accumulate columnar exactly like Avro groups, so
@@ -306,9 +329,9 @@ impl Decoder for SchemaRegistryCodec {
             Protobuf(ProtobufBatchConverter),
         }
         let mut groups: Vec<(u32, Group)> = Vec::new();
-        for msg in b {
-            let (id, payload) = parse_wire_format(&msg)?;
-            let cached = self.resolve_cached(id).await?;
+        let mut readers: HashMap<u32, AvroValueReader<'_>> = HashMap::new();
+        for (id, payload) in staged {
+            let cached = cached_by_id.get(&id).expect("resolved during pass 1");
             match cached.as_ref() {
                 CachedSchema::Protobuf(descriptor) => {
                     match groups.iter_mut().find(|(gid, _)| gid == &id) {
@@ -322,7 +345,17 @@ impl Decoder for SchemaRegistryCodec {
                     }
                 }
                 CachedSchema::Avro(schema) => {
-                    let value = avro_read_value(schema, payload)?;
+                    let value = match readers.entry(id) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            entry.get().read_value(payload)?
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let reader = AvroValueReader::new(schema)?;
+                            let value = reader.read_value(payload)?;
+                            entry.insert(reader);
+                            value
+                        }
+                    };
                     match groups.iter_mut().find(|(gid, _)| gid == &id) {
                         Some((_, Group::Avro(accumulator))) => accumulator.push(&value)?,
                         _ => {
