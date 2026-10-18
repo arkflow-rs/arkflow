@@ -306,9 +306,12 @@ impl Decoder for SchemaRegistryCodec {
         let mut staged: Vec<(u32, &[u8])> = Vec::with_capacity(b.len());
         for msg in &b {
             let (id, payload) = parse_wire_format(msg)?;
-            cached_by_id
-                .entry(id)
-                .or_insert(self.resolve_cached(id).await?);
+            // Vacant-only resolve: `or_insert` would eagerly evaluate the
+            // resolve (a cache lookup) for every repeated id.
+            if let std::collections::hash_map::Entry::Vacant(entry) = cached_by_id.entry(id) {
+                let cached = self.resolve_cached(id).await?;
+                entry.insert(cached);
+            }
             staged.push((id, payload));
         }
         // Pass 2: decode in message order through per-id readers built once

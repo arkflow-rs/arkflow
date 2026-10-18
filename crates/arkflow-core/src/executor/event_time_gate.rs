@@ -2490,17 +2490,21 @@ mod tests {
             &mut mixed_hold_drop,
         );
 
-        // (c) raw filter micro-bench: all-true vs 50/50 masks on the same
-        // batch shape — the exact cost `filter_batch` pays per group.
+        // (c) raw filter micro-bench: all-true (zero-copy path) vs the actual
+        // mixed-split shape — the full 2,048-row mixed source filtered twice,
+        // once per outcome group with that group's contiguous half mask. This
+        // is the exact work `filter_batch` pays per group in the mixed arm.
         use datafusion::arrow::array::BooleanArray;
         use datafusion::arrow::compute::filter_record_batch;
-        let source = batch(window_c.clone());
+        let uniform_source = batch(window_c.clone());
+        let mixed_source = batch(mixed_times.clone());
         let all_true = BooleanArray::from(vec![true; rows]);
-        let half_mask = BooleanArray::from((0..rows).map(|i| i % 2 == 0).collect::<Vec<bool>>());
+        let hold_mask = BooleanArray::from((0..2 * rows).map(|i| i >= rows).collect::<Vec<bool>>());
+        let drop_mask = BooleanArray::from((0..2 * rows).map(|i| i < rows).collect::<Vec<bool>>());
         let mut filter_all_true = || {
             let mut n = 0usize;
             for _ in 0..rounds {
-                let _ = filter_record_batch(source.record_batch(), &all_true).unwrap();
+                let _ = filter_record_batch(uniform_source.record_batch(), &all_true).unwrap();
                 n += rows;
             }
             n
@@ -2510,15 +2514,20 @@ mod tests {
             rows,
             &mut filter_all_true,
         );
-        let mut filter_half = || {
+        let mut filter_mixed_split = || {
             let mut n = 0usize;
             for _ in 0..rounds {
-                let _ = filter_record_batch(source.record_batch(), &half_mask).unwrap();
-                n += rows;
+                let _ = filter_record_batch(mixed_source.record_batch(), &hold_mask).unwrap();
+                let _ = filter_record_batch(mixed_source.record_batch(), &drop_mask).unwrap();
+                n += 2 * rows;
             }
             n
         };
-        time("raw filter 50% mask (gather copy)", rows, &mut filter_half);
+        time(
+            "raw filter 2×half-mask over 2·rows source (mixed split)",
+            2 * rows,
+            &mut filter_mixed_split,
+        );
     }
 }
 
