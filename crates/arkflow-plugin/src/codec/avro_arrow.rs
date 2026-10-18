@@ -52,6 +52,30 @@ pub fn avro_read_value(schema: &AvroSchema, payload: &[u8]) -> Result<AvroValue,
         .map_err(|e| Error::Process(format!("Avro decode failed: {}", e)))
 }
 
+/// Batch-scoped value reader: builds the `GenericDatumReader` once and
+/// reuses it for every payload of one schema (`read_value` takes `&self`),
+/// amortizing the per-message `ResolvedSchema` name-table build that
+/// `avro_read_value` pays on every message. Borrowed from the cached
+/// schema, so it can only live inside the scope that holds the cache entry.
+pub struct AvroValueReader<'s> {
+    reader: GenericDatumReader<'s>,
+}
+
+impl<'s> AvroValueReader<'s> {
+    pub fn new(schema: &'s AvroSchema) -> Result<Self, Error> {
+        let reader = GenericDatumReader::builder(schema)
+            .build()
+            .map_err(|e| Error::Process(format!("Avro reader build failed: {}", e)))?;
+        Ok(Self { reader })
+    }
+
+    pub fn read_value(&self, payload: &[u8]) -> Result<AvroValue, Error> {
+        self.reader
+            .read_value(&mut std::io::Cursor::new(payload))
+            .map_err(|e| Error::Process(format!("Avro decode failed: {}", e)))
+    }
+}
+
 /// One column builder, mirroring the flat leaf mapping of the single-row
 /// conversion path: same Arrow types, same timezone and decimal constants.
 enum Column {
@@ -509,6 +533,109 @@ mod tests {
     use apache_avro::types::Value;
     use apache_avro::writer::datum::GenericDatumWriter;
     use apache_avro::Decimal;
+
+    /// Ad-hoc release timing (NOT run by CI): the decode-audit L2 tail —
+    /// per-message `GenericDatumReader` construction (the current hot path)
+    /// vs one reader reused across messages (`read_value` takes `&self`, so
+    /// a batch-scoped reader amortizes the `ResolvedSchema` name-table build
+    /// without any upstream API). Run with:
+    /// `cargo test --release -p arkflow-plugin --lib -- --ignored avro_reader_reuse_timing --nocapture`
+    #[test]
+    #[ignore]
+    fn avro_reader_reuse_timing() {
+        fn wide_schema(width: usize) -> AvroSchema {
+            let types = [
+                r#""long""#,
+                r#""string""#,
+                r#""double""#,
+                r#""boolean""#,
+                r#"["null", "int"]"#,
+            ];
+            let fields: Vec<String> = (0..width)
+                .map(|i| {
+                    format!(
+                        r#"{{"name": "f_{i}", "type": {}}}"#,
+                        types[i % types.len()]
+                    )
+                })
+                .collect();
+            parse(&format!(
+                r#"{{"type": "record", "name": "W{width}", "fields": [{}]}}"#,
+                fields.join(",")
+            ))
+        }
+
+        fn wide_payload(schema: &AvroSchema, width: usize, i: u64) -> Vec<u8> {
+            let value = Value::Record(
+                (0..width)
+                    .map(|f| {
+                        let v = match f % 5 {
+                            0 => Value::Long(i as i64),
+                            1 => Value::String(format!("s_{}", i % 97)),
+                            2 => Value::Double((i % 1000) as f64 * 0.5),
+                            3 => Value::Boolean(i.is_multiple_of(2)),
+                            _ => Value::Union(1, Box::new(Value::Int((i % 1_000_000) as i32))),
+                        };
+                        (format!("f_{f}"), v)
+                    })
+                    .collect(),
+            );
+            encode(schema, value)
+        }
+
+        let batch_rows = 1_000usize;
+        let rounds = 200usize; // 200k messages per measurement
+
+        let time = |name: &str, f: &mut dyn FnMut() -> usize| {
+            let mut best = std::time::Duration::MAX;
+            let mut rows = 0;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                rows = f();
+                best = best.min(start.elapsed());
+            }
+            println!(
+                "{name}: {rows} rows in {best:?} ({:.0} rows/s)",
+                rows as f64 / best.as_secs_f64()
+            );
+        };
+
+        for width in [5usize, 25, 100] {
+            let schema = wide_schema(width);
+            let payloads: Vec<Vec<u8>> = (0..batch_rows)
+                .map(|i| wide_payload(&schema, width, i as u64))
+                .collect();
+
+            let mut per_message = || {
+                let mut rows = 0usize;
+                for _ in 0..rounds {
+                    for payload in &payloads {
+                        assert!(avro_read_value(&schema, payload).is_ok());
+                        rows += 1;
+                    }
+                }
+                rows
+            };
+            time(&format!("w{width} per-message reader (current)"), &mut per_message);
+
+            let mut reused = || {
+                let reader = GenericDatumReader::builder(&schema)
+                    .build()
+                    .expect("reader builds");
+                let mut rows = 0usize;
+                for _ in 0..rounds {
+                    for payload in &payloads {
+                        assert!(reader
+                            .read_value(&mut std::io::Cursor::new(payload.as_slice()))
+                            .is_ok());
+                        rows += 1;
+                    }
+                }
+                rows
+            };
+            time(&format!("w{width} batch-scoped reused reader"), &mut reused);
+        }
+    }
 
     /// Push one raw value through the accumulator (no encoder round trip) —
     /// the replacement for the removed single-row `avro_value_to_arrow`.

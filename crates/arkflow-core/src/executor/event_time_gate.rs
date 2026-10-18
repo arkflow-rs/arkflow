@@ -2413,6 +2413,114 @@ mod tests {
             "acking never touches the abort counter"
         );
     }
+
+    /// Ad-hoc release timing (NOT run by CI): the hot-path-audit tail "混合
+    /// 结果组仍按组拷贝". Uniform held-release Emit rides arrow's all-true
+    /// zero-copy fast path; a Hold+late-Drop mixed batch pays one gather per
+    /// group. The raw-filter arms isolate the copy cost itself — they are
+    /// the decision instrument. Run with:
+    /// `cargo test --release -p arkflow-core --lib -- --ignored event_time_gate_group_copy_timing --nocapture`
+    #[test]
+    #[ignore]
+    fn event_time_gate_group_copy_timing() {
+        let rows = 1_024usize;
+        let rounds = 2_000usize;
+
+        // Windows: [0,1000) late against a 3900 watermark, [3000,4000) still
+        // open at 3900, [4000,5000) still open at 4900.
+        let window_a: Vec<i64> = (0..rows).map(|i| 100 + (i % 800) as i64).collect();
+        let window_c: Vec<i64> = (0..rows).map(|i| 3_100 + (i % 800) as i64).collect();
+        let mut mixed_times = window_c.clone();
+        mixed_times.extend(window_a.iter().copied()); // half Hold, half late-Drop
+
+        let time = |name: &str, rows_per_round: usize, f: &mut dyn FnMut() -> usize| {
+            let mut best = std::time::Duration::MAX;
+            let mut total = 0;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                total = f();
+                best = best.min(start.elapsed());
+            }
+            println!(
+                "{name}: {total} rows in {best:?} ({:.0} rows/s, {:.0}µs/round for {rows_per_round} rows)",
+                total as f64 / best.as_secs_f64(),
+                best.as_micros() as f64 / rounds as f64,
+            );
+        };
+
+        // (a) held → uniform Emit: single group, all-true mask (zero-copy).
+        // Fresh gate per round keeps the watermark from ratcheting.
+        let held_batch = batch(window_a.clone());
+        let mut uniform_emit = || {
+            let mut emitted = 0usize;
+            for _ in 0..rounds {
+                let mut gate =
+                    EventTimeGate::new(&time_spec(LateEventPolicy::Drop), vec![1_000]).unwrap();
+                gate.observe(0, held_batch.clone()).unwrap();
+                let decision = gate.observe(0, batch(vec![4_900])).unwrap();
+                emitted += decision.ready.iter().map(|(b, _)| b.len()).sum::<usize>();
+            }
+            emitted
+        };
+        time(
+            "held → uniform Emit (1 group, all-true)",
+            rows,
+            &mut uniform_emit,
+        );
+
+        // (b) fresh batch, half on-time Hold + half late Drop: two partial
+        // groups, both filtered (the Drop group's copy is discarded). The
+        // anchor stays at 3900 so the split holds for every round.
+        let mixed_batch = batch(mixed_times.clone());
+        let mut mixed_hold_drop = || {
+            let mut gated = 0usize;
+            for _ in 0..rounds {
+                let mut gate =
+                    EventTimeGate::new(&time_spec(LateEventPolicy::Drop), vec![1_000]).unwrap();
+                gate.observe(0, batch(vec![3_900])).unwrap();
+                let decision = gate.observe(0, mixed_batch.clone()).unwrap();
+                gated += decision.ready.iter().map(|(b, _)| b.len()).sum::<usize>();
+                gated += decision.dropped_acks.len() * rows;
+            }
+            gated
+        };
+        time(
+            "fresh Hold+Drop mixed (2 partial groups)",
+            2 * rows,
+            &mut mixed_hold_drop,
+        );
+
+        // (c) raw filter micro-bench: all-true vs 50/50 masks on the same
+        // batch shape — the exact cost `filter_batch` pays per group.
+        use datafusion::arrow::array::BooleanArray;
+        use datafusion::arrow::compute::filter_record_batch;
+        let source = batch(window_c.clone());
+        let all_true = BooleanArray::from(vec![true; rows]);
+        let half_mask =
+            BooleanArray::from((0..rows).map(|i| i % 2 == 0).collect::<Vec<bool>>());
+        let mut filter_all_true = || {
+            let mut n = 0usize;
+            for _ in 0..rounds {
+                let _ = filter_record_batch(source.record_batch(), &all_true).unwrap();
+                n += rows;
+            }
+            n
+        };
+        time(
+            "raw filter all-true (zero-copy path)",
+            rows,
+            &mut filter_all_true,
+        );
+        let mut filter_half = || {
+            let mut n = 0usize;
+            for _ in 0..rounds {
+                let _ = filter_record_batch(source.record_batch(), &half_mask).unwrap();
+                n += rows;
+            }
+            n
+        };
+        time("raw filter 50% mask (gather copy)", rows, &mut filter_half);
+    }
 }
 
 #[cfg(test)]
