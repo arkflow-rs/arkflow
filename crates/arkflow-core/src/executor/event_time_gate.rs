@@ -2496,8 +2496,7 @@ mod tests {
         use datafusion::arrow::compute::filter_record_batch;
         let source = batch(window_c.clone());
         let all_true = BooleanArray::from(vec![true; rows]);
-        let half_mask =
-            BooleanArray::from((0..rows).map(|i| i % 2 == 0).collect::<Vec<bool>>());
+        let half_mask = BooleanArray::from((0..rows).map(|i| i % 2 == 0).collect::<Vec<bool>>());
         let mut filter_all_true = || {
             let mut n = 0usize;
             for _ in 0..rounds {

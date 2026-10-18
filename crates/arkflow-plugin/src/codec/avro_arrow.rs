@@ -552,12 +552,7 @@ mod tests {
                 r#"["null", "int"]"#,
             ];
             let fields: Vec<String> = (0..width)
-                .map(|i| {
-                    format!(
-                        r#"{{"name": "f_{i}", "type": {}}}"#,
-                        types[i % types.len()]
-                    )
-                })
+                .map(|i| format!(r#"{{"name": "f_{i}", "type": {}}}"#, types[i % types.len()]))
                 .collect();
             parse(&format!(
                 r#"{{"type": "record", "name": "W{width}", "fields": [{}]}}"#,
@@ -616,7 +611,10 @@ mod tests {
                 }
                 rows
             };
-            time(&format!("w{width} per-message reader (current)"), &mut per_message);
+            time(
+                &format!("w{width} per-message reader (current)"),
+                &mut per_message,
+            );
 
             let mut reused = || {
                 let reader = GenericDatumReader::builder(&schema)
