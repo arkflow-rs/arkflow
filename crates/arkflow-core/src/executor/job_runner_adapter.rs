@@ -313,6 +313,11 @@ pub(crate) async fn run_job_with_metrics_started<A: JobComponentAdapter>(
     };
     let mut graph = builder.build(&plan, adapter, resource)?;
     graph.temporaries = resource.temporary.values().cloned().collect();
+    // WAL flush failures are sampled from the WAL on every metrics snapshot:
+    // attach it once here so the data path pays nothing per batch.
+    if let (Some(metrics), Some(wal)) = (metrics.as_ref(), adapter.wal()) {
+        metrics.kernel.set_wal(&wal);
+    }
     let result = run_graph_with_metrics_startup(graph, cancellation, metrics, startup).await;
     if let Some(state) = state {
         state.close()?;
@@ -2119,6 +2124,40 @@ mod runner_tests {
         }
     }
 
+    /// Runner adapter with an input WAL, so the metrics wiring can be
+    /// asserted without registering real plugin components.
+    struct WalReportingAdapter {
+        inner: RunnerAdapter,
+        wal: Arc<crate::wal::Wal>,
+    }
+
+    impl crate::job::JobComponentAdapter for WalReportingAdapter {
+        fn build_input(
+            &self,
+            source: &SourceSpec,
+            resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            self.inner.build_input(source, resource)
+        }
+        fn build_output(
+            &self,
+            sink: &SinkSpec,
+            resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            self.inner.build_output(sink, resource)
+        }
+        fn build_processor(
+            &self,
+            operator: &OperatorSpec,
+            resource: &Resource,
+        ) -> Result<Arc<dyn Processor>, Error> {
+            self.inner.build_processor(operator, resource)
+        }
+        fn wal(&self) -> Option<Arc<crate::wal::Wal>> {
+            Some(self.wal.clone())
+        }
+    }
+
     // ---------- spec helpers ----------
 
     fn processing_time() -> TimeSpec {
@@ -3361,6 +3400,44 @@ mod runner_tests {
         )
         .await
         .expect("an EOF stateful Job must complete and close its backend");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_with_metrics_started_binds_the_adapters_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal_config = crate::wal::WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = crate::wal::Wal::open(&wal_config).unwrap();
+        let adapter = WalReportingAdapter {
+            inner: adapter_with(keyed_eof_input()),
+            wal: wal.clone(),
+        };
+        let spec = SpecBuilder::new("runner-wal-metrics-job", true)
+            .ephemeral_state()
+            .build();
+        let metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+        assert!(!metrics.kernel.wal_bound());
+
+        run_job_with_metrics_started(
+            &spec,
+            &adapter,
+            &mut resource(),
+            CancellationToken::new(),
+            Some(metrics.clone()),
+            None,
+        )
+        .await
+        .expect("an EOF stateful Job must complete");
+
+        assert!(
+            metrics.kernel.wal_bound(),
+            "the runner must attach the adapter's WAL counter"
+        );
+        assert_eq!(metrics.snapshot().wal_flush_failures, wal.flush_failures());
+        wal.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

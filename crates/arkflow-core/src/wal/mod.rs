@@ -277,7 +277,12 @@ pub struct Wal {
     // --- flusher failure visibility (D3 of fix-object-store-wal-loss-window) ---
     /// Total flush failures counted on the background flusher's wake path;
     /// exposed through [`Wal::flush_failures`] for status reporting.
-    flush_failures: AtomicU64,
+    ///
+    /// Shared by handle with the metrics snapshot: the counter outlives the
+    /// WAL on purpose, so a Stream that stopped after failing does not make
+    /// its still-exported series drop back to zero. Sharing the counter (not
+    /// the `Wal`) keeps the store's exclusive lock bound to the WAL lifetime.
+    flush_failures: Arc<AtomicU64>,
     /// Consecutive wake-path flush failures; any success resets them.
     /// Reaching [`WAL_FLUSH_ESCALATION_THRESHOLD`] escalates the log level.
     flush_failures_consecutive: AtomicU64,
@@ -403,7 +408,7 @@ impl Wal {
             ack_notify: Notify::new(),
             close: CancellationToken::new(),
             flusher: Mutex::new(None),
-            flush_failures: AtomicU64::new(0),
+            flush_failures: Arc::new(AtomicU64::new(0)),
             flush_failures_consecutive: AtomicU64::new(0),
             flush_failure_last_log_ms: AtomicU64::new(0),
             seal_wait_timeout_ms: AtomicU64::new(0),
@@ -1146,15 +1151,25 @@ impl Wal {
     /// Total flush failures counted on the background flusher's wake path
     /// (observability: distinguishes a transient retry from a broken
     /// store; sustained failure also escalates to error-level logging).
-    /// Crate-visible for the in-crate regression tests; no external
-    /// consumer yet, per the core-api-surface spec's zero-reference rule.
+    /// The metrics snapshot reads the shared handle
+    /// ([`Self::flush_failures_handle`]) instead; this accessor stays
+    /// test-only so the production build has no unreferenced helper.
     #[cfg(test)]
     pub(crate) fn flush_failures(&self) -> u64 {
         self.flush_failures.load(Ordering::Relaxed)
     }
 
+    /// Shared handle to the lifetime flush-failure counter. The metrics
+    /// snapshot holds this (not the `Wal`) so the reported total survives a
+    /// stopped Stream without keeping the store's exclusive lock alive.
+    pub(crate) fn flush_failures_handle(&self) -> Arc<AtomicU64> {
+        self.flush_failures.clone()
+    }
+
     /// Current consecutive wake-path flush failures; reset by any
-    /// successful flush.
+    /// successful flush. Test-only: the lifetime total is the exported
+    /// signal, and keeping this ungated would trip the zero-reference
+    /// dead-code rule.
     #[cfg(test)]
     pub(crate) fn flush_consecutive_failures(&self) -> u64 {
         self.flush_failures_consecutive.load(Ordering::Relaxed)
@@ -3005,5 +3020,58 @@ mod tests {
         }
         assert!(wal.flush_failures() >= escalated);
         wal.close().await.ok(); // the shutdown flush succeeding is not asserted here
+    }
+
+    /// The metrics snapshot samples the WAL counter at scrape time: an
+    /// unbound runtime reports zero, a bound one surfaces background-flush
+    /// failures, and the Stream-level snapshot carries the same value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_metrics_snapshot_reports_wal_flush_failures() {
+        let attempts = StdArc::new(AtomicU64::new(0));
+        let fail_until = StdArc::new(AtomicU64::new(u64::MAX));
+        let store: StdArc<dyn crate::wal::store::WalStore> = StdArc::new(FlakyAppendStore {
+            attempts: attempts.clone(),
+            fail_until: fail_until.clone(),
+        });
+        let wal = Wal::open_with_store(
+            &WalConfig {
+                sync: SyncPolicy::GroupCommit,
+                ..WalConfig::default()
+            },
+            store,
+            1,
+        )
+        .unwrap();
+
+        let metrics = crate::runtime::RuntimeMetrics::default();
+        assert_eq!(metrics.snapshot().wal_flush_failures, 0);
+        metrics.kernel.set_wal(&wal);
+        assert_eq!(
+            metrics.snapshot().wal_flush_failures,
+            0,
+            "a bound but healthy WAL reports zero"
+        );
+
+        wal.append(&StdArc::new(sample_batch(None))).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while metrics.snapshot().wal_flush_failures == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "flush failures never surfaced in the metrics snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // The Stream snapshot maps the kernel counter rather than keeping a
+        // second copy, so the two never diverge mid-scrape.
+        assert_eq!(metrics.snapshot().wal_flush_failures, wal.flush_failures());
+
+        fail_until.store(0, Ordering::SeqCst);
+        wal.close().await.ok();
+        // The exported series stays put once the WAL is gone: the metrics
+        // side holds the counter, not the WAL, so a stopped Stream does not
+        // report a drop back to zero.
+        let reported = metrics.snapshot().wal_flush_failures;
+        drop(wal);
+        assert_eq!(metrics.snapshot().wal_flush_failures, reported);
     }
 }

@@ -1412,6 +1412,13 @@ pub trait JobComponentAdapter: Send + Sync {
         operator: &OperatorSpec,
         resource: &Resource,
     ) -> Result<Arc<dyn Processor>, Error>;
+
+    /// Input WAL owned by this adapter, when the runtime has one. Used to
+    /// surface background-flush failures in the kernel metrics snapshot.
+    /// Defaults to `None`: adapters without WAL durability report zero.
+    fn wal(&self) -> Option<Arc<crate::wal::Wal>> {
+        None
+    }
 }
 
 #[cfg(test)]

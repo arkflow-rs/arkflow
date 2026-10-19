@@ -455,6 +455,10 @@ impl JobComponentAdapter for StreamJobAdapter {
         }
     }
 
+    fn wal(&self) -> Option<Arc<crate::wal::Wal>> {
+        self.wal.clone()
+    }
+
     fn build_output(&self, sink: &SinkSpec, resource: &Resource) -> Result<Arc<dyn Output>, Error> {
         let payload = sink.config.clone();
         OutputConfig {

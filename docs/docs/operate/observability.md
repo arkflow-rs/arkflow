@@ -44,13 +44,16 @@ carry `# HELP`/`# TYPE` metadata; monotonically increasing counters are typed
 | `arkflow_job_checkpoint_failures_total` | counter | `job` | Failed checkpoints. |
 | `arkflow_job_watermark_lag_ms` | gauge | `job` | Max watermark lag across sources. |
 | `arkflow_job_late_events_total` | counter | `job` | Late events dropped/routed/updated. |
+| `arkflow_job_wal_flush_failures_total` | counter | `job` | Background flush failures of the Job's input WAL (0 without a WAL). |
 | `arkflow_stream_input_messages` / `_output_messages` / `_restarts` / `_checkpoint_failures` / `_late_events` | counter | `stream_id` | Legacy Stream counters (names unchanged). |
+| `arkflow_stream_wal_flush_failures_total` | counter | `stream_id` | Background flush failures of the Stream's input WAL (0 without durability). |
 | `arkflow_stream_in_flight` / `_mean_latency_us` / `_checkpoint_duration_ms` / `_watermark_lag_ms` | gauge | `stream_id` | Legacy Stream gauges. |
 
 Labels use fixed vocabularies — Job/chain/Stream identifiers plus an optional
 `node` label. Message content, correlation IDs, and error text never become
 labels, so cardinality stays bounded by the configured workload
-(O(jobs × chains) per process). Counters reset when the process restarts; use
+(O(jobs × chains) per process). Counters reset when the process restarts or a
+Stream is re-registered; stopping a Stream keeps its last reported total. Use
 `rate()`/`increase()` over stable windows.
 
 ### Readiness and liveness
@@ -183,6 +186,12 @@ convergence. Alert on its fields rather than scraping raw operations lists.
 - Hub readiness probe failing (storage/recovery impaired).
 - `arkflow_job_chain_errors_total` increasing, `arkflow_job_checkpoint_failures_total`
   increasing, or `arkflow_job_watermark_lag_ms` trending up.
+- `arkflow_job_wal_flush_failures_total` or
+  `arkflow_stream_wal_flush_failures_total` increasing: WAL appends are not
+  reaching storage, so staged entries are not durable and would be lost on a
+  crash. Isolated increments during a storage blip are retried automatically;
+  a sustained increase (the process also escalates its log to error level
+  after 8 consecutive failures) means the store is not making progress.
 
 ## Related pages
 
