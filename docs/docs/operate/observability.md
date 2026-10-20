@@ -52,9 +52,11 @@ carry `# HELP`/`# TYPE` metadata; monotonically increasing counters are typed
 Labels use fixed vocabularies — Job/chain/Stream identifiers plus an optional
 `node` label. Message content, correlation IDs, and error text never become
 labels, so cardinality stays bounded by the configured workload
-(O(jobs × chains) per process). Counters reset when the process restarts or a
-Stream is re-registered; stopping a Stream keeps its last reported total. Use
-`rate()`/`increase()` over stable windows.
+(O(jobs × chains) per process). Counters reset when the process restarts, a
+Stream is re-registered, or a Stream is restarted in place (the restart opens
+a new WAL, so the same `stream_id` series starts again from zero). Stopping a
+Stream keeps its last reported total. Use `rate()`/`increase()` over stable
+windows.
 
 ### Readiness and liveness
 

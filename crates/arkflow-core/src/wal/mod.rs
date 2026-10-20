@@ -3062,15 +3062,18 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         // The Stream snapshot maps the kernel counter rather than keeping a
-        // second copy, so the two never diverge mid-scrape.
-        assert_eq!(metrics.snapshot().wal_flush_failures, wal.flush_failures());
-
+        // second copy. Stop the failure injection and the flusher first: while
+        // both are live the counter can advance between the two reads, which
+        // would make a correct implementation fail this assertion.
         fail_until.store(0, Ordering::SeqCst);
         wal.close().await.ok();
+        let reported = metrics.snapshot().wal_flush_failures;
+        assert!(reported > 0);
+        assert_eq!(reported, wal.flush_failures());
+
         // The exported series stays put once the WAL is gone: the metrics
         // side holds the counter, not the WAL, so a stopped Stream does not
         // report a drop back to zero.
-        let reported = metrics.snapshot().wal_flush_failures;
         drop(wal);
         assert_eq!(metrics.snapshot().wal_flush_failures, reported);
     }
