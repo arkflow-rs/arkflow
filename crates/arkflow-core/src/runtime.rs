@@ -246,6 +246,7 @@ impl RuntimeMetrics {
             checkpoint_failures: kernel.checkpoint_failures,
             watermark_lag_ms: kernel.watermark_lag_ms,
             late_events: kernel.late_events,
+            wal_flush_failures: kernel.wal_flush_failures,
         }
     }
 }

@@ -156,6 +156,12 @@ pub fn kernel_job_families(
         MetricType::COUNTER,
         vec![(job_labels(), snapshot.late_events)],
     ));
+    families.extend(family(
+        "arkflow_job_wal_flush_failures_total",
+        "Background flush failures of the Job's input WAL (0 when the Job has no WAL).",
+        MetricType::COUNTER,
+        vec![(job_labels(), snapshot.wal_flush_failures)],
+    ));
     families
 }
 
@@ -226,6 +232,12 @@ pub fn stream_families(
         "Cumulative late events across event-time gates.",
         MetricType::COUNTER,
         one(metrics.late_events),
+    ));
+    families.extend(family(
+        "arkflow_stream_wal_flush_failures_total",
+        "Cumulative background flush failures of the Stream's input WAL.",
+        MetricType::COUNTER,
+        one(metrics.wal_flush_failures),
     ));
     families
 }
@@ -298,6 +310,7 @@ mod tests {
             checkpoint_failures: 1,
             watermark_lag_ms: 250,
             late_events: 4,
+            wal_flush_failures: 2,
         }
     }
 
@@ -314,6 +327,7 @@ mod tests {
         assert!(text.contains("# TYPE arkflow_job_chain_errors_total counter"));
         assert!(text.contains("# TYPE arkflow_job_checkpoint_failures_total counter"));
         assert!(text.contains("# TYPE arkflow_job_late_events_total counter"));
+        assert!(text.contains("# TYPE arkflow_job_wal_flush_failures_total counter"));
         assert!(text.contains("# TYPE arkflow_job_chain_in_flight gauge"));
         assert!(text.contains("# TYPE arkflow_job_chain_mean_latency_us gauge"));
         assert!(text.contains("# TYPE arkflow_job_checkpoint_duration_ms gauge"));
@@ -341,6 +355,7 @@ mod tests {
         assert!(text.contains("arkflow_job_chain_errors_total{job=\"orders-job\",chain=\"sql\"} 3"));
         assert!(text.contains("arkflow_job_watermark_lag_ms{job=\"orders-job\"} 250"));
         assert!(text.contains("arkflow_job_checkpoint_duration_ms{job=\"orders-job\"} 120"));
+        assert!(text.contains("arkflow_job_wal_flush_failures_total{job=\"orders-job\"} 2"));
         // Only the closed vocabulary appears as label names.
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (name, rest) = line.split_once('{').expect("sample line with labels");
@@ -382,6 +397,17 @@ mod tests {
     }
 
     #[test]
+    fn job_without_wal_exports_a_zero_flush_failure_counter() {
+        let mut jobs = BTreeMap::new();
+        jobs.insert("no-wal".to_string(), KernelMetricsSnapshot::default());
+        let text = data_plane_exposition(&[], &jobs);
+        assert!(
+            text.contains("arkflow_job_wal_flush_failures_total{job=\"no-wal\"} 0"),
+            "unexpected exposition:\n{text}"
+        );
+    }
+
+    #[test]
     fn stream_families_preserve_legacy_names_and_labels() {
         let metrics = StreamMetricsSnapshot {
             input_batches: 1,
@@ -400,13 +426,16 @@ mod tests {
             checkpoint_failures: 0,
             watermark_lag_ms: 0,
             late_events: 0,
+            wal_flush_failures: 3,
         };
         let text = encode_families(stream_families("orders", &metrics, &[]));
         assert!(text.contains("arkflow_stream_input_messages{stream_id=\"orders\"} 11"));
         assert!(text.contains("arkflow_stream_output_messages{stream_id=\"orders\"} 9"));
         assert!(text.contains("arkflow_stream_restarts{stream_id=\"orders\"} 2"));
+        assert!(text.contains("arkflow_stream_wal_flush_failures_total{stream_id=\"orders\"} 3"));
         assert!(text.contains("# TYPE arkflow_stream_input_messages counter"));
         assert!(text.contains("# TYPE arkflow_stream_in_flight gauge"));
+        assert!(text.contains("# TYPE arkflow_stream_wal_flush_failures_total counter"));
     }
 
     #[test]
@@ -420,6 +449,12 @@ mod tests {
             text.contains(
                 "arkflow_job_chain_batches_in_total{node=\"node-a\",job=\"orders-job\",chain=\"src\"} 7"
             )
+        );
+        assert!(
+            text.contains(
+                "arkflow_job_wal_flush_failures_total{node=\"node-a\",job=\"orders-job\"} 2"
+            ),
+            "the WAL counter must carry the reporting node's label on the Hub export"
         );
     }
 }

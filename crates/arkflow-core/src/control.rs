@@ -98,6 +98,11 @@ pub struct StreamMetricsSnapshot {
     pub watermark_lag_ms: u64,
     #[serde(default)]
     pub late_events: u64,
+    /// Cumulative background-flush failures of the Stream's input WAL
+    /// (0 when durability is disabled). `serde(default)` keeps older
+    /// control-plane payloads decodable.
+    #[serde(default)]
+    pub wal_flush_failures: u64,
 }
 
 /// Public snapshot for one Stream.
