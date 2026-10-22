@@ -2570,7 +2570,7 @@ mod placement_tests {
             .iter()
             .find(|assignment| assignment.task_id == "sink-1")
             .unwrap();
-        assert_eq!(moved.id, format!("sink-1:a:7"));
+        assert_eq!(moved.id, "sink-1:a:7");
     }
 
     #[test]
