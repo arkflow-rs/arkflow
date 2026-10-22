@@ -485,6 +485,46 @@ impl JobSpec {
         side_edges.into_iter().collect()
     }
 
+    /// Enumerate placement affinity groups: components whose builders declare
+    /// the same affinity key (e.g. the Kafka L3 transactional input/output
+    /// pairing) must sit on one node so their process-internal bridge works.
+    /// Derived from configuration only, through the builder registry — the
+    /// plan itself does not know any plugin's field names. Operators between
+    /// the paired endpoints do not join the group: they may span nodes behind
+    /// remote data edges. A key claimed by a single component constrains
+    /// nothing and is dropped.
+    pub fn affinity_groups(&self) -> Result<Vec<AffinityGroupSpec>, Error> {
+        let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for source in &self.sources {
+            let affinity =
+                crate::input::placement_affinity(&source.input_type, &Some(source.config.clone()))?;
+            if let Some(key) = affinity {
+                groups
+                    .entry(key)
+                    .or_default()
+                    .insert(source.operator_id.clone());
+            }
+        }
+        for sink in &self.sinks {
+            let affinity =
+                crate::output::placement_affinity(&sink.output_type, &Some(sink.config.clone()))?;
+            if let Some(key) = affinity {
+                groups
+                    .entry(key)
+                    .or_default()
+                    .insert(sink.operator_id.clone());
+            }
+        }
+        Ok(groups
+            .into_iter()
+            .filter(|(_, operator_ids)| operator_ids.len() > 1)
+            .map(|(key, operator_ids)| AffinityGroupSpec {
+                key,
+                operator_ids: operator_ids.into_iter().collect(),
+            })
+            .collect())
+    }
+
     fn operator_reachable(&self, from: &str, target: &str) -> bool {
         let mut queue = vec![from.to_owned()];
         let mut visited = BTreeSet::new();
@@ -1007,6 +1047,15 @@ pub struct SideEdgeSpec {
     pub kind: SideEdgeKind,
 }
 
+/// A set of operators whose components declare the same placement affinity
+/// key (see [`JobSpec::affinity_groups`]); every member task must sit on one
+/// node under either placement strategy.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AffinityGroupSpec {
+    pub key: String,
+    pub operator_ids: Vec<String>,
+}
+
 impl JobPlan {
     pub fn compile(spec: JobSpec) -> Result<Self, Error> {
         spec.validate()?;
@@ -1050,8 +1099,10 @@ impl JobPlan {
 
     /// Assign every plan task to a compute node under the Job's placement
     /// strategy. Colocated keeps each connected component on one node; split
-    /// round-robins tasks in physical plan order and rejects the assignment
-    /// when a side edge (error, late-event route) would cross nodes.
+    /// round-robins tasks in physical plan order, pins affinity groups onto
+    /// one node, and rejects the assignment when a side edge (error,
+    /// late-event route) would cross nodes. Affinity groups are validated
+    /// under both strategies.
     pub fn assignments_for_nodes(
         &self,
         node_ids: &[String],
@@ -1065,19 +1116,30 @@ impl JobPlan {
             // would cross nodes — callers surface the error as a failed
             // placement, never a panic inside placement bookkeeping.
             PlacementStrategy::Split => self.assignments_split(node_ids, generation),
-            PlacementStrategy::Colocated => Ok(self.assignments_colocated(node_ids, generation)),
+            PlacementStrategy::Colocated => {
+                // Accepted colocated assignments are bitwise unchanged; the
+                // affinity check only rejects a pairing whose endpoints sit
+                // in different disconnected components — a combination that
+                // previously failed later, at Agent startup.
+                let assignments = self.assignments_colocated(node_ids, generation);
+                self.validate_affinity_assignments(&assignments)?;
+                Ok(assignments)
+            }
         }
     }
 
     /// Split placement: physical plan order round-robin across the node set.
-    /// Side edges (error, late-event route) must stay co-located — a split
-    /// that would separate one fails placement before any dispatch.
+    /// Affinity groups are pinned onto the node of their first member in
+    /// plan order (a pure function of task order + node list, so incremental
+    /// re-placement keeps the group whole). Side edges (error, late-event
+    /// route) must stay co-located — a pin that would separate one fails
+    /// placement before any dispatch.
     fn assignments_split(
         &self,
         node_ids: &[String],
         generation: u64,
     ) -> Result<Vec<TaskAttempt>, Error> {
-        let assignments = self
+        let mut assignments = self
             .tasks
             .iter()
             .enumerate()
@@ -1094,8 +1156,39 @@ impl JobPlan {
                 }
             })
             .collect::<Vec<_>>();
+        self.pin_affinity_groups(&mut assignments, generation)?;
+        self.validate_affinity_assignments(&assignments)?;
         self.validate_side_edge_assignments(&assignments)?;
         Ok(assignments)
+    }
+
+    /// Reassign every task of each affinity group onto the node of the
+    /// group's first member in plan order. `self.tasks` and `assignments`
+    /// are index-aligned (both enumerate the plan in the same order).
+    fn pin_affinity_groups(
+        &self,
+        assignments: &mut [TaskAttempt],
+        generation: u64,
+    ) -> Result<(), Error> {
+        for group in self.spec.affinity_groups()? {
+            let members = |task: &TaskSpec| group.operator_ids.contains(&task.operator_id);
+            let Some(anchor_node) = self
+                .tasks
+                .iter()
+                .zip(assignments.iter())
+                .find(|(task, _)| members(task))
+                .map(|(_, attempt)| attempt.node_id.clone())
+            else {
+                continue;
+            };
+            for (task, attempt) in self.tasks.iter().zip(assignments.iter_mut()) {
+                if members(task) && attempt.node_id != anchor_node {
+                    attempt.node_id = anchor_node.clone();
+                    attempt.id = format!("{}:{anchor_node}:{generation}", task.id);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate every task assignment participating in a runtime side edge.
@@ -1163,6 +1256,63 @@ impl JobPlan {
                             to_task
                         )));
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate every task assignment participating in a placement affinity
+    /// group. Public for the same trust-boundary reason as the side-edge
+    /// validation: the Hub and the Agent both enforce the invariant.
+    pub fn validate_affinity_assignments(&self, assignments: &[TaskAttempt]) -> Result<(), Error> {
+        let mut node_by_task = BTreeMap::new();
+        for assignment in assignments {
+            if node_by_task
+                .insert(assignment.task_id.clone(), assignment.node_id.clone())
+                .is_some()
+            {
+                return Err(Error::Config(format!(
+                    "duplicate task assignment for '{}'",
+                    assignment.task_id
+                )));
+            }
+        }
+        self.validate_affinity_nodes(&node_by_task)
+    }
+
+    /// Validate that every affinity group sits on one node. Missing member
+    /// tasks fail closed — a partial assignment must not hide a split
+    /// pairing until write time.
+    pub fn validate_affinity_nodes(
+        &self,
+        node_by_task: &BTreeMap<String, String>,
+    ) -> Result<(), Error> {
+        for group in self.spec.affinity_groups()? {
+            let mut anchor: Option<(String, String)> = None;
+            for task in &self.tasks {
+                if !group.operator_ids.contains(&task.operator_id) {
+                    continue;
+                }
+                let node = node_by_task.get(&task.id).ok_or_else(|| {
+                    Error::Config(format!(
+                        "placement affinity group '{}' is missing assignment for task '{}'",
+                        group.key, task.id
+                    ))
+                })?;
+                if let Some((anchor_task, anchor_node)) = &anchor {
+                    if node != anchor_node {
+                        return Err(Error::Config(format!(
+                            "placement requires co-located affinity group '{}': tasks '{}' and '{}' split across nodes '{}' and '{}'",
+                            group.key,
+                            anchor_task,
+                            task.id,
+                            anchor_node,
+                            node
+                        )));
+                    }
+                } else {
+                    anchor = Some((task.id.clone(), node.clone()));
                 }
             }
         }
@@ -2267,6 +2417,321 @@ mod placement_tests {
         }))
         .unwrap();
         assert!(zero.validate().is_err());
+    }
+
+    // --- placement affinity (Kafka L3 pairing shape) ---
+
+    use crate::codec::Codec;
+    use crate::input::InputBuilder;
+    use crate::output::OutputBuilder;
+    use std::sync::Once;
+
+    /// Mirrors the Kafka builders' affinity derivation: the input declares
+    /// `transactional_offsets` + `consumer_group`, the output declares
+    /// `offset_commit_group`, and both derive the same key from config only.
+    struct AffinitySourceBuilder;
+    struct AffinitySinkBuilder;
+
+    impl InputBuilder for AffinitySourceBuilder {
+        fn build(
+            &self,
+            _name: Option<&str>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn Codec>>,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Err(Error::Config("stub input never builds".into()))
+        }
+
+        fn placement_affinity(
+            &self,
+            config: &Option<serde_json::Value>,
+        ) -> Result<Option<String>, Error> {
+            let Some(config) = config.as_ref() else {
+                return Ok(None);
+            };
+            if config
+                .get("transactional_offsets")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                let group = config
+                    .get("consumer_group")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Error::Config("consumer_group is required".into()))?;
+                return Ok(Some(format!("kafka-txn:{group}")));
+            }
+            Ok(None)
+        }
+    }
+
+    impl OutputBuilder for AffinitySinkBuilder {
+        fn build(
+            &self,
+            _name: Option<&str>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn Codec>>,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Err(Error::Config("stub output never builds".into()))
+        }
+
+        fn placement_affinity(
+            &self,
+            config: &Option<serde_json::Value>,
+        ) -> Result<Option<String>, Error> {
+            let Some(group) = config
+                .as_ref()
+                .and_then(|config| config.get("offset_commit_group"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(format!("kafka-txn:{group}")))
+        }
+    }
+
+    static AFFINITY_STUBS: Once = Once::new();
+
+    fn affinity_job() -> JobSpec {
+        AFFINITY_STUBS.call_once(|| {
+            crate::input::register_input_builder(
+                "affinity-source",
+                Arc::new(AffinitySourceBuilder),
+            )
+            .unwrap();
+            crate::output::register_output_builder("affinity-sink", Arc::new(AffinitySinkBuilder))
+                .unwrap();
+        });
+        let mut job = split_job();
+        job.sources[0].input_type = "affinity-source".into();
+        job.sources[0].config = serde_json::json!({
+            "transactional_offsets": true,
+            "consumer_group": "g1"
+        });
+        job.sinks[0].output_type = "affinity-sink".into();
+        job.sinks[0].config = serde_json::json!({"offset_commit_group": "g1"});
+        job
+    }
+
+    fn node_of<'a>(assignments: &'a [TaskAttempt], task_id: &str) -> &'a str {
+        &assignments
+            .iter()
+            .find(|assignment| assignment.task_id == task_id)
+            .unwrap_or_else(|| panic!("no assignment for {task_id}"))
+            .node_id
+    }
+
+    #[test]
+    fn affinity_group_derives_from_configs_and_drops_single_members() {
+        let mut job = affinity_job();
+        // Both sides declare the same key: one group with two members.
+        let groups = job.affinity_groups().unwrap();
+        assert_eq!(groups.len(), 1, "groups: {groups:?}");
+        assert_eq!(groups[0].key, "kafka-txn:g1");
+        assert_eq!(
+            groups[0].operator_ids,
+            vec!["sink".to_string(), "source".to_string()]
+        );
+
+        // Only one side declares: a single-member group constrains nothing.
+        job.sinks[0].config = serde_json::json!({});
+        assert!(job.affinity_groups().unwrap().is_empty());
+
+        // Unregistered types (no builder in this registry) contribute nothing.
+        job.sources[0].input_type = "memory".into();
+        job.sources[0].config = serde_json::json!({"transactional_offsets": true});
+        assert!(job.affinity_groups().unwrap().is_empty());
+    }
+
+    #[test]
+    fn affinity_pair_pins_onto_the_source_node_deterministically() {
+        // parallelism 2 → tasks 0..5 alternate a/b/a/b/a/b; the pair
+        // (source, sink) pins onto the source's node, the middle aggregate
+        // keeps its spread.
+        let plan = JobPlan::compile(affinity_job()).unwrap();
+        let nodes = vec!["a".to_string(), "b".to_string()];
+        let assignments = plan.assignments_for_nodes(&nodes, 7).unwrap();
+
+        for task_id in ["source-0", "source-1", "sink-0", "sink-1"] {
+            assert_eq!(node_of(&assignments, task_id), "a", "task {task_id}");
+        }
+        let aggregate_nodes: BTreeSet<String> = assignments
+            .iter()
+            .filter(|attempt| attempt.task_id.starts_with("aggregate"))
+            .map(|attempt| attempt.node_id.clone())
+            .collect();
+        assert_eq!(aggregate_nodes.len(), 2, "middle operator stays spread");
+
+        // Deterministic: same plan + node list derives the same mapping, and
+        // the moved task's attempt id carries the pinned node.
+        assert_eq!(plan.assignments_for_nodes(&nodes, 7).unwrap(), assignments);
+        let moved = assignments
+            .iter()
+            .find(|assignment| assignment.task_id == "sink-1")
+            .unwrap();
+        assert_eq!(moved.id, format!("sink-1:a:7"));
+    }
+
+    #[test]
+    fn validate_affinity_nodes_rejects_a_split_pair_and_missing_assignments() {
+        let mut job = affinity_job();
+        job.parallelism = 1;
+        let plan = JobPlan::compile(job).unwrap();
+
+        let split = BTreeMap::from([
+            ("source-0".to_string(), "a".to_string()),
+            ("aggregate-0".to_string(), "a".to_string()),
+            ("sink-0".to_string(), "b".to_string()),
+        ]);
+        let error = plan
+            .validate_affinity_nodes(&split)
+            .expect_err("a split affinity pair must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("kafka-txn:g1"), "names the key: {message}");
+        assert!(message.contains("source-0"), "names both tasks: {message}");
+        assert!(message.contains("sink-0"), "names both tasks: {message}");
+        assert!(
+            message.contains("'a'") && message.contains("'b'"),
+            "names both nodes: {message}"
+        );
+
+        let mut missing = split.clone();
+        missing.remove("sink-0");
+        let error = plan
+            .validate_affinity_nodes(&missing)
+            .expect_err("a missing member task must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("missing assignment for task 'sink-0'"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn affinity_pinning_that_breaks_a_side_edge_rejects_the_assignment() {
+        let mut job = affinity_job();
+        job.parallelism = 1;
+        // Operator order fixes the task indices: source(0→a), aggregate(1→b),
+        // x(2→a), sink(3→b). The data path runs source→x→aggregate→sink, and
+        // aggregate→sink is the error side edge — co-located on b before
+        // pinning. The affinity pin then moves the sink to the source's node
+        // (a) and the side edge splits.
+        let x = OperatorSpec {
+            id: "x".into(),
+            kind: OperatorKind::Map,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        };
+        let aggregate_index = job
+            .operators
+            .iter()
+            .position(|operator| operator.id == "aggregate")
+            .unwrap();
+        job.operators.insert(aggregate_index + 1, x);
+        let sink_operator = job
+            .operators
+            .iter_mut()
+            .find(|operator| operator.id == "sink")
+            .unwrap();
+        sink_operator.config = serde_json::json!({"__arkflow_error_sink": true});
+        // Re-wire: source→x, x→aggregate; aggregate→sink stays as the error edge.
+        job.edges.retain(|edge| edge.id != "source-aggregate");
+        job.edges.push(EdgeSpec {
+            id: "source-x".into(),
+            from: "source".into(),
+            to: "x".into(),
+            partitioned: true,
+        });
+        job.edges.push(EdgeSpec {
+            id: "x-aggregate".into(),
+            from: "x".into(),
+            to: "aggregate".into(),
+            partitioned: true,
+        });
+
+        let plan = JobPlan::compile(job.clone()).unwrap();
+        let error = plan
+            .assignments_for_nodes(&["a".into(), "b".into()], 1)
+            .expect_err("a pin that splits an error side edge must reject the placement");
+        assert!(
+            error.to_string().contains("co-located side edges"),
+            "expected the side-edge rejection, got {error}"
+        );
+
+        // Without the affinity declaration the same plan stays co-located and
+        // is accepted — the rejection comes from the pin, not the shape.
+        job.sinks[0].config = serde_json::json!({});
+        let plan = JobPlan::compile(job).unwrap();
+        let assignments = plan
+            .assignments_for_nodes(&["a".into(), "b".into()], 1)
+            .expect("without affinity the error edge stays co-located");
+        assert_eq!(node_of(&assignments, "sink-0"), "b");
+    }
+
+    #[test]
+    fn colocated_rejects_an_affinity_pair_split_across_components() {
+        // A second disconnected component (source2 -> sink2) whose sink
+        // claims the first component's source group: colocated placement
+        // puts the components on different nodes, and the affinity check
+        // rejects the pairing that could never run.
+        let mut job = affinity_job();
+        job.placement = PlacementStrategy::Colocated;
+        job.operators.push(OperatorSpec {
+            id: "source2".into(),
+            kind: OperatorKind::Source,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.operators.push(OperatorSpec {
+            id: "sink2".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        job.edges.push(EdgeSpec {
+            id: "source2-sink2".into(),
+            from: "source2".into(),
+            to: "sink2".into(),
+            partitioned: false,
+        });
+        job.sources.push(SourceSpec {
+            codec: None,
+            operator_id: "source2".into(),
+            input_type: "memory".into(),
+            config: serde_json::json!({}),
+            time: TimeSpec {
+                mode: TimeMode::ProcessingTime,
+                timestamp_field: None,
+                watermark: None,
+                allowed_lateness_ms: 0,
+                late_event_policy: LateEventPolicy::Drop,
+                late_event_route: None,
+            },
+        });
+        // sink2 claims g1; the original sink stops claiming it so the group
+        // members are exactly the disconnected pair.
+        job.sinks[0].config = serde_json::json!({});
+        job.sinks.push(SinkSpec {
+            codec: None,
+            operator_id: "sink2".into(),
+            output_type: "affinity-sink".into(),
+            config: serde_json::json!({"offset_commit_group": "g1"}),
+        });
+
+        let plan = JobPlan::compile(job).unwrap();
+        let error = plan
+            .assignments_for_nodes(&["a".into(), "b".into()], 1)
+            .expect_err("a disconnected affinity pair must be rejected under colocated");
+        let message = error.to_string();
+        assert!(
+            message.contains("kafka-txn:g1") && message.contains("affinity"),
+            "expected the affinity rejection, got {message}"
+        );
     }
 }
 

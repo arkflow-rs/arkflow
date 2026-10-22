@@ -310,12 +310,61 @@ completes only after every downstream replica has acknowledged, and
 window-held batches stay excluded from barrier drain exactly as locally. Side
 edges — error sinks and late-event routes — must remain co-located; if a plan
 would split one across nodes, the entire placement is rejected before
-dispatch. The Hub dispatches `split` placements only to nodes that run a data
+dispatch. **Placement affinity groups** follow the same rule: components whose
+builders declare a shared affinity key are pinned onto one node after the
+round-robin. Today this is the Kafka L3 exactly-once pairing — an input with
+`transactional_offsets: true` and an output whose `offset_commit_group` names
+its consumer group (see [exactly-once](/build/exactly-once)) — so a split
+placement keeps the pair on one node while the operators between them may span
+nodes behind remote edges; an assignment that splits the pair is rejected at
+the Hub and again at the Agent, and an incremental re-placement moves the pair
+to the replacement node together. The Hub dispatches `split` placements only
+to nodes that run a data
 plane (a configured `health_check.data_port` with a routable
 `health_check.data_host`, advertised as the `network_shuffle` capability);
 otherwise placement fails closed with no partial dispatch. Deployments that
 never set these fields keep the colocated behavior unchanged — no extra
 listener, no capability, byte-identical placement.
+
+A split job with the Kafka L3 exactly-once pairing — the pair is pinned onto
+one node, any operators between them may span nodes behind remote edges:
+
+```yaml validate=full
+streams: []
+jobs:
+  - id: eos-orders-copy
+    version: 1
+    placement: split          # the L3 pair is pinned onto one node
+    operators:
+      - id: source
+        kind: source
+      - id: sink
+        kind: sink
+    edges:
+      - id: source-sink
+        from: source
+        to: sink
+    sources:
+      - operator_id: source
+        input_type: kafka
+        config:
+          brokers: [localhost:9092]
+          topics: [orders]
+          consumer_group: orders-copy-group
+          start_from_latest: false
+          transactional_offsets: true   # L3 input side
+        time:
+          mode: processing_time
+    sinks:
+      - operator_id: sink
+        output_type: kafka
+        config:
+          brokers: [localhost:9092]
+          topic: {type: value, value: orders-copy}
+          exactly_once: true
+          transactional_id: arkflow-orders-copy-0
+          offset_commit_group: orders-copy-group   # L3 output side; must name the input's consumer_group
+```
 
 #### Resource-aware placement and rebalancing
 

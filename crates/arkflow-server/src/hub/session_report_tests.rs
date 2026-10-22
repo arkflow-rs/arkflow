@@ -2423,3 +2423,159 @@ async fn undeclared_jobs_bypass_the_resource_gate() {
     let tasks = poll_start_tasks_and_complete(&hub, "node-a", &session.session_token).await;
     assert!(!tasks.is_empty());
 }
+
+/// L3 placement affinity end to end at the Hub: a split-placement Kafka
+/// job whose input declares `transactional_offsets` and whose output
+/// declares `offset_commit_group` dispatches with the pair pinned onto one
+/// node, and an incremental re-placement (failed node replaced in place)
+/// moves the pair to the replacement node together while the survivor's
+/// assignment stays untouched.
+#[tokio::test]
+async fn split_l3_pair_stays_pinned_across_incremental_replacement() {
+    arkflow_plugin::initialize().unwrap();
+    let hub = Hub::new(config());
+    let mut sessions = BTreeMap::new();
+    for (index, node_id) in ["node-a", "node-b"].into_iter().enumerate() {
+        let session = hub
+            .register(RegisterRequest {
+                data_address: Some(format!("{node_id}:9100")),
+                node_id: node_id.into(),
+                node_token: "node-secret".into(),
+                protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+                capabilities: shuffle_capabilities(),
+                boot_id: Some("boot".into()),
+            })
+            .await
+            .unwrap();
+        sessions.insert(node_id.to_string(), session.session_token.clone());
+        let auth = AgentAuth {
+            node_id: node_id.into(),
+            session_token: sessions[node_id].clone(),
+        };
+        report_shuffle_node(&hub, &auth, 0.1 + 0.1 * index as f64, 10.0, 1).await;
+    }
+
+    let spec = serde_json::json!({
+        "id": "l3-orders",
+        "version": 1,
+        "placement": "split",
+        "parallelism": 1,
+        "operators": [
+            {"id": "source", "kind": "source"},
+            {"id": "m", "kind": "map"},
+            {"id": "sink", "kind": "sink"}
+        ],
+        "edges": [
+            {"id": "e1", "from": "source", "to": "m"},
+            {"id": "e2", "from": "m", "to": "sink"}
+        ],
+        "sources": [{
+            "operator_id": "source",
+            "input_type": "kafka",
+            "config": {
+                "brokers": ["localhost:9092"],
+                "topics": ["in"],
+                "consumer_group": "g1",
+                "start_from_latest": false,
+                "transactional_offsets": true
+            },
+            "time": {"mode": "processing_time"}
+        }],
+        "sinks": [{
+            "operator_id": "sink",
+            "output_type": "kafka",
+            "config": {
+                "brokers": ["localhost:9092"],
+                "topic": {"type": "value", "value": "out"},
+                "exactly_once": true,
+                "transactional_id": "t1",
+                "offset_commit_group": "g1"
+            }
+        }]
+    });
+    hub.upsert_job(JobRecord {
+        job_id: "l3-orders".into(),
+        version: 1,
+        spec_json: spec.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec![],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+    })
+    .await
+    .unwrap();
+
+    // The affinity pin puts the L3 pair (source-0, sink-0) on one node and
+    // keeps the middle operator on the other.
+    let tasks_a = poll_start_tasks_and_complete(&hub, "node-a", &sessions["node-a"]).await;
+    let tasks_b = poll_start_tasks_and_complete(&hub, "node-b", &sessions["node-b"]).await;
+    assert_eq!(tasks_a, vec!["sink-0".to_string(), "source-0".to_string()]);
+    assert_eq!(
+        tasks_b,
+        vec!["m-0".to_string()],
+        "middle operator splits off"
+    );
+
+    // A replacement candidate joins, then the pair's node fails.
+    let session_e = hub
+        .register(RegisterRequest {
+            data_address: Some("node-e:9100".into()),
+            node_id: "node-e".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: shuffle_capabilities(),
+            boot_id: Some("boot".into()),
+        })
+        .await
+        .unwrap();
+    sessions.insert("node-e".to_string(), session_e.session_token.clone());
+    report_shuffle_node(
+        &hub,
+        &AgentAuth {
+            node_id: "node-e".into(),
+            session_token: sessions["node-e"].clone(),
+        },
+        0.5,
+        10.0,
+        1,
+    )
+    .await;
+    hub.nodes
+        .write()
+        .await
+        .get_mut("node-a")
+        .unwrap()
+        .resource
+        .maintenance_state = NodeMaintenanceState::Maintenance;
+    let job_record = hub
+        .jobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.job_id == "l3-orders")
+        .expect("job record");
+    hub.reconcile_job(&job_record).await.unwrap();
+
+    // The pair moves to the replacement node together; the survivor keeps
+    // its assignment and is not re-dispatched.
+    let inherited = poll_start_tasks_and_complete(&hub, "node-e", &sessions["node-e"]).await;
+    assert_eq!(
+        inherited, tasks_a,
+        "the replacement node takes over the whole pinned pair"
+    );
+    let auth_b = AgentAuth {
+        node_id: "node-b".into(),
+        session_token: sessions["node-b"].clone(),
+    };
+    let commands = hub.commands(auth_b).await.unwrap();
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command.operation.as_str() == "job_start"),
+        "survivor node-b must not be re-dispatched"
+    );
+}
