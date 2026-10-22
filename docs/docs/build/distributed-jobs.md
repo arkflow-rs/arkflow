@@ -314,7 +314,7 @@ dispatch. **Placement affinity groups** follow the same rule: components whose
 builders declare a shared affinity key are pinned onto one node after the
 round-robin. Today this is the Kafka L3 exactly-once pairing — an input with
 `transactional_offsets: true` and an output whose `offset_commit_group` names
-its consumer group (see [exactly-once](/build/exactly-once)) — so a split
+its consumer group (see [exactly-once](/docs/build/exactly-once)) — so a split
 placement keeps the pair on one node while the operators between them may span
 nodes behind remote edges; an assignment that splits the pair is rejected at
 the Hub and again at the Agent, and an incremental re-placement moves the pair
