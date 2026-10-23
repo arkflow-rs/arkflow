@@ -211,7 +211,9 @@ pub(crate) fn validate_pairings() -> Result<(), Error> {
          committed (a crash restarts per auto.offset.reset and can skip records). \
          Pair each input with a transactional Kafka output setting \
          `offset_commit_group: <consumer_group>`, or remove \
-         `transactional_offsets` from the input.",
+         `transactional_offsets` from the input. Distributed deployments pin \
+         the pair onto one node; reaching this error there means the task map \
+         bypassed affinity validation.",
         unpaired.join(", ")
     )))
 }
@@ -291,6 +293,13 @@ mod tests {
         assert!(
             message.contains("offset_commit_group"),
             "names the output key: {message}"
+        );
+        // The distributed hint: under split placement the pair is pinned by
+        // affinity, so reaching this error there means the task map bypassed
+        // affinity validation (spec: L3 配对 SHALL 声明放置亲和).
+        assert!(
+            message.contains("affinity validation"),
+            "explains the distributed-deployment meaning: {message}"
         );
 
         declare_offset_committer(&group);

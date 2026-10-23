@@ -1617,6 +1617,146 @@ fn rejects_assignment_that_splits_an_edge() {
     assert!(matches!(result, Err(Error::Config(message)) if message.contains("co-located")));
 }
 
+/// The Agent-side belt-and-braces for placement affinity: `build_subgraph`
+/// rejects a task map that splits an affinity pair, and builds the graph
+/// normally when the pair sits on one node (the same node hosts both sides
+/// of the pairing, remote edges appear only around the middle operator).
+#[test]
+fn build_subgraph_rejects_a_split_affinity_pair() {
+    use crate::codec::Codec;
+    use crate::input::InputBuilder;
+    use crate::output::OutputBuilder;
+    use std::sync::Once;
+
+    struct AffinitySourceStub;
+    struct AffinitySinkStub;
+
+    impl InputBuilder for AffinitySourceStub {
+        fn build(
+            &self,
+            _name: Option<&str>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn Codec>>,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Err(Error::Config("stub input never builds".into()))
+        }
+
+        fn placement_affinity(
+            &self,
+            _config: &Option<serde_json::Value>,
+        ) -> Result<Option<String>, Error> {
+            Ok(Some("kafka-txn:e2e".into()))
+        }
+    }
+
+    impl OutputBuilder for AffinitySinkStub {
+        fn build(
+            &self,
+            _name: Option<&str>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn Codec>>,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Output>, Error> {
+            Err(Error::Config("stub output never builds".into()))
+        }
+
+        fn placement_affinity(
+            &self,
+            _config: &Option<serde_json::Value>,
+        ) -> Result<Option<String>, Error> {
+            Ok(Some("kafka-txn:e2e".into()))
+        }
+    }
+
+    static STUBS: Once = Once::new();
+    STUBS.call_once(|| {
+        crate::input::register_input_builder("affinity-e2e-source", Arc::new(AffinitySourceStub))
+            .unwrap();
+        crate::output::register_output_builder("affinity-e2e-sink", Arc::new(AffinitySinkStub))
+            .unwrap();
+    });
+
+    let mut job = spec(
+        vec![map_operator("m")],
+        vec![edge("source", "m"), edge("m", "sink")],
+        1,
+    );
+    job.sources[0].input_type = "affinity-e2e-source".into();
+    job.sources[0].config = serde_json::json!({"transactional_offsets": true});
+    job.sinks[0].output_type = "affinity-e2e-sink".into();
+    job.sinks[0].config = serde_json::json!({"offset_commit_group": "e2e"});
+    let plan = JobPlan::compile(job).unwrap();
+
+    let adapter = || Adapter {
+        input: Arc::new(VecInput::new(vec![vec![(1, "a".into())]])),
+        output: Arc::new(CollectOutput::default()),
+        processor: Arc::new(PassThroughProcessor),
+    };
+
+    let context =
+        |task_nodes: BTreeMap<String, String>| crate::executor::graph::RemoteEdgeContext {
+            tls: None,
+            local_node: "node-a".into(),
+            task_nodes,
+            node_addrs: BTreeMap::new(),
+            manager: authenticated_manager("node-a"),
+            generation: 1,
+        };
+
+    // The pairing splits across nodes: the Agent rejects the stale task map
+    // before building anything.
+    let split = BTreeMap::from([
+        ("source-0".to_string(), "node-a".to_string()),
+        ("m-0".to_string(), "node-b".to_string()),
+        ("sink-0".to_string(), "node-b".to_string()),
+    ]);
+    let result = ExecutionGraphBuilder::default().build_subgraph(
+        &plan,
+        &["source-0".to_string()],
+        &adapter(),
+        &resource(),
+        Some(&context(split)),
+    );
+    assert!(
+        matches!(&result, Err(Error::Config(message)) if message.contains("kafka-txn:e2e")),
+        "expected the affinity rejection, got {:?}",
+        result.map(|_| "built")
+    );
+
+    // Co-located pairing: the node hosting the source also hosts the sink
+    // and builds its whole local subgraph normally.
+    let colocated = BTreeMap::from([
+        ("source-0".to_string(), "node-a".to_string()),
+        ("m-0".to_string(), "node-a".to_string()),
+        ("sink-0".to_string(), "node-a".to_string()),
+    ]);
+    let graph = ExecutionGraphBuilder::default()
+        .build_subgraph(
+            &plan,
+            &[
+                "source-0".to_string(),
+                "m-0".to_string(),
+                "sink-0".to_string(),
+            ],
+            &adapter(),
+            &resource(),
+            Some(&context(colocated)),
+        )
+        .unwrap_or_else(|error| panic!("co-located pair must build: {error}"));
+    let built_tasks: Vec<String> = graph
+        .chains
+        .iter()
+        .flat_map(|chain| chain.task_ids.iter().cloned())
+        .collect();
+    for task_id in ["source-0", "m-0", "sink-0"] {
+        assert!(
+            built_tasks.iter().any(|built| built == task_id),
+            "task {task_id} missing from {built_tasks:?}"
+        );
+    }
+}
+
 // ---------- barrier alignment tests ----------
 
 use crate::checkpoint::CheckpointBarrier;

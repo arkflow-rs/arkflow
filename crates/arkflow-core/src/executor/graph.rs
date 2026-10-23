@@ -438,6 +438,7 @@ impl ExecutionGraphBuilder {
             // The Hub validates placement before dispatch, but an Agent must
             // also fail closed if it receives a stale or incomplete task map.
             plan.validate_side_edge_nodes(&remote.task_nodes)?;
+            plan.validate_affinity_nodes(&remote.task_nodes)?;
         }
         let index = PlanIndex::new(plan);
         let tasks = task_ids

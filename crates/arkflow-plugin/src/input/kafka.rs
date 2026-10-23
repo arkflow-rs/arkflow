@@ -1468,6 +1468,17 @@ impl InputBuilder for KafkaInputBuilder {
         }
         Ok(Arc::new(KafkaInput::new(name, kafka_config, codec)?))
     }
+
+    fn placement_affinity(
+        &self,
+        config: &Option<serde_json::Value>,
+    ) -> Result<Option<String>, Error> {
+        let kafka_config: KafkaInputConfig = parse_config(config, "Kafka input")?;
+        if kafka_config.transactional_offsets {
+            return Ok(Some(format!("kafka-txn:{}", kafka_config.consumer_group)));
+        }
+        Ok(None)
+    }
 }
 
 pub fn init() -> Result<(), Error> {

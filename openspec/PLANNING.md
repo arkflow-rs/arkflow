@@ -200,14 +200,14 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 - 交付顺序 = 价值优先：**1 CDC → 2 Schema → 3 EOS → 4 状态**。（前三项已全部闭环）
 - ~~状态 checkpoint（Change 4）守「单节点、不引入分布式」~~ → 已修订为分布式 Job 运行时（见上节）。
 - Codec trait async 化（`refactor-codec-async`）作为 IO 类 codec 的前置，独立 change。
-- Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 = SQL output 的 `upsert: true` + `upsert_keys`（2026-09-16 前该能力虚标未实现，`fix-sql-output-upsert` 后实装）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）留 future（方向② backlog）。
+- Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 = SQL output 的 `upsert: true` + `upsert_keys`（2026-09-16 前该能力虚标未实现，`fix-sql-output-upsert` 后实装）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）~~留 future~~ → ✅ 2026-09-25 随 `add-kafka-l3-transactional-offsets` 闭环（同进程配对，见第八节表；跨进程配对仍 fail-closed）。
 
 ### 下一步（2026-09-12 对齐，2026-09-16 更新）
 
 1. ~~**合入 v1**~~ → ✅ 已完成：PR #1222 squash 合入 main（`d656ae2`），main 与 v1 内容一致。
 2. **关闭过时 issue**：#901（InfluxDB）、#430 等 issue 对应能力已实现，需核实后关闭并回复贡献者。（仍未做）
 3. ~~**方向选择**~~ → ✅ 已确认：下一主线 = **数据面可观测性**，已立项 `changes/add-data-plane-observability`（2026-09-15，当日归档合入）。
-4. ~~**方向②剩余缺口**~~ → ✅ 2026-09-16 闭环两个 change（见下节）；方向② backlog 收敛为：原生 CDC 直连 input、EOS L3、状态后端选项（rocksdb/远程）。
+4. ~~**方向②剩余缺口**~~ → ✅ 2026-09-16 闭环两个 change（见下节）；方向② backlog 收敛为：原生 CDC 直连 input、~~EOS L3~~（2026-09-25 闭环；split 放置下的 L3 配对 2026-10-22 由 `add-kafka-l3-placement-affinity` 放置亲和闭环——配对钉同节点、拆分即拒，真正的跨进程配对仍无语义，见第八节）、状态后端选项（rocksdb/远程）。
 
 ### 方向②收尾（2026-09-16 归档）
 
@@ -430,7 +430,7 @@ Kubernetes 交付面按三层推进，**operator 的触发条件在此写死，�
 
 - 事件时间：分区级 watermark、窗口迟到行为显式定义、滑动窗口覆盖所有包含窗口、迟到事件专门路由边、非法时间戳不无限持有（`event-time-processing`）。
 - 状态与容错：keyed state 后端、版本化状态格式、state journal 版本围栏、checkpoint 恢复（源位置 + 全部分区 watermark 一并还原）、WAL（含 S3）、端到端有界背压（含跨节点边沿 TCP 反压）。
-- 投递语义：Kafka L2 事务 exactly-once（`read_committed` 原子可见、zombie producer 围栏、事务 id 稳定性契约）+ 诚实边界声明（事务提交后、offset 提交前崩溃的残留重复需下游幂等吸收，L3 未做）。
+- 投递语义：Kafka L2 事务 exactly-once（`read_committed` 原子可见、zombie producer 围栏、事务 id 稳定性契约）+ 诚实边界声明（事务提交后、offset 提交前崩溃的残留重复需下游幂等吸收；该边界后由同进程 L3 消除，见第八节）。
 - 分布式运行时：代数围栏（exactly one live runner）、资源感知放置、opt-in 压力再均衡（带冷却防抖）、网络 shuffle（key-group 路由稳定、Ack 三态镜像回执、fail-closed）。
 - 运维面：savepoint、Hub 生命周期 API、OIDC/RBAC、节点资源上报、Web 控制台、benchmark 套件。
 
@@ -523,7 +523,7 @@ P3  eos-l3-and-transactional-sinks offset 进事务 + 更多事务 sink      独
 
 **四轮 CR 修复**：会话回执槽位清空竞态（same_channel 守卫）与转发器关停监视（fix-session-receipt-lifecycle）；迁移自引用 FK 父母先行行序（fix-migrate-self-reference-ordering）；L3 与分区指派组合的构建期显式拒绝（fix-l3-assign-mode-validation）。
 
-**剩余边界（更新）**：~~远程边透明重连与去重~~、~~真 key 重分布~~、~~Kafka L3~~ 已闭环；仍开放：temporal/outer join、Hub 阶段 2（选主）、L3 的跨进程配对（分布式部署输入/输出分节点时注册表不可达，显式 fail-closed）、远程边去重的处理级残留（投递级已覆盖）。
+**剩余边界（更新）**：~~远程边透明重连与去重~~、~~真 key 重分布~~、~~Kafka L3~~ 已闭环；仍开放：temporal/outer join、Hub 阶段 2（选主）、~~L3 的跨进程配对~~（2026-10-22 `add-kafka-l3-placement-affinity` 闭环：分布式 Job 经 builder 放置亲和钩子把配对钉到同节点，Hub/Agent 双侧校验 fail-closed——注意闭环的是"分布式 Job 可用 L3"，真正的跨进程配对仍无语义（拆分即拒、从不执行），跨节点元数据协议仍 Non-goal——CGM 可经 librdkafka FFI 跨进程重建的可行性结论留档该 change design）、远程边去重的处理级残留（投递级已覆盖）。
 
 ---
 

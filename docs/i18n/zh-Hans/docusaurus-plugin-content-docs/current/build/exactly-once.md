@@ -94,7 +94,7 @@ output:
 L3 的边界以显式报错而非静默降级来执行:
 
 - **配对在启动期校验(fail-closed)**——声明了 `transactional_offsets: true` 的 Kafka 输入,其消费者组若从未被任何输出的 `offset_commit_group` 指名,组位点将静默无人提交(崩溃后组完全按 `auto.offset.reset` 重启,`latest` 会跳过期间生产的全部记录)。流/作业的全部组件构建完成后,启动校验以配置错误拒绝该配置,错误指名组与两侧配置键。
-- **进程内配对**——输出通过进程内注册表解析被指名的组;输入与输出必须运行在同一个 ArkFlow 进程内。输入与输出跨节点的分布式作业不在覆盖范围(独立变更)。`offset_commit_group` 指名的组没有声明 `transactional_offsets` 的活输入时,写入失败。
+- **配对由放置亲和共位**——输出通过进程内注册表解析被指名的组,输入与输出必须运行在同一个 ArkFlow 进程内。分布式作业自动满足这一点:Kafka 输入/输出 builder 从 `transactional_offsets`/`offset_commit_group` 推导出同一个放置亲和 key,`placement: split` 下规划器把配对钉到同一节点(其间的算子仍可跨节点经远程数据边传输)。会把配对拆开的 assignment 会被拒绝——Hub 放置校验与 Agent 建图各拦一次,任务启动前即失败。`offset_commit_group` 指名的组没有声明 `transactional_offsets` 的活输入时,写入失败。
 - **单一输入主题**——批次元数据只带分区不带主题,注册表按输入的主题列表路由;多主题订阅会被拒绝。
 - **仅限 Kafka → Kafka**——不含 Kafka 源元数据列的批次不贡献位点(写入照常进行);非 Kafka 源无法与事务性输出配对。这类批次**不在 L3 保证之内**:声明 `transactional_offsets: true` 后输入不再自行提交位点,若后续没有携带元数据的事务推进组位点,重启会重放这些记录并造成重复输出——请保持 Kafka 输入与输出之间的管道不含丢弃元数据的处理器(如 `json_to_arrow` 这类重建批次的变换),否则在下游吸收重复。
 
@@ -105,6 +105,6 @@ L3 的边界以显式报错而非静默降级来执行:
 ## 要求摘要
 
 - `exactly_once: true` 要求非空的 `transactional_id`;否则校验失败并给出明确错误。
-- `offset_commit_group` 要求 `exactly_once: true`;否则 builder 拒绝该配置。被指名的组必须有同进程、声明了 `transactional_offsets: true` 的 Kafka 输入:事务性输入未被任何输出认领的配置**启动即失败**(配置错误);写入时组无活输入则以配置错误失败该次写入。
+- `offset_commit_group` 要求 `exactly_once: true`;否则 builder 拒绝该配置。被指名的组必须有运行在同进程、声明了 `transactional_offsets: true` 的 Kafka 输入(分布式作业通过把配对钉到同一节点来满足):事务性输入未被任何输出认领的配置**启动即失败**(配置错误);写入时组无活输入则以配置错误失败该次写入。
 - WAL 的对象存储 `node_id` 与 Kafka `transactional_id` 是**相互独立**的配置值——互不派生。
 - 事务性 Kafka 输出之外的其他输出保持当前默认的至少一次行为。其他 sink 的幂等适配器(SQL UPSERT 等)可在后续变更中添加。
