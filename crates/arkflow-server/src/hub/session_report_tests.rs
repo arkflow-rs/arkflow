@@ -2463,11 +2463,13 @@ async fn split_l3_pair_stays_pinned_across_incremental_replacement() {
         "operators": [
             {"id": "source", "kind": "source"},
             {"id": "m", "kind": "map"},
+            {"id": "m2", "kind": "map"},
             {"id": "sink", "kind": "sink"}
         ],
         "edges": [
             {"id": "e1", "from": "source", "to": "m"},
-            {"id": "e2", "from": "m", "to": "sink"}
+            {"id": "e2", "from": "m", "to": "m2"},
+            {"id": "e3", "from": "m2", "to": "sink"}
         ],
         "sources": [{
             "operator_id": "source",
@@ -2509,15 +2511,24 @@ async fn split_l3_pair_stays_pinned_across_incremental_replacement() {
     .await
     .unwrap();
 
-    // The affinity pin puts the L3 pair (source-0, sink-0) on one node and
-    // keeps the middle operator on the other.
+    // The affinity pin puts the L3 pair (source-0, sink-0) on one node;
+    // m2-0 is the bystander the round-robin happened to place there too, so
+    // the replacement assertion below checks the whole node task set —
+    // pinned pair and bystander alike — not just the pair.
     let tasks_a = poll_start_tasks_and_complete(&hub, "node-a", &sessions["node-a"]).await;
     let tasks_b = poll_start_tasks_and_complete(&hub, "node-b", &sessions["node-b"]).await;
-    assert_eq!(tasks_a, vec!["sink-0".to_string(), "source-0".to_string()]);
+    assert_eq!(
+        tasks_a,
+        vec![
+            "m2-0".to_string(),
+            "sink-0".to_string(),
+            "source-0".to_string()
+        ]
+    );
     assert_eq!(
         tasks_b,
         vec!["m-0".to_string()],
-        "middle operator splits off"
+        "the odd-position middle operator splits off"
     );
 
     // A replacement candidate joins, then the pair's node fails.

@@ -11,7 +11,7 @@ Split placement for multi-node Jobs: strategy declaration, deterministic task-le
 - **THEN** 放置策略为 colocated，assignment 与升级前一致
 
 ### Requirement: split 放置 SHALL 按 task 粒度确定性轮转
-`split` 放置 SHALL 按 plan 的物理 task 顺序（sources→operators→sinks）以节点数取模轮转分配；相同输入 MUST 在任意节点推导出相同映射。同 operator 的 subtask SHALL 分布到不同节点（当节点数 ≥ 2 时）。
+`split` 放置 SHALL 按 plan 的物理 task 顺序（sources→operators→sinks）以节点数取模轮转分配；相同输入 MUST 在任意节点推导出相同映射。同 operator 的 subtask SHALL 分布到不同节点（当节点数 ≥ 2 时）；放置亲和组的成员算子不受该散布要求约束——其全部 subtask 被钉到同一节点（见「放置亲和组 SHALL 共位」），钉扎在轮转之后执行并优先于散布。
 
 #### Scenario: 双节点轮转分配
 - **WHEN** 一个 3 operator × 2 subtask 的 Job 以 split 放置分配到节点 [A, B]
