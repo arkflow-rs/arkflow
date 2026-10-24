@@ -50,6 +50,7 @@ export type EngineStatus = {
   streams_total: number
   streams_running: number
   streams_failed: number
+  approval_required?: boolean
 }
 export type SystemResource = {
   id: string
@@ -177,6 +178,22 @@ export type Rollout = {
   updated_at_ms: number
 }
 export type RolloutDetail = { rollout: Rollout; targets: RolloutTarget[] }
+export type ConfigApproval = {
+  request_id: string
+  config_version_id: string
+  targets: string[]
+  batch_size: number
+  requester_id: string
+  status: 'pending' | 'approving' | 'approved' | 'rejected' | 'expired'
+  approver_id?: string
+  decided_at_ms?: number
+  rollout_id?: string
+  correlation_id: string
+  expires_at_ms: number
+  created_at_ms: number
+  updated_at_ms: number
+  failure_note?: string
+}
 export type AuditRecord = {
   event_id: number
   actor?: string
@@ -521,6 +538,22 @@ export const api = {
     request<Rollout>('/rollouts', {
       method: 'POST',
       body: JSON.stringify({ config_version: configVersion, node_ids: nodeIds, batch_size: batchSize }),
+    }),
+  configApprovals: (status?: string) =>
+    request<ConfigApproval[]>(
+      `/config-approvals${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+    ),
+  configApproval: (id: string) =>
+    request<ConfigApproval>(`/config-approvals/${encodeURIComponent(id)}`),
+  submitConfigApproval: (configVersion: string, nodeIds: string[], batchSize: number) =>
+    request<ConfigApproval>('/config-approvals', {
+      method: 'POST',
+      body: JSON.stringify({ config_version: configVersion, node_ids: nodeIds, batch_size: batchSize }),
+    }),
+  decideConfigApproval: (id: string, decision: 'approve' | 'reject', note?: string) =>
+    request<ConfigApproval>(`/config-approvals/${encodeURIComponent(id)}/decide`, {
+      method: 'POST',
+      body: JSON.stringify({ decision, note }),
     }),
   rolloutAction: (id: string, action: 'pause' | 'resume' | 'cancel' | 'rollback', configVersion?: string) =>
     request<Rollout>(`/rollouts/${encodeURIComponent(id)}/actions`, {

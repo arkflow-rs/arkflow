@@ -278,7 +278,7 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转�
 2. ~~操作取消/超时/重试/重连 reconciliation 未闭环~~ → ✅ 已落地（#1204、#1216）；Job 级重平衡/恢复编排仍在 v1 演进。
 3. 鉴权仍以全局 operator/node token 为主，尚无用户、角色和细粒度权限模型。（未动；RBAC 属阶段 4。注意阶段 3 的配置审批流隐含依赖多身份，建议排在 RBAC 之后避免返工）
 4. ~~Agent 命令轮询与结果上报用 URL 查询参数携带 session token~~ → ✅ 已完成（2026-09-13 核实）：`bearer_auth` 走 `Authorization: Bearer`（`agent.rs` `bearer_auth`），Hub 优先读 header，查询参数仅保留为升级窗口兼容。
-5. ~~配置缺少版本化发布/回滚~~ → ✅ Console 已有 draft/validate/diff/publish/rollback 工作流（`harden-console-configuration-workflow` 已归档）；批量发布/审批流未做。
+5. ~~配置缺少版本化发布/回滚~~ → ✅ Console 已有 draft/validate/diff/publish/rollback 工作流（`harden-console-configuration-workflow` 已归档）；~~批量发布/审批流未做~~ → 2026-10-23 核实修订：**批量发布已随 `harden-control-plane-fleet` 落地**（`control-plane-rollout` spec：不可变版本 + 有界批次 + 健康门控收敛 + 暂停/回滚；实现 `hub/rollout.rs`；Console `features/rollouts.tsx` 有创建/暂停/回滚完整 UI）——阶段 3 的"滚动发布、分批发布、失败自动暂停和回滚"一条同时闭环。剩余仅**审批流**，已由 `add-config-approval-flow` 落地（2026-10-24，32/32 任务）：审批请求不可变快照 + `approval_required` 策略闸门（四创建入口全覆盖，回滚仅放行曾应用版本）+ `ApproveRollouts` 仅 Admin 与职责分离 + `APPROVING` 中间态认领防崩溃双建 + TTL/有界保留清扫 + 审计 + Console 审批队列页；策略关闭时行为逐位不变；无存储 Hub 开启策略启动即拒（fail-closed）。v1 全局开关，标签分组策略留待节点标签体系落地。
 6. ~~Console Overview/Runtime/配置编辑未补全~~ → ✅ 已补齐（含组件目录、可视化 Job DAG 编排器）。
 7. ~~双节点端到端测试~~ → ✅ 已闭环：`crates/arkflow-server/tests/two_node_job_smoke.rs`（Hub + 双 Agent、barrier checkpoint、kill/restart 恢复、旧启动代 fencing）；Stream 层面亦已覆盖。
 8. **新增**：v1 合入 main 前需完成 PR #1219 评审闭环（`repair-v1-review-defects` 已 38/38，待归档）；分布式 Job 的生产化验证（长稳、规模上限、状态后端除 embedded_kv 外的选项）未做。

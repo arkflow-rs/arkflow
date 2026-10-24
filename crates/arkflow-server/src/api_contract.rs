@@ -37,6 +37,11 @@ pub enum OperatorAction {
     Configure,
     ManageNodes,
     ManageRollouts,
+    /// Decide configuration approval requests. Held by admin only: the
+    /// operator role can submit requests but must not approve them, keeping
+    /// submission and approval in different hands (see
+    /// `configuration-approval`).
+    ApproveRollouts,
     ReadAudit,
 }
 
@@ -111,6 +116,22 @@ pub struct CreateRolloutRequest {
     pub node_ids: Vec<String>,
     #[serde(default = "default_rollout_batch_size")]
     pub batch_size: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubmitApprovalRequest {
+    pub config_version: String,
+    pub node_ids: Vec<String>,
+    #[serde(default = "default_rollout_batch_size")]
+    pub batch_size: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApprovalDecisionRequest {
+    /// `approve` or `reject`.
+    pub decision: String,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -271,5 +292,33 @@ mod tests {
         assert!(viewer.can_scope(OperatorAction::Read, "node", Some("node-a")));
         assert!(!viewer.can_scope(OperatorAction::Read, "node", Some("node-b")));
         assert!(OperatorPrincipal::legacy_operator().can(OperatorAction::ManageRollouts));
+    }
+
+    #[test]
+    fn approve_rollouts_is_admin_only() {
+        // Admin (legacy static token and structured credentials) can decide
+        // approval requests.
+        assert!(OperatorPrincipal::legacy_operator().can(OperatorAction::ApproveRollouts));
+        let admin = OperatorPrincipal {
+            id: "root".into(),
+            roles: vec![OperatorRole::Admin],
+            scopes: Vec::new(),
+        };
+        assert!(admin.can(OperatorAction::ApproveRollouts));
+        // The operator role can submit requests but never approve them, and
+        // the viewer role can do neither.
+        let operator = OperatorPrincipal {
+            id: "alice".into(),
+            roles: vec![OperatorRole::Operator],
+            scopes: Vec::new(),
+        };
+        assert!(operator.can(OperatorAction::ManageRollouts));
+        assert!(!operator.can(OperatorAction::ApproveRollouts));
+        let viewer = OperatorPrincipal {
+            id: "bob".into(),
+            roles: vec![OperatorRole::Viewer],
+            scopes: Vec::new(),
+        };
+        assert!(!viewer.can(OperatorAction::ApproveRollouts));
     }
 }

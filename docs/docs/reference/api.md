@@ -220,6 +220,21 @@ operation metadata only — never credentials or job configuration bodies.
 | `GET` | `/rollouts/{id}` | Rollout state and per-node progress. |
 | `POST` | `/rollouts/{id}/actions` | Rollout actions: pause, resume, cancel, rollback. |
 
+When `control_api.approval_required` is enabled on the Hub, the creation
+routes (`POST /rollouts` and the node-level apply/rollback routes) reject
+direct creation with an `approval_required` problem and publishing goes
+through approval requests instead:
+
+| Method | Route | Purpose |
+|--------|-------|---------|
+| `GET`/`POST` | `/config-approvals` | List approval requests (`?status=pending\|approving\|approved\|rejected\|expired`) / submit one pinning a version, targets, and batch size. |
+| `GET` | `/config-approvals/{id}` | One approval request and its pinned snapshot. |
+| `POST` | `/config-approvals/{id}/decide` | Approve or reject (`{"decision":"approve"\|"reject","note":"..."}`). Requires the `ApproveRollouts` permission (admin role only) and a principal different from the requester. |
+
+Approval creates the rollout with the approver as actor; a rollback is
+exempt only when its target version was previously applied to the affected
+nodes.
+
 See [Reconciliation rollout and recovery](../operate/control-plane/reconciliation.md)
 for the state machine behind these routes.
 

@@ -19,6 +19,8 @@ fn config() -> HubConfig {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     }
 }
 

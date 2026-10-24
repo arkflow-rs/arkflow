@@ -186,6 +186,41 @@ pub(super) async fn hub_configuration_command<T: Serialize>(
         }
     };
     if hub.has_storage() {
+        // The approval gate: forward application requires an approved
+        // request; rollback may only target a version that was actually
+        // applied to this node (never-applied content would ride the
+        // rollback path around the gate).
+        if hub.approval_required() {
+            let blocked = if operation == "apply_configuration" {
+                Some(hub.ensure_rollout_creation_allowed().expect_err("policy enabled"))
+            } else {
+                let version = payload
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                match hub
+                    .version_was_applied_to(&version, std::slice::from_ref(&node_id))
+                    .await
+                {
+                    Ok(true) => None,
+                    Ok(false) => Some(format!(
+                        "rollback target '{}' was never applied to node '{}'; under the \
+                         approval policy only previously applied versions may roll back \
+                         — submit new content through the approval flow",
+                        version, node_id
+                    )),
+                    Err(_) => Some(format!(
+                        "cannot verify that rollback target '{}' was applied to node \
+                         '{}'; submit new content through the approval flow",
+                        version, node_id
+                    )),
+                }
+            };
+            if let Some(message) = blocked {
+                return problem(StatusCode::UNPROCESSABLE_ENTITY, "approval_required", message);
+            }
+        }
         let config_version_id = if operation == "apply_configuration" {
             headers
                 .get("x-config-version")

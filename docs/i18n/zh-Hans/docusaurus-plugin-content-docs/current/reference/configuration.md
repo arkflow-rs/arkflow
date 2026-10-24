@@ -60,6 +60,8 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 | `api_token` | string | 否 | — | 保护带版本控制平面 API 的可选 Bearer 令牌。设置后,`/api/v1` 下的所有端点(含读端点)在没有有效 `Authorization: Bearer` 请求头时一律返回 `401`。 |
 | `insecure_local` | boolean | 否 | `false` | 显式允许独立控制 API 在不设 `api_token` 的情况下绑定非回环 `address`。默认拒绝该组合启动;设置后进程会启动并输出 error 级警告。切勿在共享网络中使用。 |
 | `cors_origins` | array&lt;string&gt; | 否 | `[]` | 允许调用控制 API 的浏览器来源。为空则拒绝跨域调用。 |
+| `approval_required` | boolean | 否 | `false` | 任何配置 rollout 创建前都需第二个身份审批:全部创建路由(批量创建、节点级 apply 与回滚)拒绝直接创建,发布改走 `/api/v1/config-approvals`(见[审批闸门](/zh-Hans/docs/operate/control-plane/reconciliation#配置审批闸门))。需要至少两个 operator 身份——单条凭据无法自批自提。 |
+| `approval_ttl_ms` | integer | 否 | `86400000` | 待审批请求的可决策时长(毫秒),超时过期。 |
 | `hub_urls` | array&lt;string&gt; | 否 | `[]` | 计算节点 Agent 模式使用的 Hub 地址列表,按序作为故障转移候选(参见 [Agent 多 Hub 故障转移](/zh-Hans/docs/operate/control-plane/deploy#agent-multi-hub-failover))。空列表即为独立(standalone)模式。**破坏性变更:** 取代原先单字符串的 `hub_url` 字段;仍声明 `hub_url` 的配置会在校验时报错并附迁移指引——把 `hub_url: "http://hub:8080"` 改写为 `hub_urls: ["http://hub:8080"]`。 |
 | `node_id` | string | 否 | — | 本进程向其 Hub 上报的稳定身份。 |
 | `node_token` | string | 否 | — | 共享的节点注册凭据。绝不会包含在报告中。 |

@@ -5,6 +5,7 @@ import { api, AuditRecord, errorMessage, formatTime, RolloutDetail } from '../ap
 import { useT } from '../i18n'
 import { usePrompt } from './confirm'
 import { useNodes, useRolloutDetail, useRollouts } from '../queries'
+import { useStatus } from '../queries'
 
 export function Rollouts({ onError }: { onError: (message: string) => void }) {
   const t = useT()
@@ -12,6 +13,7 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
   const prompt = usePrompt()
   const nodes = useNodes().data?.items ?? []
   const rollouts = useRollouts().data ?? []
+  const approvalRequired = useStatus().data?.approval_required ?? false
   const [selectedId, setSelectedId] = useState<string>()
   const detailQuery = useRolloutDetail(selectedId)
   const selected = detailQuery.data
@@ -29,10 +31,18 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
     if (!version.trim() || targets.length === 0) return
     try {
       setBusy(true)
-      const rollout = await api.createRollout(version.trim(), targets, batch)
-      setSelectedId(rollout.rollout_id)
+      if (approvalRequired) {
+        // The approval policy is enabled: the direct creation route rejects
+        // submissions, so publish through the approval queue instead.
+        await api.submitConfigApproval(version.trim(), targets, batch)
+        toast.success(t('approvals.submitted'))
+      } else {
+        const rollout = await api.createRollout(version.trim(), targets, batch)
+        setSelectedId(rollout.rollout_id)
+      }
       setBusy(false)
       invalidate()
+      void queryClient.invalidateQueries({ queryKey: ['live', 'config-approvals'] })
     } catch (cause) {
       setBusy(false)
       onError(errorMessage(cause))
@@ -86,9 +96,10 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
             ))}
           </select>
           <button disabled={busy || !version.trim() || targets.length === 0} onClick={() => void create()}>
-            {t('rollouts.create')}
+            {approvalRequired ? t('rollouts.submitForApproval') : t('rollouts.create')}
           </button>
         </div>
+        {approvalRequired && <div className="warning">{t('approvals.gateEnabled')}</div>}
         <div className="node-picker">
           {nodes.map((node) => (
             <label key={node.id}>

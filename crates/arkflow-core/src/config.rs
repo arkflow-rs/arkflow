@@ -203,6 +203,20 @@ pub struct ControlApiConfig {
     /// Explicit browser origins allowed to call the control API. Empty denies cross-origin calls.
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    /// Require a second principal's approval before any configuration
+    /// rollout is created (see the `configuration-approval` capability).
+    /// Disabled by default: enabling it gates every rollout creation route
+    /// on an approval request decided by a different principal.
+    #[serde(default)]
+    pub approval_required: bool,
+    /// How long a pending configuration approval request stays decidable
+    /// before it expires (milliseconds). Default 24 hours.
+    #[serde(default = "default_approval_ttl_ms")]
+    pub approval_ttl_ms: u64,
+}
+
+pub fn default_approval_ttl_ms() -> u64 {
+    86_400_000
 }
 
 /// Compute-node Agent mode configuration.
@@ -452,6 +466,8 @@ impl Default for ControlApiConfig {
             api_token: None,
             insecure_local: false,
             cors_origins: Vec::new(),
+            approval_required: false,
+            approval_ttl_ms: default_approval_ttl_ms(),
         }
     }
 }
@@ -697,6 +713,8 @@ mod tests {
                 api_token: Some("test-token".to_string()),
                 insecure_local: false,
                 cors_origins: Vec::new(),
+                approval_required: false,
+                approval_ttl_ms: default_approval_ttl_ms(),
             },
             agent: AgentConfig::default(),
             data_plane: DataPlaneConfig::default(),

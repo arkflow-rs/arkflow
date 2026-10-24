@@ -27,6 +27,7 @@ pub(super) async fn hub_status(State(hub): State<hub::Hub>, _headers: HeaderMap)
         streams_total: nodes.iter().map(|node| node.streams_total).sum(),
         streams_running: nodes.iter().map(|node| node.streams_running).sum(),
         streams_failed: nodes.iter().map(|node| node.streams_failed).sum(),
+        approval_required: hub.approval_required(),
     })
     .into_response()
 }

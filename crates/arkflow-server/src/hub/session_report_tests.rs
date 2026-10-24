@@ -21,6 +21,8 @@ fn config() -> HubConfig {
         lease_ttl_ms: 1000,
         poll_interval_ms: 1000,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     }
 }
 
@@ -128,6 +130,8 @@ async fn new_session_resets_the_report_cursor() {
 fn short_session_config() -> HubConfig {
     HubConfig {
         session_ttl_ms: 80,
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         ..config()
     }
 }

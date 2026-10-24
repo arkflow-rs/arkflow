@@ -50,6 +50,8 @@ async fn agent_resource_gauges_reach_the_hub_metrics_export() {
         lease_ttl_ms: 30_000,
         poll_interval_ms: 20,
         session_ttl_ms: arkflow_server::hub::default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: arkflow_server::hub::default_approval_ttl_ms(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

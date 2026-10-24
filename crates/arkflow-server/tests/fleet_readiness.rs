@@ -217,6 +217,8 @@ fn hub_config(session_ttl_ms: u64) -> HubConfig {
         lease_ttl_ms: AGENT_HEARTBEAT_MS * 10,
         poll_interval_ms: HUB_POLL_INTERVAL_MS,
         session_ttl_ms,
+        approval_required: false,
+        approval_ttl_ms: arkflow_server::hub::default_approval_ttl_ms(),
     }
 }
 

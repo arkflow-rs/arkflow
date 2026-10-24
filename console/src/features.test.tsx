@@ -12,6 +12,7 @@ import { Jobs } from './features/jobs'
 import { JobEditor } from './features/job-editor'
 import type { Job, JobCheckpoint } from './api'
 import { Rollouts } from './features/rollouts'
+import { Approvals } from './features/approvals'
 
 afterEach(() => cleanup())
 
@@ -997,5 +998,72 @@ describe('job editor determinism', () => {
       expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/jobs/validate')).length).toBe(1),
     )
     expect(view.getByRole('button', { name: 'Create stopped' })).toBeDisabled()
+  })
+})
+
+describe('configuration approvals', () => {
+  const pendingRequest = {
+    request_id: 'approval-1',
+    config_version_id: 'cfg-1',
+    targets: ['node-a'],
+    batch_size: 1,
+    requester_id: 'alice',
+    status: 'pending' as const,
+    correlation_id: 'approval-1-c',
+    expires_at_ms: 9_999_999_999_999,
+    created_at_ms: 1,
+    updated_at_ms: 1,
+  }
+  const rejectedRequest = {
+    ...pendingRequest,
+    request_id: 'approval-2',
+    status: 'rejected' as const,
+    approver_id: 'bob',
+  }
+
+  it('renders pending requests and decides them through the queue', async () => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/decide') && init?.method === 'POST')
+        return Promise.resolve({ ok: true, json: async () => ({ ...pendingRequest, status: 'approved' }) })
+      if (url.includes('/config-approvals?status=pending'))
+        return Promise.resolve({ ok: true, json: async () => [pendingRequest] })
+      if (url.endsWith('/config-approvals'))
+        return Promise.resolve({ ok: true, json: async () => [pendingRequest, rejectedRequest] })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderWithQueries(<Approvals onError={() => {}} />)
+    expect(await screen.findByText('approval-1')).toBeTruthy()
+    fireEvent.click(await screen.findByText('Approve'))
+    await waitFor(() => {
+      const decide = fetchMock.mock.calls.find(([url, init]) => url.endsWith('/decide') && init?.method === 'POST')
+      expect(decide).toBeTruthy()
+      expect(String(decide![1]!.body)).toContain('"decision":"approve"')
+    })
+    vi.unstubAllGlobals()
+  })
+
+  it('resubmits a rejected request with its pinned snapshot', async () => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith('/config-approvals') && init?.method === 'POST')
+        return Promise.resolve({ ok: true, json: async () => pendingRequest })
+      if (url.includes('/config-approvals?status=pending'))
+        return Promise.resolve({ ok: true, json: async () => [] })
+      if (url.endsWith('/config-approvals'))
+        return Promise.resolve({ ok: true, json: async () => [rejectedRequest] })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderWithQueries(<Approvals onError={() => {}} />)
+    // Switch to the full list to see the rejected request.
+    fireEvent.click(await screen.findByText('All'))
+    expect(await screen.findByText('approval-2')).toBeTruthy()
+    fireEvent.click(await screen.findByText('Resubmit'))
+    await waitFor(() => {
+      const submit = fetchMock.mock.calls.find(([url, init]) => url.endsWith('/config-approvals') && init?.method === 'POST')
+      expect(submit).toBeTruthy()
+      expect(String(submit![1]!.body)).toContain('"config_version":"cfg-1"')
+    })
+    vi.unstubAllGlobals()
   })
 })

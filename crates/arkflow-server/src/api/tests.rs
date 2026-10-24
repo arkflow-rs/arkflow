@@ -86,6 +86,8 @@ async fn hub_component_catalogue_exposes_registered_job_components() {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         }),
         &ServerConfig::default(),
     );
@@ -325,6 +327,8 @@ async fn ha_enabled_without_storage_fails_before_binding() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     })
     .with_ha(hub::HubHaConfig {
         enabled: true,
@@ -354,6 +358,8 @@ async fn hub_startup_policy_covers_local_external_storage_and_credentials() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let local = ServerConfig {
         address: "127.0.0.1:8080".into(),
@@ -381,6 +387,8 @@ async fn hub_startup_policy_covers_local_external_storage_and_credentials() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     assert!(secure
         .validate_hub_startup(&credentialed_without_storage)
@@ -400,6 +408,8 @@ async fn hub_startup_policy_covers_local_external_storage_and_credentials() {
             lease_ttl_ms: 1_000,
             poll_interval_ms: 10,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage::StorageActor::start(store.clone(), 8),
     );
@@ -417,10 +427,103 @@ async fn hub_startup_policy_covers_local_external_storage_and_credentials() {
             lease_ttl_ms: 1_000,
             poll_interval_ms: 10,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage::StorageActor::start(store, 8),
     );
     assert!(secure.validate_hub_startup(&valid_hub).is_ok());
+}
+
+/// The approval gate fails closed without durable storage: approval
+/// requests and their decisions live in storage, so a volatile Hub cannot
+/// enforce the policy and must refuse to start with it enabled.
+#[tokio::test]
+async fn approval_policy_requires_durable_storage() {
+    let insecure = ServerConfig {
+        insecure_local: true,
+        ..ServerConfig::default()
+    };
+    let volatile = hub::Hub::new(hub::HubConfig {
+        operator_token: Some("root|admin|admin-secret".into()),
+        node_token: Some("node-secret".into()),
+        insecure_local: true,
+        lease_ttl_ms: 1_000,
+        poll_interval_ms: 10,
+        session_ttl_ms: default_session_ttl_ms(),
+        approval_required: true,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
+    });
+    let mut gated = insecure.clone();
+    gated.approval_required = true;
+    let error = gated
+        .validate_hub_startup(&volatile)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("durable"), "{error}");
+    assert!(error.contains("approval_required"), "{error}");
+    // With storage the same startup passes (the identity warning may fire
+    // but never blocks).
+    let temp = tempfile::tempdir().unwrap();
+    let store_path = temp.path().join("hub.sqlite");
+    let store = storage::ControlPlaneStore::open(store_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let stored = hub::Hub::with_storage(
+        hub::HubConfig {
+            operator_token: Some("root|admin|admin-secret".into()),
+            node_token: Some("node-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 1_000,
+            poll_interval_ms: 10,
+            session_ttl_ms: default_session_ttl_ms(),
+            approval_required: true,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
+        },
+        storage::StorageActor::start(store, 8),
+    );
+    let secure = ServerConfig {
+        approval_required: true,
+        address: "127.0.0.1:0".into(),
+        ..ServerConfig::default()
+    };
+    assert!(secure.validate_hub_startup(&stored).is_ok());
+}
+
+/// The approval gate's startup warning shape: enabling `approval_required`
+/// with a single static operator identity is survivable (the warning fires,
+/// startup proceeds — OIDC identities only appear at runtime), while the
+/// identity counter itself distinguishes structured credentials, plain
+/// tokens, and absent credentials.
+#[test]
+fn approval_identity_counting_covers_credential_shapes() {
+    let base = |token: Option<&str>| hub::HubConfig {
+        operator_token: token.map(str::to_owned),
+        node_token: Some("node".into()),
+        insecure_local: true,
+        lease_ttl_ms: 1_000,
+        poll_interval_ms: 10,
+        session_ttl_ms: default_session_ttl_ms(),
+        approval_required: true,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
+    };
+    // No static credentials: zero identities.
+    assert_eq!(hub::Hub::new(base(None)).static_operator_identity_count(), 0);
+    // Plain static token: the single legacy `operator` identity.
+    assert_eq!(
+        hub::Hub::new(base(Some("plain-token"))).static_operator_identity_count(),
+        1
+    );
+    // Structured credential: exactly one identity.
+    assert_eq!(
+        hub::Hub::new(base(Some("alice|admin|secret"))).static_operator_identity_count(),
+        1
+    );
+    // Malformed structured credential: zero usable identities.
+    assert_eq!(
+        hub::Hub::new(base(Some("alice|typo|secret"))).static_operator_identity_count(),
+        0
+    );
 }
 
 /// Standalone startup guard: non-loopback without a token refuses startup
@@ -940,6 +1043,8 @@ async fn hub_http_contract_registers_and_routes_a_targeted_command() {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let app = hub_router(hub, &ServerConfig::default());
     let response = app
@@ -1001,6 +1106,8 @@ async fn hub_routes_distinguish_viewer_from_operator_actions() {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let app = hub_router(hub, &ServerConfig::default());
     let response = app
@@ -1045,6 +1152,8 @@ async fn job_workbench_routes_validate_create_detail_and_versions() {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let app = hub_router(hub, &ServerConfig::default());
     let spec = serde_json::json!({
@@ -1126,6 +1235,8 @@ async fn job_action_route_leaves_an_audit_trail() {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage::StorageActor::start(store, 8),
     );
@@ -1246,6 +1357,8 @@ async fn denied_mutation_is_visible_in_audit_history() {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage::StorageActor::start(store, 8),
     );
@@ -1301,6 +1414,8 @@ async fn sse_replays_durable_events_by_last_event_id() {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage::StorageActor::start(store, 8),
     );
@@ -1337,6 +1452,8 @@ async fn desired_state_route_persists_offline_intent_and_rejects_stale_generatio
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage::StorageActor::start(store, 8),
     );
@@ -1549,6 +1666,8 @@ async fn configuration_apply_persists_target_and_reconciles_offline_write() {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage.clone(),
     );
@@ -1665,6 +1784,8 @@ async fn node_level_rollback_returns_a_single_node_rollout() {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage,
     );
@@ -1707,6 +1828,8 @@ async fn operation_resource_exposes_retry_superseded_and_blocked_states() {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage.clone(),
     );
@@ -1828,6 +1951,8 @@ async fn hub_end_to_end_two_nodes_aggregate_target_reconnect_and_drain() {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let app = hub_router(hub.clone(), &ServerConfig::default());
 
@@ -2184,6 +2309,8 @@ async fn hub_tls_listener_serves_readiness_over_https() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let config = ServerConfig {
         address: format!("127.0.0.1:{port}"),
@@ -2234,6 +2361,8 @@ async fn half_configured_hub_tls_fails_startup() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let config = ServerConfig {
         address: "127.0.0.1:0".into(),
@@ -2260,10 +2389,12 @@ fn console_hub() -> hub::Hub {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     })
 }
 
-async fn post_json(
+pub(super) async fn post_json(
     app: &Router,
     path: &str,
     bearer: &str,
@@ -2283,7 +2414,7 @@ async fn post_json(
     read_json(response).await
 }
 
-async fn get_json(app: &Router, path: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
+pub(super) async fn get_json(app: &Router, path: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
         .oneshot(
@@ -2297,7 +2428,7 @@ async fn get_json(app: &Router, path: &str, bearer: &str) -> (StatusCode, serde_
     read_json(response).await
 }
 
-async fn read_json(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+pub(super) async fn read_json(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
     let status = response.status();
     let content_type = response
         .headers()
@@ -2571,6 +2702,8 @@ async fn job_detail_reports_scoped_metrics_and_observed_tasks() {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let app = hub_router(hub, &ServerConfig::default());
     let spec = serde_json::json!({
@@ -2664,6 +2797,8 @@ fn storage_hub_config() -> hub::HubConfig {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     }
 }
 
@@ -2680,6 +2815,8 @@ fn scoped_operator_hub_config() -> hub::HubConfig {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     }
 }
 
@@ -2712,7 +2849,7 @@ async fn put_json(
 }
 
 /// Body-less request (DELETE, POST without payload) returning status+JSON.
-async fn request_without_body(
+pub(super) async fn request_without_body(
     app: &Router,
     method: &str,
     path: &str,
@@ -2825,6 +2962,8 @@ fn server_config_from_engine_maps_health_settings_and_rejects_bad_addresses() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let bad = ServerConfig {
         address: "not-a-socket-address".into(),
@@ -3045,6 +3184,8 @@ async fn hub_tls_startup_rejects_unreadable_and_empty_material() {
             lease_ttl_ms: 1_000,
             poll_interval_ms: 10,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         })
     };
     let base = || ServerConfig {
@@ -4707,6 +4848,8 @@ async fn hub_health_and_readiness_report_leadership_and_recovery() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     })
     .with_ha(hub::HubHaConfig {
         enabled: true,
@@ -5206,6 +5349,8 @@ async fn oidc_login_hub() -> hub::Hub {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     })
     .with_oidc(federation)
 }
@@ -5855,6 +6000,8 @@ async fn serve_hub_with_storage_restores_operations_and_shuts_down_cleanly() {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 10_000,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage::StorageActor::start(storage::ControlPlaneStore::in_memory().unwrap(), 8),
     );
@@ -5904,6 +6051,8 @@ async fn serve_hub_over_tls_releases_leadership_on_shutdown() {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 10_000,
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         },
         storage::StorageActor::start(storage::ControlPlaneStore::in_memory().unwrap(), 8),
     );
@@ -6216,6 +6365,8 @@ async fn no_storage_hub_reports_enqueue_and_orchestration_limits() {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let app = hub_router(hub.clone(), &ServerConfig::default());
     // Register an online node WITHOUT the lifecycle/configuration
@@ -7143,6 +7294,8 @@ async fn oidc_secure_login_and_callback_failure_modes() {
         lease_ttl_ms: 10_000,
         poll_interval_ms: 100,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     })
     .with_oidc(federation);
     let app = hub_router(hub, &ServerConfig::default());

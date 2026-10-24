@@ -182,6 +182,8 @@ async fn serve_from_config_starts_and_stops_on_cancellation() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 100,
         session_ttl_ms: 3_600_000,
+        approval_required: false,
+        approval_ttl_ms: arkflow_server::hub::default_approval_ttl_ms(),
     };
     let config = ServerConfig {
         address: "127.0.0.1:0".into(),

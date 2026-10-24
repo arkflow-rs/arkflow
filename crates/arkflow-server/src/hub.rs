@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, RwLock};
 
+mod approval;
 mod checkpoint;
 mod command_metrics;
 mod error;
@@ -32,6 +33,8 @@ mod rollout;
 mod secret_dispatch;
 mod wire;
 
+#[cfg(test)]
+mod approval_tests;
 #[cfg(test)]
 mod job_orchestration_tests;
 #[cfg(test)]
@@ -73,10 +76,22 @@ pub struct HubConfig {
     /// never renewed: after expiry every agent request is rejected and the
     /// Agent transparently re-registers through its normal reconnect loop.
     pub session_ttl_ms: u64,
+    /// Require a second principal's approval before any configuration
+    /// rollout is created (the `configuration-approval` capability). While
+    /// enabled, rollout creation routes reject direct creation and approvals
+    /// are the only path to a new rollout.
+    pub approval_required: bool,
+    /// How long a pending configuration approval request stays decidable
+    /// before it expires (milliseconds).
+    pub approval_ttl_ms: u64,
 }
 
 pub fn default_session_ttl_ms() -> u64 {
     3_600_000
+}
+
+pub fn default_approval_ttl_ms() -> u64 {
+    arkflow_core::config::default_approval_ttl_ms()
 }
 
 #[derive(Debug, Clone)]
@@ -322,5 +337,44 @@ impl Hub {
     /// Seconds this Hub process has been serving.
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// Distinct static operator identities this Hub can authenticate
+    /// (structured credentials only; a plain static token is the single
+    /// legacy `operator` identity, and OIDC users are runtime-resolved so
+    /// they cannot be counted at startup).
+    pub fn static_operator_identity_count(&self) -> usize {
+        match self.config.operator_token.as_deref() {
+            Some(token) if !token.trim().is_empty() => {
+                if token.contains('|') {
+                    match parse_operator_credential(token) {
+                        Some(_) => 1,
+                        // Malformed structured credential: zero usable
+                        // identities (startup validation reports it).
+                        None => 0,
+                    }
+                } else {
+                    1
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Whether rollout creation is gated on approval requests (see
+    /// `configuration-approval`).
+    pub fn approval_required(&self) -> bool {
+        self.config.approval_required
+    }
+
+    /// Whether an OIDC federation is configured (runtime-resolved operator
+    /// identities exist beyond the static credentials).
+    pub fn oidc_is_configured(&self) -> bool {
+        self.oidc.is_some()
+    }
+
+    /// TTL applied to new approval requests (milliseconds).
+    pub fn approval_ttl_ms(&self) -> u64 {
+        self.config.approval_ttl_ms
     }
 }
