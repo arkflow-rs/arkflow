@@ -194,6 +194,19 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 | `GET` | `/rollouts/{id}` | 灰度发布状态与各节点进度。 |
 | `POST` | `/rollouts/{id}/actions` | 灰度发布操作:暂停、恢复、取消、回滚。 |
 
+当 Hub 启用 `control_api.approval_required` 后,创建类路由(`POST /rollouts`
+与节点级 apply/rollback 路由)会以 `approval_required` 错误拒绝直接创建,
+发布改走审批请求:
+
+| 方法 | 路由 | 用途 |
+|--------|-------|---------|
+| `GET`/`POST` | `/config-approvals` | 列出审批请求(`?status=pending\|approving\|approved\|rejected\|expired`)/ 提交一个钉住版本、目标节点与批大小的请求。 |
+| `GET` | `/config-approvals/{id}` | 单个审批请求及其钉住的快照。 |
+| `POST` | `/config-approvals/{id}/decide` | 批准或拒绝(`{"decision":"approve"\|"reject","note":"..."}`)。需要 `ApproveRollouts` 权限(仅 admin 角色),且审批人必须不同于提交人。 |
+
+批准后由系统创建 rollout 并以审批人作为 actor;回滚只有在目标版本
+曾应用到受影响节点时才豁免审批。
+
 这些路由背后的状态机参见[对账式灰度发布与恢复](/zh-Hans/docs/operate/control-plane/reconciliation)。
 
 ### 发现与指标

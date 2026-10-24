@@ -7,6 +7,9 @@
 //! `arkflow_core::control_plane::ControlPlane` and contains no Axum types.
 
 mod agent_endpoints;
+#[cfg(test)]
+mod approval_api_tests;
+mod config_approvals;
 mod configuration;
 mod diagnostics;
 mod events;
@@ -15,6 +18,7 @@ mod nodes;
 mod operations;
 mod rollouts;
 mod streams;
+
 #[cfg(test)]
 mod tests;
 
@@ -28,6 +32,7 @@ use agent_endpoints::{
     agent_command_result, agent_commands, agent_heartbeat, agent_job_observation, agent_register,
     agent_report,
 };
+use config_approvals::{decide_approval, get_approval, list_approvals, submit_approval};
 use configuration::{
     apply_configuration, configuration, configuration_diff, configuration_draft,
     configuration_versions, hub_apply_configuration, hub_configuration, hub_configuration_diff,
@@ -133,6 +138,13 @@ pub struct ServerConfig {
     pub poll_interval_ms: u64,
     #[serde(default = "default_session_ttl_ms")]
     pub session_ttl_ms: u64,
+    /// Require a second principal's approval before any configuration
+    /// rollout is created. Default disabled; see `configuration-approval`.
+    #[serde(default)]
+    pub approval_required: bool,
+    /// How long a pending approval request stays decidable (milliseconds).
+    #[serde(default = "default_approval_ttl_ms")]
+    pub approval_ttl_ms: u64,
     #[serde(default)]
     pub observability: arkflow_core::config::ObservabilityConfig,
 }
@@ -160,6 +172,8 @@ impl ServerConfig {
             lease_ttl_ms: agent.agent_lease_ttl_ms,
             poll_interval_ms: default_poll_interval_ms(),
             session_ttl_ms: agent.agent_session_ttl_ms,
+            approval_required: control_api.approval_required,
+            approval_ttl_ms: control_api.approval_ttl_ms,
             observability: config.node.observability.clone(),
         }
     }
@@ -200,6 +214,25 @@ impl ServerConfig {
                 ));
             }
         }
+        // The approval gate needs durable state: approval requests and the
+        // decisions that adopt rollouts live in storage, and a volatile Hub
+        // would route node configuration through agent commands without any
+        // gate. Refuse the combination instead of silently not enforcing.
+        if self.approval_required && !hub.has_storage() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "approval_required needs durable Hub storage; set ARKFLOW_HUB_STORAGE \
+                 (a volatile insecure_local Hub cannot enforce the approval policy)",
+            ));
+        }
+        if self.approval_required
+            && !hub.oidc_is_configured()
+            && hub.static_operator_identity_count() < 2
+        {
+            tracing::warn!(
+                "approval_required is enabled but fewer than two distinct operator                  identities are statically configured; a single principal cannot                  approve its own submission, so configuration rollouts will be                  blocked until a second operator identity (structured credential                  or OIDC) can decide approval requests"
+            );
+        }
         Ok(address)
     }
 }
@@ -222,6 +255,8 @@ impl Default for ServerConfig {
             lease_ttl_ms: default_lease_ttl_ms(),
             poll_interval_ms: default_poll_interval_ms(),
             session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: default_approval_ttl_ms(),
             observability: arkflow_core::config::ObservabilityConfig::default(),
         }
     }
@@ -296,6 +331,10 @@ fn default_poll_interval_ms() -> u64 {
 }
 fn default_session_ttl_ms() -> u64 {
     hub::default_session_ttl_ms()
+}
+
+fn default_approval_ttl_ms() -> u64 {
+    arkflow_core::config::default_approval_ttl_ms()
 }
 
 #[derive(Debug, Deserialize)]
@@ -661,6 +700,12 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/rollouts", get(hub_rollouts).post(create_rollout))
         .route("/rollouts/{id}", get(hub_rollout))
         .route("/rollouts/{id}/actions", post(rollout_action))
+        .route(
+            "/config-approvals",
+            get(list_approvals).post(submit_approval),
+        )
+        .route("/config-approvals/{id}", get(get_approval))
+        .route("/config-approvals/{id}/decide", post(decide_approval))
         .route("/operations/status", get(hub_operational_status))
         .route("/nodes/{node_id}/drain", post(hub_drain_node))
         .route(
@@ -1052,6 +1097,10 @@ pub async fn serve_hub(
                     sweep_logged(
                         "prune_job_upgrade_history",
                         maintenance_hub.prune_job_upgrade_history().await,
+                    );
+                    sweep_logged(
+                        "sweep_config_approvals",
+                        maintenance_hub.sweep_config_approvals().await,
                     );
                 }
                 _ = maintenance_cancel.cancelled() => break,

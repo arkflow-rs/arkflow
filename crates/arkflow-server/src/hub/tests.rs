@@ -1296,6 +1296,8 @@ fn config() -> HubConfig {
         lease_ttl_ms: 1000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     }
 }
 
@@ -1308,6 +1310,8 @@ async fn secure_hub_fails_closed_for_missing_credentials_without_mutation() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     assert!(!hub.operator_authorized(None).await);
     let result = hub

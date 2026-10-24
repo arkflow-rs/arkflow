@@ -49,6 +49,36 @@ When the node returns online, registration/report events resume reconciliation
 for the current generation. Operators who want Streams to remain stopped must
 write an explicit stopped desired state.
 
+## Configuration approval gate
+
+Setting `control_api.approval_required: true` (with `approval_ttl_ms`,
+default 24h) requires a second principal's approval before any configuration
+rollout is created. Every creation path is gated — the batch creation route,
+node-level apply, and rollback — and direct creation is rejected with an
+explicit `approval_required` error pointing at the approval flow:
+
+1. An operator submits `POST /config-approvals` pinning the configuration
+   version, target nodes, and batch size. The submission validates the
+   version and nodes but creates nothing.
+2. A different principal (admin role — the `ApproveRollouts` action is not
+   granted to the operator role) approves or rejects the request.
+3. Approval creates the rollout with the approver as the recorded actor. A
+   crash between the rollout creation and the approval marking is recovered
+   by adoption: at most one rollout ever exists per request.
+
+Rollback is exempt only when its target version was previously applied to
+the affected nodes: rolling back to a version that was never applied is new
+content riding the rollback path and is rejected.
+
+Two operational requirements follow from the design. A single static
+operator credential resolves to one principal identity, so it **cannot
+approve its own submission** — enabling the policy on a one-identity
+deployment freezes publishing (the Hub logs a startup warning when it
+detects this). Plan for at least two operator identities (structured
+credentials or OIDC) before enabling the gate. Rejected and expired requests
+are terminal; republishing submits a new request, which the console can
+pre-fill from the rejected one.
+
 ## Rollback
 
 Rollback is a new configuration Intent and generation. It does not delete the

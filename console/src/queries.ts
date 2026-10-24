@@ -100,6 +100,14 @@ export function useRollouts() {
   return useQuery({ queryKey: ['live', 'rollouts'], queryFn: () => api.rollouts(), ...live })
 }
 
+export function useConfigApprovals(status?: string) {
+  return useQuery({
+    queryKey: ['live', 'config-approvals', status ?? null],
+    queryFn: () => api.configApprovals(status),
+    ...live,
+  })
+}
+
 export function useRolloutDetail(rolloutId: string | undefined) {
   return useQuery({
     queryKey: ['live', 'rollout-detail', rolloutId ?? null],

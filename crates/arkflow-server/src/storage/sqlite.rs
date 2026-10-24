@@ -19,6 +19,40 @@ pub struct SqliteBackend {
     connection: Arc<Mutex<Connection>>,
 }
 
+fn config_approval_from_row(row: &Row<'_>) -> rusqlite::Result<ConfigApprovalRequest> {
+    let targets_json: String = row.get(2)?;
+    let targets = serde_json::from_str(&targets_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let raw_status: String = row.get(5)?;
+    let status = ConfigApprovalStatus::parse(&raw_status).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown approval status: {raw_status}"),
+            )),
+        )
+    })?;
+    Ok(ConfigApprovalRequest {
+        request_id: row.get(0)?,
+        config_version_id: row.get(1)?,
+        targets,
+        batch_size: row.get(3)?,
+        requester_id: row.get(4)?,
+        status,
+        approver_id: row.get(6)?,
+        decided_at_ms: row.get(7)?,
+        rollout_id: row.get(8)?,
+        correlation_id: row.get(9)?,
+        expires_at_ms: row.get(10)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+        failure_note: row.get(13)?,
+    })
+}
+
 fn job_upgrade_from_row(row: &Row<'_>) -> rusqlite::Result<JobUpgradeRecord> {
     Ok(JobUpgradeRecord {
         upgrade_id: row.get(0)?,
@@ -1431,6 +1465,198 @@ impl SqliteBackend {
         })
     }
 
+    pub fn create_config_approval_request(
+        &self,
+        request: ConfigApprovalRequest,
+    ) -> Result<(), StorageError> {
+        let targets = serde_json::to_string(&request.targets)
+            .map_err(|error| StorageError::Encoding(error.to_string()))?;
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO cp_config_approval_requests (request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    request.request_id,
+                    request.config_version_id,
+                    targets,
+                    request.batch_size,
+                    request.requester_id,
+                    request.status.as_str(),
+                    request.approver_id,
+                    request.decided_at_ms,
+                    request.rollout_id,
+                    request.correlation_id,
+                    request.expires_at_ms,
+                    request.created_at_ms,
+                    request.updated_at_ms,
+                    request.failure_note,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_config_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ConfigApprovalRequest>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note FROM cp_config_approval_requests WHERE request_id = ?1",
+                    [request_id],
+                    config_approval_from_row,
+                )
+                .optional()
+        })
+    }
+
+    pub fn list_config_approval_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ConfigApprovalRequest>, StorageError> {
+        self.with_connection(|connection| match status {
+            Some(status) => {
+                let mut statement = connection.prepare(
+                    "SELECT request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note FROM cp_config_approval_requests WHERE status = ?1 ORDER BY created_at_ms DESC, request_id DESC LIMIT 1024",
+                )?;
+                let rows = statement.query_map([status], config_approval_from_row)?;
+                rows.collect()
+            }
+            None => {
+                let mut statement = connection.prepare(
+                    "SELECT request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note FROM cp_config_approval_requests ORDER BY created_at_ms DESC, request_id DESC LIMIT 1024",
+                )?;
+                let rows = statement.query_map([], config_approval_from_row)?;
+                rows.collect()
+            }
+        })
+    }
+
+    pub fn begin_decide_config_approval_request(
+        &self,
+        request_id: &str,
+        status: &str,
+        approver_id: &str,
+        decided_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let updated = transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = ?2, approver_id = ?3, decided_at_ms = ?4, updated_at_ms = ?5 WHERE request_id = ?1 AND status = 'pending'",
+                rusqlite::params![request_id, status, approver_id, decided_at_ms, updated_at_ms],
+            )?;
+            Ok(updated == 1)
+        })
+    }
+
+    pub fn complete_config_approval_request(
+        &self,
+        request_id: &str,
+        rollout_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let updated = transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'approved', rollout_id = ?2, updated_at_ms = ?3 WHERE request_id = ?1 AND status = 'approving'",
+                rusqlite::params![request_id, rollout_id, updated_at_ms],
+            )?;
+            Ok(updated == 1)
+        })
+    }
+
+    pub fn reset_config_approval_request(
+        &self,
+        request_id: &str,
+        failure_note: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let updated = transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'pending', failure_note = ?2, updated_at_ms = ?3 WHERE request_id = ?1 AND status = 'approving'",
+                rusqlite::params![request_id, failure_note, updated_at_ms],
+            )?;
+            Ok(updated == 1)
+        })
+    }
+
+    pub fn find_rollout_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RolloutRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms FROM cp_rollouts WHERE correlation_id = ?1 ORDER BY created_at_ms LIMIT 1",
+                    [correlation_id],
+                    |row| {
+                        Ok(RolloutRecord {
+                            rollout_id: row.get(0)?,
+                            config_version_id: row.get(1)?,
+                            state: row.get(2)?,
+                            batch_size: row.get(3)?,
+                            current_batch: row.get(4)?,
+                            total_targets: row.get(5)?,
+                            actor: row.get(6)?,
+                            correlation_id: row.get(7)?,
+                            created_at_ms: row.get(8)?,
+                            updated_at_ms: row.get(9)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+    }
+
+    pub fn sweep_config_approval_requests(
+        &self,
+        now_ms: u64,
+        terminal_older_than_ms: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError> {
+        let cutoff_ms = now_ms.saturating_sub(terminal_older_than_ms);
+        // An approving row without a rollout is only reset once it stopped
+        // changing for a full maintenance tick, so a sweep never races an
+        // approval that is still creating its rollout.
+        let stalled_before_ms = now_ms.saturating_sub(APPROVING_STALL_MS);
+        self.immediate_transaction(|transaction| {
+            let mut written = 0usize;
+            written += transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'expired', updated_at_ms = ?2 WHERE status = 'pending' AND expires_at_ms <= ?1",
+                rusqlite::params![now_ms, now_ms],
+            )?;
+            // Adoption: a rollout already carries the request's correlation id,
+            // so the approval created it and only the marking was lost.
+            written += transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'approved', rollout_id = (SELECT rollout_id FROM cp_rollouts WHERE correlation_id = cp_config_approval_requests.correlation_id ORDER BY created_at_ms LIMIT 1), updated_at_ms = ?1 WHERE status = 'approving' AND EXISTS (SELECT 1 FROM cp_rollouts WHERE correlation_id = cp_config_approval_requests.correlation_id)",
+                rusqlite::params![now_ms],
+            )?;
+            written += transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'pending', failure_note = COALESCE(failure_note, 'approval did not complete; retry the decision'), updated_at_ms = ?1 WHERE status = 'approving' AND updated_at_ms <= ?2 AND NOT EXISTS (SELECT 1 FROM cp_rollouts WHERE correlation_id = cp_config_approval_requests.correlation_id)",
+                rusqlite::params![now_ms, stalled_before_ms],
+            )?;
+            written += transaction.execute(
+                "DELETE FROM cp_config_approval_requests WHERE status IN ('approved', 'rejected', 'expired') AND updated_at_ms < ?1",
+                rusqlite::params![cutoff_ms],
+            )?;
+            written += transaction.execute(
+                "DELETE FROM cp_config_approval_requests WHERE status IN ('approved', 'rejected', 'expired') AND request_id NOT IN (SELECT request_id FROM cp_config_approval_requests WHERE status IN ('approved', 'rejected', 'expired') ORDER BY updated_at_ms DESC, request_id DESC LIMIT ?1)",
+                rusqlite::params![max_retained],
+            )?;
+            Ok(written)
+        })
+    }
+
+    pub fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError> {
+        self.with_connection(|connection| {
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM cp_config_approval_requests WHERE status = ?1",
+                [status],
+                |row| row.get(0),
+            )?;
+            Ok(count as usize)
+        })
+    }
+
     pub fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
         self.immediate_transaction(|transaction| {
             transaction.execute(
@@ -2357,6 +2583,26 @@ impl SqliteBackend {
                     REFERENCES cp_rollouts(rollout_id)
             );
 
+            CREATE TABLE IF NOT EXISTS cp_config_approval_requests (
+                request_id TEXT PRIMARY KEY,
+                config_version_id TEXT NOT NULL,
+                targets_json TEXT NOT NULL,
+                batch_size INTEGER NOT NULL,
+                requester_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                approver_id TEXT,
+                decided_at_ms INTEGER,
+                rollout_id TEXT,
+                correlation_id TEXT NOT NULL UNIQUE,
+                expires_at_ms INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                failure_note TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS cp_config_approval_status
+                ON cp_config_approval_requests(status, created_at_ms);
+
             CREATE TABLE IF NOT EXISTS cp_job_upgrades (
                 upgrade_id TEXT PRIMARY KEY,
                 job_id TEXT NOT NULL,
@@ -2734,6 +2980,73 @@ impl StorageBackend for SqliteBackend {
     }
     async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
         self.list_rollouts()
+    }
+    async fn create_config_approval_request(
+        &self,
+        request: ConfigApprovalRequest,
+    ) -> Result<(), StorageError> {
+        self.create_config_approval_request(request)
+    }
+    async fn get_config_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ConfigApprovalRequest>, StorageError> {
+        self.get_config_approval_request(request_id)
+    }
+    async fn list_config_approval_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ConfigApprovalRequest>, StorageError> {
+        self.list_config_approval_requests(status)
+    }
+    async fn begin_decide_config_approval_request(
+        &self,
+        request_id: &str,
+        status: &str,
+        approver_id: &str,
+        decided_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.begin_decide_config_approval_request(
+            request_id,
+            status,
+            approver_id,
+            decided_at_ms,
+            updated_at_ms,
+        )
+    }
+    async fn complete_config_approval_request(
+        &self,
+        request_id: &str,
+        rollout_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.complete_config_approval_request(request_id, rollout_id, updated_at_ms)
+    }
+    async fn reset_config_approval_request(
+        &self,
+        request_id: &str,
+        failure_note: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.reset_config_approval_request(request_id, failure_note, updated_at_ms)
+    }
+    async fn find_rollout_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RolloutRecord>, StorageError> {
+        self.find_rollout_by_correlation(correlation_id)
+    }
+    async fn sweep_config_approval_requests(
+        &self,
+        now_ms: u64,
+        terminal_older_than_ms: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError> {
+        self.sweep_config_approval_requests(now_ms, terminal_older_than_ms, max_retained)
+    }
+    async fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError> {
+        self.count_config_approval_requests(status)
     }
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
         self.upsert_job_upgrade(record)

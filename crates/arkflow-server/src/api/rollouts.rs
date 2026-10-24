@@ -24,6 +24,13 @@ pub(super) async fn create_rollout(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    if let Err(message) = hub.ensure_rollout_creation_allowed() {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "approval_required",
+            message,
+        );
+    }
     let actor = Some(principal.id);
     let correlation_id = headers
         .get("x-correlation-id")

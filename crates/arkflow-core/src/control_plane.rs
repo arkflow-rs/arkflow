@@ -186,6 +186,7 @@ impl ControlPlane {
                 .iter()
                 .filter(|stream| matches!(stream.state, crate::control::StreamState::Failed))
                 .count(),
+            approval_required: false,
         }
     }
 

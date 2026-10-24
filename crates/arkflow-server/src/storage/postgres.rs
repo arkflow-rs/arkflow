@@ -635,6 +635,26 @@ const PG_DDL: &str = r#"
                     REFERENCES cp_rollouts(rollout_id)
             );
 
+            CREATE TABLE IF NOT EXISTS cp_config_approval_requests (
+                request_id TEXT COLLATE "C" PRIMARY KEY,
+                config_version_id TEXT COLLATE "C" NOT NULL,
+                targets_json TEXT NOT NULL,
+                batch_size BIGINT NOT NULL,
+                requester_id TEXT COLLATE "C" NOT NULL,
+                status TEXT NOT NULL,
+                approver_id TEXT,
+                decided_at_ms BIGINT,
+                rollout_id TEXT COLLATE "C",
+                correlation_id TEXT COLLATE "C" NOT NULL UNIQUE,
+                expires_at_ms BIGINT NOT NULL,
+                created_at_ms BIGINT NOT NULL,
+                updated_at_ms BIGINT NOT NULL,
+                failure_note TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS cp_config_approval_status
+                ON cp_config_approval_requests(status, created_at_ms);
+
             CREATE TABLE IF NOT EXISTS cp_job_upgrades (
                 upgrade_id TEXT COLLATE "C" PRIMARY KEY,
                 job_id TEXT COLLATE "C" NOT NULL,

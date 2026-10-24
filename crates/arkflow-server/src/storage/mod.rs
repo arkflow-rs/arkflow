@@ -199,6 +199,75 @@ pub struct RolloutTargetRecord {
     pub updated_at_ms: u64,
 }
 
+/// A sweep never resets an `approving` request that changed within this
+/// window: the approval may still be creating its rollout.
+pub(crate) const APPROVING_STALL_MS: u64 = 60_000;
+
+/// Lifecycle of one configuration approval request. `Approving` is the
+/// crash-safe intermediate state between a decision to approve and the
+/// rollout it creates: a request in that state either adopts the rollout its
+/// correlation id already produced or returns to `Pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApprovalStatus {
+    Pending,
+    Approving,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+impl ConfigApprovalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approving => "approving",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "approving" => Some(Self::Approving),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Approved | Self::Rejected | Self::Expired)
+    }
+}
+
+/// An immutable publish snapshot awaiting a second principal's decision:
+/// `(config_version_id, targets, batch_size)` is fixed at submission; only
+/// the decision metadata changes afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigApprovalRequest {
+    pub request_id: String,
+    pub config_version_id: String,
+    pub targets: Vec<String>,
+    pub batch_size: u32,
+    pub requester_id: String,
+    pub status: ConfigApprovalStatus,
+    pub approver_id: Option<String>,
+    pub decided_at_ms: Option<u64>,
+    pub rollout_id: Option<String>,
+    /// Links the request to the rollout it creates, so a crash between
+    /// rollout creation and approval marking adopts that rollout instead of
+    /// creating a second one.
+    pub correlation_id: String,
+    pub expires_at_ms: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub failure_note: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedOperation {
     pub operation_id: String,
@@ -382,6 +451,8 @@ pub enum StorageError {
     IdempotencyKeyReused,
     #[error("unsupported backend operation: {0}")]
     Unsupported(&'static str),
+    #[error("storage encoding error: {0}")]
+    Encoding(String),
     #[error("stale leader: claimed epoch {claimed_epoch}, current lease epoch {current_epoch}")]
     StaleLeader {
         claimed_epoch: u64,
@@ -804,6 +875,43 @@ storage_ops! {
     },
     ("recover_rollouts", RecoverRollouts, recover_rollouts) fenced Vec<RolloutRecord> {},
     ("list_rollouts", ListRollouts, list_rollouts) plain Vec<RolloutRecord> {},
+    ("create_config_approval_request", CreateConfigApprovalRequest, create_config_approval_request) fenced () {
+        request: ConfigApprovalRequest as v,
+    },
+    ("get_config_approval_request", GetConfigApprovalRequest, get_config_approval_request) plain Option<ConfigApprovalRequest> {
+        request_id: String as s,
+    },
+    ("list_config_approval_requests", ListConfigApprovalRequests, list_config_approval_requests) plain Vec<ConfigApprovalRequest> {
+        status: Option<String> as q,
+    },
+    ("begin_decide_config_approval_request", BeginDecideConfigApprovalRequest, begin_decide_config_approval_request) fenced bool {
+        request_id: String as s,
+        status: String as s,
+        approver_id: String as s,
+        decided_at_ms: u64 as v,
+        updated_at_ms: u64 as v,
+    },
+    ("complete_config_approval_request", CompleteConfigApprovalRequest, complete_config_approval_request) fenced bool {
+        request_id: String as s,
+        rollout_id: String as s,
+        updated_at_ms: u64 as v,
+    },
+    ("reset_config_approval_request", ResetConfigApprovalRequest, reset_config_approval_request) fenced bool {
+        request_id: String as s,
+        failure_note: String as s,
+        updated_at_ms: u64 as v,
+    },
+    ("find_rollout_by_correlation", FindRolloutByCorrelation, find_rollout_by_correlation) plain Option<RolloutRecord> {
+        correlation_id: String as s,
+    },
+    ("sweep_config_approval_requests", SweepConfigApprovalRequests, sweep_config_approval_requests) fenced usize {
+        now_ms: u64 as v,
+        terminal_older_than_ms: u64 as v,
+        max_retained: usize as v,
+    },
+    ("count_config_approval_requests", CountConfigApprovalRequests, count_config_approval_requests) plain usize {
+        status: String as s,
+    },
     ("upsert_job_upgrade", UpsertJobUpgrade, upsert_job_upgrade) fenced () {
         record: JobUpgradeRecord as v,
     },
@@ -1083,6 +1191,60 @@ pub trait StorageBackend: Send + Sync + 'static {
     ) -> Result<Option<String>, StorageError>;
     async fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
     async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
+    async fn create_config_approval_request(
+        &self,
+        request: ConfigApprovalRequest,
+    ) -> Result<(), StorageError>;
+    async fn get_config_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ConfigApprovalRequest>, StorageError>;
+    async fn list_config_approval_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ConfigApprovalRequest>, StorageError>;
+    /// Optimistic CAS reserving the decision: applies only while the request
+    /// is still `pending`. Returns false on a lost race (decision already
+    /// taken or the request expired out of `pending`).
+    async fn begin_decide_config_approval_request(
+        &self,
+        request_id: &str,
+        status: &str,
+        approver_id: &str,
+        decided_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError>;
+    /// `approving` → `approved`, recording the rollout the approval created.
+    async fn complete_config_approval_request(
+        &self,
+        request_id: &str,
+        rollout_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError>;
+    /// `approving` → `pending` after a failed rollout creation; the request
+    /// stays retryable and the failure reason is recorded.
+    async fn reset_config_approval_request(
+        &self,
+        request_id: &str,
+        failure_note: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError>;
+    /// The rollout an approval already created for this correlation id, if
+    /// any — the adoption lookup that keeps a crash from creating two.
+    async fn find_rollout_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RolloutRecord>, StorageError>;
+    /// Expire overdue pending requests, resolve stuck `approving` rows, and
+    /// prune terminal requests under age/count bounds. Never removes
+    /// pending or approving rows. Returns the number of rows written.
+    async fn sweep_config_approval_requests(
+        &self,
+        now_ms: u64,
+        terminal_older_than_ms: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError>;
+    async fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError>;
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError>;
     /// Optimistically-concurrent mutation of an existing orchestration row:
     /// the mutable columns apply only while the row still holds
@@ -1704,6 +1866,182 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::list_rollouts(backend).await,
             Self::Postgres(backend) => StorageBackend::list_rollouts(backend).await,
+        }
+    }
+    async fn create_config_approval_request(
+        &self,
+        request: ConfigApprovalRequest,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::create_config_approval_request(backend, request).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::create_config_approval_request(backend, request).await
+            }
+        }
+    }
+    async fn get_config_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ConfigApprovalRequest>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::get_config_approval_request(backend, request_id).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::get_config_approval_request(backend, request_id).await
+            }
+        }
+    }
+    async fn list_config_approval_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ConfigApprovalRequest>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::list_config_approval_requests(backend, status).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::list_config_approval_requests(backend, status).await
+            }
+        }
+    }
+    async fn begin_decide_config_approval_request(
+        &self,
+        request_id: &str,
+        status: &str,
+        approver_id: &str,
+        decided_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::begin_decide_config_approval_request(
+                    backend,
+                    request_id,
+                    status,
+                    approver_id,
+                    decided_at_ms,
+                    updated_at_ms,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::begin_decide_config_approval_request(
+                    backend,
+                    request_id,
+                    status,
+                    approver_id,
+                    decided_at_ms,
+                    updated_at_ms,
+                )
+                .await
+            }
+        }
+    }
+    async fn complete_config_approval_request(
+        &self,
+        request_id: &str,
+        rollout_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::complete_config_approval_request(
+                    backend,
+                    request_id,
+                    rollout_id,
+                    updated_at_ms,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::complete_config_approval_request(
+                    backend,
+                    request_id,
+                    rollout_id,
+                    updated_at_ms,
+                )
+                .await
+            }
+        }
+    }
+    async fn reset_config_approval_request(
+        &self,
+        request_id: &str,
+        failure_note: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::reset_config_approval_request(
+                    backend,
+                    request_id,
+                    failure_note,
+                    updated_at_ms,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::reset_config_approval_request(
+                    backend,
+                    request_id,
+                    failure_note,
+                    updated_at_ms,
+                )
+                .await
+            }
+        }
+    }
+    async fn find_rollout_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RolloutRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::find_rollout_by_correlation(backend, correlation_id).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::find_rollout_by_correlation(backend, correlation_id).await
+            }
+        }
+    }
+    async fn sweep_config_approval_requests(
+        &self,
+        now_ms: u64,
+        terminal_older_than_ms: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::sweep_config_approval_requests(
+                    backend,
+                    now_ms,
+                    terminal_older_than_ms,
+                    max_retained,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::sweep_config_approval_requests(
+                    backend,
+                    now_ms,
+                    terminal_older_than_ms,
+                    max_retained,
+                )
+                .await
+            }
+        }
+    }
+    async fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::count_config_approval_requests(backend, status).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::count_config_approval_requests(backend, status).await
+            }
         }
     }
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
@@ -4082,6 +4420,303 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    fn approval_request(
+        request_id: &str,
+        correlation: &str,
+        expires_at_ms: u64,
+    ) -> ConfigApprovalRequest {
+        ConfigApprovalRequest {
+            request_id: request_id.into(),
+            config_version_id: "cfg-approve-1".into(),
+            targets: vec!["node-a".into(), "node-b".into()],
+            batch_size: 1,
+            requester_id: "alice".into(),
+            status: ConfigApprovalStatus::Pending,
+            approver_id: None,
+            decided_at_ms: None,
+            rollout_id: None,
+            correlation_id: correlation.into(),
+            expires_at_ms,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            failure_note: None,
+        }
+    }
+
+    /// The approval-request surface: creation round-trips, the decision CAS
+    /// serializes concurrent deciders, terminal requests cannot be decided
+    /// again, adoption finds the rollout a correlation produced, and the
+    /// sweep expires/punes without ever touching pending rows.
+    #[tokio::test]
+    async fn config_approval_lifecycle_cas_and_sweep() {
+        let store = ControlPlaneStore::contract("config_approval_lifecycle_cas_and_sweep").await;
+        store
+            .create_config_approval_request(approval_request("req-1", "corr-a", 1_000))
+            .await
+            .unwrap();
+
+        // Round-trip with JSON targets and status mapping.
+        let fetched = store
+            .get_config_approval_request("req-1")
+            .await
+            .unwrap()
+            .expect("request exists");
+        assert_eq!(
+            fetched.targets,
+            vec!["node-a".to_string(), "node-b".to_string()]
+        );
+        assert_eq!(fetched.status, ConfigApprovalStatus::Pending);
+        assert!(store
+            .get_config_approval_request("req-missing")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .list_config_approval_requests(Some("pending"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // CAS: the first decision wins, the second loses.
+        assert!(store
+            .begin_decide_config_approval_request("req-1", "approving", "bob", 20, 20)
+            .await
+            .unwrap());
+        assert!(!store
+            .begin_decide_config_approval_request("req-1", "approving", "carol", 21, 21)
+            .await
+            .unwrap());
+        assert!(!store
+            .begin_decide_config_approval_request("req-1", "rejected", "carol", 21, 21)
+            .await
+            .unwrap());
+
+        // Complete marks approved with the rollout id.
+        assert!(store
+            .complete_config_approval_request("req-1", "rollout-x", 22)
+            .await
+            .unwrap());
+        let approved = store
+            .get_config_approval_request("req-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved.status, ConfigApprovalStatus::Approved);
+        assert_eq!(approved.rollout_id.as_deref(), Some("rollout-x"));
+        // Terminal: no further transition applies.
+        assert!(!store
+            .begin_decide_config_approval_request("req-1", "rejected", "carol", 23, 23)
+            .await
+            .unwrap());
+        assert!(!store
+            .reset_config_approval_request("req-1", "note", 23)
+            .await
+            .unwrap());
+
+        // Adoption: a rollout carrying the correlation id is findable.
+        store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "rollout-adopt".into(),
+                    config_version_id: "cfg-adopt".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 1,
+                    actor: Some("bob".into()),
+                    correlation_id: Some("corr-adopt".into()),
+                    created_at_ms: 10,
+                    updated_at_ms: 10,
+                },
+                vec![RolloutTargetRecord {
+                    rollout_id: "rollout-adopt".into(),
+                    node_id: "node-a".into(),
+                    ordinal: 0,
+                    state: "pending".into(),
+                    attempt_id: None,
+                    error: None,
+                    observed_config_version: None,
+                    updated_at_ms: 10,
+                }],
+                "{\"v\":2}",
+                None,
+            )
+            .await
+            .unwrap();
+        let adopted = store
+            .find_rollout_by_correlation("corr-adopt")
+            .await
+            .unwrap()
+            .expect("rollout exists");
+        assert_eq!(adopted.rollout_id, "rollout-adopt");
+        assert!(store
+            .find_rollout_by_correlation("corr-none")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Rejection path: pending → rejected is terminal.
+        store
+            .create_config_approval_request(approval_request("req-2", "corr-b", 1_000))
+            .await
+            .unwrap();
+        assert!(store
+            .begin_decide_config_approval_request("req-2", "rejected", "carol", 30, 30)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .count_config_approval_requests("rejected")
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Expiry: an overdue pending request expires; the fresh one survives;
+        // pending rows are never deleted.
+        store
+            .create_config_approval_request(approval_request("req-3", "corr-c", 50))
+            .await
+            .unwrap();
+        let written = store
+            .sweep_config_approval_requests(100, 30, 100)
+            .await
+            .unwrap();
+        assert!(written >= 1);
+        let expired = store
+            .get_config_approval_request("req-3")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.status, ConfigApprovalStatus::Expired);
+        assert_eq!(
+            store
+                .count_config_approval_requests("pending")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Retention: terminal rows past the age bound are pruned.
+        let written = store
+            .sweep_config_approval_requests(10_000, 30, 100)
+            .await
+            .unwrap();
+        assert!(written >= 1);
+        assert!(store
+            .get_config_approval_request("req-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A stuck `approving` row is resolved by the sweep: adopted when its
+    /// correlation already produced a rollout, reset to pending otherwise —
+    /// but only once it stopped changing for the stall window.
+    #[tokio::test]
+    async fn config_approval_sweep_resolves_stuck_approving() {
+        let store =
+            ControlPlaneStore::contract("config_approval_sweep_resolves_stuck_approving").await;
+        // Fresh approving row (updated now): the sweep must not touch it.
+        store
+            .create_config_approval_request(approval_request("req-live", "corr-live", 10_000))
+            .await
+            .unwrap();
+        assert!(store
+            .begin_decide_config_approval_request("req-live", "approving", "bob", 100, 100)
+            .await
+            .unwrap());
+        store
+            .sweep_config_approval_requests(150, 30, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_config_approval_request("req-live")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConfigApprovalStatus::Approving
+        );
+
+        // Stalled approving row with an existing rollout: adopted.
+        store
+            .create_config_approval_request(approval_request("req-adopt", "corr-adopt2", 10_000))
+            .await
+            .unwrap();
+        assert!(store
+            .begin_decide_config_approval_request("req-adopt", "approving", "bob", 10, 10)
+            .await
+            .unwrap());
+        store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "rollout-adopt2".into(),
+                    config_version_id: "cfg-adopt2".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 1,
+                    actor: Some("bob".into()),
+                    correlation_id: Some("corr-adopt2".into()),
+                    created_at_ms: 12,
+                    updated_at_ms: 12,
+                },
+                vec![RolloutTargetRecord {
+                    rollout_id: "rollout-adopt2".into(),
+                    node_id: "node-a".into(),
+                    ordinal: 0,
+                    state: "pending".into(),
+                    attempt_id: None,
+                    error: None,
+                    observed_config_version: None,
+                    updated_at_ms: 12,
+                }],
+                "{\"v\":3}",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .sweep_config_approval_requests(150, 30, 100)
+            .await
+            .unwrap();
+        let adopted = store
+            .get_config_approval_request("req-adopt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.status, ConfigApprovalStatus::Approved);
+        assert_eq!(adopted.rollout_id.as_deref(), Some("rollout-adopt2"));
+
+        // Stalled approving row with no rollout: reset to pending with a
+        // note. The stall window is APPROVING_STALL_MS, so the decision must
+        // be older than that.
+        store
+            .create_config_approval_request(approval_request("req-reset", "corr-reset", 10_000))
+            .await
+            .unwrap();
+        assert!(store
+            .begin_decide_config_approval_request("req-reset", "approving", "bob", 10, 10)
+            .await
+            .unwrap());
+        store
+            .sweep_config_approval_requests(APPROVING_STALL_MS + 200, 30, 100)
+            .await
+            .unwrap();
+        let reset = store
+            .get_config_approval_request("req-reset")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.status, ConfigApprovalStatus::Pending);
+        assert!(reset.failure_note.is_some());
     }
 
     /// The rollout orchestration surface: content-bearing creation seeds the

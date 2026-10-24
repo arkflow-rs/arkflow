@@ -3632,6 +3632,8 @@ async fn spawned_hub() -> (
         lease_ttl_ms: 2_000,
         poll_interval_ms: 20,
         session_ttl_ms: 2_000,
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

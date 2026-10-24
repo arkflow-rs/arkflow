@@ -313,6 +313,16 @@ small {
   color: var(--danger);
   background: var(--danger-bg);
 }
+.state.approved {
+  color: var(--ok);
+  background: var(--ok-bg);
+}
+.state.rejected,
+.state.expired {
+  color: var(--danger);
+  background: var(--danger-bg);
+}
+.state.approving,
 .state.draining,
 .state.maintenance,
 .state.paused,
