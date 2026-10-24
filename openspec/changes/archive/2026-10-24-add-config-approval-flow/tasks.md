@@ -10,7 +10,7 @@
 - [x] 2.1 `HubConfig` 新增 `approval_required: bool`（serde default false）与 `approval_ttl_ms: u64`（默认 24h），启动校验与配置文档注释
 - [x] 2.2 `OperatorAction` 新增 `ApproveRollouts`：Admin 允许、Operator/Viewer 拒绝（`api_contract.rs` 的 `can` match + 既有 RBAC 矩阵测试扩展）
 - [x] 2.3 hub 状态端点附加 `approval_required` 字段（Console 据此分流；serde default 向后兼容）
-- [ ] 2.4 启动校验告警：`approval_required` 开启且静态配置去重 operator 身份 < 2 时输出醒目告警（不拒绝启动；单测覆盖单身份/双身份/OIDC-only 形态）
+- [x] 2.4 启动校验告警：`approval_required` 开启且静态配置去重 operator 身份 < 2 时输出醒目告警（不拒绝启动；单测覆盖单身份/双身份/OIDC-only 形态）
 
 ## 3. 审批状态机与 API
 
