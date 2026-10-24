@@ -159,9 +159,13 @@ impl Hub {
             .await
             .map_err(HubError::from)?
             .ok_or_else(|| HubError::Invalid("approval request not found".into()))?;
-        if request.requester_id == approver_id {
+        // Segregation guards the approve direction only: publishing needs a
+        // second principal, but rejecting one's own submission is the
+        // conservative direction and must stay available — otherwise a
+        // mistaken submission could only ever leave through TTL expiry.
+        if approve && request.requester_id == approver_id {
             return Err(HubError::Invalid(format!(
-                "principal '{approver_id}' submitted this request and cannot decide it; \
+                "principal '{approver_id}' submitted this request and cannot approve it; \
                  approval requires a second principal"
             )));
         }

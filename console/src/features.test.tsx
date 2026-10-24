@@ -1034,7 +1034,10 @@ describe('configuration approvals', () => {
     vi.stubGlobal('fetch', fetchMock)
     renderWithQueries(<Approvals onError={() => {}} />)
     expect(await screen.findByText('approval-1')).toBeTruthy()
-    fireEvent.click(await screen.findByText('Approve'))
+    fireEvent.click(screen.getByText('Approve'))
+    // Approving requires confirmation (it publishes to the fleet): the
+    // dialog's danger confirm button carries the same label.
+    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Approve' }))
     await waitFor(() => {
       const decide = fetchMock.mock.calls.find(
         ([url, init]) => url.endsWith('/decide') && init?.method === 'POST',

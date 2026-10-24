@@ -98,12 +98,17 @@ Rejecting a pending request SHALL mark it rejected with the rejecting principal 
 
 ### Requirement: Approver SHALL differ from the requester
 
-While approval policy is enabled, the Hub SHALL grant the approve action only to principals holding the dedicated `ApproveRollouts` permission (held by the admin role, not the operator role) and SHALL reject an approval decision whose principal is the same as the request's requester.
+While approval policy is enabled, the Hub SHALL grant the approve action only to principals holding the dedicated `ApproveRollouts` permission (held by the admin role, not the operator role) and SHALL reject an approval whose principal is the same as the request's requester. Rejecting one's own submission is the conservative direction and MUST remain available: the requester MAY withdraw (reject) a pending request they submitted.
 
 #### Scenario: Self-approval is rejected
 
-- **WHEN** the principal that submitted a pending request submits an approval decision for it
+- **WHEN** the principal that submitted a pending request approves it
 - **THEN** the decision fails with an error naming the segregation rule
+
+#### Scenario: The requester may withdraw their own submission
+
+- **WHEN** the principal that submitted a pending request rejects it
+- **THEN** the request becomes rejected with that principal recorded, and no rollout is created
 
 #### Scenario: Operator role cannot approve
 

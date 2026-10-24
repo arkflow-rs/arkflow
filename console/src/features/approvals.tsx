@@ -3,6 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { api, ConfigApproval, errorMessage, formatTime } from '../api'
 import { useT } from '../i18n'
+import { useConfirm, usePrompt } from './confirm'
 import { useConfigApprovals } from '../queries'
 
 /// The approval queue: pending requests first with approve/reject actions,
@@ -12,6 +13,8 @@ import { useConfigApprovals } from '../queries'
 export function Approvals({ onError }: { onError: (message: string) => void }) {
   const t = useT()
   const queryClient = useQueryClient()
+  const confirm = useConfirm()
+  const prompt = usePrompt()
   const pending = useConfigApprovals('pending').data ?? []
   const decided = useConfigApprovals().data ?? []
   const [busy, setBusy] = useState(false)
@@ -22,9 +25,29 @@ export function Approvals({ onError }: { onError: (message: string) => void }) {
     void queryClient.invalidateQueries({ queryKey: ['live', 'rollouts'] })
   }
   const decide = async (id: string, decision: 'approve' | 'reject') => {
+    // Approving publishes the pinned configuration to the fleet: confirm
+    // before acting. Rejecting asks for a reason recorded in the audit.
+    const confirmed =
+      decision === 'approve'
+        ? await confirm({
+            title: t('approvals.approveConfirmTitle', { id }),
+            body: t('approvals.approveConfirmBody'),
+            confirmLabel: t('approvals.approve'),
+          })
+        : true
+    if (!confirmed) return
+    const note =
+      decision === 'reject'
+        ? ((await prompt({
+            title: t('approvals.rejectPromptTitle', { id }),
+            label: t('approvals.rejectNoteLabel'),
+            confirmLabel: t('approvals.reject'),
+          })) ?? undefined)
+        : undefined
+    if (decision === 'reject' && note === undefined) return
     try {
       setBusy(true)
-      await api.decideConfigApproval(id, decision)
+      await api.decideConfigApproval(id, decision, note)
       setBusy(false)
       invalidate()
       toast.success(t('toast.accepted'))

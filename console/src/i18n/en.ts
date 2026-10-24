@@ -278,6 +278,11 @@ export const en = {
   'approvals.failureNote': 'last failure: {note}',
   'approvals.createdRollout': 'rollout {id}',
   'approvals.submitted': 'Submitted for approval',
+  'approvals.approveConfirmTitle': 'Approve {id}?',
+  'approvals.approveConfirmBody':
+    'Approval creates a rollout publishing the pinned configuration version to the target nodes.',
+  'approvals.rejectPromptTitle': 'Reject {id}',
+  'approvals.rejectNoteLabel': 'Reason (recorded in the audit)',
   'approvals.gateEnabled':
     'Approval policy is enabled: publishing submits an approval request decided by a second principal.',
   'rollouts.submitForApproval': 'Submit for approval',

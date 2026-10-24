@@ -269,6 +269,10 @@ export const zh = {
   'approvals.failureNote': '上次失败：{note}',
   'approvals.createdRollout': '发布 {id}',
   'approvals.submitted': '已提交审批',
+  'approvals.approveConfirmTitle': '批准 {id}？',
+  'approvals.approveConfirmBody': '批准后将创建 rollout，把钉住的配置版本发布到目标节点。',
+  'approvals.rejectPromptTitle': '拒绝 {id}',
+  'approvals.rejectNoteLabel': '理由（记入审计）',
   'approvals.gateEnabled': '审批策略已启用：发布将提交审批请求，由第二身份批准。',
   'rollouts.submitForApproval': '提交审批',
 

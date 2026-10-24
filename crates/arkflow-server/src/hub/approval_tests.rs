@@ -247,6 +247,36 @@ async fn rejection_is_terminal_and_republish_needs_a_new_request() {
     assert_eq!(old.status, ConfigApprovalStatus::Rejected);
 }
 
+/// Segregation guards the approve direction only: the requester may reject
+/// (withdraw) their own submission — the conservative direction — so a
+/// mistaken request is not stuck until TTL expiry.
+#[tokio::test]
+async fn requester_can_reject_own_submission_but_never_approve() {
+    let hub = hub_with_node("approval_self_reject", approval_config()).await;
+    let request = hub
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
+        .await
+        .unwrap();
+    // Approving own submission stays rejected.
+    let err = hub
+        .decide_config_approval(&request.request_id, true, "alice".into(), None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cannot approve it"), "got: {err}");
+    // Rejecting own submission is allowed.
+    let decided = hub
+        .decide_config_approval(
+            &request.request_id,
+            false,
+            "alice".into(),
+            Some("withdrawn".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(decided.status, ConfigApprovalStatus::Rejected);
+    assert_eq!(decided.approver_id.as_deref(), Some("alice"));
+}
+
 #[tokio::test]
 async fn expired_requests_cannot_be_decided() {
     let mut config = approval_config();
