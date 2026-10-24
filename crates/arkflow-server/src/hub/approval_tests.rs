@@ -88,12 +88,7 @@ async fn submission_validates_without_side_effects() {
     // A valid submission creates no rollout.
     let before = hub.rollouts().await.unwrap().len();
     let request = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
     assert_eq!(request.status, ConfigApprovalStatus::Pending);
@@ -106,12 +101,7 @@ async fn submission_rejected_when_policy_disabled() {
     config.approval_required = false;
     let hub = hub_with_node("approval_submit_disabled", config).await;
     let err = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap_err();
     assert!(
@@ -124,12 +114,7 @@ async fn submission_rejected_when_policy_disabled() {
 async fn approve_creates_rollout_as_approver_and_decisions_are_single() {
     let hub = hub_with_node("approval_approve", approval_config()).await;
     let request = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
 
@@ -160,23 +145,12 @@ async fn approve_creates_rollout_as_approver_and_decisions_are_single() {
     // A request already being approved cannot be rejected instead: only
     // the approve retry re-enters through `approving`.
     let second = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
     let storage = hub.storage().unwrap();
     storage
-        .begin_decide_config_approval_request(
-            &second.request_id,
-            "approving",
-            "bob",
-            1,
-            1,
-        )
+        .begin_decide_config_approval_request(&second.request_id, "approving", "bob", 1, 1)
         .await
         .unwrap();
     let err = hub
@@ -184,8 +158,7 @@ async fn approve_creates_rollout_as_approver_and_decisions_are_single() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("cannot be decided")
-            || err.to_string().contains("concurrently"),
+        err.to_string().contains("cannot be decided") || err.to_string().contains("concurrently"),
         "got: {err}"
     );
 }
@@ -194,25 +167,14 @@ async fn approve_creates_rollout_as_approver_and_decisions_are_single() {
 async fn approval_adopts_a_crash_created_rollout_instead_of_duplicating() {
     let hub = hub_with_node("approval_adoption", approval_config()).await;
     let request = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
     // Simulate the crash window: the CAS to `approving` landed and the
     // rollout was created, but the completion marking did not.
     let storage = hub.storage().unwrap();
     storage
-        .begin_decide_config_approval_request(
-            &request.request_id,
-            "approving",
-            "bob",
-            1,
-            1,
-        )
+        .begin_decide_config_approval_request(&request.request_id, "approving", "bob", 1, 1)
         .await
         .unwrap();
     let created = hub
@@ -231,7 +193,10 @@ async fn approval_adopts_a_crash_created_rollout_instead_of_duplicating() {
         .await
         .unwrap();
     assert_eq!(decided.status, ConfigApprovalStatus::Approved);
-    assert_eq!(decided.rollout_id.as_deref(), Some(created.rollout_id.as_str()));
+    assert_eq!(
+        decided.rollout_id.as_deref(),
+        Some(created.rollout_id.as_str())
+    );
     // Exactly one rollout carries the correlation id.
     let adopted = storage
         .find_rollout_by_correlation(&request.correlation_id)
@@ -245,16 +210,16 @@ async fn approval_adopts_a_crash_created_rollout_instead_of_duplicating() {
 async fn rejection_is_terminal_and_republish_needs_a_new_request() {
     let hub = hub_with_node("approval_reject", approval_config()).await;
     let request = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
     let decided = hub
-        .decide_config_approval(&request.request_id, false, "bob".into(), Some("not ready".into()))
+        .decide_config_approval(
+            &request.request_id,
+            false,
+            "bob".into(),
+            Some("not ready".into()),
+        )
         .await
         .unwrap();
     assert_eq!(decided.status, ConfigApprovalStatus::Rejected);
@@ -270,16 +235,15 @@ async fn rejection_is_terminal_and_republish_needs_a_new_request() {
     assert!(err.to_string().contains("cannot be decided"), "got: {err}");
     // Republish = new request id, old record unchanged.
     let fresh = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
     assert_ne!(fresh.request_id, request.request_id);
-    let old = hub.config_approval(&request.request_id).await.unwrap().unwrap();
+    let old = hub
+        .config_approval(&request.request_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(old.status, ConfigApprovalStatus::Rejected);
 }
 
@@ -289,12 +253,7 @@ async fn expired_requests_cannot_be_decided() {
     config.approval_ttl_ms = 1;
     let hub = hub_with_node("approval_expiry", config).await;
     let request = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
     // Let the TTL lapse deterministically.
@@ -339,12 +298,7 @@ async fn pending_requests_survive_a_hub_restart_and_policy_toggle() {
     .await
     .unwrap();
     let request = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
 
@@ -428,10 +382,7 @@ async fn rollback_gate_allows_applied_and_blocks_never_applied_versions() {
         )
         .await
         .unwrap_err();
-    assert!(
-        err.to_string().contains("approval flow"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("approval flow"), "got: {err}");
     let rolled_back = hub
         .act_rollout(
             &seed.rollout_id,
@@ -499,12 +450,7 @@ async fn policy_off_direct_creation_and_rollback_are_unchanged() {
 async fn sweep_is_not_audited_and_never_removes_pending() {
     let hub = hub_with_node("approval_sweep_audit", approval_config()).await;
     let request = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
     let storage = hub.storage().unwrap();
@@ -531,12 +477,7 @@ async fn approval_decisions_are_audited_with_scalar_metadata() {
     let hub = hub_with_node("approval_audit_records", approval_config()).await;
     let storage = hub.storage().unwrap();
     let request = hub
-        .submit_config_approval(
-            "cfg-seed".into(),
-            vec!["node-a".into()],
-            1,
-            "alice".into(),
-        )
+        .submit_config_approval("cfg-seed".into(), vec!["node-a".into()], 1, "alice".into())
         .await
         .unwrap();
     hub.decide_config_approval(&request.request_id, true, "bob".into(), None)

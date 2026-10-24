@@ -7,17 +7,17 @@
 //! `arkflow_core::control_plane::ControlPlane` and contains no Axum types.
 
 mod agent_endpoints;
+#[cfg(test)]
+mod approval_api_tests;
+mod config_approvals;
 mod configuration;
 mod diagnostics;
 mod events;
 mod jobs;
-mod config_approvals;
 mod nodes;
 mod operations;
 mod rollouts;
 mod streams;
-#[cfg(test)]
-mod approval_api_tests;
 
 #[cfg(test)]
 mod tests;
@@ -32,6 +32,7 @@ use agent_endpoints::{
     agent_command_result, agent_commands, agent_heartbeat, agent_job_observation, agent_register,
     agent_report,
 };
+use config_approvals::{decide_approval, get_approval, list_approvals, submit_approval};
 use configuration::{
     apply_configuration, configuration, configuration_diff, configuration_draft,
     configuration_versions, hub_apply_configuration, hub_configuration, hub_configuration_diff,
@@ -55,7 +56,6 @@ use nodes::{
 use operations::{
     cancel_operation, hub_cancel_operation, hub_operation, hub_operations, operation, operations,
 };
-use config_approvals::{decide_approval, get_approval, list_approvals, submit_approval};
 use rollouts::{create_rollout, hub_rollout, hub_rollouts, rollout_action};
 use streams::{
     hub_desired_state, hub_restart_action, hub_stream, hub_streams, hub_targeted_command,

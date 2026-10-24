@@ -82,7 +82,10 @@ impl Hub {
             rollout_id: None,
             // Unique even under sequence reuse across restarts: the
             // timestamp prefix separates restart epochs.
-            correlation_id: format!("approval-{now}-{}", HUB_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
+            correlation_id: format!(
+                "approval-{now}-{}",
+                HUB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ),
             expires_at_ms: now.saturating_add(self.config.approval_ttl_ms),
             created_at_ms: now,
             updated_at_ms: now,
@@ -114,8 +117,7 @@ impl Hub {
             .map_err(HubError::from)?;
         // Lazy expiry: an overdue pending request reads as expired.
         if let Some(request) = request.as_mut() {
-            if request.status == ConfigApprovalStatus::Pending
-                && request.expires_at_ms <= now_ms()
+            if request.status == ConfigApprovalStatus::Pending && request.expires_at_ms <= now_ms()
             {
                 request.status = ConfigApprovalStatus::Expired;
             }
@@ -166,7 +168,13 @@ impl Hub {
         if request.expires_at_ms <= now_ms() {
             // Persist the expiry so the state is durable, then report it.
             let _ = storage
-                .begin_decide_config_approval_request(request_id, "expired", &approver_id, now_ms(), now_ms())
+                .begin_decide_config_approval_request(
+                    request_id,
+                    "expired",
+                    &approver_id,
+                    now_ms(),
+                    now_ms(),
+                )
                 .await;
             return Err(HubError::Invalid(
                 "approval request has expired; submit a new request".into(),
@@ -192,7 +200,13 @@ impl Hub {
         if !resumed_approving {
             let target_status = if approve { "approving" } else { "rejected" };
             let reserved = storage
-                .begin_decide_config_approval_request(request_id, target_status, &approver_id, now, now)
+                .begin_decide_config_approval_request(
+                    request_id,
+                    target_status,
+                    &approver_id,
+                    now,
+                    now,
+                )
                 .await
                 .map_err(HubError::from)?;
             if !reserved {
@@ -292,11 +306,7 @@ impl Hub {
     pub async fn sweep_config_approvals(&self) -> Result<usize, HubError> {
         let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
         storage
-            .sweep_config_approval_requests(
-                now_ms(),
-                APPROVAL_RETENTION_MS,
-                APPROVAL_RETAINED_MAX,
-            )
+            .sweep_config_approval_requests(now_ms(), APPROVAL_RETENTION_MS, APPROVAL_RETAINED_MAX)
             .await
             .map_err(HubError::from)
     }
@@ -374,12 +384,8 @@ impl Hub {
                 .map_err(HubError::from)?;
             if targets.iter().any(|target| {
                 node_ids.contains(&target.node_id)
-                    && (target.observed_config_version.as_deref()
-                        == Some(config_version_id)
-                        || matches!(
-                            target.state.as_str(),
-                            "applied" | "converged" | "succeeded"
-                        ))
+                    && (target.observed_config_version.as_deref() == Some(config_version_id)
+                        || matches!(target.state.as_str(), "applied" | "converged" | "succeeded"))
             }) {
                 return Ok(true);
             }
@@ -387,5 +393,3 @@ impl Hub {
         Ok(false)
     }
 }
-
-

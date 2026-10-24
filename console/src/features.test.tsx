@@ -1036,7 +1036,9 @@ describe('configuration approvals', () => {
     expect(await screen.findByText('approval-1')).toBeTruthy()
     fireEvent.click(await screen.findByText('Approve'))
     await waitFor(() => {
-      const decide = fetchMock.mock.calls.find(([url, init]) => url.endsWith('/decide') && init?.method === 'POST')
+      const decide = fetchMock.mock.calls.find(
+        ([url, init]) => url.endsWith('/decide') && init?.method === 'POST',
+      )
       expect(decide).toBeTruthy()
       expect(String(decide![1]!.body)).toContain('"decision":"approve"')
     })
@@ -1060,7 +1062,9 @@ describe('configuration approvals', () => {
     expect(await screen.findByText('approval-2')).toBeTruthy()
     fireEvent.click(await screen.findByText('Resubmit'))
     await waitFor(() => {
-      const submit = fetchMock.mock.calls.find(([url, init]) => url.endsWith('/config-approvals') && init?.method === 'POST')
+      const submit = fetchMock.mock.calls.find(
+        ([url, init]) => url.endsWith('/config-approvals') && init?.method === 'POST',
+      )
       expect(submit).toBeTruthy()
       expect(String(submit![1]!.body)).toContain('"config_version":"cfg-1"')
     })

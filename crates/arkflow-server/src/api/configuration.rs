@@ -192,7 +192,10 @@ pub(super) async fn hub_configuration_command<T: Serialize>(
         // rollback path around the gate).
         if hub.approval_required() {
             let blocked = if operation == "apply_configuration" {
-                Some(hub.ensure_rollout_creation_allowed().expect_err("policy enabled"))
+                Some(
+                    hub.ensure_rollout_creation_allowed()
+                        .expect_err("policy enabled"),
+                )
             } else {
                 let version = payload
                     .get("id")
@@ -218,7 +221,11 @@ pub(super) async fn hub_configuration_command<T: Serialize>(
                 }
             };
             if let Some(message) = blocked {
-                return problem(StatusCode::UNPROCESSABLE_ENTITY, "approval_required", message);
+                return problem(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "approval_required",
+                    message,
+                );
             }
         }
         let config_version_id = if operation == "apply_configuration" {

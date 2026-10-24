@@ -3045,10 +3045,7 @@ impl StorageBackend for SqliteBackend {
     ) -> Result<usize, StorageError> {
         self.sweep_config_approval_requests(now_ms, terminal_older_than_ms, max_retained)
     }
-    async fn count_config_approval_requests(
-        &self,
-        status: &str,
-    ) -> Result<usize, StorageError> {
+    async fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError> {
         self.count_config_approval_requests(status)
     }
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {

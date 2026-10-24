@@ -36,11 +36,7 @@ export function Approvals({ onError }: { onError: (message: string) => void }) {
   const resubmit = async (request: ConfigApproval) => {
     try {
       setBusy(true)
-      await api.submitConfigApproval(
-        request.config_version_id,
-        request.targets,
-        request.batch_size,
-      )
+      await api.submitConfigApproval(request.config_version_id, request.targets, request.batch_size)
       setBusy(false)
       invalidate()
       toast.success(t('approvals.submitted'))
@@ -75,8 +71,7 @@ export function Approvals({ onError }: { onError: (message: string) => void }) {
               </span>
               <span className={`state ${request.status}`}>{request.status}</span>
               <small>
-                {t('approvals.by', { actor: request.requester_id })} ·{' '}
-                {formatTime(request.created_at_ms)}
+                {t('approvals.by', { actor: request.requester_id })} · {formatTime(request.created_at_ms)}
               </small>
               {request.status === 'pending' && (
                 <div className="actions">
@@ -99,7 +94,9 @@ export function Approvals({ onError }: { onError: (message: string) => void }) {
                 <small>{t('approvals.createdRollout', { id: request.rollout_id })}</small>
               )}
               {request.failure_note && (
-                <small className="warning">{t('approvals.failureNote', { note: request.failure_note })}</small>
+                <small className="warning">
+                  {t('approvals.failureNote', { note: request.failure_note })}
+                </small>
               )}
             </div>
           ))}

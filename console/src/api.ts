@@ -540,11 +540,8 @@ export const api = {
       body: JSON.stringify({ config_version: configVersion, node_ids: nodeIds, batch_size: batchSize }),
     }),
   configApprovals: (status?: string) =>
-    request<ConfigApproval[]>(
-      `/config-approvals${status ? `?status=${encodeURIComponent(status)}` : ''}`,
-    ),
-  configApproval: (id: string) =>
-    request<ConfigApproval>(`/config-approvals/${encodeURIComponent(id)}`),
+    request<ConfigApproval[]>(`/config-approvals${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  configApproval: (id: string) => request<ConfigApproval>(`/config-approvals/${encodeURIComponent(id)}`),
   submitConfigApproval: (configVersion: string, nodeIds: string[], batchSize: number) =>
     request<ConfigApproval>('/config-approvals', {
       method: 'POST',

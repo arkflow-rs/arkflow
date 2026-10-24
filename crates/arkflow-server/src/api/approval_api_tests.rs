@@ -171,7 +171,10 @@ async fn approval_flow_over_http_end_to_end() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert!(
-        body["message"].as_str().unwrap_or_default().contains("approval"),
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("approval"),
         "the rejection must point at the approval flow: {body}"
     );
 
@@ -206,7 +209,10 @@ async fn approval_flow_over_http_end_to_end() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert!(
-        body["message"].as_str().unwrap_or_default().contains("second principal"),
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("second principal"),
         "got: {body}"
     );
 
@@ -228,9 +234,11 @@ async fn approval_flow_over_http_end_to_end() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(list.as_array().unwrap().iter().any(|item| {
-        item["request_id"].as_str() == Some(request_id.as_str())
-    }));
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| { item["request_id"].as_str() == Some(request_id.as_str()) }));
 
     // A second principal approves (the Hub method; the HTTP route shape was
     // covered above). The rollout is created with the approver as actor.
@@ -271,5 +279,8 @@ async fn approval_flow_over_http_end_to_end() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert!(body["message"].as_str().unwrap_or_default().contains("not found"));
+    assert!(body["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not found"));
 }

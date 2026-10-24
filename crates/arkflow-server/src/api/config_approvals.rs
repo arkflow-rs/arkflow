@@ -1,7 +1,7 @@
 //! Configuration approval request handlers on the Hub API (see the
 //! `configuration-approval` capability).
 use super::{hub_problem, problem, require_operator_action};
-use crate::api_contract::{OperatorAction, SubmitApprovalRequest, ApprovalDecisionRequest};
+use crate::api_contract::{ApprovalDecisionRequest, OperatorAction, SubmitApprovalRequest};
 use crate::hub;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -121,9 +121,11 @@ pub(super) async fn decide_approval(
         .await
     {
         Ok(decided) => (StatusCode::ACCEPTED, Json(decided)).into_response(),
-        Err(hub::HubError::Invalid(message)) => {
-            problem(StatusCode::UNPROCESSABLE_ENTITY, "invalid_decision", message)
-        }
+        Err(hub::HubError::Invalid(message)) => problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_decision",
+            message,
+        ),
         Err(error) => hub_problem(error),
     }
 }

@@ -508,7 +508,10 @@ fn approval_identity_counting_covers_credential_shapes() {
         approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     };
     // No static credentials: zero identities.
-    assert_eq!(hub::Hub::new(base(None)).static_operator_identity_count(), 0);
+    assert_eq!(
+        hub::Hub::new(base(None)).static_operator_identity_count(),
+        0
+    );
     // Plain static token: the single legacy `operator` identity.
     assert_eq!(
         hub::Hub::new(base(Some("plain-token"))).static_operator_identity_count(),
@@ -2414,7 +2417,11 @@ pub(super) async fn post_json(
     read_json(response).await
 }
 
-pub(super) async fn get_json(app: &Router, path: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
+pub(super) async fn get_json(
+    app: &Router,
+    path: &str,
+    bearer: &str,
+) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
         .oneshot(
@@ -2428,7 +2435,9 @@ pub(super) async fn get_json(app: &Router, path: &str, bearer: &str) -> (StatusC
     read_json(response).await
 }
 
-pub(super) async fn read_json(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+pub(super) async fn read_json(
+    response: axum::response::Response,
+) -> (StatusCode, serde_json::Value) {
     let status = response.status();
     let content_type = response
         .headers()

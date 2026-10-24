@@ -452,7 +452,8 @@ pub enum StorageError {
     #[error("unsupported backend operation: {0}")]
     Unsupported(&'static str),
     #[error("storage encoding error: {0}")]
-    Encoding(String),    #[error("stale leader: claimed epoch {claimed_epoch}, current lease epoch {current_epoch}")]
+    Encoding(String),
+    #[error("stale leader: claimed epoch {claimed_epoch}, current lease epoch {current_epoch}")]
     StaleLeader {
         claimed_epoch: u64,
         current_epoch: u64,
@@ -1243,8 +1244,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         terminal_older_than_ms: u64,
         max_retained: usize,
     ) -> Result<usize, StorageError>;
-    async fn count_config_approval_requests(&self, status: &str)
-        -> Result<usize, StorageError>;
+    async fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError>;
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError>;
     /// Optimistically-concurrent mutation of an existing orchestration row:
     /// the mutable columns apply only while the row still holds
@@ -2034,10 +2034,7 @@ impl StorageBackend for ControlPlaneStore {
             }
         }
     }
-    async fn count_config_approval_requests(
-        &self,
-        status: &str,
-    ) -> Result<usize, StorageError> {
+    async fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError> {
         match self {
             Self::Sqlite(backend) => {
                 StorageBackend::count_config_approval_requests(backend, status).await
@@ -4425,7 +4422,11 @@ mod tests {
             .is_empty());
     }
 
-    fn approval_request(request_id: &str, correlation: &str, expires_at_ms: u64) -> ConfigApprovalRequest {
+    fn approval_request(
+        request_id: &str,
+        correlation: &str,
+        expires_at_ms: u64,
+    ) -> ConfigApprovalRequest {
         ConfigApprovalRequest {
             request_id: request_id.into(),
             config_version_id: "cfg-approve-1".into(),
@@ -4462,7 +4463,10 @@ mod tests {
             .await
             .unwrap()
             .expect("request exists");
-        assert_eq!(fetched.targets, vec!["node-a".to_string(), "node-b".to_string()]);
+        assert_eq!(
+            fetched.targets,
+            vec!["node-a".to_string(), "node-b".to_string()]
+        );
         assert_eq!(fetched.status, ConfigApprovalStatus::Pending);
         assert!(store
             .get_config_approval_request("req-missing")
