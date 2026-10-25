@@ -188,6 +188,36 @@ export const en = {
   'toast.failed': 'Operation failed',
   'settings.credentialsNote':
     'Credentials are read from build-time environment configuration and never rendered in the UI. Live updates stream over SSE; the periodic snapshot is a fallback.',
+  'settings.webhooks.title': 'Webhook alerting',
+  'settings.webhooks.subtitle': 'Forward control-plane events to external endpoints',
+  'settings.webhooks.deliveryNote':
+    'Delivery is best-effort: bounded queues, 3 attempts with backoff, and auto-pause after 5 consecutive failed deliveries (the paused state is visible here and as a webhook.paused event). The durable event record stays in the event log.',
+  'settings.webhooks.id': 'ID',
+  'settings.webhooks.url': 'Endpoint URL',
+  'settings.webhooks.eventTypes': 'Event type prefixes',
+  'settings.webhooks.status': 'Status',
+  'settings.webhooks.actions': 'Actions',
+  'settings.webhooks.enabled': 'Enabled',
+  'settings.webhooks.paused': 'Paused',
+  'settings.webhooks.signed': 'signed',
+  'settings.webhooks.add': 'Add subscription',
+  'settings.webhooks.edit': 'Edit',
+  'settings.webhooks.save': 'Save set',
+  'settings.webhooks.pause': 'Pause',
+  'settings.webhooks.enable': 'Enable',
+  'settings.webhooks.test': 'Test',
+  'settings.webhooks.testing': 'Testing delivery…',
+  'settings.webhooks.testDelivered': 'Test delivered (HTTP {status}).',
+  'settings.webhooks.testFailed': 'Test failed: {detail}',
+  'settings.webhooks.testError': 'Test request failed: {message}',
+  'settings.webhooks.replaceError': 'Saving the subscription set failed: {message}',
+  'settings.webhooks.unavailable': 'Webhook management is unavailable: {message}',
+  'settings.webhooks.empty': 'No webhook subscriptions configured.',
+  'settings.webhooks.secret': 'Signing secret',
+  'settings.webhooks.secretHint':
+    'Optional. When set, deliveries carry an X-Arkflow-Signature header (hex HMAC-SHA256 of the body). Leave empty for unsigned delivery.',
+  'settings.webhooks.secretReplaceHint':
+    'A secret is configured and never displayed. Leave empty to keep it; enter a new value to replace it.',
 
   // Jobs page
   'jobs.title': 'Stateful Jobs',

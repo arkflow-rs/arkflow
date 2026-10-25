@@ -633,7 +633,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 | 序 | 方向 | 要点 | 备注 |
 | --- | --- | --- | --- |
 | P0 | ~~`add-node-labels`~~ | 节点标签体系 + 按标签批量操作 | ✅ 已落地 #1336（标签 + 过滤 + selector rollout；审批分组策略仍留 `add-approval-label-scoping`） |
-| P0 | `add-alerting-webhooks` | webhook/事件订阅转发 | 复用 SSE 基建，纯增量；阶段 4 最小切口 |
+| P0 | ~~`add-alerting-webhooks`~~ | webhook/事件订阅转发 | ✅ 已落地：订阅全量替换 + 前缀过滤转发（HMAC 签名头、3 次退避重试、连续 5 败自动暂停 + `webhook.paused/resumed` 生命周期事件、leader-only 投递、Console Settings 管理面；新动作 `ManageWebhooks`；新 spec `webhook-alerting`，`control-plane-identity` RBAC 动作面扩展）|
 | P1 | 控制面限流/配额 | per-principal/per-node 限速 | 企业入场券 |
 | P1 | 控制面 DB 备份/恢复 | 快照/导出/恢复工具 | 企业入场券 |
 | P1 | `console-rbac-and-pagination` | 角色感知 UI + 服务端分页/过滤 + 本地死页面清理 | 纯前端消费，后端零改动 |

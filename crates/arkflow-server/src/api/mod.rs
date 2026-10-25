@@ -20,6 +20,9 @@ mod nodes;
 mod operations;
 mod rollouts;
 mod streams;
+mod webhooks;
+#[cfg(test)]
+mod webhooks_api_tests;
 
 #[cfg(test)]
 mod tests;
@@ -64,6 +67,7 @@ use streams::{
     hub_desired_state, hub_restart_action, hub_stream, hub_streams, hub_targeted_command,
     restart_stream, start_stream, stop_stream, stream, streams,
 };
+use webhooks::{hub_replace_webhooks, hub_test_webhook, hub_webhooks};
 
 // Helpers referenced only by the moved test module.
 #[cfg(test)]
@@ -696,6 +700,8 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         .route("/operations/{id}", delete(hub_cancel_operation))
         .route("/events", get(hub_events))
         .route("/events/stream", get(hub_event_stream))
+        .route("/webhooks", get(hub_webhooks).put(hub_replace_webhooks))
+        .route("/webhooks/{webhook_id}/test", post(hub_test_webhook))
         .route("/components", get(components))
         .route("/components/{kind}/{name}", get(component))
         .route("/schema", get(schema))
@@ -1111,6 +1117,15 @@ pub async fn serve_hub(
             }
         }
     });
+    // Webhook forwarder: leader-only fan-out of matching control-plane
+    // events to the durable subscription set (see the `webhook-alerting`
+    // capability).
+    let webhook_hub = hub.clone();
+    let webhook_cancel = cancellation.clone();
+    let webhook_task = tokio::spawn(async move {
+        webhook_hub.run_webhook_forwarder(webhook_cancel).await;
+    });
+    let _ = &webhook_task;
     let router = hub_router(hub.clone(), &config).into_make_service();
     let result = match tls_acceptor {
         Some(acceptor) => {

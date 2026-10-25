@@ -48,6 +48,12 @@ export function useStatus() {
 
 const DEFAULT_PREVIEW_SIZE = 256
 
+// Webhook subscriptions change only through this page's own mutations —
+// not 'live': refreshed by invalidation, not on the snapshot cadence.
+export function useWebhooks() {
+  return useQuery({ queryKey: ['webhooks'], queryFn: api.webhooks })
+}
+
 export function useNodes(label?: string) {
   return useQuery({
     queryKey: ['live', 'nodes', label ?? null],
