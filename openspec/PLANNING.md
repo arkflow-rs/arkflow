@@ -1,6 +1,6 @@
 # ArkFlow 战略规划与方向② Roadmap
 
-> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节），2026-09-25 完成能力完备性评估并制定补齐计划（见第八节），同日完成第八节全部六项补齐及三项延后子项二轮补齐（见 8.5 进度）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
+> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节），2026-09-25 完成能力完备性评估并制定补齐计划（见第八节），同日完成第八节全部六项补齐及三项延后子项二轮补齐（见 8.5 进度），2026-10-24 完成控制面能力缺失盘点并制定补齐计划（见第十一节）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
 > 维护规则：方向或现状发生变化时更新本文档；具体 change 落地后由 OpenSpec `changes/` 与归档后的 `specs/` 承载细节，本文只保留总纲。
 
 ---
@@ -346,6 +346,8 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转�
 - OpenTelemetry trace 与跨节点故障诊断。
 - 在单 Hub 模型验证稳定后，再评估外部数据库和 Hub 高可用。
 
+> **2026-10-24 盘点修订**：本节中 RBAC、OIDC、Hub 高可用（Postgres + 租约选主）、OTel trace（引擎/数据面，`add-data-plane-tracing`；`arkflow-server` 独立二进制的 tracing 初始化仍是缺口，见 11.2-8）均已闭环；阶段 4 真剩余项与控制面新增缺口（限流/备份/节点标签/告警等）的完整清单与优先级见第十一节。
+
 ### 5.8 设计边界
 
 Hub 的近期目标是成为可靠的单 Hub、多节点运营控制面，而不是立即演化为分布式调度系统。优先保证资源模型、操作一致性、配置治理、可观测性和安全边界，再考虑共识、高可用和跨 Hub 调度。
@@ -593,3 +595,59 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 ### 10.3 已阻塞项（2026-10-18 全部收口）
 
 - ~~Avro L2 reader 复用：apache-avro 上游 API（`decode_internal` 私有、reader 只收借用型 `ResolvedSchema`），需上游 owned-reader PR~~ → ✅ 2026-10-18 `optimize-hotpath-mechanical-batch-4` 闭环——**"阻塞"只对跨批长生命周期缓存成立，批内作用域复用不需要上游**：`GenericDatumReader::read_value` 接收 `&self`（0.22 reader/datum.rs:132），`SchemaRegistryCodec::decode` 改两段式（pass 1 逐消息 parse+resolve 保持历史错误顺序，pass 2 逐消息解码、`AvroValueReader` 按 id 构建一次复用），隔离 A/B +41.7%/+12.8%/+6.7%（w5/w25/w100），官方套件 avro-decode 1.05M→1.71M / 396K→442K / 109K→116K rows/s；错误顺序钉死测试保持绿。仅剩的"跨批 reader 缓存"仍需上游 owned-reader API，不再立项（收益已被批内摊销覆盖大半）。
+
+---
+
+## 十一、控制面能力缺失盘点与补齐 Roadmap（2026-10-24）
+
+> 源起：以「控制面有哪些能力缺失」为题的系统探查——两路全量扫描（`arkflow-server` 代码面 + `console/` 前端面）交叉本文件与 `specs/` 核实，全部论断带 file:line。结论沉淀于此避免重复调研；各 change 立项后细节由 OpenSpec `changes/` 与归档 `specs/` 承载，落地后从 11.4 表划掉。
+
+### 11.1 总体结论
+
+控制面完成度高：`arkflow-server` 约 5.6 万行（其中约 2.2 万行测试）**非测试代码无一处 TODO/FIXME/unimplemented 标记**。缺口形态是「能力维度整体未建」或「后端已有、Console 未消费」，不是代码里的洞。盘点时 `openspec/changes/` 为空，下列缺口均无在建工作覆盖。
+
+### 11.2 后端能力缺失（需立项）
+
+1. ~~**节点标签体系**~~ → ✅ 已由 #1336（`add-node-labels`）落地：Hub 管理标签 + 列表过滤 + selector rollout；剩余「按标签批量流命令」「标签分组审批策略」仍开放。
+2. **告警/webhook/事件订阅**：前后端零实现（grep webhook/notification/slack/email 仅误报命中）；SSE 事件流基建已具备，无向外转发能力。对应 5.7 阶段 4 整条未动。
+3. **限流/配额**：无任何 per-principal/per-node 请求限速或资源配额，仅请求体大小限制（本地 1MB/Hub 4MB）与内存硬上限（`MAX_NODES=256`、`MAX_COMMANDS_PER_NODE=128`、`MAX_OPERATIONS=1024`，`hub.rs:56-59`）。
+4. **控制面 DB 备份/恢复**：无快照/导出/恢复工具，仅停机 sqlite→pg 一次性迁移（`migrate_tool.rs`）。注意 Job 级 checkpoint/savepoint 恢复是完整的，勿混淆。
+5. **用户/凭证管理面**：RBAC 三角色 + 资源 scope + OIDC（bearer + 浏览器登录）已实现，但无用户 CRUD、无 token 签发/吊销/轮换 API，JWT 无吊销（`oidc.rs:41` 注释自认取舍）；租户/团队隔离未做。
+6. **mTLS/客户端证书**：TLS 仅服务端加密，显式 `with_no_client_auth`（`api/mod.rs:974`）。
+7. **Job 级 pause/resume**：`desired_state` 仅 running/stopped 二值（`jobs.rs:999`），action 仅 start/stop/restart（`jobs.rs:106`）；pause/resume 语义仅存在于升级编排内部（`jobs.rs:817`）。
+8. **arkflow-server 独立二进制短板**：无 tracing/OTel 初始化（引擎二进制有，Hub 二进制没有）；仅环境变量配置、无配置文件支持（`bin/arkflow-server.rs`）。
+9. **OpenAPI 文档生成**：仅 `api_contract.rs:4` 意向注释，未实现。
+10. 小项：本地 standalone 面无 `/audit` 路由（审计仅 Hub 面）；Agent query-param 传 token 旧通道处弃用兼容期（`agent_endpoints.rs:85`）。
+
+### 11.3 Console 缺口（后端 API 已有、前端未消费或空壳）
+
+1. **角色感知 UI**：后端模型完备（三角色七动作，`api_contract.rs:34-46`），前端零消费——按钮无条件渲染、`canMutate` 只反映节点在线（`app.tsx:146-147`）、403 无友好降级、principal 身份不显示（`api.ts:742` 已返回 roles）。
+2. **服务端分页/过滤**：`EventQuery`/`AuditQuery`/`OperationQuery` 参数齐全（`api/mod.rs:347-373`），前端固定取第 1 页 50 条后客户端过滤——**第 51 条起 UI 不可达**；audit 连 resource_id 参数都不传。
+3. **监控时序图表**：无图表库，Overview/Runtime 仅最新标量快照（`overview.tsx:163-176`）。
+4. **本地模式死页面**：导航 10 项常驻，本地路由仅 5 个（`mod.rs:402-435`）——连本地引擎时 Jobs/Rollouts/Approvals/Audit/Events 五页 404。
+5. **运行时 token 输入/身份切换**：静态 token 仅构建期 `VITE_API_TOKEN` 注入（`api.ts:322`），无运行时输入；OIDC 401 自动跳转已有。
+6. 小项：Rollout 创建手输版本号（未接现成版本选择器，`rollouts.tsx:81-86`）；每节点指标下钻、`/operations/status` 协议/能力兼容矩阵页、流 desired-state（含 generation CAS）入口、TOML 编辑（后端 `ConfigCandidate` 支持 toml）均无 UI；Settings 页空壳；zh 字典为 Partial，缺 key 静默回落英文无完整性校验。
+
+### 11.4 补齐 Roadmap（价值优先序）
+
+| 序 | 方向 | 要点 | 备注 |
+| --- | --- | --- | --- |
+| P0 | ~~`add-node-labels`~~ | 节点标签体系 + 按标签批量操作 | ✅ 已落地 #1336（标签 + 过滤 + selector rollout；审批分组策略仍留 `add-approval-label-scoping`） |
+| P0 | `add-alerting-webhooks` | webhook/事件订阅转发 | 复用 SSE 基建，纯增量；阶段 4 最小切口 |
+| P1 | 控制面限流/配额 | per-principal/per-node 限速 | 企业入场券 |
+| P1 | 控制面 DB 备份/恢复 | 快照/导出/恢复工具 | 企业入场券 |
+| P1 | `console-rbac-and-pagination` | 角色感知 UI + 服务端分页/过滤 + 本地死页面清理 | 纯前端消费，后端零改动 |
+| P2 | Job 级 pause/resume | `desired_state` 扩 pause + 恢复语义 | 与升级编排 pause 语义对齐 |
+| P2 | server 二进制可观测 | arkflow-server tracing/OTel 初始化 + 配置文件 | 小工程 |
+| P2 | mTLS | 客户端证书认证 | 等企业需求信号 |
+| P2 | Console 监控增强 | 时序图表、per-node 指标下钻、`/operations/status` 页、token 运行时输入、rollout 版本选择器 | 可拆分交付 |
+| P3 | 多用户/凭证管理面 | 用户 CRUD + token 生命周期；**前置：JWT 吊销机制**（否则凭证生命周期管理是空谈） | 阶段 4 主体；租户隔离同批评估 |
+| P3 | 外部 Secret Manager | Vault/K8s Secret 集成（现为 Hub env 预解析 `${secret:}`） | 阶段 4 |
+| P3 | OpenAPI 生成 + Agent 自升级编排 | API 文档生成；Agent 二进制升级编排（区别于 Job 升级） | 低频，按需 |
+
+### 11.5 已知设计边界（有文档记录、刻意为之，非缺口）
+
+- fleet 上限 256 节点硬编码（`hub.rs:56`）；placement_order/start 指纹仅内存、Hub 重启丢失（`hub.rs:150-171`）。
+- SQLite HA 仅开发用途；生产 HA 限 Postgres（租约选主 + epoch WriteFence 已闭环——7.3 序 5「Hub 高可用（远期）」的表述已过时）。
+- 自动扩缩容无：rescale 为显式声明的手动操作（`add-job-rescale`），压力再均衡不改并行度。
+- 审计未覆盖本地 standalone 面（仅 Hub 面）。

@@ -14,6 +14,8 @@ mod configuration;
 mod diagnostics;
 mod events;
 mod jobs;
+#[cfg(test)]
+mod node_labels_api_tests;
 mod nodes;
 mod operations;
 mod rollouts;
@@ -51,7 +53,8 @@ use jobs::{
     hub_jobs, hub_validate_job,
 };
 use nodes::{
-    hub_drain_node, hub_maintain_node, hub_nodes, hub_resume_node, hub_status, hub_system,
+    hub_drain_node, hub_maintain_node, hub_nodes, hub_replace_node_labels, hub_resume_node,
+    hub_status, hub_system,
 };
 use operations::{
     cancel_operation, hub_cancel_operation, hub_operation, hub_operations, operation, operations,
@@ -712,6 +715,7 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
             "/nodes/{node_id}/maintenance",
             post(hub_maintain_node).delete(hub_resume_node),
         )
+        .route("/nodes/{node_id}/labels", put(hub_replace_node_labels))
         .route("/metrics", get(hub_metrics))
         .route("/agent/register", post(agent_register))
         .route("/agent/heartbeat", post(agent_heartbeat))
@@ -1220,6 +1224,61 @@ async fn require_operator_action(
         })
         .await;
     Err(operator_denied(hub, supplied, action).await)
+}
+
+/// Normalize a target selection (explicit node ids XOR label selector) into
+/// the explicit node id list every downstream path consumes. The selector is
+/// resolved exactly once, here, so approval requests pin the resolved node
+/// set rather than the selector (see the `node-labels` capability).
+#[allow(clippy::result_large_err)] // same ready-made Response idiom as require_operator_action above
+async fn resolve_target_selection(
+    hub: &hub::Hub,
+    node_ids: Vec<String>,
+    target_selector: Option<std::collections::BTreeMap<String, String>>,
+) -> Result<Vec<String>, Response> {
+    match (node_ids.is_empty(), target_selector) {
+        (false, Some(_)) => Err(problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_target_selection",
+            "provide either node_ids or target_selector, not both".into(),
+        )),
+        // No selector: pass through untouched so the legacy validation
+        // (and its stable `invalid_rollout` error code) keeps answering
+        // exactly as before this capability existed.
+        (_, None) => Ok(node_ids),
+        (true, Some(selector)) => {
+            if selector.is_empty() {
+                return Err(problem(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_target_selection",
+                    "target_selector must contain at least one label".into(),
+                ));
+            }
+            if let Err(message) = hub::validate_labels(&selector) {
+                return Err(problem(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_target_selection",
+                    message,
+                ));
+            }
+            match hub.resolve_label_selector(&selector).await {
+                Ok(resolved) if resolved.is_empty() => Err(problem(
+                    StatusCode::BAD_REQUEST,
+                    "no_matching_nodes",
+                    format!(
+                        "target_selector {} matched no nodes",
+                        selector
+                            .iter()
+                            .map(|(key, value)| format!("{key}={value}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                )),
+                Ok(resolved) => Ok(resolved),
+                Err(error) => Err(hub_problem(error)),
+            }
+        }
+    }
 }
 
 fn hub_problem(error: hub::HubError) -> Response {

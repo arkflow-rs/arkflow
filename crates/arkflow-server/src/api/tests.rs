@@ -2837,7 +2837,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-async fn put_json(
+pub(super) async fn put_json(
     app: &Router,
     path: &str,
     bearer: &str,

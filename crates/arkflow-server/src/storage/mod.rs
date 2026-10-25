@@ -6,6 +6,7 @@ pub mod sqlite;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -48,6 +49,26 @@ pub struct NodeMaintenanceMutation {
     pub state: String,
     pub actor: Option<String>,
     pub correlation_id: Option<String>,
+}
+
+/// Node id with its full label map (durable fleet state for selectors).
+pub type NodeLabels = (String, BTreeMap<String, String>);
+
+/// Full replacement of a node's label map. Labels are operator-managed fleet
+/// state: nothing in the Agent registration path may construct this mutation.
+#[derive(Debug, Clone)]
+pub struct NodeLabelsMutation {
+    pub node_id: String,
+    pub labels: BTreeMap<String, String>,
+    pub actor: Option<String>,
+    pub correlation_id: Option<String>,
+}
+
+/// Decode a stored `labels_json` column. Corrupt JSON fails loudly rather
+/// than silently dropping operator-set labels.
+pub(crate) fn decode_node_labels(json: &str) -> Result<BTreeMap<String, String>, StorageError> {
+    serde_json::from_str(json)
+        .map_err(|error| StorageError::Encoding(format!("decode node labels: {error}")))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -470,7 +491,7 @@ pub enum StorageError {
 /// Schema version this binary's DDL understands. Each backend stamps it
 /// into the database during initialization and refuses to start when the
 /// stored stamp is newer (an older binary must not operate a newer schema).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Outcome of `begin_write_fence`: a lock held until `end_write_fence`
 /// (`Held`) or a verified passthrough with nothing to release.
@@ -836,6 +857,14 @@ storage_ops! {
     ("get_node_maintenance", GetNodeMaintenance, get_node_maintenance) plain Option<String> {
         node_id: String as s,
     },
+    ("replace_node_labels", ReplaceNodeLabels, replace_node_labels) fenced Option<BTreeMap<String, String>> {
+        mutation: NodeLabelsMutation as v,
+        now_ms: u64 as v,
+    },
+    ("get_node_labels", GetNodeLabels, get_node_labels) plain Option<BTreeMap<String, String>> {
+        node_id: String as s,
+    },
+    ("list_node_labels", ListNodeLabels, list_node_labels) plain Vec<NodeLabels> {},
     ("operational_aggregates", OperationalAggregates, operational_aggregates) plain OperationalAggregates {
         now_ms: u64 as v,
     },
@@ -1100,6 +1129,26 @@ pub trait StorageBackend: Send + Sync + 'static {
         now_ms: u64,
     ) -> Result<bool, StorageError>;
     async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError>;
+    /// Replace a node's full label map. Returns the previous labels when the
+    /// node row exists, `None` for an unknown node. Labels are never part of
+    /// `upsert_node`: registration/report persistence must not touch them.
+    async fn replace_node_labels(
+        &self,
+        mutation: NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<BTreeMap<String, String>>, StorageError>;
+    /// Current labels for a node, `None` for an unknown node. Corrupt JSON
+    /// fails loudly rather than silently dropping operator-set labels.
+    async fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, StorageError>;
+    /// Every persisted node with its label map, in storage order. Selector
+    /// resolution matches these durable records so a node that has not
+    /// re-registered since a Hub restart still resolves.
+    async fn list_node_labels(
+        &self,
+    ) -> Result<Vec<(String, BTreeMap<String, String>)>, StorageError>;
     async fn operational_aggregates(
         &self,
         now_ms: u64,
@@ -1536,6 +1585,37 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::get_node_maintenance(backend, node_id).await,
             Self::Postgres(backend) => StorageBackend::get_node_maintenance(backend, node_id).await,
+        }
+    }
+    async fn replace_node_labels(
+        &self,
+        mutation: NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<BTreeMap<String, String>>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::replace_node_labels(backend, mutation, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::replace_node_labels(backend, mutation, now_ms).await
+            }
+        }
+    }
+    async fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::get_node_labels(backend, node_id).await,
+            Self::Postgres(backend) => StorageBackend::get_node_labels(backend, node_id).await,
+        }
+    }
+    async fn list_node_labels(
+        &self,
+    ) -> Result<Vec<(String, BTreeMap<String, String>)>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_node_labels(backend).await,
+            Self::Postgres(backend) => StorageBackend::list_node_labels(backend).await,
         }
     }
     async fn operational_aggregates(
@@ -6179,5 +6259,137 @@ mod job_storage_tests {
                 .len(),
             1
         );
+    }
+
+    /// Labels are operator-managed fleet state: the storage contract must keep
+    /// them across Agent re-registration upserts and audit every replacement.
+    #[tokio::test]
+    async fn node_labels_roundtrip_and_re_registration_preserves_them() {
+        let store = ControlPlaneStore::contract("node_labels_roundtrip").await;
+        let mutation = || NodeMutation {
+            node_id: "node-a".into(),
+            version: "v1".into(),
+            state: "online".into(),
+            capabilities_json: "[]".into(),
+            boot_id: Some("boot-1".into()),
+            report_seq: Some(1),
+            last_seen_at_ms: 10,
+            lease_expires_at_ms: 4_102_444_800_000,
+            maintenance_state: None,
+            maintenance_updated_at_ms: None,
+        };
+        store.upsert_node(mutation()).await.unwrap();
+
+        // Unknown node returns None and persists nothing.
+        assert!(store
+            .replace_node_labels(
+                NodeLabelsMutation {
+                    node_id: "node-zzz".into(),
+                    labels: BTreeMap::from([("env".into(), "prod".into())]),
+                    actor: Some("operator-1".into()),
+                    correlation_id: None,
+                },
+                now_ms()
+            )
+            .await
+            .unwrap()
+            .is_none());
+
+        // First replacement returns the previous (empty) map.
+        let labels = BTreeMap::from([
+            ("env".to_owned(), "prod".to_owned()),
+            ("tier".to_owned(), "edge".to_owned()),
+        ]);
+        let previous = store
+            .replace_node_labels(
+                NodeLabelsMutation {
+                    node_id: "node-a".into(),
+                    labels: labels.clone(),
+                    actor: Some("operator-1".into()),
+                    correlation_id: Some("corr-1".into()),
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap()
+            .expect("node exists");
+        assert!(previous.is_empty());
+        assert_eq!(
+            store.get_node_labels("node-a").await.unwrap().unwrap(),
+            labels
+        );
+
+        // Agent re-registration upsert must NOT touch the labels column.
+        store.upsert_node(mutation()).await.unwrap();
+        assert_eq!(
+            store.get_node_labels("node-a").await.unwrap().unwrap(),
+            labels
+        );
+
+        // Full replacement semantics: the new map wins entirely.
+        let replacement = BTreeMap::from([("env".to_owned(), "staging".to_owned())]);
+        let previous = store
+            .replace_node_labels(
+                NodeLabelsMutation {
+                    node_id: "node-a".into(),
+                    labels: replacement.clone(),
+                    actor: Some("operator-2".into()),
+                    correlation_id: None,
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap()
+            .expect("node exists");
+        assert_eq!(previous, labels);
+        assert_eq!(
+            store.get_node_labels("node-a").await.unwrap().unwrap(),
+            replacement
+        );
+
+        // Every accepted replacement is audited with its actor.
+        let audit_records = store.list_audit(Some("node-a")).await.unwrap();
+        let audit = audit_records
+            .iter()
+            .filter(|record| record.action == "node.labels")
+            .collect::<Vec<_>>();
+        assert_eq!(audit.len(), 2, "both replacements audited");
+        assert!(audit.iter().all(|record| record.outcome == "accepted"));
+
+        assert!(store
+            .get_node_labels("node-missing")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn sqlite_node_labels_column_migrates_existing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("labels-migrate.db");
+        {
+            let backend = SqliteBackend::open(&path).unwrap();
+            backend
+                .with_connection(|connection| {
+                    connection.execute("ALTER TABLE cp_nodes DROP COLUMN labels_json", [])?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        // Reopen runs the guarded migration: the column returns with its
+        // default, and re-running is idempotent.
+        let backend = SqliteBackend::open(&path).unwrap();
+        backend
+            .with_connection(|connection| {
+                let has_column: bool = connection
+                    .prepare("PRAGMA table_info(cp_nodes)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .any(|name| name == "labels_json");
+                assert!(has_column);
+                Ok(())
+            })
+            .unwrap();
     }
 }

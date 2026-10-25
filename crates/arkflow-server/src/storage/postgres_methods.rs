@@ -275,6 +275,79 @@ impl StorageBackend for PostgresBackend {
         }
     }
 
+    async fn replace_node_labels(
+        &self,
+        mutation: NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        let encoded = serde_json::to_string(&mutation.labels)
+            .map_err(|error| StorageError::Encoding(format!("encode node labels: {error}")))?;
+        {
+            let mut transaction = self.begin().await?;
+            let __ret = async {
+            let previous_json: Option<String> = transaction
+                .query_row(
+                    "SELECT labels_json FROM cp_nodes WHERE node_id = ?1",
+                    binds![&mutation.node_id],
+                    |row| row.get(0),
+                ).await
+                .optional()?;
+            let Some(previous_json) = previous_json else { return Ok(None) };
+            let previous = decode_node_labels(&previous_json)?;
+            let summary = format!("{}->{} labels", previous.len(), mutation.labels.len());
+            transaction.execute(
+                "UPDATE cp_nodes SET labels_json = ?2, updated_at_ms = ?3 WHERE node_id = ?1",
+                binds![mutation.node_id, encoded, now_ms],
+            ).await?;
+            transaction.execute(
+                "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES (?1, 'node_labels_changed', 'succeeded', ?2, ?3, ?4, ?5)",
+                binds![mutation.node_id, summary, mutation.correlation_id, mutation.actor, now_ms],
+            ).await?;
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES (?1, 'node.labels', 'node', ?2, ?2, ?3, 'accepted', ?4, ?5)",
+                binds![mutation.actor, mutation.node_id, mutation.correlation_id, summary, now_ms],
+            ).await?;
+            Ok(Some(previous))
+            }.await;
+            transaction.commit().await?;
+            __ret
+        }
+    }
+
+    async fn list_node_labels(&self) -> Result<Vec<NodeLabels>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            let rows = connection
+                .query_all(
+                    "SELECT node_id, labels_json FROM cp_nodes",
+                    binds![],
+                    |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+                )
+                .await?;
+            rows.into_iter()
+                .map(|(node_id, json)| Ok((node_id, decode_node_labels(&json)?)))
+                .collect()
+        }
+    }
+
+    async fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            connection
+                .query_row(
+                    "SELECT labels_json FROM cp_nodes WHERE node_id = ?1",
+                    binds![node_id],
+                    |row| row.get::<String>(0),
+                ).await
+                .optional()?
+                .map(|json| decode_node_labels(&json))
+                .transpose()
+        }
+    }
+
 
     async fn claim_outbox(
         &self,

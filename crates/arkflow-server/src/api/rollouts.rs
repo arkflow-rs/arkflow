@@ -31,6 +31,16 @@ pub(super) async fn create_rollout(
             message,
         );
     }
+    let node_ids = match super::resolve_target_selection(
+        &hub,
+        request.node_ids,
+        request.target_selector,
+    )
+    .await
+    {
+        Ok(node_ids) => node_ids,
+        Err(response) => return response,
+    };
     let actor = Some(principal.id);
     let correlation_id = headers
         .get("x-correlation-id")
@@ -39,7 +49,7 @@ pub(super) async fn create_rollout(
     match hub
         .create_rollout(
             request.config_version,
-            request.node_ids,
+            node_ids,
             request.batch_size,
             actor,
             correlation_id,

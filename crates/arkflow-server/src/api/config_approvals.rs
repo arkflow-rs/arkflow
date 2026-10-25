@@ -31,10 +31,20 @@ pub(super) async fn submit_approval(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    let node_ids = match super::resolve_target_selection(
+        &hub,
+        request.node_ids,
+        request.target_selector,
+    )
+    .await
+    {
+        Ok(node_ids) => node_ids,
+        Err(response) => return response,
+    };
     match hub
         .submit_config_approval(
             request.config_version,
-            request.node_ids,
+            node_ids,
             request.batch_size,
             principal.id,
         )

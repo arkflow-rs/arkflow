@@ -794,6 +794,7 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
                 streams_failed: 0,
                 maintenance_state: NodeMaintenanceState::Active,
                 data_address: None,
+                labels: BTreeMap::new(),
             },
             session_token: String::new(),
             session_expires_at_ms: now + 1_000,
