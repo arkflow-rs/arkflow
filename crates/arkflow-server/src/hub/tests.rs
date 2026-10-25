@@ -4885,9 +4885,21 @@ async fn succeed_all_starts(hub: &Hub, auth: &AgentAuth) -> usize {
 
 /// Register one node, create a durable running Job at version 1, and drive
 /// its start to a succeeded, observed-running state.
+///
+/// The fixture never heartbeats `node-a`, so it runs with a generous node
+/// lease: with the default 1s test lease a slow (loaded CI) run expires the
+/// node mid-test and the rollback's `job_start` is rejected as
+/// `node_unavailable`, leaving the Job observed `stopped`. Phase deadlines
+/// are driven explicitly through `expire_phase_deadline`, never by the clock.
 async fn atomic_upgrade_fixture(job_id: &str) -> (Hub, AgentAuth) {
     let store = crate::storage::ControlPlaneStore::contract("atomic_upgrade_fixture").await;
-    let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+    let hub = Hub::with_storage(
+        HubConfig {
+            lease_ttl_ms: 60_000,
+            ..config()
+        },
+        StorageActor::start(store, 8),
+    );
     let session = hub
         .register(RegisterRequest {
             data_address: None,

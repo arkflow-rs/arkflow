@@ -609,7 +609,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 ### 11.2 后端能力缺失（需立项）
 
 1. ~~**节点标签体系**~~ → ✅ 已由 #1336（`add-node-labels`）落地：Hub 管理标签 + 列表过滤 + selector rollout；剩余「按标签批量流命令」「标签分组审批策略」仍开放。
-2. **告警/webhook/事件订阅**：前后端零实现（grep webhook/notification/slack/email 仅误报命中）；SSE 事件流基建已具备，无向外转发能力。对应 5.7 阶段 4 整条未动。
+2. ~~**告警/webhook/事件订阅**~~ → ✅ 已由 #1338（`add-alerting-webhooks`，2026-10-25 归档，新 spec `webhook-alerting`）落地：订阅全量替换 + 前缀过滤转发 + HMAC 签名 + 退避重试 + 连续失败自动暂停 + leader-only 投递 + Console Settings 管理面。5.7 阶段 4 中 Slack/邮件原生通道仍开放（可经 webhook 接入）。
 3. **限流/配额**：无任何 per-principal/per-node 请求限速或资源配额，仅请求体大小限制（本地 1MB/Hub 4MB）与内存硬上限（`MAX_NODES=256`、`MAX_COMMANDS_PER_NODE=128`、`MAX_OPERATIONS=1024`，`hub.rs:56-59`）。
 4. **控制面 DB 备份/恢复**：无快照/导出/恢复工具，仅停机 sqlite→pg 一次性迁移（`migrate_tool.rs`）。注意 Job 级 checkpoint/savepoint 恢复是完整的，勿混淆。
 5. **用户/凭证管理面**：RBAC 三角色 + 资源 scope + OIDC（bearer + 浏览器登录）已实现，但无用户 CRUD、无 token 签发/吊销/轮换 API，JWT 无吊销（`oidc.rs:41` 注释自认取舍）；租户/团队隔离未做。
@@ -626,7 +626,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 3. **监控时序图表**：无图表库，Overview/Runtime 仅最新标量快照（`overview.tsx:163-176`）。
 4. **本地模式死页面**：导航 10 项常驻，本地路由仅 5 个（`mod.rs:402-435`）——连本地引擎时 Jobs/Rollouts/Approvals/Audit/Events 五页 404。
 5. **运行时 token 输入/身份切换**：静态 token 仅构建期 `VITE_API_TOKEN` 注入（`api.ts:322`），无运行时输入；OIDC 401 自动跳转已有。
-6. 小项：Rollout 创建手输版本号（未接现成版本选择器，`rollouts.tsx:81-86`）；每节点指标下钻、`/operations/status` 协议/能力兼容矩阵页、流 desired-state（含 generation CAS）入口、TOML 编辑（后端 `ConfigCandidate` 支持 toml）均无 UI；Settings 页空壳；zh 字典为 Partial，缺 key 静默回落英文无完整性校验。
+6. 小项：Rollout 创建手输版本号（未接现成版本选择器，`rollouts.tsx:81-86`）；每节点指标下钻、`/operations/status` 协议/能力兼容矩阵页、流 desired-state（含 generation CAS）入口、TOML 编辑（后端 `ConfigCandidate` 支持 toml）均无 UI；~~Settings 页空壳~~（#1338 已填入 Webhook 管理面）；~~zh 字典为 Partial，缺 key 静默回落英文无完整性校验~~（2026-10-25 核实：`zh.ts` 自 #1261 起 `satisfies Record<keyof typeof en, string>`，缺 key 编译期报错）。
 
 ### 11.4 补齐 Roadmap（价值优先序）
 
