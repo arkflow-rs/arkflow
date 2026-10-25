@@ -51,6 +51,9 @@ pub struct NodeMaintenanceMutation {
     pub correlation_id: Option<String>,
 }
 
+/// Node id with its full label map (durable fleet state for selectors).
+pub type NodeLabels = (String, BTreeMap<String, String>);
+
 /// Full replacement of a node's label map. Labels are operator-managed fleet
 /// state: nothing in the Agent registration path may construct this mutation.
 #[derive(Debug, Clone)]
@@ -861,7 +864,7 @@ storage_ops! {
     ("get_node_labels", GetNodeLabels, get_node_labels) plain Option<BTreeMap<String, String>> {
         node_id: String as s,
     },
-    ("list_node_labels", ListNodeLabels, list_node_labels) plain Vec<(String, BTreeMap<String, String>)> {},
+    ("list_node_labels", ListNodeLabels, list_node_labels) plain Vec<NodeLabels> {},
     ("operational_aggregates", OperationalAggregates, operational_aggregates) plain OperationalAggregates {
         now_ms: u64 as v,
     },

@@ -520,9 +520,7 @@ impl SqliteBackend {
         })
     }
 
-    pub fn list_node_labels(
-        &self,
-    ) -> Result<Vec<(String, std::collections::BTreeMap<String, String>)>, StorageError> {
+    pub fn list_node_labels(&self) -> Result<Vec<super::NodeLabels>, StorageError> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare("SELECT node_id, labels_json FROM cp_nodes")?;
             let rows = statement.query_map([], |row| {

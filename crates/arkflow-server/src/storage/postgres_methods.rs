@@ -314,7 +314,7 @@ impl StorageBackend for PostgresBackend {
         }
     }
 
-    async fn list_node_labels(&self) -> Result<Vec<(String, std::collections::BTreeMap<String, String>)>, StorageError> {
+    async fn list_node_labels(&self) -> Result<Vec<NodeLabels>, StorageError> {
         {
             let mut connection = self.lease().await?;
             let rows = connection
