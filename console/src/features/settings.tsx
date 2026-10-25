@@ -69,7 +69,9 @@ function WebhooksPanel() {
           <h3>{t('settings.webhooks.title')}</h3>
           <span>{t('settings.webhooks.subtitle')}</span>
         </div>
-        <p className="error-text">{t('settings.webhooks.unavailable', { message: String(webhooks.error) })}</p>
+        <p className="error-text">
+          {t('settings.webhooks.unavailable', { message: String(webhooks.error) })}
+        </p>
       </section>
     )
   }
@@ -152,7 +154,11 @@ function WebhooksPanel() {
           {t('settings.webhooks.add')}
         </button>
       </div>
-      {replace.isError ? <p className="error-text">{t('settings.webhooks.replaceError', { message: String(replace.error) })}</p> : null}
+      {replace.isError ? (
+        <p className="error-text">
+          {t('settings.webhooks.replaceError', { message: String(replace.error) })}
+        </p>
+      ) : null}
       {form ? (
         <WebhookForm
           form={form}
@@ -217,9 +223,7 @@ function WebhookRow({
       <td>
         <code>{subscription.event_types.join(', ')}</code>
       </td>
-      <td>
-        {subscription.enabled ? t('settings.webhooks.enabled') : t('settings.webhooks.paused')}
-      </td>
+      <td>{subscription.enabled ? t('settings.webhooks.enabled') : t('settings.webhooks.paused')}</td>
       <td>
         <div className="toolbar">
           <button type="button" onClick={onTest}>
@@ -261,11 +265,7 @@ function WebhookForm({
     >
       <label>
         <span>{t('settings.webhooks.id')}</span>
-        <input
-          value={form.id}
-          onChange={(event) => onChange({ ...form, id: event.target.value })}
-          required
-        />
+        <input value={form.id} onChange={(event) => onChange({ ...form, id: event.target.value })} required />
       </label>
       <label>
         <span>{t('settings.webhooks.url')}</span>
@@ -293,9 +293,7 @@ function WebhookForm({
           onChange={(event) => onChange({ ...form, secret: event.target.value })}
         />
         <small>
-          {hasSecret
-            ? t('settings.webhooks.secretReplaceHint')
-            : t('settings.webhooks.secretHint')}
+          {hasSecret ? t('settings.webhooks.secretReplaceHint') : t('settings.webhooks.secretHint')}
         </small>
       </label>
       <label className="checkbox">

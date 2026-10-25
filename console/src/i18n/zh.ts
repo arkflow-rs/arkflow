@@ -207,8 +207,7 @@ export const zh = {
   'settings.webhooks.secret': '签名密钥',
   'settings.webhooks.secretHint':
     '可选。设置后每次投递携带 X-Arkflow-Signature 头（请求体的十六进制 HMAC-SHA256）。留空则不签名。',
-  'settings.webhooks.secretReplaceHint':
-    '已配置密钥且永不回显。留空表示保留原密钥；输入新值则替换。',
+  'settings.webhooks.secretReplaceHint': '已配置密钥且永不回显。留空表示保留原密钥；输入新值则替换。',
 
   // Jobs page
   'jobs.title': '有状态作业',
