@@ -1241,12 +1241,10 @@ async fn resolve_target_selection(
             "invalid_target_selection",
             "provide either node_ids or target_selector, not both".into(),
         )),
-        (false, None) => Ok(node_ids),
-        (true, None) => Err(problem(
-            StatusCode::BAD_REQUEST,
-            "invalid_target_selection",
-            "a target selection is required: node_ids or target_selector".into(),
-        )),
+        // No selector: pass through untouched so the legacy validation
+        // (and its stable `invalid_rollout` error code) keeps answering
+        // exactly as before this capability existed.
+        (_, None) => Ok(node_ids),
         (true, Some(selector)) => {
             if selector.is_empty() {
                 return Err(problem(

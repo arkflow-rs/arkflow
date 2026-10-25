@@ -34,6 +34,7 @@
 - 迁移：两后端均走既有机制——SQLite 以 `PRAGMA table_info` 守卫 + 条件 `ALTER TABLE cp_nodes ADD COLUMN labels_json TEXT NOT NULL DEFAULT '{}'`（`storage/sqlite.rs:2698-2727` 已有 cp_nodes 加 `node_version`/`maintenance_state` 列的完全相同先例；`PRAGMA user_version` 只是迁移跑完后的盖章，不是触发器）；PG `ADD COLUMN IF NOT EXISTS` + `cp_schema_meta` 版本推进（`postgres.rs:714` 先例）。新建库的 `CREATE TABLE cp_nodes` 同步加列，DEFAULT 使无标签 INSERT 不必携带该列。常量默认值在两后端均为合法 DDL。
 - 读写：`NodeRecord` 增 `labels: BTreeMap<String, String>`（BTreeMap 保证序列化确定序，便于快照/测试断言），行映射层与 `capabilities_json` 同法。
 - **实现红线（CR 确认）**：`upsert_node` 的 INSERT/ON CONFLICT 列清单是显式集合（`sqlite.rs:403`、`postgres_methods.rs:180` 同一 SQL 文本），**不得**把 labels_json 加进 `NodeMutation` 或该 SQL——列不在清单里即天然不被 register/heartbeat/report 的 upsert 触碰，"重注册不冲标签"正是靠这一点免费成立；一旦把空 labels 塞进 upsert，每次 Agent 重注册都会冲掉 operator 标签。标签的唯一写路径是 `replace_node_labels` 专用方法（独立 UPDATE 语句）。
+- **注册回灌与并发 PUT 的全序（CR 二轮确认）**：注册的预插入回灌读与 `replace_node_labels` 的"存储写→内存写"存在竞态窗口（窗口内 selector 会解析到过期标签）。修复：注册在 upsert 完成后，于**单次持有节点表写锁期间**完成"重读存储+补内存"——PUT 的内存写需要同一把锁，故任一 PUT 要么存储写在我们的读之前（被读到），要么内存写在我们的释放之后（覆盖我们），内存态不可能以过期标签结束本次注册。晚期重读失败不使注册失败（upsert/游标重置等副作用已发生）；早期回灌读失败则照常拒绝（尚无副作用）。
 - 备选否决：独立 `cp_node_labels` 表——为 ≤16×256 规模引入 join 与第二套迁移面不值。
 
 ### D3. 变更语义：`PUT /nodes/{id}/labels` 全量替换，授权 `ManageNodes`

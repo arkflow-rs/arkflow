@@ -257,7 +257,8 @@ async fn rollout_target_selector_over_http() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "invalid_target_selection");
 
-    // Neither: rejected.
+    // Neither: rejected by the legacy validation path, keeping the
+    // pre-existing `invalid_rollout` error code for old clients.
     let (status, body) = post_json(
         &app,
         "/api/v1/rollouts",
@@ -266,7 +267,7 @@ async fn rollout_target_selector_over_http() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["code"], "invalid_target_selection");
+    assert_eq!(body["code"], "invalid_rollout");
 
     // Empty selector map: rejected (never an implicit fleet-wide match).
     let (status, body) = post_json(
