@@ -1230,6 +1230,7 @@ async fn require_operator_action(
 /// the explicit node id list every downstream path consumes. The selector is
 /// resolved exactly once, here, so approval requests pin the resolved node
 /// set rather than the selector (see the `node-labels` capability).
+#[allow(clippy::result_large_err)] // same ready-made Response idiom as require_operator_action above
 async fn resolve_target_selection(
     hub: &hub::Hub,
     node_ids: Vec<String>,
