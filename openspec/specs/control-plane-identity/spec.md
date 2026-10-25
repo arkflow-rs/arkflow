@@ -17,7 +17,7 @@ The service SHALL authorize actions by principal, role, action, and resource sco
 #### Scenario: Deny an out-of-scope action
 
 - **WHEN** an authenticated principal lacks permission for the target node or requested action
-- **THEN** the service returns 403 and leaves desired state, operations, and audit state unchanged
+- **THEN** the service returns 403, leaves desired state and operations unchanged, and audits the denial
 
 #### Scenario: Viewer cannot manage webhooks
 
