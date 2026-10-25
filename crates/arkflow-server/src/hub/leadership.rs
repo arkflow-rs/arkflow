@@ -93,6 +93,10 @@ impl Leadership {
 }
 
 const HUB_NODE_ID_FOR_EVENTS: &str = "hub";
+/// Event type broadcast on every leadership transition. Leader-only
+/// workers that consume the event broadcast (the webhook forwarder) key
+/// off it to reconcile immediately instead of waiting for their next tick.
+pub(crate) const LEADERSHIP_EVENT_TYPE: &str = "hub.leadership";
 
 impl Hub {
     /// Opt into lease election. Call before `serve_hub`. Resolves the holder
@@ -176,7 +180,7 @@ impl Hub {
         );
         let event = ControlEvent {
             occurred_at_ms: now_ms(),
-            event_type: "hub.leadership".into(),
+            event_type: LEADERSHIP_EVENT_TYPE.into(),
             stream_id: None,
             outcome: next.role().into(),
             message: Some(format!(

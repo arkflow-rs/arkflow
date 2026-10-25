@@ -8,6 +8,7 @@
 //! must not treat webhooks as the sole record of any event.
 
 use super::error::HubError;
+use super::leadership::LEADERSHIP_EVENT_TYPE;
 use super::wire::HubEvent;
 use super::{now_ms, Hub};
 use crate::storage::{WebhookSetMutation, WebhookSubscription};
@@ -254,6 +255,12 @@ impl PendingQueue {
 /// publishes `webhook.paused`. The forwarder's registry owns the queue's
 /// sending half; this loop owns the draining. `backoff` is the production
 /// schedule; tests inject a zero schedule.
+///
+/// Every attempt is gated on leadership: the forwarder aborts this task on
+/// a transition, but the event already dequeued (possibly mid-backoff) and
+/// any transition the forwarder has not observed yet must not be delivered
+/// by a demoted leader either. Observing a lost lease ends the loop; the
+/// forwarder spawns a fresh task with an empty queue on the next term.
 async fn run_subscription_delivery_with(
     hub: Hub,
     id: String,
@@ -266,6 +273,13 @@ async fn run_subscription_delivery_with(
         let event = queue.next().await;
         let mut delivered = false;
         for attempt in 0..WEBHOOK_MAX_ATTEMPTS {
+            if !hub.is_leader().await {
+                tracing::info!(
+                    webhook = %id,
+                    "webhook delivery stopped: this hub no longer holds the lease"
+                );
+                return;
+            }
             match deliver_once(&subscription, &event).await {
                 Ok(()) => {
                     delivered = true;
@@ -309,21 +323,31 @@ struct DeliveryTask {
 /// out to per-subscription queues. Only the lease holder forwards; a
 /// standby keeps its subscription snapshot but runs no delivery tasks, and
 /// on takeover resumes with subsequently published events (no replay).
+///
+/// Delivery tasks are reconciled against leadership and the durable
+/// subscription set on startup, periodically, and immediately on every
+/// leadership transition (which the Hub broadcasts on this same channel):
+/// a demoted leader aborts its tasks and discards their queues at once
+/// rather than up to a refresh interval later, and a promoted standby
+/// starts forwarding this term's events without waiting for its next tick.
 pub async fn run_webhook_forwarder(hub: Hub, cancellation: tokio_util::sync::CancellationToken) {
     let mut receiver = hub.subscribe();
     let mut subscriptions: Vec<WebhookSubscription> = Vec::new();
     let mut tasks: HashMap<String, DeliveryTask> = HashMap::new();
     let mut refresh = tokio::time::interval(WEBHOOK_REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    refresh.tick().await; // the first tick fires immediately; skip it
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => break,
+            // The first tick fires immediately: that is the startup reconcile.
             _ = refresh.tick() => {
                 refresh_subscriptions(&hub, &mut subscriptions, &mut tasks).await;
             }
             update = receiver.recv() => match update {
                 Ok(event) => {
+                    if event.event.event_type == LEADERSHIP_EVENT_TYPE {
+                        refresh_subscriptions(&hub, &mut subscriptions, &mut tasks).await;
+                    }
                     if !hub.is_leader().await {
                         continue;
                     }
@@ -342,6 +366,8 @@ pub async fn run_webhook_forwarder(hub: Hub, cancellation: tokio_util::sync::Can
                         missed,
                         "webhook forwarder lagged behind the event broadcast; lagged events are not replayed"
                     );
+                    // A leadership transition may be among the missed events.
+                    refresh_subscriptions(&hub, &mut subscriptions, &mut tasks).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
@@ -352,24 +378,33 @@ pub async fn run_webhook_forwarder(hub: Hub, cancellation: tokio_util::sync::Can
     }
 }
 
-/// Reconcile the running delivery tasks with the durable subscription set.
-/// Storage errors keep the previous snapshot (the API or a restart will
-/// correct it); a standby drains all tasks.
+/// Reconcile the running delivery tasks with leadership and the durable
+/// subscription set. A standby drains all tasks — dropping them discards
+/// queued pre-transition events, which a later term must not replay — and
+/// does so before consulting storage, because losing the lease to an
+/// unreachable store must still stop deliveries. Storage errors otherwise
+/// keep the previous snapshot (the API or a restart will correct it).
 async fn refresh_subscriptions(
     hub: &Hub,
     subscriptions: &mut Vec<WebhookSubscription>,
     tasks: &mut HashMap<String, DeliveryTask>,
 ) {
-    let Ok(fresh) = hub.list_webhooks().await else {
-        return;
-    };
     if !hub.is_leader().await {
         for (_, task) in tasks.drain() {
             task.handle.abort();
         }
-        *subscriptions = fresh;
+        if let Ok(fresh) = hub.list_webhooks().await {
+            *subscriptions = fresh;
+        }
         return;
     }
+    let Ok(fresh) = hub.list_webhooks().await else {
+        return;
+    };
+    // A delivery loop exits on its own after auto-pausing or on observing
+    // a lost lease; reap it so a still-enabled subscription gets a fresh
+    // task and queue below.
+    tasks.retain(|_, task| !task.handle.is_finished());
     let active: BTreeSet<String> = fresh
         .iter()
         .filter(|subscription| subscription.enabled)
@@ -728,6 +763,13 @@ mod tests {
     }
 
     async fn spawn_receiver(status_sequence: Vec<u16>) -> Receiver {
+        spawn_receiver_with_delay(status_sequence, Duration::ZERO).await
+    }
+
+    /// Requests are captured on arrival, then held for `delay` before the
+    /// response — a slow receiver lets a test park a second event in the
+    /// subscription queue behind an in-flight one.
+    async fn spawn_receiver_with_delay(status_sequence: Vec<u16>, delay: Duration) -> Receiver {
         use axum::routing::post;
         let requests: std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -757,6 +799,7 @@ mod tests {
                             guard.push(captured);
                             index
                         };
+                        tokio::time::sleep(delay).await;
                         let status = sequence
                             .get(index)
                             .copied()
@@ -924,6 +967,97 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         task.abort();
+        receiver._serve.abort();
+    }
+
+    async fn ha_hub_with_storage(label: &str) -> Hub {
+        hub_with_storage(label)
+            .await
+            .with_ha(crate::hub::HubHaConfig {
+                enabled: true,
+                lease_ttl_ms: 60_000,
+                holder_id: Some("hub-a".into()),
+                advertise_url: None,
+            })
+    }
+
+    fn publish(hub: &Hub, event_type: &str) {
+        let _ = hub.updates.send(hub_event(event_type));
+    }
+
+    fn received_event_types(receiver: &Receiver) -> Vec<String> {
+        receiver
+            .requests
+            .lock()
+            .expect("receiver lock")
+            .iter()
+            .map(|request| request.event_type.clone())
+            .collect()
+    }
+
+    async fn wait_for_requests(receiver: &Receiver, count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if receiver.requests.lock().expect("receiver lock").len() >= count {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "receiver saw too few requests"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarder_follows_leadership_transitions_without_replay() {
+        // Each request is held for 300ms so a second event sits queued
+        // behind an in-flight one at the moment the lease is lost.
+        let receiver = spawn_receiver_with_delay(vec![200], Duration::from_millis(300)).await;
+        let hub = ha_hub_with_storage("forwarder_leadership_transitions").await;
+        // Persist the subscription while still the unfenced single
+        // instance, then enter the election as a standby.
+        hub.replace_webhooks(
+            vec![subscription("alerts", &receiver.url, &["rollout."])],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        hub.enter_election().await;
+        assert!(!hub.is_leader().await);
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let forwarder = tokio::spawn(run_webhook_forwarder(hub.clone(), cancellation.clone()));
+
+        // Promotion broadcasts `hub.leadership` ahead of anything published
+        // afterwards: the forwarder reconciles on it (spawning the delivery
+        // task) before it sees the first event, with no refresh tick needed.
+        assert!(hub.run_election_tick().await.is_leader());
+        publish(&hub, "rollout.one");
+        publish(&hub, "rollout.two");
+        wait_for_requests(&receiver, 1).await;
+
+        // Lease lost while `one` is in flight and `two` is queued: the task
+        // is aborted and its queue discarded at once, and nothing published
+        // during the standby term is forwarded.
+        hub.step_down("test lease lost").await;
+        publish(&hub, "rollout.three");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(received_event_types(&receiver), vec!["rollout.one"]);
+
+        // Re-acquiring the lease resumes with this term's events only: the
+        // pre-loss `two` and the standby-term `three` are never replayed.
+        assert!(hub.run_election_tick().await.is_leader());
+        publish(&hub, "rollout.four");
+        wait_for_requests(&receiver, 2).await;
+        assert_eq!(
+            received_event_types(&receiver),
+            vec!["rollout.one", "rollout.four"]
+        );
+
+        cancellation.cancel();
+        let _ = forwarder.await;
         receiver._serve.abort();
     }
 }

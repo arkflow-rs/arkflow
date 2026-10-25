@@ -353,11 +353,10 @@ async fn webhook_forwarder_delivers_matching_events_and_stops_on_standby() {
         forwarder_hub.run_webhook_forwarder(cancellation).await;
     });
 
-    // The forwarder registers its broadcast receiver immediately but loads
-    // the subscription set on its first refresh tick (~2s): a broadcast
-    // arriving before the tasks exist would be dropped, so wait for the
-    // first refresh before triggering the lifecycle event.
-    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    // The forwarder reconciles on startup, but asynchronously: give it a
+    // moment to load the subscription set, since a broadcast arriving
+    // before the delivery task exists is dropped (best-effort, no replay).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Re-enabling `sleeper` persists a webhook.resumed event and
     // broadcasts it; the forwarder must deliver it to `meta`.
