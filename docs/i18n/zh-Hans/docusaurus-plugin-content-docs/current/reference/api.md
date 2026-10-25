@@ -190,6 +190,23 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 | `GET` | `/events` | 查询集群事件日志。 |
 | `GET` | `/events/stream` | 实时事件的 Server-Sent Events 流。 |
 | `GET` | `/audit` | 有界审计历史(`?resource_id={id}`),包含被接受与被拒绝的变更。 |
+| `GET`/`PUT` | `/webhooks` | 列出/全量替换 webhook 告警订阅集(参见[Webhook 告警](#webhook-告警))。 |
+| `POST` | `/webhooks/{id}/test` | 同步投递一条合成 `webhook.test` 测试事件。 |
+
+#### Webhook 告警
+
+`GET/PUT /webhooks` 以全量替换语义管理 webhook 订阅集(至多 16 条)。
+两个路由(以及 `POST /webhooks/{id}/test`)都要求 `ManageWebhooks` 动作
+——admin 与 operator 角色——每次接受的替换或拒绝均入审计
+(`webhook.replace`)。每个条目包含 `id`、`url`(仅 `http`/`https`)、
+`event_types`(前缀过滤)、`enabled` 与可选的只写 `secret`:响应永不回显
+secret;省略时保留该 id 已存的密钥,显式空字符串则清除。
+
+投递为 best-effort(仅 leader 转发、有界丢最旧队列、3 次退避重试、连续
+5 次失败后自动暂停并发布 `webhook.paused`/`webhook.resumed` 生命周期事
+件)。带签名的投递携带 `X-Arkflow-Signature`(请求体的十六进制
+HMAC-SHA256)。完整契约参见
+[Webhook 告警](/docs/operate/control-plane/webhook-alerting)。
 
 `DELETE /operations/{intent_id}` 取消的是 Intent,而不是已经执行的副作用:派发之前会抑制待处理的工作;派发之后,Attempt 的结果仍然可见。
 

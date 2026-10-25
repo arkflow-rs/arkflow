@@ -179,6 +179,36 @@ export const zh = {
   'toast.failed': '操作失败',
   'settings.credentialsNote':
     '凭证从构建期环境配置读取，不会在界面中渲染。实时更新通过 SSE 推送；周期性快照作为兜底。',
+  'settings.webhooks.title': 'Webhook 告警',
+  'settings.webhooks.subtitle': '将控制面事件转发到外部端点',
+  'settings.webhooks.deliveryNote':
+    '投递为 best-effort：有界队列、3 次退避重试、连续 5 次失败后自动暂停（暂停状态在本页可见，并产生 webhook.paused 事件）。事件的持久记录仍在事件日志中。',
+  'settings.webhooks.id': '标识',
+  'settings.webhooks.url': '端点 URL',
+  'settings.webhooks.eventTypes': '事件类型前缀',
+  'settings.webhooks.status': '状态',
+  'settings.webhooks.actions': '操作',
+  'settings.webhooks.enabled': '启用',
+  'settings.webhooks.paused': '已暂停',
+  'settings.webhooks.signed': '已签名',
+  'settings.webhooks.add': '新增订阅',
+  'settings.webhooks.edit': '编辑',
+  'settings.webhooks.save': '保存订阅集',
+  'settings.webhooks.pause': '暂停',
+  'settings.webhooks.enable': '启用',
+  'settings.webhooks.test': '测试',
+  'settings.webhooks.testing': '正在测试投递…',
+  'settings.webhooks.testDelivered': '测试投递成功（HTTP {status}）。',
+  'settings.webhooks.testFailed': '测试投递失败：{detail}',
+  'settings.webhooks.testError': '测试请求失败：{message}',
+  'settings.webhooks.replaceError': '保存订阅集失败：{message}',
+  'settings.webhooks.unavailable': 'Webhook 管理不可用：{message}',
+  'settings.webhooks.empty': '尚未配置任何 webhook 订阅。',
+  'settings.webhooks.secret': '签名密钥',
+  'settings.webhooks.secretHint':
+    '可选。设置后每次投递携带 X-Arkflow-Signature 头（请求体的十六进制 HMAC-SHA256）。留空则不签名。',
+  'settings.webhooks.secretReplaceHint':
+    '已配置密钥且永不回显。留空表示保留原密钥；输入新值则替换。',
 
   // Jobs page
   'jobs.title': '有状态作业',

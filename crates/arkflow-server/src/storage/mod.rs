@@ -71,6 +71,39 @@ pub(crate) fn decode_node_labels(json: &str) -> Result<BTreeMap<String, String>,
         .map_err(|error| StorageError::Encoding(format!("decode node labels: {error}")))
 }
 
+/// A webhook alerting subscription (see the `webhook-alerting` capability).
+/// The signing secret is stored for delivery-time HMAC computation and is
+/// never part of any API response representation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WebhookSubscription {
+    pub id: String,
+    pub url: String,
+    /// Event-type prefix filters; an event forwards when its `event_type`
+    /// starts with at least one entry.
+    pub event_types: Vec<String>,
+    pub enabled: bool,
+    pub secret: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at_ms: u64,
+}
+
+/// Full replacement of the webhook subscription set. The submitted list
+/// becomes the complete set; delivery workers observe the new set on their
+/// next refresh tick.
+#[derive(Debug, Clone)]
+pub struct WebhookSetMutation {
+    pub subscriptions: Vec<WebhookSubscription>,
+    pub actor: Option<String>,
+    pub correlation_id: Option<String>,
+}
+
+/// Decode a stored `event_types_json` column. Corrupt JSON fails loudly
+/// rather than silently disabling a subscription's filters.
+pub(crate) fn decode_webhook_event_types(json: &str) -> Result<Vec<String>, StorageError> {
+    serde_json::from_str(json)
+        .map_err(|error| StorageError::Encoding(format!("decode webhook event types: {error}")))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OperationalAggregates {
     pub node_states: Vec<(String, u64)>,
@@ -491,7 +524,7 @@ pub enum StorageError {
 /// Schema version this binary's DDL understands. Each backend stamps it
 /// into the database during initialization and refuses to start when the
 /// stored stamp is newer (an older binary must not operate a newer schema).
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Outcome of `begin_write_fence`: a lock held until `end_write_fence`
 /// (`Held`) or a verified passthrough with nothing to release.
@@ -865,6 +898,24 @@ storage_ops! {
         node_id: String as s,
     },
     ("list_node_labels", ListNodeLabels, list_node_labels) plain Vec<NodeLabels> {},
+    /// Full replacement of the webhook subscription set. Returns the ids
+    /// whose subscriptions transitioned disabled→enabled (each already
+    /// persisted as a `webhook.resumed` event) so the Hub can broadcast
+    /// them to live subscribers.
+    ("replace_webhooks", ReplaceWebhooks, replace_webhooks) fenced Vec<String> {
+        mutation: WebhookSetMutation as v,
+        now_ms: u64 as v,
+    },
+    ("list_webhooks", ListWebhooks, list_webhooks) plain Vec<WebhookSubscription> {},
+    /// Auto-pause a subscription after sustained delivery failure: flips
+    /// `enabled` to false and persists a `webhook.paused` event plus a
+    /// system-actor audit row in the same transaction. Returns whether the
+    /// subscription actually transitioned.
+    ("pause_webhook", PauseWebhook, pause_webhook) fenced bool {
+        webhook_id: String as s,
+        reason: String as s,
+        now_ms: u64 as v,
+    },
     ("operational_aggregates", OperationalAggregates, operational_aggregates) plain OperationalAggregates {
         now_ms: u64 as v,
     },
@@ -1149,6 +1200,25 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn list_node_labels(
         &self,
     ) -> Result<Vec<(String, BTreeMap<String, String>)>, StorageError>;
+    /// Full replacement of the webhook subscription set, audited in the same
+    /// transaction. Returns the ids that transitioned disabled→enabled
+    /// (each persisted as a `webhook.resumed` event).
+    async fn replace_webhooks(
+        &self,
+        mutation: WebhookSetMutation,
+        now_ms: u64,
+    ) -> Result<Vec<String>, StorageError>;
+    /// Every stored webhook subscription, ordered by id.
+    async fn list_webhooks(&self) -> Result<Vec<WebhookSubscription>, StorageError>;
+    /// Flip a subscription to disabled after sustained delivery failure,
+    /// persisting a `webhook.paused` event and a system-actor audit row in
+    /// the same transaction. Returns whether it transitioned.
+    async fn pause_webhook(
+        &self,
+        webhook_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError>;
     async fn operational_aggregates(
         &self,
         now_ms: u64,
@@ -1612,10 +1682,45 @@ impl StorageBackend for ControlPlaneStore {
     }
     async fn list_node_labels(
         &self,
-    ) -> Result<Vec<(String, BTreeMap<String, String>)>, StorageError> {
+    ) -> Result<Vec<(String, std::collections::BTreeMap<String, String>)>, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::list_node_labels(backend).await,
             Self::Postgres(backend) => StorageBackend::list_node_labels(backend).await,
+        }
+    }
+    async fn replace_webhooks(
+        &self,
+        mutation: WebhookSetMutation,
+        now_ms: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::replace_webhooks(backend, mutation, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::replace_webhooks(backend, mutation, now_ms).await
+            }
+        }
+    }
+    async fn list_webhooks(&self) -> Result<Vec<WebhookSubscription>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_webhooks(backend).await,
+            Self::Postgres(backend) => StorageBackend::list_webhooks(backend).await,
+        }
+    }
+    async fn pause_webhook(
+        &self,
+        webhook_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::pause_webhook(backend, webhook_id, reason, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::pause_webhook(backend, webhook_id, reason, now_ms).await
+            }
         }
     }
     async fn operational_aggregates(
@@ -6361,6 +6466,143 @@ mod job_storage_tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// Webhook subscriptions are operator-managed durable state: full
+    /// replacement semantics, disabled→enabled transitions persist
+    /// `webhook.resumed` events, and auto-pause persists `webhook.paused`
+    /// events plus system audit rows.
+    #[tokio::test]
+    async fn webhooks_roundtrip_replace_pause_and_lifecycle_events() {
+        let store = ControlPlaneStore::contract("webhooks_roundtrip").await;
+        let subscription = |id: &str, enabled: bool| WebhookSubscription {
+            id: id.into(),
+            url: format!("https://example.com/hook/{id}"),
+            event_types: vec!["rollout.".into()],
+            enabled,
+            secret: Some(format!("secret-{id}")),
+            created_by: Some("operator-1".into()),
+            created_at_ms: now_ms(),
+        };
+
+        // Full replacement: the submitted list becomes the complete set.
+        store
+            .replace_webhooks(
+                WebhookSetMutation {
+                    subscriptions: vec![subscription("alerts", true), subscription("quiet", false)],
+                    actor: Some("operator-1".into()),
+                    correlation_id: Some("corr-1".into()),
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let stored = store.list_webhooks().await.unwrap();
+        assert_eq!(
+            stored.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["alerts", "quiet"]
+        );
+        assert_eq!(stored[0].secret.as_deref(), Some("secret-alerts"));
+        assert!(stored[0].enabled);
+        assert!(!stored[1].enabled);
+
+        // Re-enabling the paused subscription reports the resumed id.
+        let resumed = store
+            .replace_webhooks(
+                WebhookSetMutation {
+                    subscriptions: vec![subscription("quiet", true)],
+                    actor: Some("operator-1".into()),
+                    correlation_id: None,
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed, ["quiet".to_owned()]);
+
+        // A fresh enabled subscription is not a "resumed" transition.
+        let resumed = store
+            .replace_webhooks(
+                WebhookSetMutation {
+                    subscriptions: vec![subscription("quiet", true), subscription("fresh", true)],
+                    actor: None,
+                    correlation_id: None,
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(resumed.is_empty());
+
+        // Auto-pause flips the flag once and persists lifecycle events.
+        assert!(store
+            .pause_webhook("quiet", "5 consecutive failures", now_ms())
+            .await
+            .unwrap());
+        assert!(!store
+            .pause_webhook("quiet", "already paused", now_ms())
+            .await
+            .unwrap());
+        assert!(!store
+            .pause_webhook("missing", "unknown id", now_ms())
+            .await
+            .unwrap());
+        let stored = store.list_webhooks().await.unwrap();
+        let quiet = stored.iter().find(|s| s.id == "quiet").unwrap();
+        assert!(!quiet.enabled);
+
+        // Lifecycle events are durable control-plane events under the hub
+        // identity (visible to REST/SSE replay), and mutations are audited.
+        let events = store.list_events(None).await.unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "webhook.resumed"
+                && event.node_id.as_deref() == Some("hub")));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "webhook.paused"
+                && event.node_id.as_deref() == Some("hub")));
+        let audit = store.list_audit(None).await.unwrap();
+        assert!(audit
+            .iter()
+            .any(|record| record.action == "webhook.replace"));
+        assert!(audit.iter().any(|record| record.action == "webhook.pause"
+            && record.resource_id.as_deref() == Some("quiet")));
+    }
+
+    /// Subscriptions must survive a backend reopen (Hub restart) unchanged.
+    #[tokio::test]
+    async fn webhooks_survive_backend_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("webhooks-reopen.db");
+        {
+            let backend = SqliteBackend::open(&path).unwrap();
+            backend
+                .replace_webhooks(
+                    WebhookSetMutation {
+                        subscriptions: vec![WebhookSubscription {
+                            id: "alerts".into(),
+                            url: "https://example.com/hook".into(),
+                            event_types: vec!["node.".into(), "rollout.".into()],
+                            enabled: true,
+                            secret: Some("secret".into()),
+                            created_by: Some("operator-1".into()),
+                            created_at_ms: now_ms(),
+                        }],
+                        actor: Some("operator-1".into()),
+                        correlation_id: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+        }
+        let backend = SqliteBackend::open(&path).unwrap();
+        let stored = backend.list_webhooks().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "alerts");
+        assert_eq!(stored[0].event_types, ["node.", "rollout."]);
+        assert_eq!(stored[0].secret.as_deref(), Some("secret"));
+        assert!(stored[0].enabled);
     }
 
     #[test]

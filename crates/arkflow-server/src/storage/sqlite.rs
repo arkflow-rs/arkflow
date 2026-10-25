@@ -550,6 +550,139 @@ impl SqliteBackend {
             .transpose()
     }
 
+    /// Full replacement of the webhook subscription set, audited in the same
+    /// transaction. Returns the ids that transitioned disabled→enabled,
+    /// each already persisted as a `webhook.resumed` event.
+    pub fn replace_webhooks(
+        &self,
+        mutation: super::WebhookSetMutation,
+        now_ms: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut previous: std::collections::BTreeMap<String, bool> =
+                std::collections::BTreeMap::new();
+            {
+                let mut statement =
+                    transaction.prepare("SELECT webhook_id, enabled FROM cp_webhooks")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })?;
+                for row in rows {
+                    let (id, enabled) = row?;
+                    previous.insert(id, enabled);
+                }
+            }
+            transaction.execute("DELETE FROM cp_webhooks", [])?;
+            for subscription in &mutation.subscriptions {
+                let event_types = serde_json::to_string(&subscription.event_types)
+                    .map_err(|error| StorageError::Encoding(format!("encode webhook event types: {error}")))?;
+                transaction.execute(
+                    "INSERT INTO cp_webhooks (webhook_id, url, event_types_json, enabled, secret, created_by, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        subscription.id,
+                        subscription.url,
+                        event_types,
+                        subscription.enabled,
+                        subscription.secret,
+                        subscription.created_by,
+                        subscription.created_at_ms,
+                    ],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES (?1, 'webhook.replace', 'webhook', NULL, NULL, ?2, 'accepted', ?3, ?4)",
+                rusqlite::params![
+                    mutation.actor,
+                    mutation.correlation_id,
+                    format!("{} webhooks", mutation.subscriptions.len()),
+                    now_ms,
+                ],
+            )?;
+            let resumed = mutation
+                .subscriptions
+                .iter()
+                .filter(|subscription| {
+                    subscription.enabled && previous.get(&subscription.id) == Some(&false)
+                })
+                .map(|subscription| subscription.id.clone())
+                .collect::<Vec<_>>();
+            for id in &resumed {
+                transaction.execute(
+                    "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES ('hub', 'webhook.resumed', 'succeeded', ?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        format!("webhook {id} resumed"),
+                        mutation.correlation_id,
+                        mutation.actor,
+                        now_ms,
+                    ],
+                )?;
+            }
+            Ok(resumed)
+        })
+    }
+
+    pub fn list_webhooks(&self) -> Result<Vec<super::WebhookSubscription>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare("SELECT webhook_id, url, event_types_json, enabled, secret, created_by, created_at_ms FROM cp_webhooks ORDER BY webhook_id")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)? as u64,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?
+        .into_iter()
+        .map(|(id, url, event_types, enabled, secret, created_by, created_at_ms)| {
+            Ok(super::WebhookSubscription {
+                id,
+                url,
+                event_types: super::decode_webhook_event_types(&event_types)?,
+                enabled,
+                secret,
+                created_by,
+                created_at_ms,
+            })
+        })
+        .collect()
+    }
+
+    /// Auto-pause after sustained delivery failure: flips `enabled` to
+    /// false and persists a `webhook.paused` event plus a system-actor
+    /// audit row in the same transaction. Returns whether the subscription
+    /// transitioned (an already-paused or unknown id returns false).
+    pub fn pause_webhook(
+        &self,
+        webhook_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let changed = transaction.execute(
+                "UPDATE cp_webhooks SET enabled = 0 WHERE webhook_id = ?1 AND enabled = 1",
+                [webhook_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            transaction.execute(
+                "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES ('hub', 'webhook.paused', 'failed', ?1, NULL, 'system', ?2)",
+                rusqlite::params![format!("webhook {webhook_id} paused: {reason}"), now_ms],
+            )?;
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES ('system', 'webhook.pause', 'webhook', ?1, NULL, NULL, 'accepted', ?2, ?3)",
+                rusqlite::params![webhook_id, reason, now_ms],
+            )?;
+            Ok(true)
+        })
+    }
+
     pub fn operational_aggregates(
         &self,
         now_ms: u64,
@@ -2608,6 +2741,16 @@ impl SqliteBackend {
                 occurred_at_ms INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS cp_webhooks (
+                webhook_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                event_types_json TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                secret TEXT,
+                created_by TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS cp_audit_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 actor TEXT,
@@ -2916,6 +3059,24 @@ impl StorageBackend for SqliteBackend {
         &self,
     ) -> Result<Vec<(String, std::collections::BTreeMap<String, String>)>, StorageError> {
         self.list_node_labels()
+    }
+    async fn replace_webhooks(
+        &self,
+        mutation: super::WebhookSetMutation,
+        now_ms: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        self.replace_webhooks(mutation, now_ms)
+    }
+    async fn list_webhooks(&self) -> Result<Vec<super::WebhookSubscription>, StorageError> {
+        self.list_webhooks()
+    }
+    async fn pause_webhook(
+        &self,
+        webhook_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.pause_webhook(webhook_id, reason, now_ms)
     }
     async fn operational_aggregates(
         &self,

@@ -38,6 +38,11 @@ pub enum OperatorAction {
     Configure,
     ManageNodes,
     ManageRollouts,
+    /// Replace the webhook subscription set and fire test deliveries (see
+    /// the `webhook-alerting` capability). Held by admin and operator:
+    /// webhooks are an outbound control-plane channel carrying signing
+    /// secrets, but they are day-to-day operational tooling.
+    ManageWebhooks,
     /// Decide configuration approval requests. Held by admin only: the
     /// operator role can submit requests but must not approve them, keeping
     /// submission and approval in different hands (see
@@ -65,6 +70,7 @@ impl OperatorPrincipal {
                     | OperatorAction::Configure
                     | OperatorAction::ManageNodes
                     | OperatorAction::ManageRollouts
+                    | OperatorAction::ManageWebhooks
             ),
             OperatorRole::Viewer => {
                 matches!(action, OperatorAction::Read | OperatorAction::ReadAudit)
@@ -103,6 +109,35 @@ pub struct DesiredStateRequest {
     pub config_version: Option<String>,
     #[serde(default)]
     pub action_id: Option<String>,
+}
+
+/// Incoming webhook subscription (full-replace payload entry). The signing
+/// secret is write-only: responses never echo it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebhookSubscriptionInput {
+    pub id: String,
+    pub url: String,
+    #[serde(default)]
+    pub event_types: Vec<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+/// Response representation of a stored webhook subscription. Never contains
+/// the signing secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebhookSubscriptionResponse {
+    pub id: String,
+    pub url: String,
+    pub event_types: Vec<String>,
+    pub enabled: bool,
+    pub created_by: Option<String>,
+    pub created_at_ms: u64,
+    /// Set when the signing secret is configured; the value itself never
+    /// leaves the Hub.
+    pub has_secret: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -303,6 +338,35 @@ mod tests {
         assert!(viewer.can_scope(OperatorAction::Read, "node", Some("node-a")));
         assert!(!viewer.can_scope(OperatorAction::Read, "node", Some("node-b")));
         assert!(OperatorPrincipal::legacy_operator().can(OperatorAction::ManageRollouts));
+    }
+
+    #[test]
+    fn manage_webhooks_is_admin_and_operator_but_not_viewer() {
+        assert!(OperatorPrincipal::legacy_operator().can(OperatorAction::ManageWebhooks));
+        let operator = OperatorPrincipal {
+            id: "ops".into(),
+            roles: vec![OperatorRole::Operator],
+            scopes: Vec::new(),
+        };
+        assert!(operator.can(OperatorAction::ManageWebhooks));
+        let viewer = OperatorPrincipal {
+            id: "viewer".into(),
+            roles: vec![OperatorRole::Viewer],
+            scopes: Vec::new(),
+        };
+        assert!(!viewer.can(OperatorAction::ManageWebhooks));
+        // Fleet-level resource: a node-scoped principal cannot reach the
+        // webhook routes even with the right role actions elsewhere.
+        let node_scoped = OperatorPrincipal {
+            id: "scoped".into(),
+            roles: vec![OperatorRole::Operator],
+            scopes: vec![ResourceScope {
+                resource_type: "node".into(),
+                resource_id: Some("node-a".into()),
+            }],
+        };
+        assert!(!node_scoped.can_scope(OperatorAction::ManageWebhooks, "webhook", None));
+        assert!(operator.can_scope(OperatorAction::ManageWebhooks, "webhook", None));
     }
 
     #[test]

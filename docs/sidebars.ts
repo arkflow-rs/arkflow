@@ -55,6 +55,7 @@ const sidebars: SidebarsConfig = {
         'operate/control-plane/overview', 'operate/control-plane/deploy',
         'operate/control-plane/console', 'operate/control-plane/operations',
         'operate/control-plane/reconciliation', 'operate/control-plane/job-upgrades',
+        'operate/control-plane/webhook-alerting',
       ]},
     ]},
     {type: 'category', label: 'Reference', items: [

@@ -225,6 +225,26 @@ the same durable Intent pipeline.
 | `GET` | `/events` | Query the fleet event log. |
 | `GET` | `/events/stream` | Server-Sent Events stream of live events. |
 | `GET` | `/audit` | Bounded audit history (`?resource_id={id}`), accepted and rejected mutations. |
+| `GET`/`PUT` | `/webhooks` | List / full-replace the webhook alerting subscription set (see [Webhook alerting](#webhook-alerting)). |
+| `POST` | `/webhooks/{id}/test` | One synchronous test delivery of a synthetic `webhook.test` event. |
+
+#### Webhook alerting
+
+`GET/PUT /webhooks` manage the webhook subscription set with full-replace
+semantics (at most 16 entries). Both routes (and `POST /webhooks/{id}/test`)
+require the `ManageWebhooks` action — admin and operator roles — and every
+accepted replacement or denial is audited (`webhook.replace`). Each entry
+carries `id`, `url` (`http`/`https` only), `event_types` (prefix filters),
+`enabled`, and an optional write-only `secret`: responses never echo it, an
+omitted secret retains the stored one for the same id, and an explicitly
+empty string clears it.
+
+Delivery is best-effort (leader-only forwarding, bounded drop-oldest queues,
+3 attempts with backoff, auto-pause after 5 consecutive failed deliveries
+publishing `webhook.paused`/`webhook.resumed` lifecycle events). Signed
+deliveries carry `X-Arkflow-Signature` (hex HMAC-SHA256 of the body). See
+[Webhook alerting](/docs/operate/control-plane/webhook-alerting) for the
+full contract.
 
 `DELETE /operations/{intent_id}` cancels an Intent, not an already executed
 side effect: pending work is suppressed before dispatch; after dispatch, the

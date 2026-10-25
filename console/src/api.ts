@@ -79,6 +79,31 @@ export type ControlNode = {
   data_address?: string
   labels?: Record<string, string>
 }
+// Webhook alerting subscription (see the `webhook-alerting` capability).
+// The signing secret is write-only: responses only report `has_secret`.
+export type WebhookSubscription = {
+  id: string
+  url: string
+  event_types: string[]
+  enabled: boolean
+  created_by: string | null
+  created_at_ms: number
+  has_secret: boolean
+}
+// Client-side form state: the API takes the same shape without
+// `has_secret`/`created_*` (full-replace semantics).
+export type WebhookSubscriptionInput = {
+  id: string
+  url: string
+  event_types: string[]
+  enabled: boolean
+  secret: string | null
+}
+export type WebhookTestOutcome = {
+  delivered: boolean
+  status?: number
+  error?: string
+}
 export type OperationState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
 export type Operation = {
   id: string
@@ -421,6 +446,16 @@ export const api = {
     request<{ node_id: string; labels: Record<string, string> }>(`/nodes/${encodeURIComponent(id)}/labels`, {
       method: 'PUT',
       body: JSON.stringify({ labels }),
+    }),
+  webhooks: () => request<{ subscriptions: WebhookSubscription[] }>('/webhooks'),
+  replaceWebhooks: (subscriptions: WebhookSubscriptionInput[]) =>
+    request<{ subscriptions: WebhookSubscription[] }>('/webhooks', {
+      method: 'PUT',
+      body: JSON.stringify({ subscriptions }),
+    }),
+  testWebhook: (id: string) =>
+    request<WebhookTestOutcome>(`/webhooks/${encodeURIComponent(id)}/test`, {
+      method: 'POST',
     }),
   drainNode: (id: string) =>
     request<ControlNode>(`/nodes/${encodeURIComponent(id)}/drain`, { method: 'POST' }),

@@ -31,6 +31,7 @@ mod operator;
 mod placement;
 mod rollout;
 mod secret_dispatch;
+mod webhooks;
 mod wire;
 
 #[cfg(test)]
@@ -46,6 +47,7 @@ pub use command_metrics::CommandMetrics;
 pub use error::HubError;
 pub use leadership::{HubHaConfig, Leadership};
 pub use nodes::{parse_label_term, validate_labels};
+pub use webhooks::{run_webhook_forwarder, WebhookTestOutcome, WEBHOOK_LIMIT};
 pub use wire::{
     AgentAuth, AgentCommand, AgentOperation, CommandResult, HeartbeatRequest, HubEvent, HubNode,
     HubNodeMetrics, HubOperation, HubOperationState, JobObservationRequest, NodeConnectionState,
