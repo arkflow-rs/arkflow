@@ -1138,3 +1138,20 @@ progress {
     gap: 8px;
   }
 }
+
+/* Node label chips (node-labels capability) */
+.labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.label-chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  font-size: 11px;
+  font-family: var(--mono-font, monospace);
+  color: hsl(var(--muted-foreground));
+}

@@ -1,7 +1,7 @@
 use super::checkpoint::{job_state_format_version, recovery_record_is_compatible};
 use super::error::HubError;
 use super::leadership::{HubHaConfig, Leadership};
-use super::nodes::{sanitize_capabilities, sanitize_metrics};
+use super::nodes::{parse_label_term, sanitize_capabilities, sanitize_metrics, validate_labels};
 use super::wire::{
     AgentAuth, AgentCommand, AgentOperation, CommandResult, HeartbeatRequest, HubOperation,
     HubOperationState, NodeConnectionState, NodeReport, RegisterRequest,
@@ -5803,4 +5803,58 @@ async fn atomic_upgrade_http_contract_202_and_conflicts() {
         .unwrap();
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn node_label_validation_bounds_and_charset() {
+    let valid = |pairs: &[(&str, &str)]| {
+        validate_labels(
+            &pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        )
+        .is_ok()
+    };
+    assert!(valid(&[("env", "prod"), ("tier", "edge-2")]));
+    assert!(valid(&[("a", "b")]));
+    assert!(valid(&[(&"k".repeat(63), &"v".repeat(63))]));
+
+    let invalid = |pairs: &[(&str, &str)]| {
+        validate_labels(
+            &pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        )
+        .is_err()
+    };
+    assert!(invalid(&[("", "v")]));
+    assert!(invalid(&[("env", "")]));
+    assert!(invalid(&[("env", "-prod")]));
+    assert!(invalid(&[("env", "prod-")]));
+    assert!(invalid(&[("env", "prod east")]));
+    assert!(invalid(&[(&"k".repeat(64), "v")]));
+    assert!(invalid(&[("k", &"v".repeat(64))]));
+    let seventeen: Vec<(&str, &str)> = (1..=17)
+        .map(|i| (Box::leak(format!("k{i}").into_boxed_str()) as &str, "v"))
+        .collect();
+    assert!(invalid(&seventeen));
+    // Sixteen entries is the boundary and passes.
+    let sixteen: Vec<(&str, &str)> = (1..=16)
+        .map(|i| (Box::leak(format!("k{i}").into_boxed_str()) as &str, "v"))
+        .collect();
+    assert!(valid(&sixteen));
+}
+
+#[test]
+fn label_filter_terms_parse_or_reject() {
+    assert_eq!(
+        parse_label_term("env=prod").unwrap(),
+        ("env".to_owned(), "prod".to_owned())
+    );
+    assert!(parse_label_term("env").is_err());
+    assert!(parse_label_term("env=-prod").is_err());
+    assert!(parse_label_term("=prod").is_err());
+    assert!(parse_label_term("env=").is_err());
 }

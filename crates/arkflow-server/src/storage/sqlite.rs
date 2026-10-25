@@ -482,6 +482,61 @@ impl SqliteBackend {
         })
     }
 
+    /// Full replacement of a node's label map, audited in the same
+    /// transaction. Returns the previous labels for an existing node.
+    pub fn replace_node_labels(
+        &self,
+        mutation: super::NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        let encoded = serde_json::to_string(&mutation.labels)
+            .map_err(|error| StorageError::Encoding(format!("encode node labels: {error}")))?;
+        self.immediate_transaction(|transaction| {
+            let previous_json: Option<String> = transaction
+                .query_row(
+                    "SELECT labels_json FROM cp_nodes WHERE node_id = ?1",
+                    [&mutation.node_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(previous_json) = previous_json else {
+                return Ok(None);
+            };
+            let previous = super::decode_node_labels(&previous_json)?;
+            let summary = format!("{}->{} labels", previous.len(), mutation.labels.len());
+            transaction.execute(
+                "UPDATE cp_nodes SET labels_json = ?2, updated_at_ms = ?3 WHERE node_id = ?1",
+                rusqlite::params![mutation.node_id, encoded, now_ms],
+            )?;
+            transaction.execute(
+                "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES (?1, 'node_labels_changed', 'succeeded', ?2, ?3, ?4, ?5)",
+                rusqlite::params![mutation.node_id, summary, mutation.correlation_id, mutation.actor, now_ms],
+            )?;
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES (?1, 'node.labels', 'node', ?2, ?2, ?3, 'accepted', ?4, ?5)",
+                rusqlite::params![mutation.actor, mutation.node_id, mutation.correlation_id, summary, now_ms],
+            )?;
+            Ok(Some(previous))
+        })
+    }
+
+    pub fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        let json: Option<String> = self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT labels_json FROM cp_nodes WHERE node_id = ?1",
+                    [node_id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })?;
+        json.map(|json| super::decode_node_labels(&json))
+            .transpose()
+    }
+
     pub fn operational_aggregates(
         &self,
         now_ms: u64,
@@ -2380,6 +2435,7 @@ impl SqliteBackend {
                 node_version TEXT NOT NULL DEFAULT 'unknown',
                 state TEXT NOT NULL DEFAULT 'offline',
                 capabilities_json TEXT NOT NULL DEFAULT '[]',
+                labels_json TEXT NOT NULL DEFAULT '{}',
                 boot_id TEXT,
                 last_report_seq INTEGER,
                 last_seen_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -2725,6 +2781,12 @@ impl SqliteBackend {
                 [],
             )?;
         }
+        if !node_columns.iter().any(|name| name == "labels_json") {
+            connection.execute(
+                "ALTER TABLE cp_nodes ADD COLUMN labels_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )?;
+        }
         let event_columns: Vec<String> = connection
             .prepare("PRAGMA table_info(cp_events)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -2823,6 +2885,19 @@ impl StorageBackend for SqliteBackend {
     }
     async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError> {
         self.get_node_maintenance(node_id)
+    }
+    async fn replace_node_labels(
+        &self,
+        mutation: NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        self.replace_node_labels(mutation, now_ms)
+    }
+    async fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        self.get_node_labels(node_id)
     }
     async fn operational_aggregates(
         &self,

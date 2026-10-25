@@ -77,6 +77,7 @@ export type ControlNode = {
   last_seen_at_ms?: number
   lease_expires_at_ms?: number
   data_address?: string
+  labels?: Record<string, string>
 }
 export type OperationState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
 export type Operation = {
@@ -412,8 +413,15 @@ export const api = {
       // The Hub negotiates: Prometheus text by default, JSON for consoles.
       { headers: { Accept: 'application/json' } },
     ),
-  nodes: (page = 1, pageSize = DEFAULT_PAGE_SIZE) =>
-    request<Page<ControlNode>>(`/nodes?page=${page}&page_size=${pageSize}`),
+  nodes: (page = 1, pageSize = DEFAULT_PAGE_SIZE, label?: string) =>
+    request<Page<ControlNode>>(
+      `/nodes?page=${page}&page_size=${pageSize}${label ? `&label=${encodeURIComponent(label)}` : ''}`,
+    ),
+  replaceNodeLabels: (id: string, labels: Record<string, string>) =>
+    request<{ node_id: string; labels: Record<string, string> }>(`/nodes/${encodeURIComponent(id)}/labels`, {
+      method: 'PUT',
+      body: JSON.stringify({ labels }),
+    }),
   drainNode: (id: string) =>
     request<ControlNode>(`/nodes/${encodeURIComponent(id)}/drain`, { method: 'POST' }),
   maintainNode: (id: string) =>
@@ -534,18 +542,36 @@ export const api = {
     }),
   rollouts: () => request<Rollout[]>('/rollouts'),
   rollout: (id: string) => request<RolloutDetail>(`/rollouts/${encodeURIComponent(id)}`),
-  createRollout: (configVersion: string, nodeIds: string[], batchSize: number) =>
+  createRollout: (
+    configVersion: string,
+    nodeIds: string[],
+    batchSize: number,
+    targetSelector?: Record<string, string>,
+  ) =>
     request<Rollout>('/rollouts', {
       method: 'POST',
-      body: JSON.stringify({ config_version: configVersion, node_ids: nodeIds, batch_size: batchSize }),
+      body: JSON.stringify(
+        targetSelector
+          ? { config_version: configVersion, target_selector: targetSelector, batch_size: batchSize }
+          : { config_version: configVersion, node_ids: nodeIds, batch_size: batchSize },
+      ),
     }),
   configApprovals: (status?: string) =>
     request<ConfigApproval[]>(`/config-approvals${status ? `?status=${encodeURIComponent(status)}` : ''}`),
   configApproval: (id: string) => request<ConfigApproval>(`/config-approvals/${encodeURIComponent(id)}`),
-  submitConfigApproval: (configVersion: string, nodeIds: string[], batchSize: number) =>
+  submitConfigApproval: (
+    configVersion: string,
+    nodeIds: string[],
+    batchSize: number,
+    targetSelector?: Record<string, string>,
+  ) =>
     request<ConfigApproval>('/config-approvals', {
       method: 'POST',
-      body: JSON.stringify({ config_version: configVersion, node_ids: nodeIds, batch_size: batchSize }),
+      body: JSON.stringify(
+        targetSelector
+          ? { config_version: configVersion, target_selector: targetSelector, batch_size: batchSize }
+          : { config_version: configVersion, node_ids: nodeIds, batch_size: batchSize },
+      ),
     }),
   decideConfigApproval: (id: string, decision: 'approve' | 'reject', note?: string) =>
     request<ConfigApproval>(`/config-approvals/${encodeURIComponent(id)}/decide`, {

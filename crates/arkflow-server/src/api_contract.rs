@@ -5,6 +5,7 @@
 
 use crate::storage::IntentRecord;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OperatorPrincipal {
@@ -113,17 +114,27 @@ pub struct RestartActionRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateRolloutRequest {
     pub config_version: String,
+    #[serde(default)]
     pub node_ids: Vec<String>,
     #[serde(default = "default_rollout_batch_size")]
     pub batch_size: u32,
+    /// Label selector resolved to an explicit node set once, at request time
+    /// (mutually exclusive with `node_ids`; see the `node-labels` capability).
+    #[serde(default)]
+    pub target_selector: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubmitApprovalRequest {
     pub config_version: String,
+    #[serde(default)]
     pub node_ids: Vec<String>,
     #[serde(default = "default_rollout_batch_size")]
     pub batch_size: u32,
+    /// Label selector resolved to an explicit node set once, at request time
+    /// (mutually exclusive with `node_ids`; see the `node-labels` capability).
+    #[serde(default)]
+    pub target_selector: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

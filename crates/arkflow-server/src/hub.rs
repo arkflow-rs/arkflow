@@ -45,6 +45,7 @@ mod tests;
 pub use command_metrics::CommandMetrics;
 pub use error::HubError;
 pub use leadership::{HubHaConfig, Leadership};
+pub use nodes::{parse_label_term, validate_labels};
 pub use wire::{
     AgentAuth, AgentCommand, AgentOperation, CommandResult, HeartbeatRequest, HubEvent, HubNode,
     HubNodeMetrics, HubOperation, HubOperationState, JobObservationRequest, NodeConnectionState,

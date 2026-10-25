@@ -20,6 +20,11 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
   const pollError = detailQuery.isError ? errorMessage(detailQuery.error) : ''
   const [version, setVersion] = useState('')
   const [targets, setTargets] = useState<string[]>([])
+  const [targetMode, setTargetMode] = useState<'nodes' | 'labels'>('nodes')
+  const [labelSelector, setLabelSelector] = useState('')
+  const selectorPreview = useNodes(
+    targetMode === 'labels' && labelSelector.trim() ? labelSelector.trim() : undefined,
+  )
   const [batch, setBatch] = useState(1)
   const [busy, setBusy] = useState(false)
   const [audit, setAudit] = useState<AuditRecord[]>([])
@@ -27,8 +32,46 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
     void queryClient.invalidateQueries({ queryKey: ['live', 'rollouts'] })
     void queryClient.invalidateQueries({ queryKey: ['live', 'rollout-detail'] })
   }
+  const parseSelector = (): Record<string, string> | null => {
+    const selector: Record<string, string> = {}
+    for (const term of labelSelector.split(',')) {
+      const trimmed = term.trim()
+      if (!trimmed) continue
+      const separator = trimmed.indexOf('=')
+      const key = separator > 0 ? trimmed.slice(0, separator) : ''
+      const value = separator > 0 ? trimmed.slice(separator + 1) : ''
+      if (!key || !value) {
+        onError(t('rollouts.badSelectorTerm', { term: trimmed }))
+        return null
+      }
+      selector[key] = value
+    }
+    return Object.keys(selector).length ? selector : null
+  }
   const create = async () => {
-    if (!version.trim() || targets.length === 0) return
+    if (!version.trim()) return
+    if (targetMode === 'labels') {
+      const selector = parseSelector()
+      if (!selector) return
+      try {
+        setBusy(true)
+        if (approvalRequired) {
+          await api.submitConfigApproval(version.trim(), [], batch, selector)
+          toast.success(t('approvals.submitted'))
+        } else {
+          const rollout = await api.createRollout(version.trim(), [], batch, selector)
+          setSelectedId(rollout.rollout_id)
+        }
+        setBusy(false)
+        invalidate()
+        void queryClient.invalidateQueries({ queryKey: ['live', 'config-approvals'] })
+      } catch (cause) {
+        setBusy(false)
+        onError(errorMessage(cause))
+      }
+      return
+    }
+    if (targets.length === 0) return
     try {
       setBusy(true)
       if (approvalRequired) {
@@ -95,27 +138,62 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
               </option>
             ))}
           </select>
-          <button disabled={busy || !version.trim() || targets.length === 0} onClick={() => void create()}>
+          <button
+            disabled={
+              busy ||
+              !version.trim() ||
+              (targetMode === 'nodes' ? targets.length === 0 : !labelSelector.trim())
+            }
+            onClick={() => void create()}
+          >
             {approvalRequired ? t('rollouts.submitForApproval') : t('rollouts.create')}
           </button>
         </div>
         {approvalRequired && <div className="warning">{t('approvals.gateEnabled')}</div>}
-        <div className="node-picker">
-          {nodes.map((node) => (
-            <label key={node.id}>
+        <div className="toolbar">
+          <select
+            aria-label={t('rollouts.targetMode')}
+            value={targetMode}
+            onChange={(event) => setTargetMode(event.target.value as 'nodes' | 'labels')}
+          >
+            <option value="nodes">{t('rollouts.targetByNodes')}</option>
+            <option value="labels">{t('rollouts.targetByLabels')}</option>
+          </select>
+          {targetMode === 'labels' && (
+            <>
               <input
-                type="checkbox"
-                checked={targets.includes(node.id)}
-                onChange={(event) =>
-                  setTargets((current) =>
-                    event.target.checked ? [...current, node.id] : current.filter((id) => id !== node.id),
-                  )
-                }
+                aria-label={t('rollouts.labelSelector')}
+                placeholder={t('rollouts.labelSelectorPlaceholder')}
+                value={labelSelector}
+                onChange={(event) => setLabelSelector(event.target.value)}
               />
-              {node.id} · {node.state}
-            </label>
-          ))}
+              <span>
+                {labelSelector.trim()
+                  ? t('rollouts.matchedNodes', { count: selectorPreview.data?.items.length ?? 0 })
+                  : t('rollouts.selectorEmpty')}
+              </span>
+            </>
+          )}
         </div>
+        {targetMode === 'labels' && <div className="warning">{t('rollouts.selectorResolvedAtCreation')}</div>}
+        {targetMode === 'nodes' && (
+          <div className="node-picker">
+            {nodes.map((node) => (
+              <label key={node.id}>
+                <input
+                  type="checkbox"
+                  checked={targets.includes(node.id)}
+                  onChange={(event) =>
+                    setTargets((current) =>
+                      event.target.checked ? [...current, node.id] : current.filter((id) => id !== node.id),
+                    )
+                  }
+                />
+                {node.id} · {node.state}
+              </label>
+            ))}
+          </div>
+        )}
         {rollouts.length === 0 ? (
           <p className="empty">{t('rollouts.empty')}</p>
         ) : (

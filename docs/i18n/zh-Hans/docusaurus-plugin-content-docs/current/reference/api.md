@@ -153,7 +153,7 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 |--------|-------|---------|
 | `GET` | `/system` | Hub 系统描述符。 |
 | `GET` | `/status` | 机群聚合的引擎状态:streams total/running/failed 对全部注册节点求和。 |
-| `GET` | `/nodes` | 集群节点注册表。 |
+| `GET` | `/nodes` | 集群节点注册表。支持标签过滤:`?label=env%3Dprod%2Ctier%3Dedge`(逗号连接的 `key=value` 项,AND 语义)。 |
 | `GET` | `/streams` | 整个集群中的流。 |
 | `GET` | `/nodes/{node_id}/streams/{id}` | 某节点上某条流的权威时点视图。 |
 | `PUT` | `/nodes/{node_id}/streams/{id}/desired-state` | 规范的生命周期变更(参见[约定](#conventions))。 |
@@ -167,6 +167,15 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 | `POST` | `/nodes/{node_id}/configuration/rollback/{version}` | 回滚节点配置。 |
 | `POST` | `/nodes/{node_id}/drain` | 排空节点(维护前迁走其分配)。 |
 | `POST`/`DELETE` | `/nodes/{node_id}/maintenance` | 进入/退出维护模式。 |
+| `PUT` | `/nodes/{node_id}/labels` | 整体替换该节点的标签映射(参见[节点标签](#节点标签))。 |
+
+#### 节点标签
+
+`PUT /nodes/{node_id}/labels` 接收 `{"labels": {"env": "prod", "tier": "edge"}}`,语义为整体替换:提交的映射即该节点的完整标签集。需要 `ManageNodes` 动作(operator 与 admin 角色);接受的替换与拒绝均落审计(`node.labels`)。
+
+- 标签由 Hub 管理:Agent 从不上报标签,Agent 重注册或 Hub 重启都不会改变标签。
+- 边界:每节点最多 16 条;key 与 value 各 1-63 字符,以字母数字开头和结尾,中间允许 `-`、`_`、`.`。违规以 `invalid_labels` 拒绝,不会部分应用。
+- Rollout 目标选择:`POST /rollouts`(以及审批提交)接受 `target_selector`——等值映射,与 `node_ids` 互斥。Hub 在**创建时一次性**解析为显式节点集(审批策略开启时在提交时解析);解析结果为空集以 `no_matching_nodes` 拒绝。之后的标签变更不会改变已创建 rollout 或待审批请求的目标。匹配覆盖整个注册表、不感知节点在线状态——不可达节点由 rollout 健康门控处理。
 
 旧的不定向节点的流变更路由仍作为适配器保留,它们创建的是同一条持久化 Intent 管道。
 
@@ -190,7 +199,7 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 
 | 方法 | 路由 | 用途 |
 |--------|-------|---------|
-| `GET`/`POST` | `/rollouts` | 列出灰度发布 / 创建灰度发布计划。 |
+| `GET`/`POST` | `/rollouts` | 列出 rollout / 创建 rollout 计划。目标选择为 `node_ids` **或** `target_selector`(标签等值映射,创建时一次性解析;参见[节点标签](#节点标签))。 |
 | `GET` | `/rollouts/{id}` | 灰度发布状态与各节点进度。 |
 | `POST` | `/rollouts/{id}/actions` | 灰度发布操作:暂停、恢复、取消、回滚。 |
 
@@ -200,7 +209,7 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 
 | 方法 | 路由 | 用途 |
 |--------|-------|---------|
-| `GET`/`POST` | `/config-approvals` | 列出审批请求(`?status=pending\|approving\|approved\|rejected\|expired`)/ 提交一个钉住版本、目标节点与批大小的请求。 |
+| `GET`/`POST` | `/config-approvals` | 列出审批请求(`?status=pending\|approving\|approved\|rejected\|expired`)/ 提交一个钉住版本、目标节点与批大小的请求。与 `POST /rollouts` 一样接受 `target_selector`;请求在提交时把选择器解析为显式节点集并钉住。 |
 | `GET` | `/config-approvals/{id}` | 单个审批请求及其钉住的快照。 |
 | `POST` | `/config-approvals/{id}/decide` | 批准或拒绝(`{"decision":"approve"\|"reject","note":"..."}`)。需要 `ApproveRollouts` 权限(仅 admin 角色),且审批人必须不同于提交人。 |
 

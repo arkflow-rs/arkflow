@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -51,6 +52,7 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
       })
       .catch((cause) => onError?.(errorMessage(cause)))
   }
+  const [editingLabels, setEditingLabels] = useState<ControlNode | null>(null)
   const running = streams.filter((stream) => stream.state === 'running').length
   const failed = streams.filter((stream) => stream.state === 'failed').length
   const online = nodes.filter((node) => node.state === 'online').length
@@ -133,7 +135,15 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
                       </span>
                     </div>
                     <small>{(node.capabilities ?? []).join(' · ') || t('overview.noCapabilities')}</small>
+                    {Object.keys(node.labels ?? {}).length > 0 && (
+                      <div className="labels">
+                        {Object.entries(node.labels ?? {}).map(([key, value]) => (
+                          <span className="label-chip" key={key}>{`${key}=${value}`}</span>
+                        ))}
+                      </div>
+                    )}
                     <div className="actions">
+                      <button onClick={() => setEditingLabels(node)}>{t('overview.labels')}</button>
                       {maintenance === 'active' ? (
                         <>
                           <button onClick={() => void setMaintenance(node, 'drain')}>
@@ -191,6 +201,85 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
           <p className="empty">{t('overview.noRecentEvents')}</p>
         )}
       </section>
+      {editingLabels && (
+        <LabelsEditor
+          node={editingLabels}
+          onClose={() => setEditingLabels(null)}
+          onSaved={() => {
+            setEditingLabels(null)
+            void queryClient.invalidateQueries({ queryKey: ['live', 'nodes'] })
+            toast.success(t('toast.accepted'))
+          }}
+          onError={(message) => onError?.(message)}
+        />
+      )}
     </>
+  )
+}
+
+/// Full-replacement label editor: one `key=value` per line. The submitted
+/// map becomes the node's complete label set (see the node-labels capability).
+function LabelsEditor({
+  node,
+  onClose,
+  onSaved,
+  onError,
+}: {
+  node: ControlNode
+  onClose: () => void
+  onSaved: () => void
+  onError: (message: string) => void
+}) {
+  const t = useT()
+  const [draft, setDraft] = useState(
+    Object.entries(node.labels ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join('\n'),
+  )
+  const [busy, setBusy] = useState(false)
+  const save = async () => {
+    const labels: Record<string, string> = {}
+    for (const line of draft.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      const separator = trimmed.indexOf('=')
+      const key = separator > 0 ? trimmed.slice(0, separator) : ''
+      const value = separator > 0 ? trimmed.slice(separator + 1) : ''
+      if (!key || !value || trimmed.includes('=', separator + 1)) {
+        toast.error(t('overview.labelsBadLine', { line: trimmed }))
+        return
+      }
+      labels[key] = value
+    }
+    try {
+      setBusy(true)
+      await api.replaceNodeLabels(node.id, labels)
+      setBusy(false)
+      onSaved()
+    } catch (cause) {
+      setBusy(false)
+      onError(errorMessage(cause))
+    }
+  }
+  return (
+    <div className="dialog-overlay">
+      <div className="dialog">
+        <h3>{t('overview.labelsEditorTitle', { id: node.id })}</h3>
+        <p>{t('overview.labelsEditorHint')}</p>
+        <textarea
+          className="dialog-input"
+          rows={6}
+          value={draft}
+          placeholder={'env=prod\ntier=edge'}
+          onChange={(event) => setDraft(event.target.value)}
+        />
+        <div className="dialog-actions">
+          <button onClick={onClose}>{t('common.cancel')}</button>
+          <button disabled={busy} onClick={() => void save()}>
+            {t('common.confirm')}
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }

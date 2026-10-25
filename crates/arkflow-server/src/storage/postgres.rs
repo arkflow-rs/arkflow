@@ -432,6 +432,7 @@ const PG_DDL: &str = r#"
                 node_version TEXT NOT NULL DEFAULT 'unknown',
                 state TEXT NOT NULL DEFAULT 'offline',
                 capabilities_json TEXT NOT NULL DEFAULT '[]',
+                labels_json TEXT NOT NULL DEFAULT '{}',
                 boot_id TEXT,
                 last_report_seq BIGINT,
                 last_seen_at_ms BIGINT NOT NULL DEFAULT 0,
@@ -441,6 +442,7 @@ const PG_DDL: &str = r#"
                 created_at_ms BIGINT NOT NULL,
                 updated_at_ms BIGINT NOT NULL
             );
+            ALTER TABLE cp_nodes ADD COLUMN IF NOT EXISTS labels_json TEXT NOT NULL DEFAULT '{}';
 
             CREATE TABLE IF NOT EXISTS cp_jobs (
                 job_id TEXT COLLATE "C" PRIMARY KEY,

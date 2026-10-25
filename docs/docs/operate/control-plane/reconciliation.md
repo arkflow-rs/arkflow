@@ -41,6 +41,29 @@ may resume. An expired dispatched Attempt remains ambiguous until a fresh
 Agent report establishes whether the target already took effect. This avoids
 duplicating restart or other one-shot actions.
 
+## Node labels and selector targeting
+
+Nodes carry an optional operator-managed label map (`PUT /api/v1/nodes/{id}/labels`,
+full replacement, at most 16 labels of 1-63 characters each). Labels are durable
+Hub state: Agent re-registrations and Hub restarts never change them, and every
+replacement is audited. The console exposes label editing on the fleet overview
+and label-based rollout creation.
+
+When you create a rollout (or submit one for approval), the target selection can
+be an explicit node list **or** a label selector such as
+`{"env": "prod", "tier": "edge"}`. Two operational rules follow from the
+resolution semantics:
+
+- The selector resolves **once, at creation or submission time**. Nodes that
+  gain the label afterwards are not picked up; to include them, create a new
+  rollout. Under the approval policy the pending request pins the resolved node
+  set, so approving later cannot swap targets.
+- Matching ignores node online state — a drained or stale node that still
+  carries the label stays selected, exactly as if you had listed it explicitly.
+  The rollout health gates decide whether and when that batch converges.
+
+An empty resolution (`no_matching_nodes`) rejects the request outright.
+
 ## Planned node drain
 
 Draining a node changes availability, not operator intent. The Hub should stop

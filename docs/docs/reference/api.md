@@ -173,7 +173,7 @@ corrupting state.
 |--------|-------|---------|
 | `GET` | `/system` | Hub system descriptor. |
 | `GET` | `/status` | Fleet-aggregated engine status: streams total/running/failed summed across registered nodes. |
-| `GET` | `/nodes` | Fleet node registry. |
+| `GET` | `/nodes` | Fleet node registry. Supports a label filter: `?label=env%3Dprod%2Ctier%3Dedge` (comma-joined `key=value` terms, AND semantics). |
 | `GET` | `/streams` | Streams across the fleet. |
 | `GET` | `/nodes/{node_id}/streams/{id}` | Authoritative point-in-time stream view on a node. |
 | `PUT` | `/nodes/{node_id}/streams/{id}/desired-state` | Canonical lifecycle mutation (see [Conventions](#conventions)). |
@@ -187,6 +187,28 @@ corrupting state.
 | `POST` | `/nodes/{node_id}/configuration/rollback/{version}` | Roll node configuration back. |
 | `POST` | `/nodes/{node_id}/drain` | Drain a node (evacuate assignments before maintenance). |
 | `POST`/`DELETE` | `/nodes/{node_id}/maintenance` | Enter/exit maintenance mode. |
+| `PUT` | `/nodes/{node_id}/labels` | Replace the node's complete label map (see [Node labels](#node-labels)). |
+
+#### Node labels
+
+`PUT /nodes/{node_id}/labels` takes `{"labels": {"env": "prod", "tier": "edge"}}` with
+full-replacement semantics: the submitted map becomes the node's complete label
+set. It requires the `ManageNodes` action (operator and admin roles); accepted
+replacements and denials are audited (`node.labels`).
+
+- Labels are Hub-managed: Agents never advertise labels, and re-registration
+  or a Hub restart never changes them.
+- Bounds: at most 16 labels per node; keys and values are 1-63 characters,
+  alphanumeric start and end, with `-`, `_`, `.` allowed inside. Violations
+  are rejected with `invalid_labels` without partially applying.
+- Rollout targeting: `POST /rollouts` (and approval submission) accept
+  `target_selector` — an equality map, mutually exclusive with `node_ids`. The
+  Hub resolves it to an explicit node set **once, at creation time** (or
+  submission time under the approval policy); an empty resolution is rejected
+  with `no_matching_nodes`. Later label changes never re-target an existing
+  rollout or a pending approval request. Matching covers the registry
+  regardless of node online state — the rollout health gates handle
+  unreachable nodes.
 
 The legacy un-targeted stream mutation routes remain as adapters that create
 the same durable Intent pipeline.
@@ -216,7 +238,7 @@ operation metadata only — never credentials or job configuration bodies.
 
 | Method | Route | Purpose |
 |--------|-------|---------|
-| `GET`/`POST` | `/rollouts` | List rollouts / create a rollout plan. |
+| `GET`/`POST` | `/rollouts` | List rollouts / create a rollout plan. Target selection is `node_ids` **or** `target_selector` (label equality map resolved once at creation; see [Node labels](#node-labels)). |
 | `GET` | `/rollouts/{id}` | Rollout state and per-node progress. |
 | `POST` | `/rollouts/{id}/actions` | Rollout actions: pause, resume, cancel, rollback. |
 
@@ -227,7 +249,7 @@ through approval requests instead:
 
 | Method | Route | Purpose |
 |--------|-------|---------|
-| `GET`/`POST` | `/config-approvals` | List approval requests (`?status=pending\|approving\|approved\|rejected\|expired`) / submit one pinning a version, targets, and batch size. |
+| `GET`/`POST` | `/config-approvals` | List approval requests (`?status=pending\|approving\|approved\|rejected\|expired`) / submit one pinning a version, targets, and batch size. Accepts `target_selector` like `POST /rollouts`; the request pins the selector resolved to its explicit node set at submission time. |
 | `GET` | `/config-approvals/{id}` | One approval request and its pinned snapshot. |
 | `POST` | `/config-approvals/{id}/decide` | Approve or reject (`{"decision":"approve"\|"reject","note":"..."}`). Requires the `ApproveRollouts` permission (admin role only) and a principal different from the requester. |
 
