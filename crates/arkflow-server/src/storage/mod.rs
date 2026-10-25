@@ -861,6 +861,7 @@ storage_ops! {
     ("get_node_labels", GetNodeLabels, get_node_labels) plain Option<BTreeMap<String, String>> {
         node_id: String as s,
     },
+    ("list_node_labels", ListNodeLabels, list_node_labels) plain Vec<(String, BTreeMap<String, String>)> {},
     ("operational_aggregates", OperationalAggregates, operational_aggregates) plain OperationalAggregates {
         now_ms: u64 as v,
     },
@@ -1139,6 +1140,12 @@ pub trait StorageBackend: Send + Sync + 'static {
         &self,
         node_id: &str,
     ) -> Result<Option<BTreeMap<String, String>>, StorageError>;
+    /// Every persisted node with its label map, in storage order. Selector
+    /// resolution matches these durable records so a node that has not
+    /// re-registered since a Hub restart still resolves.
+    async fn list_node_labels(
+        &self,
+    ) -> Result<Vec<(String, BTreeMap<String, String>)>, StorageError>;
     async fn operational_aggregates(
         &self,
         now_ms: u64,
@@ -1598,6 +1605,14 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::get_node_labels(backend, node_id).await,
             Self::Postgres(backend) => StorageBackend::get_node_labels(backend, node_id).await,
+        }
+    }
+    async fn list_node_labels(
+        &self,
+    ) -> Result<Vec<(String, BTreeMap<String, String>)>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_node_labels(backend).await,
+            Self::Postgres(backend) => StorageBackend::list_node_labels(backend).await,
         }
     }
     async fn operational_aggregates(

@@ -520,6 +520,21 @@ impl SqliteBackend {
         })
     }
 
+    pub fn list_node_labels(
+        &self,
+    ) -> Result<Vec<(String, std::collections::BTreeMap<String, String>)>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare("SELECT node_id, labels_json FROM cp_nodes")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?
+        .into_iter()
+        .map(|(node_id, json)| Ok((node_id, super::decode_node_labels(&json)?)))
+        .collect()
+    }
+
     pub fn get_node_labels(
         &self,
         node_id: &str,
@@ -2898,6 +2913,11 @@ impl StorageBackend for SqliteBackend {
         node_id: &str,
     ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
         self.get_node_labels(node_id)
+    }
+    async fn list_node_labels(
+        &self,
+    ) -> Result<Vec<(String, std::collections::BTreeMap<String, String>)>, StorageError> {
+        self.list_node_labels()
     }
     async fn operational_aggregates(
         &self,

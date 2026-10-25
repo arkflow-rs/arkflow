@@ -54,6 +54,8 @@
 
 这样 rollout 编排、审批、批次、回滚全部零改动——选择器只是目标选择的另一种入口语法。
 
+**CR 三轮修正（CodeRabbit major）**：解析最初只读内存注册表——Hub 重启后、Agent 重注册前，有持久化标签的节点会从解析中消失，与本节"持久化节点记录"的表述矛盾。已改为经 `list_node_labels`（双后端 `SELECT node_id, labels_json FROM cp_nodes`）读取持久化记录解析；直建 rollout 路径本就不按注册状态过滤显式 node_ids，语义一致。
+
 ### D5. 列表过滤：单 `label` 查询参数，逗号连接等值 AND
 
 `GET /nodes?label=env%3Dprod%2Ctier%3Dedge`（K8s 选择器风格）：单个参数内逗号分隔多个 `key=value` 项，AND 语义；标签 key/value 字符集不含逗号，切分无歧义。缺 `=` 或非法字符 → 400。选择单参数而非重复参数的原因：axum `Query` 提取器（serde_urlencoded）对重复键收集进 `Vec` 的行为不可依赖，且仓库既有 query 结构全部是 `Option<String>`。仅 Hub 面（本地面无 fleet 列表）。过滤在 Hub 内存中完成（≤256 节点），不动存储查询层。
@@ -74,7 +76,7 @@
 ## Migration Plan
 
 1. 代码合入即自动迁移（启动时 schema 版本推进，幂等可重入）。
-2. 回滚：旧版本二进制读新库——`labels_json` 列对旧代码是未知列，SQLite/PG 均容忍（select 按列名取）；无需数据回填。
+2. 回滚：schema 版本守卫会在启动时拒绝"库比二进制新"（SQLite `user_version`、PG `cp_schema_meta` 同样如此），旧版本二进制根本到不了正常读路径——受支持的回滚是**恢复迁移前的数据库备份**；手工重置版本号只是绕过守卫、既不删除 `labels_json` 列也不是通用流程。
 3. 灰度顺序：先 Hub 后 Console（Console 只在 API 存在时显示标签 UI——按 `isHub` 既有判别）。
 
 ## Open Questions

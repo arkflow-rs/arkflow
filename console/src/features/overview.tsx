@@ -1,3 +1,4 @@
+import * as AlertDialog from '@radix-ui/react-alert-dialog'
 import { useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
@@ -262,24 +263,35 @@ function LabelsEditor({
     }
   }
   return (
-    <div className="dialog-overlay">
-      <div className="dialog">
-        <h3>{t('overview.labelsEditorTitle', { id: node.id })}</h3>
-        <p>{t('overview.labelsEditorHint')}</p>
-        <textarea
-          className="dialog-input"
-          rows={6}
-          value={draft}
-          placeholder={'env=prod\ntier=edge'}
-          onChange={(event) => setDraft(event.target.value)}
-        />
-        <div className="dialog-actions">
-          <button onClick={onClose}>{t('common.cancel')}</button>
-          <button disabled={busy} onClick={() => void save()}>
-            {t('common.confirm')}
-          </button>
-        </div>
-      </div>
-    </div>
+    <AlertDialog.Root open onOpenChange={(open) => !open && onClose()}>
+      <AlertDialog.Portal>
+        <AlertDialog.Overlay className="dialog-overlay" />
+        <AlertDialog.Content className="dialog">
+          <AlertDialog.Title asChild>
+            <h3>{t('overview.labelsEditorTitle', { id: node.id })}</h3>
+          </AlertDialog.Title>
+          <AlertDialog.Description asChild>
+            <p>{t('overview.labelsEditorHint')}</p>
+          </AlertDialog.Description>
+          <textarea
+            className="dialog-input"
+            rows={6}
+            value={draft}
+            placeholder={'env=prod\ntier=edge'}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <div className="dialog-actions">
+            <AlertDialog.Cancel asChild>
+              <button type="button">{t('common.cancel')}</button>
+            </AlertDialog.Cancel>
+            <AlertDialog.Action asChild>
+              <button type="button" disabled={busy} onClick={() => void save()}>
+                {t('common.confirm')}
+              </button>
+            </AlertDialog.Action>
+          </div>
+        </AlertDialog.Content>
+      </AlertDialog.Portal>
+    </AlertDialog.Root>
   )
 }

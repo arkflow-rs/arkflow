@@ -175,7 +175,7 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 
 - 标签由 Hub 管理:Agent 从不上报标签,Agent 重注册或 Hub 重启都不会改变标签。
 - 边界:每节点最多 16 条;key 与 value 各 1-63 字符,以字母数字开头和结尾,中间允许 `-`、`_`、`.`。违规以 `invalid_labels` 拒绝,不会部分应用。
-- Rollout 目标选择:`POST /rollouts`(以及审批提交)接受 `target_selector`——等值映射,与 `node_ids` 互斥。Hub 在**创建时一次性**解析为显式节点集(审批策略开启时在提交时解析);解析结果为空集以 `no_matching_nodes` 拒绝。之后的标签变更不会改变已创建 rollout 或待审批请求的目标。匹配覆盖整个注册表、不感知节点在线状态——不可达节点由 rollout 健康门控处理。
+- Rollout 目标选择:`POST /rollouts`(以及审批提交)接受 `target_selector`——等值映射,与 `node_ids` 互斥。Hub 在**创建时一次性**解析为显式节点集(审批策略开启时在提交时解析);解析结果为空集以 `no_matching_nodes` 拒绝。之后的标签变更不会改变已创建 rollout 或待审批请求的目标。匹配读取持久化节点记录（`cp_nodes`）而非实时注册表:Hub 重启后尚未重注册的节点同样会被解析到;不可达节点保持可选——由 rollout 健康门控处理投递。
 
 旧的不定向节点的流变更路由仍作为适配器保留,它们创建的是同一条持久化 Intent 管道。
 

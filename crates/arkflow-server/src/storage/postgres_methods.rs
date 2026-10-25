@@ -314,6 +314,22 @@ impl StorageBackend for PostgresBackend {
         }
     }
 
+    async fn list_node_labels(&self) -> Result<Vec<(String, std::collections::BTreeMap<String, String>)>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            let rows = connection
+                .query_all(
+                    "SELECT node_id, labels_json FROM cp_nodes",
+                    binds![],
+                    |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+                )
+                .await?;
+            rows.into_iter()
+                .map(|(node_id, json)| Ok((node_id, decode_node_labels(&json)?)))
+                .collect()
+        }
+    }
+
     async fn get_node_labels(
         &self,
         node_id: &str,

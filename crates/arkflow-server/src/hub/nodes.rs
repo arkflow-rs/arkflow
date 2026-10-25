@@ -1008,23 +1008,30 @@ impl Hub {
     }
 
     /// Resolve a label selector to the sorted ids of nodes whose labels
-    /// match every selector pair (equality, AND semantics). Matching covers
-    /// the whole registry regardless of lease/connection state — unreachable
-    /// nodes stay selectable, consistent with explicit node lists, and the
-    /// rollout health gates handle delivery.
-    pub async fn resolve_label_selector(&self, selector: &BTreeMap<String, String>) -> Vec<String> {
-        let nodes = self.nodes.read().await;
-        let mut matched: Vec<String> = nodes
-            .values()
-            .filter(|node| {
+    /// match every selector pair (equality, AND semantics). Resolution reads
+    /// the DURABLE node records (`cp_nodes.labels_json`), not the in-memory
+    /// registration map: a node that has not re-registered since a Hub
+    /// restart still resolves, exactly like an unreachable-but-registered
+    /// node — consistent with explicit node lists, whose ids the direct
+    /// rollout path also never filters by registration state. The rollout
+    /// health gates handle delivery to unreachable targets.
+    pub async fn resolve_label_selector(
+        &self,
+        selector: &BTreeMap<String, String>,
+    ) -> Result<Vec<String>, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        let records = storage.list_node_labels().await.map_err(HubError::from)?;
+        let mut matched: Vec<String> = records
+            .into_iter()
+            .filter(|(_, labels)| {
                 selector
                     .iter()
-                    .all(|(key, value)| node.resource.labels.get(key) == Some(value))
+                    .all(|(key, value)| labels.get(key) == Some(value))
             })
-            .map(|node| node.resource.id.clone())
+            .map(|(node_id, _)| node_id)
             .collect();
         matched.sort();
-        matched
+        Ok(matched)
     }
     pub async fn configuration(&self, node_id: &str) -> Option<serde_json::Value> {
         self.nodes

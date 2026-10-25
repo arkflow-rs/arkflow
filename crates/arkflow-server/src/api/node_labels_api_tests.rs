@@ -411,3 +411,72 @@ async fn approval_submission_pins_resolved_node_set() {
         .collect();
     assert_eq!(still, vec!["node-a"]);
 }
+
+/// A Hub restart must not narrow selector resolution: the selector matches
+/// durable node records, so a labeled node that has not yet re-registered
+/// still resolves (CodeRabbit major on #1336).
+#[tokio::test]
+async fn selector_resolves_persisted_nodes_across_hub_restart() {
+    let store = crate::storage::ControlPlaneStore::contract("selector_restart_window").await;
+    let storage = crate::storage::StorageActor::start(store, 8);
+    let hub = hub::Hub::with_storage(
+        labels_config("root|admin|admin-secret", false),
+        storage.clone(),
+    );
+    register_node(&hub, "node-a").await;
+    hub.replace_node_labels(
+        "node-a",
+        std::collections::BTreeMap::from([("env".to_owned(), "prod".to_owned())]),
+        Some("operator-1".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    hub.create_rollout_with_content(
+        "cfg-restart-1".into(),
+        "{\"streams\":[]}".into(),
+        vec!["node-a".into()],
+        1,
+        Some("seeder".into()),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Fresh Hub over the same storage: empty in-memory registry (no agent
+    // has re-registered), durable labels present.
+    let restarted =
+        hub::Hub::with_storage(labels_config("root|admin|admin-secret", false), storage);
+    let app = hub_router(restarted, &ServerConfig::default());
+    let (status, body) = get_json(&app, "/api/v1/nodes", "admin-secret").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["items"].as_array().unwrap().is_empty(),
+        "precondition: in-memory registry is empty after restart"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/rollouts",
+        "admin-secret",
+        serde_json::json!({
+            "config_version": "cfg-restart-1",
+            "target_selector": {"env": "prod"},
+            "batch_size": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["total_targets"], 1);
+    let rollout_id = body["rollout_id"].as_str().unwrap().to_owned();
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/rollouts/{rollout_id}"),
+        "admin-secret",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let targets = body["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0]["node_id"], "node-a");
+}

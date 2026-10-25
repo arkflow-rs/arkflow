@@ -58,9 +58,11 @@ resolution semantics:
   gain the label afterwards are not picked up; to include them, create a new
   rollout. Under the approval policy the pending request pins the resolved node
   set, so approving later cannot swap targets.
-- Matching ignores node online state — a drained or stale node that still
-  carries the label stays selected, exactly as if you had listed it explicitly.
-  The rollout health gates decide whether and when that batch converges.
+- Matching reads the durable node records, not the live registration map: a
+  drained or stale node that still carries the label stays selected, and so
+  does a node that has not yet re-registered after a Hub restart — exactly as
+  if you had listed their ids explicitly. The rollout health gates decide
+  whether and when that batch converges.
 
 An empty resolution (`no_matching_nodes`) rejects the request outright.
 

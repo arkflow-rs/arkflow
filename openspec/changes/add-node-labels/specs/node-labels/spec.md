@@ -61,6 +61,11 @@ Rollout creation SHALL accept a label selector (an equality map) as the target s
 - **WHEN** a rollout created from a selector is in progress and one of its target nodes has its labels changed or removed
 - **THEN** the rollout's target set is unchanged and convergence continues to be evaluated against the persisted targets
 
+#### Scenario: Selector matches a node not yet re-registered after Hub restart
+
+- **WHEN** the Hub has restarted, a node with stored labels has not yet re-registered, and an operator creates a rollout whose selector matches that node's stored labels
+- **THEN** the resolution includes the node — selector resolution reads durable node records, never the transient in-memory registration map
+
 #### Scenario: Selector resolving to no nodes is rejected
 
 - **WHEN** an operator creates a rollout with a selector that matches no node

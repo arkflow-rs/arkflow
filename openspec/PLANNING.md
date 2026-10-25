@@ -346,7 +346,7 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转�
 - OpenTelemetry trace 与跨节点故障诊断。
 - 在单 Hub 模型验证稳定后，再评估外部数据库和 Hub 高可用。
 
-> **2026-10-24 盘点修订**：本节中 RBAC、OIDC、Hub 高可用（Postgres + 租约选主）、OTel trace 均已闭环；阶段 4 真剩余项与控制面新增缺口（限流/备份/节点标签/告警等）的完整清单与优先级见第十一节。
+> **2026-10-24 盘点修订**：本节中 RBAC、OIDC、Hub 高可用（Postgres + 租约选主）、OTel trace（引擎/数据面，`add-data-plane-tracing`；`arkflow-server` 独立二进制的 tracing 初始化仍是缺口，见 11.2-8）均已闭环；阶段 4 真剩余项与控制面新增缺口（限流/备份/节点标签/告警等）的完整清单与优先级见第十一节。
 
 ### 5.8 设计边界
 
@@ -608,7 +608,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 
 ### 11.2 后端能力缺失（需立项）
 
-1. **节点标签体系**：存储层无 labels 字段。同时阻塞两个方向——「按节点标签/能力批量操作」（5.6 阶段 3）与「标签分组审批策略」（`add-config-approval-flow` 落地时的已知简化，v1 只做全局开关）。一子解二题。
+1. ~~**节点标签体系**~~ → ✅ 已由 #1336（`add-node-labels`）落地：Hub 管理标签 + 列表过滤 + selector rollout；剩余「按标签批量流命令」「标签分组审批策略」仍开放。
 2. **告警/webhook/事件订阅**：前后端零实现（grep webhook/notification/slack/email 仅误报命中）；SSE 事件流基建已具备，无向外转发能力。对应 5.7 阶段 4 整条未动。
 3. **限流/配额**：无任何 per-principal/per-node 请求限速或资源配额，仅请求体大小限制（本地 1MB/Hub 4MB）与内存硬上限（`MAX_NODES=256`、`MAX_COMMANDS_PER_NODE=128`、`MAX_OPERATIONS=1024`，`hub.rs:56-59`）。
 4. **控制面 DB 备份/恢复**：无快照/导出/恢复工具，仅停机 sqlite→pg 一次性迁移（`migrate_tool.rs`）。注意 Job 级 checkpoint/savepoint 恢复是完整的，勿混淆。
@@ -632,7 +632,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 
 | 序 | 方向 | 要点 | 备注 |
 | --- | --- | --- | --- |
-| P0 | `add-node-labels` | 节点标签体系 + 按标签批量操作 | 一子解二题（批量运营 + 审批分组策略）；阶段 3 收口 |
+| P0 | ~~`add-node-labels`~~ | 节点标签体系 + 按标签批量操作 | ✅ 已落地 #1336（标签 + 过滤 + selector rollout；审批分组策略仍留 `add-approval-label-scoping`） |
 | P0 | `add-alerting-webhooks` | webhook/事件订阅转发 | 复用 SSE 基建，纯增量；阶段 4 最小切口 |
 | P1 | 控制面限流/配额 | per-principal/per-node 限速 | 企业入场券 |
 | P1 | 控制面 DB 备份/恢复 | 快照/导出/恢复工具 | 企业入场券 |

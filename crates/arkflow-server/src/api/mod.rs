@@ -1261,7 +1261,7 @@ async fn resolve_target_selection(
                 ));
             }
             match hub.resolve_label_selector(&selector).await {
-                resolved if resolved.is_empty() => Err(problem(
+                Ok(resolved) if resolved.is_empty() => Err(problem(
                     StatusCode::BAD_REQUEST,
                     "no_matching_nodes",
                     format!(
@@ -1273,7 +1273,8 @@ async fn resolve_target_selection(
                             .join(",")
                     ),
                 )),
-                resolved => Ok(resolved),
+                Ok(resolved) => Ok(resolved),
+                Err(error) => Err(hub_problem(error)),
             }
         }
     }

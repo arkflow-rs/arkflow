@@ -206,9 +206,10 @@ replacements and denials are audited (`node.labels`).
   Hub resolves it to an explicit node set **once, at creation time** (or
   submission time under the approval policy); an empty resolution is rejected
   with `no_matching_nodes`. Later label changes never re-target an existing
-  rollout or a pending approval request. Matching covers the registry
-  regardless of node online state — the rollout health gates handle
-  unreachable nodes.
+  rollout or a pending approval request. Matching reads the durable node
+  records (`cp_nodes`), not the live registration map: a node that has not
+  re-registered since a Hub restart still resolves, and unreachable nodes
+  stay selectable — the rollout health gates handle delivery.
 
 The legacy un-targeted stream mutation routes remain as adapters that create
 the same durable Intent pipeline.
