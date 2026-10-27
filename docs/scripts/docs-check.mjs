@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {parseComponentOwnership, routeFor, walk} from './lib.mjs';
 
-const root = path.resolve(new URL('..', import.meta.url).pathname);
+const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const docsRoot = path.join(root, 'docs');
 const repoRoot = path.dirname(root);
 const inventoryPath = path.join(root, 'reference', 'component-inventory.json');
@@ -80,7 +81,7 @@ function slugsFor(file) {
 // ---------------------------------------------------------------------------
 
 for (const file of markdown) {
-  const text = fs.readFileSync(file, 'utf8');
+  const text = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
   if (!text.startsWith('---\n') && !file.includes(`${path.sep}versioned_docs${path.sep}`)) {
     errors.push(`${path.relative(root, file)}: missing front matter`);
   }
