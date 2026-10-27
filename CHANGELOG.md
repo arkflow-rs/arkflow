@@ -7,7 +7,18 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added — Control plane
+
+- Configuration approval gate: `control_api.approval_required` (default
+  off) gates every configuration rollout creation path — batch creation,
+  node-level apply, and rollback — behind approval requests decided by a
+  second principal (`/api/v1/config-approvals`). Approvals create the
+  rollout as the approver, survive Hub restarts, adopt (never duplicate) a
+  rollout a crashed approval created, expire pending requests after
+  `approval_ttl_ms`, and audit submit/approve/reject with scalar metadata.
+  Rollback is exempt only for versions previously applied to the affected
+  nodes. Console gains an approval queue page and a policy-aware publish
+  flow.
 
 ## [0.6.0] — 2026-10-16
 

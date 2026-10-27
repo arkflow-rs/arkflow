@@ -19,6 +19,40 @@ pub struct SqliteBackend {
     connection: Arc<Mutex<Connection>>,
 }
 
+fn config_approval_from_row(row: &Row<'_>) -> rusqlite::Result<ConfigApprovalRequest> {
+    let targets_json: String = row.get(2)?;
+    let targets = serde_json::from_str(&targets_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let raw_status: String = row.get(5)?;
+    let status = ConfigApprovalStatus::parse(&raw_status).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown approval status: {raw_status}"),
+            )),
+        )
+    })?;
+    Ok(ConfigApprovalRequest {
+        request_id: row.get(0)?,
+        config_version_id: row.get(1)?,
+        targets,
+        batch_size: row.get(3)?,
+        requester_id: row.get(4)?,
+        status,
+        approver_id: row.get(6)?,
+        decided_at_ms: row.get(7)?,
+        rollout_id: row.get(8)?,
+        correlation_id: row.get(9)?,
+        expires_at_ms: row.get(10)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+        failure_note: row.get(13)?,
+    })
+}
+
 fn job_upgrade_from_row(row: &Row<'_>) -> rusqlite::Result<JobUpgradeRecord> {
     Ok(JobUpgradeRecord {
         upgrade_id: row.get(0)?,
@@ -445,6 +479,207 @@ impl SqliteBackend {
                     |row| row.get(0),
                 )
                 .optional()
+        })
+    }
+
+    /// Full replacement of a node's label map, audited in the same
+    /// transaction. Returns the previous labels for an existing node.
+    pub fn replace_node_labels(
+        &self,
+        mutation: super::NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        let encoded = serde_json::to_string(&mutation.labels)
+            .map_err(|error| StorageError::Encoding(format!("encode node labels: {error}")))?;
+        self.immediate_transaction(|transaction| {
+            let previous_json: Option<String> = transaction
+                .query_row(
+                    "SELECT labels_json FROM cp_nodes WHERE node_id = ?1",
+                    [&mutation.node_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(previous_json) = previous_json else {
+                return Ok(None);
+            };
+            let previous = super::decode_node_labels(&previous_json)?;
+            let summary = format!("{}->{} labels", previous.len(), mutation.labels.len());
+            transaction.execute(
+                "UPDATE cp_nodes SET labels_json = ?2, updated_at_ms = ?3 WHERE node_id = ?1",
+                rusqlite::params![mutation.node_id, encoded, now_ms],
+            )?;
+            transaction.execute(
+                "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES (?1, 'node_labels_changed', 'succeeded', ?2, ?3, ?4, ?5)",
+                rusqlite::params![mutation.node_id, summary, mutation.correlation_id, mutation.actor, now_ms],
+            )?;
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES (?1, 'node.labels', 'node', ?2, ?2, ?3, 'accepted', ?4, ?5)",
+                rusqlite::params![mutation.actor, mutation.node_id, mutation.correlation_id, summary, now_ms],
+            )?;
+            Ok(Some(previous))
+        })
+    }
+
+    pub fn list_node_labels(&self) -> Result<Vec<super::NodeLabels>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare("SELECT node_id, labels_json FROM cp_nodes")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?
+        .into_iter()
+        .map(|(node_id, json)| Ok((node_id, super::decode_node_labels(&json)?)))
+        .collect()
+    }
+
+    pub fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        let json: Option<String> = self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT labels_json FROM cp_nodes WHERE node_id = ?1",
+                    [node_id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })?;
+        json.map(|json| super::decode_node_labels(&json))
+            .transpose()
+    }
+
+    /// Full replacement of the webhook subscription set, audited in the same
+    /// transaction. Returns the ids that transitioned disabled→enabled,
+    /// each already persisted as a `webhook.resumed` event.
+    pub fn replace_webhooks(
+        &self,
+        mutation: super::WebhookSetMutation,
+        now_ms: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let mut previous: std::collections::BTreeMap<String, bool> =
+                std::collections::BTreeMap::new();
+            {
+                let mut statement =
+                    transaction.prepare("SELECT webhook_id, enabled FROM cp_webhooks")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })?;
+                for row in rows {
+                    let (id, enabled) = row?;
+                    previous.insert(id, enabled);
+                }
+            }
+            transaction.execute("DELETE FROM cp_webhooks", [])?;
+            for subscription in &mutation.subscriptions {
+                let event_types = serde_json::to_string(&subscription.event_types)
+                    .map_err(|error| StorageError::Encoding(format!("encode webhook event types: {error}")))?;
+                transaction.execute(
+                    "INSERT INTO cp_webhooks (webhook_id, url, event_types_json, enabled, secret, created_by, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        subscription.id,
+                        subscription.url,
+                        event_types,
+                        subscription.enabled,
+                        subscription.secret,
+                        subscription.created_by,
+                        subscription.created_at_ms,
+                    ],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES (?1, 'webhook.replace', 'webhook', NULL, NULL, ?2, 'accepted', ?3, ?4)",
+                rusqlite::params![
+                    mutation.actor,
+                    mutation.correlation_id,
+                    format!("{} webhooks", mutation.subscriptions.len()),
+                    now_ms,
+                ],
+            )?;
+            let resumed = mutation
+                .subscriptions
+                .iter()
+                .filter(|subscription| {
+                    subscription.enabled && previous.get(&subscription.id) == Some(&false)
+                })
+                .map(|subscription| subscription.id.clone())
+                .collect::<Vec<_>>();
+            for id in &resumed {
+                transaction.execute(
+                    "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES ('hub', 'webhook.resumed', 'succeeded', ?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        format!("webhook {id} resumed"),
+                        mutation.correlation_id,
+                        mutation.actor,
+                        now_ms,
+                    ],
+                )?;
+            }
+            Ok(resumed)
+        })
+    }
+
+    pub fn list_webhooks(&self) -> Result<Vec<super::WebhookSubscription>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare("SELECT webhook_id, url, event_types_json, enabled, secret, created_by, created_at_ms FROM cp_webhooks ORDER BY webhook_id")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)? as u64,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?
+        .into_iter()
+        .map(|(id, url, event_types, enabled, secret, created_by, created_at_ms)| {
+            Ok(super::WebhookSubscription {
+                id,
+                url,
+                event_types: super::decode_webhook_event_types(&event_types)?,
+                enabled,
+                secret,
+                created_by,
+                created_at_ms,
+            })
+        })
+        .collect()
+    }
+
+    /// Auto-pause after sustained delivery failure: flips `enabled` to
+    /// false and persists a `webhook.paused` event plus a system-actor
+    /// audit row in the same transaction. Returns whether the subscription
+    /// transitioned (an already-paused or unknown id returns false).
+    pub fn pause_webhook(
+        &self,
+        webhook_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let changed = transaction.execute(
+                "UPDATE cp_webhooks SET enabled = 0 WHERE webhook_id = ?1 AND enabled = 1",
+                [webhook_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            transaction.execute(
+                "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES ('hub', 'webhook.paused', 'failed', ?1, NULL, 'system', ?2)",
+                rusqlite::params![format!("webhook {webhook_id} paused: {reason}"), now_ms],
+            )?;
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES ('system', 'webhook.pause', 'webhook', ?1, NULL, NULL, 'accepted', ?2, ?3)",
+                rusqlite::params![webhook_id, reason, now_ms],
+            )?;
+            Ok(true)
         })
     }
 
@@ -1431,6 +1666,198 @@ impl SqliteBackend {
         })
     }
 
+    pub fn create_config_approval_request(
+        &self,
+        request: ConfigApprovalRequest,
+    ) -> Result<(), StorageError> {
+        let targets = serde_json::to_string(&request.targets)
+            .map_err(|error| StorageError::Encoding(error.to_string()))?;
+        self.immediate_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO cp_config_approval_requests (request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    request.request_id,
+                    request.config_version_id,
+                    targets,
+                    request.batch_size,
+                    request.requester_id,
+                    request.status.as_str(),
+                    request.approver_id,
+                    request.decided_at_ms,
+                    request.rollout_id,
+                    request.correlation_id,
+                    request.expires_at_ms,
+                    request.created_at_ms,
+                    request.updated_at_ms,
+                    request.failure_note,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_config_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ConfigApprovalRequest>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note FROM cp_config_approval_requests WHERE request_id = ?1",
+                    [request_id],
+                    config_approval_from_row,
+                )
+                .optional()
+        })
+    }
+
+    pub fn list_config_approval_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ConfigApprovalRequest>, StorageError> {
+        self.with_connection(|connection| match status {
+            Some(status) => {
+                let mut statement = connection.prepare(
+                    "SELECT request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note FROM cp_config_approval_requests WHERE status = ?1 ORDER BY created_at_ms DESC, request_id DESC LIMIT 1024",
+                )?;
+                let rows = statement.query_map([status], config_approval_from_row)?;
+                rows.collect()
+            }
+            None => {
+                let mut statement = connection.prepare(
+                    "SELECT request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note FROM cp_config_approval_requests ORDER BY created_at_ms DESC, request_id DESC LIMIT 1024",
+                )?;
+                let rows = statement.query_map([], config_approval_from_row)?;
+                rows.collect()
+            }
+        })
+    }
+
+    pub fn begin_decide_config_approval_request(
+        &self,
+        request_id: &str,
+        status: &str,
+        approver_id: &str,
+        decided_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let updated = transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = ?2, approver_id = ?3, decided_at_ms = ?4, updated_at_ms = ?5 WHERE request_id = ?1 AND status = 'pending'",
+                rusqlite::params![request_id, status, approver_id, decided_at_ms, updated_at_ms],
+            )?;
+            Ok(updated == 1)
+        })
+    }
+
+    pub fn complete_config_approval_request(
+        &self,
+        request_id: &str,
+        rollout_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let updated = transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'approved', rollout_id = ?2, updated_at_ms = ?3 WHERE request_id = ?1 AND status = 'approving'",
+                rusqlite::params![request_id, rollout_id, updated_at_ms],
+            )?;
+            Ok(updated == 1)
+        })
+    }
+
+    pub fn reset_config_approval_request(
+        &self,
+        request_id: &str,
+        failure_note: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|transaction| {
+            let updated = transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'pending', failure_note = ?2, updated_at_ms = ?3 WHERE request_id = ?1 AND status = 'approving'",
+                rusqlite::params![request_id, failure_note, updated_at_ms],
+            )?;
+            Ok(updated == 1)
+        })
+    }
+
+    pub fn find_rollout_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RolloutRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms FROM cp_rollouts WHERE correlation_id = ?1 ORDER BY created_at_ms LIMIT 1",
+                    [correlation_id],
+                    |row| {
+                        Ok(RolloutRecord {
+                            rollout_id: row.get(0)?,
+                            config_version_id: row.get(1)?,
+                            state: row.get(2)?,
+                            batch_size: row.get(3)?,
+                            current_batch: row.get(4)?,
+                            total_targets: row.get(5)?,
+                            actor: row.get(6)?,
+                            correlation_id: row.get(7)?,
+                            created_at_ms: row.get(8)?,
+                            updated_at_ms: row.get(9)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+    }
+
+    pub fn sweep_config_approval_requests(
+        &self,
+        now_ms: u64,
+        terminal_older_than_ms: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError> {
+        let cutoff_ms = now_ms.saturating_sub(terminal_older_than_ms);
+        // An approving row without a rollout is only reset once it stopped
+        // changing for a full maintenance tick, so a sweep never races an
+        // approval that is still creating its rollout.
+        let stalled_before_ms = now_ms.saturating_sub(APPROVING_STALL_MS);
+        self.immediate_transaction(|transaction| {
+            let mut written = 0usize;
+            written += transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'expired', updated_at_ms = ?2 WHERE status = 'pending' AND expires_at_ms <= ?1",
+                rusqlite::params![now_ms, now_ms],
+            )?;
+            // Adoption: a rollout already carries the request's correlation id,
+            // so the approval created it and only the marking was lost.
+            written += transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'approved', rollout_id = (SELECT rollout_id FROM cp_rollouts WHERE correlation_id = cp_config_approval_requests.correlation_id ORDER BY created_at_ms LIMIT 1), updated_at_ms = ?1 WHERE status = 'approving' AND EXISTS (SELECT 1 FROM cp_rollouts WHERE correlation_id = cp_config_approval_requests.correlation_id)",
+                rusqlite::params![now_ms],
+            )?;
+            written += transaction.execute(
+                "UPDATE cp_config_approval_requests SET status = 'pending', failure_note = COALESCE(failure_note, 'approval did not complete; retry the decision'), updated_at_ms = ?1 WHERE status = 'approving' AND updated_at_ms <= ?2 AND NOT EXISTS (SELECT 1 FROM cp_rollouts WHERE correlation_id = cp_config_approval_requests.correlation_id)",
+                rusqlite::params![now_ms, stalled_before_ms],
+            )?;
+            written += transaction.execute(
+                "DELETE FROM cp_config_approval_requests WHERE status IN ('approved', 'rejected', 'expired') AND updated_at_ms < ?1",
+                rusqlite::params![cutoff_ms],
+            )?;
+            written += transaction.execute(
+                "DELETE FROM cp_config_approval_requests WHERE status IN ('approved', 'rejected', 'expired') AND request_id NOT IN (SELECT request_id FROM cp_config_approval_requests WHERE status IN ('approved', 'rejected', 'expired') ORDER BY updated_at_ms DESC, request_id DESC LIMIT ?1)",
+                rusqlite::params![max_retained],
+            )?;
+            Ok(written)
+        })
+    }
+
+    pub fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError> {
+        self.with_connection(|connection| {
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM cp_config_approval_requests WHERE status = ?1",
+                [status],
+                |row| row.get(0),
+            )?;
+            Ok(count as usize)
+        })
+    }
+
     pub fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
         self.immediate_transaction(|transaction| {
             transaction.execute(
@@ -2154,6 +2581,7 @@ impl SqliteBackend {
                 node_version TEXT NOT NULL DEFAULT 'unknown',
                 state TEXT NOT NULL DEFAULT 'offline',
                 capabilities_json TEXT NOT NULL DEFAULT '[]',
+                labels_json TEXT NOT NULL DEFAULT '{}',
                 boot_id TEXT,
                 last_report_seq INTEGER,
                 last_seen_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -2313,6 +2741,16 @@ impl SqliteBackend {
                 occurred_at_ms INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS cp_webhooks (
+                webhook_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                event_types_json TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                secret TEXT,
+                created_by TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS cp_audit_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 actor TEXT,
@@ -2356,6 +2794,26 @@ impl SqliteBackend {
                 FOREIGN KEY (rollout_id)
                     REFERENCES cp_rollouts(rollout_id)
             );
+
+            CREATE TABLE IF NOT EXISTS cp_config_approval_requests (
+                request_id TEXT PRIMARY KEY,
+                config_version_id TEXT NOT NULL,
+                targets_json TEXT NOT NULL,
+                batch_size INTEGER NOT NULL,
+                requester_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                approver_id TEXT,
+                decided_at_ms INTEGER,
+                rollout_id TEXT,
+                correlation_id TEXT NOT NULL UNIQUE,
+                expires_at_ms INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                failure_note TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS cp_config_approval_status
+                ON cp_config_approval_requests(status, created_at_ms);
 
             CREATE TABLE IF NOT EXISTS cp_job_upgrades (
                 upgrade_id TEXT PRIMARY KEY,
@@ -2479,6 +2937,12 @@ impl SqliteBackend {
                 [],
             )?;
         }
+        if !node_columns.iter().any(|name| name == "labels_json") {
+            connection.execute(
+                "ALTER TABLE cp_nodes ADD COLUMN labels_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )?;
+        }
         let event_columns: Vec<String> = connection
             .prepare("PRAGMA table_info(cp_events)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -2577,6 +3041,42 @@ impl StorageBackend for SqliteBackend {
     }
     async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError> {
         self.get_node_maintenance(node_id)
+    }
+    async fn replace_node_labels(
+        &self,
+        mutation: NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        self.replace_node_labels(mutation, now_ms)
+    }
+    async fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        self.get_node_labels(node_id)
+    }
+    async fn list_node_labels(
+        &self,
+    ) -> Result<Vec<(String, std::collections::BTreeMap<String, String>)>, StorageError> {
+        self.list_node_labels()
+    }
+    async fn replace_webhooks(
+        &self,
+        mutation: super::WebhookSetMutation,
+        now_ms: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        self.replace_webhooks(mutation, now_ms)
+    }
+    async fn list_webhooks(&self) -> Result<Vec<super::WebhookSubscription>, StorageError> {
+        self.list_webhooks()
+    }
+    async fn pause_webhook(
+        &self,
+        webhook_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.pause_webhook(webhook_id, reason, now_ms)
     }
     async fn operational_aggregates(
         &self,
@@ -2734,6 +3234,73 @@ impl StorageBackend for SqliteBackend {
     }
     async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError> {
         self.list_rollouts()
+    }
+    async fn create_config_approval_request(
+        &self,
+        request: ConfigApprovalRequest,
+    ) -> Result<(), StorageError> {
+        self.create_config_approval_request(request)
+    }
+    async fn get_config_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ConfigApprovalRequest>, StorageError> {
+        self.get_config_approval_request(request_id)
+    }
+    async fn list_config_approval_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ConfigApprovalRequest>, StorageError> {
+        self.list_config_approval_requests(status)
+    }
+    async fn begin_decide_config_approval_request(
+        &self,
+        request_id: &str,
+        status: &str,
+        approver_id: &str,
+        decided_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.begin_decide_config_approval_request(
+            request_id,
+            status,
+            approver_id,
+            decided_at_ms,
+            updated_at_ms,
+        )
+    }
+    async fn complete_config_approval_request(
+        &self,
+        request_id: &str,
+        rollout_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.complete_config_approval_request(request_id, rollout_id, updated_at_ms)
+    }
+    async fn reset_config_approval_request(
+        &self,
+        request_id: &str,
+        failure_note: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.reset_config_approval_request(request_id, failure_note, updated_at_ms)
+    }
+    async fn find_rollout_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RolloutRecord>, StorageError> {
+        self.find_rollout_by_correlation(correlation_id)
+    }
+    async fn sweep_config_approval_requests(
+        &self,
+        now_ms: u64,
+        terminal_older_than_ms: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError> {
+        self.sweep_config_approval_requests(now_ms, terminal_older_than_ms, max_retained)
+    }
+    async fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError> {
+        self.count_config_approval_requests(status)
     }
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
         self.upsert_job_upgrade(record)

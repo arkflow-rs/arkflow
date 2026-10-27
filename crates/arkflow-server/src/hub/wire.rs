@@ -127,6 +127,11 @@ pub struct HubNode {
     /// Advertised cross-node data-plane address ("host:port").
     #[serde(default)]
     pub data_address: Option<String>,
+    /// Operator-managed fleet labels (see the `node-labels` capability).
+    /// Agents never advertise labels; the Hub re-hydrates them from storage
+    /// on every registration so they survive restarts and re-registrations.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

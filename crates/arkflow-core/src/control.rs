@@ -98,6 +98,11 @@ pub struct StreamMetricsSnapshot {
     pub watermark_lag_ms: u64,
     #[serde(default)]
     pub late_events: u64,
+    /// Cumulative background-flush failures of the Stream's input WAL
+    /// (0 when durability is disabled). `serde(default)` keeps older
+    /// control-plane payloads decodable.
+    #[serde(default)]
+    pub wal_flush_failures: u64,
 }
 
 /// Public snapshot for one Stream.
@@ -230,6 +235,10 @@ pub struct EngineStatus {
     pub streams_total: usize,
     pub streams_running: usize,
     pub streams_failed: usize,
+    /// Whether the configuration approval gate is enabled on this Hub (see
+    /// `configuration-approval`); absent (false) on older binaries. The
+    /// Console uses it to switch the publish flow to submit-for-approval.
+    pub approval_required: bool,
 }
 
 /// Standard JSON error payload for control-plane routes.

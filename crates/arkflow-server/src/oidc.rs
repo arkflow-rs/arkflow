@@ -1016,6 +1016,8 @@ mod tests {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: 3_600_000,
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         })
         .with_oidc(federation);
 
@@ -1164,6 +1166,8 @@ mod tests {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: 3_600_000,
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         })
         .with_oidc(federation.clone());
 
@@ -1279,6 +1283,8 @@ mod tests {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: 3_600_000,
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         })
         .with_oidc(federation.clone());
 
@@ -1386,6 +1392,8 @@ mod tests {
             lease_ttl_ms: 10_000,
             poll_interval_ms: 100,
             session_ttl_ms: 3_600_000,
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         })
         .with_oidc(federation.clone());
 

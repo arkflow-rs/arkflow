@@ -39,6 +39,19 @@ pub trait InputBuilder: Send + Sync {
         codec: Option<Arc<dyn Codec>>,
         resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error>;
+
+    /// Placement affinity key this component contributes to the job plan
+    /// (e.g. the Kafka L3 transactional pairing). Sources returning the same
+    /// key as other components are pinned onto one node by placement; the
+    /// default of `None` means no affinity. Derives from configuration only —
+    /// implementations MUST NOT take side effects (no connections).
+    fn placement_affinity(
+        &self,
+        config: &Option<serde_json::Value>,
+    ) -> Result<Option<String>, Error> {
+        let _ = config;
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -771,4 +784,102 @@ pub fn registered_names() -> Vec<String> {
     let mut names: Vec<String> = INPUT_BUILDERS.read().unwrap().keys().cloned().collect();
     names.sort();
     names
+}
+
+/// Resolve the placement affinity of an input type through its registered
+/// builder. An unregistered type contributes no affinity (`Ok(None)`) — it
+/// cannot be built on any node, so the existing build path stays the
+/// fail-closed boundary; a registered builder's affinity error (malformed
+/// config) propagates so placement fails before dispatch.
+pub fn placement_affinity(
+    input_type: &str,
+    config: &Option<serde_json::Value>,
+) -> Result<Option<String>, Error> {
+    let builders = INPUT_BUILDERS.read().unwrap();
+    match builders.get(input_type) {
+        Some(builder) => builder.placement_affinity(config),
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+
+    struct StubBuilder {
+        affinity: Option<String>,
+        fail: bool,
+    }
+
+    impl InputBuilder for StubBuilder {
+        fn build(
+            &self,
+            _name: Option<&str>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn Codec>>,
+            _resource: &Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Err(Error::Config("stub input never builds".to_string()))
+        }
+
+        fn placement_affinity(
+            &self,
+            _config: &Option<serde_json::Value>,
+        ) -> Result<Option<String>, Error> {
+            if self.fail {
+                Err(Error::Config("stub affinity config error".to_string()))
+            } else {
+                Ok(self.affinity.clone())
+            }
+        }
+    }
+
+    fn unique_type(prefix: &str) -> String {
+        format!("{prefix}-{}", std::process::id())
+    }
+
+    #[test]
+    fn placement_affinity_resolves_through_the_registry() {
+        let declared = unique_type("affinity-in-declared");
+        register_input_builder(
+            &declared,
+            Arc::new(StubBuilder {
+                affinity: Some("kafka-txn:g1".into()),
+                fail: false,
+            }),
+        )
+        .unwrap();
+        let default = unique_type("affinity-in-default");
+        register_input_builder(
+            &default,
+            Arc::new(StubBuilder {
+                affinity: None,
+                fail: false,
+            }),
+        )
+        .unwrap();
+        let failing = unique_type("affinity-in-fail");
+        register_input_builder(
+            &failing,
+            Arc::new(StubBuilder {
+                affinity: None,
+                fail: true,
+            }),
+        )
+        .unwrap();
+
+        let config = Some(serde_json::json!({"consumer_group": "g1"}));
+        assert_eq!(
+            placement_affinity(&declared, &config).unwrap(),
+            Some("kafka-txn:g1".to_string())
+        );
+        assert_eq!(placement_affinity(&default, &config).unwrap(), None);
+        // An unregistered type contributes no affinity and does not fail.
+        assert_eq!(
+            placement_affinity("affinity-in-unregistered", &config).unwrap(),
+            None
+        );
+        // A registered builder's affinity error propagates (fail-closed).
+        assert!(placement_affinity(&failing, &config).is_err());
+    }
 }

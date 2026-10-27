@@ -506,13 +506,17 @@ impl KafkaOutput {
                     .ok_or_else(|| {
                         Error::Config(format!(
                         "Kafka offset commit group '{group}' has no live input in this process; \
-                         the paired Kafka input must declare transactional_offsets"
+                         the paired Kafka input must declare transactional_offsets (distributed \
+                         deployments pin the pair onto one node — this error means the pairing \
+                         was split across nodes)"
                     ))
                     })?;
                 let frontier = crate::kafka_txn::group_frontier(group).ok_or_else(|| {
                     Error::Config(format!(
                         "Kafka offset commit group '{group}' has no live input frontier in this \
-                         process; the paired Kafka input must declare transactional_offsets"
+                         process; the paired Kafka input must declare transactional_offsets \
+                         (distributed deployments pin the pair onto one node — this error means \
+                         the pairing was split across nodes)"
                     ))
                 })?;
                 let clamped = {
@@ -712,6 +716,19 @@ impl OutputBuilder for KafkaOutputBuilder {
         }
 
         Ok(Arc::new(KafkaOutput::new(config, codec)?))
+    }
+
+    fn placement_affinity(
+        &self,
+        config: &Option<serde_json::Value>,
+    ) -> Result<Option<String>, Error> {
+        if config.is_none() {
+            return Ok(None);
+        }
+        let config: KafkaOutputConfig = serde_json::from_value(config.clone().unwrap())?;
+        Ok(config
+            .offset_commit_group
+            .map(|group| format!("kafka-txn:{group}")))
     }
 }
 

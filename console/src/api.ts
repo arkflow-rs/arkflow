@@ -50,6 +50,7 @@ export type EngineStatus = {
   streams_total: number
   streams_running: number
   streams_failed: number
+  approval_required?: boolean
 }
 export type SystemResource = {
   id: string
@@ -76,6 +77,32 @@ export type ControlNode = {
   last_seen_at_ms?: number
   lease_expires_at_ms?: number
   data_address?: string
+  labels?: Record<string, string>
+}
+// Webhook alerting subscription (see the `webhook-alerting` capability).
+// The signing secret is write-only: responses only report `has_secret`.
+export type WebhookSubscription = {
+  id: string
+  url: string
+  event_types: string[]
+  enabled: boolean
+  created_by: string | null
+  created_at_ms: number
+  has_secret: boolean
+}
+// Client-side form state: the API takes the same shape without
+// `has_secret`/`created_*` (full-replace semantics).
+export type WebhookSubscriptionInput = {
+  id: string
+  url: string
+  event_types: string[]
+  enabled: boolean
+  secret: string | null
+}
+export type WebhookTestOutcome = {
+  delivered: boolean
+  status?: number
+  error?: string
 }
 export type OperationState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
 export type Operation = {
@@ -177,6 +204,22 @@ export type Rollout = {
   updated_at_ms: number
 }
 export type RolloutDetail = { rollout: Rollout; targets: RolloutTarget[] }
+export type ConfigApproval = {
+  request_id: string
+  config_version_id: string
+  targets: string[]
+  batch_size: number
+  requester_id: string
+  status: 'pending' | 'approving' | 'approved' | 'rejected' | 'expired'
+  approver_id?: string
+  decided_at_ms?: number
+  rollout_id?: string
+  correlation_id: string
+  expires_at_ms: number
+  created_at_ms: number
+  updated_at_ms: number
+  failure_note?: string
+}
 export type AuditRecord = {
   event_id: number
   actor?: string
@@ -395,8 +438,25 @@ export const api = {
       // The Hub negotiates: Prometheus text by default, JSON for consoles.
       { headers: { Accept: 'application/json' } },
     ),
-  nodes: (page = 1, pageSize = DEFAULT_PAGE_SIZE) =>
-    request<Page<ControlNode>>(`/nodes?page=${page}&page_size=${pageSize}`),
+  nodes: (page = 1, pageSize = DEFAULT_PAGE_SIZE, label?: string) =>
+    request<Page<ControlNode>>(
+      `/nodes?page=${page}&page_size=${pageSize}${label ? `&label=${encodeURIComponent(label)}` : ''}`,
+    ),
+  replaceNodeLabels: (id: string, labels: Record<string, string>) =>
+    request<{ node_id: string; labels: Record<string, string> }>(`/nodes/${encodeURIComponent(id)}/labels`, {
+      method: 'PUT',
+      body: JSON.stringify({ labels }),
+    }),
+  webhooks: () => request<{ subscriptions: WebhookSubscription[] }>('/webhooks'),
+  replaceWebhooks: (subscriptions: WebhookSubscriptionInput[]) =>
+    request<{ subscriptions: WebhookSubscription[] }>('/webhooks', {
+      method: 'PUT',
+      body: JSON.stringify({ subscriptions }),
+    }),
+  testWebhook: (id: string) =>
+    request<WebhookTestOutcome>(`/webhooks/${encodeURIComponent(id)}/test`, {
+      method: 'POST',
+    }),
   drainNode: (id: string) =>
     request<ControlNode>(`/nodes/${encodeURIComponent(id)}/drain`, { method: 'POST' }),
   maintainNode: (id: string) =>
@@ -517,10 +577,41 @@ export const api = {
     }),
   rollouts: () => request<Rollout[]>('/rollouts'),
   rollout: (id: string) => request<RolloutDetail>(`/rollouts/${encodeURIComponent(id)}`),
-  createRollout: (configVersion: string, nodeIds: string[], batchSize: number) =>
+  createRollout: (
+    configVersion: string,
+    nodeIds: string[],
+    batchSize: number,
+    targetSelector?: Record<string, string>,
+  ) =>
     request<Rollout>('/rollouts', {
       method: 'POST',
-      body: JSON.stringify({ config_version: configVersion, node_ids: nodeIds, batch_size: batchSize }),
+      body: JSON.stringify(
+        targetSelector
+          ? { config_version: configVersion, target_selector: targetSelector, batch_size: batchSize }
+          : { config_version: configVersion, node_ids: nodeIds, batch_size: batchSize },
+      ),
+    }),
+  configApprovals: (status?: string) =>
+    request<ConfigApproval[]>(`/config-approvals${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  configApproval: (id: string) => request<ConfigApproval>(`/config-approvals/${encodeURIComponent(id)}`),
+  submitConfigApproval: (
+    configVersion: string,
+    nodeIds: string[],
+    batchSize: number,
+    targetSelector?: Record<string, string>,
+  ) =>
+    request<ConfigApproval>('/config-approvals', {
+      method: 'POST',
+      body: JSON.stringify(
+        targetSelector
+          ? { config_version: configVersion, target_selector: targetSelector, batch_size: batchSize }
+          : { config_version: configVersion, node_ids: nodeIds, batch_size: batchSize },
+      ),
+    }),
+  decideConfigApproval: (id: string, decision: 'approve' | 'reject', note?: string) =>
+    request<ConfigApproval>(`/config-approvals/${encodeURIComponent(id)}/decide`, {
+      method: 'POST',
+      body: JSON.stringify({ decision, note }),
     }),
   rolloutAction: (id: string, action: 'pause' | 'resume' | 'cancel' | 'rollback', configVersion?: string) =>
     request<Rollout>(`/rollouts/${encodeURIComponent(id)}/actions`, {

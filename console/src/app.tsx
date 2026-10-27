@@ -34,6 +34,7 @@ import { Audit } from './features/audit'
 import { ConfirmProvider } from './features/confirm'
 import { resolvedTheme } from './theme'
 import { Rollouts } from './features/rollouts'
+import { Approvals } from './features/approvals'
 import { useSetLocale, useLocale, useT, type Locale } from './i18n'
 import { useTheme, type ThemeSetting } from './theme'
 
@@ -48,6 +49,7 @@ const NAV_ITEMS = [
   { path: '/events', key: 'events' },
   { path: '/jobs', key: 'jobs' },
   { path: '/rollouts', key: 'rollouts' },
+  { path: '/approvals', key: 'approvals' },
   { path: '/configuration', key: 'configuration' },
   { path: '/components', key: 'components' },
   { path: '/audit', key: 'audit' },
@@ -56,7 +58,7 @@ const NAV_ITEMS = [
 
 const NAV_GROUPS = [
   { key: 'observe', items: ['overview', 'runtime', 'events'] },
-  { key: 'deliver', items: ['jobs', 'rollouts'] },
+  { key: 'deliver', items: ['jobs', 'rollouts', 'approvals'] },
   { key: 'admin', items: ['configuration', 'components', 'audit', 'settings'] },
 ] as const
 
@@ -289,6 +291,7 @@ function ConsoleShell() {
             }
           />
           <Route path="/rollouts" element={<Rollouts onError={setError} />} />
+          <Route path="/approvals" element={<Approvals onError={setError} />} />
           <Route path="/components" element={<Components onError={setError} />} />
           <Route path="/events" element={<Events />} />
           <Route path="/audit" element={<Audit onError={setError} />} />

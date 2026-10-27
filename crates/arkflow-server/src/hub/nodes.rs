@@ -135,6 +135,62 @@ pub(crate) fn sanitize_capabilities(capabilities: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Maximum labels per node (see the `node-labels` capability).
+pub(crate) const MAX_NODE_LABELS: usize = 16;
+/// Maximum length of a label key or label value.
+pub(crate) const MAX_NODE_LABEL_PART_LEN: usize = 63;
+
+/// A label key or value is 1-63 characters, starts and ends with an
+/// alphanumeric character, and allows `-`, `_`, `.` in between — the same
+/// shape Kubernetes uses for label values.
+fn valid_label_part(part: &str) -> bool {
+    if part.is_empty() || part.len() > MAX_NODE_LABEL_PART_LEN {
+        return false;
+    }
+    let alnum = |character: char| character.is_ascii_alphanumeric();
+    part.chars()
+        .all(|character| alnum(character) || matches!(character, '-' | '_' | '.'))
+        && part.chars().next().is_some_and(alnum)
+        && part.chars().last().is_some_and(alnum)
+}
+
+/// Validate a full label map. The error names the offending entry so the
+/// operator can fix it in one round trip.
+pub fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), String> {
+    if labels.len() > MAX_NODE_LABELS {
+        return Err(format!(
+            "label map exceeds {MAX_NODE_LABELS} entries (got {})",
+            labels.len()
+        ));
+    }
+    for (key, value) in labels {
+        if !valid_label_part(key) {
+            return Err(format!(
+                "invalid label key '{key}': 1-{MAX_NODE_LABEL_PART_LEN} chars, alphanumeric start and end, only '-', '_', '.' inside"
+            ));
+        }
+        if !valid_label_part(value) {
+            return Err(format!(
+                "invalid label value for '{key}': 1-{MAX_NODE_LABEL_PART_LEN} chars, alphanumeric start and end, only '-', '_', '.' inside"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse one `key=value` label filter term.
+pub fn parse_label_term(term: &str) -> Result<(String, String), String> {
+    let (key, value) = term
+        .split_once('=')
+        .ok_or_else(|| format!("invalid label filter '{term}': expected key=value"))?;
+    if !valid_label_part(key) || !valid_label_part(value) {
+        return Err(format!(
+            "invalid label filter '{term}': key and value must be 1-{MAX_NODE_LABEL_PART_LEN} chars, alphanumeric start and end, only '-', '_', '.' inside"
+        ));
+    }
+    Ok((key.to_owned(), value.to_owned()))
+}
+
 pub(crate) fn bounded_text(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -271,6 +327,18 @@ impl Hub {
             .clone()
             .filter(|boot_id| !boot_id.trim().is_empty())
             .unwrap_or_else(|| session_token.clone());
+        // Labels are durable operator state: re-hydrate them from storage so
+        // they survive Hub restarts (the in-memory registry is rebuilt from
+        // re-registrations). The registration upsert itself never touches the
+        // labels column — see the `node-labels` capability.
+        let labels = match self.storage.as_ref() {
+            Some(storage) => storage
+                .get_node_labels(&request.node_id)
+                .await
+                .map_err(HubError::from)?
+                .unwrap_or_default(),
+            None => BTreeMap::new(),
+        };
         let resource = HubNode {
             id: request.node_id.clone(),
             protocol_version: request.protocol_version.clone(),
@@ -287,6 +355,7 @@ impl Hub {
                 .data_address
                 .clone()
                 .filter(|address| !address.trim().is_empty()),
+            labels,
         };
         let mut nodes = self.nodes.write().await;
         if nodes.len() >= MAX_NODES && !nodes.contains_key(&request.node_id) {
@@ -396,6 +465,25 @@ impl Hub {
                 .reset_observed_cursors(request.node_id.clone())
                 .await
                 .map_err(HubError::from)?;
+            // A concurrent label replacement may have committed between the
+            // pre-insert hydration read and this point. Re-sync the labels
+            // with the read and the write inside one hold of the node-map
+            // write lock: `replace_node_labels` takes the same lock for its
+            // memory update after its storage write, so a replacement either
+            // lands its storage write before our read (we pick it up) or its
+            // memory update after our release (it overwrites us) — the
+            // in-memory map can never end this registration stale.
+            {
+                let mut nodes = self.nodes.write().await;
+                if nodes.contains_key(&request.node_id) {
+                    let fresh = storage.get_node_labels(&request.node_id).await;
+                    if let Some(node) = nodes.get_mut(&request.node_id) {
+                        if let Ok(Some(fresh)) = fresh {
+                            node.resource.labels = fresh;
+                        }
+                    }
+                }
+            }
             for operation in &invalidated_job_starts {
                 persist_operation(storage, operation)
                     .await
@@ -880,6 +968,70 @@ impl Hub {
         let node = nodes.get_mut(node_id).ok_or(HubError::NotFound)?;
         node.resource.maintenance_state = state;
         Ok(node.resource.clone())
+    }
+
+    /// Full replacement of a node's label map (see the `node-labels`
+    /// capability). Validation rejects oversized or malformed maps without
+    /// partially applying; authorization and denial auditing live at the API
+    /// layer; the accepted replacement is audited by the storage layer in the
+    /// same transaction. Returns the stored labels.
+    pub async fn replace_node_labels(
+        &self,
+        node_id: &str,
+        labels: BTreeMap<String, String>,
+        actor: Option<String>,
+        correlation_id: Option<String>,
+    ) -> Result<BTreeMap<String, String>, HubError> {
+        validate_labels(&labels).map_err(HubError::Invalid)?;
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        storage
+            .replace_node_labels(
+                crate::storage::NodeLabelsMutation {
+                    node_id: node_id.into(),
+                    labels: labels.clone(),
+                    actor,
+                    correlation_id,
+                },
+                now_ms(),
+            )
+            .await
+            .map_err(HubError::from)?
+            .ok_or(HubError::NotFound)?;
+        // The storage row existed, so the labels are durable even when the
+        // in-memory record is absent (Hub restarted, Agent not yet
+        // re-registered) — re-registration re-hydrates them.
+        let mut nodes = self.nodes.write().await;
+        if let Some(node) = nodes.get_mut(node_id) {
+            node.resource.labels = labels.clone();
+        }
+        Ok(labels)
+    }
+
+    /// Resolve a label selector to the sorted ids of nodes whose labels
+    /// match every selector pair (equality, AND semantics). Resolution reads
+    /// the DURABLE node records (`cp_nodes.labels_json`), not the in-memory
+    /// registration map: a node that has not re-registered since a Hub
+    /// restart still resolves, exactly like an unreachable-but-registered
+    /// node — consistent with explicit node lists, whose ids the direct
+    /// rollout path also never filters by registration state. The rollout
+    /// health gates handle delivery to unreachable targets.
+    pub async fn resolve_label_selector(
+        &self,
+        selector: &BTreeMap<String, String>,
+    ) -> Result<Vec<String>, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        let records = storage.list_node_labels().await.map_err(HubError::from)?;
+        let mut matched: Vec<String> = records
+            .into_iter()
+            .filter(|(_, labels)| {
+                selector
+                    .iter()
+                    .all(|(key, value)| labels.get(key) == Some(value))
+            })
+            .map(|(node_id, _)| node_id)
+            .collect();
+        matched.sort();
+        Ok(matched)
     }
     pub async fn configuration(&self, node_id: &str) -> Option<serde_json::Value> {
         self.nodes

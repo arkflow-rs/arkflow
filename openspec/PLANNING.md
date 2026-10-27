@@ -1,6 +1,6 @@
 # ArkFlow 战略规划与方向② Roadmap
 
-> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节），2026-09-25 完成能力完备性评估并制定补齐计划（见第八节），同日完成第八节全部六项补齐及三项延后子项二轮补齐（见 8.5 进度）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
+> 沉淀于 2026-07-31 的代码库探索，2026-08-27 对齐 v1 分支实际进展，2026-09-12 对齐内核收口与未来方向探索（见第七节），2026-09-25 完成能力完备性评估并制定补齐计划（见第八节），同日完成第八节全部六项补齐及三项延后子项二轮补齐（见 8.5 进度），2026-10-24 完成控制面能力缺失盘点并制定补齐计划（见第十一节）。目的：**避免重复探索**——下次会话读本文件即可恢复全部战略上下文，不必重新调研现状。
 > 维护规则：方向或现状发生变化时更新本文档；具体 change 落地后由 OpenSpec `changes/` 与归档后的 `specs/` 承载细节，本文只保留总纲。
 
 ---
@@ -200,14 +200,14 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 - 交付顺序 = 价值优先：**1 CDC → 2 Schema → 3 EOS → 4 状态**。（前三项已全部闭环）
 - ~~状态 checkpoint（Change 4）守「单节点、不引入分布式」~~ → 已修订为分布式 Job 运行时（见上节）。
 - Codec trait async 化（`refactor-codec-async`）作为 IO 类 codec 的前置，独立 change。
-- Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 = SQL output 的 `upsert: true` + `upsert_keys`（2026-09-16 前该能力虚标未实现，`fix-sql-output-upsert` 后实装）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）留 future（方向② backlog）。
+- Change 3 EOS 形态：`Output::write_batch` 默认方法（1 ack = 1 事务单元，默认实现等价逐条）；Kafka L2 事务 producer（opt-in `exactly_once`+`transactional_id`，**显式配置而非 node_id 派生**——output build 拿不到 durability 配置，transactional.id 与 WAL node_id 是不同身份概念）；SQL L1 = SQL output 的 `upsert: true` + `upsert_keys`（2026-09-16 前该能力虚标未实现，`fix-sql-output-upsert` 后实装）。L2 诚实边界：已 commit 跨重启重复靠业务幂等；L3（Kafka→Kafka `send_offsets_to_transaction`）~~留 future~~ → ✅ 2026-09-25 随 `add-kafka-l3-transactional-offsets` 闭环（同进程配对，见第八节表；跨进程配对仍 fail-closed）。
 
 ### 下一步（2026-09-12 对齐，2026-09-16 更新）
 
 1. ~~**合入 v1**~~ → ✅ 已完成：PR #1222 squash 合入 main（`d656ae2`），main 与 v1 内容一致。
 2. **关闭过时 issue**：#901（InfluxDB）、#430 等 issue 对应能力已实现，需核实后关闭并回复贡献者。（仍未做）
 3. ~~**方向选择**~~ → ✅ 已确认：下一主线 = **数据面可观测性**，已立项 `changes/add-data-plane-observability`（2026-09-15，当日归档合入）。
-4. ~~**方向②剩余缺口**~~ → ✅ 2026-09-16 闭环两个 change（见下节）；方向② backlog 收敛为：原生 CDC 直连 input、EOS L3、状态后端选项（rocksdb/远程）。
+4. ~~**方向②剩余缺口**~~ → ✅ 2026-09-16 闭环两个 change（见下节）；方向② backlog 收敛为：原生 CDC 直连 input、~~EOS L3~~（2026-09-25 闭环；split 放置下的 L3 配对 2026-10-22 由 `add-kafka-l3-placement-affinity` 放置亲和闭环——配对钉同节点、拆分即拒，真正的跨进程配对仍无语义，见第八节）、状态后端选项（rocksdb/远程）。
 
 ### 方向②收尾（2026-09-16 归档）
 
@@ -215,7 +215,7 @@ Change 4  有状态 Processor 的 checkpoint 与恢复              依赖 Chang
 - **`add-schema-registry-avro-compatibility`** ✅：补齐 Change 2 原定未交付范围。Avro wire format 解码（`apache-avro` 0.22，schemaType 分派，扁平 Arrow 映射含逻辑类型/nullable union，嵌套结构明确报错）；`message_type` 降为条件必填（仅 protobuf id 需要）；新增主题兼容性门禁（`subject` + `min_compatibility`，首条消息惰性查 `GET /config/{subject}`，秩比较 NONE<BACKWARD/FORWARD(+T)<FULL(+T)，OnceCell 缓存，fail-fast）。另修正 `howto_cdc_schema_registry.yaml` 的 envelope 扁平化失实注释。
 - **修正过期表述**：本文件 Change 3 决策中「SQL L1 复用现有 upsert（零代码）」不实——sql output 此前只有裸 INSERT、元数据虚标 upsert，本次 `fix-sql-output-upsert` 后该表述才成立（即 L1 幂等吸收现可通过 `upsert: true` + `upsert_keys` 使用）。
 - **CR 遗留跟进（2026-09-16 review；2026-10-06 核实修订）**：① ~~Avro 路径每条消息重建 `GenericDatumReader`~~ → 2026-10-06 源码核实升级定性：解码热路径每消息三层成本——L1 `resolve_cached` 命中深拷贝整棵 schema（apache-avro `Schema` 无 Arc）、L2 reader 构建重建名字表、L3 每字段每消息新建 Arrow array；上游 API 约束（`decode_internal` 私有、reader 只收借用型 `ResolvedSchema`、`ResolvedOwnedSchema` 不可被 reader 消费）使 reader 复用走不通。随 `optimize-schema-registry-avro-decode` 闭环：L1 以 `Arc<CachedSchema>` 缓存消灭（A/B 实测 +19.6%/+22.1%/+20.6%）+ benchmark 套件新增 avro-decode 三宽度场景；L3（每字段每消息 Arrow array 分配 + 合并重拷）随 `optimize-avro-columnar-decode`（PR #1310）以列式累积器闭环——同 schema id 批零中间批次，吞吐数据留档该 change tasks；仅剩 L2（reader 复用）因上游 API 阻塞留 backlog（需向 apache-avro 提 owned-reader 能力 PR）；Protobuf 侧同形态的逐消息单行批次随 `optimize-protobuf-batch-decode`（PR #1312）以 `ProtobufBatchConverter` 列式累积闭环（26 字段宽消息计时 ×18.5，数据留档该 change tasks），成本栈至此除 L2 外全部闭环。② ~~subject 未 URL 编码~~ → 已由 PR #1284 修复（`percent_encoding` + `SUBJECT_PATH_SEGMENT` 编码集 + wiremock 用例）。③ ~~多版本 schema 合并报错~~ → 已由 PR #1284 修复（`batch_merge::normalize_and_concat` 字段并集 + 缺列补 null + 类型冲突显式报错，schema_registry decode 已接入）。
-- **PR #1309 coderabbit 复审（2026-10-06，八条全部处理）**：六条 spec 措辞修正（skip 模式推断路径、`crate::hub::*` 内外调用方区分、`__meta_ext.topic` 字段名、flush triggers 界定封存节奏而非对象存储写完成时延、`insecure_local` 外部绑定的运行期放行、`health_check.api_token` 键名）+ 两条经代码核实判定为 spec-实现措辞差而非行为缺陷：WAL flush-failure 计数器 `#[cfg(test)]` 是 core-api-surface 零引用规则的刻意决策（spec 措辞已对齐为"counter + 限流日志"）；优雅取消时 batch 尾部冲刷（`shutdown_interior_chain` 先 abort 队列再 Finish 冲刷）是刻意设计且两种交错均满足 at-least-once（spec 场景拆分为错误关闭 abort / 优雅取消冲刷两分支）。**遗留一项可立项**：WAL flush-failure 计数器接入数据面 metrics 导出（data-plane-observability 后续，需跨 wal→adapter→KernelMetricsSnapshot 三层布线）。
+- **PR #1309 coderabbit 复审（2026-10-06，八条全部处理）**：六条 spec 措辞修正（skip 模式推断路径、`crate::hub::*` 内外调用方区分、`__meta_ext.topic` 字段名、flush triggers 界定封存节奏而非对象存储写完成时延、`insecure_local` 外部绑定的运行期放行、`health_check.api_token` 键名）+ 两条经代码核实判定为 spec-实现措辞差而非行为缺陷：WAL flush-failure 计数器 `#[cfg(test)]` 是 core-api-surface 零引用规则的刻意决策（spec 措辞已对齐为"counter + 限流日志"）；优雅取消时 batch 尾部冲刷（`shutdown_interior_chain` 先 abort 队列再 Finish 冲刷）是刻意设计且两种交错均满足 at-least-once（spec 场景拆分为错误关闭 abort / 优雅取消冲刷两分支）。**遗留一项可立项**：WAL flush-failure 计数器接入数据面 metrics 导出（data-plane-observability 后续，需跨 wal→adapter→KernelMetricsSnapshot 三层布线）→ ✅ 2026-10-19 已由 `add-wal-flush-failure-metrics` 闭环：`Wal.flush_failures` 改 `Arc<AtomicU64>` 句柄，`KernelMetrics` 只持计数器（不持 WAL，避免延长 redb 独占锁；也避免 `Weak` 在停止后回零），新增 `arkflow_job_wal_flush_failures_total` / `arkflow_stream_wal_flush_failures_total` 两条 counter。
 
 ### 数据面可观测性（2026-09-15 立项并实施，`add-data-plane-observability`）
 
@@ -278,7 +278,7 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转�
 2. ~~操作取消/超时/重试/重连 reconciliation 未闭环~~ → ✅ 已落地（#1204、#1216）；Job 级重平衡/恢复编排仍在 v1 演进。
 3. 鉴权仍以全局 operator/node token 为主，尚无用户、角色和细粒度权限模型。（未动；RBAC 属阶段 4。注意阶段 3 的配置审批流隐含依赖多身份，建议排在 RBAC 之后避免返工）
 4. ~~Agent 命令轮询与结果上报用 URL 查询参数携带 session token~~ → ✅ 已完成（2026-09-13 核实）：`bearer_auth` 走 `Authorization: Bearer`（`agent.rs` `bearer_auth`），Hub 优先读 header，查询参数仅保留为升级窗口兼容。
-5. ~~配置缺少版本化发布/回滚~~ → ✅ Console 已有 draft/validate/diff/publish/rollback 工作流（`harden-console-configuration-workflow` 已归档）；批量发布/审批流未做。
+5. ~~配置缺少版本化发布/回滚~~ → ✅ Console 已有 draft/validate/diff/publish/rollback 工作流（`harden-console-configuration-workflow` 已归档）；~~批量发布/审批流未做~~ → 2026-10-23 核实修订：**批量发布已随 `harden-control-plane-fleet` 落地**（`control-plane-rollout` spec：不可变版本 + 有界批次 + 健康门控收敛 + 暂停/回滚；实现 `hub/rollout.rs`；Console `features/rollouts.tsx` 有创建/暂停/回滚完整 UI）——阶段 3 的"滚动发布、分批发布、失败自动暂停和回滚"一条同时闭环。剩余仅**审批流**，已由 `add-config-approval-flow` 落地（2026-10-24，32/32 任务）：审批请求不可变快照 + `approval_required` 策略闸门（四创建入口全覆盖，回滚仅放行曾应用版本）+ `ApproveRollouts` 仅 Admin 与职责分离 + `APPROVING` 中间态认领防崩溃双建 + TTL/有界保留清扫 + 审计 + Console 审批队列页；策略关闭时行为逐位不变；无存储 Hub 开启策略启动即拒（fail-closed）。v1 全局开关，标签分组策略留待节点标签体系落地。
 6. ~~Console Overview/Runtime/配置编辑未补全~~ → ✅ 已补齐（含组件目录、可视化 Job DAG 编排器）。
 7. ~~双节点端到端测试~~ → ✅ 已闭环：`crates/arkflow-server/tests/two_node_job_smoke.rs`（Hub + 双 Agent、barrier checkpoint、kill/restart 恢复、旧启动代 fencing）；Stream 层面亦已覆盖。
 8. **新增**：v1 合入 main 前需完成 PR #1219 评审闭环（`repair-v1-review-defects` 已 38/38，待归档）；分布式 Job 的生产化验证（长稳、规模上限、状态后端除 embedded_kv 外的选项）未做。
@@ -345,6 +345,8 @@ Hub 已完成从本地健康接口到单 Hub、多 Compute Node 控制面的转�
 - GitOps 配置同步和审计追踪。
 - OpenTelemetry trace 与跨节点故障诊断。
 - 在单 Hub 模型验证稳定后，再评估外部数据库和 Hub 高可用。
+
+> **2026-10-24 盘点修订**：本节中 RBAC、OIDC、Hub 高可用（Postgres + 租约选主）、OTel trace（引擎/数据面，`add-data-plane-tracing`；`arkflow-server` 独立二进制的 tracing 初始化仍是缺口，见 11.2-8）均已闭环；阶段 4 真剩余项与控制面新增缺口（限流/备份/节点标签/告警等）的完整清单与优先级见第十一节。
 
 ### 5.8 设计边界
 
@@ -430,7 +432,7 @@ Kubernetes 交付面按三层推进，**operator 的触发条件在此写死，�
 
 - 事件时间：分区级 watermark、窗口迟到行为显式定义、滑动窗口覆盖所有包含窗口、迟到事件专门路由边、非法时间戳不无限持有（`event-time-processing`）。
 - 状态与容错：keyed state 后端、版本化状态格式、state journal 版本围栏、checkpoint 恢复（源位置 + 全部分区 watermark 一并还原）、WAL（含 S3）、端到端有界背压（含跨节点边沿 TCP 反压）。
-- 投递语义：Kafka L2 事务 exactly-once（`read_committed` 原子可见、zombie producer 围栏、事务 id 稳定性契约）+ 诚实边界声明（事务提交后、offset 提交前崩溃的残留重复需下游幂等吸收，L3 未做）。
+- 投递语义：Kafka L2 事务 exactly-once（`read_committed` 原子可见、zombie producer 围栏、事务 id 稳定性契约）+ 诚实边界声明（事务提交后、offset 提交前崩溃的残留重复需下游幂等吸收；该边界后由同进程 L3 消除，见第八节）。
 - 分布式运行时：代数围栏（exactly one live runner）、资源感知放置、opt-in 压力再均衡（带冷却防抖）、网络 shuffle（key-group 路由稳定、Ack 三态镜像回执、fail-closed）。
 - 运维面：savepoint、Hub 生命周期 API、OIDC/RBAC、节点资源上报、Web 控制台、benchmark 套件。
 
@@ -523,7 +525,7 @@ P3  eos-l3-and-transactional-sinks offset 进事务 + 更多事务 sink      独
 
 **四轮 CR 修复**：会话回执槽位清空竞态（same_channel 守卫）与转发器关停监视（fix-session-receipt-lifecycle）；迁移自引用 FK 父母先行行序（fix-migrate-self-reference-ordering）；L3 与分区指派组合的构建期显式拒绝（fix-l3-assign-mode-validation）。
 
-**剩余边界（更新）**：~~远程边透明重连与去重~~、~~真 key 重分布~~、~~Kafka L3~~ 已闭环；仍开放：temporal/outer join、Hub 阶段 2（选主）、L3 的跨进程配对（分布式部署输入/输出分节点时注册表不可达，显式 fail-closed）、远程边去重的处理级残留（投递级已覆盖）。
+**剩余边界（更新）**：~~远程边透明重连与去重~~、~~真 key 重分布~~、~~Kafka L3~~ 已闭环；仍开放：temporal/outer join、Hub 阶段 2（选主）、~~L3 的跨进程配对~~（2026-10-22 `add-kafka-l3-placement-affinity` 闭环：分布式 Job 经 builder 放置亲和钩子把配对钉到同节点，Hub/Agent 双侧校验 fail-closed——注意闭环的是"分布式 Job 可用 L3"，真正的跨进程配对仍无语义（拆分即拒、从不执行），跨节点元数据协议仍 Non-goal——CGM 可经 librdkafka FFI 跨进程重建的可行性结论留档该 change design）、远程边去重的处理级残留（投递级已覆盖）。
 
 ---
 
@@ -593,3 +595,59 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 ### 10.3 已阻塞项（2026-10-18 全部收口）
 
 - ~~Avro L2 reader 复用：apache-avro 上游 API（`decode_internal` 私有、reader 只收借用型 `ResolvedSchema`），需上游 owned-reader PR~~ → ✅ 2026-10-18 `optimize-hotpath-mechanical-batch-4` 闭环——**"阻塞"只对跨批长生命周期缓存成立，批内作用域复用不需要上游**：`GenericDatumReader::read_value` 接收 `&self`（0.22 reader/datum.rs:132），`SchemaRegistryCodec::decode` 改两段式（pass 1 逐消息 parse+resolve 保持历史错误顺序，pass 2 逐消息解码、`AvroValueReader` 按 id 构建一次复用），隔离 A/B +41.7%/+12.8%/+6.7%（w5/w25/w100），官方套件 avro-decode 1.05M→1.71M / 396K→442K / 109K→116K rows/s；错误顺序钉死测试保持绿。仅剩的"跨批 reader 缓存"仍需上游 owned-reader API，不再立项（收益已被批内摊销覆盖大半）。
+
+---
+
+## 十一、控制面能力缺失盘点与补齐 Roadmap（2026-10-24）
+
+> 源起：以「控制面有哪些能力缺失」为题的系统探查——两路全量扫描（`arkflow-server` 代码面 + `console/` 前端面）交叉本文件与 `specs/` 核实，全部论断带 file:line。结论沉淀于此避免重复调研；各 change 立项后细节由 OpenSpec `changes/` 与归档 `specs/` 承载，落地后从 11.4 表划掉。
+
+### 11.1 总体结论
+
+控制面完成度高：`arkflow-server` 约 5.6 万行（其中约 2.2 万行测试）**非测试代码无一处 TODO/FIXME/unimplemented 标记**。缺口形态是「能力维度整体未建」或「后端已有、Console 未消费」，不是代码里的洞。盘点时 `openspec/changes/` 为空，下列缺口均无在建工作覆盖。
+
+### 11.2 后端能力缺失（需立项）
+
+1. ~~**节点标签体系**~~ → ✅ 已由 #1336（`add-node-labels`）落地：Hub 管理标签 + 列表过滤 + selector rollout；剩余「按标签批量流命令」「标签分组审批策略」仍开放。
+2. ~~**告警/webhook/事件订阅**~~ → ✅ 已由 #1338（`add-alerting-webhooks`，2026-10-25 归档，新 spec `webhook-alerting`）落地：订阅全量替换 + 前缀过滤转发 + HMAC 签名 + 退避重试 + 连续失败自动暂停 + leader-only 投递 + Console Settings 管理面。5.7 阶段 4 中 Slack/邮件原生通道仍开放（可经 webhook 接入）。
+3. **限流/配额**：无任何 per-principal/per-node 请求限速或资源配额，仅请求体大小限制（本地 1MB/Hub 4MB）与内存硬上限（`MAX_NODES=256`、`MAX_COMMANDS_PER_NODE=128`、`MAX_OPERATIONS=1024`，`hub.rs:56-59`）。
+4. **控制面 DB 备份/恢复**：无快照/导出/恢复工具，仅停机 sqlite→pg 一次性迁移（`migrate_tool.rs`）。注意 Job 级 checkpoint/savepoint 恢复是完整的，勿混淆。
+5. **用户/凭证管理面**：RBAC 三角色 + 资源 scope + OIDC（bearer + 浏览器登录）已实现，但无用户 CRUD、无 token 签发/吊销/轮换 API，JWT 无吊销（`oidc.rs:41` 注释自认取舍）；租户/团队隔离未做。
+6. **mTLS/客户端证书**：TLS 仅服务端加密，显式 `with_no_client_auth`（`api/mod.rs:974`）。
+7. **Job 级 pause/resume**：`desired_state` 仅 running/stopped 二值（`jobs.rs:999`），action 仅 start/stop/restart（`jobs.rs:106`）；pause/resume 语义仅存在于升级编排内部（`jobs.rs:817`）。
+8. **arkflow-server 独立二进制短板**：无 tracing/OTel 初始化（引擎二进制有，Hub 二进制没有）；仅环境变量配置、无配置文件支持（`bin/arkflow-server.rs`）。
+9. **OpenAPI 文档生成**：仅 `api_contract.rs:4` 意向注释，未实现。
+10. 小项：本地 standalone 面无 `/audit` 路由（审计仅 Hub 面）；Agent query-param 传 token 旧通道处弃用兼容期（`agent_endpoints.rs:85`）。
+
+### 11.3 Console 缺口（后端 API 已有、前端未消费或空壳）
+
+1. **角色感知 UI**：后端模型完备（三角色七动作，`api_contract.rs:34-46`），前端零消费——按钮无条件渲染、`canMutate` 只反映节点在线（`app.tsx:146-147`）、403 无友好降级、principal 身份不显示（`api.ts:742` 已返回 roles）。
+2. **服务端分页/过滤**：`EventQuery`/`AuditQuery`/`OperationQuery` 参数齐全（`api/mod.rs:347-373`），前端固定取第 1 页 50 条后客户端过滤——**第 51 条起 UI 不可达**；audit 连 resource_id 参数都不传。
+3. **监控时序图表**：无图表库，Overview/Runtime 仅最新标量快照（`overview.tsx:163-176`）。
+4. **本地模式死页面**：导航 10 项常驻，本地路由仅 5 个（`mod.rs:402-435`）——连本地引擎时 Jobs/Rollouts/Approvals/Audit/Events 五页 404。
+5. **运行时 token 输入/身份切换**：静态 token 仅构建期 `VITE_API_TOKEN` 注入（`api.ts:322`），无运行时输入；OIDC 401 自动跳转已有。
+6. 小项：Rollout 创建手输版本号（未接现成版本选择器，`rollouts.tsx:81-86`）；每节点指标下钻、`/operations/status` 协议/能力兼容矩阵页、流 desired-state（含 generation CAS）入口、TOML 编辑（后端 `ConfigCandidate` 支持 toml）均无 UI；~~Settings 页空壳~~（#1338 已填入 Webhook 管理面）；~~zh 字典为 Partial，缺 key 静默回落英文无完整性校验~~（2026-10-25 核实：`zh.ts` 自 #1261 起 `satisfies Record<keyof typeof en, string>`，缺 key 编译期报错）。
+
+### 11.4 补齐 Roadmap（价值优先序）
+
+| 序 | 方向 | 要点 | 备注 |
+| --- | --- | --- | --- |
+| P0 | ~~`add-node-labels`~~ | 节点标签体系 + 按标签批量操作 | ✅ 已落地 #1336（标签 + 过滤 + selector rollout；审批分组策略仍留 `add-approval-label-scoping`） |
+| P0 | ~~`add-alerting-webhooks`~~ | webhook/事件订阅转发 | ✅ 已落地：订阅全量替换 + 前缀过滤转发（HMAC 签名头、3 次退避重试、连续 5 败自动暂停 + `webhook.paused/resumed` 生命周期事件、leader-only 投递、Console Settings 管理面；新动作 `ManageWebhooks`；新 spec `webhook-alerting`，`control-plane-identity` RBAC 动作面扩展）|
+| P1 | 控制面限流/配额 | per-principal/per-node 限速 | 企业入场券 |
+| P1 | 控制面 DB 备份/恢复 | 快照/导出/恢复工具 | 企业入场券 |
+| P1 | `console-rbac-and-pagination` | 角色感知 UI + 服务端分页/过滤 + 本地死页面清理 | 纯前端消费，后端零改动 |
+| P2 | Job 级 pause/resume | `desired_state` 扩 pause + 恢复语义 | 与升级编排 pause 语义对齐 |
+| P2 | server 二进制可观测 | arkflow-server tracing/OTel 初始化 + 配置文件 | 小工程 |
+| P2 | mTLS | 客户端证书认证 | 等企业需求信号 |
+| P2 | Console 监控增强 | 时序图表、per-node 指标下钻、`/operations/status` 页、token 运行时输入、rollout 版本选择器 | 可拆分交付 |
+| P3 | 多用户/凭证管理面 | 用户 CRUD + token 生命周期；**前置：JWT 吊销机制**（否则凭证生命周期管理是空谈） | 阶段 4 主体；租户隔离同批评估 |
+| P3 | 外部 Secret Manager | Vault/K8s Secret 集成（现为 Hub env 预解析 `${secret:}`） | 阶段 4 |
+| P3 | OpenAPI 生成 + Agent 自升级编排 | API 文档生成；Agent 二进制升级编排（区别于 Job 升级） | 低频，按需 |
+
+### 11.5 已知设计边界（有文档记录、刻意为之，非缺口）
+
+- fleet 上限 256 节点硬编码（`hub.rs:56`）；placement_order/start 指纹仅内存、Hub 重启丢失（`hub.rs:150-171`）。
+- SQLite HA 仅开发用途；生产 HA 限 Postgres（租约选主 + epoch WriteFence 已闭环——7.3 序 5「Hub 高可用（远期）」的表述已过时）。
+- 自动扩缩容无：rescale 为显式声明的手动操作（`add-job-rescale`），压力再均衡不改并行度。
+- 审计未覆盖本地 standalone 面（仅 Hub 面）。

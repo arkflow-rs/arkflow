@@ -1,7 +1,7 @@
 use super::checkpoint::{job_state_format_version, recovery_record_is_compatible};
 use super::error::HubError;
 use super::leadership::{HubHaConfig, Leadership};
-use super::nodes::{sanitize_capabilities, sanitize_metrics};
+use super::nodes::{parse_label_term, sanitize_capabilities, sanitize_metrics, validate_labels};
 use super::wire::{
     AgentAuth, AgentCommand, AgentOperation, CommandResult, HeartbeatRequest, HubOperation,
     HubOperationState, NodeConnectionState, NodeReport, RegisterRequest,
@@ -1296,6 +1296,8 @@ fn config() -> HubConfig {
         lease_ttl_ms: 1000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     }
 }
 
@@ -1308,6 +1310,8 @@ async fn secure_hub_fails_closed_for_missing_credentials_without_mutation() {
         lease_ttl_ms: 1_000,
         poll_interval_ms: 10,
         session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     });
     assert!(!hub.operator_authorized(None).await);
     let result = hub
@@ -4881,9 +4885,21 @@ async fn succeed_all_starts(hub: &Hub, auth: &AgentAuth) -> usize {
 
 /// Register one node, create a durable running Job at version 1, and drive
 /// its start to a succeeded, observed-running state.
+///
+/// The fixture never heartbeats `node-a`, so it runs with a generous node
+/// lease: with the default 1s test lease a slow (loaded CI) run expires the
+/// node mid-test and the rollback's `job_start` is rejected as
+/// `node_unavailable`, leaving the Job observed `stopped`. Phase deadlines
+/// are driven explicitly through `expire_phase_deadline`, never by the clock.
 async fn atomic_upgrade_fixture(job_id: &str) -> (Hub, AgentAuth) {
     let store = crate::storage::ControlPlaneStore::contract("atomic_upgrade_fixture").await;
-    let hub = Hub::with_storage(config(), StorageActor::start(store, 8));
+    let hub = Hub::with_storage(
+        HubConfig {
+            lease_ttl_ms: 60_000,
+            ..config()
+        },
+        StorageActor::start(store, 8),
+    );
     let session = hub
         .register(RegisterRequest {
             data_address: None,
@@ -5799,4 +5815,58 @@ async fn atomic_upgrade_http_contract_202_and_conflicts() {
         .unwrap();
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn node_label_validation_bounds_and_charset() {
+    let valid = |pairs: &[(&str, &str)]| {
+        validate_labels(
+            &pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        )
+        .is_ok()
+    };
+    assert!(valid(&[("env", "prod"), ("tier", "edge-2")]));
+    assert!(valid(&[("a", "b")]));
+    assert!(valid(&[(&"k".repeat(63), &"v".repeat(63))]));
+
+    let invalid = |pairs: &[(&str, &str)]| {
+        validate_labels(
+            &pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        )
+        .is_err()
+    };
+    assert!(invalid(&[("", "v")]));
+    assert!(invalid(&[("env", "")]));
+    assert!(invalid(&[("env", "-prod")]));
+    assert!(invalid(&[("env", "prod-")]));
+    assert!(invalid(&[("env", "prod east")]));
+    assert!(invalid(&[(&"k".repeat(64), "v")]));
+    assert!(invalid(&[("k", &"v".repeat(64))]));
+    let seventeen: Vec<(&str, &str)> = (1..=17)
+        .map(|i| (Box::leak(format!("k{i}").into_boxed_str()) as &str, "v"))
+        .collect();
+    assert!(invalid(&seventeen));
+    // Sixteen entries is the boundary and passes.
+    let sixteen: Vec<(&str, &str)> = (1..=16)
+        .map(|i| (Box::leak(format!("k{i}").into_boxed_str()) as &str, "v"))
+        .collect();
+    assert!(valid(&sixteen));
+}
+
+#[test]
+fn label_filter_terms_parse_or_reject() {
+    assert_eq!(
+        parse_label_term("env=prod").unwrap(),
+        ("env".to_owned(), "prod".to_owned())
+    );
+    assert!(parse_label_term("env").is_err());
+    assert!(parse_label_term("env=-prod").is_err());
+    assert!(parse_label_term("=prod").is_err());
+    assert!(parse_label_term("env=").is_err());
 }

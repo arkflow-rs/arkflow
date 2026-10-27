@@ -6,6 +6,7 @@ pub mod sqlite;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -48,6 +49,59 @@ pub struct NodeMaintenanceMutation {
     pub state: String,
     pub actor: Option<String>,
     pub correlation_id: Option<String>,
+}
+
+/// Node id with its full label map (durable fleet state for selectors).
+pub type NodeLabels = (String, BTreeMap<String, String>);
+
+/// Full replacement of a node's label map. Labels are operator-managed fleet
+/// state: nothing in the Agent registration path may construct this mutation.
+#[derive(Debug, Clone)]
+pub struct NodeLabelsMutation {
+    pub node_id: String,
+    pub labels: BTreeMap<String, String>,
+    pub actor: Option<String>,
+    pub correlation_id: Option<String>,
+}
+
+/// Decode a stored `labels_json` column. Corrupt JSON fails loudly rather
+/// than silently dropping operator-set labels.
+pub(crate) fn decode_node_labels(json: &str) -> Result<BTreeMap<String, String>, StorageError> {
+    serde_json::from_str(json)
+        .map_err(|error| StorageError::Encoding(format!("decode node labels: {error}")))
+}
+
+/// A webhook alerting subscription (see the `webhook-alerting` capability).
+/// The signing secret is stored for delivery-time HMAC computation and is
+/// never part of any API response representation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WebhookSubscription {
+    pub id: String,
+    pub url: String,
+    /// Event-type prefix filters; an event forwards when its `event_type`
+    /// starts with at least one entry.
+    pub event_types: Vec<String>,
+    pub enabled: bool,
+    pub secret: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at_ms: u64,
+}
+
+/// Full replacement of the webhook subscription set. The submitted list
+/// becomes the complete set; delivery workers observe the new set on their
+/// next refresh tick.
+#[derive(Debug, Clone)]
+pub struct WebhookSetMutation {
+    pub subscriptions: Vec<WebhookSubscription>,
+    pub actor: Option<String>,
+    pub correlation_id: Option<String>,
+}
+
+/// Decode a stored `event_types_json` column. Corrupt JSON fails loudly
+/// rather than silently disabling a subscription's filters.
+pub(crate) fn decode_webhook_event_types(json: &str) -> Result<Vec<String>, StorageError> {
+    serde_json::from_str(json)
+        .map_err(|error| StorageError::Encoding(format!("decode webhook event types: {error}")))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,6 +251,75 @@ pub struct RolloutTargetRecord {
     pub error: Option<String>,
     pub observed_config_version: Option<String>,
     pub updated_at_ms: u64,
+}
+
+/// A sweep never resets an `approving` request that changed within this
+/// window: the approval may still be creating its rollout.
+pub(crate) const APPROVING_STALL_MS: u64 = 60_000;
+
+/// Lifecycle of one configuration approval request. `Approving` is the
+/// crash-safe intermediate state between a decision to approve and the
+/// rollout it creates: a request in that state either adopts the rollout its
+/// correlation id already produced or returns to `Pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApprovalStatus {
+    Pending,
+    Approving,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+impl ConfigApprovalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approving => "approving",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "approving" => Some(Self::Approving),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Approved | Self::Rejected | Self::Expired)
+    }
+}
+
+/// An immutable publish snapshot awaiting a second principal's decision:
+/// `(config_version_id, targets, batch_size)` is fixed at submission; only
+/// the decision metadata changes afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigApprovalRequest {
+    pub request_id: String,
+    pub config_version_id: String,
+    pub targets: Vec<String>,
+    pub batch_size: u32,
+    pub requester_id: String,
+    pub status: ConfigApprovalStatus,
+    pub approver_id: Option<String>,
+    pub decided_at_ms: Option<u64>,
+    pub rollout_id: Option<String>,
+    /// Links the request to the rollout it creates, so a crash between
+    /// rollout creation and approval marking adopts that rollout instead of
+    /// creating a second one.
+    pub correlation_id: String,
+    pub expires_at_ms: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub failure_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,6 +505,8 @@ pub enum StorageError {
     IdempotencyKeyReused,
     #[error("unsupported backend operation: {0}")]
     Unsupported(&'static str),
+    #[error("storage encoding error: {0}")]
+    Encoding(String),
     #[error("stale leader: claimed epoch {claimed_epoch}, current lease epoch {current_epoch}")]
     StaleLeader {
         claimed_epoch: u64,
@@ -399,7 +524,7 @@ pub enum StorageError {
 /// Schema version this binary's DDL understands. Each backend stamps it
 /// into the database during initialization and refuses to start when the
 /// stored stamp is newer (an older binary must not operate a newer schema).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Outcome of `begin_write_fence`: a lock held until `end_write_fence`
 /// (`Held`) or a verified passthrough with nothing to release.
@@ -765,6 +890,32 @@ storage_ops! {
     ("get_node_maintenance", GetNodeMaintenance, get_node_maintenance) plain Option<String> {
         node_id: String as s,
     },
+    ("replace_node_labels", ReplaceNodeLabels, replace_node_labels) fenced Option<BTreeMap<String, String>> {
+        mutation: NodeLabelsMutation as v,
+        now_ms: u64 as v,
+    },
+    ("get_node_labels", GetNodeLabels, get_node_labels) plain Option<BTreeMap<String, String>> {
+        node_id: String as s,
+    },
+    ("list_node_labels", ListNodeLabels, list_node_labels) plain Vec<NodeLabels> {},
+    /// Full replacement of the webhook subscription set. Returns the ids
+    /// whose subscriptions transitioned disabled→enabled (each already
+    /// persisted as a `webhook.resumed` event) so the Hub can broadcast
+    /// them to live subscribers.
+    ("replace_webhooks", ReplaceWebhooks, replace_webhooks) fenced Vec<String> {
+        mutation: WebhookSetMutation as v,
+        now_ms: u64 as v,
+    },
+    ("list_webhooks", ListWebhooks, list_webhooks) plain Vec<WebhookSubscription> {},
+    /// Auto-pause a subscription after sustained delivery failure: flips
+    /// `enabled` to false and persists a `webhook.paused` event plus a
+    /// system-actor audit row in the same transaction. Returns whether the
+    /// subscription actually transitioned.
+    ("pause_webhook", PauseWebhook, pause_webhook) fenced bool {
+        webhook_id: String as s,
+        reason: String as s,
+        now_ms: u64 as v,
+    },
     ("operational_aggregates", OperationalAggregates, operational_aggregates) plain OperationalAggregates {
         now_ms: u64 as v,
     },
@@ -804,6 +955,43 @@ storage_ops! {
     },
     ("recover_rollouts", RecoverRollouts, recover_rollouts) fenced Vec<RolloutRecord> {},
     ("list_rollouts", ListRollouts, list_rollouts) plain Vec<RolloutRecord> {},
+    ("create_config_approval_request", CreateConfigApprovalRequest, create_config_approval_request) fenced () {
+        request: ConfigApprovalRequest as v,
+    },
+    ("get_config_approval_request", GetConfigApprovalRequest, get_config_approval_request) plain Option<ConfigApprovalRequest> {
+        request_id: String as s,
+    },
+    ("list_config_approval_requests", ListConfigApprovalRequests, list_config_approval_requests) plain Vec<ConfigApprovalRequest> {
+        status: Option<String> as q,
+    },
+    ("begin_decide_config_approval_request", BeginDecideConfigApprovalRequest, begin_decide_config_approval_request) fenced bool {
+        request_id: String as s,
+        status: String as s,
+        approver_id: String as s,
+        decided_at_ms: u64 as v,
+        updated_at_ms: u64 as v,
+    },
+    ("complete_config_approval_request", CompleteConfigApprovalRequest, complete_config_approval_request) fenced bool {
+        request_id: String as s,
+        rollout_id: String as s,
+        updated_at_ms: u64 as v,
+    },
+    ("reset_config_approval_request", ResetConfigApprovalRequest, reset_config_approval_request) fenced bool {
+        request_id: String as s,
+        failure_note: String as s,
+        updated_at_ms: u64 as v,
+    },
+    ("find_rollout_by_correlation", FindRolloutByCorrelation, find_rollout_by_correlation) plain Option<RolloutRecord> {
+        correlation_id: String as s,
+    },
+    ("sweep_config_approval_requests", SweepConfigApprovalRequests, sweep_config_approval_requests) fenced usize {
+        now_ms: u64 as v,
+        terminal_older_than_ms: u64 as v,
+        max_retained: usize as v,
+    },
+    ("count_config_approval_requests", CountConfigApprovalRequests, count_config_approval_requests) plain usize {
+        status: String as s,
+    },
     ("upsert_job_upgrade", UpsertJobUpgrade, upsert_job_upgrade) fenced () {
         record: JobUpgradeRecord as v,
     },
@@ -992,6 +1180,45 @@ pub trait StorageBackend: Send + Sync + 'static {
         now_ms: u64,
     ) -> Result<bool, StorageError>;
     async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError>;
+    /// Replace a node's full label map. Returns the previous labels when the
+    /// node row exists, `None` for an unknown node. Labels are never part of
+    /// `upsert_node`: registration/report persistence must not touch them.
+    async fn replace_node_labels(
+        &self,
+        mutation: NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<BTreeMap<String, String>>, StorageError>;
+    /// Current labels for a node, `None` for an unknown node. Corrupt JSON
+    /// fails loudly rather than silently dropping operator-set labels.
+    async fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, StorageError>;
+    /// Every persisted node with its label map, in storage order. Selector
+    /// resolution matches these durable records so a node that has not
+    /// re-registered since a Hub restart still resolves.
+    async fn list_node_labels(
+        &self,
+    ) -> Result<Vec<(String, BTreeMap<String, String>)>, StorageError>;
+    /// Full replacement of the webhook subscription set, audited in the same
+    /// transaction. Returns the ids that transitioned disabled→enabled
+    /// (each persisted as a `webhook.resumed` event).
+    async fn replace_webhooks(
+        &self,
+        mutation: WebhookSetMutation,
+        now_ms: u64,
+    ) -> Result<Vec<String>, StorageError>;
+    /// Every stored webhook subscription, ordered by id.
+    async fn list_webhooks(&self) -> Result<Vec<WebhookSubscription>, StorageError>;
+    /// Flip a subscription to disabled after sustained delivery failure,
+    /// persisting a `webhook.paused` event and a system-actor audit row in
+    /// the same transaction. Returns whether it transitioned.
+    async fn pause_webhook(
+        &self,
+        webhook_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError>;
     async fn operational_aggregates(
         &self,
         now_ms: u64,
@@ -1083,6 +1310,60 @@ pub trait StorageBackend: Send + Sync + 'static {
     ) -> Result<Option<String>, StorageError>;
     async fn recover_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
     async fn list_rollouts(&self) -> Result<Vec<RolloutRecord>, StorageError>;
+    async fn create_config_approval_request(
+        &self,
+        request: ConfigApprovalRequest,
+    ) -> Result<(), StorageError>;
+    async fn get_config_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ConfigApprovalRequest>, StorageError>;
+    async fn list_config_approval_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ConfigApprovalRequest>, StorageError>;
+    /// Optimistic CAS reserving the decision: applies only while the request
+    /// is still `pending`. Returns false on a lost race (decision already
+    /// taken or the request expired out of `pending`).
+    async fn begin_decide_config_approval_request(
+        &self,
+        request_id: &str,
+        status: &str,
+        approver_id: &str,
+        decided_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError>;
+    /// `approving` → `approved`, recording the rollout the approval created.
+    async fn complete_config_approval_request(
+        &self,
+        request_id: &str,
+        rollout_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError>;
+    /// `approving` → `pending` after a failed rollout creation; the request
+    /// stays retryable and the failure reason is recorded.
+    async fn reset_config_approval_request(
+        &self,
+        request_id: &str,
+        failure_note: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError>;
+    /// The rollout an approval already created for this correlation id, if
+    /// any — the adoption lookup that keeps a crash from creating two.
+    async fn find_rollout_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RolloutRecord>, StorageError>;
+    /// Expire overdue pending requests, resolve stuck `approving` rows, and
+    /// prune terminal requests under age/count bounds. Never removes
+    /// pending or approving rows. Returns the number of rows written.
+    async fn sweep_config_approval_requests(
+        &self,
+        now_ms: u64,
+        terminal_older_than_ms: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError>;
+    async fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError>;
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError>;
     /// Optimistically-concurrent mutation of an existing orchestration row:
     /// the mutable columns apply only while the row still holds
@@ -1374,6 +1655,72 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::get_node_maintenance(backend, node_id).await,
             Self::Postgres(backend) => StorageBackend::get_node_maintenance(backend, node_id).await,
+        }
+    }
+    async fn replace_node_labels(
+        &self,
+        mutation: NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<BTreeMap<String, String>>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::replace_node_labels(backend, mutation, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::replace_node_labels(backend, mutation, now_ms).await
+            }
+        }
+    }
+    async fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::get_node_labels(backend, node_id).await,
+            Self::Postgres(backend) => StorageBackend::get_node_labels(backend, node_id).await,
+        }
+    }
+    async fn list_node_labels(
+        &self,
+    ) -> Result<Vec<(String, std::collections::BTreeMap<String, String>)>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_node_labels(backend).await,
+            Self::Postgres(backend) => StorageBackend::list_node_labels(backend).await,
+        }
+    }
+    async fn replace_webhooks(
+        &self,
+        mutation: WebhookSetMutation,
+        now_ms: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::replace_webhooks(backend, mutation, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::replace_webhooks(backend, mutation, now_ms).await
+            }
+        }
+    }
+    async fn list_webhooks(&self) -> Result<Vec<WebhookSubscription>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_webhooks(backend).await,
+            Self::Postgres(backend) => StorageBackend::list_webhooks(backend).await,
+        }
+    }
+    async fn pause_webhook(
+        &self,
+        webhook_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::pause_webhook(backend, webhook_id, reason, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::pause_webhook(backend, webhook_id, reason, now_ms).await
+            }
         }
     }
     async fn operational_aggregates(
@@ -1704,6 +2051,182 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::list_rollouts(backend).await,
             Self::Postgres(backend) => StorageBackend::list_rollouts(backend).await,
+        }
+    }
+    async fn create_config_approval_request(
+        &self,
+        request: ConfigApprovalRequest,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::create_config_approval_request(backend, request).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::create_config_approval_request(backend, request).await
+            }
+        }
+    }
+    async fn get_config_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ConfigApprovalRequest>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::get_config_approval_request(backend, request_id).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::get_config_approval_request(backend, request_id).await
+            }
+        }
+    }
+    async fn list_config_approval_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ConfigApprovalRequest>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::list_config_approval_requests(backend, status).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::list_config_approval_requests(backend, status).await
+            }
+        }
+    }
+    async fn begin_decide_config_approval_request(
+        &self,
+        request_id: &str,
+        status: &str,
+        approver_id: &str,
+        decided_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::begin_decide_config_approval_request(
+                    backend,
+                    request_id,
+                    status,
+                    approver_id,
+                    decided_at_ms,
+                    updated_at_ms,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::begin_decide_config_approval_request(
+                    backend,
+                    request_id,
+                    status,
+                    approver_id,
+                    decided_at_ms,
+                    updated_at_ms,
+                )
+                .await
+            }
+        }
+    }
+    async fn complete_config_approval_request(
+        &self,
+        request_id: &str,
+        rollout_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::complete_config_approval_request(
+                    backend,
+                    request_id,
+                    rollout_id,
+                    updated_at_ms,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::complete_config_approval_request(
+                    backend,
+                    request_id,
+                    rollout_id,
+                    updated_at_ms,
+                )
+                .await
+            }
+        }
+    }
+    async fn reset_config_approval_request(
+        &self,
+        request_id: &str,
+        failure_note: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::reset_config_approval_request(
+                    backend,
+                    request_id,
+                    failure_note,
+                    updated_at_ms,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::reset_config_approval_request(
+                    backend,
+                    request_id,
+                    failure_note,
+                    updated_at_ms,
+                )
+                .await
+            }
+        }
+    }
+    async fn find_rollout_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RolloutRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::find_rollout_by_correlation(backend, correlation_id).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::find_rollout_by_correlation(backend, correlation_id).await
+            }
+        }
+    }
+    async fn sweep_config_approval_requests(
+        &self,
+        now_ms: u64,
+        terminal_older_than_ms: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::sweep_config_approval_requests(
+                    backend,
+                    now_ms,
+                    terminal_older_than_ms,
+                    max_retained,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::sweep_config_approval_requests(
+                    backend,
+                    now_ms,
+                    terminal_older_than_ms,
+                    max_retained,
+                )
+                .await
+            }
+        }
+    }
+    async fn count_config_approval_requests(&self, status: &str) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::count_config_approval_requests(backend, status).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::count_config_approval_requests(backend, status).await
+            }
         }
     }
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
@@ -4084,6 +4607,303 @@ mod tests {
             .is_empty());
     }
 
+    fn approval_request(
+        request_id: &str,
+        correlation: &str,
+        expires_at_ms: u64,
+    ) -> ConfigApprovalRequest {
+        ConfigApprovalRequest {
+            request_id: request_id.into(),
+            config_version_id: "cfg-approve-1".into(),
+            targets: vec!["node-a".into(), "node-b".into()],
+            batch_size: 1,
+            requester_id: "alice".into(),
+            status: ConfigApprovalStatus::Pending,
+            approver_id: None,
+            decided_at_ms: None,
+            rollout_id: None,
+            correlation_id: correlation.into(),
+            expires_at_ms,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            failure_note: None,
+        }
+    }
+
+    /// The approval-request surface: creation round-trips, the decision CAS
+    /// serializes concurrent deciders, terminal requests cannot be decided
+    /// again, adoption finds the rollout a correlation produced, and the
+    /// sweep expires/punes without ever touching pending rows.
+    #[tokio::test]
+    async fn config_approval_lifecycle_cas_and_sweep() {
+        let store = ControlPlaneStore::contract("config_approval_lifecycle_cas_and_sweep").await;
+        store
+            .create_config_approval_request(approval_request("req-1", "corr-a", 1_000))
+            .await
+            .unwrap();
+
+        // Round-trip with JSON targets and status mapping.
+        let fetched = store
+            .get_config_approval_request("req-1")
+            .await
+            .unwrap()
+            .expect("request exists");
+        assert_eq!(
+            fetched.targets,
+            vec!["node-a".to_string(), "node-b".to_string()]
+        );
+        assert_eq!(fetched.status, ConfigApprovalStatus::Pending);
+        assert!(store
+            .get_config_approval_request("req-missing")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .list_config_approval_requests(Some("pending"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // CAS: the first decision wins, the second loses.
+        assert!(store
+            .begin_decide_config_approval_request("req-1", "approving", "bob", 20, 20)
+            .await
+            .unwrap());
+        assert!(!store
+            .begin_decide_config_approval_request("req-1", "approving", "carol", 21, 21)
+            .await
+            .unwrap());
+        assert!(!store
+            .begin_decide_config_approval_request("req-1", "rejected", "carol", 21, 21)
+            .await
+            .unwrap());
+
+        // Complete marks approved with the rollout id.
+        assert!(store
+            .complete_config_approval_request("req-1", "rollout-x", 22)
+            .await
+            .unwrap());
+        let approved = store
+            .get_config_approval_request("req-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved.status, ConfigApprovalStatus::Approved);
+        assert_eq!(approved.rollout_id.as_deref(), Some("rollout-x"));
+        // Terminal: no further transition applies.
+        assert!(!store
+            .begin_decide_config_approval_request("req-1", "rejected", "carol", 23, 23)
+            .await
+            .unwrap());
+        assert!(!store
+            .reset_config_approval_request("req-1", "note", 23)
+            .await
+            .unwrap());
+
+        // Adoption: a rollout carrying the correlation id is findable.
+        store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "rollout-adopt".into(),
+                    config_version_id: "cfg-adopt".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 1,
+                    actor: Some("bob".into()),
+                    correlation_id: Some("corr-adopt".into()),
+                    created_at_ms: 10,
+                    updated_at_ms: 10,
+                },
+                vec![RolloutTargetRecord {
+                    rollout_id: "rollout-adopt".into(),
+                    node_id: "node-a".into(),
+                    ordinal: 0,
+                    state: "pending".into(),
+                    attempt_id: None,
+                    error: None,
+                    observed_config_version: None,
+                    updated_at_ms: 10,
+                }],
+                "{\"v\":2}",
+                None,
+            )
+            .await
+            .unwrap();
+        let adopted = store
+            .find_rollout_by_correlation("corr-adopt")
+            .await
+            .unwrap()
+            .expect("rollout exists");
+        assert_eq!(adopted.rollout_id, "rollout-adopt");
+        assert!(store
+            .find_rollout_by_correlation("corr-none")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Rejection path: pending → rejected is terminal.
+        store
+            .create_config_approval_request(approval_request("req-2", "corr-b", 1_000))
+            .await
+            .unwrap();
+        assert!(store
+            .begin_decide_config_approval_request("req-2", "rejected", "carol", 30, 30)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .count_config_approval_requests("rejected")
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Expiry: an overdue pending request expires; the fresh one survives;
+        // pending rows are never deleted.
+        store
+            .create_config_approval_request(approval_request("req-3", "corr-c", 50))
+            .await
+            .unwrap();
+        let written = store
+            .sweep_config_approval_requests(100, 30, 100)
+            .await
+            .unwrap();
+        assert!(written >= 1);
+        let expired = store
+            .get_config_approval_request("req-3")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.status, ConfigApprovalStatus::Expired);
+        assert_eq!(
+            store
+                .count_config_approval_requests("pending")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Retention: terminal rows past the age bound are pruned.
+        let written = store
+            .sweep_config_approval_requests(10_000, 30, 100)
+            .await
+            .unwrap();
+        assert!(written >= 1);
+        assert!(store
+            .get_config_approval_request("req-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A stuck `approving` row is resolved by the sweep: adopted when its
+    /// correlation already produced a rollout, reset to pending otherwise —
+    /// but only once it stopped changing for the stall window.
+    #[tokio::test]
+    async fn config_approval_sweep_resolves_stuck_approving() {
+        let store =
+            ControlPlaneStore::contract("config_approval_sweep_resolves_stuck_approving").await;
+        // Fresh approving row (updated now): the sweep must not touch it.
+        store
+            .create_config_approval_request(approval_request("req-live", "corr-live", 10_000))
+            .await
+            .unwrap();
+        assert!(store
+            .begin_decide_config_approval_request("req-live", "approving", "bob", 100, 100)
+            .await
+            .unwrap());
+        store
+            .sweep_config_approval_requests(150, 30, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_config_approval_request("req-live")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConfigApprovalStatus::Approving
+        );
+
+        // Stalled approving row with an existing rollout: adopted.
+        store
+            .create_config_approval_request(approval_request("req-adopt", "corr-adopt2", 10_000))
+            .await
+            .unwrap();
+        assert!(store
+            .begin_decide_config_approval_request("req-adopt", "approving", "bob", 10, 10)
+            .await
+            .unwrap());
+        store
+            .create_rollout_with_content(
+                RolloutRecord {
+                    rollout_id: "rollout-adopt2".into(),
+                    config_version_id: "cfg-adopt2".into(),
+                    state: "applying".into(),
+                    batch_size: 1,
+                    current_batch: 0,
+                    total_targets: 1,
+                    actor: Some("bob".into()),
+                    correlation_id: Some("corr-adopt2".into()),
+                    created_at_ms: 12,
+                    updated_at_ms: 12,
+                },
+                vec![RolloutTargetRecord {
+                    rollout_id: "rollout-adopt2".into(),
+                    node_id: "node-a".into(),
+                    ordinal: 0,
+                    state: "pending".into(),
+                    attempt_id: None,
+                    error: None,
+                    observed_config_version: None,
+                    updated_at_ms: 12,
+                }],
+                "{\"v\":3}",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .sweep_config_approval_requests(150, 30, 100)
+            .await
+            .unwrap();
+        let adopted = store
+            .get_config_approval_request("req-adopt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.status, ConfigApprovalStatus::Approved);
+        assert_eq!(adopted.rollout_id.as_deref(), Some("rollout-adopt2"));
+
+        // Stalled approving row with no rollout: reset to pending with a
+        // note. The stall window is APPROVING_STALL_MS, so the decision must
+        // be older than that.
+        store
+            .create_config_approval_request(approval_request("req-reset", "corr-reset", 10_000))
+            .await
+            .unwrap();
+        assert!(store
+            .begin_decide_config_approval_request("req-reset", "approving", "bob", 10, 10)
+            .await
+            .unwrap());
+        store
+            .sweep_config_approval_requests(APPROVING_STALL_MS + 200, 30, 100)
+            .await
+            .unwrap();
+        let reset = store
+            .get_config_approval_request("req-reset")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.status, ConfigApprovalStatus::Pending);
+        assert!(reset.failure_note.is_some());
+    }
+
     /// The rollout orchestration surface: content-bearing creation seeds the
     /// config version, updates move the rollout and its targets, recovery
     /// returns only live rollouts, and listing is bounded but complete.
@@ -5544,5 +6364,274 @@ mod job_storage_tests {
                 .len(),
             1
         );
+    }
+
+    /// Labels are operator-managed fleet state: the storage contract must keep
+    /// them across Agent re-registration upserts and audit every replacement.
+    #[tokio::test]
+    async fn node_labels_roundtrip_and_re_registration_preserves_them() {
+        let store = ControlPlaneStore::contract("node_labels_roundtrip").await;
+        let mutation = || NodeMutation {
+            node_id: "node-a".into(),
+            version: "v1".into(),
+            state: "online".into(),
+            capabilities_json: "[]".into(),
+            boot_id: Some("boot-1".into()),
+            report_seq: Some(1),
+            last_seen_at_ms: 10,
+            lease_expires_at_ms: 4_102_444_800_000,
+            maintenance_state: None,
+            maintenance_updated_at_ms: None,
+        };
+        store.upsert_node(mutation()).await.unwrap();
+
+        // Unknown node returns None and persists nothing.
+        assert!(store
+            .replace_node_labels(
+                NodeLabelsMutation {
+                    node_id: "node-zzz".into(),
+                    labels: BTreeMap::from([("env".into(), "prod".into())]),
+                    actor: Some("operator-1".into()),
+                    correlation_id: None,
+                },
+                now_ms()
+            )
+            .await
+            .unwrap()
+            .is_none());
+
+        // First replacement returns the previous (empty) map.
+        let labels = BTreeMap::from([
+            ("env".to_owned(), "prod".to_owned()),
+            ("tier".to_owned(), "edge".to_owned()),
+        ]);
+        let previous = store
+            .replace_node_labels(
+                NodeLabelsMutation {
+                    node_id: "node-a".into(),
+                    labels: labels.clone(),
+                    actor: Some("operator-1".into()),
+                    correlation_id: Some("corr-1".into()),
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap()
+            .expect("node exists");
+        assert!(previous.is_empty());
+        assert_eq!(
+            store.get_node_labels("node-a").await.unwrap().unwrap(),
+            labels
+        );
+
+        // Agent re-registration upsert must NOT touch the labels column.
+        store.upsert_node(mutation()).await.unwrap();
+        assert_eq!(
+            store.get_node_labels("node-a").await.unwrap().unwrap(),
+            labels
+        );
+
+        // Full replacement semantics: the new map wins entirely.
+        let replacement = BTreeMap::from([("env".to_owned(), "staging".to_owned())]);
+        let previous = store
+            .replace_node_labels(
+                NodeLabelsMutation {
+                    node_id: "node-a".into(),
+                    labels: replacement.clone(),
+                    actor: Some("operator-2".into()),
+                    correlation_id: None,
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap()
+            .expect("node exists");
+        assert_eq!(previous, labels);
+        assert_eq!(
+            store.get_node_labels("node-a").await.unwrap().unwrap(),
+            replacement
+        );
+
+        // Every accepted replacement is audited with its actor.
+        let audit_records = store.list_audit(Some("node-a")).await.unwrap();
+        let audit = audit_records
+            .iter()
+            .filter(|record| record.action == "node.labels")
+            .collect::<Vec<_>>();
+        assert_eq!(audit.len(), 2, "both replacements audited");
+        assert!(audit.iter().all(|record| record.outcome == "accepted"));
+
+        assert!(store
+            .get_node_labels("node-missing")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Webhook subscriptions are operator-managed durable state: full
+    /// replacement semantics, disabled→enabled transitions persist
+    /// `webhook.resumed` events, and auto-pause persists `webhook.paused`
+    /// events plus system audit rows.
+    #[tokio::test]
+    async fn webhooks_roundtrip_replace_pause_and_lifecycle_events() {
+        let store = ControlPlaneStore::contract("webhooks_roundtrip").await;
+        let subscription = |id: &str, enabled: bool| WebhookSubscription {
+            id: id.into(),
+            url: format!("https://example.com/hook/{id}"),
+            event_types: vec!["rollout.".into()],
+            enabled,
+            secret: Some(format!("secret-{id}")),
+            created_by: Some("operator-1".into()),
+            created_at_ms: now_ms(),
+        };
+
+        // Full replacement: the submitted list becomes the complete set.
+        store
+            .replace_webhooks(
+                WebhookSetMutation {
+                    subscriptions: vec![subscription("alerts", true), subscription("quiet", false)],
+                    actor: Some("operator-1".into()),
+                    correlation_id: Some("corr-1".into()),
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let stored = store.list_webhooks().await.unwrap();
+        assert_eq!(
+            stored.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["alerts", "quiet"]
+        );
+        assert_eq!(stored[0].secret.as_deref(), Some("secret-alerts"));
+        assert!(stored[0].enabled);
+        assert!(!stored[1].enabled);
+
+        // Re-enabling the paused subscription reports the resumed id.
+        let resumed = store
+            .replace_webhooks(
+                WebhookSetMutation {
+                    subscriptions: vec![subscription("quiet", true)],
+                    actor: Some("operator-1".into()),
+                    correlation_id: None,
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed, ["quiet".to_owned()]);
+
+        // A fresh enabled subscription is not a "resumed" transition.
+        let resumed = store
+            .replace_webhooks(
+                WebhookSetMutation {
+                    subscriptions: vec![subscription("quiet", true), subscription("fresh", true)],
+                    actor: None,
+                    correlation_id: None,
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(resumed.is_empty());
+
+        // Auto-pause flips the flag once and persists lifecycle events.
+        assert!(store
+            .pause_webhook("quiet", "5 consecutive failures", now_ms())
+            .await
+            .unwrap());
+        assert!(!store
+            .pause_webhook("quiet", "already paused", now_ms())
+            .await
+            .unwrap());
+        assert!(!store
+            .pause_webhook("missing", "unknown id", now_ms())
+            .await
+            .unwrap());
+        let stored = store.list_webhooks().await.unwrap();
+        let quiet = stored.iter().find(|s| s.id == "quiet").unwrap();
+        assert!(!quiet.enabled);
+
+        // Lifecycle events are durable control-plane events under the hub
+        // identity (visible to REST/SSE replay), and mutations are audited.
+        let events = store.list_events(None).await.unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "webhook.resumed"
+                && event.node_id.as_deref() == Some("hub")));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "webhook.paused"
+                && event.node_id.as_deref() == Some("hub")));
+        let audit = store.list_audit(None).await.unwrap();
+        assert!(audit
+            .iter()
+            .any(|record| record.action == "webhook.replace"));
+        assert!(audit.iter().any(|record| record.action == "webhook.pause"
+            && record.resource_id.as_deref() == Some("quiet")));
+    }
+
+    /// Subscriptions must survive a backend reopen (Hub restart) unchanged.
+    #[tokio::test]
+    async fn webhooks_survive_backend_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("webhooks-reopen.db");
+        {
+            let backend = SqliteBackend::open(&path).unwrap();
+            backend
+                .replace_webhooks(
+                    WebhookSetMutation {
+                        subscriptions: vec![WebhookSubscription {
+                            id: "alerts".into(),
+                            url: "https://example.com/hook".into(),
+                            event_types: vec!["node.".into(), "rollout.".into()],
+                            enabled: true,
+                            secret: Some("secret".into()),
+                            created_by: Some("operator-1".into()),
+                            created_at_ms: now_ms(),
+                        }],
+                        actor: Some("operator-1".into()),
+                        correlation_id: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+        }
+        let backend = SqliteBackend::open(&path).unwrap();
+        let stored = backend.list_webhooks().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "alerts");
+        assert_eq!(stored[0].event_types, ["node.", "rollout."]);
+        assert_eq!(stored[0].secret.as_deref(), Some("secret"));
+        assert!(stored[0].enabled);
+    }
+
+    #[test]
+    fn sqlite_node_labels_column_migrates_existing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("labels-migrate.db");
+        {
+            let backend = SqliteBackend::open(&path).unwrap();
+            backend
+                .with_connection(|connection| {
+                    connection.execute("ALTER TABLE cp_nodes DROP COLUMN labels_json", [])?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        // Reopen runs the guarded migration: the column returns with its
+        // default, and re-running is idempotent.
+        let backend = SqliteBackend::open(&path).unwrap();
+        backend
+            .with_connection(|connection| {
+                let has_column: bool = connection
+                    .prepare("PRAGMA table_info(cp_nodes)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .any(|name| name == "labels_json");
+                assert!(has_column);
+                Ok(())
+            })
+            .unwrap();
     }
 }

@@ -1394,6 +1394,8 @@ mod plan_cache_tests {
             lease_ttl_ms: 1000,
             poll_interval_ms: 1000,
             session_ttl_ms: crate::hub::default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         });
         let first = hub.cached_plan(&spec_json("orders")).expect("compiles");
         // Same content again: served from the cache (identical assignments).
@@ -1420,6 +1422,8 @@ mod plan_cache_tests {
             lease_ttl_ms: 1000,
             poll_interval_ms: 1000,
             session_ttl_ms: crate::hub::default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
         });
         assert!(hub.cached_plan("not-json").is_none());
         // The failure is cached: the map holds the None verdict.

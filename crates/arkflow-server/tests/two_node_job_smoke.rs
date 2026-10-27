@@ -206,6 +206,8 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         // whole test; heartbeats renew every 50ms so 2s bounds any
         // stale-session-gated replacement step without spurious expiry.
         session_ttl_ms: 2_000,
+        approval_required: false,
+        approval_ttl_ms: arkflow_server::hub::default_approval_ttl_ms(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -487,6 +489,8 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
         // whole test; heartbeats renew every 50ms so 2s bounds any
         // stale-session-gated replacement step without spurious expiry.
         session_ttl_ms: 2_000,
+        approval_required: false,
+        approval_ttl_ms: arkflow_server::hub::default_approval_ttl_ms(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

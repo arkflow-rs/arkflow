@@ -46,8 +46,20 @@ export function useStatus() {
   return useQuery({ queryKey: ['live', 'status'], queryFn: api.status, ...live })
 }
 
-export function useNodes() {
-  return useQuery({ queryKey: ['live', 'nodes'], queryFn: () => api.nodes(), ...live })
+const DEFAULT_PREVIEW_SIZE = 256
+
+// Webhook subscriptions change only through this page's own mutations —
+// not 'live': refreshed by invalidation, not on the snapshot cadence.
+export function useWebhooks() {
+  return useQuery({ queryKey: ['webhooks'], queryFn: api.webhooks })
+}
+
+export function useNodes(label?: string) {
+  return useQuery({
+    queryKey: ['live', 'nodes', label ?? null],
+    queryFn: () => (label ? api.nodes(1, DEFAULT_PREVIEW_SIZE, label) : api.nodes()),
+    ...live,
+  })
 }
 
 export function useStreams(nodeId?: string) {
@@ -98,6 +110,14 @@ export function useMetrics(nodeId?: string) {
 
 export function useRollouts() {
   return useQuery({ queryKey: ['live', 'rollouts'], queryFn: () => api.rollouts(), ...live })
+}
+
+export function useConfigApprovals(status?: string) {
+  return useQuery({
+    queryKey: ['live', 'config-approvals', status ?? null],
+    queryFn: () => api.configApprovals(status),
+    ...live,
+  })
 }
 
 export function useRolloutDetail(rolloutId: string | undefined) {

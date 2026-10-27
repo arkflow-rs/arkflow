@@ -275,6 +275,220 @@ impl StorageBackend for PostgresBackend {
         }
     }
 
+    async fn replace_node_labels(
+        &self,
+        mutation: NodeLabelsMutation,
+        now_ms: u64,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        let encoded = serde_json::to_string(&mutation.labels)
+            .map_err(|error| StorageError::Encoding(format!("encode node labels: {error}")))?;
+        {
+            let mut transaction = self.begin().await?;
+            let __ret = async {
+            let previous_json: Option<String> = transaction
+                .query_row(
+                    "SELECT labels_json FROM cp_nodes WHERE node_id = ?1",
+                    binds![&mutation.node_id],
+                    |row| row.get(0),
+                ).await
+                .optional()?;
+            let Some(previous_json) = previous_json else { return Ok(None) };
+            let previous = decode_node_labels(&previous_json)?;
+            let summary = format!("{}->{} labels", previous.len(), mutation.labels.len());
+            transaction.execute(
+                "UPDATE cp_nodes SET labels_json = ?2, updated_at_ms = ?3 WHERE node_id = ?1",
+                binds![mutation.node_id, encoded, now_ms],
+            ).await?;
+            transaction.execute(
+                "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES (?1, 'node_labels_changed', 'succeeded', ?2, ?3, ?4, ?5)",
+                binds![mutation.node_id, summary, mutation.correlation_id, mutation.actor, now_ms],
+            ).await?;
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES (?1, 'node.labels', 'node', ?2, ?2, ?3, 'accepted', ?4, ?5)",
+                binds![mutation.actor, mutation.node_id, mutation.correlation_id, summary, now_ms],
+            ).await?;
+            Ok(Some(previous))
+            }.await;
+            transaction.commit().await?;
+            __ret
+        }
+    }
+
+    async fn list_node_labels(&self) -> Result<Vec<NodeLabels>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            let rows = connection
+                .query_all(
+                    "SELECT node_id, labels_json FROM cp_nodes",
+                    binds![],
+                    |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+                )
+                .await?;
+            rows.into_iter()
+                .map(|(node_id, json)| Ok((node_id, decode_node_labels(&json)?)))
+                .collect()
+        }
+    }
+
+    async fn get_node_labels(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            connection
+                .query_row(
+                    "SELECT labels_json FROM cp_nodes WHERE node_id = ?1",
+                    binds![node_id],
+                    |row| row.get::<String>(0),
+                ).await
+                .optional()?
+                .map(|json| decode_node_labels(&json))
+                .transpose()
+        }
+    }
+
+    async fn replace_webhooks(
+        &self,
+        mutation: WebhookSetMutation,
+        now_ms: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        {
+            let mut transaction = self.begin().await?;
+            let __ret = async {
+            let mut previous: std::collections::BTreeMap<String, bool> =
+                std::collections::BTreeMap::new();
+            {
+                let rows = transaction
+                    .query_all(
+                        "SELECT webhook_id, enabled FROM cp_webhooks",
+                        binds![],
+                        |row| Ok((row.get::<String>(0)?, row.get::<bool>(1)?)),
+                    ).await?;
+                for (id, enabled) in rows {
+                    previous.insert(id, enabled);
+                }
+            }
+            transaction.execute("DELETE FROM cp_webhooks", binds![]).await?;
+            for subscription in &mutation.subscriptions {
+                let event_types = serde_json::to_string(&subscription.event_types)
+                    .map_err(|error| StorageError::Encoding(format!("encode webhook event types: {error}")))?;
+                transaction.execute(
+                    "INSERT INTO cp_webhooks (webhook_id, url, event_types_json, enabled, secret, created_by, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    binds![
+                        subscription.id,
+                        subscription.url,
+                        event_types,
+                        subscription.enabled,
+                        subscription.secret,
+                        subscription.created_by,
+                        subscription.created_at_ms,
+                    ],
+                ).await?;
+            }
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES (?1, 'webhook.replace', 'webhook', NULL, NULL, ?2, 'accepted', ?3, ?4)",
+                binds![
+                    mutation.actor,
+                    mutation.correlation_id,
+                    format!("{} webhooks", mutation.subscriptions.len()),
+                    now_ms as i64,
+                ],
+            ).await?;
+            let resumed = mutation
+                .subscriptions
+                .iter()
+                .filter(|subscription| {
+                    subscription.enabled && previous.get(&subscription.id) == Some(&false)
+                })
+                .map(|subscription| subscription.id.clone())
+                .collect::<Vec<_>>();
+            for id in &resumed {
+                transaction.execute(
+                    "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES ('hub', 'webhook.resumed', 'succeeded', ?1, ?2, ?3, ?4)",
+                    binds![
+                        format!("webhook {id} resumed"),
+                        mutation.correlation_id,
+                        mutation.actor,
+                        now_ms as i64,
+                    ],
+                ).await?;
+            }
+            Ok(resumed)
+            }.await;
+            transaction.commit().await?;
+            __ret
+        }
+    }
+
+    async fn list_webhooks(&self) -> Result<Vec<WebhookSubscription>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            let rows = connection
+                .query_all(
+                    "SELECT webhook_id, url, event_types_json, enabled, secret, created_by, created_at_ms FROM cp_webhooks ORDER BY webhook_id",
+                    binds![],
+                    |row| {
+                        Ok((
+                            row.get::<String>(0)?,
+                            row.get::<String>(1)?,
+                            row.get::<String>(2)?,
+                            row.get::<bool>(3)?,
+                            row.get::<Option<String>>(4)?,
+                            row.get::<Option<String>>(5)?,
+                            row.get::<i64>(6)? as u64,
+                        ))
+                    },
+                )
+                .await?;
+            rows.into_iter()
+                .map(|(id, url, event_types, enabled, secret, created_by, created_at_ms)| {
+                    Ok(WebhookSubscription {
+                        id,
+                        url,
+                        event_types: decode_webhook_event_types(&event_types)?,
+                        enabled,
+                        secret,
+                        created_by,
+                        created_at_ms,
+                    })
+                })
+                .collect()
+        }
+    }
+
+    async fn pause_webhook(
+        &self,
+        webhook_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        {
+            let mut transaction = self.begin().await?;
+            let __ret = async {
+            let changed = transaction
+                .execute(
+                    "UPDATE cp_webhooks SET enabled = FALSE WHERE webhook_id = ?1 AND enabled = TRUE",
+                    binds![webhook_id],
+                ).await?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            transaction.execute(
+                "INSERT INTO cp_events (node_id, event_type, outcome, message, correlation_id, actor, occurred_at_ms) VALUES ('hub', 'webhook.paused', 'failed', ?1, NULL, 'system', ?2)",
+                binds![format!("webhook {webhook_id} paused: {reason}"), now_ms as i64],
+            ).await?;
+            transaction.execute(
+                "INSERT INTO cp_audit_events (actor, action, resource_type, resource_id, node_id, correlation_id, outcome, message, occurred_at_ms) VALUES ('system', 'webhook.pause', 'webhook', ?1, NULL, NULL, 'accepted', ?2, ?3)",
+                binds![webhook_id, reason, now_ms as i64],
+            ).await?;
+            Ok(true)
+            }.await;
+            transaction.commit().await?;
+            __ret
+        }
+    }
+
 
     async fn claim_outbox(
         &self,
@@ -1388,6 +1602,243 @@ impl StorageBackend for PostgresBackend {
     }
 
 
+    async fn create_config_approval_request(
+        &self,
+        request: ConfigApprovalRequest,
+    ) -> Result<(), StorageError> {
+        let targets = serde_json::to_string(&request.targets)
+            .map_err(|error| StorageError::Encoding(error.to_string()))?;
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            transaction.execute(
+                "INSERT INTO cp_config_approval_requests (request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                binds![
+                    request.request_id,
+                    request.config_version_id,
+                    targets,
+                    request.batch_size,
+                    request.requester_id,
+                    request.status.as_str(),
+                    request.approver_id,
+                    request.decided_at_ms,
+                    request.rollout_id,
+                    request.correlation_id,
+                    request.expires_at_ms,
+                    request.created_at_ms,
+                    request.updated_at_ms,
+                    request.failure_note,
+                ],
+            ).await?;
+            Ok(())
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn get_config_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ConfigApprovalRequest>, StorageError> {
+        let mut connection = self.lease().await?;
+        connection
+            .query_row(
+                "SELECT request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note FROM cp_config_approval_requests WHERE request_id = ?1",
+                binds![request_id],
+                config_approval_from_row,
+            )
+            .await
+            .optional()
+    }
+
+    async fn list_config_approval_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ConfigApprovalRequest>, StorageError> {
+        let mut connection = self.lease().await?;
+        match status {
+            Some(status) => {
+                connection
+                    .query_all(
+                        &q(
+                            "SELECT request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note FROM cp_config_approval_requests WHERE status = ?1 ORDER BY created_at_ms DESC, request_id DESC LIMIT 1024",
+                        ),
+                        binds![status],
+                        config_approval_from_row,
+                    )
+                    .await
+            }
+            None => {
+                connection
+                    .query_all(
+                        &q(
+                            "SELECT request_id, config_version_id, targets_json, batch_size, requester_id, status, approver_id, decided_at_ms, rollout_id, correlation_id, expires_at_ms, created_at_ms, updated_at_ms, failure_note FROM cp_config_approval_requests ORDER BY created_at_ms DESC, request_id DESC LIMIT 1024",
+                        ),
+                        &[],
+                        config_approval_from_row,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn begin_decide_config_approval_request(
+        &self,
+        request_id: &str,
+        status: &str,
+        approver_id: &str,
+        decided_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let updated = transaction
+                .execute(
+                    "UPDATE cp_config_approval_requests SET status = ?2, approver_id = ?3, decided_at_ms = ?4, updated_at_ms = ?5 WHERE request_id = ?1 AND status = 'pending'",
+                    binds![request_id, status, approver_id, decided_at_ms, updated_at_ms],
+                )
+                .await?;
+            Ok(updated == 1)
+        }
+        .await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn complete_config_approval_request(
+        &self,
+        request_id: &str,
+        rollout_id: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let updated = transaction
+                .execute(
+                    "UPDATE cp_config_approval_requests SET status = 'approved', rollout_id = ?2, updated_at_ms = ?3 WHERE request_id = ?1 AND status = 'approving'",
+                    binds![request_id, rollout_id, updated_at_ms],
+                )
+                .await?;
+            Ok(updated == 1)
+        }
+        .await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn reset_config_approval_request(
+        &self,
+        request_id: &str,
+        failure_note: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let updated = transaction
+                .execute(
+                    "UPDATE cp_config_approval_requests SET status = 'pending', failure_note = ?2, updated_at_ms = ?3 WHERE request_id = ?1 AND status = 'approving'",
+                    binds![request_id, failure_note, updated_at_ms],
+                )
+                .await?;
+            Ok(updated == 1)
+        }
+        .await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn find_rollout_by_correlation(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<RolloutRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        connection
+            .query_row(
+                "SELECT rollout_id, config_version_id, state, batch_size, current_batch, total_targets, actor, correlation_id, created_at_ms, updated_at_ms FROM cp_rollouts WHERE correlation_id = ?1 ORDER BY created_at_ms LIMIT 1",
+                binds![correlation_id],
+                |row| {
+                    Ok(RolloutRecord {
+                        rollout_id: row.get(0)?,
+                        config_version_id: row.get(1)?,
+                        state: row.get(2)?,
+                        batch_size: row.get(3)?,
+                        current_batch: row.get(4)?,
+                        total_targets: row.get(5)?,
+                        actor: row.get(6)?,
+                        correlation_id: row.get(7)?,
+                        created_at_ms: row.get(8)?,
+                        updated_at_ms: row.get(9)?,
+                    })
+                },
+            )
+            .await
+            .optional()
+    }
+
+    async fn sweep_config_approval_requests(
+        &self,
+        now_ms: u64,
+        terminal_older_than_ms: u64,
+        max_retained: usize,
+    ) -> Result<usize, StorageError> {
+        let cutoff_ms = now_ms.saturating_sub(terminal_older_than_ms);
+        let stalled_before_ms = now_ms.saturating_sub(APPROVING_STALL_MS);
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let mut written = 0usize;
+            written += transaction
+                .execute(
+                    "UPDATE cp_config_approval_requests SET status = 'expired', updated_at_ms = ?2 WHERE status = 'pending' AND expires_at_ms <= ?1",
+                    binds![now_ms, now_ms],
+                )
+                .await? as usize;
+            written += transaction
+                .execute(
+                    "UPDATE cp_config_approval_requests SET status = 'approved', rollout_id = (SELECT rollout_id FROM cp_rollouts WHERE correlation_id = cp_config_approval_requests.correlation_id ORDER BY created_at_ms LIMIT 1), updated_at_ms = ?1 WHERE status = 'approving' AND EXISTS (SELECT 1 FROM cp_rollouts WHERE correlation_id = cp_config_approval_requests.correlation_id)",
+                    binds![now_ms],
+                )
+                .await? as usize;
+            written += transaction
+                .execute(
+                    "UPDATE cp_config_approval_requests SET status = 'pending', failure_note = COALESCE(failure_note, 'approval did not complete; retry the decision'), updated_at_ms = ?1 WHERE status = 'approving' AND updated_at_ms <= ?2 AND NOT EXISTS (SELECT 1 FROM cp_rollouts WHERE correlation_id = cp_config_approval_requests.correlation_id)",
+                    binds![now_ms, stalled_before_ms],
+                )
+                .await? as usize;
+            written += transaction
+                .execute(
+                    "DELETE FROM cp_config_approval_requests WHERE status IN ('approved', 'rejected', 'expired') AND updated_at_ms < ?1",
+                    binds![cutoff_ms],
+                )
+                .await? as usize;
+            written += transaction
+                .execute(
+                    "DELETE FROM cp_config_approval_requests WHERE status IN ('approved', 'rejected', 'expired') AND request_id NOT IN (SELECT request_id FROM cp_config_approval_requests WHERE status IN ('approved', 'rejected', 'expired') ORDER BY updated_at_ms DESC, request_id DESC LIMIT ?1)",
+                    binds![max_retained],
+                )
+                .await? as usize;
+            Ok(written)
+        }
+        .await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn count_config_approval_requests(
+        &self,
+        status: &str,
+    ) -> Result<usize, StorageError> {
+        let mut connection = self.lease().await?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM cp_config_approval_requests WHERE status = ?1",
+                binds![status],
+                |row| row.get(0),
+            )
+            .await
+            .optional()?
+            .unwrap_or(0);
+        Ok(count as usize)
+    }
+
     async fn upsert_job_upgrade(&self, record: JobUpgradeRecord) -> Result<(), StorageError> {
         {
             let mut transaction = self.begin().await?;
@@ -2236,6 +2687,31 @@ impl StorageBackend for PostgresBackend {
             oldest_pending_age_seconds: oldest.map(|created| now_ms.saturating_sub(created as u64) / 1000),
         })
     }
+}
+
+fn config_approval_from_row(row: &Row<'_>) -> Result<ConfigApprovalRequest, StorageError> {
+    let targets_json: String = row.get(2)?;
+    let targets = serde_json::from_str(&targets_json)
+        .map_err(|error| StorageError::Encoding(error.to_string()))?;
+    let raw_status: String = row.get(5)?;
+    let status = ConfigApprovalStatus::parse(&raw_status)
+        .ok_or_else(|| StorageError::Encoding(format!("unknown approval status: {raw_status}")))?;
+    Ok(ConfigApprovalRequest {
+        request_id: row.get(0)?,
+        config_version_id: row.get(1)?,
+        targets,
+        batch_size: row.get(3)?,
+        requester_id: row.get(4)?,
+        status,
+        approver_id: row.get(6)?,
+        decided_at_ms: row.get(7)?,
+        rollout_id: row.get(8)?,
+        correlation_id: row.get(9)?,
+        expires_at_ms: row.get(10)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+        failure_note: row.get(13)?,
+    })
 }
 
 fn row_to_job_pg(row: &Row<'_>) -> Result<JobRecord, StorageError> {

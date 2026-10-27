@@ -31,6 +31,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         hub_storage: std::env::var("ARKFLOW_HUB_STORAGE").ok(),
         tls_cert: std::env::var("ARKFLOW_HUB_TLS_CERT").ok(),
         tls_key: std::env::var("ARKFLOW_HUB_TLS_KEY").ok(),
+        approval_required: std::env::var("ARKFLOW_APPROVAL_REQUIRED")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
+        approval_ttl_ms: std::env::var("ARKFLOW_APPROVAL_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|ttl| *ttl >= 1_000)
+            .unwrap_or_else(arkflow_server::hub::default_approval_ttl_ms),
         ..ServerConfig::default()
     };
     let ha = HubHaConfig {
@@ -59,6 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         lease_ttl_ms: config.lease_ttl_ms,
         poll_interval_ms: config.poll_interval_ms,
         session_ttl_ms: config.session_ttl_ms,
+        approval_required: config.approval_required,
+        approval_ttl_ms: config.approval_ttl_ms,
     };
     bootstrap::serve_from_config(hub_config, config, ha, cancellation).await
 }

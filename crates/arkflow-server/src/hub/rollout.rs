@@ -333,6 +333,31 @@ impl Hub {
                 let Some(config_version_id) = rollback_config_version else {
                     return Err(HubError::Invalid("rollback requires config_version".into()));
                 };
+                // Under the approval policy a rollback may only target a
+                // version that was actually applied to the rollout's nodes:
+                // a never-applied version would ride the rollback path
+                // around the approval gate. Unverifiable history fails
+                // closed.
+                if self.config.approval_required {
+                    let node_ids = storage
+                        .list_rollout_targets(rollout_id.to_owned())
+                        .await
+                        .map_err(HubError::from)?
+                        .into_iter()
+                        .map(|target| target.node_id)
+                        .collect::<Vec<_>>();
+                    if !self
+                        .version_was_applied_to(&config_version_id, &node_ids)
+                        .await?
+                    {
+                        return Err(HubError::Invalid(format!(
+                            "rollback target '{config_version_id}' was never applied to the \
+                             rollout's nodes; under the approval policy only previously \
+                             applied versions may roll back — submit new content through \
+                             the approval flow"
+                        )));
+                    }
+                }
                 let targets = storage
                     .list_rollout_targets(rollout_id.to_owned())
                     .await

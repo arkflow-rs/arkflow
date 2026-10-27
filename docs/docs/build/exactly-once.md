@@ -150,11 +150,17 @@ L3 boundaries, enforced by explicit errors rather than silent degradation:
   `latest` skips everything produced meanwhile). Once all components of a
   stream/job are built, startup validation rejects such a configuration with
   a configuration error naming the group and both keys.
-- **Process-internal pairing** — the output resolves the named group through
-  the in-process registry; the input and output must run in the same ArkFlow
-  process. Distributed jobs that split input and output across nodes are not
-  covered (independent change). An `offset_commit_group` naming a group with
-  no live `transactional_offsets` input fails the write.
+- **Pairing is co-located by placement affinity** — the output resolves the
+  named group through the in-process registry, so the input and output must
+  run in one ArkFlow process. Distributed jobs get this automatically: the
+  Kafka input/output builders derive a shared placement affinity key from
+  `transactional_offsets` / `offset_commit_group`, and under
+  `placement: split` the planner pins the pair onto one node (operators
+  between them may still span nodes behind remote data edges). An assignment
+  that would split the pair is rejected — at Hub placement validation and
+  again at Agent graph build — before any task starts. An
+  `offset_commit_group` naming a group with no live `transactional_offsets`
+  input fails the write.
 - **Single input topic** — batch metadata carries partitions without topics, so
   the registry routes by the input's topic list; a multi-topic subscription is
   rejected.
@@ -177,10 +183,12 @@ A complete runnable L3 example is in
 - `exactly_once: true` requires a non-empty `transactional_id`; validation fails
   with a clear error otherwise.
 - `offset_commit_group` requires `exactly_once: true`; the builder rejects the
-  configuration otherwise. The named group must have a same-process Kafka input
-  with `transactional_offsets: true`: a configuration whose transactional input
-  is never claimed by any output **fails startup** with a configuration error,
-  and a write against a group with no live input fails the write.
+  configuration otherwise. The named group must have a Kafka input with
+  `transactional_offsets: true` running in the same process (distributed jobs
+  satisfy this by pinning the pair onto one node): a configuration whose
+  transactional input is never claimed by any output **fails startup** with a
+  configuration error, and a write against a group with no live input fails
+  the write.
 - The WAL's object-store `node_id` and the Kafka `transactional_id` are
   **independent** configuration values — neither is derived from the other.
 - Outputs other than the transactional Kafka output keep today's default

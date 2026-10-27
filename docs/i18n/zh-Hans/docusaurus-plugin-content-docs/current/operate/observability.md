@@ -40,12 +40,15 @@ Job 位于 `arkflow_job_*`。所有序列都携带 `# HELP`/`# TYPE` 元数据;�
 | `arkflow_job_checkpoint_failures_total` | counter | `job` | 失败的检查点。 |
 | `arkflow_job_watermark_lag_ms` | gauge | `job` | 各源中最大的水位线滞后。 |
 | `arkflow_job_late_events_total` | counter | `job` | 被丢弃/路由/更新的迟到事件。 |
+| `arkflow_job_wal_flush_failures_total` | counter | `job` | 作业输入 WAL 的后台刷盘失败次数(无 WAL 时为 0)。 |
 | `arkflow_stream_input_messages` / `_output_messages` / `_restarts` / `_checkpoint_failures` / `_late_events` | counter | `stream_id` | 旧版 Stream 计数器(名称不变)。 |
+| `arkflow_stream_wal_flush_failures_total` | counter | `stream_id` | Stream 输入 WAL 的后台刷盘失败次数(未启用持久化时为 0)。 |
 | `arkflow_stream_in_flight` / `_mean_latency_us` / `_checkpoint_duration_ms` / `_watermark_lag_ms` | gauge | `stream_id` | 旧版 Stream gauge 指标。 |
 
 标签使用固定词表——作业/链路/Stream 标识符,外加可选的 `node` 标签。消息内容、关联 ID
 与错误文本绝不会成为标签,因此基数受限于所配置的负载规模(每个进程 O(作业数 × 链路数))。
-进程重启时计数器会归零;请在稳定窗口上使用 `rate()`/`increase()`。
+进程重启、Stream 重新注册或原地重启(重启会打开新的 WAL,同一 `stream_id` 序列从零开始)时
+计数器会归零;停止 Stream 会保留最后上报的总量。请在稳定窗口上使用 `rate()`/`increase()`。
 
 ### 就绪与存活
 
@@ -157,6 +160,9 @@ v1 的 span 模型是每次 Job 执行的生命周期骨架:
 - Hub 就绪探测失败(存储/恢复受损)。
 - `arkflow_job_chain_errors_total` 增长、`arkflow_job_checkpoint_failures_total`
   增长,或 `arkflow_job_watermark_lag_ms` 呈上升趋势。
+- `arkflow_job_wal_flush_failures_total` 或 `arkflow_stream_wal_flush_failures_total`
+  增长:WAL 追加未能写入存储,暂存条目并不持久,崩溃时会丢失。存储短暂抖动时的零星增长会自动重试;
+  持续增长(连续 8 次失败后进程还会把日志升级为 error 级)说明存储已无法推进。
 
 ## 相关页面
 
