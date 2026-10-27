@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 // README component-list parity gate: both READMEs carry generated-style
 // marker regions (`README_COMPONENTS:<kind> START/END`) around the component
@@ -10,7 +11,7 @@ import path from 'node:path';
 // README_zh.md enumerate the same set — the requirement in
 // openspec/specs/documentation-accuracy that was previously unenforced.
 
-const docsRoot = path.resolve(new URL('..', import.meta.url).pathname);
+const docsRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const repoRoot = path.dirname(docsRoot);
 const inventoryPath = path.join(docsRoot, 'reference', 'component-inventory.json');
 const errors = [];

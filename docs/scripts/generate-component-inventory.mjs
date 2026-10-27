@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {parseComponentOwnership, routeFor, walk} from './lib.mjs';
 
-const root = path.resolve(new URL('..', import.meta.url).pathname);
+const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const inventoryPath = path.join(root, 'reference', 'component-inventory.json');
 const docsRoot = path.join(root, 'docs');
 const componentsDir = path.join(docsRoot, 'components');
@@ -46,17 +47,19 @@ const rows = inventory.components
 
 const generated = `${start}\n\n| Kind | Component | Description | Documentation |\n| --- | --- | --- | --- |\n${rows}\n\n${end}`;
 const current = fs.readFileSync(pagePath, 'utf8');
+const eol = current.includes('\r\n') ? '\r\n' : '\n';
+const currentLf = current.replace(/\r\n/g, '\n');
 const pattern = new RegExp(`${start}[\\s\\S]*?${end}`);
-if (!pattern.test(current)) throw new Error(`missing generated markers in ${pagePath}`);
-const next = current.replace(pattern, generated);
+if (!pattern.test(currentLf)) throw new Error(`missing generated markers in ${pagePath}`);
+const nextLf = currentLf.replace(pattern, generated);
 if (process.argv.includes('--check')) {
-  if (next !== current) {
+  if (nextLf !== currentLf) {
     console.error(`${path.relative(root, pagePath)} is stale; run pnpm components:generate`);
     process.exitCode = 1;
   } else {
     console.log('component inventory is up to date');
   }
 } else {
-  fs.writeFileSync(pagePath, next);
+  fs.writeFileSync(pagePath, nextLf.replace(/\n/g, eol));
   console.log(`generated ${path.relative(root, pagePath)} from ${inventory.components.length} entries`);
 }
