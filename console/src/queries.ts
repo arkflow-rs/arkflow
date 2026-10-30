@@ -1,6 +1,14 @@
 import { useEffect, useState } from 'react'
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, JOB_DETAIL_INTERVAL_MS, ROLLOUT_DETAIL_INTERVAL_MS, SNAPSHOT_INTERVAL_MS } from './api'
+import {
+  api,
+  type AuditListQuery,
+  type EventListQuery,
+  type OperationListQuery,
+  JOB_DETAIL_INTERVAL_MS,
+  ROLLOUT_DETAIL_INTERVAL_MS,
+  SNAPSHOT_INTERVAL_MS,
+} from './api'
 
 // The last error raised by any mounted ['live', ...] query, or null while all
 // live resources are healthy. Lets the shell mark the view stale even when the
@@ -84,18 +92,18 @@ export function useJobDetail(jobId: string | undefined) {
   })
 }
 
-export function useOperations(nodeId?: string) {
+export function useOperations(query: OperationListQuery = {}) {
   return useQuery({
-    queryKey: ['live', 'operations', nodeId ?? null],
-    queryFn: () => api.operations(nodeId),
+    queryKey: ['live', 'operations', query],
+    queryFn: () => api.operations(query),
     ...live,
   })
 }
 
-export function useEvents(nodeId?: string) {
+export function useEvents(query: EventListQuery = {}) {
   return useQuery({
-    queryKey: ['live', 'events', nodeId ?? null],
-    queryFn: () => api.events(nodeId),
+    queryKey: ['live', 'events', query],
+    queryFn: () => api.events(query),
     ...live,
   })
 }
@@ -110,6 +118,17 @@ export function useMetrics(nodeId?: string) {
 
 export function useRollouts() {
   return useQuery({ queryKey: ['live', 'rollouts'], queryFn: () => api.rollouts(), ...live })
+}
+
+// Audit history is append-only and paged server-side: not 'live' (no SSE
+// invalidation or snapshot polling), but every distinct page/filter is its
+// own cache entry so paging never serves a stale first page forever.
+export function useAudit(query: AuditListQuery = {}) {
+  return useQuery({
+    queryKey: ['audit', query],
+    queryFn: () => api.audit(query),
+    placeholderData: keepPreviousData,
+  })
 }
 
 export function useConfigApprovals(status?: string) {

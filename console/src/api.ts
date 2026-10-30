@@ -37,6 +37,36 @@ export type StreamStatus = {
   metrics: StreamMetrics
 }
 export type Page<T> = { items: T[]; page: number; page_size: number; total: number }
+
+// List queries pass the backend's own parameter names straight through, so
+// the URL state, the fetch, and the API contract stay one vocabulary.
+export type EventListQuery = {
+  node_id?: string
+  event_type?: string
+  stream_id?: string
+  correlation_id?: string
+  page?: number
+  page_size?: number
+}
+export type OperationListQuery = {
+  node_id?: string
+  resource_id?: string
+  operation?: string
+  state?: string
+  correlation_id?: string
+  page?: number
+  page_size?: number
+}
+export type AuditListQuery = { resource_id?: string; page?: number; page_size?: number }
+
+function withQuery(path: string, query: Record<string, string | number | undefined>): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  }
+  const search = params.toString()
+  return search ? `${path}?${search}` : path
+}
 export type SystemHaStatus = {
   enabled: boolean
   role: string
@@ -52,6 +82,23 @@ export type EngineStatus = {
   streams_failed: number
   approval_required?: boolean
 }
+/** Operator actions the control plane can authorize, mirroring the v1 wire
+ * contract (serde snake_case). The echo lists what the caller may do. */
+export type OperatorAction =
+  | 'read'
+  | 'operate'
+  | 'configure'
+  | 'manage_nodes'
+  | 'manage_rollouts'
+  | 'manage_webhooks'
+  | 'approve_rollouts'
+  | 'read_audit'
+
+/** The `/system` identity echo: who is calling, their roles, and the actions
+ * the same enforcement predicate grants them. Absent on older control
+ * planes — the console then stays ungated rather than locking everything. */
+export type PrincipalEcho = { id: string; roles: string[]; actions: OperatorAction[] }
+
 export type SystemResource = {
   id: string
   version: string
@@ -62,6 +109,7 @@ export type SystemResource = {
   active_operations: number
   capabilities: string[]
   ha?: SystemHaStatus
+  principal?: PrincipalEcho | null
 }
 export type NodeMaintenanceState = 'active' | 'draining' | 'maintenance'
 export type ControlNode = {
@@ -332,9 +380,18 @@ export const JOB_DETAIL_INTERVAL_MS = 5_000
 export const ROLLOUT_DETAIL_INTERVAL_MS = 5_000
 export const DEFAULT_PAGE_SIZE = 50
 
+/** True when a mutation was rejected for authorization (403): show the
+ * permission degradation instead of a raw server error, and never retry. */
+export function isPermissionError(cause: unknown): boolean {
+  return (cause as ApiError | null)?.status === 403
+}
+
 export function errorMessage(cause: unknown): string {
   if (typeof cause === 'object' && cause && 'message' in cause) {
     const error = cause as ApiError
+    if (isPermissionError(error)) {
+      return translate(currentLocale(), 'perm.denied', { message: error.message })
+    }
     return `${error.message}${error.correlation_id ? ` (ref ${error.correlation_id})` : ''}`
   }
   return cause instanceof Error ? cause.message : translate(currentLocale(), 'api.controlApiUnavailable')
@@ -465,10 +522,8 @@ export const api = {
     request<ControlNode>(`/nodes/${encodeURIComponent(id)}/maintenance`, { method: 'DELETE' }),
   streams: (nodeId?: string) =>
     request<Page<StreamStatus>>(`/streams${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
-  events: (nodeId?: string) =>
-    request<Page<ControlEvent>>(`/events${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
-  operations: (nodeId?: string) =>
-    request<Page<Operation>>(`/operations${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
+  events: (query: EventListQuery = {}) => request<Page<ControlEvent>>(withQuery('/events', query)),
+  operations: (query: OperationListQuery = {}) => request<Page<Operation>>(withQuery('/operations', query)),
   operation: (id: string) => request<Operation>(`/operations/${encodeURIComponent(id)}`),
   config: (nodeId?: string) =>
     request<Record<string, unknown>>(
@@ -618,8 +673,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ action, ...(configVersion ? { config_version: configVersion } : {}) }),
     }),
-  audit: (resourceId?: string) =>
-    request<Page<AuditRecord>>(`/audit${resourceId ? `?resource_id=${encodeURIComponent(resourceId)}` : ''}`),
+  audit: (query: AuditListQuery = {}) => request<Page<AuditRecord>>(withQuery('/audit', query)),
 }
 
 export function streamEvents(

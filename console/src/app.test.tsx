@@ -198,7 +198,7 @@ describe('console application', () => {
         ok: true,
         json: async () => {
           if (url.endsWith('/system'))
-            return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
+            return { version: 'hub', state: 'running', node_count: 1, capabilities: ['fleet_aggregation'] }
           if (url.includes('/nodes?'))
             return page([
               {
@@ -249,7 +249,7 @@ describe('console application', () => {
         ok: true,
         json: async () => {
           if (url.endsWith('/system'))
-            return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
+            return { version: 'hub', state: 'running', node_count: 1, capabilities: ['fleet_aggregation'] }
           if (url.includes('/nodes?')) return page([])
           if (url.includes('/audit'))
             return {
@@ -283,6 +283,20 @@ describe('console application', () => {
     )
   })
 
+  it('hides Hub-only navigation on a local plane', async () => {
+    render(<App />)
+    await screen.findByText('Fleet health')
+    for (const label of ['Jobs', 'Rollouts', 'Approvals', 'Audit'])
+      expect(screen.queryByText(label, { selector: 'a' })).not.toBeInTheDocument()
+    expect(screen.getByText('Streams', { selector: 'a' })).toBeInTheDocument()
+  })
+
+  it('explains a Hub-only page reached by direct URL on a local plane', async () => {
+    window.history.replaceState(null, '', '/audit')
+    render(<App />)
+    expect(await screen.findByTestId('hub-only-explainer')).toBeInTheDocument()
+  })
+
   it('tracks a Hub lifecycle operation to a terminal state', async () => {
     let operationReads = 0
     fetchMock.mockImplementation((url: string, init?: RequestInit) =>
@@ -290,7 +304,7 @@ describe('console application', () => {
         ok: true,
         json: async () => {
           if (url.endsWith('/system'))
-            return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
+            return { version: 'hub', state: 'running', node_count: 1, capabilities: ['fleet_aggregation'] }
           if (url.includes('/nodes?'))
             return page([
               {
@@ -388,7 +402,12 @@ describe('console application', () => {
       if (url.endsWith('/system'))
         return Promise.resolve({
           ok: true,
-          json: async () => ({ version: 'hub', state: 'running', node_count: 1, capabilities: [] }),
+          json: async () => ({
+            version: 'hub',
+            state: 'running',
+            node_count: 1,
+            capabilities: ['fleet_aggregation'],
+          }),
         })
       if (url.includes('/nodes?'))
         return Promise.resolve({
@@ -471,7 +490,7 @@ describe('console application', () => {
               streams_total: 0,
               streams_running: 0,
               streams_failed: 0,
-              capabilities: [],
+              capabilities: ['fleet_aggregation'],
             }
           if (url.endsWith('/jobs')) return []
           return page([])
@@ -498,7 +517,7 @@ describe('console application', () => {
               streams_total: 0,
               streams_running: 0,
               streams_failed: 0,
-              capabilities: [],
+              capabilities: ['fleet_aggregation'],
             }
           if (url.endsWith('/jobs')) return []
           return page([])

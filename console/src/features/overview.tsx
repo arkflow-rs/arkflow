@@ -10,8 +10,15 @@ import { useEvents, useMetrics, useNodes, useOperations, useStatus, useStreams, 
 import { useConfirm } from './confirm'
 import { Card, EventRow, SkeletonRows, active, number } from './shared'
 
-export function Overview({ onError }: { onError?: (message: string) => void }) {
+export function Overview({
+  onError,
+  canManageNodes = true,
+}: {
+  onError?: (message: string) => void
+  canManageNodes?: boolean
+}) {
   const t = useT()
+  const nodeActionTitle = canManageNodes ? undefined : t('perm.requires', { action: 'manage_nodes' })
   const queryClient = useQueryClient()
   const confirm = useConfirm()
   const [searchParams] = useSearchParams()
@@ -20,8 +27,8 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
   const statusQuery = useStatus()
   const nodesQuery = useNodes()
   const streamsQuery = useStreams(nodeId)
-  const operationsQuery = useOperations(nodeId)
-  const eventsQuery = useEvents(nodeId)
+  const operationsQuery = useOperations({ node_id: nodeId })
+  const eventsQuery = useEvents({ node_id: nodeId })
   const metricsQuery = useMetrics(nodeId)
   const system = systemQuery.data ?? null
   const status = statusQuery.data ?? null
@@ -144,18 +151,36 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
                       </div>
                     )}
                     <div className="actions">
-                      <button onClick={() => setEditingLabels(node)}>{t('overview.labels')}</button>
+                      <button
+                        disabled={!canManageNodes}
+                        title={nodeActionTitle}
+                        onClick={() => setEditingLabels(node)}
+                      >
+                        {t('overview.labels')}
+                      </button>
                       {maintenance === 'active' ? (
                         <>
-                          <button onClick={() => void setMaintenance(node, 'drain')}>
+                          <button
+                            disabled={!canManageNodes}
+                            title={nodeActionTitle}
+                            onClick={() => void setMaintenance(node, 'drain')}
+                          >
                             {t('overview.drain')}
                           </button>
-                          <button onClick={() => void setMaintenance(node, 'maintain')}>
+                          <button
+                            disabled={!canManageNodes}
+                            title={nodeActionTitle}
+                            onClick={() => void setMaintenance(node, 'maintain')}
+                          >
                             {t('overview.maintain')}
                           </button>
                         </>
                       ) : (
-                        <button onClick={() => void setMaintenance(node, 'resume')}>
+                        <button
+                          disabled={!canManageNodes}
+                          title={nodeActionTitle}
+                          onClick={() => void setMaintenance(node, 'resume')}
+                        >
                           {t('overview.resume')}
                         </button>
                       )}

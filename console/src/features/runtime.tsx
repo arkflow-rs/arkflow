@@ -22,8 +22,8 @@ export function Runtime({
   const [searchParams] = useSearchParams()
   const nodeId = searchParams.get('node_id') ?? undefined
   const streamsQuery = useStreams(nodeId)
-  const operationsQuery = useOperations(nodeId)
-  const eventsQuery = useEvents(nodeId)
+  const operationsQuery = useOperations({ node_id: nodeId, page: 1, page_size: 50 })
+  const eventsQuery = useEvents({ node_id: nodeId })
   // While a node-scoped refetch is pending, placeholder rows still belong to
   // the previously selected node — hide them so commands can never be sent
   // against the wrong node.

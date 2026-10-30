@@ -14,7 +14,13 @@ type FormState = {
 
 const EMPTY_FORM: FormState = { id: '', url: '', eventTypes: '', secret: '', enabled: true }
 
-export function Settings() {
+export function Settings({
+  hubMode,
+  canManageWebhooks = true,
+}: {
+  hubMode: boolean | undefined
+  canManageWebhooks?: boolean
+}) {
   const t = useT()
   const status = useStatus().data ?? null
   return (
@@ -40,12 +46,12 @@ export function Settings() {
         </div>
         <p>{t('settings.credentialsNote')}</p>
       </section>
-      <WebhooksPanel />
+      {hubMode !== false && <WebhooksPanel canMutate={canManageWebhooks} />}
     </>
   )
 }
 
-function WebhooksPanel() {
+function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
   const t = useT()
   const webhooks = useWebhooks()
   const queryClient = useQueryClient()
@@ -150,7 +156,12 @@ function WebhooksPanel() {
         </p>
       ) : null}
       <div className="toolbar">
-        <button type="button" onClick={() => setForm({ ...EMPTY_FORM })}>
+        <button
+          type="button"
+          disabled={!canMutate}
+          title={!canMutate ? t('perm.requires', { action: 'manage_webhooks' }) : undefined}
+          onClick={() => setForm({ ...EMPTY_FORM })}
+        >
           {t('settings.webhooks.add')}
         </button>
       </div>

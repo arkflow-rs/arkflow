@@ -7,7 +7,9 @@ import { usePrompt } from './confirm'
 import { useNodes, useRolloutDetail, useRollouts } from '../queries'
 import { useStatus } from '../queries'
 
-export function Rollouts({ onError }: { onError: (message: string) => void }) {
+type RolloutsProps = { onError: (message: string) => void; canMutate?: boolean }
+
+export function Rollouts({ onError, canMutate = true }: RolloutsProps) {
   const t = useT()
   const queryClient = useQueryClient()
   const prompt = usePrompt()
@@ -140,10 +142,12 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
           </select>
           <button
             disabled={
+              !canMutate ||
               busy ||
               !version.trim() ||
               (targetMode === 'nodes' ? targets.length === 0 : !labelSelector.trim())
             }
+            title={!canMutate ? t('perm.requires', { action: 'manage_rollouts' }) : undefined}
             onClick={() => void create()}
           >
             {approvalRequired ? t('rollouts.submitForApproval') : t('rollouts.create')}
@@ -220,6 +224,7 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
       </section>
       {selected && (
         <RolloutDetailPanel
+          canMutate={canMutate}
           detail={selected}
           pollError={pollError}
           audit={audit}
@@ -239,6 +244,7 @@ function RolloutDetailPanel({
   audit,
   setAudit,
   busy,
+  canMutate,
   onAction,
   onClose,
 }: {
@@ -247,17 +253,18 @@ function RolloutDetailPanel({
   audit: AuditRecord[]
   setAudit: (records: AuditRecord[]) => void
   busy: boolean
+  canMutate: boolean
   onAction: (id: string, action: 'pause' | 'resume' | 'cancel' | 'rollback') => void
   onClose: () => void
 }) {
   const t = useT()
   useEffect(() => {
     void api
-      .audit(detail.rollout.rollout_id)
+      .audit({ resource_id: detail.rollout.rollout_id })
       .then((page) => setAudit(page.items))
       .catch(() => setAudit([]))
   }, [detail.rollout.rollout_id, setAudit])
-  const canAct = !['converged', 'cancelled', 'rolled_back'].includes(detail.rollout.state)
+  const canAct = canMutate && !['converged', 'cancelled', 'rolled_back'].includes(detail.rollout.state)
   return (
     <section className="panel detail">
       <div className="panel-title">

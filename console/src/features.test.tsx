@@ -730,9 +730,16 @@ describe('audit history', () => {
     renderWithQueries(<Audit onError={vi.fn()} />)
     expect(await screen.findByText('node.drain')).toBeInTheDocument()
     expect(screen.getByText('job.start')).toBeInTheDocument()
-    fireEvent.change(screen.getByLabelText('Audit filter'), { target: { value: 'node.drain' } })
-    expect(screen.queryByText('job.start')).not.toBeInTheDocument()
-    expect(screen.getByText('node.drain')).toBeInTheDocument()
+    // Filtering is server-side now: typing a resource id re-queries /audit
+    // with the resource_id param instead of hiding rows client-side.
+    const callsBefore = fetchMock.mock.calls.length
+    fireEvent.change(screen.getByLabelText('Resource ID'), { target: { value: 'node-a' } })
+    await waitFor(() => {
+      const auditCall = fetchMock.mock.calls
+        .slice(callsBefore)
+        .find(([url]) => url.includes('/audit') && url.includes('resource_id=node-a'))
+      expect(auditCall).toBeTruthy()
+    })
   })
 
   it('reports load failures through the error channel', async () => {

@@ -51,6 +51,22 @@ pub enum OperatorAction {
     ReadAudit,
 }
 
+impl OperatorAction {
+    /// Every action in the v1 wire contract, in declaration order. The
+    /// `/system` principal echo filters this against `can` so the console's
+    /// gating view stays complete when an action is added later.
+    pub const ALL: [OperatorAction; 8] = [
+        OperatorAction::Read,
+        OperatorAction::Operate,
+        OperatorAction::Configure,
+        OperatorAction::ManageNodes,
+        OperatorAction::ManageRollouts,
+        OperatorAction::ManageWebhooks,
+        OperatorAction::ApproveRollouts,
+        OperatorAction::ReadAudit,
+    ];
+}
+
 impl OperatorPrincipal {
     pub fn legacy_operator() -> Self {
         Self {
@@ -100,6 +116,32 @@ impl OperatorPrincipal {
                     same_resource || node_contains_stream
                 }))
     }
+
+    /// Identity echo for the console: who is calling, their roles, and the
+    /// actions this principal is authorized for. `actions` is derived by
+    /// `can` — the same predicate that enforces mutations — so the echo and
+    /// enforcement cannot diverge.
+    pub fn echo(&self) -> OperatorPrincipalEcho {
+        OperatorPrincipalEcho {
+            id: self.id.clone(),
+            roles: self.roles.clone(),
+            actions: OperatorAction::ALL
+                .iter()
+                .copied()
+                .filter(|action| self.can(*action))
+                .collect(),
+        }
+    }
+}
+
+/// The `principal` field of `/system`. Informational identity only — it
+/// never carries scopes or credential material, and authorizing a mutation
+/// always re-resolves the principal server-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperatorPrincipalEcho {
+    pub id: String,
+    pub roles: Vec<OperatorRole>,
+    pub actions: Vec<OperatorAction>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

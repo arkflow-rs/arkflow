@@ -10,7 +10,9 @@ import { useConfigApprovals } from '../queries'
 /// decided/expired history below. Resubmission of a rejected request
 /// pre-fills the rollouts page state through a URL hand-off (the new
 /// request gets a fresh id; the old record is immutable).
-export function Approvals({ onError }: { onError: (message: string) => void }) {
+type ApprovalsProps = { onError: (message: string) => void; canMutate?: boolean }
+
+export function Approvals({ onError, canMutate = true }: ApprovalsProps) {
   const t = useT()
   const queryClient = useQueryClient()
   const confirm = useConfirm()
@@ -98,17 +100,29 @@ export function Approvals({ onError }: { onError: (message: string) => void }) {
               </small>
               {request.status === 'pending' && (
                 <div className="actions">
-                  <button disabled={busy} onClick={() => void decide(request.request_id, 'approve')}>
+                  <button
+                    disabled={!canMutate || busy}
+                    title={!canMutate ? t('perm.requires', { action: 'approve_rollouts' }) : undefined}
+                    onClick={() => void decide(request.request_id, 'approve')}
+                  >
                     {t('approvals.approve')}
                   </button>
-                  <button disabled={busy} onClick={() => void decide(request.request_id, 'reject')}>
+                  <button
+                    disabled={!canMutate || busy}
+                    title={!canMutate ? t('perm.requires', { action: 'approve_rollouts' }) : undefined}
+                    onClick={() => void decide(request.request_id, 'reject')}
+                  >
                     {t('approvals.reject')}
                   </button>
                 </div>
               )}
               {request.status === 'rejected' && (
                 <div className="actions">
-                  <button disabled={busy} onClick={() => void resubmit(request)}>
+                  <button
+                    disabled={!canMutate || busy}
+                    title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
+                    onClick={() => void resubmit(request)}
+                  >
                     {t('approvals.resubmit')}
                   </button>
                 </div>

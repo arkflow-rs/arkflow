@@ -23,8 +23,8 @@ is served from a reverse proxy next to the Hub — see
 | **Runtime** | Live per-node stream state and convergence, backed by node reports. |
 | **Components** | The component registry browser: every registered kind/type with its config schema and example, mirroring `arkflow components show`. |
 | **Configuration** | Node configuration history, diffs, apply, and rollback. In Hub mode every action is routed through the selected node; drafts are a local-control-plane feature. |
-| **Events** | The fleet event log (same data as `GET /api/v1/events`, with the SSE stream for live updates). |
-| **Audit** | The fleet audit history (`GET /api/v1/audit`): accepted and rejected mutations with actor, target, node, and outcome, plus a text filter over the stored records. |
+| **Events** | The fleet event log (`GET /api/v1/events`, with the SSE stream for live updates), filtered and paginated server-side. |
+| **Audit** | The fleet audit history (`GET /api/v1/audit`): accepted and rejected mutations with actor, target, node, and outcome, filterable by resource and paginated server-side. |
 | **Settings** | Console preferences and connection settings. |
 
 ## Reading the console the way the API works
@@ -81,6 +81,40 @@ current path and carries over when you switch views. Legacy links that used
 the old `?page=` query parameter (for example `/?page=jobs`) redirect
 automatically to the corresponding path and keep the remaining query
 parameters.
+
+Navigation reflects what the connected control plane actually serves. The
+Jobs, Rollouts, Approvals, and Audit views depend on Hub-only APIs; when the
+console is connected to a local engine (`/system` capabilities lack
+`fleet_aggregation`) those entries disappear from the navigation, their
+direct URLs render an explainer naming the Hub requirement instead of an
+error, and Settings hides its webhook management section. While the system
+identity is still loading, the full navigation renders so nothing flashes
+away at startup.
+
+On the Events and Audit views, the filter values and page position live in
+the URL query (`event_type`, `stream_id`, `correlation_id`, `node_id`,
+`resource_id`, `page`, `page_size`): a copied link reproduces the exact
+view, filtering and pagination execute on the server, and changing any
+filter resets to the first page. The page size selector offers 25 / 50 /
+100 rows.
+
+## Identity and role-aware controls
+
+`GET /api/v1/system` echoes the authenticated principal
+(`principal: {id, roles, actions}` on both the Hub and the local plane), and
+the console uses it directly: the header shows who you are (for example
+`ops (operator)`), and every mutating control — stream lifecycle, publish and
+rollback, job actions, rollout creation, approval decisions, node
+maintenance, webhook management — is gated on the echoed action list. A
+principal without the required action sees the control disabled with a
+tooltip naming the missing permission, so a viewer session reads everything
+but changes nothing. The echo comes from the same predicate the server uses
+to authorize mutations; if a mutation is still rejected with 403 (for
+example the role changed mid-session), the console shows a permission error,
+never retries the mutation, and refreshes the identity. Against an older
+control plane that does not echo a principal, the console keeps controls
+enabled and marks the session identity as unknown rather than locking
+everything.
 
 ## When to use the console vs. the API
 

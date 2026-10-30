@@ -401,10 +401,16 @@ pub(super) fn prometheus_label(value: &str) -> String {
         .collect()
 }
 
-pub(super) async fn system(
-    State(cp): State<ControlPlane>,
-) -> Json<arkflow_core::control::SystemResource> {
-    Json(cp.system().await)
+pub(super) async fn system(State(cp): State<ControlPlane>) -> Response {
+    // The standalone plane has one all-powerful operator — the api token
+    // holder, or loopback/insecure_local when no token is configured — and
+    // no role model of its own; the echo says so with the legacy admin
+    // principal instead of fabricating roles the plane cannot enforce.
+    let mut body = serde_json::to_value(cp.system().await).expect("SystemResource serializes");
+    body["principal"] =
+        serde_json::to_value(crate::api_contract::OperatorPrincipal::legacy_operator().echo())
+            .expect("principal echo serializes");
+    Json(body).into_response()
 }
 pub(super) async fn status(
     State(cp): State<ControlPlane>,
