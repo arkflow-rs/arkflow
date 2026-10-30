@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { useConfirm } from './confirm'
 import { formatTime } from '../api'
-import type { ControlEvent, Operation, StreamStatus } from '../api'
+import type { ControlEvent, StreamStatus } from '../api'
 import { useT } from '../i18n'
 import { useEvents, useOperations, useStreams } from '../queries'
 import {
@@ -199,10 +199,10 @@ export function Runtime({
       </section>
       {detail && (
         <RuntimeDetail
+          key={detail.id}
           stream={detail}
           onError={onError}
           canOperate={canOperate}
-          operations={operations.filter((operation) => operation.resource_id === detail.id)}
           events={(events ?? []).filter((event) => event.stream_id === detail.id)}
           onClose={() => setSelected(undefined)}
         />
@@ -275,20 +275,32 @@ export function Runtime({
 
 function RuntimeDetail({
   stream,
-  operations,
   events,
   onClose,
   onError,
   canOperate,
 }: {
   stream: StreamStatus
-  operations: Operation[]
   events: ControlEvent[]
   onClose: () => void
   onError?: (message: string) => void
   canOperate: boolean
 }) {
   const t = useT()
+  // The detail's history is its own stream-scoped query: the global list is
+  // filtered and paginated, so deriving history from it would show "none"
+  // whenever the stream's operations sit on another page or fail a filter.
+  const detailPageSize = 10
+  const [operationPage, setOperationPage] = useState(1)
+  const operationsQuery = useOperations({
+    node_id: stream.node_id,
+    resource_id: stream.id,
+    page: operationPage,
+    page_size: detailPageSize,
+  })
+  const operations = operationsQuery.data?.items ?? []
+  const operationTotal = operationsQuery.data?.total
+  const operationPages = Math.max(1, Math.ceil((operationTotal ?? 0) / detailPageSize))
   return (
     <section className="panel detail">
       <div className="panel-title">
@@ -352,9 +364,12 @@ function RuntimeDetail({
       )}
       <h4>{t('runtime.operationHistory')}</h4>
       {operations.length ? (
-        operations.map((operation) => (
-          <OperationRow operation={operation} onError={onError} canMutate={canOperate} key={operation.id} />
-        ))
+        <>
+          {operations.map((operation) => (
+            <OperationRow operation={operation} onError={onError} canMutate={canOperate} key={operation.id} />
+          ))}
+          <Pagination page={operationPage} pages={operationPages} onChange={setOperationPage} />
+        </>
       ) : (
         <p className="empty">{t('runtime.noOperationHistory')}</p>
       )}

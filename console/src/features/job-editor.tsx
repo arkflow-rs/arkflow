@@ -961,7 +961,8 @@ export function JobEditor({
           <p>{t('editor.upgradeAcceptedDetail', { job: upgraded })}</p>
           <div className="actions">
             <button
-              disabled={busy}
+              disabled={busy || !canMutate}
+              title={!canMutate ? t('perm.requires', { action: 'operate' }) : undefined}
               onClick={() =>
                 void onAction(t('editor.starting'), async () => {
                   await api.setJobState(upgraded, 'running')

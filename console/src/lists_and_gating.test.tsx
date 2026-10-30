@@ -314,6 +314,67 @@ describe('server-side lists and role gating', () => {
     expect(operationsCall).toContain('page_size=25')
   })
 
+  it('fetches operation history for the selected stream independently', async () => {
+    const calls: string[] = []
+    const fetchMock = vi.fn((url: string) => {
+      calls.push(String(url))
+      if (url.includes('/operations?')) {
+        const params = new URLSearchParams(url.slice(url.indexOf('?') + 1))
+        if (params.get('resource_id') === 'orders')
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              items: [
+                {
+                  id: 'op-detail',
+                  operation: 'stream.restart',
+                  resource_id: 'orders',
+                  state: 'succeeded',
+                  progress: 100,
+                  created_at_ms: 1,
+                },
+              ],
+              page: 1,
+              page_size: 10,
+              total: 1,
+            }),
+          })
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 1, page_size: 25, total: 0 }),
+        })
+      }
+      if (url.includes('/streams'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            items: [
+              {
+                id: 'orders',
+                state: 'running',
+                metrics: { input_messages: 0, output_messages: 0 },
+              },
+            ],
+            page: 1,
+            page_size: 50,
+            total: 1,
+          }),
+        })
+      if (url.includes('/events'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 1, page_size: 50, total: 0 }),
+        })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    window.history.replaceState({}, '', '/runtime')
+    renderWithQueries(<Runtime command={async () => {}} />)
+    fireEvent.click(await screen.findByText('orders'))
+    expect(await screen.findByText('stream.restart')).toBeTruthy()
+    expect(calls.some((url) => url.includes('/operations?') && url.includes('resource_id=orders'))).toBe(true)
+  })
+
   it('disables operation cancellation without operate', () => {
     renderWithQueries(
       <OperationRow
