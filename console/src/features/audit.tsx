@@ -3,9 +3,7 @@ import { useSearchParams } from 'react-router'
 import { type AuditRecord, errorMessage, formatTime } from '../api'
 import { useAudit } from '../queries'
 import { useT } from '../i18n'
-import { Pagination, SkeletonRows } from './shared'
-
-const PAGE_SIZES = [25, 50, 100]
+import { PAGE_SIZES, Pagination, SkeletonRows, pageSizeParam } from './shared'
 
 export function Audit({ onError }: { onError: (message: string) => void }) {
   const t = useT()
@@ -14,7 +12,7 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
   const [searchParams, setSearchParams] = useSearchParams()
   const resourceId = searchParams.get('resource_id') ?? undefined
   const page = Math.max(1, Number(searchParams.get('page') ?? '1') || 1)
-  const pageSize = Number(searchParams.get('page_size') ?? '50') || 50
+  const pageSize = pageSizeParam(searchParams)
   const auditQuery = useAudit({ resource_id: resourceId, page, page_size: pageSize })
   const records = auditQuery.data?.items ?? []
   const total = auditQuery.data?.total

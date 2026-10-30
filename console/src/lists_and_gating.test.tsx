@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter } from 'react-router'
@@ -56,6 +56,49 @@ describe('server-side lists and role gating', () => {
     expect(await screen.findByText('stream_changed')).toBeTruthy()
     expect(screen.getByText('Page 2 of 2')).toBeTruthy()
     expect(window.location.search).toContain('event_type=stream_changed')
+  })
+
+  it('normalizes an out-of-range page size onto a supported size', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/events?')) {
+        const params = new URLSearchParams(url.slice(url.indexOf('?') + 1))
+        // The server clamps page_size to 1..=100: asking for 200 would return
+        // 100 rows while the page count below assumed 200.
+        expect(params.get('page_size')).toBe('100')
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 2, page_size: 100, total: 150 }),
+        })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    window.history.replaceState({}, '', '/events?page=2&page_size=200')
+    renderWithQueries(<Events />)
+    expect(await screen.findByText('Page 2 of 2')).toBeTruthy()
+  })
+
+  it('clears event filters without dropping the selected node', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/events?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 1, page_size: 50, total: 0 }),
+        })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    window.history.replaceState(
+      {},
+      '',
+      '/events?node_id=node-a&event_type=stream_changed&page=2&page_size=50',
+    )
+    renderWithQueries(<Events />)
+    fireEvent.click(await screen.findByText('Clear filters'))
+    await waitFor(() => expect(window.location.search).not.toContain('event_type'))
+    expect(window.location.search).toContain('node_id=node-a')
+    expect(window.location.search).not.toContain('page=')
+    expect(window.location.search).toContain('page_size=50')
   })
 
   it('audits with server-side resource filtering instead of a client text filter', async () => {
@@ -134,6 +177,88 @@ describe('server-side lists and role gating', () => {
     renderWithQueries(<Settings hubMode={true} canManageWebhooks={false} />)
     const add = await screen.findByText('Add subscription')
     expect((add as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('disables webhook row actions without manage_webhooks', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/webhooks'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            subscriptions: [
+              {
+                id: 'hook-1',
+                url: 'https://example.com/hook',
+                event_types: ['rollout'],
+                enabled: true,
+                created_by: 'ops',
+                created_at_ms: 1,
+                has_secret: false,
+              },
+            ],
+          }),
+        })
+      if (url.endsWith('/status'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ version: 'v', state: 'running', uptime_seconds: 1 }),
+        })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { Settings } = await import('./features/settings')
+    renderWithQueries(<Settings hubMode={true} canManageWebhooks={false} />)
+    for (const label of ['Test', 'Pause', 'Edit']) {
+      const button = await screen.findByText(label)
+      expect((button as HTMLButtonElement).disabled).toBe(true)
+      expect(button.getAttribute('title')).toContain('manage_webhooks')
+    }
+  })
+
+  it('keeps rollout actions visible but disabled without manage_rollouts', async () => {
+    const rollout = {
+      rollout_id: 'r-1',
+      config_version_id: 'v1',
+      state: 'running',
+      batch_size: 1,
+      current_batch: 0,
+      total_targets: 1,
+      created_at_ms: 1,
+      updated_at_ms: 1,
+    }
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => [rollout] })
+      if (url.includes('/rollouts/r-1'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ rollout, targets: [{ node_id: 'node-a', state: 'applying' }] }),
+        })
+      if (url.includes('/audit?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 1, page_size: 50, total: 0 }),
+        })
+      if (url.includes('/nodes?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 1, page_size: 50, total: 0 }),
+        })
+      if (url.endsWith('/status'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ version: 'v', state: 'running', uptime_seconds: 1 }),
+        })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { Rollouts } = await import('./features/rollouts')
+    renderWithQueries(<Rollouts onError={() => {}} canMutate={false} />)
+    fireEvent.click(await screen.findByText('r-1'))
+    for (const label of ['Pause', 'Cancel', 'Rollback']) {
+      const button = await screen.findByText(label)
+      expect((button as HTMLButtonElement).disabled).toBe(true)
+      expect(button.getAttribute('title')).toContain('manage_rollouts')
+    }
   })
 
   it('gates approval resubmission on configure instead of approve_rollouts', async () => {

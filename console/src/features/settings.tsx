@@ -118,6 +118,7 @@ function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
               <WebhookRow
                 key={subscription.id}
                 subscription={subscription}
+                canMutate={canMutate}
                 onEdit={() =>
                   setForm({
                     id: subscription.id,
@@ -219,16 +220,19 @@ function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
 
 function WebhookRow({
   subscription,
+  canMutate,
   onEdit,
   onToggle,
   onTest,
 }: {
   subscription: WebhookSubscription
+  canMutate: boolean
   onEdit: () => void
   onToggle: () => void
   onTest: () => void
 }) {
   const t = useT()
+  const gatedTitle = !canMutate ? t('perm.requires', { action: 'manage_webhooks' }) : undefined
   return (
     <tr>
       <td>
@@ -242,13 +246,13 @@ function WebhookRow({
       <td>{subscription.enabled ? t('settings.webhooks.enabled') : t('settings.webhooks.paused')}</td>
       <td>
         <div className="toolbar">
-          <button type="button" onClick={onTest}>
+          <button type="button" disabled={!canMutate} title={gatedTitle} onClick={onTest}>
             {t('settings.webhooks.test')}
           </button>
-          <button type="button" onClick={onToggle}>
+          <button type="button" disabled={!canMutate} title={gatedTitle} onClick={onToggle}>
             {subscription.enabled ? t('settings.webhooks.pause') : t('settings.webhooks.enable')}
           </button>
-          <button type="button" onClick={onEdit}>
+          <button type="button" disabled={!canMutate} title={gatedTitle} onClick={onEdit}>
             {t('settings.webhooks.edit')}
           </button>
         </div>

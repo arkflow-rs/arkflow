@@ -265,7 +265,11 @@ function RolloutDetailPanel({
       .then((page) => setAudit(page.items))
       .catch(() => setAudit([]))
   }, [detail.rollout.rollout_id, setAudit])
-  const canAct = canMutate && !['converged', 'cancelled', 'rolled_back'].includes(detail.rollout.state)
+  // Role gating disables actions; it never hides them (control-plane-console
+  // spec: unauthorized entries stay visible with their permission named).
+  // Only a terminal rollout has no actions to show at all.
+  const terminal = ['converged', 'cancelled', 'rolled_back'].includes(detail.rollout.state)
+  const gatedTitle = !canMutate ? t('perm.requires', { action: 'manage_rollouts' }) : undefined
   return (
     <section className="panel detail">
       <div className="panel-title">
@@ -275,9 +279,10 @@ function RolloutDetailPanel({
         </div>
         <div className="actions">
           <button onClick={onClose}>{t('rollouts.close')}</button>
-          {canAct && (
+          {!terminal && (
             <button
-              disabled={busy}
+              disabled={!canMutate || busy}
+              title={gatedTitle}
               onClick={() =>
                 onAction(detail.rollout.rollout_id, detail.rollout.state === 'paused' ? 'resume' : 'pause')
               }
@@ -285,13 +290,21 @@ function RolloutDetailPanel({
               {detail.rollout.state === 'paused' ? t('rollouts.resume') : t('rollouts.pause')}
             </button>
           )}
-          {canAct && (
-            <button disabled={busy} onClick={() => onAction(detail.rollout.rollout_id, 'cancel')}>
+          {!terminal && (
+            <button
+              disabled={!canMutate || busy}
+              title={gatedTitle}
+              onClick={() => onAction(detail.rollout.rollout_id, 'cancel')}
+            >
               {t('rollouts.cancel')}
             </button>
           )}
-          {canAct && (
-            <button disabled={busy} onClick={() => onAction(detail.rollout.rollout_id, 'rollback')}>
+          {!terminal && (
+            <button
+              disabled={!canMutate || busy}
+              title={gatedTitle}
+              onClick={() => onAction(detail.rollout.rollout_id, 'rollback')}
+            >
               {t('rollouts.rollback')}
             </button>
           )}

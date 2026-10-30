@@ -74,6 +74,20 @@ export function EventRow({ event }: { event: ControlEvent }) {
     </div>
   )
 }
+/** Page sizes the server accepts and the selects render: the Hub clamps
+ * `page_size` to 1..=100, so an arbitrary URL value must be snapped onto
+ * one of these or the page count and the returned rows diverge. */
+export const PAGE_SIZES = [25, 50, 100]
+
+/** The page size a list should request and paginate by: a URL-supplied
+ * value outside the supported set is snapped to the nearest supported size
+ * (missing/invalid values fall back to 50). */
+export function pageSizeParam(searchParams: URLSearchParams): number {
+  const requested = Number(searchParams.get('page_size')) || 50
+  return PAGE_SIZES.reduce((closest, size) =>
+    Math.abs(size - requested) < Math.abs(closest - requested) ? size : closest,
+  )
+}
 export function Pagination({
   page,
   pages,

@@ -170,6 +170,9 @@ function ConsoleShell() {
     const next = new URLSearchParams(searchParams)
     if (value) next.set('node_id', value)
     else next.delete('node_id')
+    // A page number valid for the previous node can be past the end of the
+    // new node's list: restart pagination with the node change.
+    next.delete('page')
     setSearchParams(next)
   }
 

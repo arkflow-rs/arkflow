@@ -1,9 +1,7 @@
 import { useSearchParams } from 'react-router'
 import { useT } from '../i18n'
 import { useEvents } from '../queries'
-import { EventRow, Pagination, SkeletonRows } from './shared'
-
-const PAGE_SIZES = [25, 50, 100]
+import { EventRow, PAGE_SIZES, Pagination, SkeletonRows, pageSizeParam } from './shared'
 
 export function Events() {
   const t = useT()
@@ -15,7 +13,7 @@ export function Events() {
   const streamId = searchParams.get('stream_id') ?? undefined
   const correlationId = searchParams.get('correlation_id') ?? undefined
   const page = Math.max(1, Number(searchParams.get('page') ?? '1') || 1)
-  const pageSize = Number(searchParams.get('page_size') ?? '50') || 50
+  const pageSize = pageSizeParam(searchParams)
 
   const eventsQuery = useEvents({
     node_id: nodeId,
@@ -87,7 +85,20 @@ export function Events() {
         <p className="empty">
           {t('events.noMatches')}
           {hasFilter && (
-            <button onClick={() => setSearchParams(new URLSearchParams())}>{t('common.clearFilters')}</button>
+            <button
+              onClick={() => {
+                // Clear the event filters only: node_id is header state that
+                // also scopes this page, and page_size is a view preference.
+                const next = new URLSearchParams(searchParams)
+                next.delete('event_type')
+                next.delete('stream_id')
+                next.delete('correlation_id')
+                next.delete('page')
+                setSearchParams(next)
+              }}
+            >
+              {t('common.clearFilters')}
+            </button>
           )}
         </p>
       )}

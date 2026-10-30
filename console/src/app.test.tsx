@@ -563,6 +563,18 @@ describe('console application', () => {
     await waitFor(() => expect(scopedCalls()).toBeGreaterThan(0))
   })
 
+  it('restarts list pagination when the node filter changes', async () => {
+    window.history.replaceState(null, '', '/events?page=2')
+    render(<App />)
+    await waitFor(() => {
+      const select = screen.getByLabelText('Compute node') as HTMLSelectElement
+      expect([...select.options].some((option) => option.value === 'local-node')).toBe(true)
+    })
+    fireEvent.change(screen.getByLabelText('Compute node'), { target: { value: 'local-node' } })
+    await waitFor(() => expect(window.location.search).toContain('node_id=local-node'))
+    expect(window.location.search).not.toContain('page=')
+  })
+
   it('keeps the last snapshot visible behind the stale banner when the API fails', async () => {
     render(<App />)
     await screen.findByText('Fleet health')
