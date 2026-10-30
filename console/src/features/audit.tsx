@@ -16,7 +16,7 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
   const page = Math.max(1, Number(searchParams.get('page') ?? '1') || 1)
   const pageSize = Number(searchParams.get('page_size') ?? '50') || 50
   const auditQuery = useAudit({ resource_id: resourceId, page, page_size: pageSize })
-  const records = auditQuery.isPlaceholderData ? [] : (auditQuery.data?.items ?? [])
+  const records = auditQuery.data?.items ?? []
   const total = auditQuery.data?.total
   const pages = Math.max(1, Math.ceil((total ?? 0) / pageSize))
 
@@ -57,7 +57,9 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
           <span>{total !== undefined ? t('list.total', { count: total }) : ''}</span>
         </div>
       </div>
-      {auditQuery.isPending ? (
+      {/* Page transitions keep the previous payload (keepPreviousData):
+          render skeleton rows instead of flashing the empty state. */}
+      {auditQuery.isPending || auditQuery.isPlaceholderData ? (
         <SkeletonRows rows={5} />
       ) : records.length ? (
         records.map((record) => <AuditRow key={record.event_id} record={record} />)

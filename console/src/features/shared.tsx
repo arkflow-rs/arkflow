@@ -1,7 +1,8 @@
 import { useQueryClient } from '@tanstack/react-query'
-import { api, errorMessage, formatTime } from '../api'
+import { api, formatTime } from '../api'
 import type { ControlEvent, Operation } from '../api'
 import { currentLocale, intlLocale, useT } from '../i18n'
+import { useMutationFailure } from '../queries'
 
 export const number = (value: number | undefined) =>
   value === undefined ? '—' : new Intl.NumberFormat(intlLocale(currentLocale())).format(value)
@@ -17,6 +18,7 @@ export function OperationRow({
 }) {
   const t = useT()
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   return (
     <div className="operation-row">
       <div>
@@ -44,7 +46,7 @@ export function OperationRow({
               void api
                 .cancel(operation.id)
                 .then(() => queryClient.invalidateQueries({ queryKey: ['live', 'operations'] }))
-                .catch((cause) => onError?.(errorMessage(cause)))
+                .catch((cause) => reportMutationFailure(onError, cause))
             }
           >
             {t('common.cancel')}

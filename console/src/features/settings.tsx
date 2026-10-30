@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useT } from '../i18n'
-import { useStatus, useWebhooks } from '../queries'
+import { useMutationFailure, useStatus, useWebhooks } from '../queries'
 import { api, SNAPSHOT_INTERVAL_MS, WebhookSubscription } from '../api'
 
 type FormState = {
@@ -55,6 +55,9 @@ function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
   const t = useT()
   const webhooks = useWebhooks()
   const queryClient = useQueryClient()
+  // Webhook mutations render their own error strings; the shared failure
+  // path still applies for the 403 identity refresh.
+  const reportMutationFailure = useMutationFailure()
   const [form, setForm] = useState<FormState | null>(null)
 
   const subscriptions = webhooks.data?.subscriptions ?? []
@@ -62,10 +65,12 @@ function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
   const replace = useMutation({
     mutationFn: api.replaceWebhooks,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['webhooks'] }),
+    onError: (cause) => reportMutationFailure(undefined, cause),
   })
 
   const runTest = useMutation({
     mutationFn: (id: string) => api.testWebhook(id),
+    onError: (cause) => reportMutationFailure(undefined, cause),
   })
 
   if (webhooks.isError) {

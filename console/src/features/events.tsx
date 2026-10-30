@@ -25,7 +25,7 @@ export function Events() {
     page,
     page_size: pageSize,
   })
-  const events = eventsQuery.isPlaceholderData ? [] : (eventsQuery.data?.items ?? [])
+  const events = eventsQuery.data?.items ?? []
   const total = eventsQuery.data?.total
   const pages = Math.max(1, Math.ceil((total ?? 0) / pageSize))
   const hasFilter = Boolean(eventType || streamId || correlationId)
@@ -75,7 +75,9 @@ export function Events() {
           <span>{total !== undefined ? t('list.total', { count: total }) : ''}</span>
         </div>
       </div>
-      {eventsQuery.isPending ? (
+      {/* Page transitions keep the previous payload (keepPreviousData):
+          render skeleton rows instead of flashing the empty state. */}
+      {eventsQuery.isPending || eventsQuery.isPlaceholderData ? (
         <SkeletonRows rows={5} />
       ) : events.length ? (
         events.map((event, index) => (
@@ -83,7 +85,7 @@ export function Events() {
         ))
       ) : (
         <p className="empty">
-          {hasFilter ? t('events.noMatches') : t('events.noMatches')}
+          {t('events.noMatches')}
           {hasFilter && (
             <button onClick={() => setSearchParams(new URLSearchParams())}>{t('common.clearFilters')}</button>
           )}

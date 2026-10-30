@@ -3,10 +3,19 @@ import { useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { api, errorMessage, formatTime } from '../api'
+import { api, formatTime } from '../api'
 import type { ControlNode } from '../api'
 import { useT } from '../i18n'
-import { useEvents, useMetrics, useNodes, useOperations, useStatus, useStreams, useSystem } from '../queries'
+import {
+  useEvents,
+  useMetrics,
+  useMutationFailure,
+  useNodes,
+  useOperations,
+  useStatus,
+  useStreams,
+  useSystem,
+} from '../queries'
 import { useConfirm } from './confirm'
 import { Card, EventRow, SkeletonRows, active, number } from './shared'
 
@@ -20,6 +29,7 @@ export function Overview({
   const t = useT()
   const nodeActionTitle = canManageNodes ? undefined : t('perm.requires', { action: 'manage_nodes' })
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   const confirm = useConfirm()
   const [searchParams] = useSearchParams()
   const nodeId = searchParams.get('node_id') ?? undefined
@@ -58,7 +68,7 @@ export function Overview({
         void queryClient.invalidateQueries({ queryKey: ['live', 'nodes'] })
         toast.success(t('toast.accepted'))
       })
-      .catch((cause) => onError?.(errorMessage(cause)))
+      .catch((cause) => reportMutationFailure(onError, cause))
   }
   const [editingLabels, setEditingLabels] = useState<ControlNode | null>(null)
   const running = streams.filter((stream) => stream.state === 'running').length
@@ -257,6 +267,7 @@ function LabelsEditor({
   onError: (message: string) => void
 }) {
   const t = useT()
+  const reportMutationFailure = useMutationFailure()
   const [draft, setDraft] = useState(
     Object.entries(node.labels ?? {})
       .map(([key, value]) => `${key}=${value}`)
@@ -284,7 +295,7 @@ function LabelsEditor({
       onSaved()
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   return (

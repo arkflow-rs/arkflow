@@ -40,10 +40,12 @@ request:
 ```
 
 `actions` is derived from the same predicate that enforces mutations — the
-echo cannot claim an action the enforcing check would deny. Unauthenticated
-requests echo `principal: null`, and the local standalone plane always echoes
-its single all-powerful operator as `operator (admin)`. The field is
-additive: consumers that do not know it ignore it without behavior change.
+echo cannot claim an action the enforcing check would deny. Requests without
+valid credentials are rejected (401) before any identity is echoed;
+`principal: null` is a defensive shape for a response produced without a
+resolvable principal. The local standalone plane always echoes its single
+all-powerful operator as `operator (admin)`. The field is additive: consumers
+that do not know it ignore it without behavior change.
 
 ### Resource model
 

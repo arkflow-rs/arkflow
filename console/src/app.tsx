@@ -15,14 +15,13 @@ import { Toaster } from 'sonner'
 import {
   api,
   errorMessage,
-  isPermissionError,
   oidcLogout,
   oidcStatus,
   REFRESH_DEBOUNCE_MS,
   streamEvents,
   waitForOperation,
 } from './api'
-import { useNodes, useLiveError } from './queries'
+import { useNodes, useLiveError, useMutationFailure } from './queries'
 import { useHubMode, usePermissions } from './permissions'
 import type { ApiError } from './api'
 import { Overview } from './features/overview'
@@ -149,7 +148,8 @@ function ConsoleShell() {
   const queryError = nodesQuery.isError ? nodesQuery.error : liveError
 
   const selectedNodeState = nodes.find((node) => node.id === selectedNode)
-  const { principal, can, identityKnown } = usePermissions()
+  const { principal, can } = usePermissions()
+  const reportMutationFailure = useMutationFailure()
   const nodeReachable =
     !selectedNodeState || selectedNodeState.state === 'online' || selectedNodeState.state === 'running'
   // Lifecycle controls need the node reachable AND the operate action; the
@@ -162,12 +162,7 @@ function ConsoleShell() {
       await waitForOperation(operation.id)
       await queryClient.invalidateQueries({ queryKey: ['live'] })
     } catch (cause) {
-      setError(errorMessage(cause))
-      // A 403 despite an enabled control means the echoed actions went stale
-      // (role changed mid-session); refresh the identity, never auto-retry.
-      if (isPermissionError(cause)) {
-        await queryClient.invalidateQueries({ queryKey: ['live', 'system'] })
-      }
+      reportMutationFailure(setError, cause)
     }
   }
 
@@ -254,9 +249,7 @@ function ConsoleShell() {
             >
               {principal
                 ? t('perm.signedInAs', { id: principal.id, roles: principal.roles.join(', ') })
-                : identityKnown
-                  ? ''
-                  : t('perm.identityUnknown')}
+                : t('perm.identityUnknown')}
             </span>
             {oidcAuthenticated && (
               <button
@@ -342,7 +335,13 @@ function ConsoleShell() {
           />
           <Route
             path="/approvals"
-            element={hubOnly(<Approvals onError={setError} canMutate={can('approve_rollouts')} />)}
+            element={hubOnly(
+              <Approvals
+                onError={setError}
+                canMutate={can('approve_rollouts')}
+                canConfigure={can('configure')}
+              />,
+            )}
           />
           <Route path="/components" element={<Components onError={setError} />} />
           <Route path="/events" element={<Events />} />

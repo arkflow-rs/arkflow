@@ -4,7 +4,7 @@ import { toast } from 'sonner'
 import { api, AuditRecord, errorMessage, formatTime, RolloutDetail } from '../api'
 import { useT } from '../i18n'
 import { usePrompt } from './confirm'
-import { useNodes, useRolloutDetail, useRollouts } from '../queries'
+import { useNodes, useMutationFailure, useRolloutDetail, useRollouts } from '../queries'
 import { useStatus } from '../queries'
 
 type RolloutsProps = { onError: (message: string) => void; canMutate?: boolean }
@@ -12,6 +12,7 @@ type RolloutsProps = { onError: (message: string) => void; canMutate?: boolean }
 export function Rollouts({ onError, canMutate = true }: RolloutsProps) {
   const t = useT()
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   const prompt = usePrompt()
   const nodes = useNodes().data?.items ?? []
   const rollouts = useRollouts().data ?? []
@@ -69,7 +70,7 @@ export function Rollouts({ onError, canMutate = true }: RolloutsProps) {
         void queryClient.invalidateQueries({ queryKey: ['live', 'config-approvals'] })
       } catch (cause) {
         setBusy(false)
-        onError(errorMessage(cause))
+        reportMutationFailure(onError, cause)
       }
       return
     }
@@ -90,7 +91,7 @@ export function Rollouts({ onError, canMutate = true }: RolloutsProps) {
       void queryClient.invalidateQueries({ queryKey: ['live', 'config-approvals'] })
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   const action = async (id: string, operation: 'pause' | 'resume' | 'cancel' | 'rollback') => {
@@ -112,7 +113,7 @@ export function Rollouts({ onError, canMutate = true }: RolloutsProps) {
       toast.success(t('toast.accepted'))
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   return (

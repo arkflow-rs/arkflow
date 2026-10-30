@@ -135,4 +135,31 @@ describe('server-side lists and role gating', () => {
     const add = await screen.findByText('Add subscription')
     expect((add as HTMLButtonElement).disabled).toBe(true)
   })
+
+  it('gates approval resubmission on configure instead of approve_rollouts', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/config-approvals'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => [
+            {
+              request_id: 'approval-r',
+              requester_id: 'ops',
+              config_version_id: 'v1',
+              targets: ['node-a'],
+              batch_size: 1,
+              status: 'rejected',
+              created_at_ms: 1,
+            },
+          ],
+        })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    // canMutate (approve_rollouts) is held, but resubmission is a
+    // configuration submission: it must gate on configure alone.
+    renderWithQueries(<Approvals onError={() => {}} canMutate={true} canConfigure={false} />)
+    const resubmit = await screen.findByText('Resubmit')
+    expect((resubmit as HTMLButtonElement).disabled).toBe(true)
+  })
 })

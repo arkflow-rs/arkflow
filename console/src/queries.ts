@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   api,
+  errorMessage,
+  isPermissionError,
   type AuditListQuery,
   type EventListQuery,
   type OperationListQuery,
@@ -35,6 +37,26 @@ export function useLiveError(): Error | null {
     return cache.subscribe(recompute)
   }, [queryClient])
   return error
+}
+
+// Shared mutation failure path: report the message, and on a 403 despite an
+// enabled control refresh the echoed identity — the action list went stale
+// (role changed mid-session), and role gating must recover without a manual
+// reload. The mutation itself is never retried.
+export function useMutationFailure(): (
+  onError: ((message: string) => void) | undefined,
+  cause: unknown,
+) => void {
+  const queryClient = useQueryClient()
+  return useCallback(
+    (onError, cause) => {
+      if (isPermissionError(cause)) {
+        void queryClient.invalidateQueries({ queryKey: ['live', 'system'] })
+      }
+      onError?.(errorMessage(cause))
+    },
+    [queryClient],
+  )
 }
 
 // Live resources refetch on the snapshot cadence and keep the previous payload

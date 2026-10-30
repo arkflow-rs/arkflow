@@ -5,7 +5,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { api, errorMessage, formatTime, resolveDiff, resolveValidation, waitForOperation } from '../api'
 import type { ConfigCandidate, ConfigDiff, ConfigIssue } from '../api'
 import { useT } from '../i18n'
-import { useSystem } from '../queries'
+import { useMutationFailure, useSystem } from '../queries'
 import { useConfirm } from './confirm'
 
 export function convertConfiguration(
@@ -32,6 +32,7 @@ export function Configuration({
 }) {
   const t = useT()
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   const confirm = useConfirm()
   // Hub deployments manage configuration per node; there is no fleet-wide
   // draft or active config to load until a node is selected. The mode stays
@@ -125,7 +126,7 @@ export function Configuration({
       return true
     } catch (cause) {
       setBusy('')
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
       return false
     }
   }

@@ -13,8 +13,6 @@ export type Permissions = {
    * echo is absent: an older control plane cannot be asked for roles, and
    * locking every button would be worse than showing them. */
   can: (action: OperatorAction) => boolean
-  /** False until `/system` resolves — the identity is unknown, not denied. */
-  identityKnown: boolean
 }
 
 export function usePermissions(): Permissions {
@@ -22,7 +20,7 @@ export function usePermissions(): Permissions {
   const principal = system.data?.principal ?? null
   const actions = principal?.actions
   const can = useCallback((action: OperatorAction) => (actions ? actions.includes(action) : true), [actions])
-  return { principal, can, identityKnown: system.isSuccess && principal != null }
+  return { principal, can }
 }
 
 /** `true` when connected to a Hub, `false` on a local plane, and

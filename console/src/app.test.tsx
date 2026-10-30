@@ -391,6 +391,7 @@ describe('console application', () => {
   })
 
   it('shows a permission failure without retrying the mutation', async () => {
+    let systemReads = 0
     fetchMock.mockImplementation((url: string, init?: RequestInit) => {
       if (init?.method === 'POST' && url.includes('/nodes/node-a/streams/orders/start'))
         return Promise.resolve({
@@ -399,7 +400,8 @@ describe('console application', () => {
           headers: new Headers(),
           json: async () => ({ code: 'forbidden', message: 'Operator is not authorized' }),
         })
-      if (url.endsWith('/system'))
+      if (url.endsWith('/system')) {
+        systemReads += 1
         return Promise.resolve({
           ok: true,
           json: async () => ({
@@ -409,6 +411,7 @@ describe('console application', () => {
             capabilities: ['fleet_aggregation'],
           }),
         })
+      }
       if (url.includes('/nodes?'))
         return Promise.resolve({
           ok: true,
@@ -454,6 +457,9 @@ describe('console application', () => {
     expect(
       fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/start') && init?.method === 'POST'),
     ).toHaveLength(1)
+    // The 403 also refreshes the echoed identity, so stale role gating
+    // recovers without a manual reload (control-plane-console spec).
+    await waitFor(() => expect(systemReads).toBeGreaterThanOrEqual(2))
   })
 
   it('switches the interface language and persists the choice', async () => {

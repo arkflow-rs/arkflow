@@ -1,20 +1,25 @@
 import { useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { api, ConfigApproval, errorMessage, formatTime } from '../api'
+import { api, ConfigApproval, formatTime } from '../api'
 import { useT } from '../i18n'
 import { useConfirm, usePrompt } from './confirm'
-import { useConfigApprovals } from '../queries'
+import { useConfigApprovals, useMutationFailure } from '../queries'
 
 /// The approval queue: pending requests first with approve/reject actions,
 /// decided/expired history below. Resubmission of a rejected request
 /// pre-fills the rollouts page state through a URL hand-off (the new
 /// request gets a fresh id; the old record is immutable).
-type ApprovalsProps = { onError: (message: string) => void; canMutate?: boolean }
+type ApprovalsProps = {
+  onError: (message: string) => void
+  canMutate?: boolean
+  canConfigure?: boolean
+}
 
-export function Approvals({ onError, canMutate = true }: ApprovalsProps) {
+export function Approvals({ onError, canMutate = true, canConfigure = true }: ApprovalsProps) {
   const t = useT()
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   const confirm = useConfirm()
   const prompt = usePrompt()
   const pending = useConfigApprovals('pending').data ?? []
@@ -55,7 +60,7 @@ export function Approvals({ onError, canMutate = true }: ApprovalsProps) {
       toast.success(t('toast.accepted'))
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   const resubmit = async (request: ConfigApproval) => {
@@ -67,7 +72,7 @@ export function Approvals({ onError, canMutate = true }: ApprovalsProps) {
       toast.success(t('approvals.submitted'))
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   return (
@@ -119,8 +124,8 @@ export function Approvals({ onError, canMutate = true }: ApprovalsProps) {
               {request.status === 'rejected' && (
                 <div className="actions">
                   <button
-                    disabled={!canMutate || busy}
-                    title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
+                    disabled={!canConfigure || busy}
+                    title={!canConfigure ? t('perm.requires', { action: 'configure' }) : undefined}
                     onClick={() => void resubmit(request)}
                   >
                     {t('approvals.resubmit')}
