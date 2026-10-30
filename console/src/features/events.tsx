@@ -33,7 +33,9 @@ export function Events() {
     if (value) next.set(key, value)
     else next.delete(key)
     if (key !== 'page') next.delete('page') // any filter change restarts at page 1
-    setSearchParams(next, { replace: true })
+    // Page changes stack in history so Back returns to the previous page;
+    // filter typing replaces instead of flooding the history.
+    setSearchParams(next, { replace: key !== 'page' })
   }
 
   return (

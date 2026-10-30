@@ -179,6 +179,7 @@ function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
       {form ? (
         <WebhookForm
           form={form}
+          canMutate={canMutate}
           hasSecret={subscriptions.some((entry) => entry.id === form.id && entry.has_secret)}
           onChange={setForm}
           onCancel={() => setForm(null)}
@@ -263,12 +264,14 @@ function WebhookRow({
 
 function WebhookForm({
   form,
+  canMutate,
   hasSecret,
   onChange,
   onCancel,
   onSubmit,
 }: {
   form: FormState
+  canMutate: boolean
   hasSecret: boolean
   onChange: (next: FormState) => void
   onCancel: () => void
@@ -325,7 +328,13 @@ function WebhookForm({
         <span>{t('settings.webhooks.enabled')}</span>
       </label>
       <div className="toolbar">
-        <button type="submit">{t('settings.webhooks.save')}</button>
+        <button
+          type="submit"
+          disabled={!canMutate}
+          title={!canMutate ? t('perm.requires', { action: 'manage_webhooks' }) : undefined}
+        >
+          {t('settings.webhooks.save')}
+        </button>
         <button type="button" onClick={onCancel}>
           {t('common.cancel')}
         </button>

@@ -234,6 +234,7 @@ type Props = {
   savepoint?: JobCheckpoint
   nodes: ControlNode[]
   busy: boolean
+  canMutate?: boolean
   onClose: () => void
   onError: (message: string) => void
   onSaved: () => void
@@ -246,6 +247,7 @@ export function JobEditor({
   savepoint,
   nodes,
   busy,
+  canMutate = true,
   onClose,
   onError,
   onSaved,
@@ -504,10 +506,18 @@ export function JobEditor({
         </div>
         <div className="actions">
           <button onClick={onClose}>{t('editor.cancel')}</button>
-          <button disabled={busy} onClick={() => void validate()}>
+          <button
+            disabled={busy || !canMutate}
+            title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
+            onClick={() => void validate()}
+          >
             {t('editor.validatePlan')}
           </button>
-          <button disabled={busy || !validation?.valid} onClick={() => void submit()}>
+          <button
+            disabled={busy || !validation?.valid || !canMutate}
+            title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
+            onClick={() => void submit()}
+          >
             {mode === 'create' ? t('editor.createStopped') : t('editor.submitUpgrade')}
           </button>
         </div>

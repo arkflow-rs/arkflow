@@ -333,6 +333,57 @@ describe('server-side lists and role gating', () => {
     expect(cancel.getAttribute('title')).toContain('operate')
   })
 
+  it('pushes a history entry when paging events', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/events?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 1, page_size: 50, total: 150 }),
+        })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    window.history.replaceState({}, '', '/events')
+    const push = vi.spyOn(window.history, 'pushState')
+    renderWithQueries(<Events />)
+    fireEvent.click(await screen.findByText('Next'))
+    await waitFor(() => expect(push).toHaveBeenCalled())
+    push.mockRestore()
+  })
+
+  it('disables the open webhook form when manage_webhooks is revoked', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/webhooks'))
+        return Promise.resolve({ ok: true, json: async () => ({ subscriptions: [] }) })
+      if (url.endsWith('/status'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ version: 'v', state: 'running', uptime_seconds: 1 }),
+        })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { Settings } = await import('./features/settings')
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const tree = (canManageWebhooks: boolean) => (
+      <QueryClientProvider client={client}>
+        <ConfirmProvider>
+          <BrowserRouter>
+            <Settings hubMode={true} canManageWebhooks={canManageWebhooks} />
+          </BrowserRouter>
+        </ConfirmProvider>
+      </QueryClientProvider>
+    )
+    const view = render(tree(true))
+    fireEvent.click(await screen.findByText('Add subscription'))
+    expect((screen.getByText('Save set') as HTMLButtonElement).disabled).toBe(false)
+    // Revoked mid-edit: the open form must not keep a mutation enabled.
+    view.rerender(tree(false))
+    const save = screen.getByText('Save set')
+    expect((save as HTMLButtonElement).disabled).toBe(true)
+    expect(save.getAttribute('title')).toContain('manage_webhooks')
+  })
+
   it('gates approval resubmission on manage_rollouts instead of approve_rollouts', async () => {
     const fetchMock = vi.fn((url: string) => {
       if (url.includes('/config-approvals'))

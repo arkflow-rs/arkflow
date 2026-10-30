@@ -200,7 +200,14 @@ function ConsoleShell() {
   const hubMode = useHubMode()
   const visibleNav = (key: string) => hubMode !== false || !HUB_ONLY_PAGES.has(key)
   const hubOnly = (page: ReactNode) =>
-    hubMode === false ? (
+    hubMode === undefined ? (
+      // The identity is still loading: keep the route skeleton while the full
+      // navigation shows, rather than querying Hub-only routes a local plane
+      // does not serve (the failure would outlive the explainer swap).
+      <section className="panel" aria-busy="true">
+        <p className="empty">{t('common.loading')}</p>
+      </section>
+    ) : hubMode === false ? (
       <section className="panel" data-testid="hub-only-explainer">
         <div className="panel-title">
           <h3>{t('perm.hubOnlyTitle')}</h3>

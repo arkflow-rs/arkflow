@@ -297,6 +297,36 @@ describe('console application', () => {
     expect(await screen.findByTestId('hub-only-explainer')).toBeInTheDocument()
   })
 
+  it('does not mount a Hub-only page before the identity resolves', async () => {
+    let releaseSystem: (() => void) | undefined
+    const systemGate = new Promise<void>((resolve) => {
+      releaseSystem = resolve
+    })
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.endsWith('/system')) {
+        await systemGate
+        return {
+          ok: true,
+          json: async () => ({ version: 'local', state: 'running', node_count: 0, capabilities: [] }),
+        }
+      }
+      if (url.includes('/nodes?')) return { ok: true, json: async () => page([]) }
+      if (url.includes('/audit')) return { ok: true, json: async () => page([]) }
+      return { ok: true, json: async () => page([]) }
+    })
+    window.history.replaceState(null, '', '/audit')
+    render(<App />)
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(expect.stringMatching(/\/system$/), expect.anything()),
+    )
+    // The identity (and therefore the plane's capabilities) is unresolved:
+    // the Hub-only page must not start its own requests yet.
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/audit'))).toBe(false)
+    releaseSystem?.()
+    expect(await screen.findByTestId('hub-only-explainer')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/audit'))).toBe(false)
+  })
+
   it('tracks a Hub lifecycle operation to a terminal state', async () => {
     let operationReads = 0
     fetchMock.mockImplementation((url: string, init?: RequestInit) =>

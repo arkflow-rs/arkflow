@@ -825,6 +825,28 @@ describe('job editor determinism', () => {
     }),
   }
 
+  it('disables editor mutations when the permission is revoked', async () => {
+    globalThis.fetch = editorFetchMock() as unknown as typeof fetch
+    const view = renderEditor(
+      <JobEditor
+        mode="create"
+        nodes={[]}
+        busy={false}
+        canMutate={false}
+        onClose={vi.fn()}
+        onError={vi.fn()}
+        onSaved={vi.fn()}
+        onRefresh={vi.fn()}
+        onAction={async (_label, fn) => {
+          await fn()
+        }}
+      />,
+    )
+    expect(view.getByRole('button', { name: 'Validate Plan' })).toBeDisabled()
+    expect(view.getByRole('button', { name: 'Create stopped' })).toBeDisabled()
+    expect(view.getByRole('button', { name: 'Create stopped' }).getAttribute('title')).toContain('configure')
+  })
+
   it('resets the draft when the editor target switches from create to upgrade', async () => {
     globalThis.fetch = editorFetchMock() as unknown as typeof fetch
     const view = renderEditor(

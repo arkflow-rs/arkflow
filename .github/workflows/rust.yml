@@ -18,6 +18,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  # sasl2-sys vendors Cyrus SASL 2.1.28, whose K&R prototypes (`MD5_memcpy()`)
+  # mean "no parameters" under C23; GCC 15 on ubuntu-latest defaults to
+  # -std=gnu23 and fails to compile md5.c. Pin the C dialect for the C sources
+  # built by build scripts (rdkafka's SASL dependency).
+  CFLAGS: "-std=gnu17"
   # CI never reuses incremental artifacts, and they dominated the old ~14GB
   # target cache: it blew the 10GB repo cache quota, got evicted between
   # runs, and every run paid a 27-minute cold rebuild plus a 4-minute save.

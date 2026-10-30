@@ -189,6 +189,7 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
           savepoint={editor.savepoint}
           nodes={nodes}
           busy={!!busy}
+          canMutate={canMutate}
           onClose={() => setEditor(undefined)}
           onError={onError}
           onSaved={() => {
