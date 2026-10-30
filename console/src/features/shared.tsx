@@ -12,9 +12,11 @@ export const active = (state: Operation['state']) =>
 export function OperationRow({
   operation,
   onError,
+  canMutate = true,
 }: {
   operation: Operation
   onError?: (message: string) => void
+  canMutate?: boolean
 }) {
   const t = useT()
   const queryClient = useQueryClient()
@@ -42,6 +44,8 @@ export function OperationRow({
       <div>
         {active(operation.state) && (
           <button
+            disabled={!canMutate}
+            title={!canMutate ? t('perm.requires', { action: 'operate' }) : undefined}
             onClick={() =>
               void api
                 .cancel(operation.id)

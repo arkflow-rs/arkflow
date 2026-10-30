@@ -310,7 +310,11 @@ export function Configuration({
                 >
                   {t('config.compare')}
                 </button>
-                <button disabled={!!busy} onClick={() => void rollback(version.id)}>
+                <button
+                  disabled={!canMutate || !!busy}
+                  title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
+                  onClick={() => void rollback(version.id)}
+                >
                   {t('config.rollback')}
                 </button>
               </div>

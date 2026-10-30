@@ -7,6 +7,8 @@ import { Events } from './features/events'
 import { Audit } from './features/audit'
 import { Approvals } from './features/approvals'
 import { ConfirmProvider } from './features/confirm'
+import { Runtime } from './features/runtime'
+import { OperationRow } from './features/shared'
 
 afterEach(() => {
   cleanup()
@@ -259,6 +261,76 @@ describe('server-side lists and role gating', () => {
       expect((button as HTMLButtonElement).disabled).toBe(true)
       expect(button.getAttribute('title')).toContain('manage_rollouts')
     }
+  })
+
+  it('carries operation filters and pagination in the URL', async () => {
+    const calls: string[] = []
+    const fetchMock = vi.fn((url: string) => {
+      calls.push(String(url))
+      if (url.includes('/operations?'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            items: [
+              {
+                id: 'op-1',
+                operation: 'stream.start',
+                resource_id: 'orders',
+                state: 'running',
+                progress: 50,
+                created_at_ms: 1,
+              },
+            ],
+            page: 2,
+            page_size: 25,
+            total: 60,
+          }),
+        })
+      if (url.includes('/streams'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 1, page_size: 50, total: 0 }),
+        })
+      if (url.includes('/events'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ items: [], page: 1, page_size: 50, total: 0 }),
+        })
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    window.history.replaceState(
+      {},
+      '',
+      '/runtime?operation=stream.start&state=running&correlation_id=c-1&page=2&page_size=25',
+    )
+    renderWithQueries(<Runtime command={async () => {}} />)
+    expect(await screen.findByText('Page 2 of 3')).toBeTruthy()
+    const operationsCall = calls.find((url) => url.includes('/operations?'))
+    expect(operationsCall).toContain('operation=stream.start')
+    expect(operationsCall).toContain('state=running')
+    expect(operationsCall).toContain('correlation_id=c-1')
+    expect(operationsCall).toContain('page=2')
+    expect(operationsCall).toContain('page_size=25')
+  })
+
+  it('disables operation cancellation without operate', () => {
+    renderWithQueries(
+      <OperationRow
+        operation={{
+          id: 'op-1',
+          operation: 'stream.start',
+          resource_id: 'orders',
+          state: 'running',
+          progress: 10,
+          created_at_ms: 1,
+        }}
+        canMutate={false}
+      />,
+    )
+    const cancel = screen.getByText('Cancel')
+    expect((cancel as HTMLButtonElement).disabled).toBe(true)
+    expect(cancel.getAttribute('title')).toContain('operate')
   })
 
   it('gates approval resubmission on manage_rollouts instead of approve_rollouts', async () => {

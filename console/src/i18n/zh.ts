@@ -118,6 +118,9 @@ export const zh = {
   'runtime.activeCount': '{count} 个进行中',
   'runtime.recordedServerSide': ' · 服务端已记录 {count} 条',
   'runtime.noOperations': '暂无操作记录。',
+  'runtime.operationFilter': '操作',
+  'runtime.operationState': '操作状态',
+  'runtime.correlationFilter': '关联 ID',
 
   'config.title': '配置',
   'config.hubSelectNode': '请选择要管理的计算节点。',

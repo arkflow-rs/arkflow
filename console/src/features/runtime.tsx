@@ -5,24 +5,51 @@ import { formatTime } from '../api'
 import type { ControlEvent, Operation, StreamStatus } from '../api'
 import { useT } from '../i18n'
 import { useEvents, useOperations, useStreams } from '../queries'
-import { EventRow, OperationRow, Pagination, SkeletonRows, active, number } from './shared'
+import {
+  EventRow,
+  OperationRow,
+  PAGE_SIZES,
+  Pagination,
+  SkeletonRows,
+  active,
+  number,
+  pageSizeParam,
+} from './shared'
 import type { Command } from './types'
+
+const OPERATION_STATES = ['queued', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out'] as const
 
 export function Runtime({
   command,
   canMutate = true,
+  canOperate = true,
   onError,
 }: {
   command: Command
   canMutate?: boolean
+  canOperate?: boolean
   onError?: (message: string) => void
 }) {
   const t = useT()
   const confirm = useConfirm()
-  const [searchParams] = useSearchParams()
+  // Operation history is server-paginated: its filters and page live in the
+  // URL so a link reproduces the exact query, matching the events/audit lists.
+  const [searchParams, setSearchParams] = useSearchParams()
   const nodeId = searchParams.get('node_id') ?? undefined
+  const operationName = searchParams.get('operation') ?? undefined
+  const operationState = searchParams.get('state') ?? undefined
+  const correlationId = searchParams.get('correlation_id') ?? undefined
+  const operationPage = Math.max(1, Number(searchParams.get('page') ?? '1') || 1)
+  const operationPageSize = pageSizeParam(searchParams)
   const streamsQuery = useStreams(nodeId)
-  const operationsQuery = useOperations({ node_id: nodeId, page: 1, page_size: 50 })
+  const operationsQuery = useOperations({
+    node_id: nodeId,
+    operation: operationName,
+    state: operationState,
+    correlation_id: correlationId,
+    page: operationPage,
+    page_size: operationPageSize,
+  })
   const eventsQuery = useEvents({ node_id: nodeId })
   // While a node-scoped refetch is pending, placeholder rows still belong to
   // the previously selected node — hide them so commands can never be sent
@@ -33,9 +60,17 @@ export function Runtime({
   const events = eventsQuery.data?.items ?? []
   const streamTotal = streamsQuery.data?.total
   const operationTotal = operationsQuery.data?.total
+  const operationPages = Math.max(1, Math.ceil((operationTotal ?? 0) / operationPageSize))
+  const setOperationParam = (key: string, value: string) => {
+    const next = new URLSearchParams(searchParams)
+    if (value) next.set(key, value)
+    else next.delete(key)
+    if (key !== 'page') next.delete('page') // any filter change restarts at page 1
+    setSearchParams(next, { replace: true })
+  }
   const [filter, setFilter] = useState('')
   const [state, setState] = useState('all')
-  const [page, setPage] = useState(1)
+  const [streamPage, setStreamPage] = useState(1)
   const [selected, setSelected] = useState<string>()
   const filtered = useMemo(
     () =>
@@ -50,14 +85,14 @@ export function Runtime({
   )
   const pageSize = 8
   const pages = Math.max(1, Math.ceil(filtered.length / pageSize))
-  const visible = filtered.slice((page - 1) * pageSize, page * pageSize)
+  const visible = filtered.slice((streamPage - 1) * pageSize, streamPage * pageSize)
   const detail = streams.find((stream) => stream.id === selected)
   useEffect(() => {
     // Clamp the page when the filtered result shrinks: adjusting pagination
     // state on an external list change, not a render-derivable value.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (page > pages) setPage(pages)
-  }, [page, pages])
+    if (streamPage > pages) setStreamPage(pages)
+  }, [streamPage, pages])
   return (
     <>
       <section className="panel">
@@ -77,7 +112,7 @@ export function Runtime({
             value={filter}
             onChange={(event) => {
               setFilter(event.target.value)
-              setPage(1)
+              setStreamPage(1)
             }}
           />
           <select
@@ -85,7 +120,7 @@ export function Runtime({
             value={state}
             onChange={(event) => {
               setState(event.target.value)
-              setPage(1)
+              setStreamPage(1)
             }}
           >
             <option value="all">{t('runtime.allStates')}</option>
@@ -158,12 +193,13 @@ export function Runtime({
             ))}
           </div>
         )}
-        <Pagination page={page} pages={pages} onChange={setPage} />
+        <Pagination page={streamPage} pages={pages} onChange={setStreamPage} />
       </section>
       {detail && (
         <RuntimeDetail
           stream={detail}
           onError={onError}
+          canOperate={canOperate}
           operations={operations.filter((operation) => operation.resource_id === detail.id)}
           events={(events ?? []).filter((event) => event.stream_id === detail.id)}
           onClose={() => setSelected(undefined)}
@@ -181,13 +217,55 @@ export function Runtime({
               : ''}
           </span>
         </div>
+        <div className="toolbar">
+          <input
+            aria-label={t('runtime.operationFilter')}
+            placeholder={t('runtime.operationFilter')}
+            value={operationName ?? ''}
+            onChange={(event) => setOperationParam('operation', event.target.value.trim())}
+          />
+          <select
+            aria-label={t('runtime.operationState')}
+            value={operationState ?? 'all'}
+            onChange={(event) =>
+              setOperationParam('state', event.target.value === 'all' ? '' : event.target.value)
+            }
+          >
+            <option value="all">{t('runtime.allStates')}</option>
+            {OPERATION_STATES.map((value) => (
+              <option key={value}>{value}</option>
+            ))}
+          </select>
+          <input
+            aria-label={t('runtime.correlationFilter')}
+            placeholder={t('runtime.correlationFilter')}
+            value={correlationId ?? ''}
+            onChange={(event) => setOperationParam('correlation_id', event.target.value.trim())}
+          />
+          <select
+            aria-label={t('list.pageSize')}
+            value={operationPageSize}
+            onChange={(event) => setOperationParam('page_size', event.target.value)}
+          >
+            {PAGE_SIZES.map((value) => (
+              <option key={value} value={value}>
+                {t('list.pageSize')}: {value}
+              </option>
+            ))}
+          </select>
+        </div>
         {operations.length ? (
-          operations
-            .slice(0, 12)
-            .map((operation) => <OperationRow operation={operation} onError={onError} key={operation.id} />)
+          operations.map((operation) => (
+            <OperationRow operation={operation} onError={onError} canMutate={canOperate} key={operation.id} />
+          ))
         ) : (
           <p className="empty">{t('runtime.noOperations')}</p>
         )}
+        <Pagination
+          page={operationPage}
+          pages={operationPages}
+          onChange={(next) => setOperationParam('page', String(next))}
+        />
       </section>
     </>
   )
@@ -199,12 +277,14 @@ function RuntimeDetail({
   events,
   onClose,
   onError,
+  canOperate,
 }: {
   stream: StreamStatus
   operations: Operation[]
   events: ControlEvent[]
   onClose: () => void
   onError?: (message: string) => void
+  canOperate: boolean
 }) {
   const t = useT()
   return (
@@ -271,7 +351,7 @@ function RuntimeDetail({
       <h4>{t('runtime.operationHistory')}</h4>
       {operations.length ? (
         operations.map((operation) => (
-          <OperationRow operation={operation} onError={onError} key={operation.id} />
+          <OperationRow operation={operation} onError={onError} canMutate={canOperate} key={operation.id} />
         ))
       ) : (
         <p className="empty">{t('runtime.noOperationHistory')}</p>

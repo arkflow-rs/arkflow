@@ -319,7 +319,14 @@ function ConsoleShell() {
           <Route path="/" element={<Overview onError={setError} canManageNodes={can('manage_nodes')} />} />
           <Route
             path="/runtime"
-            element={<Runtime command={command} canMutate={canMutate} onError={setError} />}
+            element={
+              <Runtime
+                command={command}
+                canMutate={canMutate}
+                canOperate={can('operate')}
+                onError={setError}
+              />
+            }
           />
           <Route path="/jobs" element={hubOnly(<Jobs onError={setError} canMutate={canMutate} />)} />
           <Route

@@ -27,6 +27,7 @@ import {
 import { useConfirm } from './confirm'
 import { ComponentBrowserControls, ComponentKind, filterComponents } from './component-browser'
 import { useT, type TKey } from '../i18n'
+import { useMutationFailure } from '../queries'
 
 const copy = <T,>(v: T): T => structuredClone(v)
 function JobNode({ data }: { data: DagNodeData }) {
@@ -253,6 +254,7 @@ export function JobEditor({
 }: Props) {
   const confirm = useConfirm()
   const t = useT()
+  const reportMutationFailure = useMutationFailure()
   const initial = useMemo<JobSpec>(() => {
     if ((mode === 'upgrade' || mode === 'atomic') && job) {
       if (job.spec_json)
@@ -418,7 +420,7 @@ export function JobEditor({
       setValidation(result)
       setIssues(result.valid ? [] : [t('editor.incompatibleGraph')])
     } catch (cause) {
-      onError(cause instanceof Error ? cause.message : t('editor.validationFailed'))
+      reportMutationFailure(onError, cause)
     }
   }
   const submit = async () => {

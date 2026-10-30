@@ -122,6 +122,9 @@ export const en = {
   'runtime.activeCount': '{count} active',
   'runtime.recordedServerSide': ' · {count} recorded server-side',
   'runtime.noOperations': 'No operations recorded.',
+  'runtime.operationFilter': 'Operation',
+  'runtime.operationState': 'Operation state',
+  'runtime.correlationFilter': 'Correlation ID',
 
   // Configuration
   'config.title': 'Configuration',

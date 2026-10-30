@@ -462,6 +462,49 @@ describe('console application', () => {
     await waitFor(() => expect(systemReads).toBeGreaterThanOrEqual(2))
   })
 
+  it('reports a Job validation permission failure and refreshes the identity', async () => {
+    let systemReads = 0
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method === 'POST' && String(url).endsWith('/jobs/validate'))
+        return Promise.resolve({
+          ok: false,
+          status: 403,
+          headers: new Headers(),
+          json: async () => ({ code: 'forbidden', message: 'Operator is not authorized' }),
+        })
+      return Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system')) {
+            systemReads += 1
+            return {
+              version: 'hub',
+              state: 'running',
+              node_count: 1,
+              capabilities: ['fleet_aggregation'],
+            }
+          }
+          if (url.includes('/nodes?')) return page([])
+          if (url.endsWith('/jobs')) return []
+          return []
+        },
+      })
+    })
+    window.history.replaceState(null, '', '/jobs')
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Create Job' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
+    expect(await screen.findByText(/not authorized/i)).toBeInTheDocument()
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).endsWith('/jobs/validate') && (init as RequestInit | undefined)?.method === 'POST',
+      ),
+    ).toHaveLength(1)
+    // The 403 also refreshes the echoed identity, as for every other mutation.
+    await waitFor(() => expect(systemReads).toBeGreaterThanOrEqual(2))
+  })
+
   it('switches the interface language and persists the choice', async () => {
     const { LOCALE_STORAGE_KEY, LocaleProvider } = await import('./i18n')
     render(
