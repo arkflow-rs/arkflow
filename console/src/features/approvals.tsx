@@ -12,11 +12,14 @@ import { useConfigApprovals, useMutationFailure } from '../queries'
 /// request gets a fresh id; the old record is immutable).
 type ApprovalsProps = {
   onError: (message: string) => void
+  /** Decide pending requests, enforced as `approve_rollouts`. */
   canMutate?: boolean
-  canConfigure?: boolean
+  /** Resubmit a rejected request: a submission, which the Hub enforces as
+   * `manage_rollouts` (not the approval decision's `approve_rollouts`). */
+  canSubmit?: boolean
 }
 
-export function Approvals({ onError, canMutate = true, canConfigure = true }: ApprovalsProps) {
+export function Approvals({ onError, canMutate = true, canSubmit = true }: ApprovalsProps) {
   const t = useT()
   const queryClient = useQueryClient()
   const reportMutationFailure = useMutationFailure()
@@ -124,8 +127,8 @@ export function Approvals({ onError, canMutate = true, canConfigure = true }: Ap
               {request.status === 'rejected' && (
                 <div className="actions">
                   <button
-                    disabled={!canConfigure || busy}
-                    title={!canConfigure ? t('perm.requires', { action: 'configure' }) : undefined}
+                    disabled={!canSubmit || busy}
+                    title={!canSubmit ? t('perm.requires', { action: 'manage_rollouts' }) : undefined}
                     onClick={() => void resubmit(request)}
                   >
                     {t('approvals.resubmit')}

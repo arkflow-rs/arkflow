@@ -342,7 +342,7 @@ function ConsoleShell() {
               <Approvals
                 onError={setError}
                 canMutate={can('approve_rollouts')}
-                canConfigure={can('configure')}
+                canSubmit={can('manage_rollouts')}
               />,
             )}
           />

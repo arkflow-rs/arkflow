@@ -261,7 +261,7 @@ describe('server-side lists and role gating', () => {
     }
   })
 
-  it('gates approval resubmission on configure instead of approve_rollouts', async () => {
+  it('gates approval resubmission on manage_rollouts instead of approve_rollouts', async () => {
     const fetchMock = vi.fn((url: string) => {
       if (url.includes('/config-approvals'))
         return Promise.resolve({
@@ -281,9 +281,9 @@ describe('server-side lists and role gating', () => {
       throw new Error(`unexpected fetch: ${url}`)
     })
     vi.stubGlobal('fetch', fetchMock)
-    // canMutate (approve_rollouts) is held, but resubmission is a
-    // configuration submission: it must gate on configure alone.
-    renderWithQueries(<Approvals onError={() => {}} canMutate={true} canConfigure={false} />)
+    // canMutate (approve_rollouts) is held, but resubmission is a submission
+    // the Hub enforces as manage_rollouts: it must gate on that alone.
+    renderWithQueries(<Approvals onError={() => {}} canMutate={true} canSubmit={false} />)
     const resubmit = await screen.findByText('Resubmit')
     expect((resubmit as HTMLButtonElement).disabled).toBe(true)
   })
