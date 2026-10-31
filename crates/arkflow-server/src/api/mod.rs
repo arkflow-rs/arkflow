@@ -20,6 +20,7 @@ mod nodes;
 mod operations;
 #[cfg(test)]
 mod principal_echo_api_tests;
+pub(crate) mod rate_limit;
 mod rollouts;
 mod streams;
 mod webhooks;
@@ -154,6 +155,10 @@ pub struct ServerConfig {
     /// How long a pending approval request stays decidable (milliseconds).
     #[serde(default = "default_approval_ttl_ms")]
     pub approval_ttl_ms: u64,
+    /// Per-credential request rate limiting for the versioned API (see the
+    /// `control-plane-rate-limiting` capability).
+    #[serde(default)]
+    pub rate_limit: arkflow_core::config::RateLimitConfig,
     #[serde(default)]
     pub observability: arkflow_core::config::ObservabilityConfig,
 }
@@ -183,6 +188,7 @@ impl ServerConfig {
             session_ttl_ms: agent.agent_session_ttl_ms,
             approval_required: control_api.approval_required,
             approval_ttl_ms: control_api.approval_ttl_ms,
+            rate_limit: control_api.rate_limit.clone(),
             observability: config.node.observability.clone(),
         }
     }
@@ -266,6 +272,7 @@ impl Default for ServerConfig {
             session_ttl_ms: default_session_ttl_ms(),
             approval_required: false,
             approval_ttl_ms: default_approval_ttl_ms(),
+            rate_limit: arkflow_core::config::RateLimitConfig::default(),
             observability: arkflow_core::config::ObservabilityConfig::default(),
         }
     }
@@ -408,6 +415,10 @@ fn page_items<T>(items: Vec<T>, query: &PageQuery) -> Page<T> {
 
 pub fn router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
     let prefix = config.api_prefix.trim_end_matches('/');
+    // Rate limiting sits inside authentication (every request that reaches it
+    // presented a valid credential) and inside the versioned prefix, so the
+    // outer health/readiness/liveness and top-level `/metrics` stay unlimited.
+    let rate_limiter = rate_limit::RateLimiter::new(rate_limit::Plane::Local, &config.rate_limit);
     let api = Router::new()
         .route("/system", get(system))
         .route("/status", get(status))
@@ -446,7 +457,13 @@ pub fn router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
         // write endpoints are protected identically (the old per-handler
         // checks left reads unauthenticated). `route_layer` stays inside the
         // nest, so the outer health/readiness/liveness probes and the
-        // top-level `/metrics` remain unauthenticated by design.
+        // top-level `/metrics` remain unauthenticated by design. Layer order
+        // is reverse-addition: authentication (added last) runs first, then
+        // rate limiting, then the handler.
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit::rate_limit_middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(
             control_plane.clone(),
             local_auth_middleware,
@@ -740,6 +757,14 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         api
     }
     .with_state(hub.clone())
+    // Layer order is reverse-addition: operator authentication (added last)
+    // runs first, then rate limiting, then the handler. The limiter switches
+    // to the agent key space by path prefix, covering the auth-exempt agent
+    // routes with per-node buckets.
+    .layer(middleware::from_fn_with_state(
+        rate_limit::RateLimiter::new(rate_limit::Plane::Hub, &config.rate_limit),
+        rate_limit::rate_limit_middleware,
+    ))
     .layer(axum::middleware::from_fn_with_state(
         auth_hub,
         operator_auth_middleware,
