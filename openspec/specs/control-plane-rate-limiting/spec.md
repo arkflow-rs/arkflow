@@ -19,7 +19,7 @@ Both control planes (local standalone and Hub) SHALL enforce a per-credential-id
 
 ### Requirement: Credential-identity bucketing
 
-The limiter SHALL key buckets on a truncated hash of the presented credential, never storing credential material: static and structured operator credentials are keyed per credential (one credential equals one principal), OIDC browser sessions are keyed per session, agent requests are keyed per node credential with the legacy query-token channel and the Bearer header resolving to the same bucket, and unauthenticated local mode shares a single anonymous bucket. The bucket table SHALL be capacity-bounded: when the bound is reached, unrecognized identities share one catch-all bucket governed by the principal rate, and idle buckets are reclaimed lazily on the request path without background tasks.
+The limiter SHALL key buckets on a truncated hash of the presented credential, never storing credential material: static and structured operator credentials are keyed per credential (one credential equals one principal), OIDC browser sessions are keyed per session, agent requests are keyed per node credential with the legacy query-token channel and the Bearer header resolving to the same bucket, and a control plane that does not enforce an operator credential shares a single anonymous bucket regardless of any presented value. The bucket table SHALL be capacity-bounded per key space: when a key space's bound is reached, unrecognized identities in that key space share one catch-all bucket governed by that key space's configured rate and burst limits, and idle buckets are reclaimed lazily on the request path without background tasks.
 
 #### Scenario: Per-credential isolation
 

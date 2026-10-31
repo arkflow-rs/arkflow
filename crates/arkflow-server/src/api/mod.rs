@@ -418,7 +418,11 @@ pub fn router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
     // Rate limiting sits inside authentication (every request that reaches it
     // presented a valid credential) and inside the versioned prefix, so the
     // outer health/readiness/liveness and top-level `/metrics` stay unlimited.
-    let rate_limiter = rate_limit::RateLimiter::new(rate_limit::Plane::Local, &config.rate_limit);
+    let rate_limiter = rate_limit::RateLimiter::new(
+        rate_limit::Plane::Local,
+        &config.rate_limit,
+        control_plane.credential_enforced(),
+    );
     let api = Router::new()
         .route("/system", get(system))
         .route("/status", get(status))
@@ -762,7 +766,11 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
     // to the agent key space by path prefix, covering the auth-exempt agent
     // routes with per-node buckets.
     .layer(middleware::from_fn_with_state(
-        rate_limit::RateLimiter::new(rate_limit::Plane::Hub, &config.rate_limit),
+        rate_limit::RateLimiter::new(
+            rate_limit::Plane::Hub,
+            &config.rate_limit,
+            hub.static_operator_identity_count() > 0 || hub.oidc_is_configured(),
+        ),
         rate_limit::rate_limit_middleware,
     ))
     .layer(axum::middleware::from_fn_with_state(

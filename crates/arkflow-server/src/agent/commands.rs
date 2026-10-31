@@ -707,10 +707,14 @@ pub(super) async fn send_result(
 pub(super) async fn post_json<T: Serialize>(
     client: &Client,
     url: String,
+    session_token: &str,
     body: &T,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    client
-        .post(url)
+    // The session credential rides the Bearer header as well as the body:
+    // the Hub rate limiter keys agent routes on the presented credential, so
+    // body-only requests would all share one anonymous bucket. Older Hubs
+    // ignore the header and keep authenticating from the body.
+    bearer_auth(client.post(url), session_token)
         .json(body)
         .send()
         .await?

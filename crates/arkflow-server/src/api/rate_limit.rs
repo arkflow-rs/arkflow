@@ -120,6 +120,12 @@ struct KeySpace {
 pub struct RateLimiter {
     plane: Plane,
     enabled: bool,
+    /// Whether the plane's operator authentication rejects requests without a
+    /// valid credential. When it does not (the unauthenticated local mode
+    /// accepts every request), a presented Bearer value is not an identity:
+    /// keying on it would let a client mint fresh buckets by rotating the
+    /// header, so all callers share the anonymous bucket instead.
+    operator_credential_enforced: bool,
     operator: KeySpace,
     node: KeySpace,
 }
@@ -130,7 +136,11 @@ impl RateLimiter {
     /// closed (protective) rather than divide by zero or lock everything out.
     /// A burst below one token can never admit a request (`consume` needs
     /// `tokens >= 1.0`), so bursts clamp up to 1.0 instead.
-    pub fn new(plane: Plane, config: &arkflow_core::config::RateLimitConfig) -> Arc<Self> {
+    pub fn new(
+        plane: Plane,
+        config: &arkflow_core::config::RateLimitConfig,
+        operator_credential_enforced: bool,
+    ) -> Arc<Self> {
         let defaults = arkflow_core::config::RateLimitConfig::default();
         let clamp = |value: f64, fallback: f64, name: &str| {
             if value.is_finite() && value > 0.0 {
@@ -150,6 +160,7 @@ impl RateLimiter {
         Arc::new(Self {
             plane,
             enabled: config.enabled,
+            operator_credential_enforced,
             operator: KeySpace {
                 limit: ClassLimit {
                     rps: clamp(
@@ -314,7 +325,8 @@ pub async fn rate_limit_middleware(
         let credential = agent_credential(&request);
         limiter.admit("node", credential.as_deref(), &limiter.node, now)
     } else {
-        let credential = super::bearer(request.headers());
+        let credential =
+            super::bearer(request.headers()).filter(|_| limiter.operator_credential_enforced);
         limiter.admit("operator", credential.as_deref(), &limiter.operator, now)
     };
     match outcome {
@@ -351,7 +363,7 @@ mod tests {
     }
 
     fn limiter() -> RateLimiter {
-        let limiter = RateLimiter::new(Plane::Local, &config());
+        let limiter = RateLimiter::new(Plane::Local, &config(), true);
         Arc::try_unwrap(limiter).ok().expect("sole owner")
     }
 
@@ -491,7 +503,7 @@ mod tests {
     fn disabled_limiter_admits_everything() {
         let mut config = config();
         config.enabled = false;
-        let limiter = RateLimiter::new(Plane::Local, &config);
+        let limiter = RateLimiter::new(Plane::Local, &config, true);
         let now = base();
         for _ in 0..100 {
             assert!(limiter
@@ -508,7 +520,7 @@ mod tests {
         let mut config = config();
         config.principal_rps = 0.0;
         config.node_burst = f64::NAN;
-        let limiter = RateLimiter::new(Plane::Local, &config);
+        let limiter = RateLimiter::new(Plane::Local, &config, true);
         assert_eq!(limiter.operator.limit.rps, defaults.principal_rps);
         assert_eq!(limiter.node.limit.burst, defaults.node_burst);
     }
@@ -517,7 +529,7 @@ mod tests {
     fn burst_below_one_token_clamps_up() {
         let mut config = config();
         config.principal_burst = 0.5;
-        let limiter = RateLimiter::new(Plane::Local, &config);
+        let limiter = RateLimiter::new(Plane::Local, &config, true);
         assert_eq!(limiter.operator.limit.burst, 1.0);
         let now = base();
         // Exactly one request fits; the bucket is not a permanent lockout.
@@ -569,7 +581,7 @@ mod tests {
 
     #[test]
     fn rejections_are_counted_per_plane_and_kind() {
-        let limiter = RateLimiter::new(Plane::Hub, &config());
+        let limiter = RateLimiter::new(Plane::Hub, &config(), true);
         let now = base();
         for _ in 0..3 {
             let _ = limiter.admit("node", Some("n"), &limiter.node, now);
@@ -604,8 +616,11 @@ mod tests {
             (StatusCode::OK, "handler-ran")
         }
 
-        fn test_app(config: &arkflow_core::config::RateLimitConfig) -> Router {
-            let limiter = RateLimiter::new(Plane::Local, config);
+        fn test_app(
+            config: &arkflow_core::config::RateLimitConfig,
+            operator_credential_enforced: bool,
+        ) -> Router {
+            let limiter = RateLimiter::new(Plane::Local, config, operator_credential_enforced);
             Router::new()
                 .fallback(marker)
                 .layer(axum::middleware::from_fn_with_state(
@@ -642,8 +657,22 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn unauthenticated_local_mode_shares_one_anonymous_bucket() {
+            // No operator credential is enforced: a presented Bearer value is
+            // not an identity, so rotating the header must not mint fresh
+            // buckets — every caller draws from the anonymous bucket.
+            let app = test_app(&tiny_config(), false);
+            let first = send(app.clone(), "/status", Some("rotation-1")).await;
+            assert_eq!(first.status(), StatusCode::OK);
+            let second = send(app.clone(), "/status", Some("rotation-2")).await;
+            assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+            let third = send(app, "/status", None).await;
+            assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        #[tokio::test]
         async fn over_limit_request_is_rejected_with_retry_after() {
-            let app = test_app(&tiny_config());
+            let app = test_app(&tiny_config(), true);
             let first = send(app.clone(), "/status", Some("cred")).await;
             assert_eq!(first.status(), StatusCode::OK);
             assert_eq!(body_text(first).await, "handler-ran");
@@ -661,7 +690,7 @@ mod tests {
 
         #[tokio::test]
         async fn exempt_oidc_paths_bypass_the_limiter() {
-            let app = test_app(&tiny_config());
+            let app = test_app(&tiny_config(), true);
             for _ in 0..5 {
                 let response = send(app.clone(), "/auth/oidc/login", Some("cred")).await;
                 assert_eq!(response.status(), StatusCode::OK);
@@ -671,7 +700,7 @@ mod tests {
 
         #[tokio::test]
         async fn metrics_export_is_exempt_from_limiting() {
-            let app = test_app(&tiny_config());
+            let app = test_app(&tiny_config(), true);
             // Exhaust the principal bucket first: /metrics must stay
             // reachable regardless.
             let first = send(app.clone(), "/status", Some("cred")).await;
@@ -688,7 +717,7 @@ mod tests {
             // Defaults (burst 1000) must absorb a sustained agent sequence —
             // register/heartbeat/report/commands/observations at the default
             // 1s poll interval are three orders of magnitude below the cap.
-            let app = test_app(&arkflow_core::config::RateLimitConfig::default());
+            let app = test_app(&arkflow_core::config::RateLimitConfig::default(), true);
             for _ in 0..500 {
                 let response = send(app.clone(), "/agent/heartbeat", Some("node-token")).await;
                 assert_eq!(response.status(), StatusCode::OK);
