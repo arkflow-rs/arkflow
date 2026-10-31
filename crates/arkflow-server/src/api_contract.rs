@@ -118,9 +118,12 @@ impl OperatorPrincipal {
     }
 
     /// Identity echo for the console: who is calling, their roles, and the
-    /// actions this principal is authorized for. `actions` is derived by
-    /// `can` — the same predicate that enforces mutations — so the echo and
-    /// enforcement cannot diverge.
+    /// role-level actions this principal holds. `actions` lists role-level
+    /// capabilities (`can`), not per-resource decisions — a scoped
+    /// credential can hold an action here and still be denied on a specific
+    /// resource, because every mutation additionally enforces resource
+    /// scopes server-side (`can_scope`); the echo carries no resource
+    /// context from which to precompute that decision.
     pub fn echo(&self) -> OperatorPrincipalEcho {
         OperatorPrincipalEcho {
             id: self.id.clone(),

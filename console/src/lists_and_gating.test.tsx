@@ -8,6 +8,8 @@ import { Audit } from './features/audit'
 import { Approvals } from './features/approvals'
 import { ConfirmProvider } from './features/confirm'
 import { Runtime } from './features/runtime'
+import { Configuration } from './features/configuration'
+import { ActiveUpgradeCard } from './features/jobs'
 import { OperationRow } from './features/shared'
 
 afterEach(() => {
@@ -470,5 +472,65 @@ describe('server-side lists and role gating', () => {
     renderWithQueries(<Approvals onError={() => {}} canMutate={true} canSubmit={false} />)
     const resubmit = await screen.findByText('Resubmit')
     expect((resubmit as HTMLButtonElement).disabled).toBe(true)
+  })
+})
+
+describe('denied controls stay visible and name the permission', () => {
+  it('renders upgrade lifecycle actions disabled with the required permission instead of hiding them', () => {
+    const upgrade = {
+      upgrade_id: 'up-1',
+      job_id: 'orders',
+      from_version: 1,
+      to_version: 2,
+      phase: 'verifying',
+      savepoint_id: 'sp-1',
+      phase_deadline_at_ms: 1,
+      savepoint_retries: 0,
+      verify_timeout_ms: 1,
+      actor: null,
+    }
+    renderWithQueries(
+      <ActiveUpgradeCard
+        job={{ job_id: 'orders' } as never}
+        upgrade={upgrade as never}
+        canMutate={false}
+        busy={false}
+        onAction={vi.fn()}
+        onDone={vi.fn()}
+      />,
+    )
+    for (const name of ['Pause', 'Roll back', 'Cancel']) {
+      const button = screen.getByRole('button', { name })
+      expect(button).toBeDisabled()
+      expect(button).toHaveAttribute('title', 'Requires the operate permission')
+    }
+  })
+
+  it('keeps the publish control disabled with the required permission for a viewer', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith('/configuration/draft'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ format: 'json', content: '{"streams":[]}' }),
+        })
+      if (url.includes('/configuration/versions')) return Promise.resolve({ ok: true, json: async () => [] })
+      if (url.endsWith('/configuration'))
+        return Promise.resolve({ ok: true, json: async () => ({ streams: [] }) })
+      if (url.endsWith('/system'))
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ id: 'local', capabilities: [], principal: null }),
+        })
+      return Promise.resolve({ ok: true, json: async () => [] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderWithQueries(<Configuration onError={() => {}} canMutate={false} />)
+    await screen.findByDisplayValue('{"streams":[]}')
+    const publish = screen.getByRole('button', { name: 'Publish' })
+    expect(publish).toBeDisabled()
+    expect(publish).toHaveAttribute('title', 'Requires the configure permission')
+    // Clicking a disabled control dispatches nothing; assert no apply call.
+    fireEvent.click(publish)
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/configuration/apply'))).toBe(false)
   })
 })
