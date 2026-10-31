@@ -110,6 +110,43 @@ async fn hub_component_catalogue_exposes_registered_job_components() {
 }
 
 #[tokio::test]
+async fn hub_operator_credential_enforcement_matches_the_auth_path() {
+    // Mirrors `operator_principal`: enforcement is only off where that path
+    // authenticates every request (no static token + insecure_local), so
+    // rate limiting may key on the presented credential everywhere else.
+    let base = hub::HubConfig {
+        operator_token: None,
+        node_token: None,
+        insecure_local: true,
+        lease_ttl_ms: 10_000,
+        poll_interval_ms: 100,
+        session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
+    };
+    assert!(!hub::Hub::new(base.clone()).operator_credential_enforced());
+    // A blank token skips the credential-free branch entirely: the legacy
+    // path only applies when `operator_token` is None, so authentication
+    // still requires the OIDC path here.
+    let blank = hub::HubConfig {
+        operator_token: Some("   ".into()),
+        ..base.clone()
+    };
+    assert!(hub::Hub::new(blank).operator_credential_enforced());
+    let static_token = hub::HubConfig {
+        operator_token: Some("operator-secret".into()),
+        ..base.clone()
+    };
+    assert!(hub::Hub::new(static_token).operator_credential_enforced());
+    // Without the insecure_local opt-in there is no credential-free path.
+    let secure = hub::HubConfig {
+        insecure_local: false,
+        ..base
+    };
+    assert!(hub::Hub::new(secure).operator_credential_enforced());
+}
+
+#[tokio::test]
 async fn configuration_validation_requires_the_operator_token() {
     // The validate endpoint resolves secret references and constructs
     // every component in the candidate, so it must be as guarded as
