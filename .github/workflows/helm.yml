@@ -25,6 +25,10 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  # Same rationale as rust.yml: sasl2-sys vendors Cyrus SASL 2.1.28, whose
+  # K&R prototypes are invalid under the C23 default of recent GCC on the
+  # runner image; pin the C dialect for the build-script-compiled sources.
+  CFLAGS: "-std=gnu17"
 
 jobs:
   chart:
