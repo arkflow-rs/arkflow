@@ -147,6 +147,7 @@ export function Configuration({
     })
   const publish = () =>
     void run(t('config.busyPublishing'), async () => {
+      if (!canMutate) return
       const operation = await api.applyConfig(candidate, nodeId)
       await waitForOperation(operation.id)
       await reload()
@@ -268,7 +269,11 @@ export function Configuration({
           <button disabled={!editable || !!busy} onClick={validate}>
             {t('config.validate')}
           </button>
-          <button disabled={!validated || !!busy} onClick={publish}>
+          <button
+            disabled={!validated || !canMutate || !!busy}
+            title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
+            onClick={publish}
+          >
             {t('config.publish')}
           </button>
         </div>

@@ -211,7 +211,7 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
   )
 }
 
-function ActiveUpgradeCard({
+export function ActiveUpgradeCard({
   job,
   upgrade,
   canMutate,
@@ -249,27 +249,41 @@ function ActiveUpgradeCard({
             ? t('jobs.upgradeSavepoint', { id: upgrade.savepoint_id })
             : t('jobs.upgradeSavepointPending')}
         </span>
-        {canMutate && (
-          <span className="actions">
-            {upgrade.phase === 'paused' ? (
-              <button disabled={busy} onClick={() => void run(t('jobs.resumingUpgrade'), 'resume')}>
-                {t('jobs.resumeUpgrade')}
-              </button>
-            ) : (
-              <button disabled={busy} onClick={() => void run(t('jobs.pausingUpgrade'), 'pause')}>
-                {t('jobs.pauseUpgrade')}
-              </button>
-            )}
-            {upgrade.phase === 'verifying' && (
-              <button disabled={busy} onClick={() => void run(t('jobs.rollingBackUpgrade'), 'rollback')}>
-                {t('jobs.rollbackUpgrade')}
-              </button>
-            )}
-            <button disabled={busy} onClick={() => void run(t('jobs.cancellingUpgrade'), 'cancel')}>
-              {t('jobs.cancelUpgrade')}
+        <span className="actions">
+          {upgrade.phase === 'paused' ? (
+            <button
+              disabled={!canMutate || busy}
+              title={!canMutate ? t('perm.requires', { action: 'operate' }) : undefined}
+              onClick={() => void run(t('jobs.resumingUpgrade'), 'resume')}
+            >
+              {t('jobs.resumeUpgrade')}
             </button>
-          </span>
-        )}
+          ) : (
+            <button
+              disabled={!canMutate || busy}
+              title={!canMutate ? t('perm.requires', { action: 'operate' }) : undefined}
+              onClick={() => void run(t('jobs.pausingUpgrade'), 'pause')}
+            >
+              {t('jobs.pauseUpgrade')}
+            </button>
+          )}
+          {upgrade.phase === 'verifying' && (
+            <button
+              disabled={!canMutate || busy}
+              title={!canMutate ? t('perm.requires', { action: 'operate' }) : undefined}
+              onClick={() => void run(t('jobs.rollingBackUpgrade'), 'rollback')}
+            >
+              {t('jobs.rollbackUpgrade')}
+            </button>
+          )}
+          <button
+            disabled={!canMutate || busy}
+            title={!canMutate ? t('perm.requires', { action: 'operate' }) : undefined}
+            onClick={() => void run(t('jobs.cancellingUpgrade'), 'cancel')}
+          >
+            {t('jobs.cancelUpgrade')}
+          </button>
+        </span>
       </div>
       {upgrade.last_error && <div className="error-row">{upgrade.last_error}</div>}
       <p>
