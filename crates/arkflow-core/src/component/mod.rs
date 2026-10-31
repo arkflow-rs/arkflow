@@ -399,13 +399,13 @@ pub fn build_config_schema() -> serde_json::Value {
                     "approval_required": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Require a second principal's approval before any configuration rollout is created; gates every rollout creation route when enabled."
+                        "description": "Require a second principal's approval before configuration rollouts are created. Enforcement lives on the Hub control plane (the arkflow-server binary reads ARKFLOW_APPROVAL_REQUIRED); the standalone apply route is not approval-gated."
                     },
                     "approval_ttl_ms": {
                         "type": "integer",
                         "format": "uint64",
                         "default": 86400000,
-                        "description": "How long a pending configuration approval request stays decidable before it expires (milliseconds)."
+                        "description": "How long a pending configuration approval request stays decidable before it expires (milliseconds). Read by the Hub from ARKFLOW_APPROVAL_TTL_MS."
                     },
                     "rate_limit": {
                         "type": "object",
