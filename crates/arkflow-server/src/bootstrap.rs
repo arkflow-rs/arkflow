@@ -247,7 +247,7 @@ async fn run_restore_from_snapshot(
             return Err(error.into());
         }
     };
-    let report = if is_postgres_url(&to) {
+    let report = if is_postgres_url(to) {
         let backend = match ControlPlaneStore::open(&to).await {
             Ok(ControlPlaneStore::Postgres(backend)) => backend,
             Ok(ControlPlaneStore::Sqlite(_)) => {
@@ -269,11 +269,11 @@ async fn run_restore_from_snapshot(
             }
         }
     } else {
-        if let Some(message) = sqlite_control_plane_file_guard(&to) {
+        if let Some(message) = sqlite_control_plane_file_guard(to) {
             error_sink(format!("restore failed: {message}"));
             return Ok(2);
         }
-        match table_copier::restore_sqlite_target(&snapshot, &to).await {
+        match table_copier::restore_sqlite_target(&snapshot, to).await {
             Ok(report) => report,
             Err(error) => {
                 error_sink(format!("restore failed: {error}"));

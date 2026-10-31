@@ -540,13 +540,13 @@ pub async fn copy_sqlite_to_postgres(
         let rows = coerce_rows_for_postgres(rows, &columns, &target_columns, table)?;
         for chunk in rows.chunks(CHUNK) {
             let mut transaction = pool.begin().await?;
-            pg_insert_chunk(&mut *transaction, table, &columns, chunk).await?;
+            pg_insert_chunk(&mut transaction, table, &columns, chunk).await?;
             transaction.commit().await?;
         }
         verify_count(&mut report, table, rows.len(), pg_count(pool, table).await?)?;
     }
     let mut connection = pool.acquire().await?;
-    reset_postgres_sequences(&mut *connection).await?;
+    reset_postgres_sequences(&mut connection).await?;
     Ok(report)
 }
 
@@ -679,7 +679,7 @@ pub async fn restore_postgres_target(
             )));
         }
     }
-    let non_empty = postgres_non_empty_tables(&mut *tx).await?;
+    let non_empty = postgres_non_empty_tables(&mut tx).await?;
     if !non_empty.is_empty() {
         return Err(StorageError::NonEmptyTarget { tables: non_empty });
     }
@@ -693,7 +693,7 @@ pub async fn restore_postgres_target(
             )));
         }
         let rows = coerce_rows_for_postgres(rows, &columns, &target_columns, table)?;
-        pg_insert_rows(&mut *tx, table, &columns, &rows).await?;
+        pg_insert_rows(&mut tx, table, &columns, &rows).await?;
         verify_count(
             &mut report,
             table,
@@ -701,7 +701,7 @@ pub async fn restore_postgres_target(
             pg_count(&mut *tx, table).await?,
         )?;
     }
-    reset_postgres_sequences(&mut *tx).await?;
+    reset_postgres_sequences(&mut tx).await?;
     tx.commit().await?;
     Ok(report)
 }
