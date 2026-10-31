@@ -130,6 +130,35 @@ and optional machine-readable `details`:
 }
 ```
 
+### Rate limiting
+
+Both control planes enforce a per-credential request rate limit over the
+versioned API; health probes, `GET /metrics`, and the OIDC login flow are
+exempt. Buckets are keyed on a truncated hash of the presented credential —
+static/structured operator credentials per credential, OIDC browser sessions
+per session, agent requests per node (the `Authorization: Bearer` header and
+the legacy `session_token` query parameter resolve to the same bucket). A
+request that exceeds its bucket is rejected before reaching any handler:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+Content-Type: application/json
+
+{"code":"rate_limited","message":"Control-plane request rate limit exceeded; retry after the indicated interval"}
+```
+
+`Retry-After` carries the whole-second refill estimate. Rejections create no
+audit events and no operation records, and are exported as the
+`arkflow_control_plane_rate_limit_rejections_total{plane,key_kind}` counter
+family (`plane` is `local` or `hub`; `key_kind` is `principal`, `node`, or
+`catch_all` — the shared bucket that absorbs traffic beyond the bounded
+bucket table). Configuration lives under `control_api.rate_limit` on the node
+plane and the `ARKFLOW_RATE_LIMIT_*` environment variables on the Hub (see
+[deployment](../operate/control-plane/deploy.md#rate-limiting)). Defaults are
+enabled with limits far above legitimate traffic; `enabled: false` restores
+the unlimited behavior exactly.
+
 ## Node API
 
 | Method | Route | Purpose |

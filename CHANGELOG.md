@@ -9,6 +9,15 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added — Control plane
 
+- Per-credential request rate limiting on both control planes
+  (`control_api.rate_limit` / `ARKFLOW_RATE_LIMIT_*`): token buckets keyed on
+  a hashed credential (per operator credential or browser session, per agent
+  node; Bearer and legacy query-token channels share one node bucket),
+  capacity-bounded bucket table with a catch-all lane, `429` + `Retry-After`
+  rejections outside the audit stream, and the
+  `arkflow_control_plane_rate_limit_rejections_total{plane,key_kind}` metric.
+  Enabled by default with limits far above legitimate traffic;
+  `enabled: false` restores unlimited handling.
 - Configuration approval gate: `control_api.approval_required` (default
   off) gates every configuration rollout creation path — batch creation,
   node-level apply, and rollback — behind approval requests decided by a

@@ -765,9 +765,18 @@ async fn observability_router_serves_metrics_ready_and_live_without_the_api_serv
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    // No streams and no jobs: a valid (empty) exposition.
+    // No streams and no jobs: no data-plane series leak into the
+    // observability-only router. (Control-plane counters are process-global
+    // statics and may carry series recorded by concurrently running tests.)
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(!text.lines().any(|line| !line.starts_with('#')));
+    assert!(
+        !text.lines().any(
+            |line| !line.starts_with('#') && line.starts_with("arkflow_stream_")
+                || !line.starts_with('#') && line.starts_with("arkflow_job_")
+                || !line.starts_with('#') && line.starts_with("arkflow_node_")
+        ),
+        "data-plane series must not appear: {text}"
+    );
 }
 
 /// The API-server router gains `/ready` and `/live` while the legacy

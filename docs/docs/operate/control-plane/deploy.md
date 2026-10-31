@@ -85,6 +85,46 @@ during a rolling enable, plaintext and TLS nodes cannot talk to each other
 (connections fail closed). Certificate rotation means restarting the
 process (automatic renewal is out of scope).
 
+### Rate limiting
+
+Both control planes rate-limit requests per credential over the versioned API
+(health probes, `/metrics`, and the OIDC login flow are exempt). Buckets are
+token buckets keyed on a hashed credential: one bucket per operator
+credential or browser session, one per agent node. The bucket table is
+capacity-bounded — traffic presenting more distinct credentials than the
+bound shares one slow catch-all bucket, so a forged-credential flood cannot
+grow memory. Over-limit requests get `429` with a `Retry-After` header and
+are counted by the `arkflow_control_plane_rate_limit_rejections_total`
+metric.
+
+Hub environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ARKFLOW_RATE_LIMIT_ENABLED` | `true` | Master switch; `false` restores unlimited handling exactly. |
+| `ARKFLOW_RATE_LIMIT_PRINCIPAL_RPS` | `100` | Token refill per second per operator credential or browser session. |
+| `ARKFLOW_RATE_LIMIT_PRINCIPAL_BURST` | `200` | Burst capacity of a principal bucket. |
+| `ARKFLOW_RATE_LIMIT_NODE_RPS` | `500` | Token refill per second per agent node; must cover the register/heartbeat/report/commands/observations cadence. |
+| `ARKFLOW_RATE_LIMIT_NODE_BURST` | `1000` | Burst capacity of a node bucket. |
+
+A standalone (local-plane) node configures the same knobs under
+`health_check.control_api.rate_limit`:
+
+```yaml validate=full
+health_check:
+  control_api:
+    rate_limit:
+      enabled: true
+      principal_rps: 100
+      principal_burst: 200
+      node_rps: 500
+      node_burst: 1000
+```
+
+Defaults sit two orders of magnitude above legitimate traffic (including the
+default 1s agent polling cadence); misconfigured non-positive or non-finite
+values fall back to the defaults with a startup warning.
+
 ### Hub high availability (lease election)
 
 Multiple Hub processes can share one PostgreSQL database; a singleton lease

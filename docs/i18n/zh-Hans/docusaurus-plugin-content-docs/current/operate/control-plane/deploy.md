@@ -49,6 +49,35 @@ openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
 
 请在全部计算节点上启用 TLS 后再依赖 split 放置:滚动启用期间明文与 TLS 节点互连失败(连接 fail-closed)。证书轮换意味着重启进程(自动续期不在范围内)。
 
+### 限速
+
+两个控制面都对版本化 API 按凭证限速(健康探针、`/metrics`、OIDC 登录流豁免)。桶是以哈希凭证为键的令牌桶:每个 operator 凭证或浏览器会话一桶,每个 agent 节点一桶。桶表容量有界——呈现超过上限的不同凭证数的流量共享一个慢速 catch-all 桶,伪造凭证洪泛无法撑大内存。超限请求收到带 `Retry-After` 头的 `429`,并计入 `arkflow_control_plane_rate_limit_rejections_total` 指标。
+
+Hub 环境变量:
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ARKFLOW_RATE_LIMIT_ENABLED` | `true` | 总开关;`false` 精确恢复不限速处理。 |
+| `ARKFLOW_RATE_LIMIT_PRINCIPAL_RPS` | `100` | 每个 operator 凭证/浏览器会话的每秒令牌补充速率。 |
+| `ARKFLOW_RATE_LIMIT_PRINCIPAL_BURST` | `200` | principal 桶的突发容量。 |
+| `ARKFLOW_RATE_LIMIT_NODE_RPS` | `500` | 每个 agent 节点的每秒令牌补充速率;须覆盖 register/heartbeat/report/commands/observations 的节奏。 |
+| `ARKFLOW_RATE_LIMIT_NODE_BURST` | `1000` | node 桶的突发容量。 |
+
+standalone(本地)节点在 `health_check.control_api.rate_limit` 下配置同一组参数:
+
+```yaml validate=full
+health_check:
+  control_api:
+    rate_limit:
+      enabled: true
+      principal_rps: 100
+      principal_burst: 200
+      node_rps: 500
+      node_burst: 1000
+```
+
+默认值比合法流量(含默认 1s agent 轮询节奏)高出两个数量级;配置出非正数或非有限值时回退默认值并记录启动告警。
+
 ### Hub 高可用(租约选主)
 
 多个 Hub 进程可以共享同一个 PostgreSQL 数据库;单例租约行(`cp_hub_lease`)通过带单调围栏 epoch 的 CAS 选出唯一 leader。在指向同一数据库的每个 Hub 实例上用环境变量开启:

@@ -108,6 +108,20 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 }
 ```
 
+### 限速
+
+两个控制面都对版本化 API 施加按凭证的请求限速;健康探针、`GET /metrics` 与 OIDC 登录流豁免。桶以凭证的截断哈希为键——静态/结构化 operator 凭证按凭证分桶,OIDC 浏览器会话按会话分桶,agent 请求按节点分桶(`Authorization: Bearer` 头与旧通道 `session_token` 查询参数归入同一桶)。超出桶容量的请求在进入任何 handler 之前被拒绝:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+Content-Type: application/json
+
+{"code":"rate_limited","message":"Control-plane request rate limit exceeded; retry after the indicated interval"}
+```
+
+`Retry-After` 携带整秒补充估算。被拒请求不产生审计事件、不产生操作记录,并经 `arkflow_control_plane_rate_limit_rejections_total{plane,key_kind}` counter family 导出(`plane` 为 `local` 或 `hub`;`key_kind` 为 `principal`、`node` 或 `catch_all`——吸收超出有界桶表流量的共享桶)。配置位于节点面的 `control_api.rate_limit` 与 Hub 侧的 `ARKFLOW_RATE_LIMIT_*` 环境变量(见[部署](../operate/control-plane/deploy.md#限速))。默认开启且限值远高于合法流量;`enabled: false` 精确恢复不限速行为。
+
 ## 节点 API
 
 | 方法 | 路由 | 用途 |

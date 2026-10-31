@@ -114,6 +114,9 @@ pub(super) async fn hub_metrics(
     body.push_str(&crate::metrics::encode_families(
         crate::metrics::storage_families(),
     ));
+    body.push_str(&crate::metrics::encode_families(
+        crate::metrics::rate_limit_families(),
+    ));
     // Data-plane series reported by Agents: the kernel Job vocabulary with an
     // extra `node` label. Expired-lease nodes are excluded by the Hub.
     for (node_id, jobs) in hub.job_metrics().await {
@@ -462,7 +465,10 @@ pub(super) async fn metrics(State(cp): State<ControlPlane>) -> Response {
         .collect();
     streams.sort_by(|left, right| left.0.cmp(&right.0));
     let jobs = runtime.job_metrics().snapshots();
-    let body = crate::metrics::data_plane_exposition(&streams, &jobs);
+    let mut body = crate::metrics::data_plane_exposition(&streams, &jobs);
+    body.push_str(&crate::metrics::encode_families(
+        crate::metrics::rate_limit_families(),
+    ));
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 

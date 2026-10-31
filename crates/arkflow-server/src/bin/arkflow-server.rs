@@ -3,6 +3,34 @@ use arkflow_server::hub::{HubConfig, HubHaConfig};
 use arkflow_server::ServerConfig;
 use tokio_util::sync::CancellationToken;
 
+/// Rate-limit overrides for the Hub plane; unset variables fall back to the
+/// defaults in `arkflow_core::config::RateLimitConfig`.
+fn env_rate_limit_config() -> arkflow_core::config::RateLimitConfig {
+    use arkflow_core::config::{
+        default_node_burst, default_node_rps, default_principal_burst, default_principal_rps,
+        default_rate_limit_enabled, RateLimitConfig,
+    };
+    let flag = |name: &str| -> Option<bool> {
+        std::env::var(name)
+            .ok()
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+    };
+    let number = |name: &str| -> Option<f64> {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+    };
+    RateLimitConfig {
+        enabled: flag("ARKFLOW_RATE_LIMIT_ENABLED").unwrap_or_else(default_rate_limit_enabled),
+        principal_rps: number("ARKFLOW_RATE_LIMIT_PRINCIPAL_RPS")
+            .unwrap_or_else(default_principal_rps),
+        principal_burst: number("ARKFLOW_RATE_LIMIT_PRINCIPAL_BURST")
+            .unwrap_or_else(default_principal_burst),
+        node_rps: number("ARKFLOW_RATE_LIMIT_NODE_RPS").unwrap_or_else(default_node_rps),
+        node_burst: number("ARKFLOW_RATE_LIMIT_NODE_BURST").unwrap_or_else(default_node_burst),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
@@ -39,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .and_then(|value| value.parse().ok())
             .filter(|ttl| *ttl >= 1_000)
             .unwrap_or_else(arkflow_server::hub::default_approval_ttl_ms),
+        rate_limit: env_rate_limit_config(),
         ..ServerConfig::default()
     };
     let ha = HubHaConfig {
