@@ -346,9 +346,11 @@ See the `examples/` directory for ready-to-use configurations:
 
 ## Monitoring
 
-Key metrics to watch after enabling these optimizations:
+The WAL exports background flush-failure counters — watch for any increase:
 
-- `segment_put_latency` — should be under 200 ms p99; if higher, check region
-- `segment_put_frequency` — should drop with `aggressive` strategy
-- `cursor_lag` — should stay under 10,000 entries
-- `recovery_latency` — should be under 5 s on restart
+- `arkflow_stream_wal_flush_failures_total` — background flush failures of
+  the stream's input WAL (0 without durability)
+- `arkflow_job_wal_flush_failures_total` — background flush failures of a
+  Job's input WAL (0 without a WAL)
+
+See [Observability](../operate/observability.md) for the full metrics list.

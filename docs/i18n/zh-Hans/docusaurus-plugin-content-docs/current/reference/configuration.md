@@ -82,6 +82,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 | `metrics_path` | string | 否 | `/metrics` | Prometheus 暴露端点(格式 0.0.4)。 |
 | `ready_path` | string | 否 | `/ready` | 就绪探针:引擎完成启动所配置的流与作业后即成功。 |
 | `live_path` | string | 否 | `/live` | 存活探针:进程运行期间即成功。 |
+| `tracing` | object | 否 | — | OTel 追踪导出(OTLP HTTP-JSON;默认关闭):`enabled`、`endpoint`、`service_name`。参见[追踪](/zh-Hans/docs/operate/observability#追踪)。 |
 
 ### 独立 Hub 的启动安全
 
@@ -148,7 +149,7 @@ streams: []
 
 | 字段 | 类型 | 必填 | 默认值 | 描述 |
 |-------|------|----------|---------|-------------|
-| `thread_num` | integer | 否 | `1` | 处理器工作任务数量。 |
+| `thread_num` | integer | 否 | CPU 核数 | 处理器工作任务数量。 |
 | `processors` | array&lt;object&gt; | 是 | — | 处理器组件的有序列表。 |
 
 ## job
@@ -191,6 +192,10 @@ jobs:
 | `state` | object | 否 | — | `backend`(例如 `embedded_kv`)、`durability`(默认 `durable`,或显式 `ephemeral`)、可选的稳定 `root`(或 `ARKFLOW_STATE_ROOT`)、`namespace`、`ttl_ms`、`format_version`、`max_pending_transactions`(正数;默认 4096;当窗口看到非常高的每窗口键基数时应调大,因为每个打开的窗口组或未确认的输出都会占用一个事务)、可选的正数 `max_bytes` 活动状态预算。有状态算子必需;持久状态还要求 `checkpoint`。 |
 | `checkpoint` | object | 否 | — | `interval_ms`、`retention`、`object_store_uri`(例如 `file://...` 或 `s3://...`)。 |
 | `recovery` | string | 否 | `latest_checkpoint` | `latest_checkpoint`、`latest_savepoint` 或 `fail`。 |
+| `rescale` | boolean | 否 | `false` | 显式开启扩缩容恢复:恢复工件在不同并行度下写入时,键控状态按键组归属重分布到新任务集,而不是直接失败(参见[分布式作业](/zh-Hans/docs/build/distributed-jobs))。 |
+| `placement` | string | 否 | `colocated` | 跨计算节点的任务放置:`colocated`(默认)或 `split`(跨节点边经由 shuffle 数据面)。 |
+| `rebalance` | object | 否 | — | 显式开启的压力再均衡:节点持续上报资源压力时,Hub 会把作业迁走。缺省等同于 `off`。 |
+| `resources` | object | 否 | — | 可选的每任务资源请求(`cpu_millicores`、`memory_bytes`);声明后参与放置核算与 Agent 运行时尺寸计算。 |
 
 ### `time`(source 的事件时间声明)
 

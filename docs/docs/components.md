@@ -7,7 +7,7 @@ sidebar_position: 5
 
 # Components
 
-ArkFlow ships 41 registered components across six kinds. Every page in this
+ArkFlow ships 50 registered components across six kinds. Every page in this
 section is machine-checked against the live component registry: the type
 names, configuration schemas, and examples you see here cannot silently
 drift from the binary.

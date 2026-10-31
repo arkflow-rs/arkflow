@@ -6108,12 +6108,12 @@
         {
           "type": "object",
           "title": "session_window",
-          "description": "Groups messages into sessions based on a maximum gap between messages. Supports SQL joins across sources.",
+          "description": "Groups messages into sessions based on a maximum gap between messages.",
           "properties": {
             "type": {
               "type": "string",
               "const": "session_window",
-              "description": "Groups messages into sessions based on a maximum gap between messages. Supports SQL joins across sources."
+              "description": "Groups messages into sessions based on a maximum gap between messages."
             },
             "name": {
               "type": "string",
@@ -6315,12 +6315,12 @@
         {
           "type": "object",
           "title": "tumbling_window",
-          "description": "Fixed-size, non-overlapping time windows. Supports SQL joins across sources.",
+          "description": "Fixed-size, non-overlapping time windows.",
           "properties": {
             "type": {
               "type": "string",
               "const": "tumbling_window",
-              "description": "Fixed-size, non-overlapping time windows. Supports SQL joins across sources."
+              "description": "Fixed-size, non-overlapping time windows."
             },
             "name": {
               "type": "string",

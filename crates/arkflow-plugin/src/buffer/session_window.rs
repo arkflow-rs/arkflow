@@ -202,7 +202,7 @@ pub fn init() -> Result<(), Error> {
     register_buffer_builder("session_window", Arc::new(SessionWindowBuilder))?;
     register_buffer_metadata(ComponentMetadata::with_schema(
         "session_window",
-        "Groups messages into sessions based on a maximum gap between messages. Supports SQL joins across sources.",
+        "Groups messages into sessions based on a maximum gap between messages.",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,

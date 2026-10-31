@@ -83,12 +83,15 @@ contract above.
 
 ## Single-node boundary
 
-The durable WAL lives on the local disk of the node running the stream. It
-protects against **process crashes** (kill, panic, power loss to the process),
-not against the loss of the node itself (disk failure, host termination). High
-availability across nodes (replicated WAL / consensus) is out of scope. For
-HA-grade durability, run on replicated storage or front the stream with a
-durable, replayable source (e.g. Kafka).
+The durable WAL protects against **process crashes** (kill, panic, power loss
+to the process). With the default local (`redb`) backend it lives on the
+local disk of the node running the stream, so the loss of the node itself
+(disk failure, host termination) also loses the WAL; the object-store backend
+(see [WAL](./wal.md)) persists segments and the manifest to S3-compatible
+storage, surviving node loss. High availability across nodes (replicated WAL
+/ consensus) is out of scope. For HA-grade durability with the local backend,
+run on replicated storage or front the stream with a durable, replayable
+source (e.g. Kafka).
 
 ## S3 WAL manifest write coordination
 
