@@ -125,12 +125,14 @@ async fn hub_operator_credential_enforcement_matches_the_auth_path() {
         approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
     };
     assert!(!hub::Hub::new(base.clone()).operator_credential_enforced());
-    // A whitespace token is treated as absent by the auth path too.
+    // A blank token skips the credential-free branch entirely: the legacy
+    // path only applies when `operator_token` is None, so authentication
+    // still requires the OIDC path here.
     let blank = hub::HubConfig {
         operator_token: Some("   ".into()),
         ..base.clone()
     };
-    assert!(!hub::Hub::new(blank).operator_credential_enforced());
+    assert!(hub::Hub::new(blank).operator_credential_enforced());
     let static_token = hub::HubConfig {
         operator_token: Some("operator-secret".into()),
         ..base.clone()

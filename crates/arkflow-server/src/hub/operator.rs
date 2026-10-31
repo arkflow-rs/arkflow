@@ -11,16 +11,13 @@ impl Hub {
     }
 
     /// Whether operator authentication actually rejects requests without a
-    /// valid credential. Mirrors `operator_principal`: with no static token
-    /// configured, an `insecure_local` Hub authenticates every request as
-    /// the legacy operator before any OIDC check, so a presented Bearer
-    /// value is not an identity there.
+    /// valid credential. Mirrors `operator_principal`: the credential-free
+    /// legacy-operator branch runs only when no `operator_token` is
+    /// configured at all and `insecure_local` is opted in — a blank token
+    /// matches the outer `if let` and skips that branch, so authentication
+    /// still requires the OIDC path there.
     pub fn operator_credential_enforced(&self) -> bool {
-        self.config
-            .operator_token
-            .as_deref()
-            .is_some_and(|token| !token.trim().is_empty())
-            || !self.config.insecure_local
+        self.config.operator_token.is_some() || !self.config.insecure_local
     }
 
     pub async fn operator_principal(&self, supplied: Option<&str>) -> Option<OperatorPrincipal> {
