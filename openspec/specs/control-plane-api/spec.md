@@ -130,7 +130,6 @@ The job upgrade endpoint SHALL accept an atomic mode that performs savepoint, ve
 - **WHEN** ${file:~/.ssh/id_rsa} 或 ${file:relative/path} 引用被解析
 - **THEN** 解析以显式错误失败
 
-
 ### Requirement: Server module reorganization SHALL preserve the API surface and agent entry points
 控制面服务端内部模块结构的重组（handler 按路由域拆分到 `api/`、Agent 按关注点拆分到 `agent/`）SHALL 保持对外行为与公共入口不变：`router`/`hub_router`/`observability_router`/`serve`/`serve_hub` 与 `agent::run` 等公共函数的路径与签名 SHALL 不因内部重组而变化，全部路由（本地 API 与 Hub API）的 HTTP 契约 SHALL 原样保持，Agent 命令分发的字符串协议 SHALL 逐字不变。
 
@@ -141,3 +140,23 @@ The job upgrade endpoint SHALL accept an atomic mode that performs savepoint, ve
 #### Scenario: Agent 拆分后命令协议不变
 - **WHEN** agent.rs 被重组进 `agent/` 目录模块
 - **THEN** Hub 下发的字符串命令（job_start/job_stop/job_checkpoint/validate_configuration 等）的匹配与执行语义逐字不变
+
+### Requirement: System identity echoes the authenticated principal
+
+The `/system` endpoint on both the Hub plane and the local plane SHALL include an optional `principal` object `{ id, roles, actions }` describing the principal authenticated for the current request, where `actions` lists every operator action the principal is authorized for under the same predicate that enforces mutations. Requests without valid credentials on a plane that requires them SHALL be rejected with 401 before any identity is echoed; when a response is nevertheless produced without a resolvable principal, the field SHALL be null-shaped (`principal: null`) rather than omitted. The field SHALL be additive: consumers that do not know it MUST be able to ignore it without behavior change.
+
+#### Scenario: Structured credential session
+
+- **WHEN** a request authenticates with a structured operator credential holding the viewer role
+- **THEN** `/system` echoes that credential's principal id, the viewer role, and exactly the actions the viewer role authorizes
+
+#### Scenario: Unauthenticated probe
+
+- **WHEN** `/system` is requested without valid credentials on a plane that requires them
+- **THEN** the request is rejected with 401 and no identity is disclosed
+
+#### Scenario: Echo and enforcement cannot diverge
+
+- **WHEN** an echoed `actions` list includes an action
+- **THEN** authorizing a mutation that requires that action uses the same principal predicate, so the echo is never stale relative to enforcement for the same request's principal
+
