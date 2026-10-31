@@ -62,12 +62,19 @@ fn rewrite_sql(sql: &str) -> String {
 #[derive(Clone)]
 pub(crate) enum PgVal {
     /// Typed NULL: bound as text. Every NULL produced from an `Option`
-    /// numeric field must use `NullInt` instead — a text-typed parameter
-    /// sent to a bigint column fails PostgreSQL's strict prepared-statement
-    /// type check (SQLSTATE 42804).
+    /// numeric field must use one of the typed NULL variants instead — a
+    /// text-typed parameter sent to a bigint/float8/boolean/bytea column
+    /// fails PostgreSQL's strict prepared-statement type check
+    /// (SQLSTATE 42804).
     Null,
     /// Typed NULL bound as bigint, for `Option<i64/u64/u32>` fields.
     NullInt,
+    /// Typed NULL bound as float8.
+    NullReal,
+    /// Typed NULL bound as boolean.
+    NullBool,
+    /// Typed NULL bound as bytea.
+    NullBytes,
     Text(String),
     Int(i64),
     Real(f64),
@@ -252,6 +259,9 @@ fn push_arguments(vals: &[PgVal]) -> PgArguments {
         let _ = match val {
             PgVal::Null => args.add(Option::<String>::None),
             PgVal::NullInt => args.add(Option::<i64>::None),
+            PgVal::NullReal => args.add(Option::<f64>::None),
+            PgVal::NullBool => args.add(Option::<bool>::None),
+            PgVal::NullBytes => args.add(Option::<Vec<u8>>::None),
             PgVal::Text(s) => args.add(s.clone()),
             PgVal::Int(v) => args.add(*v),
             PgVal::Real(v) => args.add(*v),
