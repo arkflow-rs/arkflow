@@ -658,10 +658,16 @@ mod tests {
 
         #[tokio::test]
         async fn unauthenticated_local_mode_shares_one_anonymous_bucket() {
+            // One token per 10 seconds: a CI scheduling pause between the
+            // sequential oneshot requests must never refill the bucket
+            // mid-test, which a fast refill rate would allow.
+            let mut config = tiny_config();
+            config.principal_rps = 0.1;
+            config.node_rps = 0.1;
             // No operator credential is enforced: a presented Bearer value is
             // not an identity, so rotating the header must not mint fresh
             // buckets — every caller draws from the anonymous bucket.
-            let app = test_app(&tiny_config(), false);
+            let app = test_app(&config, false);
             let first = send(app.clone(), "/status", Some("rotation-1")).await;
             assert_eq!(first.status(), StatusCode::OK);
             let second = send(app.clone(), "/status", Some("rotation-2")).await;

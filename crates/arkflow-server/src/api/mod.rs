@@ -769,7 +769,7 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         rate_limit::RateLimiter::new(
             rate_limit::Plane::Hub,
             &config.rate_limit,
-            hub.static_operator_identity_count() > 0 || hub.oidc_is_configured(),
+            hub.operator_credential_enforced(),
         ),
         rate_limit::rate_limit_middleware,
     ))
