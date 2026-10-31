@@ -107,18 +107,29 @@ fn record_rejection(plane: Plane, kind: KeyKind) {
     REJECTIONS[plane as usize][kind as usize].fetch_add(1, Ordering::Relaxed);
 }
 
+/// One bounded bucket table per key space. Agent routes are unauthenticated,
+/// so forging millions of node credentials must not be able to saturate the
+/// table that operator credentials live in: each space gets its own bound and
+/// its own catch-all lane.
+struct KeySpace {
+    limit: ClassLimit,
+    kind: KeyKind,
+    buckets: Mutex<HashMap<Key, Bucket>>,
+}
+
 pub struct RateLimiter {
     plane: Plane,
     enabled: bool,
-    principal: ClassLimit,
-    node: ClassLimit,
-    buckets: Mutex<HashMap<Key, Bucket>>,
+    operator: KeySpace,
+    node: KeySpace,
 }
 
 impl RateLimiter {
     /// Build a limiter. Non-finite or non-positive rates are clamped to the
     /// defaults with a startup warning: a misconfigured limit must fail
     /// closed (protective) rather than divide by zero or lock everything out.
+    /// A burst below one token can never admit a request (`consume` needs
+    /// `tokens >= 1.0`), so bursts clamp up to 1.0 instead.
     pub fn new(plane: Plane, config: &arkflow_core::config::RateLimitConfig) -> Arc<Self> {
         let defaults = arkflow_core::config::RateLimitConfig::default();
         let clamp = |value: f64, fallback: f64, name: &str| {
@@ -134,26 +145,35 @@ impl RateLimiter {
                 fallback
             }
         };
+        let clamp_burst =
+            |value: f64, fallback: f64, name: &str| clamp(value, fallback, name).max(1.0);
         Arc::new(Self {
             plane,
             enabled: config.enabled,
-            principal: ClassLimit {
-                rps: clamp(
-                    config.principal_rps,
-                    defaults.principal_rps,
-                    "principal_rps",
-                ),
-                burst: clamp(
-                    config.principal_burst,
-                    defaults.principal_burst,
-                    "principal_burst",
-                ),
+            operator: KeySpace {
+                limit: ClassLimit {
+                    rps: clamp(
+                        config.principal_rps,
+                        defaults.principal_rps,
+                        "principal_rps",
+                    ),
+                    burst: clamp_burst(
+                        config.principal_burst,
+                        defaults.principal_burst,
+                        "principal_burst",
+                    ),
+                },
+                kind: KeyKind::Principal,
+                buckets: Mutex::new(HashMap::new()),
             },
-            node: ClassLimit {
-                rps: clamp(config.node_rps, defaults.node_rps, "node_rps"),
-                burst: clamp(config.node_burst, defaults.node_burst, "node_burst"),
+            node: KeySpace {
+                limit: ClassLimit {
+                    rps: clamp(config.node_rps, defaults.node_rps, "node_rps"),
+                    burst: clamp_burst(config.node_burst, defaults.node_burst, "node_burst"),
+                },
+                kind: KeyKind::Node,
+                buckets: Mutex::new(HashMap::new()),
             },
-            buckets: Mutex::new(HashMap::new()),
         })
     }
 
@@ -161,14 +181,13 @@ impl RateLimiter {
         self.enabled
     }
 
-    /// Admit one request presented under `space`-prefixed credential
+    /// Admit one request against a key space under `space`-prefixed
     /// `credential` (None = anonymous). Returns the refill wait on rejection.
     fn admit(
         &self,
         space: &str,
         credential: Option<&str>,
-        mut limit: ClassLimit,
-        mut kind: KeyKind,
+        keyspace: &KeySpace,
         now: Instant,
     ) -> Result<(), Duration> {
         if !self.enabled {
@@ -178,29 +197,27 @@ impl RateLimiter {
             Some(credential) if !credential.is_empty() => credential_key(space, credential),
             _ => Key::anonymous(),
         };
-        {
-            let mut buckets = self.buckets.lock().expect("rate limiter mutex");
-            if !buckets.contains_key(&key) && buckets.len() >= MAX_BUCKETS {
-                let window = limit.idle_window();
-                buckets.retain(|_, bucket| now.duration_since(bucket.last_refill) < window);
-                if buckets.len() >= MAX_BUCKETS && key != Key::catch_all() {
-                    // Table still saturated after reclamation: unidentified
-                    // traffic shares one slow lane instead of growing memory.
-                    kind = KeyKind::CatchAll;
-                    limit = self.principal;
-                    let bucket = buckets.entry(Key::catch_all()).or_insert_with(|| Bucket {
-                        tokens: limit.burst,
-                        last_refill: now,
-                    });
-                    return Self::consume(bucket, limit, self.plane, kind, now);
-                }
+        let mut kind = keyspace.kind;
+        let mut buckets = keyspace.buckets.lock().expect("rate limiter mutex");
+        if !buckets.contains_key(&key) && buckets.len() >= MAX_BUCKETS {
+            let window = keyspace.limit.idle_window();
+            buckets.retain(|_, bucket| now.duration_since(bucket.last_refill) < window);
+            if buckets.len() >= MAX_BUCKETS && key != Key::catch_all() {
+                // Table still saturated after reclamation: unidentified
+                // traffic shares one slow lane instead of growing memory.
+                kind = KeyKind::CatchAll;
+                let bucket = buckets.entry(Key::catch_all()).or_insert_with(|| Bucket {
+                    tokens: keyspace.limit.burst,
+                    last_refill: now,
+                });
+                return Self::consume(bucket, keyspace.limit, self.plane, kind, now);
             }
-            let bucket = buckets.entry(key).or_insert_with(|| Bucket {
-                tokens: limit.burst,
-                last_refill: now,
-            });
-            Self::consume(bucket, limit, self.plane, kind, now)
         }
+        let bucket = buckets.entry(key).or_insert_with(|| Bucket {
+            tokens: keyspace.limit.burst,
+            last_refill: now,
+        });
+        Self::consume(bucket, keyspace.limit, self.plane, kind, now)
     }
 
     fn consume(
@@ -224,10 +241,11 @@ impl RateLimiter {
     }
 }
 
-/// Inner-router paths exempt from limiting, mirroring the operator-auth
-/// exemption: the OIDC login flow must stay reachable under credential
-/// floods. Health probes and metrics are outer-router paths and never reach
-/// this middleware.
+/// Inner-router paths exempt from limiting. The OIDC login flow must stay
+/// reachable under credential floods (prefix match, like the auth exemption);
+/// `/metrics` is the metrics export registered inside both versioned routers
+/// — matched exactly so no future route sharing the prefix inherits the
+/// exemption. Outer-router health probes never reach this middleware.
 const RATE_LIMIT_EXEMPT: &[&str] = &["/auth/oidc/"];
 
 /// Agent requests present the node credential via the Bearer header; the
@@ -284,31 +302,20 @@ pub async fn rate_limit_middleware(
         return next.run(request).await;
     }
     let path = request.uri().path();
-    if RATE_LIMIT_EXEMPT
-        .iter()
-        .any(|exempt| path.starts_with(exempt))
+    if path == "/metrics"
+        || RATE_LIMIT_EXEMPT
+            .iter()
+            .any(|exempt| path.starts_with(exempt))
     {
         return next.run(request).await;
     }
     let now = Instant::now();
     let outcome = if path.starts_with("/agent/") {
         let credential = agent_credential(&request);
-        limiter.admit(
-            "node",
-            credential.as_deref(),
-            limiter.node,
-            KeyKind::Node,
-            now,
-        )
+        limiter.admit("node", credential.as_deref(), &limiter.node, now)
     } else {
         let credential = super::bearer(request.headers());
-        limiter.admit(
-            "operator",
-            credential.as_deref(),
-            limiter.principal,
-            KeyKind::Principal,
-            now,
-        )
+        limiter.admit("operator", credential.as_deref(), &limiter.operator, now)
     };
     match outcome {
         Ok(()) => next.run(request).await,
@@ -358,23 +365,11 @@ mod tests {
         let now = base();
         for _ in 0..3 {
             assert!(limiter
-                .admit(
-                    "operator",
-                    Some("a"),
-                    limiter.principal,
-                    KeyKind::Principal,
-                    now
-                )
+                .admit("operator", Some("a"), &limiter.operator, now)
                 .is_ok());
         }
         assert!(limiter
-            .admit(
-                "operator",
-                Some("a"),
-                limiter.principal,
-                KeyKind::Principal,
-                now
-            )
+            .admit("operator", Some("a"), &limiter.operator, now)
             .is_err());
     }
 
@@ -383,33 +378,15 @@ mod tests {
         let limiter = limiter();
         let now = base();
         for _ in 0..3 {
-            let _ = limiter.admit(
-                "operator",
-                Some("a"),
-                limiter.principal,
-                KeyKind::Principal,
-                now,
-            );
+            let _ = limiter.admit("operator", Some("a"), &limiter.operator, now);
         }
         assert!(limiter
-            .admit(
-                "operator",
-                Some("a"),
-                limiter.principal,
-                KeyKind::Principal,
-                now
-            )
+            .admit("operator", Some("a"), &limiter.operator, now)
             .is_err());
         // 10 rps refills one token in 100ms.
         let later = now + Duration::from_millis(100);
         assert!(limiter
-            .admit(
-                "operator",
-                Some("a"),
-                limiter.principal,
-                KeyKind::Principal,
-                later
-            )
+            .admit("operator", Some("a"), &limiter.operator, later)
             .is_ok());
     }
 
@@ -418,31 +395,13 @@ mod tests {
         let limiter = limiter();
         let now = base();
         for _ in 0..3 {
-            let _ = limiter.admit(
-                "operator",
-                Some("a"),
-                limiter.principal,
-                KeyKind::Principal,
-                now,
-            );
+            let _ = limiter.admit("operator", Some("a"), &limiter.operator, now);
         }
         assert!(limiter
-            .admit(
-                "operator",
-                Some("a"),
-                limiter.principal,
-                KeyKind::Principal,
-                now
-            )
+            .admit("operator", Some("a"), &limiter.operator, now)
             .is_err());
         assert!(limiter
-            .admit(
-                "operator",
-                Some("b"),
-                limiter.principal,
-                KeyKind::Principal,
-                now
-            )
+            .admit("operator", Some("b"), &limiter.operator, now)
             .is_ok());
     }
 
@@ -453,15 +412,15 @@ mod tests {
         // The middleware delivers the same token string from either channel,
         // so the limiter keys both on the token alone.
         for _ in 0..3 {
-            let _ = limiter.admit("node", Some("token-1"), limiter.node, KeyKind::Node, now);
+            let _ = limiter.admit("node", Some("token-1"), &limiter.node, now);
         }
         assert!(limiter
-            .admit("node", Some("token-1"), limiter.node, KeyKind::Node, now)
+            .admit("node", Some("token-1"), &limiter.node, now)
             .is_err());
         assert!(limiter
-            .admit("node", Some("token-2"), limiter.node, KeyKind::Node, now)
+            .admit("node", Some("token-2"), &limiter.node, now)
             .is_ok());
-        let buckets = limiter.buckets.lock().unwrap();
+        let buckets = limiter.node.buckets.lock().unwrap();
         assert_eq!(buckets.len(), 2);
         assert!(buckets.contains_key(&credential_key("node", "token-1")));
     }
@@ -471,19 +430,13 @@ mod tests {
         let limiter = limiter();
         let now = base();
         for _ in 0..3 {
-            let _ = limiter.admit("operator", None, limiter.principal, KeyKind::Principal, now);
+            let _ = limiter.admit("operator", None, &limiter.operator, now);
         }
         assert!(limiter
-            .admit("operator", None, limiter.principal, KeyKind::Principal, now)
+            .admit("operator", None, &limiter.operator, now)
             .is_err());
         assert!(limiter
-            .admit(
-                "operator",
-                Some(""),
-                limiter.principal,
-                KeyKind::Principal,
-                now
-            )
+            .admit("operator", Some(""), &limiter.operator, now)
             .is_err());
     }
 
@@ -495,8 +448,7 @@ mod tests {
             let _ = limiter.admit(
                 "operator",
                 Some(format!("credential-{index}").as_str()),
-                limiter.principal,
-                KeyKind::Principal,
+                &limiter.operator,
                 now,
             );
         }
@@ -504,26 +456,14 @@ mod tests {
         // A fresh identity must be served from the catch-all bucket and
         // counted as such; the catch-all has the same burst, so exhaust it.
         for _ in 0..4 {
-            let _ = limiter.admit(
-                "operator",
-                Some("stranger"),
-                limiter.principal,
-                KeyKind::Principal,
-                now,
-            );
+            let _ = limiter.admit("operator", Some("stranger"), &limiter.operator, now);
         }
         assert!(rejection_total(Plane::Local, KeyKind::CatchAll) > before);
         // All strangers share the one catch-all bucket.
         assert!(limiter
-            .admit(
-                "operator",
-                Some("other-stranger"),
-                limiter.principal,
-                KeyKind::Principal,
-                now
-            )
+            .admit("operator", Some("other-stranger"), &limiter.operator, now)
             .is_err());
-        let buckets = limiter.buckets.lock().unwrap();
+        let buckets = limiter.operator.buckets.lock().unwrap();
         assert_eq!(buckets.len(), MAX_BUCKETS + 1);
     }
 
@@ -535,21 +475,14 @@ mod tests {
             let _ = limiter.admit(
                 "operator",
                 Some(format!("credential-{index}").as_str()),
-                limiter.principal,
-                KeyKind::Principal,
+                &limiter.operator,
                 start,
             );
         }
         // The idle window at these defaults is 2 × 3/10 = 0.6s.
         let later = start + Duration::from_secs(1);
-        let _ = limiter.admit(
-            "operator",
-            Some("fresh"),
-            limiter.principal,
-            KeyKind::Principal,
-            later,
-        );
-        let buckets = limiter.buckets.lock().unwrap();
+        let _ = limiter.admit("operator", Some("fresh"), &limiter.operator, later);
+        let buckets = limiter.operator.buckets.lock().unwrap();
         assert!(buckets.len() < MAX_BUCKETS);
         assert!(buckets.contains_key(&credential_key("operator", "fresh")));
     }
@@ -562,13 +495,7 @@ mod tests {
         let now = base();
         for _ in 0..100 {
             assert!(limiter
-                .admit(
-                    "operator",
-                    Some("a"),
-                    limiter.principal,
-                    KeyKind::Principal,
-                    now
-                )
+                .admit("operator", Some("a"), &limiter.operator, now)
                 .is_ok());
         }
     }
@@ -582,8 +509,62 @@ mod tests {
         config.principal_rps = 0.0;
         config.node_burst = f64::NAN;
         let limiter = RateLimiter::new(Plane::Local, &config);
-        assert_eq!(limiter.principal.rps, defaults.principal_rps);
-        assert_eq!(limiter.node.burst, defaults.node_burst);
+        assert_eq!(limiter.operator.limit.rps, defaults.principal_rps);
+        assert_eq!(limiter.node.limit.burst, defaults.node_burst);
+    }
+
+    #[test]
+    fn burst_below_one_token_clamps_up() {
+        let mut config = config();
+        config.principal_burst = 0.5;
+        let limiter = RateLimiter::new(Plane::Local, &config);
+        assert_eq!(limiter.operator.limit.burst, 1.0);
+        let now = base();
+        // Exactly one request fits; the bucket is not a permanent lockout.
+        assert!(limiter
+            .admit("operator", Some("a"), &limiter.operator, now)
+            .is_ok());
+        assert!(limiter
+            .admit("operator", Some("a"), &limiter.operator, now)
+            .is_err());
+        let later = now + Duration::from_millis(100);
+        assert!(limiter
+            .admit("operator", Some("a"), &limiter.operator, later)
+            .is_ok());
+    }
+
+    #[test]
+    fn saturated_node_table_does_not_evict_operators() {
+        // Agent routes are unauthenticated: a forged-credential flood must
+        // stay contained in the node key space and never push operator
+        // credentials into the shared catch-all lane.
+        let limiter = limiter();
+        let now = base();
+        assert!(limiter
+            .admit("operator", Some("ops"), &limiter.operator, now)
+            .is_ok());
+        for index in 0..MAX_BUCKETS {
+            let _ = limiter.admit(
+                "node",
+                Some(format!("forged-{index}").as_str()),
+                &limiter.node,
+                now,
+            );
+        }
+        // Node space is saturated; fresh node identities hit its catch-all.
+        let before = rejection_total(Plane::Local, KeyKind::CatchAll);
+        for _ in 0..4 {
+            let _ = limiter.admit("node", Some("more-forged"), &limiter.node, now);
+        }
+        assert!(rejection_total(Plane::Local, KeyKind::CatchAll) > before);
+        // The operator space is untouched: a fresh operator credential gets
+        // its own bucket, not the catch-all lane.
+        assert!(limiter
+            .admit("operator", Some("fresh-ops"), &limiter.operator, now)
+            .is_ok());
+        let operators = limiter.operator.buckets.lock().unwrap();
+        assert!(operators.contains_key(&credential_key("operator", "fresh-ops")));
+        assert!(!operators.contains_key(&Key::catch_all()));
     }
 
     #[test]
@@ -591,11 +572,11 @@ mod tests {
         let limiter = RateLimiter::new(Plane::Hub, &config());
         let now = base();
         for _ in 0..3 {
-            let _ = limiter.admit("node", Some("n"), limiter.node, KeyKind::Node, now);
+            let _ = limiter.admit("node", Some("n"), &limiter.node, now);
         }
         let before = rejection_total(Plane::Hub, KeyKind::Node);
         assert!(limiter
-            .admit("node", Some("n"), limiter.node, KeyKind::Node, now)
+            .admit("node", Some("n"), &limiter.node, now)
             .is_err());
         assert_eq!(rejection_total(Plane::Hub, KeyKind::Node), before + 1);
     }
@@ -686,6 +667,20 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::OK);
                 assert_eq!(body_text(response).await, "handler-ran");
             }
+        }
+
+        #[tokio::test]
+        async fn metrics_export_is_exempt_from_limiting() {
+            let app = test_app(&tiny_config());
+            // Exhaust the principal bucket first: /metrics must stay
+            // reachable regardless.
+            let first = send(app.clone(), "/status", Some("cred")).await;
+            assert_eq!(first.status(), StatusCode::OK);
+            let second = send(app.clone(), "/status", Some("cred")).await;
+            assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+            let metrics = send(app, "/metrics", Some("cred")).await;
+            assert_eq!(metrics.status(), StatusCode::OK);
+            assert_eq!(body_text(metrics).await, "handler-ran");
         }
 
         #[tokio::test]

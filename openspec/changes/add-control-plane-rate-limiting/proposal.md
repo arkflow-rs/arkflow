@@ -12,7 +12,7 @@
   - 本地面：按 bearer 凭证分桶，未配置凭证（loopback/insecure_local）共享单桶。
 - **429 拒绝**：problem+json（`rate_limited`）+ `Retry-After`（向上取整秒）；被拒请求不进 handler、不计审计（噪声）。
 - **桶容量有界**：追踪桶数上限（常量，溢出 key 共享一个 catch-all 桶），防高频伪造凭证把桶表打爆成内存 DoS。
-- **配置**：`control_api.rate_limit` / Hub 侧同构节——`enabled`（默认 `true`）、`principal_rps`+`principal_burst`（默认 100/200）、`node_rps`+`node_burst`（默认 500/1000，须覆盖默认 1s 轮询 `api/mod.rs:338` 下 register/heartbeat/report/commands/observations 的合法速率，富余 2 个数量级）。默认开启 + 富余默认值 = 正常部署无感；`enabled: false` 一键回退旧行为。
+- **配置**：`health_check.rate_limit`（control_api 节 flatten 并入 health_check）/ Hub 侧同构节——`enabled`（默认 `true`）、`principal_rps`+`principal_burst`（默认 100/200）、`node_rps`+`node_burst`（默认 500/1000，须覆盖默认 1s 轮询 `api/mod.rs:338` 下 register/heartbeat/report/commands/observations 的合法速率，富余 2 个数量级）。默认开启 + 富余默认值 = 正常部署无感；`enabled: false` 一键回退旧行为。
 - **指标**：`arkflow_control_plane_rate_limit_rejections_total{plane,key_kind}` counter，接入既有 metrics 渲染（`metrics.rs` storage_families 先例）。
 - **边界**：健康探针、`/metrics`、OIDC 登录流在外层路由或豁免清单（`api/mod.rs:551`），保持现状不限额（监控与准入通道不被限速器误伤）。
 

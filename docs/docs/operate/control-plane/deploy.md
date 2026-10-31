@@ -112,8 +112,7 @@ A standalone (local-plane) node configures the same knobs under
 
 ```yaml validate=full
 health_check:
-  control_api:
-    rate_limit:
+  rate_limit:
       enabled: true
       principal_rps: 100
       principal_burst: 200

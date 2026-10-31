@@ -83,13 +83,13 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 
 ### 分页
 
-集合端点返回:
+分页的集合端点(`/nodes`、`/streams`、`/operations`、`/events`、`/audit`)返回:
 
 ```json
 {"items": [], "page": 1, "page_size": 50, "total": 0}
 ```
 
-`page_size` 上限为 100。操作列表支持 `node_id`、`resource_id`、`operation`、`state` 与 `correlation_id` 过滤。请使用 `intent_id` 与 `generation` 作为稳定的对账依据,不要假设某个命令 ID 代表最终成功。
+`page_size` 上限为 100。其余集合端点(`/jobs`、`/rollouts`、`/config-approvals`)返回纯数组,`GET /webhooks` 则把列表包在 `{"subscriptions": [...]}` 中。操作列表支持 `node_id`、`resource_id`、`operation`、`state` 与 `correlation_id` 过滤。请使用 `intent_id` 与 `generation` 作为稳定的对账依据,不要假设某个命令 ID 代表最终成功。
 
 ### 问题信封
 
@@ -120,7 +120,7 @@ Content-Type: application/json
 {"code":"rate_limited","message":"Control-plane request rate limit exceeded; retry after the indicated interval"}
 ```
 
-`Retry-After` 携带整秒补充估算。被拒请求不产生审计事件、不产生操作记录,并经 `arkflow_control_plane_rate_limit_rejections_total{plane,key_kind}` counter family 导出(`plane` 为 `local` 或 `hub`;`key_kind` 为 `principal`、`node` 或 `catch_all`——吸收超出有界桶表流量的共享桶)。配置位于节点面的 `control_api.rate_limit` 与 Hub 侧的 `ARKFLOW_RATE_LIMIT_*` 环境变量(见[部署](../operate/control-plane/deploy.md#限速))。默认开启且限值远高于合法流量;`enabled: false` 精确恢复不限速行为。
+`Retry-After` 携带整秒补充估算。被拒请求不产生审计事件、不产生操作记录,并经 `arkflow_control_plane_rate_limit_rejections_total{plane,key_kind}` counter family 导出(`plane` 为 `local` 或 `hub`;`key_kind` 为 `principal`、`node` 或 `catch_all`——吸收超出有界桶表流量的共享桶)。配置位于节点面的 `health_check.rate_limit`(control-API 节以 flatten 形态并入 `health_check`)与 Hub 侧的 `ARKFLOW_RATE_LIMIT_*` 环境变量(见[部署](../operate/control-plane/deploy.md#限速))。默认开启且限值远高于合法流量;`enabled: false` 精确恢复不限速行为。
 
 ## 节点 API
 
@@ -170,6 +170,8 @@ Content-Type: application/json
 | `GET`/`POST` | `/jobs/{id}/checkpoints` | 列出恢复工件 / 触发一次屏障检查点。 |
 | `GET`/`POST` | `/jobs/{id}/savepoints` | 列出工件 / 触发一次保存点(savepoint)。 |
 | `POST` | `/jobs/{id}/upgrades` | 升级到新版本(作业必须已停止且已收敛)。 |
+| `GET` | `/jobs/{id}/upgrades/{upgrade_id}` | 升级状态:阶段、保存点、超时、最近错误。 |
+| `POST` | `/jobs/{id}/upgrades/{upgrade_id}/actions` | 升级操作:`pause`、`resume`、`cancel`、`rollback`。 |
 | `POST` | `/jobs/{id}/upgrades/{upgrade_id}/rollback` | 回滚到兼容的保存点。 |
 | `POST` | `/jobs/{id}/actions/{action}` | 一次性操作,生命周期语义与流操作等价。 |
 
@@ -262,6 +264,17 @@ HMAC-SHA256)。完整契约参见
 曾应用到受影响节点时才豁免审批。
 
 这些路由背后的状态机参见[对账式灰度发布与恢复](/zh-Hans/docs/operate/control-plane/reconciliation)。
+
+### 登录会话(OIDC)
+
+当 Hub 配置了 OIDC 提供方时(参见[部署](/zh-Hans/docs/operate/control-plane/deploy#oidc-jwt-联邦)),操作员 API 还会提供一个浏览器登录流:
+
+| 方法 | 路由 | 用途 |
+|--------|-------|---------|
+| `GET` | `/auth/oidc/status` | 公开探测端点,报告 `login_enabled`、`authenticated` 与当前主体。 |
+| `GET` | `/auth/oidc/login` | 302 跳转到身份提供方(PKCE S256 与 `nonce` 绑定到 HttpOnly cookie)。 |
+| `GET` | `/auth/oidc/callback` | 用 code 换取 id_token 并创建服务端会话。 |
+| `GET` | `/auth/oidc/logout` | 删除服务端会话并清除 cookie。 |
 
 ### 发现与指标
 

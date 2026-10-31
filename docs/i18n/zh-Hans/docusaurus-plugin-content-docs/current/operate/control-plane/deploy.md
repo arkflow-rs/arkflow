@@ -67,8 +67,7 @@ standalone(本地)节点在 `health_check.control_api.rate_limit` 下配置同�
 
 ```yaml validate=full
 health_check:
-  control_api:
-    rate_limit:
+  rate_limit:
       enabled: true
       principal_rps: 100
       principal_burst: 200

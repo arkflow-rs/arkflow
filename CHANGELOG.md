@@ -10,7 +10,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added — Control plane
 
 - Per-credential request rate limiting on both control planes
-  (`control_api.rate_limit` / `ARKFLOW_RATE_LIMIT_*`): token buckets keyed on
+  (`health_check.rate_limit` / `ARKFLOW_RATE_LIMIT_*`): token buckets keyed on
   a hashed credential (per operator credential or browser session, per agent
   node; Bearer and legacy query-token channels share one node bucket),
   capacity-bounded bucket table with a catch-all lane, `429` + `Retry-After`

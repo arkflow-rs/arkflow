@@ -21,7 +21,7 @@
 - **D3 中间件位置 = 认证层内侧、版本化前缀内**：本地挂 `.route_layer`（认证之后，复用同一分桶逻辑）；Hub 挂 operator 认证层内侧 + **agent 路由独立覆盖**——agent 路由豁免 operator 认证（`OPERATOR_AUTH_EXEMPT`），限速中间件按路径前缀切换键空间（`/agent/` → node 桶，其余 → principal 桶），豁免清单（健康探针/metrics/OIDC 登录）不经过限速器，与今日认证豁免边界逐位一致。
 - **D4 429 = problem+json `rate_limited` + `Retry-After`（向上取整秒）**：复用既有 `problem()` 助手形状；不审计、不计入操作历史。
 - **D5 桶表有界**：常量 `MAX_BUCKETS = 1024`（256 节点上限 × 4 富余）。满时新 key 落入共享 catch-all 桶（按 `principal_rps` 计），使伪造海量凭证的洪泛退化为共享慢通道而非内存增长；既有桶惰性淘汰（重置时刻超过 `burst/rps` × 2 未活动即回收，随请求路径顺带清扫，不 spawn 后台任务）。
-- **D6 配置节 serde default 双向兼容**：`ServerConfig.rate_limit: RateLimitConfig { enabled: bool = true, principal_rps: u32 = 100, principal_burst: u32 = 200, node_rps: u32 = 500, node_burst: u32 = 1000 }`。Hub 与本地面同构读取；默认值论证：人机交互 ≤1 rps，脚本 ≤10 rps，100 rps 已是 10× 富余；node 面覆盖 poll(1s)+heartbeat+report+per-job observations，500 rps 富余 2 个数量级。
+- **D6 配置节 serde default 双向兼容**：`ServerConfig.rate_limit: RateLimitConfig { enabled: bool = true, ... }`，本地 YAML 暴露为 `health_check.rate_limit`（`control_api` 经 serde flatten 并入 `health_check`，无独立嵌套层）。Hub 与本地面同构读取；默认值论证：人机交互 ≤1 rps，脚本 ≤10 rps，100 rps 已是 10× 富余；node 面覆盖 poll(1s)+heartbeat+report+per-job observations，500 rps 富余 2 个数量级。
 - **D7 指标**：限速器持 `AtomicU64`（plane × key_kind 三态：`principal`/`node`/`catch_all`），`metrics.rs` 新 family `arkflow_control_plane_rate_limit_rejections_total`，低基数标签封闭。
 
 ## Risks / Trade-offs

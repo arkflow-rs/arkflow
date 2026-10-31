@@ -4,21 +4,39 @@ use arkflow_server::ServerConfig;
 use tokio_util::sync::CancellationToken;
 
 /// Rate-limit overrides for the Hub plane; unset variables fall back to the
-/// defaults in `arkflow_core::config::RateLimitConfig`.
+/// defaults in `arkflow_core::config::RateLimitConfig`. Unrecognized boolean
+/// spellings and unparseable numbers warn on stderr instead of silently
+/// flipping a default: a typo in `ARKFLOW_RATE_LIMIT_ENABLED` must not turn
+/// a protection off unnoticed.
 fn env_rate_limit_config() -> arkflow_core::config::RateLimitConfig {
     use arkflow_core::config::{
         default_node_burst, default_node_rps, default_principal_burst, default_principal_rps,
         default_rate_limit_enabled, RateLimitConfig,
     };
+    let warn = |name: &str, value: &str, expected: &str| {
+        eprintln!("warning: {name}='{value}' is not {expected}; using the default");
+    };
     let flag = |name: &str| -> Option<bool> {
-        std::env::var(name)
-            .ok()
-            .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        std::env::var(name).ok().map(|value| match value.as_str() {
+            "1" | "true" | "yes" => true,
+            "0" | "false" | "no" => false,
+            _ => {
+                warn(name, &value, "one of 1/true/yes/0/false/no");
+                true
+            }
+        })
     };
     let number = |name: &str| -> Option<f64> {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse().ok())
+        match std::env::var(name) {
+            Ok(value) => match value.parse::<f64>() {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    warn(name, &value, "a number");
+                    None
+                }
+            },
+            Err(_) => None,
+        }
     };
     RateLimitConfig {
         enabled: flag("ARKFLOW_RATE_LIMIT_ENABLED").unwrap_or_else(default_rate_limit_enabled),

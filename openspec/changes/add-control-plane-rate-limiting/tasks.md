@@ -7,7 +7,7 @@
 
 ## 2. 配置与接线
 
-- [ ] 2.1 `ServerConfig` 增 `rate_limit: RateLimitConfig { enabled=true, principal_rps=100, principal_burst=200, node_rps=500, node_burst=1000 }`（serde default 双向兼容）；既有配置无该节解析不变的单测
+- [ ] 2.1 `ServerConfig` 增 `rate_limit: RateLimitConfig`（serde default 双向兼容；本地 YAML 键为 `health_check.rate_limit`，因 control_api flatten 并入 health_check）；既有配置无该节解析不变的单测
 - [ ] 2.2 本地面接线：`router()` 版本化前缀内挂限速层（认证内侧），键 = `bearer()` 输出哈希、无凭证 `anonymous`
 - [ ] 2.3 Hub 面接线：operator 认证层内侧挂限速层，按路径前缀切换键空间（`/agent/` → node 桶，其余 → principal 桶）；豁免清单（健康探针/metrics/OIDC 登录）不经限速器
 - [ ] 2.4 429 响应：problem+json `rate_limited` + `Retry-After`（向上取整秒）；集成测试断言 429 形状且 handler 未执行、Retry-After 为正整数
