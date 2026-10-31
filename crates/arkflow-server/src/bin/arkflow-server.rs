@@ -49,17 +49,48 @@ fn env_rate_limit_config() -> arkflow_core::config::RateLimitConfig {
     }
 }
 
+const USAGE: &str = "\
+arkflow-server — ArkFlow control-plane Hub
+
+Usage:
+  arkflow-server
+      Run the Hub (configured through ARKFLOW_* environment variables).
+  arkflow-server migrate --from sqlite:<path> --to postgres:<url>
+      One-shot offline store migration (Hub stopped; see the deploy docs).
+  arkflow-server backup --from <store> --to <snapshot-file>
+      Snapshot the control-plane store to a new SQLite-format file.
+      <store> is a SQLite path or a postgres:// URL; the snapshot file
+      must not exist.
+  arkflow-server restore --from <snapshot-file> --to <store>
+      Restore a snapshot into an EMPTY control-plane store. Stop every
+      Hub instance against the target first.
+  arkflow-server --help
+      Show this help.
+";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("migrate") {
-        let rest: Vec<String> = args.collect();
-        let mut stderr = |message: String| eprintln!("{message}");
-        let code = bootstrap::run_migrate(&rest, &mut stderr).await?;
-        if code != 0 {
-            std::process::exit(code);
+    let subcommand = args.next();
+    match subcommand.as_deref() {
+        Some("migrate" | "backup" | "restore") => {
+            let rest: Vec<String> = args.collect();
+            let mut stderr = |message: String| eprintln!("{message}");
+            let code = match subcommand.as_deref() {
+                Some("migrate") => bootstrap::run_migrate(&rest, &mut stderr).await?,
+                Some("backup") => bootstrap::run_backup(&rest, &mut stderr).await?,
+                _ => bootstrap::run_restore(&rest, &mut stderr).await?,
+            };
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
         }
-        return Ok(());
+        Some("--help" | "-h" | "help") => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        _ => {}
     }
 
     let cancellation = CancellationToken::new();

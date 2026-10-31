@@ -30,6 +30,41 @@ arkflow-server migrate --from sqlite:/var/lib/arkflow/hub.sqlite \
 
 该工具按外键序以 1000 行事务逐表拷贝 `cp_*` 表,把 identity 序列重置到已迁移最大 id 之上,任何行数不一致都会非零退出。迁移成功后再把 `ARKFLOW_HUB_STORAGE` 指向 PostgreSQL URL 并重启 Hub。全新的 PostgreSQL 部署不需要该工具——启动 DDL 会创建 schema。
 
+### 备份与恢复
+
+`arkflow-server backup` 把控制面存储生成一份一致性快照(单个 SQLite 数据库文件);`arkflow-server restore` 把快照导入空库。两者都是离线 CLI 子命令——从不与运行中的 Hub 通信。
+
+```bash
+arkflow-server backup --from /var/lib/arkflow/hub.sqlite --to /backups/hub-2026-10-31.sqlite
+arkflow-server backup --from postgres://user:pass@db/hub --to /backups/hub-2026-10-31.sqlite
+arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to /var/lib/arkflow/hub.sqlite
+arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to postgres://user:pass@db/hub-restored
+```
+
+存储参数沿用 `ARKFLOW_HUB_STORAGE` 的 scheme 分派(`postgres://` URL 或 SQLite 路径),因此源与目标后端任意组合均可用:无论源后端是什么,快照恒为 SQLite 数据库文件。
+
+一致性语义:
+
+- **SQLite 源**:快照经 storage actor 串行化连接执行 `VACUUM INTO` 产生——捕获的行数与文件拷贝共享同一锁窗口。若 Hub 在另一个进程中持续写同一存储文件,备份期间落进来的写会使行数校验失败;此时在写入静止后重试或先停 Hub。失败的尝试不会留下半成品快照文件。
+- **PostgreSQL 源**:所有表都在单个 `REPEATABLE READ` 事务内读取,快照反映跨表同一时间点。长读会持有 MVCC 快照;建议低峰备份。目标数据库必须已存在——该工具建表,不建库。
+- 每张表的行数在命令报告成功前逐表校验;任何不一致都会以指明问题表的方式失败。
+
+快照属性:
+
+- 租约表(`cp_hub_lease`)永不进快照:恢复后的 Hub 经既有比较交换路径重建租约,陈旧的 fencing epoch 不会随恢复存活。
+- 快照携带源库当时的 schema 版本。比运行中二进制更新的快照在恢复时被拒绝;更旧的快照在拷贝前经正常的打开时迁移路径升级。
+
+恢复要求:
+
+- 目标必须为空。`restore` 先检查所有业务表,任一已含行都会拒绝——逐个列出非空表——并且不写任何数据。
+- 先停止针对目标数据库的每一个 Hub 实例。SQLite 侧恢复的单个 immediate 事务会让并发运行的 Hub 显式失败而不是竞写;PostgreSQL 没有等价锁,停机规则由运维保证。
+- identity 序列重置到已恢复最大 id 之上,恢复出的存储立即可接受新事件与 outbox 行;未处理的 reconciliation intents 在 Hub 于恢复库上启动后经既有恢复路径重放。
+- SQLite 目标必须已经是控制面数据库(或全新路径)——该命令拒绝往无关的 SQLite 文件里建 `cp_*` 表。
+
+调度:该工具只做单次一致性快照;定时备份、轮换与保留策略属于调度层(cron、Kubernetes CronJob)。
+
+**快照密级**:快照包含存储里的一切,包括配置版本 payload 原文。secret 引用(`secret:`/`env:`/`file:`)保持未解析形态,但 operator 写入配置的**字面**凭据会明文进入快照。请按数据库同等的密级保管快照文件(文件系统权限、加密存储)。
+
 ### TLS
 
 **控制面。**同时设置 `ARKFLOW_HUB_TLS_CERT` 与 `ARKFLOW_HUB_TLS_KEY`(PEM 文件路径),Hub 即以 TLS 承载全部请求——路由、认证与 readiness 语义不变。只配置其一会拒绝启动。Agent 用 `hub_urls` 中的 `https://` 条目访问 TLS Hub,无需额外配置。未同时配置时保持明文监听,行为与之前逐字节一致。

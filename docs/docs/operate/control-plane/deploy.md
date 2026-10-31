@@ -52,6 +52,78 @@ non-zero on any row-count mismatch. Point `ARKFLOW_HUB_STORAGE` at the
 PostgreSQL URL and restart the Hub only after a successful migration. Fresh
 PostgreSQL deployments never need the tool — startup DDL creates the schema.
 
+### Backup and restore
+
+`arkflow-server backup` produces a consistent snapshot of the control-plane
+store as a single SQLite database file; `arkflow-server restore` imports one
+into an empty store. Both are offline CLI subcommands — they never contact a
+running Hub.
+
+```bash
+arkflow-server backup --from /var/lib/arkflow/hub.sqlite --to /backups/hub-2026-10-31.sqlite
+arkflow-server backup --from postgres://user:pass@db/hub --to /backups/hub-2026-10-31.sqlite
+arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to /var/lib/arkflow/hub.sqlite
+arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to postgres://user:pass@db/hub-restored
+```
+
+The store argument follows the same scheme dispatch as `ARKFLOW_HUB_STORAGE`
+(`postgres://` URL or SQLite path), so both source and target backends work
+in every combination: a snapshot is always a SQLite database file regardless
+of the source backend.
+
+Consistency semantics:
+
+- **SQLite source**: the snapshot is produced by `VACUUM INTO` on the storage
+  actor's serialized connection — the captured row counts and the file copy
+  share one lock window. Running `backup` against a store that a Hub in
+  another process is actively writing can fail the row-count verification
+  when a write lands mid-copy; retry while writes are quiesced or stop the
+  Hub. A failed attempt leaves no partial file behind.
+- **PostgreSQL source**: every table is read inside a single
+  `REPEATABLE READ` transaction, so the snapshot reflects one point in time
+  across all tables. The long read holds an MVCC snapshot; schedule backups
+  off-peak. The target database must already exist — the tool creates
+  tables, not databases.
+- Every per-table row count is verified before the command reports success;
+  any mismatch fails the command with the offending table named.
+
+Snapshot properties:
+
+- The lease table (`cp_hub_lease`) is never copied: a restored Hub rebuilds
+  its lease through the existing compare-and-swap path, so no stale fencing
+  epoch survives the restore.
+- The snapshot carries the schema version of the source store. A snapshot
+  newer than the running binary is refused at restore time; an older one is
+  upgraded through the normal open-time migration path before copying.
+
+Restore requirements:
+
+- The target must be EMPTY. `restore` checks every business table first and
+  refuses — naming each non-empty table — if any already holds rows, without
+  writing anything.
+- Stop every Hub instance against the target database first. For SQLite the
+  restore's single immediate transaction makes a concurrently running Hub
+  fail loudly instead of racing; PostgreSQL has no equivalent lock, so the
+  stop-first rule is the operator's responsibility.
+- Identity sequences are reset above the restored max ids, so a restored
+  store accepts new events and outbox rows immediately; unprocessed
+  reconciliation intents replay through the existing recovery path once a
+  Hub starts on the restored store.
+- A SQLite target must already be a control-plane database (or a fresh
+  path) — the command refuses to create `cp_*` tables inside an unrelated
+  SQLite file.
+
+Scheduling: the tool performs a single consistent snapshot; recurring
+backups, rotation, and retention are the scheduler's job (cron, Kubernetes
+CronJob).
+
+**Snapshot sensitivity**: a snapshot contains everything the store does,
+including configuration-version payloads verbatim. Secret references
+(`secret:`/`env:`/`file:`) stay unresolved, but any literal credential an
+operator typed into a configuration is present in the clear. Treat snapshot
+files with the same care as the database itself (filesystem permissions,
+encrypted storage).
+
 ### TLS
 
 **Control plane.** Set both `ARKFLOW_HUB_TLS_CERT` and `ARKFLOW_HUB_TLS_KEY`

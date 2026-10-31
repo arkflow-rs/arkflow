@@ -3,6 +3,7 @@
 pub mod migrate_tool;
 pub mod postgres;
 pub mod sqlite;
+pub mod table_copier;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -519,6 +520,19 @@ pub enum StorageError {
          upgrade arkflow-server before pointing it at this database"
     )]
     SchemaTooNew { database: u32, binary: u32 },
+    #[error(
+        "restore target is not empty: tables {tables:?} already contain rows; \
+         restore requires an empty control-plane database"
+    )]
+    NonEmptyTarget { tables: Vec<String> },
+    #[error("row count mismatch for {table} after copy: expected {expected}, got {actual}")]
+    RowCountMismatch {
+        table: String,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("unsupported column type in store copy: {0}")]
+    ColumnType(String),
 }
 
 /// Schema version this binary's DDL understands. Each backend stamps it
@@ -1040,6 +1054,14 @@ storage_ops! {
     ("release_hub_lease", ReleaseHubLease, release_hub_lease) plain bool {
         holder: String as s,
         now_ms: u64 as v,
+    },
+    /// Offline SQLite-source backup: `VACUUM INTO` a consistent snapshot
+    /// file on the actor's serialized connection (no concurrent command can
+    /// interleave), then strip the lease row and verify per-table counts.
+    /// Plain (non-fenced): reads need no epoch fence. PostgreSQL sources
+    /// take the transactional copy path instead and never send this.
+    ("backup_sqlite", BackupSqlite, backup_sqlite) plain table_copier::CopyReport {
+        to_path: String as s,
     },
 }
 
@@ -1612,6 +1634,58 @@ impl ControlPlaneStore {
                 "immediate_transaction is SQLite-only; use the storage contract",
             )),
         }
+    }
+
+    /// SQLite-source backup: `VACUUM INTO` a consistent single-file snapshot
+    /// through the storage actor (the caller sends this as an actor command,
+    /// so no other command can interleave), then strip the lease row and
+    /// verify the per-table counts captured in the same lock window.
+    /// PostgreSQL sources never send this command — they take the
+    /// transactional copy path (`table_copier::backup_postgres_to_sqlite`).
+    pub async fn backup_sqlite(
+        &self,
+        to_path: &str,
+    ) -> Result<table_copier::CopyReport, StorageError> {
+        let backend = match self {
+            Self::Sqlite(backend) => backend,
+            Self::Postgres(_) => {
+                return Err(StorageError::Unsupported(
+                    "SQLite-source backup runs on the storage actor; PostgreSQL sources use the transactional copy path",
+                ));
+            }
+        };
+        // One lock window holds the source counts and the VACUUM INTO: the
+        // actor serializes every command, so no in-process write can
+        // interleave between capturing the counts and copying the database.
+        // (A separate process writing the same file is possible for a
+        // cross-process backup against a live Hub; the verification then
+        // fails closed and the operator retries while writes are quiesced.)
+        let outcome = backend.with_connection(|connection| {
+            let mut expected = Vec::new();
+            for table in table_copier::TABLE_ORDER {
+                let count: i64 =
+                    connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+                expected.push((table.to_string(), count as usize));
+            }
+            connection.execute("VACUUM INTO ?1", [to_path])?;
+            Ok(expected)
+        });
+        let expected = match outcome {
+            Ok(expected) => expected,
+            Err(error) => {
+                // A failed backup must not leave a partial snapshot behind
+                // that a retry would then refuse to overwrite.
+                let _ = std::fs::remove_file(to_path);
+                return Err(error);
+            }
+        };
+        let result = table_copier::finalize_sqlite_snapshot(to_path, expected);
+        if result.is_err() {
+            let _ = std::fs::remove_file(to_path);
+        }
+        result
     }
 }
 
