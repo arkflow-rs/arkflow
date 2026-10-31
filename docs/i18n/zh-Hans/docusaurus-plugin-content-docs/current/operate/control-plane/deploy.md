@@ -57,7 +57,7 @@ arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to postgres://use
 恢复要求:
 
 - 目标必须为空。`restore` 先检查所有业务表,任一已含行都会拒绝——逐个列出非空表——并且不写任何数据。
-- 先停止针对目标数据库的每一个 Hub 实例。SQLite 侧恢复的单个 immediate 事务会让并发运行的 Hub 显式失败而不是竞写;PostgreSQL 没有等价锁,停机规则由运维保证。
+- 先停止针对目标数据库的每一个 Hub 实例。恢复会强制这一点:SQLite 侧以单个 immediate 事务执行(并发运行的 Hub 会显式失败而不是竞写);PostgreSQL 侧在恢复的单个事务内对每张业务表加 `ACCESS EXCLUSIVE ... NOWAIT` 锁——仍在持锁的 Hub 会让恢复立刻以 busy 错误失败,且任何失败都会整体回滚,重试总是从干净空库开始。
 - identity 序列重置到已恢复最大 id 之上,恢复出的存储立即可接受新事件与 outbox 行;未处理的 reconciliation intents 在 Hub 于恢复库上启动后经既有恢复路径重放。
 - SQLite 目标必须已经是控制面数据库(或全新路径)——该命令拒绝往无关的 SQLite 文件里建 `cp_*` 表。
 

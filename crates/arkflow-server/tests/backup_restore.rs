@@ -681,3 +681,151 @@ async fn backup_restore_round_trip_against_live_postgres_when_available() {
     assert_eq!(hooks.len(), 1);
     assert!(hooks[0].enabled, "BOOLEAN round-trips through the snapshot");
 }
+
+/// Gated: the PostgreSQL restore enforces exclusive access — a Hub-like
+/// writer holding a lock on a business table makes the restore fail with a
+/// busy error (nothing written), and a snapshot row that fails coercion
+/// mid-restore rolls back the tables copied before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_restore_is_exclusive_and_atomic_when_available() {
+    let Ok(base) = std::env::var("ARKFLOW_TEST_POSTGRES_URL") else {
+        eprintln!("skipping: ARKFLOW_TEST_POSTGRES_URL not set");
+        return;
+    };
+    use sqlx::Row as _;
+    let (scheme, rest) = base.split_once("://").expect("url with scheme");
+    let authority = rest.split('/').next().expect("authority");
+    let url_for = |db: &str| format!("{scheme}://{authority}/{db}");
+    use sqlx::Connection as _;
+    let mut admin = sqlx::PgConnection::connect(&url_for("postgres"))
+        .await
+        .unwrap();
+    for name in [
+        "ct_restore_busy_src",
+        "ct_restore_busy_dst",
+        "ct_restore_atomic",
+    ] {
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+        )))
+        .execute(&mut admin)
+        .await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+    }
+    drop(admin);
+
+    let dir = tempfile::tempdir().unwrap();
+    let snapshot_path = dir.path().join("snapshot.sqlite");
+
+    // --- exclusive access: a held row lock makes the restore fail loudly ---
+    let source_url = url_for("ct_restore_busy_src");
+    let store = ControlPlaneStore::open(&source_url).await.unwrap();
+    seed_store(&store).await;
+    drop(store);
+    let mut sink = |_: String| {};
+    let code = bootstrap::run_backup(
+        &args(&[
+            "--from",
+            &source_url,
+            "--to",
+            snapshot_path.to_str().unwrap(),
+        ]),
+        &mut sink,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+
+    let target_url = url_for("ct_restore_busy_dst");
+    ControlPlaneStore::open(&target_url).await.unwrap(); // converge target DDL
+                                                         // A Hub-like writer holds a lock on a business table of the target.
+    let mut writer = sqlx::PgConnection::connect(&target_url).await.unwrap();
+    let mut locked = writer.begin().await.unwrap();
+    sqlx::query("SELECT * FROM cp_jobs FOR UPDATE")
+        .execute(&mut *locked)
+        .await
+        .unwrap();
+    let error = bootstrap::run_restore(
+        &args(&[
+            "--from",
+            snapshot_path.to_str().unwrap(),
+            "--to",
+            &target_url,
+        ]),
+        &mut sink,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("busy"), "{error}");
+    // The target is untouched: nothing was written before the failure.
+    let jobs: i64 = sqlx::query("SELECT COUNT(*) FROM cp_jobs")
+        .fetch_one(&mut *locked)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(jobs, 0, "a busy target must not be written");
+    locked.rollback().await.unwrap();
+    drop(writer);
+
+    // A retry after the writer releases succeeds.
+    let code = bootstrap::run_restore(
+        &args(&[
+            "--from",
+            snapshot_path.to_str().unwrap(),
+            "--to",
+            &target_url,
+        ]),
+        &mut sink,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+
+    // --- atomicity: a coercion failure on the SECOND table rolls back the
+    // first table's rows, so the target stays empty for a retry ---
+    let atomic_url = url_for("ct_restore_atomic");
+    ControlPlaneStore::open(&atomic_url).await.unwrap(); // converge target DDL
+    let corrupt = dir.path().join("corrupt.sqlite");
+    std::fs::copy(&snapshot_path, &corrupt).unwrap();
+    {
+        let snapshot_store = ControlPlaneStore::open(corrupt.to_str().unwrap())
+            .await
+            .unwrap();
+        snapshot_store
+            .with_connection(|connection| {
+                // A TEXT value in the BIGINT generation column: SQLite's
+                // dynamic typing stores it; the PostgreSQL copy must reject
+                // it mid-restore.
+                connection.execute(
+                    "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, updated_at_ms) \
+                     VALUES ('corrupt-job', 1, '{}', 'stopped', 'draft', 'unknown', 'not-a-number', '[]', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let error = bootstrap::run_restore(
+        &args(&["--from", corrupt.to_str().unwrap(), "--to", &atomic_url]),
+        &mut sink,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("cp_jobs"), "{error}");
+    // cp_nodes was copied BEFORE cp_jobs failed — atomicity rolls it back.
+    let mut probe = sqlx::PgConnection::connect(&atomic_url).await.unwrap();
+    let nodes: i64 = sqlx::query("SELECT COUNT(*) FROM cp_nodes")
+        .fetch_one(&mut probe)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        nodes, 0,
+        "cp_nodes rows copied before the failure must roll back"
+    );
+}

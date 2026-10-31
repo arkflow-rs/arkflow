@@ -115,13 +115,22 @@ async fn migrate_end_to_end_against_live_postgres_when_available() {
     drop(store);
 
     // Give the migration a dedicated database.
-    let target = format!("{url}/ct_bootstrap_migrate");
+    // Replace (not append to) the base URL's path: rsplit on the last slash
+    // breaks for a base URL that already names a database (".../postgres"
+    // would produce the malformed database name "postgres/ct_bootstrap_migrate").
+    let (scheme, authority) = {
+        let (scheme, rest) = url.split_once("://").expect("postgres URL with scheme");
+        (scheme, rest.split('/').next().expect("authority"))
+    };
+    let target = format!("{scheme}://{authority}/ct_bootstrap_migrate");
     let mut messages = Vec::new();
     let mut sink = |message: String| messages.push(message);
     // The target database may not exist; create it through the admin URL.
-    if let Some((prefix, _)) = url.rsplit_once('/') {
+    {
         use sqlx::Connection as _;
-        if let Ok(mut admin) = sqlx::PgConnection::connect(&format!("{prefix}/postgres")).await {
+        if let Ok(mut admin) =
+            sqlx::PgConnection::connect(&format!("{scheme}://{authority}/postgres")).await
+        {
             let _ = sqlx::query("DROP DATABASE IF EXISTS ct_bootstrap_migrate WITH (FORCE)")
                 .execute(&mut admin)
                 .await;

@@ -193,10 +193,48 @@ pub async fn run_restore(
         error_sink(format!("restore failed: {message}"));
         return Ok(2);
     }
+    // Open a WORKING COPY of the snapshot, never the archive itself: the
+    // normal backend open flips the file's journal mode and may run schema
+    // migration, and the archived backup must stay byte-identical (this also
+    // lets restore read a snapshot from read-only media). The copy is
+    // removed when the restore finishes, success or failure.
+    let work_dir = std::env::temp_dir().join(format!(
+        "arkflow-restore-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or_default()
+    ));
+    let work_copy = work_dir.join("snapshot.sqlite");
+    if let Err(error) =
+        std::fs::create_dir_all(&work_dir).and_then(|()| std::fs::copy(&from, &work_copy))
+    {
+        error_sink(format!(
+            "restore failed: could not stage a working copy of the snapshot: {error}"
+        ));
+        return Ok(2);
+    }
+    let outcome =
+        run_restore_from_snapshot(work_copy.to_string_lossy().as_ref(), &to, error_sink).await;
+    let _ = std::fs::remove_dir_all(&work_dir);
+    outcome
+}
+
+/// Restore body after the snapshot has been staged as a writable working
+/// copy: version check via the normal open path, scheme-dispatched target,
+/// empty check, copy, verify, sequences.
+async fn run_restore_from_snapshot(
+    snapshot_path: &str,
+    target: &str,
+    error_sink: &mut dyn FnMut(String),
+) -> Result<i32, Box<dyn Error + Send + Sync>> {
+    let from = snapshot_path;
+    let to = target;
     // Opening the snapshot runs the normal version check: a snapshot newer
     // than this binary fails here, before any target is touched; an older
     // one is upgraded through the existing open-time migration path.
-    let snapshot = match ControlPlaneStore::open(&from).await {
+    let snapshot = match ControlPlaneStore::open(from).await {
         Ok(ControlPlaneStore::Sqlite(backend)) => backend,
         Ok(ControlPlaneStore::Postgres(_)) => {
             error_sink(format!(

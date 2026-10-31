@@ -35,9 +35,15 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transaction), fail-closed restore into an empty target only (every
   non-empty table named), schema-version compatibility checks, per-table
   row-count verification, identity-sequence reset, and cross-backend
-  restores. The lease table is never copied — a restored Hub rebuilds its
-  lease through the existing CAS path. Snapshots contain configuration
-  payloads verbatim; handle them with database-level secrecy.
+  restores. The restore is exclusive and atomic: the SQLite target is
+  restored in one immediate transaction and the PostgreSQL target locks
+  every business table `ACCESS EXCLUSIVE NOWAIT` for a single
+  all-or-nothing transaction, so a running Hub fails the restore instead of
+  racing it and a failure leaves nothing behind. The lease table is never
+  copied — a restored Hub rebuilds its lease through the existing CAS path,
+  and restoring never mutates the archived snapshot (it opens a working
+  copy). Snapshots contain configuration payloads verbatim; handle them
+  with database-level secrecy.
 - Fixed the `migrate` tool silently dropping webhook subscriptions:
   `cp_webhooks` was missing from the shared table copy order, so a
   SQLite-to-PostgreSQL migration lost every subscription. The table now

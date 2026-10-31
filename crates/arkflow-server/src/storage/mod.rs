@@ -531,6 +531,8 @@ pub enum StorageError {
         expected: usize,
         actual: usize,
     },
+    #[error("restore target is busy: {0}; stop every Hub instance against the target database and retry")]
+    TargetBusy(String),
     #[error("unsupported column type in store copy: {0}")]
     ColumnType(String),
 }
@@ -1660,6 +1662,10 @@ impl ControlPlaneStore {
         // (A separate process writing the same file is possible for a
         // cross-process backup against a live Hub; the verification then
         // fails closed and the operator retries while writes are quiesced.)
+        // Cleanup only ever removes a file THIS call created: the method is
+        // public, so a caller may pass a pre-existing path it does not want
+        // deleted on failure.
+        let pre_existing = std::path::Path::new(to_path).exists();
         let outcome = backend.with_connection(|connection| {
             let mut expected = Vec::new();
             for table in table_copier::TABLE_ORDER {
@@ -1672,20 +1678,19 @@ impl ControlPlaneStore {
             connection.execute("VACUUM INTO ?1", [to_path])?;
             Ok(expected)
         });
-        let expected = match outcome {
-            Ok(expected) => expected,
+        let result =
+            outcome.and_then(|expected| table_copier::finalize_sqlite_snapshot(to_path, expected));
+        match result {
+            Ok(report) => Ok(report),
             Err(error) => {
-                // A failed backup must not leave a partial snapshot behind
-                // that a retry would then refuse to overwrite.
-                let _ = std::fs::remove_file(to_path);
-                return Err(error);
+                if !pre_existing {
+                    // A failed backup must not leave a partial snapshot
+                    // behind that a retry would then refuse to overwrite.
+                    let _ = std::fs::remove_file(to_path);
+                }
+                Err(error)
             }
-        };
-        let result = table_copier::finalize_sqlite_snapshot(to_path, expected);
-        if result.is_err() {
-            let _ = std::fs::remove_file(to_path);
         }
-        result
     }
 }
 

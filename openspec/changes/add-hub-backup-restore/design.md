@@ -22,7 +22,8 @@
   - 目标空校验：对每张 `TABLE_ORDER` 表 `SELECT EXISTS(SELECT 1 FROM ...)`，任一非空中止并列出表名（一张一张查，给出全部非空表而不是首个即停，便于诊断）；
   - 快照版本新于二进制 `SCHEMA_VERSION` 拒绝（复用既有 `user_version` 检查语义；PG 目标侧同理比对后端 schema 版本）；
   - 序列重置：PG 走既有 `setval` 循环；SQLite 目标 `sqlite_sequence` 随行插入自动推进，无需处理（AUTOINCREMENT 语义）；
-  - 恢复期间目标库由 restore 进程独占打开——Hub 同时运行会因 SQLite 写锁/PG 连接冲突失败，错误信息指导「停止 Hub 后重试」。
+  - 恢复期间目标库由 restore 进程独占打开——Hub 同时运行会因 SQLite 写锁/PG 连接冲突失败，错误信息指导「停止 Hub 后重试」；
+  - **实施强化（CodeRabbit 评审后）**：快照以**临时工作副本**打开（`SqliteBackend::open` 会翻转 journal mode，归档快照必须保持字节不变，且只读介质可恢复）；PG 侧整个恢复（`ACCESS EXCLUSIVE NOWAIT` 逐表锁 → 空库校验 → 拷贝 → 行数校验 → `setval`）在**单个事务**内执行——持锁的 Hub 使恢复立刻以 `TargetBusy` 失败（实现 spec 的「无法独占即失败」），任何失败整体回滚，重试总是面对干净空库；`migrate` 保留逐 chunk 提交语义不变。
 - **D5 `TABLE_ORDER` 增补 `cp_webhooks`**：webhook 订阅无外键依赖，追加在 `cp_events` 之后的任意稳定位置；migrate 与 backup/restore 共用，`migrate` 的 sqlite→pg 从此不再丢订阅（行为修复，附迁移前后的行数校验天然覆盖）。
 - **D6 CLI**：`backup --from <store> --to <file>` / `restore --from <file> --to <store>`，与 `migrate` 相同的 `bootstrap::run_*` 形态（可测试、错误经 sink 输出）；退出码 0/非 0。restore 前打印将被覆盖的数据库 scheme 与目标（无 `--force`，非空即拒）。实施澄清：store 参数沿用 `ARKFLOW_HUB_STORAGE` 的常规 scheme 分派（`postgres://` 前缀→PG，其余为 SQLite 路径），与 `migrate` 的 `--from/--to` 旗标结构同构——显式、可测试、不耦合环境变量。另加 SQLite 目标守卫：已存在的非空文件若完全不含 `cp%` 表（即不是控制面库）直接拒绝，避免把无关 SQLite 文件 DDL 成控制面库。
 

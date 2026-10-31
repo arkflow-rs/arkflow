@@ -413,13 +413,16 @@ fn coerce_rows_for_postgres(
         .collect()
 }
 
-async fn pg_insert_chunk(
-    pool: &sqlx::PgPool,
+/// Insert already-coerced rows into a PostgreSQL table on the given
+/// connection, with no transaction of its own: the caller decides the commit
+/// granularity (`migrate` commits per chunk; `restore` inserts everything on
+/// one transaction so a failure rolls the whole restore back).
+async fn pg_insert_rows(
+    connection: &mut sqlx::PgConnection,
     table: &str,
     columns: &[String],
     rows: &[Vec<PgVal>],
 ) -> Result<(), StorageError> {
-    let mut transaction = pool.begin().await?;
     let column_list = columns.join(", ");
     for values in rows {
         let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${i}")).collect();
@@ -442,10 +445,20 @@ async fn pg_insert_chunk(
                 PgVal::Bytes(v) => query.bind(v.clone()),
             };
         }
-        query.execute(&mut *transaction).await?;
+        query.execute(&mut *connection).await?;
     }
-    transaction.commit().await?;
     Ok(())
+}
+
+/// `migrate`'s copy granularity: per-chunk transactions, matching the
+/// historical behavior of committing bounded batches as it goes.
+async fn pg_insert_chunk(
+    connection: &mut sqlx::PgConnection,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<PgVal>],
+) -> Result<(), StorageError> {
+    pg_insert_rows(connection, table, columns, rows).await
 }
 
 async fn pg_count(
@@ -462,13 +475,15 @@ async fn pg_count(
 /// List every `TABLE_ORDER` business table that already holds rows, in copy
 /// order. Restore surfaces ALL of them before writing anything, so an
 /// operator can see the full picture instead of fixing one table at a time.
-async fn postgres_non_empty_tables(pool: &sqlx::PgPool) -> Result<Vec<String>, StorageError> {
+async fn postgres_non_empty_tables(
+    connection: &mut sqlx::PgConnection,
+) -> Result<Vec<String>, StorageError> {
     let mut non_empty = Vec::new();
     for table in TABLE_ORDER {
         let exists: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT EXISTS(SELECT 1 FROM {table})"
         )))
-        .fetch_one(pool)
+        .fetch_one(&mut *connection)
         .await?;
         if exists {
             non_empty.push(table.to_string());
@@ -491,12 +506,12 @@ fn sqlite_non_empty_tables(
 
 /// Reset PostgreSQL IDENTITY sequences above the copied max ids, so newly
 /// generated ids continue after the restored rows instead of colliding.
-async fn reset_postgres_sequences(pool: &sqlx::PgPool) -> Result<(), StorageError> {
+async fn reset_postgres_sequences(connection: &mut sqlx::PgConnection) -> Result<(), StorageError> {
     for (table, column) in IDENTITY_COLUMNS {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT setval(pg_get_serial_sequence('{table}', '{column}'), COALESCE((SELECT MAX({column}) FROM {table}), 0) + 1, false)"
         )))
-        .execute(pool)
+        .execute(&mut *connection)
         .await?;
     }
     Ok(())
@@ -506,8 +521,9 @@ async fn reset_postgres_sequences(pool: &sqlx::PgPool) -> Result<(), StorageErro
 
 /// Copy a SQLite source into a PostgreSQL target: read per table in
 /// `TABLE_ORDER`, order self-referencing rows parents-first, coerce values
-/// to the target column kinds, insert in bounded chunks, and verify the
-/// per-table row counts. Shared by `migrate` and `restore --to postgres:`.
+/// to the target column kinds, insert in bounded per-chunk transactions, and
+/// verify the per-table row counts. Used by `migrate`; `restore` uses
+/// [`restore_postgres_target`] for atomic all-or-nothing semantics.
 pub async fn copy_sqlite_to_postgres(
     source: &SqliteBackend,
     pool: &sqlx::PgPool,
@@ -523,11 +539,14 @@ pub async fn copy_sqlite_to_postgres(
         }
         let rows = coerce_rows_for_postgres(rows, &columns, &target_columns, table)?;
         for chunk in rows.chunks(CHUNK) {
-            pg_insert_chunk(pool, table, &columns, chunk).await?;
+            let mut transaction = pool.begin().await?;
+            pg_insert_chunk(&mut *transaction, table, &columns, chunk).await?;
+            transaction.commit().await?;
         }
         verify_count(&mut report, table, rows.len(), pg_count(pool, table).await?)?;
     }
-    reset_postgres_sequences(pool).await?;
+    let mut connection = pool.acquire().await?;
+    reset_postgres_sequences(&mut *connection).await?;
     Ok(report)
 }
 
@@ -635,17 +654,56 @@ pub async fn restore_sqlite_target(
     })
 }
 
-/// Restore a snapshot into an empty PostgreSQL target: the empty check runs
-/// before any write, then the shared SQLite→PostgreSQL copy applies.
+/// Restore a snapshot into an empty PostgreSQL target. The whole restore —
+/// exclusive locks, empty check, copy, count verification, and sequence
+/// resets — runs in ONE transaction: any failure rolls back every insert, so
+/// a retry never trips over a partially restored database. Before the empty
+/// check every `TABLE_ORDER` table is locked `ACCESS EXCLUSIVE ... NOWAIT`:
+/// a Hub still running against the target (holding its own locks) makes the
+/// restore fail immediately with `TargetBusy` instead of racing it, and no
+/// new writer can start for the restore's duration — restore fails rather
+/// than proceeds when the target cannot be opened exclusively.
 pub async fn restore_postgres_target(
     source: &SqliteBackend,
     pool: &sqlx::PgPool,
 ) -> Result<CopyReport, StorageError> {
-    let non_empty = postgres_non_empty_tables(pool).await?;
+    let mut tx = pool.begin().await?;
+    for table in TABLE_ORDER {
+        let lock = format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE NOWAIT");
+        if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(lock))
+            .execute(&mut *tx)
+            .await
+        {
+            return Err(StorageError::TargetBusy(format!(
+                "could not lock table {table} exclusively: {error}"
+            )));
+        }
+    }
+    let non_empty = postgres_non_empty_tables(&mut *tx).await?;
     if !non_empty.is_empty() {
         return Err(StorageError::NonEmptyTarget { tables: non_empty });
     }
-    copy_sqlite_to_postgres(source, pool).await
+    let mut report = CopyReport::default();
+    for table in TABLE_ORDER {
+        let (columns, rows) = read_sqlite_table_ordered(source, table)?;
+        let target_columns = pg_table_columns(&mut *tx, table).await?;
+        if target_columns.is_empty() {
+            return Err(StorageError::Encoding(format!(
+                "target database is missing table {table}"
+            )));
+        }
+        let rows = coerce_rows_for_postgres(rows, &columns, &target_columns, table)?;
+        pg_insert_rows(&mut *tx, table, &columns, &rows).await?;
+        verify_count(
+            &mut report,
+            table,
+            rows.len(),
+            pg_count(&mut *tx, table).await?,
+        )?;
+    }
+    reset_postgres_sequences(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(report)
 }
 
 /// Post-process a SQLite-source snapshot produced by `VACUUM INTO` on the
