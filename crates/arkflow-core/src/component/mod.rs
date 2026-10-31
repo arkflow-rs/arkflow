@@ -396,6 +396,45 @@ pub fn build_config_schema() -> serde_json::Value {
                         "description": "Explicit opt-in to run the standalone control API without a token on a non-loopback bind; the process logs a prominent warning."
                     },
                     "cors_origins": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "approval_required": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Require a second principal's approval before any configuration rollout is created; gates every rollout creation route when enabled."
+                    },
+                    "approval_ttl_ms": {
+                        "type": "integer",
+                        "format": "uint64",
+                        "default": 86400000,
+                        "description": "How long a pending configuration approval request stays decidable before it expires (milliseconds)."
+                    },
+                    "rate_limit": {
+                        "type": "object",
+                        "description": "Per-credential request rate limiting for the versioned control API. Defaults sit orders of magnitude above legitimate deployment traffic; misconfigured non-positive or non-finite values fall back to the defaults with a startup warning.",
+                        "additionalProperties": false,
+                        "properties": {
+                            "enabled": {"type": "boolean", "default": true},
+                            "principal_rps": {
+                                "type": "number",
+                                "default": 100.0,
+                                "description": "Token refill per second per operator credential or browser session."
+                            },
+                            "principal_burst": {
+                                "type": "number",
+                                "default": 200.0,
+                                "description": "Burst capacity of an operator-credential bucket."
+                            },
+                            "node_rps": {
+                                "type": "number",
+                                "default": 500.0,
+                                "description": "Token refill per second per agent node; must cover the register/heartbeat/report/commands/observations cadence."
+                            },
+                            "node_burst": {
+                                "type": "number",
+                                "default": 1000.0,
+                                "description": "Burst capacity of an agent node bucket."
+                            }
+                        }
+                    },
                     "hub_urls": {
                         "type": "array",
                         "items": {"type": "string"},

@@ -108,7 +108,8 @@ Hub environment variables:
 | `ARKFLOW_RATE_LIMIT_NODE_BURST` | `1000` | Burst capacity of a node bucket. |
 
 A standalone (local-plane) node configures the same knobs under
-`health_check.control_api.rate_limit`:
+`health_check.rate_limit` (the control-API section is flattened into
+`health_check`):
 
 ```yaml validate=full
 health_check:

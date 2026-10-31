@@ -63,7 +63,7 @@ Hub 环境变量:
 | `ARKFLOW_RATE_LIMIT_NODE_RPS` | `500` | 每个 agent 节点的每秒令牌补充速率;须覆盖 register/heartbeat/report/commands/observations 的节奏。 |
 | `ARKFLOW_RATE_LIMIT_NODE_BURST` | `1000` | node 桶的突发容量。 |
 
-standalone(本地)节点在 `health_check.control_api.rate_limit` 下配置同一组参数:
+standalone(本地)节点在 `health_check.rate_limit` 下配置同一组参数(control_api 节已 flatten 并入 `health_check`):
 
 ```yaml validate=full
 health_check:
