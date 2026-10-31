@@ -619,8 +619,10 @@ pub async fn backup_postgres_to_sqlite(
 
 /// Restore a snapshot into an empty SQLite target. The whole restore runs
 /// in one immediate transaction: the empty check sees the pre-copy state,
-/// any failure rolls back every insert, and the writer lock the transaction
-/// holds makes a concurrently-running Hub fail loudly instead of racing.
+/// any failure rolls back every insert, and the write lock the transaction
+/// holds makes a Hub that is writing at that moment fail loudly instead of
+/// racing. An idle Hub holds no locks and is NOT detected — operators must
+/// still stop every Hub instance against the target first.
 pub async fn restore_sqlite_target(
     source: &SqliteBackend,
     target_path: &str,
@@ -659,10 +661,10 @@ pub async fn restore_sqlite_target(
 /// resets — runs in ONE transaction: any failure rolls back every insert, so
 /// a retry never trips over a partially restored database. Before the empty
 /// check every `TABLE_ORDER` table is locked `ACCESS EXCLUSIVE ... NOWAIT`:
-/// a Hub still running against the target (holding its own locks) makes the
-/// restore fail immediately with `TargetBusy` instead of racing it, and no
-/// new writer can start for the restore's duration — restore fails rather
-/// than proceeds when the target cannot be opened exclusively.
+/// a session with an open transaction on any table makes the restore fail
+/// immediately with `TargetBusy`, and no writer can interleave for the
+/// restore's duration. An idle Hub holds no locks and is NOT detected;
+/// operators must still stop every Hub instance against the target first.
 pub async fn restore_postgres_target(
     source: &SqliteBackend,
     pool: &sqlx::PgPool,

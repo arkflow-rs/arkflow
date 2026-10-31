@@ -101,13 +101,14 @@ Restore requirements:
 - The target must be EMPTY. `restore` checks every business table first and
   refuses — naming each non-empty table — if any already holds rows, without
   writing anything.
-- Stop every Hub instance against the target database first. The restore
-  enforces it: SQLite runs as one immediate transaction (a concurrently
-  running Hub fails loudly instead of racing), and PostgreSQL locks every
-  business table `ACCESS EXCLUSIVE ... NOWAIT` for the restore's single
-  transaction — a Hub still holding locks makes the restore fail with a
-  busy error, and any failure rolls the whole restore back so a retry
-  starts from a clean, empty target.
+- Stop every Hub instance against the target database first — an idle Hub
+  holds no locks and is not detected, so this rule stays with the operator.
+  What the restore does enforce: SQLite runs as one immediate transaction
+  and PostgreSQL locks every business table `ACCESS EXCLUSIVE ... NOWAIT`
+  for its single transaction — a Hub transaction active at that moment
+  fails the restore with a busy error, no writer can interleave while it
+  runs, and any failure rolls the whole restore back so a retry starts
+  from a clean, empty target.
 - Identity sequences are reset above the restored max ids, so a restored
   store accepts new events and outbox rows immediately; unprocessed
   reconciliation intents replay through the existing recovery path once a
