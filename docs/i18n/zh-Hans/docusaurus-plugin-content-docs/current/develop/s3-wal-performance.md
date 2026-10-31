@@ -297,26 +297,24 @@ zstd-9: 50000 -> 276 bytes (ratio: 181.16x)
 
 | 指标 | 描述 | 告警阈值 |
 |--------|-------------|-----------------|
-| `segment_put_latency` | PUT 一个段所需时间 | >500ms p99 |
-| `segment_put_frequency` | 每秒 PUT 次数 | >10 次/秒(可能需要调优) |
-| `segment_size` | 段平均字节数 | `<100KB 或 >10MB` |
-| `cursor_lag` | 游标与最大已写序列的差距 | >10,000 条 |
-| `recovery_latency` | 启动时重放 WAL 所需时间 | >5s |
+| `arkflow_stream_wal_flush_failures_total` | 流输入 WAL 的后台刷洗失败 | 任何增长 |
+| `arkflow_job_wal_flush_failures_total` | 作业输入 WAL 的后台刷洗失败 | 任何增长 |
 
 ### 日志
 
 需要关注的关键日志行:
 
 ```
-[DEBUG] Sealing segment: entries={n}, bytes={size}
-[INFO]  Segment PUT complete: {segment_key}, {size} bytes in {duration_ms}ms
-[INFO]  Recovery: replayed {n} entries from {m} segments in {duration_ms}ms
-[WARN]  Segment PUT failed: {error}, retrying...
+[DEBUG] PUT worker {id} uploaded segment {segment_index}
+[ERROR] PUT worker {id} segment {segment_index} failed: {error}
+[WARN]  manifest write recovered after contention
+[WARN]  manifest write experiencing sustained contention (>= 3 retries)
+[WARN]  manifest backend does not support conditional PUT; falling back to unconditional Overwrite — coordination disabled, concurrent writers may lose updates
 ```
 
 ## 参考资料
 
-- 用户侧调优指南:`docs/docs/components/0-inputs/wal-optimization.md`
+- 用户侧调优指南:`docs/docs/build/wal.md`
 - 设计:`openspec/changes/archive/2026-07-27-add-wal-s3-backend/design.md`
 - 设计:`openspec/changes/archive/2026-07-28-comprehensive-wal-optimization/design.md`
 - 规格:`openspec/specs/input-durability/spec.md`

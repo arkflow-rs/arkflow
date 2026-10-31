@@ -35,15 +35,16 @@ description: 通过控制平面 Hub 将流处理作业灰度发布到机群。
 
 ## 2. 启动 Hub 并注册 Agent
 
-`examples/control_plane_hub.yaml` 配置了一个 Hub 及其 API 与健康检查端点;`examples/control_plane_example.yaml`
-展示了 Agent 侧的部署配置:
+Hub 是独立的 `arkflow-server` 二进制,通过环境变量配置——`ARKFLOW_NODE_TOKEN`
+必须与 Agent 的共享 `node_token` 一致(参见[部署](./control-plane/deploy.md))。
+`examples/control_plane_node.yaml` 展示了 Agent 侧的部署配置:
 
 ```bash
 # 终端 1 —— Hub
-./target/release/arkflow --config examples/control_plane_hub.yaml
+ARKFLOW_NODE_TOKEN=replace-with-node-token ./target/release/arkflow-server
 
 # 终端 2+ —— 每个计算节点一个 Agent
-./target/release/arkflow --config examples/control_plane_example.yaml
+./target/release/arkflow --config examples/control_plane_node.yaml
 ```
 
 预期结果:每个 Agent 都会作为持有租约的节点出现在 Hub 的机群 API(`/api/v1`)中。

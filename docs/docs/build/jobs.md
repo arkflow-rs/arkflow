@@ -151,7 +151,7 @@ A Hub plus two compute nodes is enough to run a job on multiple machines.
 Start from the maintained examples:
 
 ```bash
-./target/release/arkflow --config examples/control_plane_hub.yaml   # the Hub
+ARKFLOW_NODE_TOKEN=replace-with-node-token ./target/release/arkflow-server  # the Hub
 ./target/release/arkflow --config examples/control_plane_node.yaml  # node-a; repeat with node-b
 ```
 

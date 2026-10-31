@@ -103,7 +103,7 @@ jobs:
 一个 Hub 加两个计算节点,就足以让作业跑在多台机器上。从仓库维护的示例开始:
 
 ```bash
-./target/release/arkflow --config examples/control_plane_hub.yaml   # the Hub
+ARKFLOW_NODE_TOKEN=replace-with-node-token ./target/release/arkflow-server  # the Hub
 ./target/release/arkflow --config examples/control_plane_node.yaml  # node-a; repeat with node-b
 ```
 

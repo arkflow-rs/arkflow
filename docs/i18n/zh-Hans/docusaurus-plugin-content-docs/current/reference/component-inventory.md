@@ -11,9 +11,9 @@ description: 供文档检查使用的受支持组件清单(inventory)。
 | 类别 | 组件 | 描述 | 文档 |
 | --- | --- | --- | --- |
 | buffer | `memory` | 内存缓冲:达到容量上限或超时后释放一个批次。 | [参考](/zh-Hans/docs/components/buffers/memory) |
-| buffer | `session_window` | 依据消息间最大间隔把消息划分为会话。支持跨数据源的 SQL join。 | [参考](/zh-Hans/docs/components/buffers/session_window) |
+| buffer | `session_window` | 依据消息间最大间隔把消息划分为会话。 | [参考](/zh-Hans/docs/components/buffers/session_window) |
 | buffer | `sliding_window` | 按固定间隔向前滑动的时间重叠窗口。 | [参考](/zh-Hans/docs/components/buffers/sliding_window) |
-| buffer | `tumbling_window` | 固定大小、互不重叠的时间窗口。支持跨数据源的 SQL join。 | [参考](/zh-Hans/docs/components/buffers/tumbling_window) |
+| buffer | `tumbling_window` | 固定大小、互不重叠的时间窗口。 | [参考](/zh-Hans/docs/components/buffers/tumbling_window) |
 | codec | `debezium_json` | 把 Debezium CDC Envelope JSON(before/after/op/source/ts_ms)解码为列式 Arrow 批次;附加到消费 Debezium 主题的 Kafka 输入上。CDC 偏移量即 Kafka 输入经确认门控的偏移量。 | [参考](/zh-Hans/docs/components/codecs/debezium) |
 | codec | `json` | 将 Arrow RecordBatch 编码/解码为 JSON 字节负载。 | [参考](/zh-Hans/docs/components/codecs/json) |
 | codec | `protobuf` | 使用 Protobuf 描述符对 Arrow RecordBatch 进行编码/解码。 | [参考](/zh-Hans/docs/components/codecs/protobuf) |

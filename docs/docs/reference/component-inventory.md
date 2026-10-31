@@ -11,9 +11,9 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | Kind | Component | Description | Documentation |
 | --- | --- | --- | --- |
 | buffer | `memory` | In-memory buffer that releases a batch when it reaches capacity or after a timeout. | [reference](../components/buffers/memory) |
-| buffer | `session_window` | Groups messages into sessions based on a maximum gap between messages. Supports SQL joins across sources. | [reference](../components/buffers/session_window) |
+| buffer | `session_window` | Groups messages into sessions based on a maximum gap between messages. | [reference](../components/buffers/session_window) |
 | buffer | `sliding_window` | Overlapping time windows that slide forward by a fixed interval. | [reference](../components/buffers/sliding_window) |
-| buffer | `tumbling_window` | Fixed-size, non-overlapping time windows. Supports SQL joins across sources. | [reference](../components/buffers/tumbling_window) |
+| buffer | `tumbling_window` | Fixed-size, non-overlapping time windows. | [reference](../components/buffers/tumbling_window) |
 | codec | `debezium_json` | Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset. | [reference](../components/codecs/debezium) |
 | codec | `json` | Encodes/decodes Arrow RecordBatches as JSON byte payloads. | [reference](../components/codecs/json) |
 | codec | `protobuf` | Encodes/decodes Arrow RecordBatches using a Protobuf descriptor. | [reference](../components/codecs/protobuf) |

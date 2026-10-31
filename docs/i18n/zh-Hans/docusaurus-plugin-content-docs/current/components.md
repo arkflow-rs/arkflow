@@ -7,7 +7,7 @@ sidebar_position: 5
 
 # 组件
 
-ArkFlow 内置六类共 41 个注册组件。本节的每个页面都会与实时组件注册表进行机器校验:这里的类型名称、配置 schema 与示例不会与二进制悄然漂移。
+ArkFlow 内置六类共 50 个注册组件。本节的每个页面都会与实时组件注册表进行机器校验:这里的类型名称、配置 schema 与示例不会与二进制悄然漂移。
 
 <div class="row af-cards">
   <div class="col col--4 margin-bottom--md">

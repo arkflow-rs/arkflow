@@ -13,8 +13,9 @@ description: 精选的 ArkFlow 端到端示例。
 | SQL 输出 | [`sql_output_example.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/sql_output_example.yaml) | 数据库 sink 配置 |
 | 持久化 | [`durability_example.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/durability_example.yaml) | 流级 WAL 持久化 |
 | S3 持久化 | [`durability_example_s3.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/durability_example_s3.yaml) | 基于对象存储的恢复 |
-| 控制平面 | [`control_plane_example.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/control_plane_example.yaml) | Hub 与计算节点运维 |
-| 控制平面 Hub | [`control_plane_hub.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/control_plane_hub.yaml) | 集群级配置 |
+| 控制平面节点 | [`control_plane_node.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/control_plane_node.yaml) | 计算节点(Agent)模式:通过 `hub_urls`、`node_id`、`node_token` 向 Hub 注册 |
+| 本地控制 API | [`control_plane_example.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/control_plane_example.yaml) | 暴露本地控制 API 的独立引擎 |
+| 健康检查服务 | [`control_plane_hub.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/control_plane_hub.yaml) | 无数据流的最小健康检查 / 控制平面端点配置 |
 | 本地流式作业 | [`jobs_local.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/jobs_local.yaml) | 带事件时间、状态与检查点的声明式 `jobs` DAG |
 | Debezium CDC | [`cdc_debezium.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/cdc_debezium.yaml) | CDC envelope 解码 |
 

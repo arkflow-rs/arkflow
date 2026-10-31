@@ -95,6 +95,7 @@ started.
 | `metrics_path` | string | no | `/metrics` | Prometheus exposition endpoint (format 0.0.4). |
 | `ready_path` | string | no | `/ready` | Readiness probe: success once the engine finished starting the configured Streams and Jobs. |
 | `live_path` | string | no | `/live` | Liveness probe: success while the process is running. |
+| `tracing` | object | no | — | OTel trace export (OTLP HTTP-JSON; disabled by default): `enabled`, `endpoint`, `service_name`. See [Tracing](../operate/observability.md#tracing). |
 
 ### Standalone Hub startup safety
 
@@ -194,7 +195,7 @@ the shape is:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `thread_num` | integer | no | `1` | Number of processor worker tasks. |
+| `thread_num` | integer | no | CPU core count | Number of processor worker tasks. |
 | `processors` | array&lt;object&gt; | yes | — | Ordered list of processor components. |
 
 ## job
@@ -241,6 +242,10 @@ jobs:
 | `state` | object | no | — | `backend` (e.g. `embedded_kv`), `durability` (`durable` by default or explicit `ephemeral`), optional stable `root` (or `ARKFLOW_STATE_ROOT`), `namespace`, `ttl_ms`, `format_version`, `max_pending_transactions` (positive; default 4096; raise it when a window sees very high per-window key cardinality, since one transaction is held per open window group or unacknowledged output), optional positive `max_bytes` live-state budget. Required by stateful operators; durable state also requires `checkpoint`. |
 | `checkpoint` | object | no | — | `interval_ms`, `retention`, `object_store_uri` (e.g. `file://...` or `s3://...`). |
 | `recovery` | string | no | `latest_checkpoint` | `latest_checkpoint`, `latest_savepoint`, or `fail`. |
+| `rescale` | boolean | no | `false` | Opt in to rescaling recovery: keyed state from an artifact written under a different parallelism is redistributed across the new task set by key-group ownership instead of failing closed (see [Distributed jobs](/docs/build/distributed-jobs)). |
+| `placement` | string | no | `colocated` | Task placement across compute nodes: `colocated` (default) or `split` (cross-node edges via the shuffle data plane). |
+| `rebalance` | object | no | — | Opt-in pressure rebalance: the Hub migrates the job away from a node reporting sustained resource pressure. Absent behaves like `off`. |
+| `resources` | object | no | — | Optional per-task resource requests (`cpu_millicores`, `memory_bytes`); participates in placement accounting and Agent runtime sizing when declared. |
 
 ### `time` (source event-time declaration)
 

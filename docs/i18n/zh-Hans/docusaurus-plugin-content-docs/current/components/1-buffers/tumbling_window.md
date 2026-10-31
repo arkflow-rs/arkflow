@@ -5,7 +5,7 @@ description: ArkFlow 文档页。
 
 # 滚动窗口(Tumbling Window)
 
-滚动窗口(Tumbling Window)缓冲把消息(Message)划分到固定大小、互不重叠的时间窗口(Window)中。每当配置的 `interval` 到期,当前窗口内累积的全部消息都会作为一个批次(Batch)一起发出;每条消息恰好属于一个窗口。可选的 `join` 配置允许你在发出时跨多个输入(Input)源执行 SQL 连接(Join)。
+滚动窗口(Tumbling Window)缓冲把消息(Message)划分到固定大小、互不重叠的时间窗口(Window)中。每当配置的 `interval` 到期,当前窗口内累积的全部消息都会作为一个批次(Batch)一起发出;每条消息恰好属于一个窗口。旧式 `join` 选项仍然存在,但流编译器会拒绝声明了它的窗口缓冲(见下方警告)。
 
 ## 配置
 
@@ -13,7 +13,15 @@ description: ArkFlow 文档页。
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | `tumbling_window` |
 | interval | duration | yes | — | 每个窗口的固定时长。时长耗尽时,发出所有累积的消息。示例:`1ms`、`1s`、`1m`、`1h`。 |
-| join | object | no | — | 应用于发出批次的可选 SQL 连接配置。 |
+| join | object | no | — | 旧式 SQL 连接配置;会被流编译器拒绝(见下方警告)。 |
+
+:::warning 旧式 `join` —— 被流编译器拒绝
+
+在 `tumbling_window` 缓冲上声明 `join` 会在编译时报错
+`legacy window buffers with 'join' cannot compile`。Stream 配置不支持流-流
+连接;请改用 SQL 处理器针对临时表的逐批次连接。
+
+:::
 
 ### `join`
 
