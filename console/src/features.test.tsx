@@ -730,9 +730,16 @@ describe('audit history', () => {
     renderWithQueries(<Audit onError={vi.fn()} />)
     expect(await screen.findByText('node.drain')).toBeInTheDocument()
     expect(screen.getByText('job.start')).toBeInTheDocument()
-    fireEvent.change(screen.getByLabelText('Audit filter'), { target: { value: 'node.drain' } })
-    expect(screen.queryByText('job.start')).not.toBeInTheDocument()
-    expect(screen.getByText('node.drain')).toBeInTheDocument()
+    // Filtering is server-side now: typing a resource id re-queries /audit
+    // with the resource_id param instead of hiding rows client-side.
+    const callsBefore = fetchMock.mock.calls.length
+    fireEvent.change(screen.getByLabelText('Resource ID'), { target: { value: 'node-a' } })
+    await waitFor(() => {
+      const auditCall = fetchMock.mock.calls
+        .slice(callsBefore)
+        .find(([url]) => url.includes('/audit') && url.includes('resource_id=node-a'))
+      expect(auditCall).toBeTruthy()
+    })
   })
 
   it('reports load failures through the error channel', async () => {
@@ -770,6 +777,14 @@ describe('audit history', () => {
 })
 
 describe('job editor determinism', () => {
+  // The editor reports failures through useMutationFailure, which needs a
+  // query client even when a test mounts the editor on its own.
+  const renderEditor = (ui: ReactElement) =>
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        {ui}
+      </QueryClientProvider>,
+    )
   const componentCatalogue = [
     { kind: 'input', name: 'generate', description: 'Generate', schema: null, example: {} },
     { kind: 'output', name: 'drop', description: 'Drop', schema: null, example: {} },
@@ -810,9 +825,31 @@ describe('job editor determinism', () => {
     }),
   }
 
+  it('disables editor mutations when the permission is revoked', async () => {
+    globalThis.fetch = editorFetchMock() as unknown as typeof fetch
+    const view = renderEditor(
+      <JobEditor
+        mode="create"
+        nodes={[]}
+        busy={false}
+        canMutate={false}
+        onClose={vi.fn()}
+        onError={vi.fn()}
+        onSaved={vi.fn()}
+        onRefresh={vi.fn()}
+        onAction={async (_label, fn) => {
+          await fn()
+        }}
+      />,
+    )
+    expect(view.getByRole('button', { name: 'Validate Plan' })).toBeDisabled()
+    expect(view.getByRole('button', { name: 'Create stopped' })).toBeDisabled()
+    expect(view.getByRole('button', { name: 'Create stopped' }).getAttribute('title')).toContain('configure')
+  })
+
   it('resets the draft when the editor target switches from create to upgrade', async () => {
     globalThis.fetch = editorFetchMock() as unknown as typeof fetch
-    const view = render(
+    const view = renderEditor(
       <JobEditor
         mode="create"
         nodes={[]}
@@ -831,29 +868,31 @@ describe('job editor determinism', () => {
     await view.findAllByText('generate-1')
     // Switch the same mounted editor to an upgrade target.
     view.rerender(
-      <JobEditor
-        mode="upgrade"
-        job={upgradeJob as unknown as Job}
-        savepoint={
-          {
-            checkpoint_id: 'sp-1',
-            kind: 'savepoint',
-            status: 'completed',
-            job_version: 3,
-            format_version: 1,
-            created_at_ms: 1,
-          } as unknown as JobCheckpoint
-        }
-        nodes={[]}
-        busy={false}
-        onClose={vi.fn()}
-        onError={vi.fn()}
-        onSaved={vi.fn()}
-        onRefresh={vi.fn()}
-        onAction={async (_label, fn) => {
-          await fn()
-        }}
-      />,
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <JobEditor
+          mode="upgrade"
+          job={upgradeJob as unknown as Job}
+          savepoint={
+            {
+              checkpoint_id: 'sp-1',
+              kind: 'savepoint',
+              status: 'completed',
+              job_version: 3,
+              format_version: 1,
+              created_at_ms: 1,
+            } as unknown as JobCheckpoint
+          }
+          nodes={[]}
+          busy={false}
+          onClose={vi.fn()}
+          onError={vi.fn()}
+          onSaved={vi.fn()}
+          onRefresh={vi.fn()}
+          onAction={async (_label, fn) => {
+            await fn()
+          }}
+        />
+      </QueryClientProvider>,
     )
     // The create draft is gone: the editor shows the target Job's id.
     await view.findByDisplayValue('orders')
@@ -882,7 +921,7 @@ describe('job editor determinism', () => {
       return Promise.resolve({ ok: true, json: async () => ({}) })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const view = render(
+    const view = renderEditor(
       <JobEditor
         mode="create"
         nodes={[]}
@@ -919,7 +958,7 @@ describe('job editor determinism', () => {
   it('generates collision-free node ids across add/delete/add', async () => {
     const fetchMock = editorFetchMock()
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const view = render(
+    const view = renderEditor(
       <JobEditor
         mode="create"
         nodes={[]}
@@ -970,7 +1009,7 @@ describe('job editor determinism', () => {
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
-    const view = render(
+    const view = renderEditor(
       <JobEditor
         mode="create"
         nodes={[]}

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useT } from '../i18n'
-import { useStatus, useWebhooks } from '../queries'
+import { useMutationFailure, useStatus, useWebhooks } from '../queries'
 import { api, SNAPSHOT_INTERVAL_MS, WebhookSubscription } from '../api'
 
 type FormState = {
@@ -14,7 +14,13 @@ type FormState = {
 
 const EMPTY_FORM: FormState = { id: '', url: '', eventTypes: '', secret: '', enabled: true }
 
-export function Settings() {
+export function Settings({
+  hubMode,
+  canManageWebhooks = true,
+}: {
+  hubMode: boolean | undefined
+  canManageWebhooks?: boolean
+}) {
   const t = useT()
   const status = useStatus().data ?? null
   return (
@@ -40,15 +46,18 @@ export function Settings() {
         </div>
         <p>{t('settings.credentialsNote')}</p>
       </section>
-      <WebhooksPanel />
+      {hubMode !== false && <WebhooksPanel canMutate={canManageWebhooks} />}
     </>
   )
 }
 
-function WebhooksPanel() {
+function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
   const t = useT()
   const webhooks = useWebhooks()
   const queryClient = useQueryClient()
+  // Webhook mutations render their own error strings; the shared failure
+  // path still applies for the 403 identity refresh.
+  const reportMutationFailure = useMutationFailure()
   const [form, setForm] = useState<FormState | null>(null)
 
   const subscriptions = webhooks.data?.subscriptions ?? []
@@ -56,10 +65,12 @@ function WebhooksPanel() {
   const replace = useMutation({
     mutationFn: api.replaceWebhooks,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['webhooks'] }),
+    onError: (cause) => reportMutationFailure(undefined, cause),
   })
 
   const runTest = useMutation({
     mutationFn: (id: string) => api.testWebhook(id),
+    onError: (cause) => reportMutationFailure(undefined, cause),
   })
 
   if (webhooks.isError) {
@@ -107,6 +118,7 @@ function WebhooksPanel() {
               <WebhookRow
                 key={subscription.id}
                 subscription={subscription}
+                canMutate={canMutate}
                 onEdit={() =>
                   setForm({
                     id: subscription.id,
@@ -150,7 +162,12 @@ function WebhooksPanel() {
         </p>
       ) : null}
       <div className="toolbar">
-        <button type="button" onClick={() => setForm({ ...EMPTY_FORM })}>
+        <button
+          type="button"
+          disabled={!canMutate}
+          title={!canMutate ? t('perm.requires', { action: 'manage_webhooks' }) : undefined}
+          onClick={() => setForm({ ...EMPTY_FORM })}
+        >
           {t('settings.webhooks.add')}
         </button>
       </div>
@@ -162,6 +179,7 @@ function WebhooksPanel() {
       {form ? (
         <WebhookForm
           form={form}
+          canMutate={canMutate}
           hasSecret={subscriptions.some((entry) => entry.id === form.id && entry.has_secret)}
           onChange={setForm}
           onCancel={() => setForm(null)}
@@ -203,16 +221,19 @@ function WebhooksPanel() {
 
 function WebhookRow({
   subscription,
+  canMutate,
   onEdit,
   onToggle,
   onTest,
 }: {
   subscription: WebhookSubscription
+  canMutate: boolean
   onEdit: () => void
   onToggle: () => void
   onTest: () => void
 }) {
   const t = useT()
+  const gatedTitle = !canMutate ? t('perm.requires', { action: 'manage_webhooks' }) : undefined
   return (
     <tr>
       <td>
@@ -226,13 +247,13 @@ function WebhookRow({
       <td>{subscription.enabled ? t('settings.webhooks.enabled') : t('settings.webhooks.paused')}</td>
       <td>
         <div className="toolbar">
-          <button type="button" onClick={onTest}>
+          <button type="button" disabled={!canMutate} title={gatedTitle} onClick={onTest}>
             {t('settings.webhooks.test')}
           </button>
-          <button type="button" onClick={onToggle}>
+          <button type="button" disabled={!canMutate} title={gatedTitle} onClick={onToggle}>
             {subscription.enabled ? t('settings.webhooks.pause') : t('settings.webhooks.enable')}
           </button>
-          <button type="button" onClick={onEdit}>
+          <button type="button" disabled={!canMutate} title={gatedTitle} onClick={onEdit}>
             {t('settings.webhooks.edit')}
           </button>
         </div>
@@ -243,12 +264,14 @@ function WebhookRow({
 
 function WebhookForm({
   form,
+  canMutate,
   hasSecret,
   onChange,
   onCancel,
   onSubmit,
 }: {
   form: FormState
+  canMutate: boolean
   hasSecret: boolean
   onChange: (next: FormState) => void
   onCancel: () => void
@@ -305,7 +328,13 @@ function WebhookForm({
         <span>{t('settings.webhooks.enabled')}</span>
       </label>
       <div className="toolbar">
-        <button type="submit">{t('settings.webhooks.save')}</button>
+        <button
+          type="submit"
+          disabled={!canMutate}
+          title={!canMutate ? t('perm.requires', { action: 'manage_webhooks' }) : undefined}
+        >
+          {t('settings.webhooks.save')}
+        </button>
         <button type="button" onClick={onCancel}>
           {t('common.cancel')}
         </button>

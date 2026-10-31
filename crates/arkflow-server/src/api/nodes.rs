@@ -30,11 +30,18 @@ impl From<&NodePageQuery> for PageQuery {
     }
 }
 
-pub(super) async fn hub_system(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
+pub(super) async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
     let nodes = hub.nodes().await;
     let leadership = hub.leadership().await;
+    // The auth middleware guarantees an authorized caller by the time the
+    // handler runs; resolving again (rather than trusting an extension)
+    // keeps the echo on the exact enforcement path. A None here still
+    // echoes null rather than omitting the field.
+    let principal = hub
+        .operator_principal(super::bearer(&headers).as_deref())
+        .await;
     Json(
-        serde_json::json!({"id":"arkflow-control-hub", "version":env!("CARGO_PKG_VERSION"), "state":"running", "node_count":nodes.len(), "online_nodes":nodes.iter().filter(|node| node.state == hub::NodeConnectionState::Online).count(), "capabilities":["node_registry","command_dispatch","fleet_aggregation"], "ha": {"enabled": hub.ha_config().enabled, "role": leadership.role(), "epoch": leadership.epoch(), "transitions": hub.leadership_transitions()}}),
+        serde_json::json!({"id":"arkflow-control-hub", "version":env!("CARGO_PKG_VERSION"), "state":"running", "node_count":nodes.len(), "online_nodes":nodes.iter().filter(|node| node.state == hub::NodeConnectionState::Online).count(), "capabilities":["node_registry","command_dispatch","fleet_aggregation"], "ha": {"enabled": hub.ha_config().enabled, "role": leadership.role(), "epoch": leadership.epoch(), "transitions": hub.leadership_transitions()}, "principal": principal.as_ref().map(|principal| principal.echo())}),
     ).into_response()
 }
 

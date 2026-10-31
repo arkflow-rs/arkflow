@@ -5,7 +5,14 @@ import { api, ControlNode, errorMessage, formatTime, Job, JobCheckpoint, JobDeta
 import { currentLocale, intlLocale, useT } from '../i18n'
 import { useConfirm } from './confirm'
 import { SkeletonRows } from './shared'
-import { useJobDetail, useJobVersions, useJobs, useNodes, useRollbackJobUpgrade } from '../queries'
+import {
+  useJobDetail,
+  useJobVersions,
+  useJobs,
+  useMutationFailure,
+  useNodes,
+  useRollbackJobUpgrade,
+} from '../queries'
 import { JobEditor as VisualJobEditor } from './job-editor'
 
 type JobsProps = {
@@ -18,6 +25,7 @@ const pretty = (value: unknown) => JSON.stringify(value, null, 2)
 export function Jobs({ onError, canMutate = true }: JobsProps) {
   const t = useT()
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   const confirm = useConfirm()
   const jobsQuery = useJobs()
   const jobs = jobsQuery.data ?? []
@@ -57,7 +65,7 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
       invalidateJobs()
     } catch (cause) {
       setBusy('')
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   const setStateFor = async (job: Job) => {
@@ -181,6 +189,7 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
           savepoint={editor.savepoint}
           nodes={nodes}
           busy={!!busy}
+          canMutate={canMutate}
           onClose={() => setEditor(undefined)}
           onError={onError}
           onSaved={() => {

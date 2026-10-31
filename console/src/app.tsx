@@ -21,7 +21,8 @@ import {
   streamEvents,
   waitForOperation,
 } from './api'
-import { useNodes, useLiveError } from './queries'
+import { useNodes, useLiveError, useMutationFailure } from './queries'
+import { useHubMode, usePermissions } from './permissions'
 import type { ApiError } from './api'
 import { Overview } from './features/overview'
 import { Runtime } from './features/runtime'
@@ -63,6 +64,10 @@ const NAV_GROUPS = [
 ] as const
 
 const ITEM_BY_KEY = new Map(NAV_ITEMS.map((item) => [item.key, item]))
+
+// Pages whose backing APIs exist only on the Hub plane (see the local router
+// in arkflow-server api/mod.rs): jobs, rollouts, approvals, audit.
+const HUB_ONLY_PAGES: ReadonlySet<string> = new Set(['jobs', 'rollouts', 'approvals', 'audit'])
 
 function createQueryClient() {
   return new QueryClient({
@@ -143,8 +148,13 @@ function ConsoleShell() {
   const queryError = nodesQuery.isError ? nodesQuery.error : liveError
 
   const selectedNodeState = nodes.find((node) => node.id === selectedNode)
-  const canMutate =
+  const { principal, can } = usePermissions()
+  const reportMutationFailure = useMutationFailure()
+  const nodeReachable =
     !selectedNodeState || selectedNodeState.state === 'online' || selectedNodeState.state === 'running'
+  // Lifecycle controls need the node reachable AND the operate action; the
+  // role gate is lenient while the echo is absent (older control plane).
+  const canMutate = nodeReachable && can('operate')
 
   const command = async (id: string, action: 'start' | 'stop' | 'restart') => {
     try {
@@ -152,7 +162,7 @@ function ConsoleShell() {
       await waitForOperation(operation.id)
       await queryClient.invalidateQueries({ queryKey: ['live'] })
     } catch (cause) {
-      setError(errorMessage(cause))
+      reportMutationFailure(setError, cause)
     }
   }
 
@@ -160,6 +170,9 @@ function ConsoleShell() {
     const next = new URLSearchParams(searchParams)
     if (value) next.set('node_id', value)
     else next.delete('node_id')
+    // A page number valid for the previous node can be past the end of the
+    // new node's list: restart pagination with the node change.
+    next.delete('page')
     setSearchParams(next)
   }
 
@@ -181,6 +194,29 @@ function ConsoleShell() {
   const current = NAV_ITEMS.find((item) => item.path === location.pathname) ?? NAV_ITEMS[0]
   const pageTitle = t(`nav.${current.key}`)
   const navSearch = selectedNode ? `?node_id=${encodeURIComponent(selectedNode)}` : ''
+  // Hub-only pages: hidden from navigation on a local plane, and a direct
+  // URL hit renders an explainer rather than a 404. `undefined` (identity
+  // still loading) keeps the full navigation so nothing flashes away.
+  const hubMode = useHubMode()
+  const visibleNav = (key: string) => hubMode !== false || !HUB_ONLY_PAGES.has(key)
+  const hubOnly = (page: ReactNode) =>
+    hubMode === undefined ? (
+      // The identity is still loading: keep the route skeleton while the full
+      // navigation shows, rather than querying Hub-only routes a local plane
+      // does not serve (the failure would outlive the explainer swap).
+      <section className="panel" aria-busy="true">
+        <p className="empty">{t('common.loading')}</p>
+      </section>
+    ) : hubMode === false ? (
+      <section className="panel" data-testid="hub-only-explainer">
+        <div className="panel-title">
+          <h3>{t('perm.hubOnlyTitle')}</h3>
+        </div>
+        <p className="empty">{t('perm.hubOnlyBody')}</p>
+      </section>
+    ) : (
+      page
+    )
   return (
     <div className="shell">
       <Toaster theme={resolvedTheme(themeSetting)} position="bottom-right" />
@@ -193,7 +229,7 @@ function ConsoleShell() {
               <p className="nav-group-label">{t(`nav.group.${group.key}`)}</p>
               {group.items.map((key) => {
                 const item = ITEM_BY_KEY.get(key)
-                if (!item) return null
+                if (!item || !visibleNav(key)) return null
                 return (
                   <NavLink
                     key={item.key}
@@ -216,6 +252,15 @@ function ConsoleShell() {
             <h2>{pageTitle}</h2>
           </div>
           <div className="actions">
+            <span
+              className="identity"
+              title={principal ? principal.actions.join(', ') : undefined}
+              data-testid="principal-identity"
+            >
+              {principal
+                ? t('perm.signedInAs', { id: principal.id, roles: principal.roles.join(', ') })
+                : t('perm.identityUnknown')}
+            </span>
             {oidcAuthenticated && (
               <button
                 onClick={() => {
@@ -278,24 +323,50 @@ function ConsoleShell() {
         {error && <div className="error">{error}</div>}
         {queryError && !standby && <div className="error">{errorMessage(queryError)}</div>}
         <Routes>
-          <Route path="/" element={<Overview onError={setError} />} />
+          <Route path="/" element={<Overview onError={setError} canManageNodes={can('manage_nodes')} />} />
           <Route
             path="/runtime"
-            element={<Runtime command={command} canMutate={canMutate} onError={setError} />}
+            element={
+              <Runtime
+                command={command}
+                canMutate={canMutate}
+                canOperate={can('operate')}
+                onError={setError}
+              />
+            }
           />
-          <Route path="/jobs" element={<Jobs onError={setError} canMutate={canMutate} />} />
+          <Route path="/jobs" element={hubOnly(<Jobs onError={setError} canMutate={canMutate} />)} />
           <Route
             path="/configuration"
             element={
-              <Configuration onError={setError} nodeId={selectedNode || undefined} canMutate={canMutate} />
+              <Configuration
+                onError={setError}
+                nodeId={selectedNode || undefined}
+                canMutate={nodeReachable && can('configure')}
+              />
             }
           />
-          <Route path="/rollouts" element={<Rollouts onError={setError} />} />
-          <Route path="/approvals" element={<Approvals onError={setError} />} />
+          <Route
+            path="/rollouts"
+            element={hubOnly(<Rollouts onError={setError} canMutate={can('manage_rollouts')} />)}
+          />
+          <Route
+            path="/approvals"
+            element={hubOnly(
+              <Approvals
+                onError={setError}
+                canMutate={can('approve_rollouts')}
+                canSubmit={can('manage_rollouts')}
+              />,
+            )}
+          />
           <Route path="/components" element={<Components onError={setError} />} />
           <Route path="/events" element={<Events />} />
-          <Route path="/audit" element={<Audit onError={setError} />} />
-          <Route path="/settings" element={<Settings />} />
+          <Route path="/audit" element={hubOnly(<Audit onError={setError} />)} />
+          <Route
+            path="/settings"
+            element={<Settings hubMode={hubMode} canManageWebhooks={can('manage_webhooks')} />}
+          />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

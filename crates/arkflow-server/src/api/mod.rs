@@ -18,6 +18,8 @@ mod jobs;
 mod node_labels_api_tests;
 mod nodes;
 mod operations;
+#[cfg(test)]
+mod principal_echo_api_tests;
 mod rollouts;
 mod streams;
 mod webhooks;

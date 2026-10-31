@@ -25,6 +25,28 @@ events to observe convergence.
 
 ## Conventions
 
+### Principal echo
+
+`GET /system` on both the Hub plane and the local plane includes an optional
+`principal` object describing the principal authenticated for the current
+request:
+
+```json
+{
+  "id": "ops",
+  "roles": ["operator"],
+  "actions": ["read", "operate", "configure", "manage_nodes", "manage_rollouts", "manage_webhooks"]
+}
+```
+
+`actions` is derived from the same predicate that enforces mutations — the
+echo cannot claim an action the enforcing check would deny. Requests without
+valid credentials are rejected (401) before any identity is echoed;
+`principal: null` is a defensive shape for a response produced without a
+resolvable principal. The local standalone plane always echoes its single
+all-powerful operator as `operator (admin)`. The field is additive: consumers
+that do not know it ignore it without behavior change.
+
 ### Resource model
 
 A stream has three independent views:
@@ -171,7 +193,7 @@ corrupting state.
 
 | Method | Route | Purpose |
 |--------|-------|---------|
-| `GET` | `/system` | Hub system descriptor. |
+| `GET` | `/system` | Hub system descriptor, including `principal: {id, roles, actions}` echoing the authenticated caller's identity and authorized actions (additive; see [Principal echo](#principal-echo)). |
 | `GET` | `/status` | Fleet-aggregated engine status: streams total/running/failed summed across registered nodes. |
 | `GET` | `/nodes` | Fleet node registry. Supports a label filter: `?label=env%3Dprod%2Ctier%3Dedge` (comma-joined `key=value` terms, AND semantics). |
 | `GET` | `/streams` | Streams across the fleet. |

@@ -118,6 +118,9 @@ export const zh = {
   'runtime.activeCount': '{count} 个进行中',
   'runtime.recordedServerSide': ' · 服务端已记录 {count} 条',
   'runtime.noOperations': '暂无操作记录。',
+  'runtime.operationFilter': '操作',
+  'runtime.operationState': '操作状态',
+  'runtime.correlationFilter': '关联 ID',
 
   'config.title': '配置',
   'config.hubSelectNode': '请选择要管理的计算节点。',
@@ -161,6 +164,22 @@ export const zh = {
   'events.filterPlaceholder': '过滤事件',
   'events.matching': '匹配 {count} 条',
   'events.noMatches': '没有匹配的事件。',
+  'events.filterEventType': '事件类型',
+  'events.filterStreamId': '流 ID',
+  'events.filterCorrelationId': '关联 ID',
+
+  // 权限 / 身份
+  'perm.denied': '权限不足：{message}',
+  'perm.requires': '需要 {action} 权限',
+  'perm.identityUnknown': '身份未知',
+  'perm.signedInAs': '{id}（{roles}）',
+  'perm.hubOnlyTitle': '仅 Hub 模式可用',
+  'perm.hubOnlyBody': '该页面依赖控制面 Hub，当前连接的本地引擎不提供此能力。',
+
+  // 服务端列表控件
+  'list.pageSize': '每页条数',
+  'list.filterResourceId': '资源 ID',
+  'list.total': '共 {count} 条',
 
   'settings.title': '设置',
   'settings.subtitle': '安全与能力状态',

@@ -198,7 +198,7 @@ describe('console application', () => {
         ok: true,
         json: async () => {
           if (url.endsWith('/system'))
-            return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
+            return { version: 'hub', state: 'running', node_count: 1, capabilities: ['fleet_aggregation'] }
           if (url.includes('/nodes?'))
             return page([
               {
@@ -249,7 +249,7 @@ describe('console application', () => {
         ok: true,
         json: async () => {
           if (url.endsWith('/system'))
-            return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
+            return { version: 'hub', state: 'running', node_count: 1, capabilities: ['fleet_aggregation'] }
           if (url.includes('/nodes?')) return page([])
           if (url.includes('/audit'))
             return {
@@ -283,6 +283,50 @@ describe('console application', () => {
     )
   })
 
+  it('hides Hub-only navigation on a local plane', async () => {
+    render(<App />)
+    await screen.findByText('Fleet health')
+    for (const label of ['Jobs', 'Rollouts', 'Approvals', 'Audit'])
+      expect(screen.queryByText(label, { selector: 'a' })).not.toBeInTheDocument()
+    expect(screen.getByText('Streams', { selector: 'a' })).toBeInTheDocument()
+  })
+
+  it('explains a Hub-only page reached by direct URL on a local plane', async () => {
+    window.history.replaceState(null, '', '/audit')
+    render(<App />)
+    expect(await screen.findByTestId('hub-only-explainer')).toBeInTheDocument()
+  })
+
+  it('does not mount a Hub-only page before the identity resolves', async () => {
+    let releaseSystem: (() => void) | undefined
+    const systemGate = new Promise<void>((resolve) => {
+      releaseSystem = resolve
+    })
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.endsWith('/system')) {
+        await systemGate
+        return {
+          ok: true,
+          json: async () => ({ version: 'local', state: 'running', node_count: 0, capabilities: [] }),
+        }
+      }
+      if (url.includes('/nodes?')) return { ok: true, json: async () => page([]) }
+      if (url.includes('/audit')) return { ok: true, json: async () => page([]) }
+      return { ok: true, json: async () => page([]) }
+    })
+    window.history.replaceState(null, '', '/audit')
+    render(<App />)
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(expect.stringMatching(/\/system$/), expect.anything()),
+    )
+    // The identity (and therefore the plane's capabilities) is unresolved:
+    // the Hub-only page must not start its own requests yet.
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/audit'))).toBe(false)
+    releaseSystem?.()
+    expect(await screen.findByTestId('hub-only-explainer')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/audit'))).toBe(false)
+  })
+
   it('tracks a Hub lifecycle operation to a terminal state', async () => {
     let operationReads = 0
     fetchMock.mockImplementation((url: string, init?: RequestInit) =>
@@ -290,7 +334,7 @@ describe('console application', () => {
         ok: true,
         json: async () => {
           if (url.endsWith('/system'))
-            return { version: 'hub', state: 'running', node_count: 1, capabilities: [] }
+            return { version: 'hub', state: 'running', node_count: 1, capabilities: ['fleet_aggregation'] }
           if (url.includes('/nodes?'))
             return page([
               {
@@ -377,6 +421,7 @@ describe('console application', () => {
   })
 
   it('shows a permission failure without retrying the mutation', async () => {
+    let systemReads = 0
     fetchMock.mockImplementation((url: string, init?: RequestInit) => {
       if (init?.method === 'POST' && url.includes('/nodes/node-a/streams/orders/start'))
         return Promise.resolve({
@@ -385,11 +430,18 @@ describe('console application', () => {
           headers: new Headers(),
           json: async () => ({ code: 'forbidden', message: 'Operator is not authorized' }),
         })
-      if (url.endsWith('/system'))
+      if (url.endsWith('/system')) {
+        systemReads += 1
         return Promise.resolve({
           ok: true,
-          json: async () => ({ version: 'hub', state: 'running', node_count: 1, capabilities: [] }),
+          json: async () => ({
+            version: 'hub',
+            state: 'running',
+            node_count: 1,
+            capabilities: ['fleet_aggregation'],
+          }),
         })
+      }
       if (url.includes('/nodes?'))
         return Promise.resolve({
           ok: true,
@@ -435,6 +487,52 @@ describe('console application', () => {
     expect(
       fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/start') && init?.method === 'POST'),
     ).toHaveLength(1)
+    // The 403 also refreshes the echoed identity, so stale role gating
+    // recovers without a manual reload (control-plane-console spec).
+    await waitFor(() => expect(systemReads).toBeGreaterThanOrEqual(2))
+  })
+
+  it('reports a Job validation permission failure and refreshes the identity', async () => {
+    let systemReads = 0
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method === 'POST' && String(url).endsWith('/jobs/validate'))
+        return Promise.resolve({
+          ok: false,
+          status: 403,
+          headers: new Headers(),
+          json: async () => ({ code: 'forbidden', message: 'Operator is not authorized' }),
+        })
+      return Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (url.endsWith('/system')) {
+            systemReads += 1
+            return {
+              version: 'hub',
+              state: 'running',
+              node_count: 1,
+              capabilities: ['fleet_aggregation'],
+            }
+          }
+          if (url.includes('/nodes?')) return page([])
+          if (url.endsWith('/jobs')) return []
+          return []
+        },
+      })
+    })
+    window.history.replaceState(null, '', '/jobs')
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Create Job' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
+    expect(await screen.findByText(/not authorized/i)).toBeInTheDocument()
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).endsWith('/jobs/validate') && (init as RequestInit | undefined)?.method === 'POST',
+      ),
+    ).toHaveLength(1)
+    // The 403 also refreshes the echoed identity, as for every other mutation.
+    await waitFor(() => expect(systemReads).toBeGreaterThanOrEqual(2))
   })
 
   it('switches the interface language and persists the choice', async () => {
@@ -471,7 +569,7 @@ describe('console application', () => {
               streams_total: 0,
               streams_running: 0,
               streams_failed: 0,
-              capabilities: [],
+              capabilities: ['fleet_aggregation'],
             }
           if (url.endsWith('/jobs')) return []
           return page([])
@@ -498,7 +596,7 @@ describe('console application', () => {
               streams_total: 0,
               streams_running: 0,
               streams_failed: 0,
-              capabilities: [],
+              capabilities: ['fleet_aggregation'],
             }
           if (url.endsWith('/jobs')) return []
           return page([])
@@ -536,6 +634,18 @@ describe('console application', () => {
     fireEvent.change(selector, { target: { value: 'local-node' } })
     await waitFor(() => expect(window.location.search).toContain('node_id=local-node'))
     await waitFor(() => expect(scopedCalls()).toBeGreaterThan(0))
+  })
+
+  it('restarts list pagination when the node filter changes', async () => {
+    window.history.replaceState(null, '', '/events?page=2')
+    render(<App />)
+    await waitFor(() => {
+      const select = screen.getByLabelText('Compute node') as HTMLSelectElement
+      expect([...select.options].some((option) => option.value === 'local-node')).toBe(true)
+    })
+    fireEvent.change(screen.getByLabelText('Compute node'), { target: { value: 'local-node' } })
+    await waitFor(() => expect(window.location.search).toContain('node_id=local-node'))
+    expect(window.location.search).not.toContain('page=')
   })
 
   it('keeps the last snapshot visible behind the stale banner when the API fails', async () => {

@@ -27,6 +27,7 @@ import {
 import { useConfirm } from './confirm'
 import { ComponentBrowserControls, ComponentKind, filterComponents } from './component-browser'
 import { useT, type TKey } from '../i18n'
+import { useMutationFailure } from '../queries'
 
 const copy = <T,>(v: T): T => structuredClone(v)
 function JobNode({ data }: { data: DagNodeData }) {
@@ -233,6 +234,7 @@ type Props = {
   savepoint?: JobCheckpoint
   nodes: ControlNode[]
   busy: boolean
+  canMutate?: boolean
   onClose: () => void
   onError: (message: string) => void
   onSaved: () => void
@@ -245,6 +247,7 @@ export function JobEditor({
   savepoint,
   nodes,
   busy,
+  canMutate = true,
   onClose,
   onError,
   onSaved,
@@ -253,6 +256,7 @@ export function JobEditor({
 }: Props) {
   const confirm = useConfirm()
   const t = useT()
+  const reportMutationFailure = useMutationFailure()
   const initial = useMemo<JobSpec>(() => {
     if ((mode === 'upgrade' || mode === 'atomic') && job) {
       if (job.spec_json)
@@ -418,7 +422,7 @@ export function JobEditor({
       setValidation(result)
       setIssues(result.valid ? [] : [t('editor.incompatibleGraph')])
     } catch (cause) {
-      onError(cause instanceof Error ? cause.message : t('editor.validationFailed'))
+      reportMutationFailure(onError, cause)
     }
   }
   const submit = async () => {
@@ -502,10 +506,18 @@ export function JobEditor({
         </div>
         <div className="actions">
           <button onClick={onClose}>{t('editor.cancel')}</button>
-          <button disabled={busy} onClick={() => void validate()}>
+          <button
+            disabled={busy || !canMutate}
+            title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
+            onClick={() => void validate()}
+          >
             {t('editor.validatePlan')}
           </button>
-          <button disabled={busy || !validation?.valid} onClick={() => void submit()}>
+          <button
+            disabled={busy || !validation?.valid || !canMutate}
+            title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
+            onClick={() => void submit()}
+          >
             {mode === 'create' ? t('editor.createStopped') : t('editor.submitUpgrade')}
           </button>
         </div>
@@ -949,7 +961,8 @@ export function JobEditor({
           <p>{t('editor.upgradeAcceptedDetail', { job: upgraded })}</p>
           <div className="actions">
             <button
-              disabled={busy}
+              disabled={busy || !canMutate}
+              title={!canMutate ? t('perm.requires', { action: 'operate' }) : undefined}
               onClick={() =>
                 void onAction(t('editor.starting'), async () => {
                   await api.setJobState(upgraded, 'running')

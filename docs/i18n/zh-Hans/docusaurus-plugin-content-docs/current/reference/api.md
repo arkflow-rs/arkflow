@@ -21,6 +21,20 @@ Hub 操作员 API 是一个**期望状态(desired-state)API**:一次成功的 HT
 
 ## 约定 {#conventions}
 
+### 主体回显 {#principal-echo}
+
+Hub 面与本地平面的 `GET /system` 均包含可选的 `principal` 对象,描述当前请求已认证的主体:
+
+```json
+{
+  "id": "ops",
+  "roles": ["operator"],
+  "actions": ["read", "operate", "configure", "manage_nodes", "manage_rollouts", "manage_webhooks"]
+}
+```
+
+`actions` 由与变更授权相同的判定推导——回显不可能声称一个授权检查会拒绝的动作。凭证无效的请求会在回显任何身份之前被 401 拒绝;`principal: null` 只是在无法解析主体时仍产出响应的防御性形状。本地 standalone 平面恒回显其唯一的全权操作者 `operator (admin)`。该字段为增量添加:不认识它的消费方可以无行为变化地忽略它。
+
 ### 资源模型
 
 一条流有三个相互独立的视图:
@@ -151,7 +165,7 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 
 | 方法 | 路由 | 用途 |
 |--------|-------|---------|
-| `GET` | `/system` | Hub 系统描述符。 |
+| `GET` | `/system` | Hub 系统描述符,含 `principal: {id, roles, actions}` 回显当前已认证调用方的身份与被授权动作(增量字段;见[主体回显](#principal-echo))。 |
 | `GET` | `/status` | 机群聚合的引擎状态:streams total/running/failed 对全部注册节点求和。 |
 | `GET` | `/nodes` | 集群节点注册表。支持标签过滤:`?label=env%3Dprod%2Ctier%3Dedge`(逗号连接的 `key=value` 项,AND 语义)。 |
 | `GET` | `/streams` | 整个集群中的流。 |

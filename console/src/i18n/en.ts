@@ -122,6 +122,9 @@ export const en = {
   'runtime.activeCount': '{count} active',
   'runtime.recordedServerSide': ' · {count} recorded server-side',
   'runtime.noOperations': 'No operations recorded.',
+  'runtime.operationFilter': 'Operation',
+  'runtime.operationState': 'Operation state',
+  'runtime.correlationFilter': 'Correlation ID',
 
   // Configuration
   'config.title': 'Configuration',
@@ -169,6 +172,22 @@ export const en = {
   'events.filterPlaceholder': 'Filter events',
   'events.matching': '{count} matching',
   'events.noMatches': 'No matching events.',
+  'events.filterEventType': 'Event type',
+  'events.filterStreamId': 'Stream ID',
+  'events.filterCorrelationId': 'Correlation ID',
+
+  // Permissions / identity
+  'perm.denied': 'Permission denied: {message}',
+  'perm.requires': 'Requires the {action} permission',
+  'perm.identityUnknown': 'Identity unknown',
+  'perm.signedInAs': '{id} ({roles})',
+  'perm.hubOnlyTitle': 'Available in Hub mode only',
+  'perm.hubOnlyBody': 'This page needs the control-plane Hub. The connected local engine does not expose it.',
+
+  // Server-side list controls
+  'list.pageSize': 'Page size',
+  'list.filterResourceId': 'Resource ID',
+  'list.total': '{count} total',
 
   // Settings
   'settings.title': 'Settings',

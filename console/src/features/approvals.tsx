@@ -1,18 +1,28 @@
 import { useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { api, ConfigApproval, errorMessage, formatTime } from '../api'
+import { api, ConfigApproval, formatTime } from '../api'
 import { useT } from '../i18n'
 import { useConfirm, usePrompt } from './confirm'
-import { useConfigApprovals } from '../queries'
+import { useConfigApprovals, useMutationFailure } from '../queries'
 
 /// The approval queue: pending requests first with approve/reject actions,
 /// decided/expired history below. Resubmission of a rejected request
 /// pre-fills the rollouts page state through a URL hand-off (the new
 /// request gets a fresh id; the old record is immutable).
-export function Approvals({ onError }: { onError: (message: string) => void }) {
+type ApprovalsProps = {
+  onError: (message: string) => void
+  /** Decide pending requests, enforced as `approve_rollouts`. */
+  canMutate?: boolean
+  /** Resubmit a rejected request: a submission, which the Hub enforces as
+   * `manage_rollouts` (not the approval decision's `approve_rollouts`). */
+  canSubmit?: boolean
+}
+
+export function Approvals({ onError, canMutate = true, canSubmit = true }: ApprovalsProps) {
   const t = useT()
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   const confirm = useConfirm()
   const prompt = usePrompt()
   const pending = useConfigApprovals('pending').data ?? []
@@ -53,7 +63,7 @@ export function Approvals({ onError }: { onError: (message: string) => void }) {
       toast.success(t('toast.accepted'))
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   const resubmit = async (request: ConfigApproval) => {
@@ -65,7 +75,7 @@ export function Approvals({ onError }: { onError: (message: string) => void }) {
       toast.success(t('approvals.submitted'))
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   return (
@@ -98,17 +108,29 @@ export function Approvals({ onError }: { onError: (message: string) => void }) {
               </small>
               {request.status === 'pending' && (
                 <div className="actions">
-                  <button disabled={busy} onClick={() => void decide(request.request_id, 'approve')}>
+                  <button
+                    disabled={!canMutate || busy}
+                    title={!canMutate ? t('perm.requires', { action: 'approve_rollouts' }) : undefined}
+                    onClick={() => void decide(request.request_id, 'approve')}
+                  >
                     {t('approvals.approve')}
                   </button>
-                  <button disabled={busy} onClick={() => void decide(request.request_id, 'reject')}>
+                  <button
+                    disabled={!canMutate || busy}
+                    title={!canMutate ? t('perm.requires', { action: 'approve_rollouts' }) : undefined}
+                    onClick={() => void decide(request.request_id, 'reject')}
+                  >
                     {t('approvals.reject')}
                   </button>
                 </div>
               )}
               {request.status === 'rejected' && (
                 <div className="actions">
-                  <button disabled={busy} onClick={() => void resubmit(request)}>
+                  <button
+                    disabled={!canSubmit || busy}
+                    title={!canSubmit ? t('perm.requires', { action: 'manage_rollouts' }) : undefined}
+                    onClick={() => void resubmit(request)}
+                  >
                     {t('approvals.resubmit')}
                   </button>
                 </div>
