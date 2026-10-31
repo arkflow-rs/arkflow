@@ -101,13 +101,16 @@ an `ETag` for the new generation:
 
 ### Pagination
 
-Collection endpoints return:
+Paginated collection endpoints (`/nodes`, `/streams`, `/operations`,
+`/events`, `/audit`) return:
 
 ```json
 {"items": [], "page": 1, "page_size": 50, "total": 0}
 ```
 
-`page_size` is bounded to 100. Operation listing supports `node_id`,
+`page_size` is bounded to 100. The remaining collection endpoints (`/jobs`,
+`/rollouts`, `/config-approvals`) return plain arrays, and `GET /webhooks`
+wraps its list in `{"subscriptions": [...]}`. Operation listing supports `node_id`,
 `resource_id`, `operation`, `state`, and `correlation_id` filters. Use
 `intent_id` and `generation` as stable reconciliation references instead of
 assuming that a command ID represents final success.
@@ -129,6 +132,35 @@ and optional machine-readable `details`:
   }
 }
 ```
+
+### Rate limiting
+
+Both control planes enforce a per-credential request rate limit over the
+versioned API; health probes, `GET /metrics`, and the OIDC login flow are
+exempt. Buckets are keyed on a truncated hash of the presented credential —
+static/structured operator credentials per credential, OIDC browser sessions
+per session, agent requests per node (the `Authorization: Bearer` header and
+the legacy `session_token` query parameter resolve to the same bucket). A
+request that exceeds its bucket is rejected before reaching any handler:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+Content-Type: application/json
+
+{"code":"rate_limited","message":"Control-plane request rate limit exceeded; retry after the indicated interval"}
+```
+
+`Retry-After` carries the whole-second refill estimate. Rejections create no
+audit events and no operation records, and are exported as the
+`arkflow_control_plane_rate_limit_rejections_total{plane,key_kind}` counter
+family (`plane` is `local` or `hub`; `key_kind` is `principal`, `node`, or
+`catch_all` — the shared bucket that absorbs traffic beyond the bounded
+bucket table). Configuration lives under `health_check.rate_limit` on the node
+plane (the control-API section is flattened into `health_check`) and the `ARKFLOW_RATE_LIMIT_*` environment variables on the Hub (see
+[deployment](../operate/control-plane/deploy.md#rate-limiting)). Defaults are
+enabled with limits far above legitimate traffic; `enabled: false` restores
+the unlimited behavior exactly.
 
 ## Node API
 
@@ -180,6 +212,8 @@ an operation reference.
 | `GET`/`POST` | `/jobs/{id}/checkpoints` | List recovery artifacts / trigger a barrier checkpoint. |
 | `GET`/`POST` | `/jobs/{id}/savepoints` | List artifacts / trigger a savepoint. |
 | `POST` | `/jobs/{id}/upgrades` | Upgrade to a new version (job must be stopped and converged). |
+| `GET` | `/jobs/{id}/upgrades/{upgrade_id}` | Upgrade status: phase, savepoint, deadline, last error. |
+| `POST` | `/jobs/{id}/upgrades/{upgrade_id}/actions` | Upgrade actions: `pause`, `resume`, `cancel`, `rollback`. |
 | `POST` | `/jobs/{id}/upgrades/{upgrade_id}/rollback` | Roll back to a compatible savepoint. |
 | `POST` | `/jobs/{id}/actions/{action}` | One-shot actions, equivalent in lifecycle semantics to stream actions. |
 
@@ -302,6 +336,19 @@ nodes.
 
 See [Reconciliation rollout and recovery](../operate/control-plane/reconciliation.md)
 for the state machine behind these routes.
+
+### Login sessions (OIDC)
+
+When the Hub is configured with an OIDC provider (see
+[deployment](../operate/control-plane/deploy.md#oidc-jwt-federation)), the
+operator API also serves a browser login flow:
+
+| Method | Route | Purpose |
+|--------|-------|---------|
+| `GET` | `/auth/oidc/status` | Public probe reporting `login_enabled`, `authenticated`, and the current principal. |
+| `GET` | `/auth/oidc/login` | Redirect to the identity provider (PKCE S256 and `nonce` bound to an HttpOnly cookie). |
+| `GET` | `/auth/oidc/callback` | Exchange the code for an id_token and create the server-side session. |
+| `GET` | `/auth/oidc/logout` | Delete the server-side session and clear the cookie. |
 
 ### Discovery and metrics
 

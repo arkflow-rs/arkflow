@@ -3,6 +3,52 @@ use arkflow_server::hub::{HubConfig, HubHaConfig};
 use arkflow_server::ServerConfig;
 use tokio_util::sync::CancellationToken;
 
+/// Rate-limit overrides for the Hub plane; unset variables fall back to the
+/// defaults in `arkflow_core::config::RateLimitConfig`. Unrecognized boolean
+/// spellings and unparseable numbers warn on stderr instead of silently
+/// flipping a default: a typo in `ARKFLOW_RATE_LIMIT_ENABLED` must not turn
+/// a protection off unnoticed.
+fn env_rate_limit_config() -> arkflow_core::config::RateLimitConfig {
+    use arkflow_core::config::{
+        default_node_burst, default_node_rps, default_principal_burst, default_principal_rps,
+        default_rate_limit_enabled, RateLimitConfig,
+    };
+    let warn = |name: &str, value: &str, expected: &str| {
+        eprintln!("warning: {name}='{value}' is not {expected}; using the default");
+    };
+    let flag = |name: &str| -> Option<bool> {
+        std::env::var(name).ok().map(|value| match value.as_str() {
+            "1" | "true" | "yes" => true,
+            "0" | "false" | "no" => false,
+            _ => {
+                warn(name, &value, "one of 1/true/yes/0/false/no");
+                true
+            }
+        })
+    };
+    let number = |name: &str| -> Option<f64> {
+        match std::env::var(name) {
+            Ok(value) => match value.parse::<f64>() {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    warn(name, &value, "a number");
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    };
+    RateLimitConfig {
+        enabled: flag("ARKFLOW_RATE_LIMIT_ENABLED").unwrap_or_else(default_rate_limit_enabled),
+        principal_rps: number("ARKFLOW_RATE_LIMIT_PRINCIPAL_RPS")
+            .unwrap_or_else(default_principal_rps),
+        principal_burst: number("ARKFLOW_RATE_LIMIT_PRINCIPAL_BURST")
+            .unwrap_or_else(default_principal_burst),
+        node_rps: number("ARKFLOW_RATE_LIMIT_NODE_RPS").unwrap_or_else(default_node_rps),
+        node_burst: number("ARKFLOW_RATE_LIMIT_NODE_BURST").unwrap_or_else(default_node_burst),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
@@ -39,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .and_then(|value| value.parse().ok())
             .filter(|ttl| *ttl >= 1_000)
             .unwrap_or_else(arkflow_server::hub::default_approval_ttl_ms),
+        rate_limit: env_rate_limit_config(),
         ..ServerConfig::default()
     };
     let ha = HubHaConfig {
