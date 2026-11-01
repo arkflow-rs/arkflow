@@ -286,6 +286,49 @@ The legacy YAML Stream tumbling/session buffers keep their
 legacy row-count `sliding_window` is not misread as a time window, and
 incompatible configurations fail at compile time with a migration hint.
 
+### Paused Jobs: desired state, convergence, and replay
+
+`desired_state` has three values: `running`, `stopped`, and `paused`. Job
+creation still accepts only `running` and `stopped`; `paused` is reachable
+through the pause mutation or the desired-state resource, and is cleared by
+resume or by stopping the Job.
+
+A paused Job's convergence is defined by the pause state machine, not by
+string equality between the desired and observed state:
+
+- `capturing` / `stopping` — a pause is in flight; the Job reports
+  `reconciling` even after the nodes report `stopped`.
+- `paused` — converged only when every expected assignment at the pause
+  generation is observed `stopped`. An offline node keeps the pause
+  `reconciling` (the intent is durable and the stop is re-dispatched when the
+  node returns) rather than being reported as converged.
+- `resuming` — the resume start is converging; the phase clears only at
+  observed `running`.
+
+While the pause phase is present, reconciliation treats the Job as fenced: a
+`desired_state = paused` Job dispatches only the quiesce stop, once the capture
+is durable — no start, no re-placement, and no stale start-claim supersede; the
+recorded placement is retained. Pausing is a Hub control-plane operation only:
+the Agent protocol and the kernel are unchanged and never observe a `paused`
+value.
+
+Pause artifacts use the ordinary recovery-artifact path, and the artifact kind
+follows the Job's `recovery` policy — `latest_checkpoint` produces a checkpoint
+(pinned against retention until the pause clears), `latest_savepoint` produces
+a savepoint, and `recovery: fail` has no selectable artifact, so pause is
+rejected with `pause_requires_recovery_policy`. This is what lets the ordinary
+recovery selection find the artifact on resume without rewriting the spec or
+creating a new Job version.
+
+**Replay boundary.** Resume bumps the generation and starts the ordinary
+recovery path from the pause artifact. Events processed after the artifact's
+barrier and before teardown completed are replayed from the recovered source
+positions: exactly-once for transactional sinks, at-least-once for
+non-transactional sinks. A Job whose spec declares no checkpoint configuration
+has no artifact to capture — pause stops it directly and resume is a cold
+start. A capture failure or the capture deadline aborts the pause, restores the
+pre-pause recovery pointer, and leaves the running generation untouched.
+
 ### Placement modes
 
 **Task placement has two modes**, selected by the job spec's `placement`
@@ -622,6 +665,8 @@ GET  /api/v1/jobs/{job_id}/detail
 GET  /api/v1/jobs/{job_id}/versions
 POST /api/v1/jobs/{job_id}/checkpoints
 POST /api/v1/jobs/{job_id}/savepoints
+POST /api/v1/jobs/{job_id}/actions/pause
+POST /api/v1/jobs/{job_id}/actions/resume
 POST /api/v1/jobs/{job_id}/upgrades
 POST /api/v1/jobs/{job_id}/upgrades/{upgrade_id}/rollback
 ```
@@ -631,6 +676,7 @@ compiled plan and node capabilities first, then submit with `stopped` and
 inspect `detail`; switch to `running` only after confirmation. Version
 upgrades require the job to be stopped and converged, with a completed
 savepoint whose state format is compatible; when an upgrade fails the job
-stays stopped and the operator explicitly restores the old version. The
-checkpoint/savepoint lifecycle is bound to the job version and the state
-format version.
+stays stopped and the operator explicitly restores the old version. A paused
+Job must be resumed (or stopped to clear its pause bookkeeping) before it can
+be upgraded. The checkpoint/savepoint lifecycle is bound to the job version and
+the state format version.

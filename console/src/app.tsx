@@ -36,6 +36,8 @@ import { ConfirmProvider } from './features/confirm'
 import { resolvedTheme } from './theme'
 import { Rollouts } from './features/rollouts'
 import { Approvals } from './features/approvals'
+import { Users } from './features/users'
+import { RuntimeTokenPrompt } from './features/credential'
 import { useSetLocale, useLocale, useT, type Locale } from './i18n'
 import { useTheme, type ThemeSetting } from './theme'
 
@@ -54,20 +56,25 @@ const NAV_ITEMS = [
   { path: '/configuration', key: 'configuration' },
   { path: '/components', key: 'components' },
   { path: '/audit', key: 'audit' },
+  { path: '/users', key: 'users' },
   { path: '/settings', key: 'settings' },
 ] as const
 
 const NAV_GROUPS = [
   { key: 'observe', items: ['overview', 'runtime', 'events'] },
   { key: 'deliver', items: ['jobs', 'rollouts', 'approvals'] },
-  { key: 'admin', items: ['configuration', 'components', 'audit', 'settings'] },
+  { key: 'admin', items: ['configuration', 'components', 'audit', 'users', 'settings'] },
 ] as const
 
 const ITEM_BY_KEY = new Map(NAV_ITEMS.map((item) => [item.key, item]))
 
 // Pages whose backing APIs exist only on the Hub plane (see the local router
-// in arkflow-server api/mod.rs): jobs, rollouts, approvals, audit.
-const HUB_ONLY_PAGES: ReadonlySet<string> = new Set(['jobs', 'rollouts', 'approvals', 'audit'])
+// in arkflow-server api/mod.rs): jobs, rollouts, approvals, audit, users.
+const HUB_ONLY_PAGES: ReadonlySet<string> = new Set(['jobs', 'rollouts', 'approvals', 'audit', 'users'])
+
+// Hub-only pages that additionally require a specific action from the echoed
+// principal; the nav entry stays hidden until both hold.
+const ACTION_GATED_PAGES: Record<string, 'manage_users'> = { users: 'manage_users' }
 
 function createQueryClient() {
   return new QueryClient({
@@ -198,7 +205,11 @@ function ConsoleShell() {
   // URL hit renders an explainer rather than a 404. `undefined` (identity
   // still loading) keeps the full navigation so nothing flashes away.
   const hubMode = useHubMode()
-  const visibleNav = (key: string) => hubMode !== false || !HUB_ONLY_PAGES.has(key)
+  const visibleNav = (key: string) => {
+    const requiredAction = ACTION_GATED_PAGES[key]
+    if (requiredAction) return hubMode === true && can(requiredAction)
+    return hubMode !== false || !HUB_ONLY_PAGES.has(key)
+  }
   const hubOnly = (page: ReactNode) =>
     hubMode === undefined ? (
       // The identity is still loading: keep the route skeleton while the full
@@ -322,6 +333,7 @@ function ConsoleShell() {
         )}
         {error && <div className="error">{error}</div>}
         {queryError && !standby && <div className="error">{errorMessage(queryError)}</div>}
+        <RuntimeTokenPrompt />
         <Routes>
           <Route path="/" element={<Overview onError={setError} canManageNodes={can('manage_nodes')} />} />
           <Route
@@ -363,6 +375,10 @@ function ConsoleShell() {
           <Route path="/components" element={<Components onError={setError} />} />
           <Route path="/events" element={<Events />} />
           <Route path="/audit" element={hubOnly(<Audit onError={setError} />)} />
+          <Route
+            path="/users"
+            element={hubOnly(<Users onError={setError} canManageUsers={can('manage_users')} />)}
+          />
           <Route
             path="/settings"
             element={<Settings hubMode={hubMode} canManageWebhooks={can('manage_webhooks')} />}

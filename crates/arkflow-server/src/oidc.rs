@@ -59,6 +59,9 @@ pub struct OidcAuthenticator {
     /// possibly-valid rotated key.
     refresh_done: Arc<tokio::sync::Notify>,
     refresh_throttle: Duration,
+    /// When true, federated subjects must be bound to a managed user before
+    /// they authenticate (see the `control-plane-credentials` capability).
+    managed_users_only: bool,
 }
 
 #[derive(Clone)]
@@ -108,12 +111,34 @@ impl OidcAuthenticator {
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refresh_done: Arc::new(tokio::sync::Notify::new()),
             refresh_throttle: JWKS_REFRESH_THROTTLE,
+            managed_users_only: false,
         }
+    }
+
+    /// Require every federated subject to be bound to a managed user.
+    pub fn with_managed_users_only(mut self, managed_users_only: bool) -> Self {
+        self.managed_users_only = managed_users_only;
+        self
+    }
+
+    pub fn managed_users_only(&self) -> bool {
+        self.managed_users_only
     }
 
     /// Validates a bearer token and maps it to a principal, or `None` when
     /// anything at all fails to check out (callers answer 401).
     pub async fn authenticate(&self, token: &str) -> Option<OperatorPrincipal> {
+        self.authenticate_with_iat(token)
+            .await
+            .map(|(principal, _)| principal)
+    }
+
+    /// Like [`Self::authenticate`], but also returns the token's `iat` so the
+    /// Hub can apply the managed-user revocation threshold.
+    pub async fn authenticate_with_iat(
+        &self,
+        token: &str,
+    ) -> Option<(OperatorPrincipal, Option<i64>)> {
         let header = decode_header(token).ok()?;
         if !ALLOWED_ALGORITHMS.contains(&header.alg) {
             return None;
@@ -134,11 +159,15 @@ impl OidcAuthenticator {
         }
         let role = role_from_claims(&claims, &self.role_claim)?;
         let scopes = scopes_from_claims(&claims, &self.scopes_claim);
-        Some(OperatorPrincipal {
-            id,
-            roles: vec![role],
-            scopes,
-        })
+        let issued_at = claims.get("iat").and_then(Value::as_i64);
+        Some((
+            OperatorPrincipal {
+                id,
+                roles: vec![role],
+                scopes,
+            },
+            issued_at,
+        ))
     }
 
     /// Known kids are served from cache even past the TTL (a provider key
@@ -318,6 +347,8 @@ pub struct OidcSettings {
     pub audience: String,
     pub jwks_url: Option<String>,
     pub role_claim: Option<String>,
+    /// Require federated subjects to be bound to a managed user.
+    pub managed_users_only: bool,
     pub scopes_claim: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
@@ -356,6 +387,9 @@ impl OidcFederation {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(|millis| Duration::from_millis(millis.max(1_000))),
+            managed_users_only: std::env::var("ARKFLOW_OIDC_MANAGED_USERS_ONLY")
+                .ok()
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
         };
         Self::from_settings(settings).await
     }
@@ -380,13 +414,16 @@ impl OidcFederation {
             .scopes_claim
             .clone()
             .unwrap_or_else(|| "scopes".to_string());
-        let authenticator = Arc::new(OidcAuthenticator::new(
-            issuer.clone(),
-            settings.audience.clone(),
-            jwks_url,
-            role_claim,
-            scopes_claim,
-        ));
+        let authenticator = Arc::new(
+            OidcAuthenticator::new(
+                issuer.clone(),
+                settings.audience.clone(),
+                jwks_url,
+                role_claim,
+                scopes_claim,
+            )
+            .with_managed_users_only(settings.managed_users_only),
+        );
         authenticator.spawn_periodic_refresh(
             settings
                 .jwks_refresh_interval
@@ -492,6 +529,20 @@ impl OidcFederation {
 
     pub async fn authenticate(&self, token: &str) -> Option<OperatorPrincipal> {
         self.authenticator.authenticate(token).await
+    }
+
+    /// Federation pass-through: validated principal plus the token `iat` (for
+    /// the managed-user revocation threshold).
+    pub async fn authenticate_with_iat(
+        &self,
+        token: &str,
+    ) -> Option<(OperatorPrincipal, Option<i64>)> {
+        self.authenticator.authenticate_with_iat(token).await
+    }
+
+    /// Whether federated subjects must be bound to a managed user.
+    pub fn managed_users_only(&self) -> bool {
+        self.authenticator.managed_users_only()
     }
 
     /// The IdP redirect for starting a login: random state, PKCE S256

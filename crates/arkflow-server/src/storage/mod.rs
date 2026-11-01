@@ -348,6 +348,90 @@ pub struct JobRecord {
     pub checkpoint_id: Option<String>,
     pub last_error: Option<String>,
     pub updated_at_ms: u64,
+    /// Durable pause state machine phase (`capturing`/`stopping`/`paused`/
+    /// `resuming`); `None` for Jobs that were never paused. See the
+    /// `job-pause-resume` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_phase: Option<String>,
+    /// Artifact captured at the pause generation, when one was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_artifact_id: Option<String>,
+    /// Recovery pointer before the pause captured its artifact; aborting a
+    /// pause restores it so a failed capture cannot pin recovery to a
+    /// failed artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_prev_checkpoint_id: Option<String>,
+    /// Bounded re-dispatch counter for the capture phase.
+    #[serde(default)]
+    pub pause_retry_count: u32,
+    /// When the pause was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at_ms: Option<u64>,
+    /// Principal id that requested the pause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_by: Option<String>,
+}
+
+/// Conditional update of a Job's durable pause state machine. The write is a
+/// CAS on `(job_id, expected_generation, expected_phase)`; `clear_pause`
+/// clears every pause column, and `restore_pointer` replaces the recovery
+/// pointer with `restore_checkpoint_id` (which may be `None` to restore "no
+/// pointer"). A pause begin deliberately does not bump the generation: the
+/// running kernel keeps its generation, so aborting the pause leaves the Job
+/// byte-identically running.
+#[derive(Debug, Clone, Default)]
+pub struct JobPauseUpdate {
+    pub expected_generation: u64,
+    pub expected_phase: Option<String>,
+    pub desired_state: Option<String>,
+    pub phase: Option<String>,
+    pub artifact_id: Option<String>,
+    pub prev_checkpoint_id: Option<String>,
+    pub retry_count: Option<u32>,
+    pub paused_at_ms: Option<u64>,
+    pub paused_by: Option<String>,
+    pub clear_pause: bool,
+    pub restore_pointer: bool,
+    pub restore_checkpoint_id: Option<String>,
+    pub bump_generation: bool,
+    pub last_error: Option<String>,
+}
+
+impl JobPauseUpdate {
+    /// Begin a pause at `generation`: desired state becomes `paused`, the
+    /// phase is `capturing` (or `stopping` when no artifact is producible),
+    /// and the pre-pause recovery pointer is remembered.
+    pub fn begin(
+        generation: u64,
+        phase: &str,
+        artifact_id: Option<String>,
+        prev_checkpoint_id: Option<String>,
+        paused_at_ms: u64,
+        paused_by: &str,
+    ) -> Self {
+        Self {
+            expected_generation: generation,
+            expected_phase: None,
+            desired_state: Some("paused".into()),
+            phase: Some(phase.into()),
+            artifact_id,
+            prev_checkpoint_id,
+            retry_count: Some(0),
+            paused_at_ms: Some(paused_at_ms),
+            paused_by: Some(paused_by.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// Advance the phase without touching desired state or generation.
+    pub fn advance(generation: u64, from_phase: &str, to_phase: &str) -> Self {
+        Self {
+            expected_generation: generation,
+            expected_phase: Some(from_phase.into()),
+            phase: Some(to_phase.into()),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +478,54 @@ pub struct JobObservationRecord {
     pub checkpoint_id: Option<String>,
     pub snapshot_json: String,
     pub observed_at_ms: u64,
+}
+
+/// A control-plane operator directory entry (`cp_users`). Managed identities
+/// replace the single static credential with per-user credentials and a
+/// per-user token invalidation threshold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRecord {
+    pub user_id: String,
+    pub display_name: String,
+    /// `admin` | `operator` | `viewer` (one role per user, matching the
+    /// principal model).
+    pub role: String,
+    /// JSON array of `{resource_type, resource_id}` scopes.
+    pub scopes_json: String,
+    pub disabled: bool,
+    /// Bound OIDC subject (unique when present).
+    pub oidc_subject: Option<String>,
+    /// Federated tokens with an `iat` older than this are rejected.
+    pub tokens_valid_after_ms: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// A managed operator credential (`cp_credentials`). Only the hash is stored;
+/// the plaintext token is returned once at creation/rotation time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialRecord {
+    pub credential_id: String,
+    pub user_id: String,
+    pub secret_hash: String,
+    pub label: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+    pub last_used_at_ms: Option<u64>,
+    pub revoked_at_ms: Option<u64>,
+}
+
+/// A persisted browser session (`cp_sessions`): the cookie carries the random
+/// session id, the row carries its hash plus the principal snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub session_hash: String,
+    pub user_id: Option<String>,
+    /// Serialized `OperatorPrincipal` snapshot at login time.
+    pub principal_json: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub revoked_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -502,6 +634,12 @@ pub enum StorageError {
     ActorClosed,
     #[error("desired state generation conflict: expected {expected}, current {current}")]
     GenerationConflict { expected: u64, current: u64 },
+    #[error("job {job_id} pause phase conflict: expected {expected:?}, current {current:?}")]
+    JobPauseConflict {
+        job_id: String,
+        expected: Option<String>,
+        current: Option<String>,
+    },
     #[error("idempotency key was already used for a different mutation")]
     IdempotencyKeyReused,
     #[error("unsupported backend operation: {0}")]
@@ -540,7 +678,7 @@ pub enum StorageError {
 /// Schema version this binary's DDL understands. Each backend stamps it
 /// into the database during initialization and refuses to start when the
 /// stored stamp is newer (an older binary must not operate a newer schema).
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Outcome of `begin_write_fence`: a lock held until `end_write_fence`
 /// (`Held`) or a verified passthrough with nothing to release.
@@ -798,6 +936,60 @@ storage_ops! {
         job_id: String as s,
         desired_state: String as s,
         expected_generation: u64 as v,
+    },
+    ("update_job_pause", UpdateJobPause, update_job_pause) fenced Option<JobRecord> {
+        job_id: String as s,
+        update: JobPauseUpdate as v,
+    },
+    ("list_users", ListUsers, list_users) plain Vec<UserRecord> {},
+    ("get_user", GetUser, get_user) plain Option<UserRecord> {
+        user_id: String as s,
+    },
+    ("get_user_by_oidc_subject", GetUserByOidcSubject, get_user_by_oidc_subject) plain Option<UserRecord> {
+        oidc_subject: String as s,
+    },
+    ("upsert_user", UpsertUser, upsert_user) fenced UserRecord {
+        user: UserRecord as v,
+    },
+    ("delete_user", DeleteUser, delete_user) fenced bool {
+        user_id: String as s,
+    },
+    ("bump_user_tokens_valid_after", BumpUserTokensValidAfter, bump_user_tokens_valid_after) fenced Option<UserRecord> {
+        user_id: String as s,
+        valid_after_ms: u64 as v,
+    },
+    ("list_credentials", ListCredentials, list_credentials) plain Vec<CredentialRecord> {
+        user_id: String as s,
+    },
+    ("get_credential", GetCredential, get_credential) plain Option<CredentialRecord> {
+        credential_id: String as s,
+    },
+    ("create_credential", CreateCredential, create_credential) fenced bool {
+        record: CredentialRecord as v,
+    },
+    ("revoke_credential", RevokeCredential, revoke_credential) fenced bool {
+        credential_id: String as s,
+        revoked_at_ms: u64 as v,
+    },
+    ("rotate_credential", RotateCredential, rotate_credential) fenced bool {
+        record: CredentialRecord as v,
+        previous_credential_id: String as s,
+        revoked_at_ms: u64 as v,
+    },
+    ("get_session", GetSession, get_session) plain Option<SessionRecord> {
+        session_hash: String as s,
+    },
+    ("upsert_session", UpsertSession, upsert_session) fenced bool {
+        record: SessionRecord as v,
+    },
+    ("delete_session", DeleteSession, delete_session) fenced bool {
+        session_hash: String as s,
+    },
+    ("delete_user_sessions", DeleteUserSessions, delete_user_sessions) fenced usize {
+        user_id: String as s,
+    },
+    ("prune_sessions", PruneSessions, prune_sessions) fenced usize {
+        now_ms: u64 as v,
     },
     ("upsert_job_checkpoint", UpsertJobCheckpoint, upsert_job_checkpoint) fenced () {
         record: JobCheckpointRecord as v,
@@ -1460,6 +1652,53 @@ pub trait StorageBackend: Send + Sync + 'static {
         desired_state: &str,
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, StorageError>;
+    /// CAS-guarded mutation of the durable pause state machine: guarded by
+    /// `(expected_generation, expected_phase)`, optionally bumping the
+    /// generation. Returns `None` when the Job does not exist,
+    /// `GenerationConflict`/`JobPauseConflict` when the guard did not match.
+    async fn update_job_pause(
+        &self,
+        job_id: &str,
+        update: JobPauseUpdate,
+    ) -> Result<Option<JobRecord>, StorageError>;
+
+    // ---- managed identity (cp_users / cp_credentials / cp_sessions) ----
+    async fn list_users(&self) -> Result<Vec<UserRecord>, StorageError>;
+    async fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>, StorageError>;
+    async fn get_user_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<Option<UserRecord>, StorageError>;
+    async fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError>;
+    async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError>;
+    async fn bump_user_tokens_valid_after(
+        &self,
+        user_id: &str,
+        valid_after_ms: u64,
+    ) -> Result<Option<UserRecord>, StorageError>;
+    async fn list_credentials(&self, user_id: &str) -> Result<Vec<CredentialRecord>, StorageError>;
+    async fn get_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<CredentialRecord>, StorageError>;
+    async fn create_credential(&self, record: CredentialRecord) -> Result<bool, StorageError>;
+    async fn revoke_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError>;
+    /// Atomically create `record` and revoke the previous credential.
+    async fn rotate_credential(
+        &self,
+        record: CredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError>;
+    async fn get_session(&self, session_hash: &str) -> Result<Option<SessionRecord>, StorageError>;
+    async fn upsert_session(&self, record: SessionRecord) -> Result<bool, StorageError>;
+    async fn delete_session(&self, session_hash: &str) -> Result<bool, StorageError>;
+    async fn delete_user_sessions(&self, user_id: &str) -> Result<usize, StorageError>;
+    async fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError>;
     async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError>;
     async fn list_job_checkpoints(
         &self,
@@ -2559,6 +2798,164 @@ impl StorageBackend for ControlPlaneStore {
             }
         }
     }
+    async fn update_job_pause(
+        &self,
+        job_id: &str,
+        update: JobPauseUpdate,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::update_job_pause(backend, job_id, update).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::update_job_pause(backend, job_id, update).await
+            }
+        }
+    }
+
+    async fn list_users(&self) -> Result<Vec<UserRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_users(backend).await,
+            Self::Postgres(backend) => StorageBackend::list_users(backend).await,
+        }
+    }
+    async fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::get_user(backend, user_id).await,
+            Self::Postgres(backend) => StorageBackend::get_user(backend, user_id).await,
+        }
+    }
+    async fn get_user_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<Option<UserRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::get_user_by_oidc_subject(backend, oidc_subject).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::get_user_by_oidc_subject(backend, oidc_subject).await
+            }
+        }
+    }
+    async fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::upsert_user(backend, user).await,
+            Self::Postgres(backend) => StorageBackend::upsert_user(backend, user).await,
+        }
+    }
+    async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::delete_user(backend, user_id).await,
+            Self::Postgres(backend) => StorageBackend::delete_user(backend, user_id).await,
+        }
+    }
+    async fn bump_user_tokens_valid_after(
+        &self,
+        user_id: &str,
+        valid_after_ms: u64,
+    ) -> Result<Option<UserRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::bump_user_tokens_valid_after(backend, user_id, valid_after_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::bump_user_tokens_valid_after(backend, user_id, valid_after_ms).await
+            }
+        }
+    }
+    async fn list_credentials(&self, user_id: &str) -> Result<Vec<CredentialRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_credentials(backend, user_id).await,
+            Self::Postgres(backend) => StorageBackend::list_credentials(backend, user_id).await,
+        }
+    }
+    async fn get_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<CredentialRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::get_credential(backend, credential_id).await,
+            Self::Postgres(backend) => StorageBackend::get_credential(backend, credential_id).await,
+        }
+    }
+    async fn create_credential(&self, record: CredentialRecord) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::create_credential(backend, record).await,
+            Self::Postgres(backend) => StorageBackend::create_credential(backend, record).await,
+        }
+    }
+    async fn revoke_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::revoke_credential(backend, credential_id, revoked_at_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::revoke_credential(backend, credential_id, revoked_at_ms).await
+            }
+        }
+    }
+    async fn rotate_credential(
+        &self,
+        record: CredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::rotate_credential(
+                    backend,
+                    record,
+                    previous_credential_id,
+                    revoked_at_ms,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::rotate_credential(
+                    backend,
+                    record,
+                    previous_credential_id,
+                    revoked_at_ms,
+                )
+                .await
+            }
+        }
+    }
+    async fn get_session(&self, session_hash: &str) -> Result<Option<SessionRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::get_session(backend, session_hash).await,
+            Self::Postgres(backend) => StorageBackend::get_session(backend, session_hash).await,
+        }
+    }
+    async fn upsert_session(&self, record: SessionRecord) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::upsert_session(backend, record).await,
+            Self::Postgres(backend) => StorageBackend::upsert_session(backend, record).await,
+        }
+    }
+    async fn delete_session(&self, session_hash: &str) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::delete_session(backend, session_hash).await,
+            Self::Postgres(backend) => StorageBackend::delete_session(backend, session_hash).await,
+        }
+    }
+    async fn delete_user_sessions(&self, user_id: &str) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::delete_user_sessions(backend, user_id).await,
+            Self::Postgres(backend) => StorageBackend::delete_user_sessions(backend, user_id).await,
+        }
+    }
+    async fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::prune_sessions(backend, now_ms).await,
+            Self::Postgres(backend) => StorageBackend::prune_sessions(backend, now_ms).await,
+        }
+    }
     async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::upsert_job_checkpoint(backend, record).await,
@@ -3592,6 +3989,13 @@ mod tests {
             checkpoint_id: checkpoint_id.map(str::to_owned),
             last_error: None,
             updated_at_ms: 0,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         };
         store
             .upsert_job(job("orders", Some("ckpt-old")))
@@ -5265,6 +5669,13 @@ mod tests {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 1,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         };
         let stored = store.upsert_job(job.clone()).await.unwrap();
         assert_eq!(stored.generation, 1);
@@ -5624,6 +6035,13 @@ mod tests {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 1,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         };
         let node = NodeMutation {
             node_id: "node-a".into(),
@@ -6127,6 +6545,13 @@ mod tests {
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 1,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             })
             .await
             .unwrap();
@@ -6145,6 +6570,262 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    async fn pause_fixture(store: &ControlPlaneStore, job_id: &str, checkpoint: Option<&str>) {
+        store
+            .upsert_job(JobRecord {
+                job_id: job_id.into(),
+                version: 1,
+                spec_json: "{}".into(),
+                desired_state: "running".into(),
+                observed_state: "running".into(),
+                convergence: "converged".into(),
+                generation: 1,
+                node_ids: vec!["node-a".into()],
+                checkpoint_id: checkpoint.map(str::to_owned),
+                last_error: None,
+                updated_at_ms: 1,
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Pause bookkeeping is a phase-guarded CAS: beginning a pause must not
+    /// bump the generation (an abort leaves the running kernel untouched),
+    /// every transition is fenced by the phase it observed, and the recovery
+    /// pointer is only replaced when a transition explicitly restores it.
+    #[tokio::test]
+    async fn job_pause_transitions_are_phase_guarded_and_preserve_the_running_generation() {
+        let store = ControlPlaneStore::contract(
+            "job_pause_transitions_are_phase_guarded_and_preserve_the_running_generation",
+        )
+        .await;
+        pause_fixture(&store, "paused-job", Some("ckpt-prev")).await;
+
+        let begun = store
+            .update_job_pause(
+                "paused-job",
+                JobPauseUpdate::begin(
+                    1,
+                    "capturing",
+                    Some("ckpt-pause".into()),
+                    Some("ckpt-prev".into()),
+                    1_000,
+                    "admin",
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(begun.generation, 1, "pausing must not bump the generation");
+        assert_eq!(begun.desired_state, "paused");
+        assert_eq!(begun.pause_phase.as_deref(), Some("capturing"));
+        assert_eq!(begun.pause_artifact_id.as_deref(), Some("ckpt-pause"));
+        assert_eq!(begun.pause_prev_checkpoint_id.as_deref(), Some("ckpt-prev"));
+        assert_eq!(begun.paused_by.as_deref(), Some("admin"));
+
+        // A transition conditioned on a phase that is not current conflicts
+        // instead of silently applying.
+        assert!(matches!(
+            store
+                .update_job_pause(
+                    "paused-job",
+                    JobPauseUpdate::advance(1, "stopping", "paused")
+                )
+                .await,
+            Err(StorageError::JobPauseConflict { .. })
+        ));
+
+        let stopping = store
+            .update_job_pause(
+                "paused-job",
+                JobPauseUpdate::advance(1, "capturing", "stopping"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopping.pause_phase.as_deref(), Some("stopping"));
+        let paused = store
+            .update_job_pause(
+                "paused-job",
+                JobPauseUpdate::advance(1, "stopping", "paused"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.pause_phase.as_deref(), Some("paused"));
+        assert_eq!(paused.generation, 1);
+
+        // Resume bumps the generation (a new kernel generation starts from
+        // the pause artifact).
+        let resume = JobPauseUpdate {
+            expected_generation: 1,
+            expected_phase: Some("paused".into()),
+            desired_state: Some("running".into()),
+            phase: Some("resuming".into()),
+            bump_generation: true,
+            ..JobPauseUpdate::default()
+        };
+        let resumed = store
+            .update_job_pause("paused-job", resume)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.generation, 2);
+        assert_eq!(resumed.desired_state, "running");
+        assert_eq!(resumed.pause_phase.as_deref(), Some("resuming"));
+
+        // Convergence clears the pause bookkeeping without touching the
+        // recovery pointer.
+        let clear = JobPauseUpdate {
+            expected_generation: 2,
+            expected_phase: Some("resuming".into()),
+            clear_pause: true,
+            ..JobPauseUpdate::default()
+        };
+        let cleared = store
+            .update_job_pause("paused-job", clear)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.pause_phase, None);
+        assert_eq!(cleared.pause_artifact_id, None);
+        assert_eq!(cleared.paused_by, None);
+        assert_eq!(cleared.checkpoint_id.as_deref(), Some("ckpt-prev"));
+        assert_eq!(cleared.generation, 2);
+    }
+
+    /// Aborting a pause restores the pre-pause recovery pointer — including
+    /// the "there was no pointer" case — so a failed capture cannot permanently
+    /// pin recovery to an artifact that never completed.
+    #[tokio::test]
+    async fn job_pause_abort_restores_the_pre_pause_recovery_pointer() {
+        let store =
+            ControlPlaneStore::contract("job_pause_abort_restores_the_pre_pause_recovery_pointer")
+                .await;
+        pause_fixture(&store, "abort-had-pointer", Some("ckpt-prev")).await;
+        pause_fixture(&store, "abort-no-pointer", None).await;
+
+        for (job_id, expected_pointer) in [
+            ("abort-had-pointer", Some("ckpt-prev")),
+            ("abort-no-pointer", None),
+        ] {
+            let begun = store
+                .update_job_pause(
+                    job_id,
+                    JobPauseUpdate::begin(
+                        1,
+                        "capturing",
+                        Some(format!("{job_id}-failed-artifact")),
+                        expected_pointer.map(str::to_owned),
+                        1_000,
+                        "admin",
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            // Beginning a pause remembers the pre-pause pointer without
+            // touching the live recovery pointer (the artifact dispatch does
+            // that through the checkpoint path).
+            assert_eq!(begun.checkpoint_id.as_deref(), expected_pointer);
+            assert_eq!(begun.pause_prev_checkpoint_id.as_deref(), expected_pointer);
+            let abort = JobPauseUpdate {
+                expected_generation: 1,
+                expected_phase: Some("capturing".into()),
+                desired_state: Some("running".into()),
+                clear_pause: true,
+                restore_pointer: true,
+                restore_checkpoint_id: expected_pointer.map(str::to_owned),
+                last_error: Some("pause_savepoint_failed".into()),
+                ..JobPauseUpdate::default()
+            };
+            let aborted = store
+                .update_job_pause(job_id, abort)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(aborted.desired_state, "running");
+            assert_eq!(aborted.pause_phase, None);
+            assert_eq!(aborted.checkpoint_id.as_deref(), expected_pointer);
+            assert_eq!(aborted.generation, 1);
+            assert_eq!(
+                aborted.last_error.as_deref(),
+                Some("pause_savepoint_failed")
+            );
+        }
+    }
+
+    /// A legacy schema is upgraded in place: the opened store accepts pause
+    /// mutations and the new columns read back as "never paused".
+    #[tokio::test]
+    async fn sqlite_legacy_schema_gains_pause_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "arkflow-pause-migration-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE cp_jobs (
+                        job_id TEXT PRIMARY KEY, version INTEGER NOT NULL,
+                        spec_json TEXT NOT NULL,
+                        desired_state TEXT NOT NULL DEFAULT 'stopped',
+                        observed_state TEXT NOT NULL DEFAULT 'draft',
+                        convergence TEXT NOT NULL DEFAULT 'unknown',
+                        generation INTEGER NOT NULL DEFAULT 0,
+                        node_ids_json TEXT NOT NULL DEFAULT '[]',
+                        checkpoint_id TEXT, last_error TEXT,
+                        updated_at_ms INTEGER NOT NULL
+                    );
+                    PRAGMA user_version = 3;
+                    "#,
+                )
+                .unwrap();
+        }
+        let store = crate::storage::SqliteBackend::open(&path).unwrap();
+        let job = store
+            .upsert_job(JobRecord {
+                job_id: "legacy".into(),
+                version: 1,
+                spec_json: "{}".into(),
+                desired_state: "running".into(),
+                observed_state: "running".into(),
+                convergence: "converged".into(),
+                generation: 1,
+                node_ids: Vec::new(),
+                checkpoint_id: None,
+                last_error: None,
+                updated_at_ms: 1,
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
+            })
+            .unwrap();
+        assert_eq!(job.pause_phase, None);
+        let paused = store
+            .update_job_pause(
+                "legacy",
+                JobPauseUpdate::begin(job.generation, "stopping", None, None, 5, "admin"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.pause_phase.as_deref(), Some("stopping"));
+        assert_eq!(paused.desired_state, "paused");
+        let _ = std::fs::remove_file(path);
     }
 
     /// Boot-less agents report seq 0 forever: their reports are never gated
@@ -6308,6 +6989,13 @@ mod job_storage_tests {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 1,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         };
         let stored = store.upsert_job(job.clone()).await.unwrap();
         assert_eq!(stored.generation, 1);
@@ -6345,6 +7033,13 @@ mod job_storage_tests {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 1,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         };
         assert_eq!(store.upsert_job(original).await.unwrap().generation, 4);
 
@@ -6361,6 +7056,13 @@ mod job_storage_tests {
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 2,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             })
             .await
             .unwrap();
@@ -6387,6 +7089,13 @@ mod job_storage_tests {
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 1,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             })
             .await
             .unwrap();
@@ -6712,5 +7421,149 @@ mod job_storage_tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    fn identity_user(user_id: &str) -> UserRecord {
+        UserRecord {
+            user_id: user_id.into(),
+            display_name: format!("{user_id} display"),
+            role: "operator".into(),
+            scopes_json: r#"[{"resource_type":"node","resource_id":"node-a"}]"#.into(),
+            disabled: false,
+            oidc_subject: None,
+            tokens_valid_after_ms: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    /// The managed identity directory round-trips through both backends:
+    /// users (with unique OIDC subjects), credentials (revocation/rotation),
+    /// sessions (user cascade), and user deletion (cascade).
+    /// Opening a database creates the identity tables (including the partial
+    /// unique OIDC-subject index) without touching existing rows.
+    #[test]
+    fn sqlite_open_creates_identity_tables() {
+        let backend = SqliteBackend::in_memory().unwrap();
+        assert!(backend.index_exists("cp_users_oidc_subject").unwrap());
+        assert!(backend.index_exists("cp_credentials_user").unwrap());
+        assert!(backend.index_exists("cp_sessions_expiry").unwrap());
+        assert!(backend.list_users().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn identity_directory_credentials_and_sessions_round_trip() {
+        let store =
+            ControlPlaneStore::contract("identity_directory_credentials_and_sessions").await;
+        let alice = identity_user("alice");
+        assert_eq!(store.upsert_user(alice.clone()).await.unwrap(), alice);
+        assert_eq!(store.get_user("alice").await.unwrap(), Some(alice.clone()));
+        assert_eq!(store.list_users().await.unwrap(), vec![alice.clone()]);
+
+        // Update in place and keep a unique OIDC subject binding.
+        let mut updated = alice.clone();
+        updated.role = "viewer".into();
+        updated.oidc_subject = Some("sub-alice".into());
+        updated.updated_at_ms = 2;
+        store.upsert_user(updated.clone()).await.unwrap();
+        let read = store.get_user("alice").await.unwrap().unwrap();
+        assert_eq!(read.role, "viewer");
+        assert_eq!(read.oidc_subject.as_deref(), Some("sub-alice"));
+
+        let mut bob = identity_user("bob");
+        bob.oidc_subject = Some("sub-alice".into());
+        assert!(
+            store.upsert_user(bob).await.is_err(),
+            "the OIDC subject binding is unique"
+        );
+
+        // Credential lifecycle: create, list, revoke, rotate.
+        let first = CredentialRecord {
+            credential_id: "cred-1".into(),
+            user_id: "alice".into(),
+            secret_hash: "hash-1".into(),
+            label: "laptop".into(),
+            created_at_ms: 10,
+            expires_at_ms: None,
+            last_used_at_ms: None,
+            revoked_at_ms: None,
+        };
+        assert!(store.create_credential(first.clone()).await.unwrap());
+        assert_eq!(
+            store.get_credential("cred-1").await.unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(store.list_credentials("alice").await.unwrap().len(), 1);
+        assert!(store.revoke_credential("cred-1", 20).await.unwrap());
+        assert_eq!(
+            store
+                .get_credential("cred-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked_at_ms,
+            Some(20)
+        );
+        let second = CredentialRecord {
+            credential_id: "cred-2".into(),
+            created_at_ms: 21,
+            secret_hash: "hash-2".into(),
+            ..first.clone()
+        };
+        assert!(store
+            .rotate_credential(second.clone(), "cred-1", 22)
+            .await
+            .unwrap());
+        assert_eq!(store.get_credential("cred-2").await.unwrap(), Some(second));
+        // A second revocation keeps the first timestamp (idempotent).
+        assert!(store.revoke_credential("cred-1", 99).await.unwrap());
+        assert_eq!(
+            store
+                .get_credential("cred-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked_at_ms,
+            Some(20)
+        );
+
+        // Sessions are revocable per user and pruned when expired.
+        let session = SessionRecord {
+            session_hash: "session-a".into(),
+            user_id: Some("alice".into()),
+            principal_json: r#"{"id":"alice","roles":["Viewer"],"scopes":[]}"#.into(),
+            created_at_ms: 30,
+            expires_at_ms: 60,
+            revoked_at_ms: None,
+        };
+        assert!(store.upsert_session(session.clone()).await.unwrap());
+        assert_eq!(store.get_session("session-a").await.unwrap(), Some(session));
+        assert_eq!(store.delete_user_sessions("alice").await.unwrap(), 1);
+        assert!(store.get_session("session-a").await.unwrap().is_none());
+        let expired = SessionRecord {
+            session_hash: "session-b".into(),
+            user_id: Some("alice".into()),
+            principal_json: "{}".into(),
+            created_at_ms: 1,
+            expires_at_ms: 2,
+            revoked_at_ms: None,
+        };
+        store.upsert_session(expired).await.unwrap();
+        assert_eq!(store.prune_sessions(100).await.unwrap(), 1);
+
+        // Deleting a user cascades its credentials and sessions.
+        let session = SessionRecord {
+            session_hash: "session-c".into(),
+            user_id: Some("alice".into()),
+            principal_json: "{}".into(),
+            created_at_ms: 40,
+            expires_at_ms: 100,
+            revoked_at_ms: None,
+        };
+        store.upsert_session(session).await.unwrap();
+        assert!(store.delete_user("alice").await.unwrap());
+        assert!(store.get_user("alice").await.unwrap().is_none());
+        assert!(store.list_credentials("alice").await.unwrap().is_empty());
+        assert!(store.get_session("session-c").await.unwrap().is_none());
     }
 }

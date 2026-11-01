@@ -116,6 +116,24 @@ an error-level warning). With a token configured, every `/api/v1` endpoint —
 reads included — requires the Bearer token; the health probes and the
 top-level `/metrics` stay open for probes and scrapers.
 
+### Hub identity environment variables
+
+The Hub's managed user directory and OIDC federation are configured by
+environment, not by the engine configuration file:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ARKFLOW_OPERATOR_TOKEN` | — | Static operator credential and break-glass access. Accepts a raw admin token or the structured `principal\|role\|secret` form; held in constant-time comparison. |
+| `ARKFLOW_HUB_STORAGE` | — | Durable store required by the managed identity API. Without it the Hub is volatile: `/api/v1/users*` and `/api/v1/credentials*` answer `503 identity_store_unavailable`, and managed credentials never authenticate. |
+| `ARKFLOW_OIDC_ISSUER` / `ARKFLOW_OIDC_AUDIENCE` | — | Enable OIDC JWT federation; see [deployment](../operate/control-plane/deploy.md#oidc-jwt-federation). |
+| `ARKFLOW_OIDC_MANAGED_USERS_ONLY` | `false` | Require every federated subject to be bound to a managed user (`oidc_subject`). Unbound subjects are rejected with `401` when enabled; the default keeps claim-mapped access. |
+
+The identity lifecycle (issuing one-time credentials, rotating and revoking
+them, binding OIDC subjects, and revoking already-issued JWTs) is documented
+in [Users and credentials](../operate/control-plane/users-and-credentials.md);
+the complete startup environment list is in the
+[CLI reference](./cli.md#startup-environment-variables).
+
 :::note
 When the control-plane server is enabled, `/ready` and `/live` are also
 mounted on the server address next to the legacy `/health`, `/readiness`, and

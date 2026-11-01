@@ -20,7 +20,9 @@ mod approval;
 mod checkpoint;
 mod command_metrics;
 mod error;
+mod identity;
 mod job_orchestration;
+mod job_pause;
 mod jobs;
 mod leadership;
 mod lifecycle;
@@ -37,7 +39,11 @@ mod wire;
 #[cfg(test)]
 mod approval_tests;
 #[cfg(test)]
+mod identity_tests;
+#[cfg(test)]
 mod job_orchestration_tests;
+#[cfg(test)]
+mod job_pause_tests;
 #[cfg(test)]
 mod session_report_tests;
 #[cfg(test)]

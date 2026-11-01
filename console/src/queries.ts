@@ -84,6 +84,22 @@ export function useWebhooks() {
   return useQuery({ queryKey: ['webhooks'], queryFn: api.webhooks })
 }
 
+// The user directory is Hub-only and changes through this page's mutations;
+// like webhooks it refreshes by invalidation rather than on the live cadence.
+export function useUsers(enabled = true) {
+  return useQuery({ queryKey: ['users'], queryFn: api.users, enabled })
+}
+
+// Credential metadata for the selected user; plaintext tokens never appear in
+// this response, so caching the list cannot leak a secret.
+export function useUserCredentials(userId: string | undefined) {
+  return useQuery({
+    queryKey: ['user-credentials', userId ?? null],
+    queryFn: () => api.userCredentials(userId!),
+    enabled: Boolean(userId),
+  })
+}
+
 export function useNodes(label?: string) {
   return useQuery({
     queryKey: ['live', 'nodes', label ?? null],

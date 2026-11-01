@@ -1,7 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { api, ControlNode, errorMessage, formatTime, Job, JobCheckpoint, JobDetail } from '../api'
+import {
+  api,
+  ControlNode,
+  errorMessage,
+  formatTime,
+  isPermissionError,
+  Job,
+  JobCheckpoint,
+  JobDetail,
+} from '../api'
 import { currentLocale, intlLocale, useT } from '../i18n'
 import { useConfirm } from './confirm'
 import { SkeletonRows } from './shared'
@@ -21,6 +30,97 @@ type JobsProps = {
 }
 
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
+
+/** Pause phases, mapped to their operator-facing dictionary keys so the en/zh
+ * wording stays in the i18n tables rather than in this component. */
+const PAUSE_PHASE_KEYS = {
+  capturing: 'jobs.pausePhase.capturing',
+  stopping: 'jobs.pausePhase.stopping',
+  paused: 'jobs.pausePhase.paused',
+  resuming: 'jobs.pausePhase.resuming',
+} as const
+
+/** A Job may only be paused once it is fully running and converged; pausing a
+ * stopped/transitional Job is a 409 `job_not_running`. */
+const canPauseJob = (job: Job) =>
+  !job.pause_phase &&
+  job.desired_state === 'running' &&
+  job.observed_state === 'running' &&
+  job.convergence === 'converged'
+
+/** Surface the server problem code verbatim (a 409 `pause_conflict`, for
+ * example) so operators can act on the exact contract code. */
+function jobMutationError(cause: unknown): string {
+  const code = (cause as { code?: unknown } | null)?.code
+  const message = errorMessage(cause)
+  return typeof code === 'string' && code !== '' && code !== 'request_failed'
+    ? `${code}: ${message}`
+    : message
+}
+
+/** Badge for the durable pause state machine; nothing renders for a Job that
+ * was never paused (`pause_phase` is additive/optional on the wire). */
+function PausePhaseBadge({ job }: { job: Job }) {
+  const t = useT()
+  const phase = job.pause_phase
+  if (!phase) return null
+  return (
+    <span className={`state ${phase === 'paused' ? 'paused' : 'applying'}`}>
+      {t(PAUSE_PHASE_KEYS[phase])}
+    </span>
+  )
+}
+
+/** The single pause/resume control: a settled pause offers Resume; an
+ * in-flight pause or resume stays disabled until the state machine settles; a
+ * plain Job offers Pause only when it is running and converged. */
+function PauseResumeAction({
+  job,
+  canMutate,
+  busy,
+  onPause,
+  onResume,
+}: {
+  job: Job
+  canMutate: boolean
+  busy: boolean
+  onPause: () => void
+  onResume: () => void
+}) {
+  const t = useT()
+  const denied = !canMutate ? t('perm.requires', { action: 'operate' }) : undefined
+  if (job.pause_phase === 'paused') {
+    return (
+      <button disabled={!canMutate || busy} title={denied} onClick={onResume}>
+        {t('jobs.resume')}
+      </button>
+    )
+  }
+  if (job.pause_phase === 'resuming') {
+    return (
+      <button disabled title={t('jobs.resumeInProgress')}>
+        {t('jobs.resume')}
+      </button>
+    )
+  }
+  if (job.pause_phase) {
+    return (
+      <button disabled title={t('jobs.pauseInProgress')}>
+        {t('jobs.pause')}
+      </button>
+    )
+  }
+  const pausable = canPauseJob(job)
+  return (
+    <button
+      disabled={!canMutate || busy || !pausable}
+      title={denied ?? (pausable ? undefined : t('jobs.pauseNotRunning'))}
+      onClick={onPause}
+    >
+      {t('jobs.pause')}
+    </button>
+  )
+}
 
 export function Jobs({ onError, canMutate = true }: JobsProps) {
   const t = useT()
@@ -53,10 +153,15 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
         (job) =>
           (!filter ||
             `${job.job_id} ${job.node_ids.join(' ')}`.toLowerCase().includes(filter.toLowerCase())) &&
-          (state === 'all' || job.observed_state === state || job.convergence === state),
+          (state === 'all' ||
+            job.observed_state === state ||
+            job.convergence === state ||
+            (state === 'paused' && job.pause_phase === 'paused')),
       ),
     [jobs, filter, state],
   )
+  const reportJobFailure = (cause: unknown) =>
+    isPermissionError(cause) ? reportMutationFailure(onError, cause) : onError(jobMutationError(cause))
   const action = async (label: string, fn: () => Promise<unknown>) => {
     try {
       setBusy(label)
@@ -65,7 +170,7 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
       invalidateJobs()
     } catch (cause) {
       setBusy('')
-      reportMutationFailure(onError, cause)
+      reportJobFailure(cause)
     }
   }
   const setStateFor = async (job: Job) => {
@@ -79,6 +184,48 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
       return
     void action(t(stopping ? 'jobs.stopping' : 'jobs.starting'), async () => {
       await api.setJobState(job.job_id, stopping ? 'stopped' : 'running')
+      toast.success(t('toast.accepted'))
+    })
+  }
+  const pauseFor = async (job: Job) => {
+    if (
+      !(await confirm({
+        title: t('jobs.confirmPause', { jobId: job.job_id }),
+        body: t('jobs.confirmPauseBody'),
+        confirmLabel: t('jobs.pause'),
+      }))
+    )
+      return
+    void action(t('jobs.pausing'), async () => {
+      await api.pauseJob(job.job_id)
+      toast.success(t('toast.accepted'))
+    })
+  }
+  const resumeFor = async (job: Job) => {
+    if (
+      !(await confirm({
+        title: t('jobs.confirmResume', { jobId: job.job_id }),
+        body: t('jobs.confirmResumeBody'),
+        confirmLabel: t('jobs.resume'),
+      }))
+    )
+      return
+    void action(t('jobs.resuming'), async () => {
+      await api.resumeJob(job.job_id)
+      toast.success(t('toast.accepted'))
+    })
+  }
+  const stopPausedFor = async (job: Job) => {
+    if (
+      !(await confirm({
+        title: t('jobs.confirmStop', { jobId: job.job_id }),
+        body: t('jobs.confirmStopPausedBody'),
+        confirmLabel: t('jobs.stop'),
+      }))
+    )
+      return
+    void action(t('jobs.stopping'), async () => {
+      await api.setJobState(job.job_id, 'stopped')
       toast.success(t('toast.accepted'))
     })
   }
@@ -110,6 +257,7 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
             <option value="all">{t('jobs.allStates')}</option>
             <option value="running">{t('jobs.state.running')}</option>
             <option value="stopped">{t('jobs.state.stopped')}</option>
+            <option value="paused">{t('jobs.state.paused')}</option>
             <option value="failed">{t('jobs.state.failed')}</option>
             <option value="degraded">{t('jobs.state.degraded')}</option>
           </select>
@@ -149,14 +297,25 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
                 </button>
                 <div>
                   <span className={`state ${job.observed_state}`}>{job.observed_state}</span>
+                  <PausePhaseBadge job={job} />
                   <small>
                     {t('jobs.desiredSummary', { desired: job.desired_state, convergence: job.convergence })}
                   </small>
                   {job.last_error && <small className="error-text">{job.last_error}</small>}
                 </div>
                 <div className="actions">
-                  <button disabled={!canMutate || !!busy} onClick={() => setStateFor(job)}>
-                    {job.desired_state === 'running' ? t('jobs.stop') : t('jobs.start')}
+                  <PauseResumeAction
+                    job={job}
+                    canMutate={canMutate}
+                    busy={!!busy}
+                    onPause={() => void pauseFor(job)}
+                    onResume={() => void resumeFor(job)}
+                  />
+                  <button
+                    disabled={!canMutate || !!busy}
+                    onClick={() => (job.pause_phase ? void stopPausedFor(job) : void setStateFor(job))}
+                  >
+                    {job.pause_phase || job.desired_state === 'running' ? t('jobs.stop') : t('jobs.start')}
                   </button>
                 </div>
               </div>
@@ -320,14 +479,58 @@ function JobDetailPanel({
   onViewPlan: (planJson: string) => void
 }) {
   const t = useT()
+  const confirm = useConfirm()
   const [tab, setTab] = useState<'overview' | 'plan' | 'tasks' | 'recovery' | 'versions'>('overview')
   const checkpoints = detail.checkpoints ?? []
+  const pausing = Boolean(detail.job.pause_phase)
   const runArtifact = (kind: 'checkpoint' | 'savepoint') =>
     void onAction(kind === 'checkpoint' ? t('jobs.checkpointing') : t('jobs.creatingSavepoint'), async () => {
       if (kind === 'checkpoint') await api.checkpoint(detail.job.job_id)
       else await api.savepoint(detail.job.job_id)
       onRefresh()
     })
+  const pauseJob = async () => {
+    if (
+      !(await confirm({
+        title: t('jobs.confirmPause', { jobId: detail.job.job_id }),
+        body: t('jobs.confirmPauseBody'),
+        confirmLabel: t('jobs.pause'),
+      }))
+    )
+      return
+    void onAction(t('jobs.pausing'), async () => {
+      await api.pauseJob(detail.job.job_id)
+      onRefresh()
+    })
+  }
+  const resumeJob = async () => {
+    if (
+      !(await confirm({
+        title: t('jobs.confirmResume', { jobId: detail.job.job_id }),
+        body: t('jobs.confirmResumeBody'),
+        confirmLabel: t('jobs.resume'),
+      }))
+    )
+      return
+    void onAction(t('jobs.resuming'), async () => {
+      await api.resumeJob(detail.job.job_id)
+      onRefresh()
+    })
+  }
+  const stopJob = async () => {
+    if (
+      !(await confirm({
+        title: t('jobs.confirmStop', { jobId: detail.job.job_id }),
+        body: pausing ? t('jobs.confirmStopPausedBody') : undefined,
+        confirmLabel: t('jobs.stop'),
+      }))
+    )
+      return
+    void onAction(t('jobs.stopping'), async () => {
+      await api.setJobState(detail.job.job_id, 'stopped')
+      onRefresh()
+    })
+  }
   const tabLabels = {
     overview: t('jobs.tabOverview'),
     plan: t('jobs.tabPlan'),
@@ -353,18 +556,20 @@ function JobDetailPanel({
           <button disabled={!canMutate || busy} onClick={() => runArtifact('savepoint')}>
             {t('jobs.savepoint')}
           </button>
-          {detail.job.desired_state === 'running' && (
+          <PauseResumeAction
+            job={detail.job}
+            canMutate={canMutate}
+            busy={busy}
+            onPause={() => void pauseJob()}
+            onResume={() => void resumeJob()}
+          />
+          {detail.job.desired_state === 'running' && !pausing && (
             <button disabled={!canMutate || busy} onClick={onAtomicUpgrade}>
               {t('jobs.atomicUpgrade')}
             </button>
           )}
-          {detail.job.desired_state === 'running' && (
-            <button
-              disabled={!canMutate || busy}
-              onClick={() =>
-                void onAction(t('jobs.stopping'), () => api.setJobState(detail.job.job_id, 'stopped'))
-              }
-            >
+          {(detail.job.desired_state === 'running' || pausing) && (
+            <button disabled={!canMutate || busy} onClick={() => void stopJob()}>
               {t('jobs.stop')}
             </button>
           )}
@@ -383,10 +588,23 @@ function JobDetailPanel({
           <div className="detail-grid">
             <div>
               <span className={`state ${detail.job.observed_state}`}>{detail.job.observed_state}</span>
+              <PausePhaseBadge job={detail.job} />
               <p>
                 {t('jobs.desiredLabel')} <strong>{detail.job.desired_state}</strong> ·{' '}
                 {t('jobs.convergenceLabel')} <strong>{detail.job.convergence}</strong>
               </p>
+              {detail.job.pause_phase && (
+                <>
+                  <p>
+                    {t('jobs.pauseArtifactLabel')}{' '}
+                    <strong>{detail.job.pause_artifact_id ?? t('jobs.noneValue')}</strong>
+                  </p>
+                  <p>
+                    {t('jobs.pausedAtLabel')} <strong>{formatTime(detail.job.paused_at_ms)}</strong>
+                    {detail.job.paused_by ? ` · ${t('jobs.pausedByLabel')} ${detail.job.paused_by}` : ''}
+                  </p>
+                </>
+              )}
               <p>
                 {t('jobs.nodesLabel')}{' '}
                 <strong>
@@ -455,9 +673,9 @@ function JobDetailPanel({
                     })}
                   </small>
                 </div>
-                <span className={`state ${task.state ?? 'queued'}`}>
-                  {task.state ?? 'queued'}
-                  {task.observed === false && ` · ${t('jobs.taskNotObserved')}`}
+                <span className={`state ${pausing ? 'paused' : (task.state ?? 'queued')}`}>
+                  {pausing ? t('jobs.taskNotObservedDuringPause') : (task.state ?? 'queued')}
+                  {!pausing && task.observed === false && ` · ${t('jobs.taskNotObserved')}`}
                 </span>
                 <small>
                   {t('jobs.taskGeneration', { generation: String(task.generation ?? detail.job.generation) })}

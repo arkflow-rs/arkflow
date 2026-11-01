@@ -1,5 +1,45 @@
+fn row_to_user_pg(row: &Row<'_>) -> Result<UserRecord, StorageError> {
+    Ok(UserRecord {
+        user_id: row.get(0)?,
+        display_name: row.get(1)?,
+        role: row.get(2)?,
+        scopes_json: row.get(3)?,
+        disabled: row.get(4)?,
+        oidc_subject: row.get(5)?,
+        tokens_valid_after_ms: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
+}
+
+fn row_to_credential_pg(row: &Row<'_>) -> Result<CredentialRecord, StorageError> {
+    Ok(CredentialRecord {
+        credential_id: row.get(0)?,
+        user_id: row.get(1)?,
+        secret_hash: row.get(2)?,
+        label: row.get(3)?,
+        created_at_ms: row.get(4)?,
+        expires_at_ms: row.get(5)?,
+        last_used_at_ms: row.get(6)?,
+        revoked_at_ms: row.get(7)?,
+    })
+}
+
+fn row_to_session_pg(row: &Row<'_>) -> Result<SessionRecord, StorageError> {
+    Ok(SessionRecord {
+        session_hash: row.get(0)?,
+        user_id: row.get(1)?,
+        principal_json: row.get(2)?,
+        created_at_ms: row.get(3)?,
+        expires_at_ms: row.get(4)?,
+        revoked_at_ms: row.get(5)?,
+    })
+}
+
 #[async_trait]
 impl StorageBackend for PostgresBackend {
+
+
     async fn set_desired(&self, mutation: DesiredMutation) -> Result<IntentRecord, StorageError> {
         let now = now_ms();
         {
@@ -2095,7 +2135,7 @@ impl StorageBackend for PostgresBackend {
                 StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
             })?;
             connection.execute(
-                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms",
+                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms, pause_phase=excluded.pause_phase, pause_artifact_id=excluded.pause_artifact_id, pause_prev_checkpoint_id=excluded.pause_prev_checkpoint_id, pause_retry_count=excluded.pause_retry_count, paused_at_ms=excluded.paused_at_ms, paused_by=excluded.paused_by",
                 binds![
                     job.job_id,
                     job.version,
@@ -2108,6 +2148,12 @@ impl StorageBackend for PostgresBackend {
                     job.checkpoint_id,
                     job.last_error,
                     job.updated_at_ms,
+                    job.pause_phase,
+                    job.pause_artifact_id,
+                    job.pause_prev_checkpoint_id,
+                    job.pause_retry_count,
+                    job.paused_at_ms,
+                    job.paused_by,
                 ],
             ).await?;
             Ok(job)
@@ -2184,7 +2230,7 @@ impl StorageBackend for PostgresBackend {
             // request, and the caller caches this record.
             let stored = connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     binds![&job.job_id],
                     row_to_job_pg,
                 ).await
@@ -2202,7 +2248,7 @@ impl StorageBackend for PostgresBackend {
             let mut connection = self.lease().await?;
             connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     binds![job_id],
                     row_to_job_pg,
                 ).await
@@ -2256,7 +2302,7 @@ impl StorageBackend for PostgresBackend {
             let mut connection = self.lease().await?;
             let rows = connection.query_all(
                 &q(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs ORDER BY updated_at_ms DESC, job_id LIMIT 4096",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs ORDER BY updated_at_ms DESC, job_id LIMIT 4096",
                 ),
                 &[],
                 row_to_job_pg,
@@ -2284,7 +2330,7 @@ impl StorageBackend for PostgresBackend {
             ).await?;
             connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     binds![job_id],
                     row_to_job_pg,
                 ).await
@@ -2341,7 +2387,7 @@ impl StorageBackend for PostgresBackend {
             }
             connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     binds![job_id],
                     row_to_job_pg,
                 ).await
@@ -2390,7 +2436,7 @@ impl StorageBackend for PostgresBackend {
             }
             connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     binds![job_id],
                     row_to_job_pg,
                 ).await
@@ -2401,6 +2447,378 @@ impl StorageBackend for PostgresBackend {
         }
     }
 
+
+    async fn update_job_pause(
+        &self,
+        job_id: &str,
+        update: JobPauseUpdate,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        {
+            let mut connection = self.begin().await?;
+            let __ret = async {
+            let changed = connection.execute(
+                "UPDATE cp_jobs SET \
+                    desired_state = COALESCE(?2, desired_state), \
+                    pause_phase = CASE WHEN ?3 THEN NULL ELSE COALESCE(?4, pause_phase) END, \
+                    pause_artifact_id = CASE WHEN ?3 THEN NULL ELSE COALESCE(?5, pause_artifact_id) END, \
+                    pause_prev_checkpoint_id = CASE WHEN ?3 THEN NULL ELSE COALESCE(?6, pause_prev_checkpoint_id) END, \
+                    pause_retry_count = CASE WHEN ?3 THEN 0 ELSE COALESCE(?7, pause_retry_count) END, \
+                    paused_at_ms = CASE WHEN ?3 THEN NULL ELSE COALESCE(?8, paused_at_ms) END, \
+                    paused_by = CASE WHEN ?3 THEN NULL ELSE COALESCE(?9, paused_by) END, \
+                    checkpoint_id = CASE WHEN ?10 THEN ?11 ELSE checkpoint_id END, \
+                    convergence = 'reconciling', \
+                    generation = CASE WHEN ?12 THEN generation + 1 ELSE generation END, \
+                    last_error = COALESCE(?13, last_error), \
+                    updated_at_ms = ?14 \
+                 WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS NOT DISTINCT FROM ?16",
+                binds![
+                    job_id,
+                    update.desired_state,
+                    update.clear_pause,
+                    update.phase,
+                    update.artifact_id,
+                    update.prev_checkpoint_id,
+                    update.retry_count.map(|value| value as i64),
+                    update.paused_at_ms.map(|value| value as i64),
+                    update.paused_by,
+                    update.restore_pointer,
+                    update.restore_checkpoint_id,
+                    update.bump_generation,
+                    update.last_error,
+                    now_ms(),
+                    update.expected_generation,
+                    update.expected_phase,
+                ],
+            ).await?;
+            if changed == 0 {
+                let current = connection
+                    .query_row(
+                        "SELECT generation, pause_phase FROM cp_jobs WHERE job_id = ?1",
+                        binds![job_id],
+                        |row| Ok((row.get::<u64>(0)?, row.get::<Option<String>>(1)?)),
+                    ).await
+                    .optional()?;
+                return match current {
+                    None => Ok(None),
+                    Some((generation, _)) if generation != update.expected_generation => {
+                        Err(StorageError::GenerationConflict {
+                            expected: update.expected_generation,
+                            current: generation,
+                        })
+                    }
+                    Some((_, phase)) => Err(StorageError::JobPauseConflict {
+                        job_id: job_id.to_owned(),
+                        expected: update.expected_phase,
+                        current: phase,
+                    }),
+                };
+            }
+            connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
+                    binds![job_id],
+                    row_to_job_pg,
+                ).await
+                .optional()
+            }.await;
+            connection.commit().await?;
+            __ret
+        }
+    }
+
+
+
+    // ---- managed identity (cp_users / cp_credentials / cp_sessions) ----
+
+    async fn list_users(&self) -> Result<Vec<UserRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        let rows = connection
+            .query_all(
+                &q("SELECT user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms FROM cp_users ORDER BY user_id"),
+                &[],
+                row_to_user_pg,
+            )
+            .await?;
+        Ok(rows)
+    }
+
+    async fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        connection
+            .query_row(
+                &q("SELECT user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms FROM cp_users WHERE user_id = ?1"),
+                binds![user_id],
+                row_to_user_pg,
+            )
+            .await
+            .optional()
+    }
+
+    async fn get_user_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<Option<UserRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        connection
+            .query_row(
+                &q("SELECT user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms FROM cp_users WHERE oidc_subject = ?1"),
+                binds![oidc_subject],
+                row_to_user_pg,
+            )
+            .await
+            .optional()
+    }
+
+    async fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
+        let mut transaction = self.begin().await?;
+        let user_for_row = user.clone();
+        let __ret = async {
+            transaction
+                .execute(
+                    &q("INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, role=excluded.role, scopes_json=excluded.scopes_json, disabled=excluded.disabled, oidc_subject=excluded.oidc_subject, tokens_valid_after_ms=excluded.tokens_valid_after_ms, created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms"),
+                    binds![
+                        user.user_id,
+                        user.display_name,
+                        user.role,
+                        user.scopes_json,
+                        user.disabled,
+                        user.oidc_subject,
+                        user.tokens_valid_after_ms,
+                        user.created_at_ms,
+                        user.updated_at_ms,
+                    ],
+                )
+                .await?;
+            Ok(user_for_row)
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            transaction
+                .execute(&q("DELETE FROM cp_credentials WHERE user_id = ?1"), binds![user_id])
+                .await?;
+            transaction
+                .execute(&q("DELETE FROM cp_sessions WHERE user_id = ?1"), binds![user_id])
+                .await?;
+            let changed = transaction
+                .execute(&q("DELETE FROM cp_users WHERE user_id = ?1"), binds![user_id])
+                .await?;
+            Ok(changed > 0)
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn bump_user_tokens_valid_after(
+        &self,
+        user_id: &str,
+        valid_after_ms: u64,
+    ) -> Result<Option<UserRecord>, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            transaction
+                .execute(
+                    &q("UPDATE cp_users SET tokens_valid_after_ms = ?2, updated_at_ms = ?3 WHERE user_id = ?1"),
+                    binds![user_id, valid_after_ms, now_ms()],
+                )
+                .await?;
+            transaction
+                .query_row(
+                    &q("SELECT user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms FROM cp_users WHERE user_id = ?1"),
+                    binds![user_id],
+                    row_to_user_pg,
+                )
+                .await
+                .optional()
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn list_credentials(&self, user_id: &str) -> Result<Vec<CredentialRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        let rows = connection
+            .query_all(
+                &q("SELECT credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms FROM cp_credentials WHERE user_id = ?1 ORDER BY created_at_ms DESC, credential_id"),
+                binds![user_id],
+                row_to_credential_pg,
+            )
+            .await?;
+        Ok(rows)
+    }
+
+    async fn get_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<CredentialRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        connection
+            .query_row(
+                &q("SELECT credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms FROM cp_credentials WHERE credential_id = ?1"),
+                binds![credential_id],
+                row_to_credential_pg,
+            )
+            .await
+            .optional()
+    }
+
+    async fn create_credential(&self, record: CredentialRecord) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            transaction
+                .execute(
+                    &q("INSERT INTO cp_credentials (credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+                    binds![
+                        record.credential_id,
+                        record.user_id,
+                        record.secret_hash,
+                        record.label,
+                        record.created_at_ms,
+                        record.expires_at_ms,
+                        record.last_used_at_ms,
+                        record.revoked_at_ms,
+                    ],
+                )
+                .await?;
+            Ok(true)
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn revoke_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let changed = transaction
+                .execute(
+                    &q("UPDATE cp_credentials SET revoked_at_ms = COALESCE(revoked_at_ms, ?2) WHERE credential_id = ?1"),
+                    binds![credential_id, revoked_at_ms],
+                )
+                .await?;
+            Ok(changed > 0)
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn rotate_credential(
+        &self,
+        record: CredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            transaction
+                .execute(
+                    &q("INSERT INTO cp_credentials (credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+                    binds![
+                        record.credential_id,
+                        record.user_id,
+                        record.secret_hash,
+                        record.label,
+                        record.created_at_ms,
+                        record.expires_at_ms,
+                        record.last_used_at_ms,
+                        record.revoked_at_ms,
+                    ],
+                )
+                .await?;
+            let changed = transaction
+                .execute(
+                    &q("UPDATE cp_credentials SET revoked_at_ms = COALESCE(revoked_at_ms, ?2) WHERE credential_id = ?1"),
+                    binds![previous_credential_id, revoked_at_ms],
+                )
+                .await?;
+            Ok(changed > 0)
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn get_session(&self, session_hash: &str) -> Result<Option<SessionRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        connection
+            .query_row(
+                &q("SELECT session_hash, user_id, principal_json, created_at_ms, expires_at_ms, revoked_at_ms FROM cp_sessions WHERE session_hash = ?1"),
+                binds![session_hash],
+                row_to_session_pg,
+            )
+            .await
+            .optional()
+    }
+
+    async fn upsert_session(&self, record: SessionRecord) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            transaction
+                .execute(
+                    &q("INSERT INTO cp_sessions (session_hash, user_id, principal_json, created_at_ms, expires_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(session_hash) DO UPDATE SET user_id=excluded.user_id, principal_json=excluded.principal_json, expires_at_ms=excluded.expires_at_ms, revoked_at_ms=excluded.revoked_at_ms"),
+                    binds![
+                        record.session_hash,
+                        record.user_id,
+                        record.principal_json,
+                        record.created_at_ms,
+                        record.expires_at_ms,
+                        record.revoked_at_ms,
+                    ],
+                )
+                .await?;
+            Ok(true)
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn delete_session(&self, session_hash: &str) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let changed = transaction
+                .execute(
+                    &q("DELETE FROM cp_sessions WHERE session_hash = ?1"),
+                    binds![session_hash],
+                )
+                .await?;
+            Ok(changed > 0)
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn delete_user_sessions(&self, user_id: &str) -> Result<usize, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let changed = transaction
+                .execute(&q("DELETE FROM cp_sessions WHERE user_id = ?1"), binds![user_id])
+                .await?;
+            Ok(changed as usize)
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let changed = transaction
+                .execute(
+                    &q("DELETE FROM cp_sessions WHERE expires_at_ms <= ?1 OR (revoked_at_ms IS NOT NULL AND revoked_at_ms <= ?1)"),
+                    binds![now_ms],
+                )
+                .await?;
+            Ok(changed as usize)
+        }.await;
+        transaction.commit().await?;
+        __ret
+    }
 
     async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
         {
@@ -2730,5 +3148,11 @@ fn row_to_job_pg(row: &Row<'_>) -> Result<JobRecord, StorageError> {
         checkpoint_id: row.get(8)?,
         last_error: row.get(9)?,
         updated_at_ms: row.get(10)?,
+        pause_phase: row.get(11)?,
+        pause_artifact_id: row.get(12)?,
+        pause_prev_checkpoint_id: row.get(13)?,
+        pause_retry_count: row.get(14)?,
+        paused_at_ms: row.get(15)?,
+        paused_by: row.get(16)?,
     })
 }

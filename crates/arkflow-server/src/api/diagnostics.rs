@@ -344,12 +344,25 @@ pub(crate) async fn hub_oidc_callback(
     let Some(principal) = federation.authenticate(&id_token).await else {
         return unauthorized();
     };
-    let Some(session_id) = federation.create_session(principal) else {
-        return problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "session_create_failed",
-            "OS random source is unavailable; session cannot be created".into(),
-        );
+    // Session ids are persisted (hashed) when the Hub has durable storage so
+    // they survive restarts and can be revoked per user; without storage the
+    // federation's in-memory fallback is used.
+    let session_id = match hub.create_session(principal.clone()).await {
+        Some(session_id) => session_id,
+        // Volatile Hub: fall back to the federation's in-memory sessions.
+        None => match hub
+            .oidc_login()
+            .and_then(|federation| federation.create_session(principal))
+        {
+            Some(session_id) => session_id,
+            None => {
+                return problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session_create_failed",
+                    "session cannot be created".into(),
+                )
+            }
+        },
     };
     let max_age = oidc::session_ttl_secs();
     Response::builder()
@@ -373,9 +386,7 @@ pub(crate) async fn hub_oidc_callback(
 pub(crate) async fn hub_oidc_logout(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
     if let Some(token) = bearer(&headers) {
         if let Some(session_id) = token.strip_prefix("session:") {
-            if let Some(federation) = hub.oidc_login() {
-                federation.remove_session(session_id);
-            }
+            hub.remove_session(session_id).await;
         }
     }
     Response::builder()

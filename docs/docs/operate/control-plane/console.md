@@ -16,7 +16,7 @@ is served from a reverse proxy next to the Hub — see
 | View | What it shows |
 |------|---------------|
 | **Overview** | Fleet health first: node up/down summaries, convergence state, and pointers into problem areas. |
-| **Jobs** | The job catalog with desired vs. observed state, versions, and lifecycle actions (start/stop, checkpoint, upgrade). |
+| **Jobs** | The job catalog with desired vs. observed state, versions, pause phase, and lifecycle actions (start/stop, pause/resume, checkpoint, upgrade). |
 | **Job editor** | A form-based editor for job specs with spec validation before submit. |
 | **Job DAG** | A directed-graph orchestrator view of a job's operator graph — operator boundaries, partition routes, and stateful operators, mirroring `GET /api/v1/jobs/{id}/plan`. |
 | **Rollouts** | Per-node rollout progress with pause, resume, cancel, and rollback actions. |
@@ -25,7 +25,8 @@ is served from a reverse proxy next to the Hub — see
 | **Configuration** | Node configuration history, diffs, apply, and rollback. In Hub mode every action is routed through the selected node; drafts are a local-control-plane feature. |
 | **Events** | The fleet event log (`GET /api/v1/events`, with the SSE stream for live updates), filtered and paginated server-side. |
 | **Audit** | The fleet audit history (`GET /api/v1/audit`): accepted and rejected mutations with actor, target, node, and outcome, filterable by resource and paginated server-side. |
-| **Settings** | Console preferences and connection settings. |
+| **Users** | The managed user directory and credentials page (`/users`): users, roles, scopes, OIDC bindings, one-time credential issuance, rotation, revocation, and token revocation. Visible only in Hub mode to principals holding `manage_users` (admin). |
+| **Settings** | Console preferences, connection settings, and the runtime bearer credential panel. |
 
 ## Reading the console the way the API works
 
@@ -56,6 +57,24 @@ keyed state across a changed parallelism, and per-task `resources` requests
 (`cpu_millicores`, `memory_bytes`) that participate in placement accounting —
 as form controls, serializing both back to their absent form when cleared.
 
+## Job pause and resume
+
+The Jobs list and detail panel expose **Pause** on a converged running Job and
+**Resume** on a paused one, together with a phase badge that keeps the
+transition visible (`capturing`, `stopping`, `paused`, `resuming`) instead of
+folding it into "stopped". While a pause or resume transition is in flight the
+actions are disabled, and a paused row's task list shows tasks as not observed
+rather than reporting a stale running state. The controls require the
+`operate` action like start and stop. The confirmation explains that pausing
+captures a recovery artifact before stopping and that resume replays events
+processed after the artifact, and a rejected transition shows the server's
+problem code (`pause_in_progress`, `job_already_paused`, `job_paused`,
+`orchestration_in_progress`, …) verbatim. On a paused Job, `start` and
+`restart` act as resume, and `stop` settles it as stopped. The Jobs filter
+includes a `paused` option. See
+[Streaming jobs → Pause and resume](../../build/jobs.md#pause-and-resume) for the
+server-side semantics and the replay boundary.
+
 ## Node maintenance actions
 
 The overview cards expose three node actions for fleet maintenance. Each one
@@ -74,7 +93,7 @@ While a node is not `active`, its overview card shows the current state
 ## Navigation and URLs
 
 Every view has its own URL path (`/`, `/runtime`, `/jobs`, `/configuration`,
-`/rollouts`, `/components`, `/events`, `/audit`, `/settings`), so views can be
+`/rollouts`, `/components`, `/events`, `/audit`, `/users`, `/settings`), so views can be
 bookmarked, shared, and reached with the browser's back and forward buttons.
 The selected compute node is stored as a `node_id` query parameter on the
 current path and carries over when you switch views. Legacy links that used
@@ -83,11 +102,13 @@ automatically to the corresponding path and keep the remaining query
 parameters.
 
 Navigation reflects what the connected control plane actually serves. The
-Jobs, Rollouts, Approvals, and Audit views depend on Hub-only APIs; when the
-console is connected to a local engine (`/system` capabilities lack
+Jobs, Rollouts, Approvals, Audit, and Users views depend on Hub-only APIs; when
+the console is connected to a local engine (`/system` capabilities lack
 `fleet_aggregation`) those entries disappear from the navigation, their
 direct URLs render an explainer naming the Hub requirement instead of an
-error, and Settings hides its webhook management section. While the system
+error, and Settings hides its webhook management section. The Users entry is
+additionally gated on the `manage_users` action, so non-admin principals never
+see it. While the system
 identity is still loading, the full navigation renders so nothing flashes
 away at startup.
 
@@ -105,7 +126,7 @@ filter resets to the first page. The page size selector offers 25 / 50 /
 the console uses it directly: the header shows who you are (for example
 `ops (operator)`), and every mutating control — stream lifecycle, publish and
 rollback, job actions, rollout creation, approval decisions, node
-maintenance, webhook management — is gated on the echoed action list. A
+maintenance, webhook management, and identity administration — is gated on the echoed action list. A
 principal without the required action sees the control disabled with a
 tooltip naming the missing permission, so a viewer session reads everything
 but changes nothing. The echo comes from the same predicate the server uses
@@ -115,6 +136,49 @@ never retries the mutation, and refreshes the identity. Against an older
 control plane that does not echo a principal, the console keeps controls
 enabled and marks the session identity as unknown rather than locking
 everything.
+
+## Users and credentials {#users-and-credentials}
+
+On a durable-storage Hub the console exposes a standalone **Users** page
+(`/users`), listed in the navigation only for principals holding the
+`manage_users` action (admin). It is the console-side equivalent of the
+[user and credential API](../../reference/api.md#users-and-credentials):
+
+- **Users**: list the directory, create a user (id, display name, role, scopes
+  edited item by item, optional OIDC subject), edit it, disable or enable it,
+  and delete it. Every mutating action goes through the standard confirmation
+  dialog.
+- **Credentials**: inspect credential metadata (id, label, created/expiry/
+  revocation timestamps) without ever seeing stored hashes. Issuing a
+  credential shows the plaintext token exactly once, with a copy action and an
+  explicit "shown only once" warning — the console cannot retrieve it again,
+  and the only recovery is rotation. Rotation shows the replacement token the
+  same way; a `DELETE` revocation is idempotent (the `200` body carries
+  `{"revoked": bool}` but is not needed by the UI).
+- **Revoke tokens**: invalidates a user's federated JWTs and browser sessions;
+  managed credentials stay valid and are revoked or rotated individually.
+- Rejected operations display the server's problem code verbatim
+  (`last_admin_required`, `credential_limit`, `oidc_subject_conflict`,
+  `identity_store_unavailable`, …); a `403` follows the usual
+  permission-downgrade path.
+
+The page is gated twice: Hub mode (the local engine has no user directory) and
+a `/system` principal echo that includes `manage_users`. Everyone else sees no
+navigation entry; a direct visit renders the Hub-requirement explainer, and a
+request from a lower-privileged principal fails with the server's
+`403 forbidden`.
+
+### Runtime bearer credentials
+
+The console no longer requires a token at build time. When the API answers
+`401` and no OIDC login flow is configured, the shell prompts for a bearer
+credential; the **Settings** page keeps a runtime credential panel with
+**switch credential** / **clear credential** controls. The entered token is
+kept in `sessionStorage` — never `localStorage` — so it disappears when the
+tab closes and is not shared across tabs. `VITE_API_TOKEN`, when present, only
+acts as the initial default; clearing the runtime credential falls back to it.
+When OIDC login is enabled the normal redirect-to-login flow takes precedence,
+and the runtime prompt is not used.
 
 ## When to use the console vs. the API
 
@@ -152,7 +216,10 @@ received and are not translated by the console.
 ## Security notes
 
 The console is a static bundle that holds no secrets beyond what you enter;
-it authenticates to the Hub with operator tokens over your reverse proxy.
-Keep both the Hub API and the console behind an authenticated, protected
-network boundary — do not expose token-bearing deployments to the public
-internet (see [deployment](./deploy.md)).
+it authenticates to the Hub with operator tokens over your reverse proxy. A
+bearer token entered at runtime lives in `sessionStorage` for the tab's
+lifetime and is never written to `localStorage` or the URL. The one-time
+credential reveal renders the plaintext from that single issuance response —
+the console cannot fetch it again. Keep both the Hub API and the console behind
+an authenticated, protected network boundary — do not expose token-bearing
+deployments to the public internet (see [deployment](./deploy.md)).

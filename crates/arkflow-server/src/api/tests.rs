@@ -3409,6 +3409,13 @@ async fn hub_job_read_routes_report_missing_and_corrupt_records() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: hub::now_ms_for_metrics(),
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -3433,6 +3440,13 @@ async fn hub_job_read_routes_report_missing_and_corrupt_records() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: hub::now_ms_for_metrics(),
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -3450,7 +3464,18 @@ async fn hub_job_action_and_recovery_artifact_routes_validate_input() {
     let session = register_job_node(&app, "node-a").await;
 
     create_job(&app, "acted-job").await;
-    // Unknown action and unknown Job.
+    // Unknown action is a client error; a pause of a stopped Job is a
+    // semantic conflict (the pause state machine requires a converged
+    // running Job).
+    let (status, body) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/jobs/acted-job/actions/explode",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_job_action");
     let (status, body) = request_without_body(
         &app,
         "POST",
@@ -3458,8 +3483,8 @@ async fn hub_job_action_and_recovery_artifact_routes_validate_input() {
         Some("operator"),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["code"], "invalid_job_action");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "job_not_running");
     let (status, _) = request_without_body(
         &app,
         "POST",
@@ -3558,6 +3583,190 @@ async fn hub_job_action_and_recovery_artifact_routes_validate_input() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+fn durable_pause_job_spec(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "version": 1,
+        "operators": [
+            {"id": "source", "kind": "source"},
+            {
+                "id": "aggregate",
+                "kind": "aggregate",
+                "stateful": true,
+                "key_field": "key",
+                "config": {"type": "batch", "count": 100, "timeout_ms": 1000}
+            },
+            {"id": "sink", "kind": "sink"}
+        ],
+        "edges": [
+            {"id": "source-aggregate", "from": "source", "to": "aggregate"},
+            {"id": "aggregate-sink", "from": "aggregate", "to": "sink"}
+        ],
+        "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+        "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+        "state": {"backend": "embedded_kv", "durability": "durable", "format_version": 1},
+        "checkpoint": {"interval_ms": 1000, "retention": 2,
+            "object_store_uri": format!("file:///tmp/arkflow-api-pause-{}-{id}", std::process::id())}
+    })
+}
+
+/// The Hub routes expose the pause/resume state machine with stable problem
+/// codes and additive pause fields on the Job record.
+#[tokio::test]
+async fn hub_pause_and_resume_routes_drive_the_state_machine() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    let _session = register_job_node(&app, "node-a").await;
+
+    let (status, job) = post_json(
+        &app,
+        "/api/v1/jobs",
+        "operator",
+        serde_json::json!({"spec": durable_pause_job_spec("paused-route"), "desired_state": "stopped"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+
+    // A stopped Job cannot be paused.
+    let (status, body) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/jobs/paused-route/actions/pause",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "job_not_running");
+
+    // Start it, then pretend the node observed it running and converged.
+    let (status, job) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/jobs/paused-route/actions/start",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    let generation = job["generation"].as_u64().unwrap();
+    hub.observe_job("paused-route", generation, "running", None, None)
+        .await
+        .unwrap();
+
+    // Pause is accepted (202) and records the capture phase.
+    let (status, job) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/jobs/paused-route/actions/pause",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+    assert_eq!(job["desired_state"], "paused");
+    assert_eq!(job["pause_phase"], "capturing");
+    let artifact = job["pause_artifact_id"].as_str().unwrap().to_string();
+
+    // A paused (pausing) Job cannot be upgraded or resumed yet.
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/jobs/paused-route/upgrades",
+        "operator",
+        serde_json::json!({
+            "spec": durable_pause_job_spec("paused-route"),
+            "expected_generation": generation,
+            "mode": "atomic"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "job_paused");
+    let (status, body) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/jobs/paused-route/actions/resume",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "pause_in_progress");
+
+    // Drive the machine to paused, then resume through the API.
+    hub.complete_job_checkpoint("paused-route", &artifact, "completed", None)
+        .await
+        .unwrap();
+    hub.reconcile_job_pauses().await.unwrap();
+    hub.observe_job("paused-route", generation, "stopped", None, None)
+        .await
+        .unwrap();
+    hub.reconcile_job_pauses().await.unwrap();
+    let (status, job) = get_json(&app, "/api/v1/jobs/paused-route", "operator").await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["pause_phase"], "paused");
+    assert_eq!(job["convergence"], "converged");
+    assert_eq!(job["checkpoint_id"], artifact);
+
+    // Resume of a durable Job needs a real object-store artifact (the
+    // recovery start validates its manifest); the resume route is covered by
+    // the stateless test below, and rejection paths by the assertions above.
+}
+
+/// Resume over HTTP works end to end for a Job whose recovery needs no
+/// artifact (no checkpoint configuration).
+#[tokio::test]
+async fn hub_resume_route_restores_a_stateless_paused_job() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    let _session = register_job_node(&app, "node-a").await;
+    create_job(&app, "plain-route").await;
+    let (status, job) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/jobs/plain-route/actions/start",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    let generation = job["generation"].as_u64().unwrap();
+    hub.observe_job("plain-route", generation, "running", None, None)
+        .await
+        .unwrap();
+
+    let (status, job) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/jobs/plain-route/actions/pause",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+    assert_eq!(job["pause_phase"], "stopping");
+    hub.observe_job("plain-route", generation, "stopped", None, None)
+        .await
+        .unwrap();
+    hub.reconcile_job_pauses().await.unwrap();
+
+    let (status, job) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/jobs/plain-route/actions/resume",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+    assert_eq!(job["desired_state"], "running");
+    assert_eq!(job["pause_phase"], "resuming");
+    let resumed_generation = job["generation"].as_u64().unwrap();
+    assert!(resumed_generation > generation);
+
+    hub.observe_job("plain-route", resumed_generation, "running", None, None)
+        .await
+        .unwrap();
+    hub.reconcile_job_pauses().await.unwrap();
+    let (status, job) = get_json(&app, "/api/v1/jobs/plain-route", "operator").await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert!(job.get("pause_phase").is_none(), "{job}");
+    assert_eq!(job["desired_state"], "running");
+}
+
 #[tokio::test]
 async fn hub_job_detail_reports_split_placement_violations() {
     let hub = storage_hub();
@@ -3598,6 +3807,13 @@ async fn hub_job_detail_reports_split_placement_violations() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: hub::now_ms_for_metrics(),
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -4065,6 +4281,13 @@ async fn hub_job_rollback_rejects_state_format_mismatch() {
         checkpoint_id: Some(checkpoint_id),
         last_error: None,
         updated_at_ms: hub::now_ms_for_metrics(),
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -5394,6 +5617,7 @@ async fn oidc_login_hub() -> hub::Hub {
         client_secret: Some("console-secret".into()),
         redirect_uri: Some("http://127.0.0.1:1/console/callback".into()),
         jwks_refresh_interval: None,
+        managed_users_only: false,
     })
     .await
     .expect("federation builds");
@@ -6758,6 +6982,13 @@ async fn viewer_credentials_cannot_mutate_jobs_or_rollouts() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -7339,6 +7570,7 @@ async fn oidc_secure_login_and_callback_failure_modes() {
         client_secret: Some("console-secret".into()),
         redirect_uri: Some("https://127.0.0.1:1/console/callback".into()),
         jwks_refresh_interval: None,
+        managed_users_only: false,
     })
     .await
     .expect("federation builds");
@@ -7414,4 +7646,327 @@ async fn oidc_secure_login_and_callback_failure_modes() {
             .is_some_and(|value| value.contains("; Secure")),
         "the session cookie must carry the Secure attribute"
     );
+}
+
+async fn patch_json(
+    app: &Router,
+    path: &str,
+    bearer: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::patch(path)
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    read_json(response).await
+}
+
+#[tokio::test]
+async fn hub_user_directory_and_credential_routes() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+
+    let (status, user) = post_json(
+        &app,
+        "/api/v1/users",
+        "operator",
+        serde_json::json!({
+            "user_id": "alice",
+            "display_name": "Alice",
+            "role": "viewer",
+            "scopes": [{"resource_type": "job", "resource_id": "orders"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{user}");
+    assert_eq!(user["user_id"], "alice");
+    assert_eq!(user["scopes"][0]["resource_type"], "job");
+
+    let (status, issued) = post_json(
+        &app,
+        "/api/v1/users/alice/credentials",
+        "operator",
+        serde_json::json!({"label": "laptop"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    let token = issued["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("ark_"));
+    assert!(issued["credential"].get("secret_hash").is_none());
+
+    // Metadata listing never carries the secret.
+    let (status, list) = get_json(&app, "/api/v1/users/alice/credentials", "operator").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert!(list[0].get("token").is_none());
+    assert!(list[0].get("secret_hash").is_none());
+
+    // The managed credential authenticates, but a viewer cannot manage users.
+    let (status, system) = get_json(&app, "/api/v1/system", &token).await;
+    assert_eq!(status, StatusCode::OK, "{system}");
+    assert_eq!(system["principal"]["id"], "alice");
+    assert_eq!(system["principal"]["roles"], serde_json::json!(["viewer"]));
+    let (status, denied) = get_json(&app, "/api/v1/users", &token).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert_eq!(denied["code"], "forbidden");
+
+    // Partial update keeps unset fields and can disable the user.
+    let (status, updated) = patch_json(
+        &app,
+        "/api/v1/users/alice",
+        "operator",
+        serde_json::json!({"role": "operator", "disabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["role"], "operator");
+    assert_eq!(updated["disabled"], true);
+    assert_eq!(updated["display_name"], "Alice");
+
+    // A disabled user's credential stops authenticating.
+    let (status, _) = get_json(&app, "/api/v1/system", &token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) =
+        request_without_body(&app, "DELETE", "/api/v1/users/alice", Some("operator")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = get_json(&app, "/api/v1/users/alice", "operator").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "user_not_found");
+}
+
+#[tokio::test]
+async fn hub_credential_rotation_and_revocation_routes() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/users",
+        "operator",
+        serde_json::json!({"user_id": "bob", "role": "operator"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, issued) = post_json(
+        &app,
+        "/api/v1/users/bob/credentials",
+        "operator",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    let credential_id = issued["credential"]["credential_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_token = issued["token"].as_str().unwrap().to_string();
+
+    let (status, rotated) = request_without_body(
+        &app,
+        "POST",
+        &format!("/api/v1/credentials/{credential_id}/rotate"),
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rotated}");
+    let second_token = rotated["token"].as_str().unwrap().to_string();
+    assert_ne!(first_token, second_token);
+    let (status, _) = get_json(&app, "/api/v1/system", &first_token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = get_json(&app, "/api/v1/system", &second_token).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Revoke the rotated credential; the token stops working.
+    let new_id = rotated["credential"]["credential_id"].as_str().unwrap();
+    let (status, _) = request_without_body(
+        &app,
+        "DELETE",
+        &format!("/api/v1/credentials/{new_id}"),
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get_json(&app, "/api/v1/system", &second_token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // User-level token revocation reports the cleared session count.
+    let (status, revoked) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/users/bob/revoke-tokens",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    assert_eq!(revoked["revoked_sessions"], 0);
+}
+
+#[tokio::test]
+async fn hub_user_management_requires_manage_users() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    // Unauthenticated is 401 before any handler runs.
+    let (status, _) = request_without_body(&app, "GET", "/api/v1/users", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The static admin can manage; operator/viewer managed users cannot.
+    for (user_id, role) in [("ops", "operator"), ("guest", "viewer")] {
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/users",
+            "operator",
+            serde_json::json!({"user_id": user_id, "role": role}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, issued) = post_json(
+            &app,
+            &format!("/api/v1/users/{user_id}/credentials"),
+            "operator",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let token = issued["token"].as_str().unwrap().to_string();
+        let (status, body) = get_json(&app, "/api/v1/users", &token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "forbidden");
+    }
+}
+
+#[tokio::test]
+async fn hub_user_management_enforces_last_admin_and_store_guards() {
+    // A Hub without a static break-glass credential: the only enabled admin
+    // cannot delete or disable itself.
+    let hub = hub::Hub::with_storage(
+        hub::HubConfig {
+            operator_token: None,
+            node_token: Some("node-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+            session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: hub::default_approval_ttl_ms(),
+        },
+        storage::StorageActor::start(storage::ControlPlaneStore::in_memory().unwrap(), 8),
+    );
+    let user = hub
+        .create_user(
+            storage::UserRecord {
+                user_id: "root-admin".into(),
+                display_name: "Root".into(),
+                role: "admin".into(),
+                scopes_json: "[]".into(),
+                disabled: false,
+                oidc_subject: None,
+                tokens_valid_after_ms: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "bootstrap",
+        )
+        .await
+        .unwrap();
+    let (_, token) = hub
+        .issue_credential(&user.user_id, "bootstrap", None, "bootstrap")
+        .await
+        .unwrap();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    let (status, body) =
+        request_without_body(&app, "DELETE", "/api/v1/users/root-admin", Some(&token)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "last_admin_required");
+    let audit = hub.audit(Some("root-admin")).await.unwrap();
+    assert!(
+        audit.iter().any(|record| record.action == "user.delete"
+            && record.outcome == "rejected"
+            && record.failure_code.as_deref() == Some("last_admin_required")),
+        "rejected identity mutation must be audited: {audit:?}"
+    );
+    let (status, body) = patch_json(
+        &app,
+        "/api/v1/users/root-admin",
+        &token,
+        serde_json::json!({"disabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "last_admin_required");
+
+    // A volatile Hub has no identity store.
+    let volatile = hub_router(
+        hub::Hub::new(storage_hub_config()),
+        &ServerConfig::default(),
+    );
+    let (status, body) = get_json(&volatile, "/api/v1/users", "operator").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "identity_store_unavailable");
+}
+
+#[tokio::test]
+async fn hub_identity_boundaries_are_explicit() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/users",
+        "operator",
+        serde_json::json!({"user_id": "alice", "role": "viewer"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // An empty PATCH is a client error, not a silent no-op.
+    let (status, body) = patch_json(
+        &app,
+        "/api/v1/users/alice",
+        "operator",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_user");
+
+    // Listing credentials of an unknown user is a 404, not an empty list.
+    let (status, body) = get_json(&app, "/api/v1/users/ghost/credentials", "operator").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "user_not_found");
+
+    // The directory bound is enforced. Seed the remaining users through the
+    // Hub (an API loop of 1024 creations would trip the per-credential rate
+    // limiter, which is unrelated to what this test asserts).
+    for index in 0..1023 {
+        hub.create_user(
+            storage::UserRecord {
+                user_id: format!("bulk-{index}"),
+                display_name: String::new(),
+                role: "viewer".into(),
+                scopes_json: "[]".into(),
+                disabled: false,
+                oidc_subject: None,
+                tokens_valid_after_ms: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "bootstrap",
+        )
+        .await
+        .unwrap();
+    }
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/users",
+        "operator",
+        serde_json::json!({"user_id": "one-too-many", "role": "viewer"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "user_limit");
 }

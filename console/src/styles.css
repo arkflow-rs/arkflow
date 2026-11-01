@@ -1065,6 +1065,35 @@ progress {
   color: var(--bg);
 }
 
+/* ---------- users, credentials & runtime token ---------- */
+.token-prompt {
+  border-color: var(--warn);
+}
+.issued-credential {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  padding: 12px 14px;
+  margin: 12px 0;
+}
+.issued-credential h4 {
+  border: 0;
+  padding: 0;
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+.token-value {
+  display: block;
+  overflow-wrap: anywhere;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.warning-text {
+  color: var(--warn);
+}
+
 /* ---------- skeleton ---------- */
 .skeleton {
   border-radius: 6px;
