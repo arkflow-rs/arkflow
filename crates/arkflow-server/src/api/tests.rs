@@ -3767,6 +3767,47 @@ async fn hub_resume_route_restores_a_stateless_paused_job() {
     assert_eq!(job["desired_state"], "running");
 }
 
+/// The desired-state route's pause branches reject exactly like the actions
+/// route: same problem code, a `job.pause` rejection audit record, and a
+/// point on `arkflow_job_pause_total{outcome="rejected"}`.
+#[tokio::test]
+async fn hub_desired_state_pause_rejection_is_audited_like_the_actions_route() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    let _session = register_job_node(&app, "node-a").await;
+    create_job(&app, "ds-audit").await;
+
+    // Pausing a stopped Job is rejected with the stable problem code.
+    let (status, body) = put_json(
+        &app,
+        "/api/v1/jobs/ds-audit/desired-state",
+        "operator",
+        serde_json::json!({"state": "paused"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "job_not_running");
+
+    // ...and the rejection is audited like the pause mutation.
+    let (status, page) = get_json(&app, "/api/v1/audit?resource_id=ds-audit", "operator").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rejection = page["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|record| record["action"] == "job.pause" && record["outcome"] == "rejected")
+        })
+        .unwrap_or_else(|| panic!("missing job.pause rejection audit: {page}"));
+    assert_eq!(rejection["failure_code"], "job_not_running");
+
+    let metrics = hub.command_metrics().render();
+    assert!(
+        metrics.contains("arkflow_job_pause_total{outcome=\"rejected\"}"),
+        "metrics missing rejection outcome: {metrics}"
+    );
+}
+
 #[tokio::test]
 async fn hub_job_detail_reports_split_placement_violations() {
     let hub = storage_hub();

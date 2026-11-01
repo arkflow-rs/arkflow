@@ -289,7 +289,8 @@ export const zh = {
   'users.deletedNotice': '已删除用户 {userId}。',
   'users.revokeTokens': '吊销全部令牌',
   'users.revokeTokensTitle': '吊销全部令牌',
-  'users.confirmRevokeTokens': '吊销 {userId} 的所有浏览器会话与已签发凭证？之后必须重新签发。',
+  'users.confirmRevokeTokens':
+    '吊销 {userId} 的所有浏览器会话与联邦（OIDC）令牌？托管凭证仍然有效，需逐个吊销或轮换。',
   'users.revokeTokensDone': '已吊销 {count} 个浏览器会话。',
   'users.credentials.title': '凭证',
   'users.credentials.subtitle': '仅元数据 —— 明文 token 只在签发或轮换时展示一次',
@@ -317,7 +318,8 @@ export const zh = {
   'users.credentials.revoke': '吊销',
   'users.credentials.revokeTitle': '吊销凭证',
   'users.credentials.confirmRevoke': '吊销凭证 {credentialId}？使用它的请求会立即开始返回 401。',
-  'users.credentials.revokeTokensNote': '吊销全部令牌会使该用户的浏览器会话与已签发 token 全部失效。',
+  'users.credentials.revokeTokensNote':
+    '吊销全部令牌会使该用户的浏览器会话与联邦令牌失效；托管凭证需逐个吊销或轮换。',
   'users.credentials.oneTimeTitle': '新的凭证 token',
   'users.credentials.oneTimeHint':
     '这是明文 token 唯一一次展示。请立即复制——它无法找回；若丢失请轮换该凭证。',

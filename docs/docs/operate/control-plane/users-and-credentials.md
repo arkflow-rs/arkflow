@@ -142,7 +142,10 @@ the user record (it is unique across the directory; an empty string on a
 
 - The **role and scopes come from the directory**, not from the token's
   claims. Editing the user changes the next request's authorization
-  immediately.
+  immediately. Changing a user's role or scopes also revokes that user's
+  durable browser sessions (a stored session carries the principal it was
+  created with), so the next request re-authenticates against the updated
+  record.
 - A **disabled** bound user is rejected with `401` even with a valid JWT.
 - The token's `iat` is compared with `tokens_valid_after_ms`; a token minted
   before the threshold (with a 60-second clock-skew tolerance) is rejected.

@@ -2408,8 +2408,11 @@ impl StorageBackend for PostgresBackend {
         {
             let mut connection = self.begin().await?;
             let __ret = async {
+            // `pause_phase IS NULL` fences the generic desired-state write
+            // against an in-progress pause (pausing does not bump the
+            // generation); see the sqlite backend for the full rationale.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5",
+                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5 AND pause_phase IS NULL",
                 binds![
                     job_id,
                     desired_state,
@@ -2421,13 +2424,18 @@ impl StorageBackend for PostgresBackend {
             if changed == 0 {
                 let current = connection
                     .query_row(
-                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        "SELECT generation, pause_phase FROM cp_jobs WHERE job_id = ?1",
                         binds![job_id],
-                        |row| row.get::<u64>(0),
+                        |row| Ok((row.get::<u64>(0)?, row.get::<Option<String>>(1)?)),
                     ).await
                     .optional()?;
                 return match current {
-                    Some(current) => Err(StorageError::GenerationConflict {
+                    Some((_, Some(phase))) => Err(StorageError::JobPauseConflict {
+                        job_id: job_id.to_owned(),
+                        expected: None,
+                        current: Some(phase),
+                    }),
+                    Some((current, None)) => Err(StorageError::GenerationConflict {
                         expected: expected_generation,
                         current,
                     }),

@@ -499,13 +499,16 @@ impl OidcFederation {
             .scopes_claim
             .clone()
             .unwrap_or_else(|| "scopes".to_string());
-        let authenticator = Arc::new(OidcAuthenticator::new(
-            issuer,
-            settings.audience.clone(),
-            jwks_url,
-            role_claim,
-            scopes_claim,
-        ));
+        let authenticator = Arc::new(
+            OidcAuthenticator::new(
+                issuer,
+                settings.audience.clone(),
+                jwks_url,
+                role_claim,
+                scopes_claim,
+            )
+            .with_managed_users_only(settings.managed_users_only),
+        );
         // Blocking construction may run outside a runtime (tests, sync
         // startup): only the background refresher needs one, and its
         // absence downgrades to the lazy unknown-kid refresh only.

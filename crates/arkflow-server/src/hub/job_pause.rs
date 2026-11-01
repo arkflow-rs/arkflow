@@ -194,11 +194,28 @@ impl Hub {
                 updated_at_ms: now_ms(),
             };
             // Moves the recovery pointer to the pending artifact and
-            // dispatches the capture round to the placed nodes.
-            self.record_job_checkpoint(record).await?;
+            // dispatches the capture round to the placed nodes. The durable
+            // intent is already committed, so a dispatch failure must not
+            // surface as a rejection: the reconcile tick re-issues the
+            // capture under the bounded retry budget.
+            if let Err(error) = self.record_job_checkpoint(record).await {
+                tracing::warn!(
+                    job_id,
+                    %error,
+                    "pause capture dispatch failed; deferred to the reconcile tick"
+                );
+            }
         } else {
-            // No artifact to capture: dispatch the stop directly.
-            self.reconcile_job(&job).await?;
+            // No artifact to capture: dispatch the stop directly. Same rule:
+            // post-commit dispatch failures are retryable by the reconcile
+            // tick, not client-facing rejections.
+            if let Err(error) = self.reconcile_job(&job).await {
+                tracing::warn!(
+                    job_id,
+                    %error,
+                    "pause stop dispatch failed; deferred to the reconcile tick"
+                );
+            }
         }
         self.job(job_id).await?.ok_or(HubError::NotFound)
     }
@@ -250,7 +267,16 @@ impl Hub {
             format!("resume requested at generation {}", job.generation),
             Some(actor),
         );
-        self.reconcile_job(&job).await?;
+        // Post-commit dispatch: the phase change is durable, so a dispatch
+        // failure is deferred to the reconcile tick instead of surfacing as
+        // a rejection for a mutation the Hub already accepted.
+        if let Err(error) = self.reconcile_job(&job).await {
+            tracing::warn!(
+                job_id,
+                %error,
+                "post-commit pause dispatch failed; deferred to the reconcile tick"
+            );
+        }
         self.job(job_id).await?.ok_or(HubError::NotFound)
     }
 
@@ -324,7 +350,16 @@ impl Hub {
             ),
         )
         .await;
-        self.reconcile_job(&job).await?;
+        // Post-commit dispatch: the phase change is durable, so a dispatch
+        // failure is deferred to the reconcile tick instead of surfacing as
+        // a rejection for a mutation the Hub already accepted.
+        if let Err(error) = self.reconcile_job(&job).await {
+            tracing::warn!(
+                job_id,
+                %error,
+                "post-commit pause dispatch failed; deferred to the reconcile tick"
+            );
+        }
         self.job(job_id).await?.ok_or(HubError::NotFound)
     }
 

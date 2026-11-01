@@ -2525,8 +2525,13 @@ impl SqliteBackend {
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, StorageError> {
         self.immediate_transaction(|connection| {
+            // `pause_phase IS NULL` fences the generic desired-state write
+            // against an in-progress pause: pausing does not bump the
+            // generation, so a generation-only guard would let a request that
+            // read the Job before the pause began overwrite the pause intent
+            // and leave the bookkeeping stale.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5",
+                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5 AND pause_phase IS NULL",
                 rusqlite::params![
                     job_id,
                     desired_state,
@@ -2538,13 +2543,23 @@ impl SqliteBackend {
             if changed == 0 {
                 let current = connection
                     .query_row(
-                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        "SELECT generation, pause_phase FROM cp_jobs WHERE job_id = ?1",
                         [job_id],
-                        |row| row.get::<_, u64>(0),
+                        |row| {
+                            Ok((
+                                row.get::<_, u64>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
                     )
                     .optional()?;
                 return match current {
-                    Some(current) => Err(StorageError::GenerationConflict {
+                    Some((_, Some(phase))) => Err(StorageError::JobPauseConflict {
+                        job_id: job_id.to_owned(),
+                        expected: None,
+                        current: Some(phase),
+                    }),
+                    Some((current, None)) => Err(StorageError::GenerationConflict {
                         expected: expected_generation,
                         current,
                     }),

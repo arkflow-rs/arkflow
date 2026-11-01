@@ -6572,6 +6572,63 @@ mod tests {
             .is_none());
     }
 
+    /// An in-progress pause fences the generic desired-state write: pausing
+    /// does not bump the generation, so the CAS needs `pause_phase IS NULL`
+    /// or a request that read the Job before the pause began could clobber
+    /// the pause intent while the bookkeeping stays behind.
+    #[tokio::test]
+    async fn job_desired_state_update_is_fenced_against_an_in_progress_pause() {
+        let store = ControlPlaneStore::contract(
+            "job_desired_state_update_is_fenced_against_an_in_progress_pause",
+        )
+        .await;
+        pause_fixture(&store, "orders", None).await;
+        let begun = store
+            .update_job_pause(
+                "orders",
+                JobPauseUpdate::begin(
+                    1,
+                    "capturing",
+                    Some("checkpoint-pause-g1-1".into()),
+                    None,
+                    1,
+                    "admin",
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(begun.generation, 1);
+        assert!(matches!(
+            store
+                .update_job_desired_state("orders", "stopped", begun.generation)
+                .await,
+            Err(StorageError::JobPauseConflict { .. })
+        ));
+        // Once the pause clears, the same write goes through.
+        let cleared = store
+            .update_job_pause(
+                "orders",
+                JobPauseUpdate {
+                    expected_generation: begun.generation,
+                    expected_phase: Some("capturing".into()),
+                    clear_pause: true,
+                    bump_generation: true,
+                    ..JobPauseUpdate::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.pause_phase, None);
+        let stopped = store
+            .update_job_desired_state("orders", "stopped", cleared.generation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.desired_state, "stopped");
+    }
+
     async fn pause_fixture(store: &ControlPlaneStore, job_id: &str, checkpoint: Option<&str>) {
         store
             .upsert_job(JobRecord {

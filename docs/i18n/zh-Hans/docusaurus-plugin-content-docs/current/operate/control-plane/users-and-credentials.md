@@ -117,7 +117,8 @@ identity_store_unavailable`，托管凭证也永远无法通过认证。未配�
 唯一；`PATCH` 传入空字符串可清除绑定)。一旦绑定，目录即为权威来源：
 
 - **角色与 scope 来自目录**，而非 token 的 claim。编辑用户会立即改变其下一个请求
-  的授权结果。
+  的授权结果。变更用户的角色或 scope 还会吊销该用户的持久浏览器会话（会话保存的是
+  创建时的 principal），下一个请求会按更新后的记录重新认证。
 - **已禁用**的绑定用户即便持有有效 JWT 也会被 `401` 拒绝。
 - token 的 `iat` 会与 `tokens_valid_after_ms` 比较；早于该阈值(含 60 秒时钟偏斜
   容差)的令牌会被拒绝。这就是 `POST /api/v1/users/{id}/revoke-tokens` 无需等待

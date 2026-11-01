@@ -1170,40 +1170,34 @@ pub(super) async fn hub_job_desired_state(
     };
     // `paused` is the pause intent; `running`/`stopped` on a paused Job go
     // through the pause state machine so the bookkeeping is cleared with the
-    // mutation rather than left stale.
+    // mutation rather than left stale. These branches must reject exactly
+    // like the pause actions route: same audit records and rejection metric
+    // via `pause_action_rejection`.
     let pausing = current.pause_phase.is_some();
-    let result = match request.state.as_str() {
-        "paused" => hub.pause_job(&job_id, &principal.id).await.map(Some),
-        "running" if pausing => hub.resume_job(&job_id, &principal.id).await.map(Some),
-        "stopped" if pausing => hub.stop_paused_job(&job_id, &principal.id).await.map(Some),
-        _ => {
-            hub.update_job_desired_state(&job_id, request.state.as_str(), current.generation)
-                .await
-        }
+    let paused_action = match request.state.as_str() {
+        "paused" => Some(("job.pause", hub.pause_job(&job_id, &principal.id).await)),
+        "running" if pausing => Some(("job.resume", hub.resume_job(&job_id, &principal.id).await)),
+        "stopped" if pausing => Some((
+            "job.stop",
+            hub.stop_paused_job(&job_id, &principal.id).await,
+        )),
+        _ => None,
     };
+    if let Some((action, outcome)) = paused_action {
+        return match outcome {
+            Ok(job) => Json(job).into_response(),
+            Err(error) => pause_action_rejection(&hub, &job_id, action, &principal.id, error).await,
+        };
+    }
+    let result = hub
+        .update_job_desired_state(&job_id, request.state.as_str(), current.generation)
+        .await;
     match result {
         Ok(Some(job)) => Json(job).into_response(),
         Ok(None) => problem(
             StatusCode::NOT_FOUND,
             "job_not_found",
             format!("Unknown Job {job_id}"),
-        ),
-        Err(hub::HubError::JobNotRunning) => {
-            problem(StatusCode::CONFLICT, "job_not_running", "".into())
-        }
-        Err(hub::HubError::PauseInProgress) => {
-            problem(StatusCode::CONFLICT, "pause_in_progress", "".into())
-        }
-        Err(hub::HubError::JobAlreadyPaused) => {
-            problem(StatusCode::CONFLICT, "job_already_paused", "".into())
-        }
-        Err(hub::HubError::PauseNotPaused) => {
-            problem(StatusCode::CONFLICT, "pause_not_paused", "".into())
-        }
-        Err(hub::HubError::PauseRequiresRecoveryPolicy) => problem(
-            StatusCode::CONFLICT,
-            "pause_requires_recovery_policy",
-            "".into(),
         ),
         Err(error) => hub_problem(error),
     }

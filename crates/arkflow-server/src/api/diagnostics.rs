@@ -212,8 +212,12 @@ pub(super) async fn hub_liveness() -> Json<serde_json::Value> {
 
 pub(crate) async fn hub_oidc_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
     let login_enabled = hub.oidc_login().is_some();
-    let principal = cookie_value(&headers, "arkflow_session")
-        .and_then(|session_id| hub.oidc_session_principal(&session_id));
+    // Durable sessions live in storage (`cp_sessions`); the in-memory
+    // federation map only knows volatile-Hub sessions.
+    let principal = match cookie_value(&headers, "arkflow_session") {
+        Some(session_id) => hub.resolve_session(&session_id).await,
+        None => None,
+    };
     let body = serde_json::json!({
         "login_enabled": login_enabled,
         "authenticated": principal.is_some(),
@@ -346,23 +350,33 @@ pub(crate) async fn hub_oidc_callback(
     };
     // Session ids are persisted (hashed) when the Hub has durable storage so
     // they survive restarts and can be revoked per user; without storage the
-    // federation's in-memory fallback is used.
+    // federation's in-memory fallback is used. On a durable Hub the fallback
+    // would create a session that `resolve_session` can never see, so a
+    // storage failure must fail the login instead.
     let session_id = match hub.create_session(principal.clone()).await {
         Some(session_id) => session_id,
-        // Volatile Hub: fall back to the federation's in-memory sessions.
-        None => match hub
-            .oidc_login()
-            .and_then(|federation| federation.create_session(principal))
-        {
-            Some(session_id) => session_id,
-            None => {
-                return problem(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "session_create_failed",
-                    "session cannot be created".into(),
-                )
+        None if hub.storage().is_none() => {
+            match hub
+                .oidc_login()
+                .and_then(|federation| federation.create_session(principal))
+            {
+                Some(session_id) => session_id,
+                None => {
+                    return problem(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "session_create_failed",
+                        "session cannot be created".into(),
+                    )
+                }
             }
-        },
+        }
+        None => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_create_failed",
+                "session cannot be created".into(),
+            )
+        }
     };
     let max_age = oidc::session_ttl_secs();
     Response::builder()

@@ -940,3 +940,60 @@ async fn two_hubs_share_one_pause_state_machine_without_double_advancing() {
         "the single convergence settle"
     );
 }
+
+/// A dispatch failure after the durable pause write must not surface as a
+/// rejection: the mutation is already committed, a client retry would only
+/// see `pause_in_progress`, and the reconcile tick retries the dispatch.
+/// Here the dispatch fails deterministically because the persisted spec
+/// stopped compiling (schema drift behind the Hub's back).
+#[tokio::test]
+async fn post_commit_dispatch_failure_is_not_reported_as_a_rejection() {
+    let (hub, storage) = pause_fixture("post_commit_dispatch_failure_is_not_rejected").await;
+    storage
+        .upsert_job(JobRecord {
+            job_id: "plain".into(),
+            version: 1,
+            spec_json: stateless_spec("plain"),
+            desired_state: "running".into(),
+            observed_state: "running".into(),
+            convergence: "converged".into(),
+            generation: 1,
+            node_ids: Vec::new(),
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 1,
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
+        })
+        .await
+        .unwrap();
+
+    let begun = hub.pause_job("plain", "admin").await.unwrap();
+    hub.observe_job("plain", begun.generation, "stopped", None, None)
+        .await
+        .unwrap();
+    assert_eq!(hub.reconcile_job_pauses().await.unwrap(), 1);
+    let paused = hub.job("plain").await.unwrap().unwrap();
+    assert_eq!(paused.pause_phase.as_deref(), Some(PAUSE_PAUSED));
+
+    let drifted = JobRecord {
+        spec_json: "{not json".into(),
+        ..paused.clone()
+    };
+    storage.upsert_job(drifted).await.unwrap();
+    let current = hub.job("plain").await.unwrap().unwrap();
+
+    // The resume reports the committed mutation instead of a rejection.
+    let resumed = hub.resume_job("plain", "admin").await.unwrap();
+    assert_eq!(resumed.desired_state, "running");
+    assert_eq!(resumed.pause_phase.as_deref(), Some(PAUSE_RESUMING));
+    assert_eq!(resumed.generation, current.generation + 1);
+
+    // The committed phase survives for the reconcile tick to pick up.
+    let stored = hub.job("plain").await.unwrap().unwrap();
+    assert_eq!(stored.pause_phase.as_deref(), Some(PAUSE_RESUMING));
+}

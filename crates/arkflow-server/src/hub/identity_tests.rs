@@ -369,3 +369,98 @@ async fn federated_subjects_follow_the_directory_and_revocation_threshold() {
         .await
         .is_none());
 }
+
+#[tokio::test]
+async fn unparsable_scopes_fail_closed() {
+    let store = ControlPlaneStore::contract("unparsable_scopes_fail_closed").await;
+    let storage = StorageActor::start(store, 8);
+    let hub = Hub::with_storage(config(false), storage.clone());
+
+    // Written directly to storage: a corrupt `scopes_json` row comes from
+    // schema drift, not the validated API path. An empty scope list means
+    // "unrestricted", so a parse error must deny instead of widen.
+    let mut alice = user("alice", "operator");
+    alice.scopes_json = "not-json".into();
+    storage.upsert_user(alice).await.unwrap();
+    let (_, token) = hub
+        .issue_credential("alice", "laptop", None, "admin")
+        .await
+        .unwrap();
+    assert!(hub.operator_principal(Some(&token)).await.is_none());
+
+    let mut bob = user("bob", "admin");
+    bob.oidc_subject = Some("sub-bob".into());
+    bob.scopes_json = "not-json".into();
+    storage.upsert_user(bob).await.unwrap();
+    let claims = crate::api_contract::OperatorPrincipal {
+        id: "sub-bob".into(),
+        roles: vec![crate::api_contract::OperatorRole::Viewer],
+        scopes: Vec::new(),
+    };
+    assert!(hub
+        .apply_federated_directory(claims, Some(crate::hub::now_ms_for_metrics()), false)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn volatile_hub_managed_users_only_denies_unbound_subjects() {
+    let volatile = Hub::new(config(false));
+    let stranger = crate::api_contract::OperatorPrincipal {
+        id: "stranger".into(),
+        roles: vec![crate::api_contract::OperatorRole::Viewer],
+        scopes: Vec::new(),
+    };
+    // Without storage the directory cannot be consulted; a deployment that
+    // requires managed users must not admit unbound subjects there either.
+    assert!(volatile
+        .apply_federated_directory(stranger.clone(), None, true)
+        .await
+        .is_none());
+    assert!(volatile
+        .apply_federated_directory(stranger, None, false)
+        .await
+        .is_some());
+}
+
+#[tokio::test]
+async fn authorization_changes_revoke_durable_sessions() {
+    let hub = identity_fixture("authorization_changes_revoke_sessions", false).await;
+    hub.create_user(user("alice", "operator"), "admin")
+        .await
+        .unwrap();
+    let principal = crate::api_contract::OperatorPrincipal {
+        id: "alice".into(),
+        roles: vec![crate::api_contract::OperatorRole::Operator],
+        scopes: Vec::new(),
+    };
+    let session_id = hub.create_session(principal).await.unwrap();
+    assert!(hub.resolve_session(&session_id).await.is_some());
+
+    // An update that does not touch authorization keeps the session.
+    let record = hub.user("alice").await.unwrap().unwrap();
+    hub.save_user(record, "admin").await.unwrap();
+    assert!(hub.resolve_session(&session_id).await.is_some());
+
+    // A role change revokes it: the stored principal still carries the old
+    // role until the next login.
+    let mut record = hub.user("alice").await.unwrap().unwrap();
+    record.role = "viewer".into();
+    hub.save_user(record, "admin").await.unwrap();
+    assert!(hub.resolve_session(&session_id).await.is_none());
+
+    // A scope-only change revokes too.
+    let session_id = hub
+        .create_session(crate::api_contract::OperatorPrincipal {
+            id: "alice".into(),
+            roles: vec![crate::api_contract::OperatorRole::Viewer],
+            scopes: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(hub.resolve_session(&session_id).await.is_some());
+    let mut record = hub.user("alice").await.unwrap().unwrap();
+    record.scopes_json = r#"[{"resource_type":"job","resource_id":"orders"}]"#.into();
+    hub.save_user(record, "admin").await.unwrap();
+    assert!(hub.resolve_session(&session_id).await.is_none());
+}

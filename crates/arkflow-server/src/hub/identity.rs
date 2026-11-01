@@ -85,8 +85,11 @@ pub(crate) fn parse_role(role: &str) -> Option<OperatorRole> {
     }
 }
 
-pub(crate) fn scopes_from_json(json: &str) -> Vec<ResourceScope> {
-    serde_json::from_str(json).unwrap_or_default()
+/// `None` on a parse error: an empty scope list means "unrestricted" in
+/// `OperatorPrincipal::can_scope`, so a corrupt `scopes_json` row must deny
+/// rather than widen.
+pub(crate) fn scopes_from_json(json: &str) -> Option<Vec<ResourceScope>> {
+    serde_json::from_str(json).ok()
 }
 
 pub(crate) fn scopes_to_json(scopes: &[ResourceScope]) -> Result<String, HubError> {
@@ -273,6 +276,24 @@ impl Hub {
         self.ensure_admin_reachability(&current, &next, &storage)
             .await?;
         let saved = storage.upsert_user(next).await.map_err(map_user_write)?;
+        // Role and scopes are baked into stored session principals
+        // (`resolve_session` returns the recorded `principal_json`), so an
+        // authorization change must revoke the durable sessions that still
+        // carry the old privileges. Unchanged authorization fields keep
+        // sessions intact.
+        if current.role != saved.role || current.scopes_json != saved.scopes_json {
+            let removed = storage
+                .delete_user_sessions(&saved.user_id)
+                .await
+                .map_err(HubError::from)?;
+            if removed > 0 {
+                tracing::info!(
+                    user_id = %saved.user_id,
+                    sessions = removed,
+                    "revoked durable sessions after an authorization change"
+                );
+            }
+        }
         self.record_identity_audit(
             "user.update",
             actor,
@@ -551,10 +572,13 @@ impl Hub {
         let Some(role) = parse_role(&user.role) else {
             return Ok(None);
         };
+        let Some(scopes) = scopes_from_json(&user.scopes_json) else {
+            return Ok(None);
+        };
         Ok(Some(OperatorPrincipal {
             id: user.user_id,
             roles: vec![role],
-            scopes: scopes_from_json(&user.scopes_json),
+            scopes,
         }))
     }
 
@@ -632,7 +656,9 @@ impl Hub {
         managed_users_only: bool,
     ) -> Option<OperatorPrincipal> {
         let Some(storage) = self.storage.as_ref() else {
-            return Some(principal);
+            // A volatile Hub cannot check the directory; a deployment that
+            // requires managed users must not admit unbound subjects.
+            return (!managed_users_only).then_some(principal);
         };
         match storage.get_user_by_oidc_subject(&principal.id).await {
             Ok(Some(user)) => {
@@ -645,10 +671,11 @@ impl Hub {
                     return None;
                 }
                 let role = parse_role(&user.role)?;
+                let scopes = scopes_from_json(&user.scopes_json)?;
                 Some(OperatorPrincipal {
                     id: user.user_id,
                     roles: vec![role],
-                    scopes: scopes_from_json(&user.scopes_json),
+                    scopes,
                 })
             }
             Ok(None) if managed_users_only => None,

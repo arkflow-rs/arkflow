@@ -303,7 +303,7 @@ export const en = {
   'users.revokeTokens': 'Revoke all tokens',
   'users.revokeTokensTitle': 'Revoke all tokens',
   'users.confirmRevokeTokens':
-    'Revoke every browser session and already-issued credential for {userId}? New tokens must be issued afterwards.',
+    'Revoke every browser session and federated (OIDC) token for {userId}? Managed credentials stay valid; revoke or rotate them individually.',
   'users.revokeTokensDone': 'Revoked {count} browser session(s).',
   'users.credentials.title': 'Credentials',
   'users.credentials.subtitle': 'Metadata only — plaintext tokens are shown once, at issuance or rotation',
@@ -334,7 +334,7 @@ export const en = {
   'users.credentials.confirmRevoke':
     'Revoke credential {credentialId}? Requests using it start failing with 401 immediately.',
   'users.credentials.revokeTokensNote':
-    'Revoking all tokens invalidates browser sessions and already-issued tokens for this user.',
+    'Revoking all tokens invalidates browser sessions and federated tokens for this user; managed credentials must be revoked or rotated individually.',
   'users.credentials.oneTimeTitle': 'New credential token',
   'users.credentials.oneTimeHint':
     'This is the only time the plaintext token is shown. Copy it now — it cannot be recovered; rotate the credential if it is lost.',
