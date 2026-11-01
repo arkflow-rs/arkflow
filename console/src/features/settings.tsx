@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useT } from '../i18n'
 import { useMutationFailure, useStatus, useWebhooks } from '../queries'
 import { api, SNAPSHOT_INTERVAL_MS, WebhookSubscription } from '../api'
+import { RuntimeCredentialPanel } from './credential'
 
 type FormState = {
   id: string
@@ -46,6 +47,7 @@ export function Settings({
         </div>
         <p>{t('settings.credentialsNote')}</p>
       </section>
+      <RuntimeCredentialPanel />
       {hubMode !== false && <WebhooksPanel canMutate={canManageWebhooks} />}
     </>
   )

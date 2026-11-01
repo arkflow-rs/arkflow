@@ -614,7 +614,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 4. **控制面 DB 备份/恢复**：无快照/导出/恢复工具，仅停机 sqlite→pg 一次性迁移（`migrate_tool.rs`）。注意 Job 级 checkpoint/savepoint 恢复是完整的，勿混淆。
 5. **用户/凭证管理面**：RBAC 三角色 + 资源 scope + OIDC（bearer + 浏览器登录）已实现，但无用户 CRUD、无 token 签发/吊销/轮换 API，JWT 无吊销（`oidc.rs:41` 注释自认取舍）；租户/团队隔离未做。
 6. **mTLS/客户端证书**：TLS 仅服务端加密，显式 `with_no_client_auth`（`api/mod.rs:974`）。
-7. **Job 级 pause/resume**：`desired_state` 仅 running/stopped 二值（`jobs.rs:999`），action 仅 start/stop/restart（`jobs.rs:106`）；pause/resume 语义仅存在于升级编排内部（`jobs.rs:817`）。
+7. ~~**Job 级 pause/resume**~~ → ✅ 2026-11-01 `add-job-pause-resume` 归档：`desired_state` 三值（running/stopped/paused）+ 持久暂停相位（capturing/stopping/paused/resuming），先按 `spec.recovery` 落工件再停机、resume 从工件恢复（replay 边界与无 checkpoint 冷启动已文档化），保留期 pin、崩溃续跑、升级双向互斥、审计/指标/SSE、Console 与 en/zh 文档齐备。剩余：真实双 Agent 端到端与 operations-level 审计 actor 参数化（后续专项）。
 8. **arkflow-server 独立二进制短板**：无 tracing/OTel 初始化（引擎二进制有，Hub 二进制没有）；仅环境变量配置、无配置文件支持（`bin/arkflow-server.rs`）。
 9. **OpenAPI 文档生成**：仅 `api_contract.rs:4` 意向注释，未实现。
 10. 小项：本地 standalone 面无 `/audit` 路由（审计仅 Hub 面）；Agent query-param 传 token 旧通道处弃用兼容期（`agent_endpoints.rs:85`）。
@@ -637,11 +637,11 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 | P1 | 控制面限流/配额 | per-principal/per-node 限速 | 企业入场券 |
 | P1 | 控制面 DB 备份/恢复 | 快照/导出/恢复工具 | 企业入场券 |
 | P1 | `console-rbac-and-pagination` | 角色感知 UI + 服务端分页/过滤 + 本地死页面清理 | 纯前端消费，后端零改动 |
-| P2 | Job 级 pause/resume | `desired_state` 扩 pause + 恢复语义 | 与升级编排 pause 语义对齐 |
+| P2 | ~~Job 级 pause/resume~~ | ✅ 2026-11-01 落地（`add-job-pause-resume`）：三值 desired + 持久相位 + 工件 pin + 崩溃续跑 + Console/文档 | 见 §11.2-7 |
 | P2 | server 二进制可观测 | arkflow-server tracing/OTel 初始化 + 配置文件 | 小工程 |
 | P2 | mTLS | 客户端证书认证 | 等企业需求信号 |
 | P2 | Console 监控增强 | 时序图表、per-node 指标下钻、`/operations/status` 页、token 运行时输入、rollout 版本选择器 | 可拆分交付 |
-| P3 | 多用户/凭证管理面 | 用户 CRUD + token 生命周期；**前置：JWT 吊销机制**（否则凭证生命周期管理是空谈） | 阶段 4 主体；租户隔离同批评估 |
+| P3 | ~~多用户/凭证管理面~~ | ✅ 2026-11-01 落地（`add-multi-user-credential-management`）：`cp_users`/`cp_credentials`/`cp_sessions`、`ark_` 托管凭证签发/轮换/吊销、会话持久化、OIDC 主体吊销（epoch/iat + `MANAGED_USERS_ONLY`）、`ManageUsers` 管理 API、Console `/users` 面板 + 运行期 token、en/zh 文档 | 租户隔离/自助服务/纯目录启动仍为 Non-goals |
 | P3 | 外部 Secret Manager | Vault/K8s Secret 集成（现为 Hub env 预解析 `${secret:}`） | 阶段 4 |
 | P3 | OpenAPI 生成 + Agent 自升级编排 | API 文档生成；Agent 二进制升级编排（区别于 Job 升级） | 低频，按需 |
 

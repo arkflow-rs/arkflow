@@ -293,6 +293,13 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -591,6 +598,13 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();

@@ -196,8 +196,10 @@ A="Authorization: Bearer operator-secret"
      -d '{"state":"running"}'
    ```
 
-   `PUT desired-state` supports the same `If-Match` generation guard and
-   `Idempotency-Key` dedup as streams (see
+   `PUT desired-state` applies a generation compare-and-swap internally: a
+   stale generation is rejected rather than silently overwriting newer
+   intent. Unlike the stream desired-state route it does not implement the
+   `If-Match` / `Idempotency-Key` headers (see
    [HTTP API v1](../reference/api.md)).
 
 3. **Checkpoint and savepoint.** Both write checksummed recovery artifacts to
@@ -236,6 +238,56 @@ artifact's state format is incompatible with the job version, so a bad
 restore cannot corrupt state. Kill-and-restart recovery is exercised
 end-to-end by the two-node smoke test in `crates/arkflow-server/tests/`.
 
+### Pause and resume
+
+Stopping a Job and starting it again restores from the last completed recovery
+artifact, so everything processed after that artifact is replayed by source
+position. **Pausing** is the operator-facing "freeze and continue later"
+operation: the Hub first captures a recovery artifact at the pause generation,
+then stops the Job, and resume starts from that artifact without the operator
+naming a checkpoint.
+
+```bash
+# Pause: capture, then stop. Answers 202 with the Job record; the Job reports
+# `reconciling` until every target node observed the stop.
+curl -s -H "$A" -X POST $H/jobs/sensor-window-job/actions/pause
+
+# Resume: bump the generation and restore from the pause artifact.
+curl -s -H "$A" -X POST $H/jobs/sensor-window-job/actions/resume
+
+# The desired-state resource accepts the third value as well.
+curl -s -H "$A" -X PUT $H/jobs/sensor-window-job/desired-state \
+  -d '{"state":"paused"}'
+```
+
+A pause is accepted only for a Job whose desired and observed state are both
+`running` and that is converged, with no active upgrade orchestration and no
+pause already in flight. Job creation continues to accept only `running` and
+`stopped`; `paused` is a lifecycle value, not an initial state.
+
+The pause sequence and its boundaries:
+
+| Boundary | Behaviour |
+| --- | --- |
+| Capture | The artifact kind follows `spec.recovery`: `latest_checkpoint` captures a checkpoint (pinned against retention while the pause lasts), `latest_savepoint` captures a savepoint. `recovery: fail` has no selectable artifact, so pause is rejected with `pause_requires_recovery_policy`. |
+| Ordering | The stop is dispatched only after the capture completes. A Job whose spec declares no `checkpoint` configuration skips the capture and stops directly; its resume is an ordinary cold start. |
+| Convergence | `desired_state = paused` converges only when `pause_phase = paused` and every target assignment is observed `stopped` — convergence is phase-defined, not string equality. While the phase is `capturing` or `stopping` the Job reports `reconciling`. |
+| Offline nodes | A stop cannot reach an offline node, so the pause stays `reconciling` (the intent is durable) and dispatch resumes when the node returns. An operator can `stop` the Job to settle it as stopped and clear the pause bookkeeping. |
+| Failure | A failed capture or the five-minute capture deadline (with a bounded number of re-dispatch rounds across Hub restarts) aborts the pause: the Job returns to `desired_state = running`, the pre-pause recovery pointer is restored, and `last_error` records `pause_savepoint_failed` or `pause_savepoint_timeout`. |
+| Resume | `resume` is accepted only in the `paused` phase. It bumps the generation, keeps the recovery pointer on the pause artifact, and runs the ordinary recovery start; the pause phase clears only after the Job converges to observed `running`. |
+| Replay window | Events processed after the pause artifact's barrier and before teardown completes are replayed on resume: exactly-once for transactional sinks, at-least-once for non-transactional sinks. A Job without checkpoint configuration has no artifact and resumes with a cold start. |
+| Upgrade | Upgrades are rejected while a pause phase is present (`job_paused`); pause is rejected while an upgrade orchestration is active (`orchestration_in_progress`). See [Atomic job upgrades → Pause: orchestration vs. Job](../operate/control-plane/job-upgrades.md#pause-orchestration-vs-job). |
+
+Pause and resume require a Hub with durable storage: a volatile Hub answers
+`503 pause_requires_durable_storage`. The Job record
+exposes the additive fields `pause_phase`, `pause_artifact_id`,
+`pause_prev_checkpoint_id`, `pause_retry_count`, `paused_at_ms`, and
+`paused_by`; phase transitions also appear on `GET /events/stream` as
+`job.pause_requested`, `job.paused`, `job.resume_requested`, `job.resumed`,
+and `job.pause_failed`. While a Job is paused, `start` and `restart` are
+treated as `resume`, and `stop` settles it as stopped. Route and error-code
+reference: [HTTP API → Job pause and resume](../reference/api.md#job-pause-and-resume).
+
 ## What scales — and how
 
 Task placement has two modes, selected by the job's `placement` field:
@@ -273,4 +325,7 @@ plane only on the nodes you opt in.
       persistent `object_store_uri`.
 - [ ] Distributed jobs validate against the target `node_ids` before the
       first submit.
+- [ ] Pause/resume rehearsed: the pause artifact kind matches
+      `spec.recovery`, and the replay window (artifact barrier → teardown) is
+      acceptable for non-transactional sinks.
 - [ ] Upgrade path tested: savepoint → stop → upgrade → verify → (rollback).

@@ -91,6 +91,50 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
         checkpoint_id: row.get(8)?,
         last_error: row.get(9)?,
         updated_at_ms: row.get(10)?,
+        pause_phase: row.get(11)?,
+        pause_artifact_id: row.get(12)?,
+        pause_prev_checkpoint_id: row.get(13)?,
+        pause_retry_count: row.get(14)?,
+        paused_at_ms: row.get(15)?,
+        paused_by: row.get(16)?,
+    })
+}
+
+fn row_to_user(row: &Row<'_>) -> rusqlite::Result<UserRecord> {
+    Ok(UserRecord {
+        user_id: row.get(0)?,
+        display_name: row.get(1)?,
+        role: row.get(2)?,
+        scopes_json: row.get(3)?,
+        disabled: row.get::<_, i64>(4)? != 0,
+        oidc_subject: row.get(5)?,
+        tokens_valid_after_ms: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
+}
+
+fn row_to_credential(row: &Row<'_>) -> rusqlite::Result<CredentialRecord> {
+    Ok(CredentialRecord {
+        credential_id: row.get(0)?,
+        user_id: row.get(1)?,
+        secret_hash: row.get(2)?,
+        label: row.get(3)?,
+        created_at_ms: row.get(4)?,
+        expires_at_ms: row.get(5)?,
+        last_used_at_ms: row.get(6)?,
+        revoked_at_ms: row.get(7)?,
+    })
+}
+
+fn row_to_session(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        session_hash: row.get(0)?,
+        user_id: row.get(1)?,
+        principal_json: row.get(2)?,
+        created_at_ms: row.get(3)?,
+        expires_at_ms: row.get(4)?,
+        revoked_at_ms: row.get(5)?,
     })
 }
 
@@ -2237,7 +2281,7 @@ impl SqliteBackend {
                 StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
             })?;
             connection.execute(
-                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms",
+                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms, pause_phase=excluded.pause_phase, pause_artifact_id=excluded.pause_artifact_id, pause_prev_checkpoint_id=excluded.pause_prev_checkpoint_id, pause_retry_count=excluded.pause_retry_count, paused_at_ms=excluded.paused_at_ms, paused_by=excluded.paused_by",
                 rusqlite::params![
                     job.job_id,
                     job.version,
@@ -2250,6 +2294,12 @@ impl SqliteBackend {
                     job.checkpoint_id,
                     job.last_error,
                     job.updated_at_ms,
+                    job.pause_phase,
+                    job.pause_artifact_id,
+                    job.pause_prev_checkpoint_id,
+                    job.pause_retry_count,
+                    job.paused_at_ms,
+                    job.paused_by,
                 ],
             )?;
             Ok(job)
@@ -2321,7 +2371,7 @@ impl SqliteBackend {
             // request, and the caller caches this record.
             let stored = connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     [&job.job_id],
                     row_to_job,
                 )
@@ -2334,7 +2384,7 @@ impl SqliteBackend {
         self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     [job_id],
                     row_to_job,
                 )
@@ -2379,7 +2429,7 @@ impl SqliteBackend {
     pub fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs ORDER BY updated_at_ms DESC, job_id LIMIT 4096",
+                "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs ORDER BY updated_at_ms DESC, job_id LIMIT 4096",
             )?;
             let rows = statement.query_map([], row_to_job)?;
             rows.collect()
@@ -2404,7 +2454,7 @@ impl SqliteBackend {
             )?;
             connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     [job_id],
                     row_to_job,
                 )
@@ -2460,7 +2510,7 @@ impl SqliteBackend {
             }
             Ok(connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     [job_id],
                     row_to_job,
                 )
@@ -2475,8 +2525,13 @@ impl SqliteBackend {
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, StorageError> {
         self.immediate_transaction(|connection| {
+            // `pause_phase IS NULL` fences the generic desired-state write
+            // against an in-progress pause: pausing does not bump the
+            // generation, so a generation-only guard would let a request that
+            // read the Job before the pause began overwrite the pause intent
+            // and leave the bookkeeping stale.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5",
+                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5 AND pause_phase IS NULL",
                 rusqlite::params![
                     job_id,
                     desired_state,
@@ -2488,13 +2543,23 @@ impl SqliteBackend {
             if changed == 0 {
                 let current = connection
                     .query_row(
-                        "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                        "SELECT generation, pause_phase FROM cp_jobs WHERE job_id = ?1",
                         [job_id],
-                        |row| row.get::<_, u64>(0),
+                        |row| {
+                            Ok((
+                                row.get::<_, u64>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
                     )
                     .optional()?;
                 return match current {
-                    Some(current) => Err(StorageError::GenerationConflict {
+                    Some((_, Some(phase))) => Err(StorageError::JobPauseConflict {
+                        job_id: job_id.to_owned(),
+                        expected: None,
+                        current: Some(phase),
+                    }),
+                    Some((current, None)) => Err(StorageError::GenerationConflict {
                         expected: expected_generation,
                         current,
                     }),
@@ -2503,7 +2568,85 @@ impl SqliteBackend {
             }
             Ok(connection
                 .query_row(
-                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms FROM cp_jobs WHERE job_id = ?1",
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    row_to_job,
+                )
+                .optional()?)
+        })
+    }
+
+    /// CAS-guarded durable pause state mutation. The guard is
+    /// `(generation, pause_phase)`; see [`JobPauseUpdate`] for the field
+    /// semantics. A generation bump is opt-in so that beginning a pause does
+    /// not disturb the running kernel's generation (an abort then leaves the
+    /// Job untouched).
+    pub fn update_job_pause(
+        &self,
+        job_id: &str,
+        update: JobPauseUpdate,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.immediate_transaction(|connection| {
+            let changed = connection.execute(
+                "UPDATE cp_jobs SET \
+                    desired_state = COALESCE(?2, desired_state), \
+                    pause_phase = CASE WHEN ?3 THEN NULL ELSE COALESCE(?4, pause_phase) END, \
+                    pause_artifact_id = CASE WHEN ?3 THEN NULL ELSE COALESCE(?5, pause_artifact_id) END, \
+                    pause_prev_checkpoint_id = CASE WHEN ?3 THEN NULL ELSE COALESCE(?6, pause_prev_checkpoint_id) END, \
+                    pause_retry_count = CASE WHEN ?3 THEN 0 ELSE COALESCE(?7, pause_retry_count) END, \
+                    paused_at_ms = CASE WHEN ?3 THEN NULL ELSE COALESCE(?8, paused_at_ms) END, \
+                    paused_by = CASE WHEN ?3 THEN NULL ELSE COALESCE(?9, paused_by) END, \
+                    checkpoint_id = CASE WHEN ?10 THEN ?11 ELSE checkpoint_id END, \
+                    convergence = 'reconciling', \
+                    generation = CASE WHEN ?12 THEN generation + 1 ELSE generation END, \
+                    last_error = COALESCE(?13, last_error), \
+                    updated_at_ms = ?14 \
+                 WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS ?16",
+                rusqlite::params![
+                    job_id,
+                    update.desired_state,
+                    update.clear_pause,
+                    update.phase,
+                    update.artifact_id,
+                    update.prev_checkpoint_id,
+                    update.retry_count,
+                    update.paused_at_ms,
+                    update.paused_by,
+                    update.restore_pointer,
+                    update.restore_checkpoint_id,
+                    update.bump_generation,
+                    update.last_error,
+                    now_ms(),
+                    update.expected_generation,
+                    update.expected_phase,
+                ],
+            )?;
+            if changed == 0 {
+                let current = connection
+                    .query_row(
+                        "SELECT generation, pause_phase FROM cp_jobs WHERE job_id = ?1",
+                        [job_id],
+                        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?)),
+                    )
+                    .optional()?;
+                return match current {
+                    None => Ok(None),
+                    Some((generation, _)) if generation != update.expected_generation => {
+                        Err(StorageError::GenerationConflict {
+                            expected: update.expected_generation,
+                            current: generation,
+                        })
+                    }
+                    Some((_, phase)) => Err(StorageError::JobPauseConflict {
+                        job_id: job_id.to_owned(),
+                        expected: update.expected_phase,
+                        current: phase,
+                    }),
+                };
+            }
+            Ok(connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     [job_id],
                     row_to_job,
                 )
@@ -2603,7 +2746,13 @@ impl SqliteBackend {
                 node_ids_json TEXT NOT NULL DEFAULT '[]',
                 checkpoint_id TEXT,
                 last_error TEXT,
-                updated_at_ms INTEGER NOT NULL
+                updated_at_ms INTEGER NOT NULL,
+                pause_phase TEXT,
+                pause_artifact_id TEXT,
+                pause_prev_checkpoint_id TEXT,
+                pause_retry_count INTEGER NOT NULL DEFAULT 0,
+                paused_at_ms INTEGER,
+                paused_by TEXT
             );
 
             CREATE INDEX IF NOT EXISTS cp_jobs_updated
@@ -2750,6 +2899,47 @@ impl SqliteBackend {
                 created_by TEXT,
                 created_at_ms INTEGER NOT NULL
             );
+
+
+            CREATE TABLE IF NOT EXISTS cp_users (
+                user_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL,
+                scopes_json TEXT NOT NULL DEFAULT '[]',
+                disabled INTEGER NOT NULL DEFAULT 0,
+                oidc_subject TEXT,
+                tokens_valid_after_ms INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS cp_users_oidc_subject
+                ON cp_users(oidc_subject) WHERE oidc_subject IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS cp_credentials (
+                credential_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER,
+                last_used_at_ms INTEGER,
+                revoked_at_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS cp_credentials_user
+                ON cp_credentials(user_id);
+
+            CREATE TABLE IF NOT EXISTS cp_sessions (
+                session_hash TEXT PRIMARY KEY,
+                user_id TEXT,
+                principal_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                revoked_at_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS cp_sessions_user
+                ON cp_sessions(user_id);
+            CREATE INDEX IF NOT EXISTS cp_sessions_expiry
+                ON cp_sessions(expires_at_ms);
 
             CREATE TABLE IF NOT EXISTS cp_audit_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2950,6 +3140,25 @@ impl SqliteBackend {
         if !event_columns.iter().any(|name| name == "actor") {
             connection.execute("ALTER TABLE cp_events ADD COLUMN actor TEXT", [])?;
         }
+        let job_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(cp_jobs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (column, definition) in [
+            ("pause_phase", "TEXT"),
+            ("pause_artifact_id", "TEXT"),
+            ("pause_prev_checkpoint_id", "TEXT"),
+            ("pause_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("paused_at_ms", "INTEGER"),
+            ("paused_by", "TEXT"),
+        ] {
+            if !job_columns.iter().any(|name| name == column) {
+                connection.execute(
+                    &format!("ALTER TABLE cp_jobs ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
         let checkpoint_columns: Vec<String> = connection
             .prepare("PRAGMA table_info(cp_job_checkpoints)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -3017,6 +3226,263 @@ impl SqliteBackend {
                 )
                 .optional()
                 .map(|value| value.is_some())
+        })
+    }
+
+    // ---- managed identity (cp_users / cp_credentials / cp_sessions) ----
+
+    const USER_COLUMNS: &'static str =
+        "user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms";
+    const CREDENTIAL_COLUMNS: &'static str =
+        "credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms";
+    const SESSION_COLUMNS: &'static str =
+        "session_hash, user_id, principal_json, created_at_ms, expires_at_ms, revoked_at_ms";
+
+    pub fn list_users(&self) -> Result<Vec<UserRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {} FROM cp_users ORDER BY user_id",
+                Self::USER_COLUMNS
+            ))?;
+            let rows = statement.query_map([], row_to_user)?;
+            rows.collect()
+        })
+    }
+
+    pub fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM cp_users WHERE user_id = ?1",
+                        Self::USER_COLUMNS
+                    ),
+                    [user_id],
+                    row_to_user,
+                )
+                .optional()
+        })
+    }
+
+    pub fn get_user_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<Option<UserRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM cp_users WHERE oidc_subject = ?1",
+                        Self::USER_COLUMNS
+                    ),
+                    [oidc_subject],
+                    row_to_user,
+                )
+                .optional()
+        })
+    }
+
+    pub fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
+        self.immediate_transaction(|connection| {
+            connection.execute(
+                "INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, role=excluded.role, scopes_json=excluded.scopes_json, disabled=excluded.disabled, oidc_subject=excluded.oidc_subject, tokens_valid_after_ms=excluded.tokens_valid_after_ms, created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms",
+                rusqlite::params![
+                    user.user_id,
+                    user.display_name,
+                    user.role,
+                    user.scopes_json,
+                    user.disabled,
+                    user.oidc_subject,
+                    user.tokens_valid_after_ms,
+                    user.created_at_ms,
+                    user.updated_at_ms,
+                ],
+            )?;
+            Ok(user)
+        })
+    }
+
+    /// Delete a user and cascade its credentials and sessions in one
+    /// transaction (SQLite foreign keys are not required for correctness).
+    pub fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
+        self.immediate_transaction(|connection| {
+            connection.execute("DELETE FROM cp_credentials WHERE user_id = ?1", [user_id])?;
+            connection.execute("DELETE FROM cp_sessions WHERE user_id = ?1", [user_id])?;
+            let changed =
+                connection.execute("DELETE FROM cp_users WHERE user_id = ?1", [user_id])?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn bump_user_tokens_valid_after(
+        &self,
+        user_id: &str,
+        valid_after_ms: u64,
+    ) -> Result<Option<UserRecord>, StorageError> {
+        self.immediate_transaction(|connection| {
+            connection.execute(
+                "UPDATE cp_users SET tokens_valid_after_ms = ?2, updated_at_ms = ?3 WHERE user_id = ?1",
+                rusqlite::params![user_id, valid_after_ms, now_ms()],
+            )?;
+            Ok(connection
+                .query_row(
+                    &format!("SELECT {} FROM cp_users WHERE user_id = ?1", Self::USER_COLUMNS),
+                    [user_id],
+                    row_to_user,
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn list_credentials(&self, user_id: &str) -> Result<Vec<CredentialRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {} FROM cp_credentials WHERE user_id = ?1 ORDER BY created_at_ms DESC, credential_id",
+                Self::CREDENTIAL_COLUMNS
+            ))?;
+            let rows = statement.query_map([user_id], row_to_credential)?;
+            rows.collect()
+        })
+    }
+
+    pub fn get_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<CredentialRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM cp_credentials WHERE credential_id = ?1",
+                        Self::CREDENTIAL_COLUMNS
+                    ),
+                    [credential_id],
+                    row_to_credential,
+                )
+                .optional()
+        })
+    }
+
+    pub fn create_credential(&self, record: CredentialRecord) -> Result<bool, StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO cp_credentials (credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    record.credential_id,
+                    record.user_id,
+                    record.secret_hash,
+                    record.label,
+                    record.created_at_ms,
+                    record.expires_at_ms,
+                    record.last_used_at_ms,
+                    record.revoked_at_ms,
+                ],
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Revoke a credential. A second revocation keeps the first timestamp.
+    pub fn revoke_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "UPDATE cp_credentials SET revoked_at_ms = COALESCE(revoked_at_ms, ?2) WHERE credential_id = ?1",
+                rusqlite::params![credential_id, revoked_at_ms],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Atomically issue a replacement credential and revoke the previous one.
+    pub fn rotate_credential(
+        &self,
+        record: CredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|connection| {
+            connection.execute(
+                "INSERT INTO cp_credentials (credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    record.credential_id,
+                    record.user_id,
+                    record.secret_hash,
+                    record.label,
+                    record.created_at_ms,
+                    record.expires_at_ms,
+                    record.last_used_at_ms,
+                    record.revoked_at_ms,
+                ],
+            )?;
+            let changed = connection.execute(
+                "UPDATE cp_credentials SET revoked_at_ms = COALESCE(revoked_at_ms, ?2) WHERE credential_id = ?1",
+                rusqlite::params![previous_credential_id, revoked_at_ms],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn get_session(&self, session_hash: &str) -> Result<Option<SessionRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM cp_sessions WHERE session_hash = ?1",
+                        Self::SESSION_COLUMNS
+                    ),
+                    [session_hash],
+                    row_to_session,
+                )
+                .optional()
+        })
+    }
+
+    pub fn upsert_session(&self, record: SessionRecord) -> Result<bool, StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO cp_sessions (session_hash, user_id, principal_json, created_at_ms, expires_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(session_hash) DO UPDATE SET user_id=excluded.user_id, principal_json=excluded.principal_json, expires_at_ms=excluded.expires_at_ms, revoked_at_ms=excluded.revoked_at_ms",
+                rusqlite::params![
+                    record.session_hash,
+                    record.user_id,
+                    record.principal_json,
+                    record.created_at_ms,
+                    record.expires_at_ms,
+                    record.revoked_at_ms,
+                ],
+            )?;
+            Ok(true)
+        })
+    }
+
+    pub fn delete_session(&self, session_hash: &str) -> Result<bool, StorageError> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "DELETE FROM cp_sessions WHERE session_hash = ?1",
+                [session_hash],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn delete_user_sessions(&self, user_id: &str) -> Result<usize, StorageError> {
+        self.with_connection(|connection| {
+            let changed =
+                connection.execute("DELETE FROM cp_sessions WHERE user_id = ?1", [user_id])?;
+            Ok(changed)
+        })
+    }
+
+    pub fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "DELETE FROM cp_sessions WHERE expires_at_ms <= ?1 OR (revoked_at_ms IS NOT NULL AND revoked_at_ms <= ?1)",
+                [now_ms],
+            )?;
+            Ok(changed)
         })
     }
 }
@@ -3454,6 +3920,80 @@ impl StorageBackend for SqliteBackend {
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, StorageError> {
         self.update_job_desired_state(job_id, desired_state, expected_generation)
+    }
+    async fn update_job_pause(
+        &self,
+        job_id: &str,
+        update: JobPauseUpdate,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.update_job_pause(job_id, update)
+    }
+    async fn list_users(&self) -> Result<Vec<UserRecord>, StorageError> {
+        self.list_users()
+    }
+    async fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>, StorageError> {
+        self.get_user(user_id)
+    }
+    async fn get_user_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<Option<UserRecord>, StorageError> {
+        self.get_user_by_oidc_subject(oidc_subject)
+    }
+    async fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
+        self.upsert_user(user)
+    }
+    async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
+        self.delete_user(user_id)
+    }
+    async fn bump_user_tokens_valid_after(
+        &self,
+        user_id: &str,
+        valid_after_ms: u64,
+    ) -> Result<Option<UserRecord>, StorageError> {
+        self.bump_user_tokens_valid_after(user_id, valid_after_ms)
+    }
+    async fn list_credentials(&self, user_id: &str) -> Result<Vec<CredentialRecord>, StorageError> {
+        self.list_credentials(user_id)
+    }
+    async fn get_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<CredentialRecord>, StorageError> {
+        self.get_credential(credential_id)
+    }
+    async fn create_credential(&self, record: CredentialRecord) -> Result<bool, StorageError> {
+        self.create_credential(record)
+    }
+    async fn revoke_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.revoke_credential(credential_id, revoked_at_ms)
+    }
+    async fn rotate_credential(
+        &self,
+        record: CredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.rotate_credential(record, previous_credential_id, revoked_at_ms)
+    }
+    async fn get_session(&self, session_hash: &str) -> Result<Option<SessionRecord>, StorageError> {
+        self.get_session(session_hash)
+    }
+    async fn upsert_session(&self, record: SessionRecord) -> Result<bool, StorageError> {
+        self.upsert_session(record)
+    }
+    async fn delete_session(&self, session_hash: &str) -> Result<bool, StorageError> {
+        self.delete_session(session_hash)
+    }
+    async fn delete_user_sessions(&self, user_id: &str) -> Result<usize, StorageError> {
+        self.delete_user_sessions(user_id)
+    }
+    async fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError> {
+        self.prune_sessions(now_ms)
     }
     async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError> {
         self.upsert_job_checkpoint(record)

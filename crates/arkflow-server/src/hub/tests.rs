@@ -97,6 +97,13 @@ async fn checkpoint_completion_after_hub_restart_preserves_metadata() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -311,6 +318,13 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -472,6 +486,13 @@ async fn declared_resources_over_capacity_fail_the_reconcile_loudly() {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 0,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         })
         .await
         .unwrap_err();
@@ -496,6 +517,13 @@ async fn declared_resources_over_capacity_fail_the_reconcile_loudly() {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 0,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         })
         .await
         .unwrap_err();
@@ -559,6 +587,13 @@ async fn declared_resources_within_capacity_dispatch_normally() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -604,6 +639,13 @@ async fn durable_replacement_without_checkpoint_fails_closed_before_dispatch() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -704,6 +746,13 @@ async fn current_generation_recovery_required_failure_overrides_running_observat
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     };
     hub.operations.write().await.insert(
         "recovery-required-start".into(),
@@ -816,6 +865,13 @@ async fn a_stopped_job_is_not_recommanded_once_its_stop_succeeds() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -908,6 +964,13 @@ async fn one_jobs_dispatch_failure_does_not_stall_the_scan() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     };
     hub.upsert_job(job("job-blocked", "node-a")).await.unwrap();
     hub.upsert_job(job("job-healthy", "node-b")).await.unwrap();
@@ -983,6 +1046,13 @@ async fn stale_operation_and_checkpoint_records_are_reclaimed() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1095,6 +1165,13 @@ async fn stale_job_observation_cannot_rollback_generation() {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 0,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         })
         .await
         .unwrap();
@@ -1177,6 +1254,13 @@ async fn replaced_placement_supersedes_abandoned_start_and_stops_it() {
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 0,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             })
             .await
             .unwrap();
@@ -3106,6 +3190,13 @@ async fn job_observation_rejects_stale_generation() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -3158,6 +3249,13 @@ async fn concurrent_job_generation_updates_use_compare_and_swap() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -3191,6 +3289,13 @@ async fn replacing_a_job_preserves_generation_fencing() {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 1,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         })
         .await
         .unwrap();
@@ -3209,6 +3314,13 @@ async fn replacing_a_job_preserves_generation_fencing() {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 2,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         })
         .await
         .unwrap();
@@ -3255,6 +3367,13 @@ async fn running_job_is_dispatched_to_compatible_agent() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -3551,6 +3670,13 @@ async fn job_observed_state_waits_for_every_assignment_and_ignores_retryable_pee
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 0,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             })
             .await
             .unwrap();
@@ -3766,6 +3892,13 @@ async fn job_observed_state_reports_failed_when_a_peer_permanently_fails() {
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 0,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             })
             .await
             .unwrap();
@@ -3870,6 +4003,13 @@ async fn periodic_job_reconciliation_retries_a_failed_runtime() {
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 0,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             })
             .await
             .unwrap();
@@ -3968,6 +4108,13 @@ async fn periodic_job_reconciliation_stops_persisted_divergence_after_recovery()
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 0,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             })
             .await
             .unwrap();
@@ -4050,6 +4197,13 @@ async fn audited_job_hub(secret_marker: &str) -> (Hub, crate::hub::RegisterRespo
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -4344,6 +4498,13 @@ async fn periodic_checkpoint_scheduling_writes_no_audit_rows() {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 0,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         })
         .await
         .unwrap();
@@ -4443,6 +4604,13 @@ fn ha_job_record(job_id: &str) -> JobRecord {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 1,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     }
 }
 
@@ -4927,6 +5095,13 @@ async fn atomic_upgrade_fixture(job_id: &str) -> (Hub, AgentAuth) {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -5315,6 +5490,13 @@ async fn orchestration_survives_hub_restart_and_keeps_the_fence() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();

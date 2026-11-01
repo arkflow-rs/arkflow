@@ -138,7 +138,9 @@ A="Authorization: Bearer operator-secret"
      -d '{"state":"running"}'
    ```
 
-   `PUT desired-state` 支持与流相同的 `If-Match` 世代守卫和 `Idempotency-Key` 去重(见
+   `PUT desired-state` 内部执行世代比较并交换(generation CAS):过旧的世代会被拒绝,
+   而不是静默覆盖更新的意图。与流的 desired-state 路由不同,作业路由并未实现
+   `If-Match` / `Idempotency-Key` 请求头(见
    [HTTP API v1](/zh-Hans/docs/reference/api))。
 
 3. **检查点与保存点。** 两者都会向作业的 `object_store_uri` 写入带校验和的恢复工件;检查点要求每个计划中的任务都参与同一个有效切面:
@@ -163,6 +165,40 @@ A="Authorization: Bearer operator-secret"
 
 Hub 使用作业代数(job generation)对任务尝试做隔离(fencing):失联节点上的任务会被重新放置到其他节点,而失联节点恢复后会收到停止命令,而不是跑出一个重复任务。重启时,作业依据其 `recovery` 策略(`latest_checkpoint`、`latest_savepoint` 或 `fail`)选定的恢复工件恢复状态、源位置与各分区水位线。当恢复工件的状态格式与作业版本不兼容时,恢复会被提前拒绝,因此一次错误的还原不会破坏状态。杀进程再重启的恢复路径由 `crates/arkflow-server/tests/` 中的双节点冒烟测试端到端覆盖。
 
+### 暂停与恢复 {#pause-and-resume}
+
+停止作业再启动时会从最近一个已完成的恢复工件恢复,因此该工件之后处理的数据会按源位点重放。**暂停**是面向操作员的「冻结、稍后继续」操作:Hub 先在暂停世代上落一个恢复工件,然后停止作业;恢复(resume)时直接从该工件起跑,操作员无需指定检查点。
+
+```bash
+# 暂停:先落工件,再停机。返回 202 与作业记录;在所有目标节点观测到停机之前,
+# 作业保持 `reconciling`。
+curl -s -H "$A" -X POST $H/jobs/sensor-window-job/actions/pause
+
+# 恢复:提升世代,并从暂停工件恢复。
+curl -s -H "$A" -X POST $H/jobs/sensor-window-job/actions/resume
+
+# desired-state 资源同样接受第三个取值。
+curl -s -H "$A" -X PUT $H/jobs/sensor-window-job/desired-state \
+  -d '{"state":"paused"}'
+```
+
+只有期望态与观测态均为 `running` 且已收敛、没有进行中的升级编排、也没有在途暂停的作业才会被接受暂停。创建作业时仍只接受 `running` 与 `stopped`;`paused` 是生命周期取值,不是初始状态。
+
+暂停的执行序列与边界:
+
+| 边界 | 行为 |
+| --- | --- |
+| 落工件 | 工件类型跟随 `spec.recovery`:`latest_checkpoint` 落检查点(暂停期间被保留期 pin 住,不会被回收),`latest_savepoint` 落保存点。`recovery: fail` 没有任何可选工件,暂停会被 `pause_requires_recovery_policy` 拒绝。 |
+| 顺序 | 只有工件完成之后才派发停机。规格中没有 `checkpoint` 配置的作业跳过落工件,直接停机;其恢复等价于冷启动。 |
+| 收敛 | `desired_state = paused` 只在 `pause_phase = paused` 且所有目标分配都被观测为 `stopped` 时才算收敛——收敛由相位定义,不做字符串相等。相位处于 `capturing` 或 `stopping` 时作业报告 `reconciling`。 |
+| 离线节点 | 停机命令到不了离线节点,暂停会保持 `reconciling`(意图是持久的),节点回归后继续派发。操作员也可以 `stop` 作业,把它落回 stopped 并清除暂停记账。 |
+| 失败 | 工件失败或五分钟的落工件超时(Hub 重启后允许有界的重派轮次)会中止暂停:作业回到 `desired_state = running`,恢复暂停前的恢复指针,并在 `last_error` 写入 `pause_savepoint_failed` 或 `pause_savepoint_timeout`。 |
+| 恢复 | `resume` 只在 `paused` 相位被接受:提升世代,恢复指针保持指向暂停工件,并走普通恢复启动;只有作业收敛到观测 `running` 后相位才被清除。 |
+| 重放窗口 | 暂停工件屏障之后、teardown 完成之前处理的事件会在 resume 时重放:事务型 sink 精确一次,非事务型 sink 至少一次。没有 checkpoint 配置的作业没有工件,resume 即冷启动。 |
+| 升级 | 暂停相位存在时拒绝升级(`job_paused`);升级编排活跃时拒绝暂停(`orchestration_in_progress`)。参见[原子作业升级 → 暂停:编排暂停与作业暂停](/zh-Hans/docs/operate/control-plane/job-upgrades#pause-orchestration-vs-job)。 |
+
+暂停与恢复要求 Hub 配置了持久化存储:volatile Hub 返回 `503 pause_requires_durable_storage`。作业记录暴露增量字段 `pause_phase`、`pause_artifact_id`、`pause_prev_checkpoint_id`、`pause_retry_count`、`paused_at_ms` 与 `paused_by`;相位转移也会以 `job.pause_requested`、`job.paused`、`job.resume_requested`、`job.resumed`、`job.pause_failed` 出现在 `GET /events/stream` 上。作业处于暂停态时,`start` 与 `restart` 等价于 `resume`,`stop` 则把它落回 stopped。路由与错误码参考:[HTTP API → 作业暂停与恢复](/zh-Hans/docs/reference/api#job-pause-and-resume)。
+
 ## 哪些场景能扩展,以及如何扩展 {#what-scales--and-how}
 
 任务放置有两种模式,由作业的 `placement` 字段选择:
@@ -178,4 +214,5 @@ Hub 使用作业代数(job generation)对任务尝试做隔离(fencing):失联�
 - [ ] `parallelism`/`max_parallelism` 与数据源的真实并行度匹配(对 Kafka 而言是分区数)。
 - [ ] 有状态算子声明了 `state` 后端;`checkpoint` 指向持久化的 `object_store_uri`。
 - [ ] 分布式作业在首次提交前已针对目标 `node_ids` 完成校验。
+- [ ] 暂停/恢复已演练:暂停工件类型与 `spec.recovery` 一致,且重放窗口(工件屏障 → teardown)对非事务型 sink 可接受。
 - [ ] 升级路径已演练:保存点 → 停止 → 升级 → 验证 →(回滚)。

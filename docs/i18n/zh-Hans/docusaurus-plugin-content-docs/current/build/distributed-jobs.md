@@ -148,6 +148,22 @@ Hub 持久化作业、版本、任务分配与恢复记录,并使用 generation 
 
 分区边按 JobPlan 的键组范围选择下游任务,而不是对物理源子任务取模,因此来自不同源分区的相同键仍会落在同一下游所有者上。旧式 YAML 流的滚动/会话缓冲保持"先聚合后流水线"的顺序并输出原始 schema/行;旧式按行数的 `sliding_window` 不会被误读为时间窗口,不兼容的配置在编译期失败并给出迁移提示。
 
+### 暂停作业:期望状态、收敛与重放
+
+`desired_state` 有三个取值:`running`、`stopped` 与 `paused`。创建作业时仍只接受 `running` 与 `stopped`;`paused` 通过暂停变更或 desired-state 资源进入,并由 resume 或停止作业清除。
+
+暂停作业的收敛由暂停状态机定义,而不是期望态与观测态的字符串相等:
+
+- `capturing` / `stopping` —— 暂停在进行中;即使节点已报告 `stopped`,作业仍报告 `reconciling`。
+- `paused` —— 只有当暂停世代下的全部预期分配都被观测为 `stopped` 时才收敛。离线节点会让暂停保持 `reconciling`(意图持久,节点回归后会重派停机命令),绝不会被误报为已收敛。
+- `resuming` —— 恢复启动正在收敛;只有观测到 `running` 后相位才会清除。
+
+暂停相位存在期间,协调器把作业视为被围栏:`desired_state = paused` 的作业只在工件持久化之后派发停机,不派发启动、不重放置、不 supersede 陈旧的启动声明,并保留已记录的放置。暂停只是 Hub 控制平面的操作:Agent 协议与内核不变,也永远不会观测到 `paused`。
+
+暂停工件走普通恢复工件路径,工件类型跟随作业的 `recovery` 策略——`latest_checkpoint` 生成检查点(暂停清除前被保留期 pin 住),`latest_savepoint` 生成保存点,而 `recovery: fail` 没有可选工件,暂停会以 `pause_requires_recovery_policy` 被拒绝。正因如此,resume 时普通恢复选择就能命中该工件,无需改写规格或新建作业版本。
+
+**重放边界。** resume 提升世代并从暂停工件走普通恢复路径启动。工件屏障之后、teardown 完成之前处理的事件会按恢复出的源位点重放:事务型 sink 精确一次,非事务型 sink 至少一次。规格中没有声明 checkpoint 配置的作业没有工件可落——暂停直接停机,resume 即冷启动。落工件失败或超时会中止暂停、恢复暂停前的恢复指针,且不改动正在运行的世代。
+
 ### 放置模式
 
 **任务放置有两种模式**,由作业规格的 `placement` 字段选择。
@@ -344,8 +360,10 @@ GET  /api/v1/jobs/{job_id}/detail
 GET  /api/v1/jobs/{job_id}/versions
 POST /api/v1/jobs/{job_id}/checkpoints
 POST /api/v1/jobs/{job_id}/savepoints
+POST /api/v1/jobs/{job_id}/actions/pause
+POST /api/v1/jobs/{job_id}/actions/resume
 POST /api/v1/jobs/{job_id}/upgrades
 POST /api/v1/jobs/{job_id}/upgrades/{upgrade_id}/rollback
 ```
 
-工作台与 API 客户端都应先调用 `validate` 检查编译计划与节点能力,再以 `stopped` 提交并查看 `detail`;确认之后才切换到 `running`。版本升级要求作业已停止且收敛,并持有状态格式兼容的已完成 savepoint;升级失败时作业保持停止,由操作者显式恢复旧版本。检查点/savepoint 生命周期绑定到作业版本与状态格式版本。
+工作台与 API 客户端都应先调用 `validate` 检查编译计划与节点能力,再以 `stopped` 提交并查看 `detail`;确认之后才切换到 `running`。版本升级要求作业已停止且收敛,并持有状态格式兼容的已完成 savepoint;升级失败时作业保持停止,由操作者显式恢复旧版本。暂停中的作业必须先 resume(或 stop 以清除暂停记账)才能升级。检查点/savepoint 生命周期绑定到作业版本与状态格式版本。

@@ -579,6 +579,12 @@ impl Hub {
         let operation = match job.desired_state.as_str() {
             "running" => AgentOperation::JobStart,
             "stopped" => AgentOperation::JobStop,
+            // A paused Job is inert: only the stop of the quiesce sequence is
+            // dispatched from here, and only once the capture is durable.
+            "paused" => match job.pause_phase.as_deref() {
+                Some(super::job_pause::PAUSE_STOPPING) => AgentOperation::JobStop,
+                _ => return Ok(0),
+            },
             _ => return Ok(0),
         };
         // A durable state directory is not a disposable cache.  Once a Job

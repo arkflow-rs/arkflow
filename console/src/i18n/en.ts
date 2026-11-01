@@ -9,6 +9,7 @@ export const en = {
   'nav.components': 'Components',
   'nav.events': 'Events',
   'nav.audit': 'Audit',
+  'nav.users': 'Users',
   'nav.settings': 'Settings',
   'brand.tagline': 'Control plane',
 
@@ -206,7 +207,23 @@ export const en = {
   'toast.accepted': 'Operation accepted',
   'toast.failed': 'Operation failed',
   'settings.credentialsNote':
-    'Credentials are read from build-time environment configuration and never rendered in the UI. Live updates stream over SSE; the periodic snapshot is a fallback.',
+    'Requests authenticate with a bearer credential entered at runtime (kept in sessionStorage for this browser tab) or, failing that, the optional VITE_API_TOKEN build-time default. Managed users, roles, and their credentials live in the Users panel; OIDC browser login is used unchanged when the Hub offers it.',
+  'settings.credentials.title': 'API credential',
+  'settings.credentials.subtitle': 'Bearer token used by this browser session',
+  'settings.credentials.source': 'Active credential',
+  'settings.credentials.sourceRuntime': 'Entered at runtime (this tab only)',
+  'settings.credentials.sourceEnvironment': 'Build-time default (VITE_API_TOKEN)',
+  'settings.credentials.sourceNone': 'None — protected control planes answer 401',
+  'settings.credentials.inputLabel': 'Operator bearer token',
+  'settings.credentials.inputPlaceholder': 'Paste the static operator token or a managed credential',
+  'settings.credentials.use': 'Use token',
+  'settings.credentials.clear': 'Clear token',
+  'settings.credentials.storageNote':
+    'The runtime token is stored in sessionStorage: it never reaches localStorage and is forgotten when this tab closes. It is never rendered back after saving.',
+  'settings.credentials.saved': 'Runtime credential saved; reloading data…',
+  'settings.credentials.cleared':
+    'Runtime credential cleared; falling back to the build-time default, if any.',
+  'settings.credentials.refreshFailed': 'The credential changed, but reloading data failed: {message}',
   'settings.webhooks.title': 'Webhook alerting',
   'settings.webhooks.subtitle': 'Forward control-plane events to external endpoints',
   'settings.webhooks.deliveryNote':
@@ -238,6 +255,108 @@ export const en = {
   'settings.webhooks.secretReplaceHint':
     'A secret is configured and never displayed. Leave empty to keep it; enter a new value to replace it.',
 
+  // Users & credentials (Hub only, manage_users)
+  'users.title': 'Users',
+  'users.subtitle': 'Managed identities, roles, and per-user credentials',
+  'users.directoryNote':
+    'Managed users take their role and scopes from this directory. Static operator tokens and OIDC logins keep working alongside them; every action here requires the manage_users permission.',
+  'users.unavailable': 'User management is unavailable: {message}',
+  'users.empty': 'No managed users are configured.',
+  'users.id': 'User ID',
+  'users.idHint': 'Permanent identifier: 1–64 characters of a-z, 0-9, ".", "_" or "-".',
+  'users.displayName': 'Display name',
+  'users.role': 'Role',
+  'users.role.admin': 'Admin',
+  'users.role.operator': 'Operator',
+  'users.role.viewer': 'Viewer',
+  'users.status': 'Status',
+  'users.enabled': 'Enabled',
+  'users.disabled': 'Disabled',
+  'users.scopes': 'Scopes',
+  'users.scopeType': 'Resource type',
+  'users.scopeTypePlaceholder': 'e.g. node',
+  'users.scopeId': 'Resource ID (optional)',
+  'users.scopeIdPlaceholder': 'e.g. node-a',
+  'users.oidcSubject': 'OIDC subject',
+  'users.oidcSubjectHint':
+    'Binds a directory subject to this user; the bound login inherits this role and these scopes. Leave empty to clear the binding.',
+  'users.actions': 'Actions',
+  'users.create': 'Create user',
+  'users.createTitle': 'Create user',
+  'users.edit': 'Edit',
+  'users.editTitle': 'Edit user {userId}',
+  'users.save': 'Save',
+  'users.enable': 'Enable',
+  'users.disable': 'Disable',
+  'users.delete': 'Delete',
+  'users.deleteTitle': 'Delete user',
+  'users.confirmDelete':
+    'Delete {userId}? Their credentials and browser sessions stop working immediately. This cannot be undone.',
+  'users.addScope': 'Add scope',
+  'users.removeScope': 'Remove',
+  'users.selectHint': 'Select the credentials action on a user to manage its tokens.',
+  'users.createdNotice': 'Created user {userId}.',
+  'users.updatedNotice': 'Updated user {userId}.',
+  'users.enabledNotice': 'Enabled user {userId}.',
+  'users.disabledNotice': 'Disabled user {userId}; its sessions and credentials stop authenticating.',
+  'users.deletedNotice': 'Deleted user {userId}.',
+  'users.revokeTokens': 'Revoke all tokens',
+  'users.revokeTokensTitle': 'Revoke all tokens',
+  'users.confirmRevokeTokens':
+    'Revoke every browser session and federated (OIDC) token for {userId}? Managed credentials stay valid; revoke or rotate them individually.',
+  'users.revokeTokensDone': 'Revoked {count} browser session(s).',
+  'users.credentials.title': 'Credentials',
+  'users.credentials.subtitle': 'Metadata only — plaintext tokens are shown once, at issuance or rotation',
+  'users.credentials.manage': 'Credentials',
+  'users.credentials.unavailable': 'Credential metadata is unavailable: {message}',
+  'users.credentials.metadataNote':
+    'Secret material never appears here. A plaintext token is returned exactly once when issued or rotated; issue a new one if it is lost.',
+  'users.credentials.empty': 'This user has no credentials.',
+  'users.credentials.label': 'Label',
+  'users.credentials.labelPlaceholder': 'e.g. ci-deploy',
+  'users.credentials.expires': 'Expires at (optional)',
+  'users.credentials.issue': 'Issue credential',
+  'users.credentials.credentialId': 'Credential',
+  'users.credentials.issuedAt': 'Issued',
+  'users.credentials.expiresAt': 'Expires',
+  'users.credentials.lastUsed': 'Last used',
+  'users.credentials.status': 'Status',
+  'users.credentials.actions': 'Actions',
+  'users.credentials.active': 'Active',
+  'users.credentials.revoked': 'Revoked',
+  'users.credentials.alreadyRevoked': 'This credential is already revoked.',
+  'users.credentials.rotate': 'Rotate',
+  'users.credentials.rotateTitle': 'Rotate credential',
+  'users.credentials.confirmRotate':
+    'Rotate credential {credentialId}? The current token stops working immediately and the replacement is shown once.',
+  'users.credentials.revoke': 'Revoke',
+  'users.credentials.revokeTitle': 'Revoke credential',
+  'users.credentials.confirmRevoke':
+    'Revoke credential {credentialId}? Requests using it start failing with 401 immediately.',
+  'users.credentials.revokeTokensNote':
+    'Revoking all tokens invalidates browser sessions and federated tokens for this user; managed credentials must be revoked or rotated individually.',
+  'users.credentials.oneTimeTitle': 'New credential token',
+  'users.credentials.oneTimeHint':
+    'This is the only time the plaintext token is shown. Copy it now — it cannot be recovered; rotate the credential if it is lost.',
+  'users.credentials.copy': 'Copy token',
+  'users.credentials.copied': 'Copied',
+  'users.credentials.copyFailed': 'Copy failed; select the token and copy it manually.',
+  'users.credentials.dismiss': 'Dismiss',
+
+  // Runtime bearer credential prompt
+  'token.requiredTitle': 'Authentication required',
+  'token.requiredSubtitle': 'The control plane rejected the request with 401',
+  'token.requiredBody':
+    'The Hub does not offer an OIDC browser login. Enter an operator bearer token (the static operator token or a managed credential issued from the Users panel) to continue.',
+  'token.rejectedBody':
+    'The bearer token sent with the last request was rejected (401). Enter a new token to continue.',
+  'token.label': 'Bearer token',
+  'token.placeholder': 'Paste an operator or managed token',
+  'token.use': 'Use token',
+  'token.retry': 'Retry',
+  'token.storedInSession':
+    'The token is stored in sessionStorage for this tab only and is never written to localStorage.',
+
   // Jobs page
   'jobs.title': 'Stateful Jobs',
   'jobs.countSummary': '{visible} of {total} registered',
@@ -250,6 +369,7 @@ export const en = {
   'jobs.state.stopped': 'Stopped',
   'jobs.state.failed': 'Failed',
   'jobs.state.degraded': 'Degraded',
+  'jobs.state.paused': 'Paused',
   'jobs.empty': 'No distributed Jobs match the current filters.',
   'jobs.rowSummary': 'version {version} · generation {generation} · {nodes}',
   'jobs.automaticPlacement': 'automatic placement',
@@ -297,6 +417,31 @@ export const en = {
   'jobs.restoring': 'Restoring…',
   'jobs.restore': 'Restore',
   'jobs.noVersions': 'No version history recorded.',
+
+  // Job pause/resume (durable quiesce)
+  'jobs.pause': 'Pause',
+  'jobs.resume': 'Resume',
+  'jobs.pausing': 'Pausing…',
+  'jobs.resuming': 'Resuming…',
+  'jobs.confirmPause': 'Pause {jobId}?',
+  'jobs.confirmPauseBody':
+    'Pausing first captures a recovery artifact (checkpoint or savepoint, per the Job recovery policy) and only then stops the Job. Jobs without a checkpoint configured stop immediately, and resuming them is a cold start.',
+  'jobs.confirmResume': 'Resume {jobId}?',
+  'jobs.confirmResumeBody':
+    'Resuming restores from the pause artifact and replays the data processed after its barrier: exactly-once for transactional sinks, at-least-once for non-transactional sinks.',
+  'jobs.confirmStopPausedBody':
+    'Stopping clears the pause state and settles the Job as stopped. The captured artifact stays on the recovery pointer for a later start.',
+  'jobs.pausePhase.capturing': 'Capturing artifact',
+  'jobs.pausePhase.stopping': 'Stopping',
+  'jobs.pausePhase.paused': 'Paused',
+  'jobs.pausePhase.resuming': 'Resuming',
+  'jobs.pauseInProgress': 'Pause in progress',
+  'jobs.resumeInProgress': 'Resume in progress',
+  'jobs.pauseNotRunning': 'Pause requires a running, converged Job',
+  'jobs.pauseArtifactLabel': 'Pause artifact:',
+  'jobs.pausedAtLabel': 'Paused at:',
+  'jobs.pausedByLabel': 'Paused by:',
+  'jobs.taskNotObservedDuringPause': 'not observed',
 
   // Rollouts page
   'rollouts.title': 'Configuration rollouts',
