@@ -250,6 +250,12 @@ impl Hub {
                     current: job.generation,
                 });
             }
+            // Same fence as the durable backends: a pause in progress owns
+            // the desired state until it settles (pausing does not bump the
+            // generation).
+            if job.pause_phase.is_some() {
+                return Err(HubError::JobPauseConflict);
+            }
             job.desired_state = desired_state.into();
             job.convergence = "reconciling".into();
             job.generation = expected_generation.saturating_add(1);

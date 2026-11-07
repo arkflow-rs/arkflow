@@ -913,6 +913,13 @@ async fn first_placement_lands_on_the_higher_headroom_node() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -956,6 +963,13 @@ async fn gauge_less_fleet_keeps_id_order_placement() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1066,6 +1080,13 @@ async fn opt_in_pressure_rebalance_relocates_with_fencing() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1149,6 +1170,13 @@ async fn default_off_policy_never_disturbs_a_pressured_placement() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1199,6 +1227,13 @@ async fn single_node_fleet_skips_relocation_under_pressure() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1260,6 +1295,13 @@ async fn stale_gauges_freeze_pressure_out_of_eviction() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1386,6 +1428,13 @@ async fn retained_replacement_reproduces_the_dispatch_order() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1413,6 +1462,13 @@ async fn retained_replacement_reproduces_the_dispatch_order() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1473,6 +1529,13 @@ async fn eviction_keeps_the_placement_when_survivors_cannot_host_split() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1592,6 +1655,13 @@ async fn failed_validation_does_not_corrupt_the_remembered_dispatch_order() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1663,6 +1733,13 @@ async fn failed_validation_does_not_corrupt_the_remembered_dispatch_order() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1722,6 +1799,13 @@ async fn checkpoint_payload_assignments_match_the_live_mapping() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1803,6 +1887,13 @@ async fn pinned_placement_rejects_auto_rebalance() {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 0,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         })
         .await
         .unwrap_err();
@@ -1844,6 +1935,13 @@ async fn rebalance_cooldown_blocks_a_move_inside_the_window() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -1912,6 +2010,13 @@ async fn partial_node_failure_moves_only_the_failed_tasks() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -2037,6 +2142,13 @@ async fn no_replacement_candidate_concentrates_the_failed_slot() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -2115,6 +2227,13 @@ async fn lost_fingerprint_memory_supersedes_and_redispatches_once() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -2192,6 +2311,13 @@ async fn failed_observation_redispatches_the_nodes_start() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -2283,6 +2409,13 @@ async fn declared_cpu_beyond_capacity_fails_explicitly() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap_err();
@@ -2349,6 +2482,13 @@ async fn declared_job_lands_on_effective_headroom() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -2376,6 +2516,13 @@ async fn declared_job_lands_on_effective_headroom() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -2422,6 +2569,13 @@ async fn undeclared_jobs_bypass_the_resource_gate() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -2512,6 +2666,13 @@ async fn split_l3_pair_stays_pinned_across_incremental_replacement() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();

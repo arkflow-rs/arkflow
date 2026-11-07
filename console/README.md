@@ -15,9 +15,15 @@ npm run dev
 ```
 
 The Vite proxy forwards `/api` and the compatibility root `/metrics` to
-`127.0.0.1:8080`; the console uses the canonical `/api/v1/metrics` route. For a
-protected deployment, set `VITE_API_TOKEN` only during a controlled build and
-serve `dist/` behind the same-origin authenticated proxy.
+`127.0.0.1:8080`; the console uses the canonical `/api/v1/metrics` route.
+
+A protected Hub answers `401` until the console sends a Bearer credential. The
+console prompts for one when no OIDC browser login is configured, stores it in
+`sessionStorage` (this tab only, never `localStorage`), and Settings exposes the
+same control to switch or clear it. `VITE_API_TOKEN` is only an optional
+build-time default: Vite inlines it into the public bundle, so prefer the
+runtime entry or OIDC. Serve `dist/` behind the same-origin authenticated proxy
+or provide a token at runtime.
 
 The canonical control resources are under `/api/v1`. `GET /api/v1/nodes`
 always returns a paginated collection in both local and Hub mode; the local
@@ -38,6 +44,13 @@ VITE_API_TOKEN=operator-secret npm run dev
 ```
 
 Vite reads this value at startup, so restart the dev server after changing it.
+The Settings page also accepts the token at runtime, so a dev server started
+without `VITE_API_TOKEN` can be authenticated from the UI after the first 401.
+
+Hub mode adds a Users panel (admin / `manage_users`): manage roles, scopes and
+OIDC bindings, issue or rotate per-user credentials (the plaintext token is
+shown once), revoke a single credential, and revoke all of a user's
+sessions/tokens.
 
 ## Checks
 

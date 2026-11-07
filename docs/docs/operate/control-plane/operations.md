@@ -38,7 +38,32 @@ counter semantics. Job lifecycle mutations (`job_start`, `job_stop`,
 `job_checkpoint`, `job_savepoint`) are additionally audited with actor,
 correlation, outcome, and failure-code metadata; audit history is retained
 within a bounded window (30 days, 100k records) and queryable at
-`/api/v1/audit`. Durable reconciliation history is bounded the same way:
+`/api/v1/audit`.
+
+Job pause and resume are part of the same audit and metrics surface. Both
+mutations are audited as `job.pause` / `job.resume` with the actor, target Job,
+outcome (`accepted`, `rejected`, or `failed`), and the stable problem code on
+rejection; a stop that settles a paused Job is audited as `job.stop`. Every
+attempt also feeds `arkflow_job_pause_total{outcome}`, whose label vocabulary
+is closed: `requested` (pause accepted), `paused` (quiesce converged),
+`resumed` (resume accepted), `failed` (capture aborted or the capture deadline
+expired), and `rejected` (mutation refused). Phase transitions are broadcast on
+the event stream (`GET /api/v1/events/stream`) as `job.pause_requested`,
+`job.pause_retrying`, `job.paused`, `job.resume_requested`, `job.resumed`, and
+`job.pause_failed`, and the pause phase, artifact reference, timestamp, and
+actor are visible on the Job record and detail. Because the pause phase and its
+retention pin are durable state, both mutations are unavailable on a volatile
+Hub, which answers `503 pause_requires_durable_storage`.
+
+Identity administration participates in the same audit surface: `user.create`,
+`user.update`, `user.delete`, `user.revoke_tokens`, `credential.create`,
+`credential.rotate`, and `credential.revoke` record the actor, target
+user/credential, and outcome (`accepted`/`rejected`) with scalar metadata
+only — token material and secret hashes never enter audit records. The
+60-second maintenance task also prunes expired and revoked `cp_sessions` rows,
+keeping the browser-session table bounded.
+
+Durable reconciliation history is bounded the same way:
 terminal operation records, processed outbox rows, and terminal attempt
 records are reclaimed after 24 hours or beyond a 4096-row count bound;
 pending/failed checkpoint records are reclaimed after 24 hours; events are

@@ -417,7 +417,11 @@ impl Hub {
         });
         // An active upgrade orchestration restores from its own savepoint on
         // rollback; retention must never delete an artifact it references.
-        let pinned = self.pinned_job_upgrade_savepoints(&job.job_id).await;
+        let mut pinned = self.pinned_job_upgrade_savepoints(&job.job_id).await;
+        // An active pause references its capture artifact; retention must not
+        // collect it before resume converges (defensive for savepoints, which
+        // retention never collects anyway).
+        pinned.extend(self.pinned_job_pause_artifacts(&job.job_id).await);
         for record in completed
             .into_iter()
             .skip(retention)

@@ -53,7 +53,9 @@ const sidebars: SidebarsConfig = {
       'operate/docker', 'operate/kubernetes', 'operate/helm', 'operate/rollout', 'operate/observability', 'operate/recovery', 'operate/tls-matrix',
       {type: 'category', label: 'Control Plane', link: {type: 'doc', id: 'operate/control-plane'}, items: [
         'operate/control-plane/overview', 'operate/control-plane/deploy',
-        'operate/control-plane/console', 'operate/control-plane/operations',
+        'operate/control-plane/console',
+        'operate/control-plane/users-and-credentials',
+        'operate/control-plane/operations',
         'operate/control-plane/reconciliation', 'operate/control-plane/job-upgrades',
         'operate/control-plane/webhook-alerting',
       ]},

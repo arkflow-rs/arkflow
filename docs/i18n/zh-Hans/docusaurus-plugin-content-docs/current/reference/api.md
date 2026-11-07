@@ -33,7 +33,7 @@ Hub 面与本地平面的 `GET /system` 均包含可选的 `principal` 对象,�
 }
 ```
 
-`actions` 由与变更授权相同的判定推导——回显不可能声称一个授权检查会拒绝的动作。凭证无效的请求会在回显任何身份之前被 401 拒绝;`principal: null` 只是在无法解析主体时仍产出响应的防御性形状。本地 standalone 平面恒回显其唯一的全权操作者 `operator (admin)`。该字段为增量添加:不认识它的消费方可以无行为变化地忽略它。
+`actions` 由与变更授权相同的判定推导——回显不可能声称一个授权检查会拒绝的动作。凭证无效的请求会在回显任何身份之前被 401 拒绝;`principal: null` 只是在无法解析主体时仍产出响应的防御性形状。本地 standalone 平面恒回显其唯一的全权操作者 `operator (admin)`。该字段为增量添加:不认识它的消费方可以无行为变化地忽略它。`manage_users` 动作只对 `admin` 主体出现,用于门控[用户与凭证管理](#users-and-credentials)路由。
 
 ### 资源模型
 
@@ -89,7 +89,7 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 {"items": [], "page": 1, "page_size": 50, "total": 0}
 ```
 
-`page_size` 上限为 100。其余集合端点(`/jobs`、`/rollouts`、`/config-approvals`)返回纯数组,`GET /webhooks` 则把列表包在 `{"subscriptions": [...]}` 中。操作列表支持 `node_id`、`resource_id`、`operation`、`state` 与 `correlation_id` 过滤。请使用 `intent_id` 与 `generation` 作为稳定的对账依据,不要假设某个命令 ID 代表最终成功。
+`page_size` 上限为 100。其余集合端点(`/jobs`、`/rollouts`、`/config-approvals`、`/users` 与 `/users/{id}/credentials`)返回纯数组,`GET /webhooks` 则把列表包在 `{"subscriptions": [...]}` 中。操作列表支持 `node_id`、`resource_id`、`operation`、`state` 与 `correlation_id` 过滤。请使用 `intent_id` 与 `generation` 作为稳定的对账依据,不要假设某个命令 ID 代表最终成功。
 
 ### 问题信封
 
@@ -155,27 +155,74 @@ Content-Type: application/json
 
 ### 作业
 
-作业与流使用相同的期望状态语义管理。所有变更都接受一份已校验的作业规格,并返回带有操作引用的 `202 Accepted`。
+作业与流使用相同的期望状态语义管理。变更返回更新后的作业记录:创建与暂停/恢复返回 `202 Accepted`,其余生命周期变更返回 `200 OK`。作业生命周期变更没有独立的 operation 记录——观察返回的作业及其 `convergence` 即可。
 
 | 方法 | 路由 | 用途 |
 |--------|-------|---------|
-| `POST` | `/jobs` | 创建作业:`{"spec": ..., "desired_state": "stopped" \| "running"}`。 |
+| `POST` | `/jobs` | 创建作业:`{"spec": ..., "desired_state": "stopped" \| "running"}`。创建**不接受** `paused`。 |
 | `POST` | `/jobs/validate` | 在创建任何内容之前,针对目标 `node_ids` 深度校验规格。 |
 | `GET` | `/jobs` | 列出作业。 |
 | `GET` | `/jobs/{id}` (`/jobs/{id}/status`) | 作业的观测状态。 |
 | `GET` | `/jobs/{id}/detail` | 分配与收敛详情。 |
 | `GET` | `/jobs/{id}/versions` | 版本历史。 |
 | `GET` | `/jobs/{id}/plan` | 解释计划:算子边界、分区路由、有状态算子、检查点策略。 |
-| `PUT` | `/jobs/{id}/desired-state` | 按 `If-Match` / `Idempotency-Key` 契约启动/停止。 |
+| `PUT` | `/jobs/{id}/desired-state` | 生命周期变更:`{"state": "running" \| "stopped" \| "paused"}`。内部执行世代比较并交换;未实现 `If-Match` / `Idempotency-Key` 请求头(见[作业暂停与恢复](#job-pause-and-resume))。 |
 | `GET`/`POST` | `/jobs/{id}/checkpoints` | 列出恢复工件 / 触发一次屏障检查点。 |
 | `GET`/`POST` | `/jobs/{id}/savepoints` | 列出工件 / 触发一次保存点(savepoint)。 |
+| `POST` | `/jobs/{id}/actions/pause` | 暂停一个已收敛的运行中作业:先落恢复工件,再停机。`202` + 作业记录。 |
+| `POST` | `/jobs/{id}/actions/resume` | 从暂停工件恢复暂停中的作业(提升世代 + 恢复启动)。`202` + 作业记录。 |
 | `POST` | `/jobs/{id}/upgrades` | 升级到新版本(作业必须已停止且已收敛)。 |
 | `GET` | `/jobs/{id}/upgrades/{upgrade_id}` | 升级状态:阶段、保存点、超时、最近错误。 |
 | `POST` | `/jobs/{id}/upgrades/{upgrade_id}/actions` | 升级操作:`pause`、`resume`、`cancel`、`rollback`。 |
 | `POST` | `/jobs/{id}/upgrades/{upgrade_id}/rollback` | 回滚到兼容的保存点。 |
-| `POST` | `/jobs/{id}/actions/{action}` | 一次性操作,生命周期语义与流操作等价。 |
+| `POST` | `/jobs/{id}/actions/{action}` | 一次性操作:`start`、`stop`、`restart`、`pause` 或 `resume`。`restart` 是提升世代并从恢复工件还原——不是流式重启。在暂停中的作业上,`start`/`restart` 等价于 resume,`stop` 清除暂停记账。 |
 
 推荐的提交流程:先 `validate`,以 `desired_state: "stopped"` 提交,检查 `detail` 与 `plan`,再切换到 `running`。恢复工件(recovery artifacts)绑定到作业版本与状态格式版本;不兼容的工件会在还原之前被拒绝,而不是破坏状态。
+
+#### 作业暂停与恢复 {#job-pause-and-resume}
+
+作业暂停是一次**持久静默**:Hub 先在暂停世代落恢复工件(`recovery: latest_checkpoint` 落检查点,`latest_savepoint` 落保存点;规格中没有 `checkpoint` 配置的作业直接停机),然后停止作业。变更返回 `202` 与作业记录,并且在所有目标分配都被观测为 `stopped` 之前,作业不会被报告为已暂停。
+
+```http
+POST /api/v1/jobs/{job_id}/actions/pause
+POST /api/v1/jobs/{job_id}/actions/resume
+
+PUT /api/v1/jobs/{job_id}/desired-state
+{"state": "paused"}
+```
+
+`desired_state` 有三个取值——`running`、`stopped` 与 `paused`——但创建作业时仍只接受 `running` 与 `stopped`。在暂停中的作业上,`{"state": "running"}` 等价于 resume,`{"state": "stopped"}` 会停止它并清除暂停记账。desired-state 路由内部执行世代比较并交换(CAS),并返回更新后的作业记录(`200`);与上文流式 desired-state 路由不同,它**没有**实现 `If-Match` / `Idempotency-Key` 请求头。
+
+作业响应是增量式的:从未暂停过的作业不携带下列任何字段。`GET /jobs` 与 `GET /jobs/{id}` 返回作业记录;`GET /jobs/{id}/detail` 把它嵌在 `job` 下。
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `pause_phase` | `capturing` \| `stopping` \| `paused` \| `resuming` | 持久化的暂停状态机相位;作业未暂停时缺失。 |
+| `pause_artifact_id` | string | 暂停世代上落下的恢复工件。 |
+| `pause_prev_checkpoint_id` | string | 暂停落工件前的恢复指针;落工件中止时会被还原。 |
+| `pause_retry_count` | integer | 有界的落工件重派计数(无重派时为 `0`)。 |
+| `paused_at_ms` | integer | 暂停请求发起时间。 |
+| `paused_by` | string | 发起暂停的主体 id。 |
+
+暂停作业的收敛由相位定义:只有当 `pause_phase` 为 `paused` 且所有目标分配都被观测为 `stopped` 时才收敛;`capturing`、`stopping` 与 `resuming` 报告 `reconciling`,离线节点会让暂停保持 reconciling 而不是误报收敛。resume 提升世代、保持恢复指针指向暂停工件,并走普通恢复启动;工件屏障之后、teardown 完成之前处理的事件会重放(事务型 sink 精确一次,非事务型 sink 至少一次),没有 checkpoint 配置的作业则冷启动。暂停相位存在时原子模式与停止模式升级都会被拒绝,升级编排拥有作业期间暂停/恢复也会被拒绝(见[原子作业升级](/zh-Hans/docs/operate/control-plane/job-upgrades#pause-orchestration-vs-job))。
+
+| 状态码 | 错误码 | 触发条件 |
+| --- | --- | --- |
+| `409` | `job_not_running` | 暂停要求期望态与观测态均为 `running` 且作业已收敛。 |
+| `409` | `pause_in_progress` | 暂停相位已在途,或 resume 在相位落定为 `paused` 之前到达。 |
+| `409` | `job_already_paused` | 对已处于 `paused` 相位的作业再次暂停。 |
+| `409` | `pause_not_paused` | 没有活动暂停相位时 resume(或经由暂停状态机的 stop)。 |
+| `409` | `job_paused` | 因暂停相位存在而拒绝升级。 |
+| `409` | `pause_requires_recovery_policy` | `recovery: fail` 永远无法选出恢复工件,暂停被拒绝。 |
+| `409` | `pause_conflict` | 并发暂停状态写入赢得了相位比较并交换;可重试。 |
+| `409` | `orchestration_in_progress` | 非终态升级编排拥有作业期间暂停或恢复被拒绝。 |
+| `503` | `pause_requires_durable_storage` | Hub 未使用持久化存储,无法持久化暂停相位。 |
+
+拒绝会入审计(`job.pause` / `job.resume`,结果 `rejected`,携带上述失败码)并计入
+`arkflow_job_pause_total{outcome="rejected"}`;相位转移会在 `GET /events/stream` 上发出
+`job.pause_requested`、`job.paused`、`job.resume_requested`、`job.resumed` 与
+`job.pause_failed`。落工件失败或超时会中止暂停、还原暂停前的恢复指针,并在作业的
+`last_error` 中记录 `pause_savepoint_failed` / `pause_savepoint_timeout`。
 
 ### 节点与流
 
@@ -242,6 +289,91 @@ HMAC-SHA256)。完整契约参见
 
 审计记录包含操作者、目标资源、节点、关联 ID、结果(`accepted`/`rejected`)以及稳定的失败码(`node_unavailable`、`capacity`、`incompatible_capability`、`expired`)。消息只包含标量操作元数据——绝不含凭据或作业配置体。
 
+### 用户与凭证 {#users-and-credentials}
+
+Hub 在具备持久化存储时提供托管用户目录。下列每个路由都要求
+**`manage_users`** 动作——仅 `admin` 持有——缺失有效凭证时返回 `401`,其他角色
+返回 `403`。易失(volatile)Hub(未配置 `ARKFLOW_HUB_STORAGE`)上整组路由返回
+`503 identity_store_unavailable`。
+
+| 方法 | 路由 | 用途 |
+|--------|-------|---------|
+| `GET` | `/users` | 列出用户(纯数组)。 |
+| `POST` | `/users` | 创建用户:`{user_id, display_name?, role, scopes?, oidc_subject?}` → `201` User。 |
+| `GET` | `/users/{id}` | 单个用户(不存在时 `404 user_not_found`)。 |
+| `PATCH` | `/users/{id}` | 局部更新:`display_name`、`role`、`scopes`、`disabled`、`oidc_subject`(空字符串清除 OIDC 绑定)。 |
+| `DELETE` | `/users/{id}` | `204`;级联删除该用户的凭证与浏览器会话。 |
+| `GET` | `/users/{id}/credentials` | 仅凭证元数据(纯数组)——绝不含 token 或哈希。用户不存在时返回 `404 user_not_found`。 |
+| `POST` | `/users/{id}/credentials` | 签发:`{label?, expires_at_ms?}` → `201 {credential, token}`;明文 `token` **只**在此返回。 |
+| `POST` | `/credentials/{id}/rotate` | `200 {credential, token}`;旧凭证在同一次存储变更中被吊销。 |
+| `DELETE` | `/credentials/{id}` | 幂等吊销 → `200 {"revoked": true\|false}`。 |
+| `POST` | `/users/{id}/revoke-tokens` | `200 {revoked_sessions}`;提升该用户的 JWT 吊销阈值并删除其浏览器会话。 |
+
+用户记录:
+
+```json
+{
+  "user_id": "alice",
+  "display_name": "Alice",
+  "role": "admin",
+  "scopes": [{"resource_type": "node", "resource_id": "node-a"}],
+  "disabled": false,
+  "oidc_subject": "00u1abc",
+  "tokens_valid_after_ms": 0,
+  "created_at_ms": 1767225600000,
+  "updated_at_ms": 1767225600000
+}
+```
+
+`role` 为 `admin`、`operator`、`viewer` 之一(每用户一个角色);`scopes` 以与静态
+凭证相同的 `{resource_type, resource_id?}` 文法收窄权限。用户 id 为 1–64 个字符,
+仅 `[a-z0-9._-]`,且以小写字母或数字开头。目录最多 1024 个用户,每用户最多 16 个
+活跃凭证,且一个 `oidc_subject` 只能绑定到一个用户。
+
+凭证视图与签发响应:
+
+```json
+{"credential_id":"3f6a1c9e2b7d4a80","label":"alice-laptop","created_at_ms":1767225600000,"expires_at_ms":null,"last_used_at_ms":null,"revoked_at_ms":null}
+```
+
+```json
+{"credential":{"credential_id":"3f6a1c9e2b7d4a80","label":"alice-laptop","created_at_ms":1767225600000,"expires_at_ms":null,"last_used_at_ms":null,"revoked_at_ms":null},"token":"ark_3f6a1c9e2b7d4a80_<secret>"}
+```
+
+把签发的 token 作为 `Authorization: Bearer <token>` 使用。Hub 只保存
+`SHA-256(credential_id ‖ 0x00 ‖ secret)`,无法再次展示明文;本版本中
+`last_used_at_ms` 为 `null`(使用时间戳是响应形状中的预留字段,尚未记录)。
+吊销在该凭证的下一个请求即生效。`tokens_valid_after_ms` 是 JWT 吊销阈值:绑定
+subject 的联邦令牌若 `iat` 更早(60 秒时钟偏斜容差)会被拒绝。
+
+行为不变量:
+
+- 凭证解析顺序为:静态 operator 凭证 → 托管 `ark_` 凭证 → 浏览器会话 → OIDC JWT。
+  任一项校验失败的托管 token 一律硬性 `401`,绝不回退到 OIDC;身份存储错误会拒绝
+  请求。
+- 禁用、删除用户或对其调用 `revoke-tokens` 会立即使其会话失效。`revoke-tokens`
+  **不会**吊销托管凭证——请逐个吊销或轮换。
+- 在没有静态 operator 凭证作为应急(break-glass)时,最后一个启用的 admin 不能被
+  禁用、删除或降级(`409 last_admin_required`)。
+- 被接受与被拒绝的身份变更都会审计为 `user.create`、`user.update`、
+  `user.delete`、`user.revoke_tokens`、`credential.create`、
+  `credential.rotate` 与 `credential.revoke`,只含标量元数据。拒绝记录以同一动作
+  写入 `outcome=rejected`,带真实 actor,并把稳定的问题码作为 `failure_code`
+  (例如 `last_admin_required`、`credential_limit`、`user_not_found`)。
+
+| 状态 | 错误码 | 何时出现 |
+|------|--------|----------|
+| `400` | `invalid_user` | 用户 id 格式错误、角色未知、名称/label 过长、scope 无法解析,或 `PATCH` 为空。 |
+| `400` | `invalid_credential` | 对已吊销凭证执行轮换。 |
+| `403` | `forbidden` | 已认证主体缺少 `manage_users`。 |
+| `404` | `user_not_found` / `credential_not_found` | 用户或凭证不存在——包括对不存在用户列出凭证。 |
+| `409` | `last_admin_required` | 在没有静态应急凭证的情况下,最后一个启用的 admin 将被禁用、删除或降级。 |
+| `409` | `user_limit` / `credential_limit` | 已有 1024 个用户 / 该用户已有 16 个活跃凭证。 |
+| `409` | `oidc_subject_conflict` | 该 OIDC subject 已绑定到其他用户。 |
+| `503` | `identity_store_unavailable` | Hub 没有持久化存储。 |
+
+运维生命周期见[用户与凭证](/zh-Hans/docs/operate/control-plane/users-and-credentials)。
+
 ### 灰度发布(Rollouts)
 
 | 方法 | 路由 | 用途 |
@@ -267,7 +399,7 @@ HMAC-SHA256)。完整契约参见
 
 ### 登录会话(OIDC)
 
-当 Hub 配置了 OIDC 提供方时(参见[部署](/zh-Hans/docs/operate/control-plane/deploy#oidc-jwt-联邦)),操作员 API 还会提供一个浏览器登录流:
+当 Hub 配置了 OIDC 提供方时(参见[部署](/zh-Hans/docs/operate/control-plane/deploy#oidc-jwt-federation)),操作员 API 还会提供一个浏览器登录流:
 
 | 方法 | 路由 | 用途 |
 |--------|-------|---------|
@@ -275,6 +407,11 @@ HMAC-SHA256)。完整契约参见
 | `GET` | `/auth/oidc/login` | 302 跳转到身份提供方(PKCE S256 与 `nonce` 绑定到 HttpOnly cookie)。 |
 | `GET` | `/auth/oidc/callback` | 用 code 换取 id_token 并创建服务端会话。 |
 | `GET` | `/auth/oidc/logout` | 删除服务端会话并清除 cookie。 |
+
+具备持久化存储时会话落盘(`cp_sessions`,schema v5):跨 Hub 重启存活,并在登出、
+禁用/删除用户或调用 `POST /users/{id}/revoke-tokens` 时失效。备份与恢复有意排除
+`cp_sessions`,因此恢复后的 Hub 绝不会复活登录态。易失 Hub 上会话保存在内存,
+重启即登出所有人。
 
 ### 发现与指标
 

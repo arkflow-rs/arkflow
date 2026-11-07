@@ -23,7 +23,7 @@ use sqlx::{Postgres, Row};
 /// `migrate`, `backup`, and `restore`: a table missing from this list is
 /// silently dropped by every copy command, so webhook subscriptions
 /// (`cp_webhooks`) belong here exactly like every other business table.
-pub const TABLE_ORDER: [&str; 19] = [
+pub const TABLE_ORDER: [&str; 21] = [
     "cp_nodes",
     "cp_jobs",
     "cp_job_versions",
@@ -36,6 +36,13 @@ pub const TABLE_ORDER: [&str; 19] = [
     "cp_attempts",
     "cp_events",
     "cp_webhooks",
+    // Managed identity: the user directory and credential rows are business
+    // state and must survive backup/migrate/restore. Browser sessions
+    // (`cp_sessions`) are deliberately NOT in this list: a session id is a
+    // live bearer secret, and restoring old login state after a disaster
+    // recovery is a security anti-pattern (same rationale as the lease row).
+    "cp_users",
+    "cp_credentials",
     "cp_audit_events",
     "cp_rollouts",
     "cp_rollout_targets",
@@ -972,6 +979,13 @@ mod tests {
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 7,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             },
         )
         .await

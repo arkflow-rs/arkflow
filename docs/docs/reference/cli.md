@@ -121,15 +121,22 @@ startup configuration comes from environment variables, plus the single
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ARKFLOW_HUB_ADDRESS` | `127.0.0.1:8080` | Listen address for the Hub API. |
-| `ARKFLOW_OPERATOR_TOKEN` | — | Operator token for human/admin API access. Supports the `role\|token` credential format; see [Hub authentication](../operate/control-plane/overview.md). |
+| `ARKFLOW_OPERATOR_TOKEN` | — | Operator token for human/admin API access. Supports the `role\|token` credential format; see [Hub authentication](../operate/control-plane/overview.md) and [Users and credentials](../operate/control-plane/users-and-credentials.md). |
 | `ARKFLOW_NODE_TOKEN` | — | Shared token agents use to authenticate to the Hub. |
 | `ARKFLOW_HUB_INSECURE_LOCAL` | off | Set to `1`/`true`/`yes` to relax checks for local development only. |
-| `ARKFLOW_HUB_STORAGE` | — | Storage backend spec: a SQLite path or a PostgreSQL URL. Required when HA is enabled. |
+| `ARKFLOW_HUB_STORAGE` | — | Storage backend spec: a SQLite path or a PostgreSQL URL. Required when HA is enabled and by the managed identity API (users/credentials/sessions). |
 | `ARKFLOW_HUB_TLS_CERT` / `ARKFLOW_HUB_TLS_KEY` | — | TLS certificate and key paths for the Hub listener. |
 | `ARKFLOW_HUB_HA_ENABLED` | off | Set to `1`/`true`/`yes` to enable lease-based HA. Requires `ARKFLOW_HUB_STORAGE` to be set; use a PostgreSQL URL for multi-instance HA (a SQLite path only logs a development-only warning). |
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | `15000` | Lease TTL in milliseconds; values below 1000 are rejected. |
 | `ARKFLOW_HUB_HA_HOLDER_ID` | — | Explicit lease holder identity; by default one is generated from hostname, PID, and boot time. |
 | `ARKFLOW_HUB_HA_ADVERTISE_URL` | — | Absolute `http(s)://` URL with a host that agents use to reach this Hub instance (multi-Hub discovery). |
+
+Identity-related variables that are not Hub startup basics — the OIDC
+federation block (`ARKFLOW_OIDC_*`, including
+`ARKFLOW_OIDC_MANAGED_USERS_ONLY`) — are documented in
+[deployment](../operate/control-plane/deploy.md#oidc-jwt-federation).
+The managed user directory and its credentials are documented in
+[Users and credentials](../operate/control-plane/users-and-credentials.md).
 
 ### `migrate` subcommand
 

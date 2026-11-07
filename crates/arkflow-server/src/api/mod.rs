@@ -23,6 +23,7 @@ mod principal_echo_api_tests;
 pub(crate) mod rate_limit;
 mod rollouts;
 mod streams;
+mod users;
 mod webhooks;
 #[cfg(test)]
 mod webhooks_api_tests;
@@ -69,6 +70,11 @@ use rollouts::{create_rollout, hub_rollout, hub_rollouts, rollout_action};
 use streams::{
     hub_desired_state, hub_restart_action, hub_stream, hub_streams, hub_targeted_command,
     restart_stream, start_stream, stop_stream, stream, streams,
+};
+use users::{
+    hub_create_credential, hub_create_user, hub_delete_user, hub_revoke_credential,
+    hub_revoke_user_tokens, hub_rotate_credential, hub_update_user, hub_user, hub_user_credentials,
+    hub_users,
 };
 use webhooks::{hub_replace_webhooks, hub_test_webhook, hub_webhooks};
 
@@ -684,6 +690,27 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         )
         .route("/jobs/{id}/desired-state", put(hub_job_desired_state))
         .route("/jobs/{id}/actions/{action}", post(hub_job_action))
+        .route("/users", get(hub_users).post(hub_create_user))
+        .route(
+            "/users/{user_id}",
+            get(hub_user).patch(hub_update_user).delete(hub_delete_user),
+        )
+        .route(
+            "/users/{user_id}/credentials",
+            get(hub_user_credentials).post(hub_create_credential),
+        )
+        .route(
+            "/users/{user_id}/revoke-tokens",
+            post(hub_revoke_user_tokens),
+        )
+        .route(
+            "/credentials/{credential_id}",
+            delete(hub_revoke_credential),
+        )
+        .route(
+            "/credentials/{credential_id}/rotate",
+            post(hub_rotate_credential),
+        )
         .route("/nodes/{node_id}/streams/{id}", get(hub_stream))
         .route("/nodes/{node_id}/configuration", get(hub_configuration))
         .route(
@@ -1093,6 +1120,12 @@ pub async fn serve_hub(
                         reconcile_hub.reconcile_job_upgrades().await,
                     );
                     sweep_logged("reconcile_jobs", reconcile_hub.reconcile_jobs().await);
+                    // Pause transitions act on observations the job pass just
+                    // produced (stop aggregation, resumed start convergence).
+                    sweep_logged(
+                        "reconcile_job_pauses",
+                        reconcile_hub.reconcile_job_pauses().await,
+                    );
                     sweep_logged("reconcile_rollouts", reconcile_hub.reconcile_rollouts().await);
                     sweep_logged(
                         "expire_stale_job_operations",
@@ -1119,6 +1152,10 @@ pub async fn serve_hub(
                         continue;
                     }
                     sweep_logged("prune_events", maintenance_hub.prune_events(2048).await);
+                    sweep_logged(
+                        "prune_identity_sessions",
+                        maintenance_hub.prune_identity_sessions().await,
+                    );
                     sweep_logged(
                         "prune_operation_history",
                         maintenance_hub.prune_operation_history().await,
@@ -1348,6 +1385,20 @@ fn hub_problem(error: hub::HubError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE
         }
         hub::HubError::GenerationConflict { .. } => StatusCode::CONFLICT,
+        hub::HubError::JobNotRunning
+        | hub::HubError::PauseInProgress
+        | hub::HubError::JobAlreadyPaused
+        | hub::HubError::PauseNotPaused
+        | hub::HubError::JobPaused
+        | hub::HubError::PauseRequiresRecoveryPolicy
+        | hub::HubError::JobPauseConflict => StatusCode::CONFLICT,
+        hub::HubError::PauseRequiresDurableStorage | hub::HubError::IdentityStoreUnavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        hub::HubError::LastAdminRequired
+        | hub::HubError::UserLimit
+        | hub::HubError::CredentialLimit
+        | hub::HubError::OidcSubjectConflict => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
     let code = match error {
@@ -1356,6 +1407,19 @@ fn hub_problem(error: hub::HubError) -> Response {
         hub::HubError::StaleLeader { .. } => "stale_leader",
         hub::HubError::StorageUnavailable | hub::HubError::Storage(_) => "storage_unavailable",
         hub::HubError::GenerationConflict { .. } => "generation_conflict",
+        hub::HubError::JobNotRunning => "job_not_running",
+        hub::HubError::PauseInProgress => "pause_in_progress",
+        hub::HubError::JobAlreadyPaused => "job_already_paused",
+        hub::HubError::PauseNotPaused => "pause_not_paused",
+        hub::HubError::JobPaused => "job_paused",
+        hub::HubError::PauseRequiresRecoveryPolicy => "pause_requires_recovery_policy",
+        hub::HubError::PauseRequiresDurableStorage => "pause_requires_durable_storage",
+        hub::HubError::JobPauseConflict => "pause_conflict",
+        hub::HubError::IdentityStoreUnavailable => "identity_store_unavailable",
+        hub::HubError::LastAdminRequired => "last_admin_required",
+        hub::HubError::UserLimit => "user_limit",
+        hub::HubError::CredentialLimit => "credential_limit",
+        hub::HubError::OidcSubjectConflict => "oidc_subject_conflict",
         _ => "agent_request_rejected",
     };
     problem(status, code, error.to_string().chars().take(256).collect())

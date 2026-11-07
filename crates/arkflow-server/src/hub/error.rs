@@ -28,6 +28,32 @@ pub enum HubError {
     Storage(String),
     #[error("stale leader: claimed epoch {claimed}, current lease epoch {current}")]
     StaleLeader { claimed: u64, current: u64 },
+    #[error("job is not running at the current generation")]
+    JobNotRunning,
+    #[error("a pause transition is already in progress for this job")]
+    PauseInProgress,
+    #[error("job is already paused")]
+    JobAlreadyPaused,
+    #[error("job is not paused")]
+    PauseNotPaused,
+    #[error("job must be resumed before it can be upgraded")]
+    JobPaused,
+    #[error("pause requires a recovery policy other than 'fail'")]
+    PauseRequiresRecoveryPolicy,
+    #[error("pause requires durable storage")]
+    PauseRequiresDurableStorage,
+    #[error("the pause phase changed concurrently; retry against the fresh state")]
+    JobPauseConflict,
+    #[error("managed identity requires durable storage")]
+    IdentityStoreUnavailable,
+    #[error("at least one enabled admin must remain, or a static operator credential must exist")]
+    LastAdminRequired,
+    #[error("user limit reached")]
+    UserLimit,
+    #[error("credential limit reached for this user")]
+    CredentialLimit,
+    #[error("the OIDC subject is already bound to another user")]
+    OidcSubjectConflict,
 }
 
 impl HubError {
@@ -40,6 +66,11 @@ impl HubError {
             Self::NotFound => "not_found",
             Self::OrchestrationInProgress => "orchestration_in_progress",
             Self::OrchestrationPhaseConflict => "orchestration_conflict",
+            Self::IdentityStoreUnavailable => "repository",
+            Self::LastAdminRequired
+            | Self::UserLimit
+            | Self::CredentialLimit
+            | Self::OidcSubjectConflict => "identity",
             _ => "invalid",
         }
     }
@@ -60,6 +91,7 @@ impl From<StorageError> for HubError {
                 claimed: claimed_epoch,
                 current: current_epoch,
             },
+            StorageError::JobPauseConflict { .. } => Self::JobPauseConflict,
             other => Self::Storage(other.to_string()),
         }
     }

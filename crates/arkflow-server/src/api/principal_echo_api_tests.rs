@@ -41,6 +41,7 @@ async fn hub_system_echoes_role_actions_pinned_per_role() {
                 "manage_webhooks",
                 "approve_rollouts",
                 "read_audit",
+                "manage_users",
             ]),
         ),
         (
@@ -129,6 +130,7 @@ async fn local_system_echoes_the_single_admin_operator() {
             "manage_webhooks",
             "approve_rollouts",
             "read_audit",
+            "manage_users",
         ])
     );
     // The local plane's identity stays reachable and unchanged otherwise.

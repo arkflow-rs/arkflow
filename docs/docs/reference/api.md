@@ -45,7 +45,9 @@ valid credentials are rejected (401) before any identity is echoed;
 `principal: null` is a defensive shape for a response produced without a
 resolvable principal. The local standalone plane always echoes its single
 all-powerful operator as `operator (admin)`. The field is additive: consumers
-that do not know it ignore it without behavior change.
+that do not know it ignore it without behavior change. The `manage_users`
+action appears only for `admin` principals and gates the
+[user and credential administration](#users-and-credentials) routes.
 
 ### Resource model
 
@@ -109,7 +111,8 @@ Paginated collection endpoints (`/nodes`, `/streams`, `/operations`,
 ```
 
 `page_size` is bounded to 100. The remaining collection endpoints (`/jobs`,
-`/rollouts`, `/config-approvals`) return plain arrays, and `GET /webhooks`
+`/rollouts`, `/config-approvals`, `/users`, and `/users/{id}/credentials`)
+return plain arrays, and `GET /webhooks`
 wraps its list in `{"subscriptions": [...]}`. Operation listing supports `node_id`,
 `resource_id`, `operation`, `state`, and `correlation_id` filters. Use
 `intent_id` and `generation` as stable reconciliation references instead of
@@ -195,33 +198,109 @@ the unlimited behavior exactly.
 
 ### Jobs
 
-Jobs are managed with the same desired-state semantics as streams. All
-mutations accept a validated job specification and return `202 Accepted` with
-an operation reference.
+Jobs are managed with the same desired-state semantics as streams. A mutation
+returns the updated Job record: creation and pause/resume answer
+`202 Accepted`, the other lifecycle mutations answer `200 OK`. There is no
+separate operation record for a Job lifecycle mutation — observe the returned
+Job and its `convergence`.
 
 | Method | Route | Purpose |
 |--------|-------|---------|
-| `POST` | `/jobs` | Create a job: `{"spec": ..., "desired_state": "stopped" \| "running"}`. |
+| `POST` | `/jobs` | Create a job: `{"spec": ..., "desired_state": "stopped" \| "running"}`. Creation does **not** accept `paused`. |
 | `POST` | `/jobs/validate` | Deep-validate a spec against the target `node_ids` before creating anything. |
 | `GET` | `/jobs` | List jobs. |
 | `GET` | `/jobs/{id}` (`/jobs/{id}/status`) | Observed job state. |
 | `GET` | `/jobs/{id}/detail` | Assignment and convergence detail. |
 | `GET` | `/jobs/{id}/versions` | Version history. |
 | `GET` | `/jobs/{id}/plan` | Explain the plan: operator boundaries, partition routes, stateful operators, checkpoint policy. |
-| `PUT` | `/jobs/{id}/desired-state` | Start/stop with the `If-Match` / `Idempotency-Key` contract. |
+| `PUT` | `/jobs/{id}/desired-state` | Lifecycle mutation: `{"state": "running" \| "stopped" \| "paused"}`. Applies a generation compare-and-swap internally; no `If-Match` / `Idempotency-Key` headers (see [Job pause and resume](#job-pause-and-resume)). |
 | `GET`/`POST` | `/jobs/{id}/checkpoints` | List recovery artifacts / trigger a barrier checkpoint. |
 | `GET`/`POST` | `/jobs/{id}/savepoints` | List artifacts / trigger a savepoint. |
+| `POST` | `/jobs/{id}/actions/pause` | Pause a converged running Job: capture a recovery artifact, then stop it. `202` + Job record. |
+| `POST` | `/jobs/{id}/actions/resume` | Resume a paused Job from the pause artifact (generation bump + recovery start). `202` + Job record. |
 | `POST` | `/jobs/{id}/upgrades` | Upgrade to a new version (job must be stopped and converged). |
 | `GET` | `/jobs/{id}/upgrades/{upgrade_id}` | Upgrade status: phase, savepoint, deadline, last error. |
 | `POST` | `/jobs/{id}/upgrades/{upgrade_id}/actions` | Upgrade actions: `pause`, `resume`, `cancel`, `rollback`. |
 | `POST` | `/jobs/{id}/upgrades/{upgrade_id}/rollback` | Roll back to a compatible savepoint. |
-| `POST` | `/jobs/{id}/actions/{action}` | One-shot actions, equivalent in lifecycle semantics to stream actions. |
+| `POST` | `/jobs/{id}/actions/{action}` | One-shot action: `start`, `stop`, `restart`, `pause`, or `resume`. `restart` is a generation bump that restores from the recovery artifact — not a stream-style restart. On a paused Job, `start`/`restart` mean resume and `stop` clears the pause bookkeeping. |
 
 Recommended submit flow: `validate` first, submit with
 `desired_state: "stopped"`, inspect `detail` and `plan`, then switch to
 `running`. Recovery artifacts are bound to the job version and state format
 version; an incompatible artifact is rejected before restore instead of
 corrupting state.
+
+#### Job pause and resume {#job-pause-and-resume}
+
+A Job pause is a **durable quiesce**: the Hub captures a recovery artifact at
+the pause generation (a checkpoint for `recovery: latest_checkpoint`, a
+savepoint for `latest_savepoint`; a Job whose spec has no `checkpoint`
+configuration stops directly), then stops the Job. The mutation answers `202`
+with the Job record, and the Job is not reported paused until every target
+assignment has been observed `stopped`.
+
+```http
+POST /api/v1/jobs/{job_id}/actions/pause
+POST /api/v1/jobs/{job_id}/actions/resume
+
+PUT /api/v1/jobs/{job_id}/desired-state
+{"state": "paused"}
+```
+
+`desired_state` has three values — `running`, `stopped`, and `paused` — but Job
+creation still accepts only `running` and `stopped`. On a paused Job,
+`{"state": "running"}` means resume and `{"state": "stopped"}` stops it and
+clears the pause bookkeeping. The desired-state route applies an internal
+generation compare-and-swap and returns the updated Job record (`200`); unlike
+the stream desired-state route above, it does **not** implement the
+`If-Match` / `Idempotency-Key` headers.
+
+Job responses are additive: a Job that was never paused carries none of these
+fields. `GET /jobs` and `GET /jobs/{id}` return the Job record, and
+`GET /jobs/{id}/detail` nests it under `job`.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `pause_phase` | `capturing` \| `stopping` \| `paused` \| `resuming` | Durable pause state-machine phase; absent when the Job is not paused. |
+| `pause_artifact_id` | string | Recovery artifact captured at the pause generation. |
+| `pause_prev_checkpoint_id` | string | Recovery pointer before the pause captured its artifact; restored if the capture aborts. |
+| `pause_retry_count` | integer | Bounded capture re-dispatch counter (`0` when none). |
+| `paused_at_ms` | integer | When the pause was requested. |
+| `paused_by` | string | Principal id that requested the pause. |
+
+Convergence for a paused Job is phase-defined: it converges only when
+`pause_phase` is `paused` and every target assignment is observed `stopped`;
+`capturing`, `stopping`, and `resuming` report `reconciling`, and an offline
+node keeps the pause reconciling instead of falsely converging. Resume bumps
+the generation, keeps the recovery pointer on the pause artifact, and runs the
+ordinary recovery start; events processed between the artifact barrier and
+teardown completion are replayed (exactly-once for transactional sinks,
+at-least-once for non-transactional sinks), and a Job without checkpoint
+configuration resumes with a cold start. Atomic and stopped-mode upgrades are
+rejected while a pause phase is present, and pause/resume are rejected while an
+upgrade orchestration owns the Job (see
+[Atomic job upgrades](../operate/control-plane/job-upgrades.md#pause-orchestration-vs-job)).
+
+| Status | Code | When |
+| --- | --- | --- |
+| `409` | `job_not_running` | Pause requires desired and observed `running` and a converged Job. |
+| `409` | `pause_in_progress` | A pause phase is already in flight, or resume arrived before the phase settled to `paused`. |
+| `409` | `job_already_paused` | Pause requested for a Job already in the `paused` phase. |
+| `409` | `pause_not_paused` | Resume (or a stop routed through the pause state machine) with no active pause phase. |
+| `409` | `job_paused` | Upgrade rejected because a pause phase is present. |
+| `409` | `pause_requires_recovery_policy` | Pause rejected because `recovery: fail` can never select a recovery artifact. |
+| `409` | `pause_conflict` | A concurrent pause-state write won the phase compare-and-swap; retry. |
+| `409` | `orchestration_in_progress` | Pause or resume rejected while a non-terminal upgrade orchestration owns the Job. |
+| `503` | `pause_requires_durable_storage` | The Hub runs without durable storage and cannot persist a pause phase. |
+
+Rejections are audited (`job.pause` / `job.resume`, outcome `rejected`, with
+the failure code above) and counted in
+`arkflow_job_pause_total{outcome="rejected"}`; phase transitions emit
+`job.pause_requested`, `job.paused`, `job.resume_requested`, `job.resumed`,
+and `job.pause_failed` on `GET /events/stream`. A capture failure or the
+capture deadline aborts the pause, restores the pre-pause recovery pointer, and
+records `pause_savepoint_failed` / `pause_savepoint_timeout` in the Job's
+`last_error`.
 
 ### Nodes and streams
 
@@ -311,6 +390,101 @@ Audit records carry actor, target resource, node, correlation ID, outcome
 `capacity`, `incompatible_capability`, `expired`). Messages contain scalar
 operation metadata only — never credentials or job configuration bodies.
 
+### Users and credentials {#users-and-credentials}
+
+The Hub serves a managed user directory in Hub mode when it has durable
+storage. Every route below requires the **`manage_users`** action — held by
+`admin` only — and answers `401` without a valid credential and `403` for
+everyone else. On a volatile Hub (no `ARKFLOW_HUB_STORAGE`) the whole group
+answers `503 identity_store_unavailable`.
+
+| Method | Route | Purpose |
+|--------|-------|---------|
+| `GET` | `/users` | List users (plain array). |
+| `POST` | `/users` | Create a user: `{user_id, display_name?, role, scopes?, oidc_subject?}` → `201` User. |
+| `GET` | `/users/{id}` | One user (`404 user_not_found` when absent). |
+| `PATCH` | `/users/{id}` | Partial update: `display_name`, `role`, `scopes`, `disabled`, `oidc_subject` (an empty string clears the OIDC binding). |
+| `DELETE` | `/users/{id}` | `204`; cascades the user's credentials and browser sessions. |
+| `GET` | `/users/{id}/credentials` | Credential metadata only (plain array) — never the token or hash. `404 user_not_found` when the user does not exist. |
+| `POST` | `/users/{id}/credentials` | Issue: `{label?, expires_at_ms?}` → `201 {credential, token}`; the plaintext `token` is returned **only** here. |
+| `POST` | `/credentials/{id}/rotate` | `200 {credential, token}`; the old credential is revoked in the same storage mutation. |
+| `DELETE` | `/credentials/{id}` | Idempotent revoke → `200 {"revoked": true\|false}`. |
+| `POST` | `/users/{id}/revoke-tokens` | `200 {revoked_sessions}`; raises the user's JWT revocation threshold and deletes their browser sessions. |
+
+A user record:
+
+```json
+{
+  "user_id": "alice",
+  "display_name": "Alice",
+  "role": "admin",
+  "scopes": [{"resource_type": "node", "resource_id": "node-a"}],
+  "disabled": false,
+  "oidc_subject": "00u1abc",
+  "tokens_valid_after_ms": 0,
+  "created_at_ms": 1767225600000,
+  "updated_at_ms": 1767225600000
+}
+```
+
+`role` is one of `admin`, `operator`, `viewer` (one role per user); `scopes`
+narrow it with the same `{resource_type, resource_id?}` grammar used by
+static credentials. User ids are 1–64 characters of `[a-z0-9._-]` starting
+with a lowercase letter or digit. The directory holds at most 1024 users and
+at most 16 active credentials per user, and an `oidc_subject` can be bound to
+only one user.
+
+A credential view and an issuance response:
+
+```json
+{"credential_id":"3f6a1c9e2b7d4a80","label":"alice-laptop","created_at_ms":1767225600000,"expires_at_ms":null,"last_used_at_ms":null,"revoked_at_ms":null}
+```
+
+```json
+{"credential":{"credential_id":"3f6a1c9e2b7d4a80","label":"alice-laptop","created_at_ms":1767225600000,"expires_at_ms":null,"last_used_at_ms":null,"revoked_at_ms":null},"token":"ark_3f6a1c9e2b7d4a80_<secret>"}
+```
+
+Use the issued token as `Authorization: Bearer <token>`. The Hub stores only
+`SHA-256(credential_id ‖ 0x00 ‖ secret)` and cannot display the plaintext
+again; `last_used_at_ms` is `null` on this release (usage timestamps are
+reserved in the shape but not yet recorded). Revocation takes effect on the
+credential's next request. `tokens_valid_after_ms` is the JWT revocation
+threshold: federated tokens for a bound subject with an older `iat` are
+rejected (60-second clock-skew tolerance).
+
+Behavioral invariants:
+
+- The credentials resolve in this order: static operator credential → managed
+  `ark_` credential → browser session → OIDC JWT. A managed token that fails
+  any check is a hard `401` and never falls back to OIDC; identity storage
+  errors deny the request.
+- Disabling, deleting, or `revoke-tokens` on a user invalidates their
+  sessions immediately. `revoke-tokens` does **not** revoke managed
+  credentials — revoke or rotate them individually.
+- The last enabled admin cannot be disabled, deleted, or demoted
+  (`409 last_admin_required`) unless a static operator credential is
+  configured as break-glass.
+- Accepted and rejected identity mutations are audited as `user.create`,
+  `user.update`, `user.delete`, `user.revoke_tokens`, `credential.create`,
+  `credential.rotate`, and `credential.revoke`, with scalar metadata only.
+  A rejection writes the same action with `outcome=rejected`, the real actor,
+  and the stable problem code as `failure_code` (for example
+  `last_admin_required`, `credential_limit`, `user_not_found`).
+
+| Status | Code | When |
+|--------|------|------|
+| `400` | `invalid_user` | Malformed user id, unknown role, oversized name/label, unparsable scopes, or an empty `PATCH`. |
+| `400` | `invalid_credential` | Rotating an already-revoked credential. |
+| `403` | `forbidden` | Authenticated principal without `manage_users`. |
+| `404` | `user_not_found` / `credential_not_found` | Unknown user or credential — including a credentials listing for a user that does not exist. |
+| `409` | `last_admin_required` | The last enabled admin would be disabled, deleted, or demoted with no static break-glass credential. |
+| `409` | `user_limit` / `credential_limit` | 1024 users exist / the user has 16 active credentials. |
+| `409` | `oidc_subject_conflict` | The OIDC subject is already bound to another user. |
+| `503` | `identity_store_unavailable` | The Hub has no durable storage. |
+
+See [Users and credentials](../operate/control-plane/users-and-credentials.md)
+for the operational lifecycle.
+
 ### Rollouts
 
 | Method | Route | Purpose |
@@ -349,6 +523,12 @@ operator API also serves a browser login flow:
 | `GET` | `/auth/oidc/login` | Redirect to the identity provider (PKCE S256 and `nonce` bound to an HttpOnly cookie). |
 | `GET` | `/auth/oidc/callback` | Exchange the code for an id_token and create the server-side session. |
 | `GET` | `/auth/oidc/logout` | Delete the server-side session and clear the cookie. |
+
+With durable storage the session is persisted (`cp_sessions`, schema v5): it
+survives a Hub restart and is invalidated by logout, by disabling/deleting the
+user, or by `POST /users/{id}/revoke-tokens`. Backup and restore exclude
+`cp_sessions` deliberately, so a restored Hub never resurrects logins. On a
+volatile Hub the session lives in memory and a restart signs everyone out.
 
 ### Discovery and metrics
 

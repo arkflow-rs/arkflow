@@ -49,13 +49,17 @@ pub enum OperatorAction {
     /// `configuration-approval`).
     ApproveRollouts,
     ReadAudit,
+    /// Administer the managed user directory and its credentials. Held by
+    /// admin only: issuing credentials is equivalent to issuing identity
+    /// (see `control-plane-credentials`).
+    ManageUsers,
 }
 
 impl OperatorAction {
     /// Every action in the v1 wire contract, in declaration order. The
     /// `/system` principal echo filters this against `can` so the console's
     /// gating view stays complete when an action is added later.
-    pub const ALL: [OperatorAction; 8] = [
+    pub const ALL: [OperatorAction; 9] = [
         OperatorAction::Read,
         OperatorAction::Operate,
         OperatorAction::Configure,
@@ -64,6 +68,7 @@ impl OperatorAction {
         OperatorAction::ManageWebhooks,
         OperatorAction::ApproveRollouts,
         OperatorAction::ReadAudit,
+        OperatorAction::ManageUsers,
     ];
 }
 
@@ -328,6 +333,76 @@ impl From<IntentRecord> for AcceptedIntentResponse {
             convergence: intent.convergence_state,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateUserRequest {
+    pub user_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    pub role: String,
+    #[serde(default)]
+    pub scopes: Vec<ResourceScope>,
+    #[serde(default)]
+    pub oidc_subject: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateUserRequest {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub scopes: Option<Vec<ResourceScope>>,
+    #[serde(default)]
+    pub disabled: Option<bool>,
+    /// Empty string clears the OIDC binding.
+    #[serde(default)]
+    pub oidc_subject: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserResponse {
+    pub user_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub scopes: Vec<ResourceScope>,
+    pub disabled: bool,
+    pub oidc_subject: Option<String>,
+    pub tokens_valid_after_ms: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateCredentialRequest {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialView {
+    pub credential_id: String,
+    pub label: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+    pub last_used_at_ms: Option<u64>,
+    pub revoked_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuedCredentialResponse {
+    pub credential: CredentialView,
+    /// Plaintext token; returned exactly once at issuance/rotation.
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokedTokensResponse {
+    pub revoked_sessions: usize,
 }
 
 #[cfg(test)]

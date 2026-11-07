@@ -9,6 +9,34 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added — Control plane
 
+- Job-level pause/resume (`POST /api/v1/jobs/{id}/actions/pause` and
+  `/resume`, plus `PUT /jobs/{id}/desired-state {"state":"paused"}`):
+  pausing is a durable quiesce, not a bare stop. The Hub captures a recovery
+  artifact at the pause generation — a checkpoint for
+  `recovery: latest_checkpoint` (retention-pinned until the pause clears), a
+  savepoint for `latest_savepoint`; `recovery: fail` Jobs are rejected with
+  `pause_requires_recovery_policy` — and only then stops the Job. A Job whose
+  spec declares no `checkpoint` configuration skips the capture and stops
+  directly, so its resume is a cold start. `desired_state` gains the third
+  value `paused` (Job creation still accepts only `running`/`stopped`), and Job
+  responses gain additive `pause_phase`
+  (`capturing`/`stopping`/`paused`/`resuming`), `pause_artifact_id`,
+  `pause_prev_checkpoint_id`, `pause_retry_count`, `paused_at_ms`, and
+  `paused_by` fields. A paused Job converges only when the phase is `paused`
+  and every target node observed `stopped` — an offline node keeps it
+  reconciling — and a paused Job is fenced from start/re-placement. Resume
+  bumps the generation and restores from the pause artifact; events processed
+  between the artifact barrier and teardown completion replay (transactional
+  sinks exactly-once, non-transactional at-least-once). Pause and upgrade
+  orchestration are mutually exclusive (`job_paused` /
+  `orchestration_in_progress`), and the mutations require a durable-storage
+  Hub (`503 pause_requires_durable_storage` in volatile mode). Audited as
+  `job.pause` / `job.resume`, counted in
+  `arkflow_job_pause_total{outcome=requested|paused|resumed|failed|rejected}`,
+  and broadcast as `job.pause_requested` / `job.paused` /
+  `job.resume_requested` / `job.resumed` / `job.pause_failed` events. Storage
+  schema v4 (SQLite/PostgreSQL) adds the pause columns and migrates
+  automatically on open.
 - Per-credential request rate limiting on both control planes
   (`health_check.rate_limit` / `ARKFLOW_RATE_LIMIT_*`): token buckets keyed on
   a hashed credential (per operator credential or browser session, per agent
@@ -53,6 +81,43 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and table copies coerce values to the target column types (SQLite
   integer booleans into PostgreSQL `BOOLEAN`, typed NULLs into
   `BIGINT`/`BOOLEAN`/`float8`/`bytea`).
+- Managed user directory and per-user credentials on the Hub
+  (`GET/POST /api/v1/users`, `GET/PATCH/DELETE /api/v1/users/{id}`,
+  `GET/POST /api/v1/users/{id}/credentials`,
+  `POST /api/v1/credentials/{id}/rotate`, `DELETE /api/v1/credentials/{id}`,
+  `POST /api/v1/users/{id}/revoke-tokens`). Users carry exactly one role
+  (`admin`/`operator`/`viewer`) plus resource scopes and an optional OIDC
+  subject binding; every route requires the new `manage_users` action (admin
+  only). Issued credentials are opaque `ark_<credential_id>_<secret>` bearer
+  tokens whose plaintext appears exactly once — the store keeps only
+  `SHA-256(credential_id ‖ 0x00 ‖ secret)` with constant-time comparison.
+  Authentication resolves static operator credential → managed credential →
+  browser session → OIDC JWT; a failed managed token is a hard 401 and never
+  falls back to OIDC, and identity storage errors deny the request
+  (fail-closed). Invariants: at most 1024 users, 16 active credentials per
+  user, one user per OIDC subject, and the last enabled admin cannot be
+  disabled/deleted/demoted (`last_admin_required`) unless a static operator
+  credential exists as break-glass. Rotation revokes the old credential in
+  one mutation; revocation is idempotent; identity mutations are audited as
+  `user.create`/`user.update`/`user.delete`/`user.revoke_tokens`/
+  `credential.create`/`credential.rotate`/`credential.revoke` with scalar
+  metadata only. Storage schema v5 (SQLite/PostgreSQL) adds `cp_users`,
+  `cp_credentials`, and `cp_sessions` and migrates automatically on open;
+  `cp_users`/`cp_credentials` join the backup/migrate/restore table order.
+- Durable browser sessions and OIDC token revocation: with durable storage,
+  OIDC login sessions persist in `cp_sessions` (8-hour TTL) instead of living
+  in memory, so they survive a Hub restart and can be revoked centrally —
+  logout deletes the row, and disabling/deleting the user or
+  `POST /users/{id}/revoke-tokens` invalidates it on the next request. A
+  directory-bound `oidc_subject` makes the user record authoritative for role
+  and scopes; a disabled user is 401, a token whose `iat` predates the user's
+  `tokens_valid_after_ms` (60-second skew tolerance) is rejected, and a bound
+  token without `iat` is rejected. Unbound subjects keep claim-mapped
+  behavior unless `ARKFLOW_OIDC_MANAGED_USERS_ONLY=true` requires binding.
+  `revoke-tokens` does not revoke managed credentials (use rotate/revoke).
+  Session rows are pruned by the periodic maintenance task and are
+  deliberately excluded from backup/restore so recovery never resurrects a
+  login.
 
 ## [0.6.0] — 2026-10-16
 

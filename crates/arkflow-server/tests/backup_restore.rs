@@ -19,8 +19,8 @@
 
 use arkflow_server::bootstrap;
 use arkflow_server::storage::{
-    ControlPlaneStore, DesiredMutation, JobRecord, NodeMutation, StorageActor, StorageBackend,
-    WebhookSetMutation, WebhookSubscription,
+    ControlPlaneStore, CredentialRecord, DesiredMutation, JobRecord, NodeMutation, SessionRecord,
+    StorageActor, StorageBackend, UserRecord, WebhookSetMutation, WebhookSubscription,
 };
 
 /// Collect sink messages behind a shared handle so assertions can read them
@@ -55,6 +55,13 @@ async fn seed_store(store: &ControlPlaneStore) {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: 7,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         },
     )
     .await
@@ -827,5 +834,110 @@ async fn postgres_restore_is_exclusive_and_atomic_when_available() {
     assert_eq!(
         nodes, 0,
         "cp_nodes rows copied before the failure must roll back"
+    );
+}
+
+/// Identity directory state survives backup/restore, but browser sessions do
+/// not: a session id is a live bearer secret and must never be resurrected by
+/// a disaster-recovery restore.
+#[tokio::test]
+async fn backup_carries_identity_directory_but_never_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("identity-source.sqlite");
+    let snapshot_path = dir.path().join("identity-snapshot.sqlite");
+    let restored_path = dir.path().join("identity-restored.sqlite");
+
+    let store = ControlPlaneStore::open(store_path.to_str().unwrap())
+        .await
+        .unwrap();
+    StorageBackend::upsert_user(
+        &store,
+        UserRecord {
+            user_id: "alice".into(),
+            display_name: "Alice".into(),
+            role: "operator".into(),
+            scopes_json: "[]".into(),
+            disabled: false,
+            oidc_subject: Some("sub-alice".into()),
+            tokens_valid_after_ms: 11,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        },
+    )
+    .await
+    .unwrap();
+    StorageBackend::create_credential(
+        &store,
+        CredentialRecord {
+            credential_id: "cred-1".into(),
+            user_id: "alice".into(),
+            secret_hash: "hash-only".into(),
+            label: "laptop".into(),
+            created_at_ms: 3,
+            expires_at_ms: None,
+            last_used_at_ms: None,
+            revoked_at_ms: None,
+        },
+    )
+    .await
+    .unwrap();
+    StorageBackend::upsert_session(
+        &store,
+        SessionRecord {
+            session_hash: "session-hash".into(),
+            user_id: Some("alice".into()),
+            principal_json: "{}".into(),
+            created_at_ms: 4,
+            expires_at_ms: 9_999_999_999_999,
+            revoked_at_ms: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (messages, mut sink) = collector();
+    let code = bootstrap::run_backup(
+        &args(&[
+            "--from",
+            store_path.to_str().unwrap(),
+            "--to",
+            snapshot_path.to_str().unwrap(),
+        ]),
+        &mut sink,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{:?}", messages.borrow());
+
+    let code = bootstrap::run_restore(
+        &args(&[
+            "--from",
+            snapshot_path.to_str().unwrap(),
+            "--to",
+            restored_path.to_str().unwrap(),
+        ]),
+        &mut sink,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{:?}", messages.borrow());
+
+    let restored = ControlPlaneStore::open(restored_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let users = StorageBackend::list_users(&restored).await.unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].oidc_subject.as_deref(), Some("sub-alice"));
+    let credentials = StorageBackend::list_credentials(&restored, "alice")
+        .await
+        .unwrap();
+    assert_eq!(credentials.len(), 1);
+    assert_eq!(credentials[0].secret_hash, "hash-only");
+    assert!(
+        StorageBackend::get_session(&restored, "session-hash")
+            .await
+            .unwrap()
+            .is_none(),
+        "sessions must not be restored"
     );
 }

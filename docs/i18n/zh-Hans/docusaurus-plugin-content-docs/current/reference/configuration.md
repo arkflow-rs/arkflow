@@ -90,6 +90,21 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 
 独立的 `arkflow` 引擎对其本地控制 API 施加同样的边界:`health_check.address` 为非回环地址且未设置 `health_check.api_token` 时拒绝启动。请设置 token,或用 `health_check.insecure_local: true` 显式确认(引擎随后启动并输出 error 级警告)。配置了 token 后,`/api/v1` 下的所有端点——含读端点——都要求该 Bearer 令牌;健康探针与顶层 `/metrics` 保持开放,供探针与抓取器使用。
 
+### Hub 身份环境变量
+
+Hub 的托管用户目录与 OIDC 联邦通过环境变量配置,而不是引擎配置文件:
+
+| 变量 | 默认 | 说明 |
+|----------|---------|-------------|
+| `ARKFLOW_OPERATOR_TOKEN` | — | 静态 operator 凭证与应急(break-glass)访问。接受原始 admin token 或结构化的 `principal\|role\|secret` 形式;以常量时间比较。 |
+| `ARKFLOW_HUB_STORAGE` | — | 托管身份 API 所需的持久化存储。未设置时 Hub 为易失模式:`/api/v1/users*` 与 `/api/v1/credentials*` 返回 `503 identity_store_unavailable`,托管凭证也无法认证。 |
+| `ARKFLOW_OIDC_ISSUER` / `ARKFLOW_OIDC_AUDIENCE` | — | 启用 OIDC JWT 联邦;参见[部署](../operate/control-plane/deploy.md#oidc-jwt-federation)。 |
+| `ARKFLOW_OIDC_MANAGED_USERS_ONLY` | `false` | 要求每个联邦 subject 都绑定到托管用户(`oidc_subject`)。启用后未绑定的 subject 收到 `401`;默认值保留 claim 映射访问。 |
+
+身份生命周期(签发一次性凭证、轮换与吊销、绑定 OIDC subject、吊销已签发 JWT)见
+[用户与凭证](../operate/control-plane/users-and-credentials.md);完整的启动环境变量
+清单见 [CLI 参考](./cli.md#startup-environment-variables)。
+
 :::note
 启用控制平面服务器时,`/ready` 与 `/live` 也会挂载在服务器地址上,与旧的 `/health`、`/readiness`、`/liveness` 端点并列(后者保持原有语义)。
 :::

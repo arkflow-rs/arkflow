@@ -10,8 +10,13 @@ with `health_check.hub_urls`, `node_id`, and `node_token`. Then build the consol
 `console/dist` from a protected reverse proxy. The development Vite server
 proxies `/api` and `/metrics` to `127.0.0.1:8080`; production should preserve
 the same-origin paths and set `VITE_API_BASE` only when the API prefix differs.
-Set `VITE_API_TOKEN` only in a controlled build environment when the ArkFlow
-listener has an operator credential configured. The compatibility credential
+`VITE_API_TOKEN` is only a build-time default for the console: when the API
+answers `401` and no OIDC login flow is configured, the console asks for a
+bearer credential and keeps it in `sessionStorage` (never `localStorage`), so
+production builds do not have to bake a token into the bundle. Set
+`VITE_API_TOKEN` only in a controlled build
+environment when the ArkFlow listener has an operator credential configured.
+The compatibility credential
 may be a raw token (admin) or `principal|role|secret`, for example
 `readonly|viewer|viewer-secret`; viewer credentials can read resources and
 audit history but cannot mutate Streams, nodes, or rollouts. A value that
@@ -92,6 +97,11 @@ Snapshot properties:
 - The lease table (`cp_hub_lease`) is never copied: a restored Hub rebuilds
   its lease through the existing compare-and-swap path, so no stale fencing
   epoch survives the restore.
+- The managed identity tables `cp_users` and `cp_credentials` are copied —
+  users, roles, scopes, OIDC bindings, revocation thresholds, and credential
+  hashes survive a disaster recovery. Browser sessions (`cp_sessions`) are
+  deliberately excluded: a session id is a live bearer secret, and restoring
+  old login state after a disaster is a security anti-pattern.
 - The snapshot carries the schema version of the source store. A snapshot
   newer than the running binary is refused at restore time; an older one is
   upgraded through the normal open-time migration path before copying.
@@ -122,11 +132,12 @@ backups, rotation, and retention are the scheduler's job (cron, Kubernetes
 CronJob).
 
 **Snapshot sensitivity**: a snapshot contains everything the store does,
-including configuration-version payloads verbatim. Secret references
-(`secret:`/`env:`/`file:`) stay unresolved, but any literal credential an
-operator typed into a configuration is present in the clear. Treat snapshot
-files with the same care as the database itself (filesystem permissions,
-encrypted storage).
+including configuration-version payloads verbatim and the managed identity
+tables (user metadata, audit history, and credential *hashes* — never a
+plaintext token). Secret references (`secret:`/`env:`/`file:`) stay unresolved,
+but any literal credential an operator typed into a configuration is present
+in the clear. Treat snapshot files with the same care as the database itself
+(filesystem permissions, encrypted storage).
 
 ### TLS
 
@@ -302,6 +313,7 @@ it with environment variables:
 | `ARKFLOW_OIDC_JWKS_REFRESH_MS` | no | Periodic whole-table JWKS refresh cadence in milliseconds (default 3600000, minimum 1000). The refresh revokes signing keys the provider rotated away; a failed refresh keeps the previous keys and logs a warning. |
 | `ARKFLOW_OIDC_ROLE_CLAIM` | no | Claim carrying the role(s); defaults to `roles`. |
 | `ARKFLOW_OIDC_SCOPES_CLAIM` | no | Claim carrying resource scopes; defaults to `scopes`. |
+| `ARKFLOW_OIDC_MANAGED_USERS_ONLY` | no | Set `true` to require every federated subject to be bound to a Hub user (`oidc_subject`); unbound subjects get `401` instead of claim-mapped access. Default `false`. See [Users and credentials](./users-and-credentials.md#oidc-binding-and-revocation). |
 | `ARKFLOW_OIDC_CLIENT_ID` | login | OAuth2 client id for the browser authorization-code flow. |
 | `ARKFLOW_OIDC_CLIENT_SECRET` | login | OAuth2 client secret. |
 | `ARKFLOW_OIDC_REDIRECT_URI` | login | Registered redirect URI, e.g. `https://hub.example.com/api/v1/auth/oidc/callback`. |
@@ -322,15 +334,23 @@ authorization/token endpoints at startup and serves a browser login flow:
   clears the cookie.
 
 Browser sessions participate in the same RBAC model as every other
-credential (the role comes from the role claim). The Console integrates
-automatically: it probes `GET /api/v1/auth/oidc/status` (a public endpoint
-reporting `login_enabled`, `authenticated`, and the principal), redirects
-to the login flow on a 401, and shows a sign-out control for
-authenticated sessions. `VITE_API_TOKEN` deployments keep working
-unchanged — with a static token configured the console never redirects. Sessions live in memory:
-restarting the Hub signs everyone out, and there is no revocation list —
-prefer short-lived tokens at the identity provider. Without the client
-variables the Hub stays bearer-only and the login routes are absent.
+credential: the role comes from the role claim unless the subject is bound to a
+managed user, in which case the directory's role and scopes are authoritative
+(see [Users and credentials](./users-and-credentials.md)). The Console
+integrates automatically: it probes `GET /api/v1/auth/oidc/status` (a public
+endpoint reporting `login_enabled`, `authenticated`, and the principal),
+redirects to the login flow on a 401, and shows a sign-out control for
+authenticated sessions. `VITE_API_TOKEN` deployments keep working unchanged —
+with a static token configured the console never redirects — and the console
+can also accept a bearer token at runtime instead of at build time. Sessions
+are persisted in the control-plane database when the Hub has durable storage
+(`cp_sessions`, schema v5): they survive Hub restarts, are deleted on logout,
+and are invalidated immediately when the user is disabled, deleted, or
+`POST /api/v1/users/{id}/revoke-tokens` is called. A volatile Hub keeps the
+old in-memory behavior and signs everyone out on restart. Backup and restore
+exclude `cp_sessions` on purpose, so a disaster recovery never resurrects
+logins. Without the client variables the Hub stays bearer-only and the login
+routes are absent.
 
 Claims map onto the existing RBAC model: `sub` becomes the principal id,
 the role claim accepts an array or a single string (`admin`, `operator`, or
@@ -339,8 +359,15 @@ comma-separated) uses the same `type=id` grammar as static credentials,
 for example `["node=node-a", "stream"]`. Only asymmetric algorithms
 (ES256/RS256) are accepted; signature, expiry, issuer, and audience are all
 validated, and the JWKS is cached with on-demand refresh when an unknown key
-id appears. Prefer short-lived tokens at your identity provider — there is
-no revocation list. The static credential still works when configured, so
+id appears. A subject bound to a managed user (`oidc_subject`) is governed by
+the directory instead: role and scopes come from the user record, a disabled
+user is rejected with `401`, a token whose `iat` predates the user's
+`tokens_valid_after_ms` (60-second clock-skew tolerance) is rejected, and a
+bound token without `iat` is rejected outright. Set
+`ARKFLOW_OIDC_MANAGED_USERS_ONLY=true` to require that every federated subject
+be bound. Prefer short-lived tokens at your identity provider, and use the
+managed directory's `revoke-tokens` for central revocation of already-issued
+JWTs and sessions. The static credential still works when configured, so
 you can keep break-glass automation tokens while human access moves to the
 identity provider.
 

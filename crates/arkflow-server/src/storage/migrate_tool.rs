@@ -72,6 +72,13 @@ mod tests {
                 checkpoint_id: None,
                 last_error: None,
                 updated_at_ms: 7,
+
+                pause_phase: None,
+                pause_artifact_id: None,
+                pause_prev_checkpoint_id: None,
+                pause_retry_count: 0,
+                paused_at_ms: None,
+                paused_by: None,
             },
         )
         .await

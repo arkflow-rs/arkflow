@@ -43,6 +43,40 @@ Please include as much of the following as you can:
   disclosure once a fix is available; reporters may request an embargo
   extension.
 
+## Control-plane identity material
+
+The Hub's managed identity layer is designed so a stolen database or backup
+does not yield usable bearer tokens:
+
+- **Managed credentials** are opaque `ark_<credential_id>_<secret>` tokens.
+  The plaintext is returned exactly once at issuance or rotation; the store
+  keeps only `SHA-256(credential_id ‖ 0x00 ‖ secret)` and compares in constant
+  time. Secret material never appears in audit records, events, metrics
+  labels, or logs.
+- **Browser sessions** carry a 256-bit random session id; the store keeps its
+  hash. Sessions are invalidated immediately by logout, by disabling or
+  deleting the user, or by `POST /api/v1/users/{id}/revoke-tokens`, and they
+  are deliberately excluded from backup/restore snapshots so disaster
+  recovery never resurrects a login.
+- **OIDC tokens** are validated for signature (asymmetric only), expiry,
+  issuer, and audience. A subject bound to a managed user is additionally
+  rejected when the user is disabled or when the token's `iat` predates the
+  user's revocation threshold (60-second clock-skew tolerance); a bound token
+  without `iat` is rejected.
+- **The static operator credential** (`ARKFLOW_OPERATOR_TOKEN`) is compared in
+  constant time. A malformed structured value refuses to match instead of
+  degrading to admin, and the credential is the intentional break-glass path
+  when every directory admin is unreachable.
+- **Authentication is fail-closed**: an identity storage error during
+  credential resolution denies the request rather than skipping the check.
+  Managed credentials never fall back to OIDC validation.
+
+Operationally, terminate TLS in front of the Hub, keep static break-glass
+tokens in a secret manager, and prefer issuing per-client credentials over
+sharing one token. Treat control-plane snapshots like the live database: they
+contain credential hashes, user metadata, and audit history. Report exposure
+of any of this material through the private channels above — it is in scope.
+
 ## Scope
 
 In scope: the ArkFlow engine and its plugins (`crates/`), the Hub/Agent

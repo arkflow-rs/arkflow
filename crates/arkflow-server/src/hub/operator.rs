@@ -23,14 +23,14 @@ impl Hub {
     pub async fn operator_principal(&self, supplied: Option<&str>) -> Option<OperatorPrincipal> {
         if let Some(expected) = self.config.operator_token.as_deref() {
             if !expected.trim().is_empty() {
-                {
-                    let supplied = supplied?;
+                if let Some(supplied) = supplied {
                     // A malformed structured credential (contains '|' but
                     // fails to parse) is unmatchable by design; it must
                     // never silently authenticate as Admin. Fall through to
-                    // the OIDC path below.
+                    // the managed/OIDC paths below.
                     if let Some((id, role, secret, scopes)) = parse_operator_credential(expected) {
                         if bool::from(supplied.as_bytes().ct_eq(secret.as_bytes())) {
+                            self.record_auth_outcome("static", "ok");
                             return Some(OperatorPrincipal {
                                 id: id.to_owned(),
                                 roles: vec![role],
@@ -38,23 +38,73 @@ impl Hub {
                             });
                         }
                     }
-                    // A bearer that is not the static credential falls
-                    // through to OIDC below (JWTs never ct_eq-match).
                 }
             }
         } else if self.config.insecure_local {
+            self.record_auth_outcome("anonymous", "ok");
             return Some(OperatorPrincipal::legacy_operator());
         }
 
-        // Static credentials did not match (or are absent); fall back to
-        // browser session cookies and OIDC JWT validation when federation
-        // is configured.
-        let federation = self.oidc.as_ref()?;
-        let token = supplied?;
-        if let Some(session_id) = token.strip_prefix("session:") {
-            return federation.resolve_session(session_id);
+        // Managed per-user credentials are the directory-backed middle
+        // layer: a token with the managed prefix resolves against
+        // `cp_credentials` and never falls through to OIDC (an invalid
+        // managed token must stay a 401 instead of being probed as a JWT).
+        if let Some(token) = supplied {
+            if token.starts_with(super::identity::MANAGED_TOKEN_PREFIX) {
+                let principal = match self.managed_credential_principal(token).await {
+                    Ok(principal) => principal,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "managed credential resolution failed; denying request"
+                        );
+                        None
+                    }
+                };
+                self.record_auth_outcome(
+                    "managed",
+                    if principal.is_some() { "ok" } else { "denied" },
+                );
+                return principal;
+            }
         }
-        federation.authenticate(token).await
+
+        // Browser sessions resolve against the durable session table when a
+        // store exists (so revocation and restarts work), else against the
+        // federation's in-memory map.
+        if let Some(token) = supplied {
+            if let Some(session_id) = token.strip_prefix("session:") {
+                let principal = self.resolve_session(session_id).await;
+                self.record_auth_outcome(
+                    "session",
+                    if principal.is_some() { "ok" } else { "denied" },
+                );
+                return principal;
+            }
+        }
+
+        // Static credentials did not match (or are absent); fall back to
+        // OIDC JWT validation when federation is configured.
+        let Some(federation) = self.oidc.as_ref() else {
+            self.record_auth_outcome("anonymous", "denied");
+            return None;
+        };
+        let Some(token) = supplied else {
+            self.record_auth_outcome("anonymous", "denied");
+            return None;
+        };
+        let Some((principal, issued_at_ms)) = federation.authenticate_with_iat(token).await else {
+            self.record_auth_outcome("oidc", "denied");
+            return None;
+        };
+        let issued_at_ms = issued_at_ms
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .map(|seconds| seconds.saturating_mul(1000));
+        let resolved = self
+            .apply_federated_directory(principal, issued_at_ms, federation.managed_users_only())
+            .await;
+        self.record_auth_outcome("oidc", if resolved.is_some() { "ok" } else { "denied" });
+        resolved
     }
 
     pub async fn operator_can(&self, supplied: Option<&str>, action: OperatorAction) -> bool {
