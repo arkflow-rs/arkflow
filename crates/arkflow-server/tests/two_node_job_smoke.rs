@@ -145,8 +145,10 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
             max_bytes: None,
         }),
         checkpoint: Some(CheckpointSpec {
-            // Keep retries faster than the smoke test's polling cadence so a
-            // stalled round can recover within the 60-second test budget.
+            // The 1_000 ms value is the minimum gap between periodic
+            // checkpoint rounds enforced by schedule_periodic_checkpoints().
+            // The loop re-triggers after each 5-second wait; 60_000 ms
+            // previously blocked re-triggers for the full test budget.
             interval_ms: 1_000,
             retention: 3,
             object_store_uri: checkpoint_uri,
