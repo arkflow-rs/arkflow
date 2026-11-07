@@ -18,6 +18,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  # sasl2-sys vendors Cyrus SASL 2.1.28, whose K&R prototypes (`MD5_memcpy()`)
+  # fail under GCC 15's default gnu23 dialect; keep the C sources on gnu17.
+  CFLAGS: "-std=gnu17"
   # Same size discipline as rust.yml: no incremental artifacts and line
   # tables instead of full debuginfo keep the llvm-cov target cache — and
   # the instrumented build itself — much smaller.
