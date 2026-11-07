@@ -15,6 +15,11 @@ on:
   pull_request:
     types: [ opened, synchronize, reopened, labeled ]
 
+# sasl2-sys vendors Cyrus SASL 2.1.28, whose K&R prototypes (`MD5_memcpy()`)
+# fail under GCC 15's default gnu23 dialect; keep the C sources on gnu17.
+env:
+  CFLAGS: "-std=gnu17"
+
 permissions:
   contents: read
 
