@@ -145,7 +145,9 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
             max_bytes: None,
         }),
         checkpoint: Some(CheckpointSpec {
-            interval_ms: 60_000,
+            // Keep retries faster than the smoke test's polling cadence so a
+            // stalled round can recover within the 60-second test budget.
+            interval_ms: 1_000,
             retention: 3,
             object_store_uri: checkpoint_uri,
         }),
