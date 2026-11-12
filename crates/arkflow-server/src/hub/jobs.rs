@@ -76,7 +76,8 @@ impl Hub {
                 .map(|current| current.generation.saturating_add(1))
                 .unwrap_or_else(|| job.generation.max(1));
             jobs.insert(job.job_id.clone(), job.clone());
-            drop(jobs);
+            // Same critical section as the record: a concurrent mutation must
+            // not leave the Job and its requester from different requests.
             self.job_actors
                 .write()
                 .await
@@ -293,7 +294,7 @@ impl Hub {
             job.generation = expected_generation.saturating_add(1);
             job.updated_at_ms = now_ms();
             let updated = job.clone();
-            drop(jobs);
+            // Same critical section as the record (see `upsert_job_as`).
             self.job_actors
                 .write()
                 .await

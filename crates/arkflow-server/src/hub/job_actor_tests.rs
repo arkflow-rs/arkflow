@@ -514,6 +514,41 @@ async fn volatile_hub_deferred_dispatch_keeps_the_requesting_actor() {
     assert_eq!(start.actor.as_deref(), Some("alice"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn volatile_job_and_actor_writes_stay_consistent() {
+    for _ in 0..20 {
+        let hub = Hub::new(config());
+        let mut first = job("stopped");
+        first.version = 1;
+        let mut second = job("stopped");
+        second.version = 2;
+        let one = hub.clone();
+        let two = hub.clone();
+        let (first, second) = tokio::join!(
+            tokio::spawn(async move { one.upsert_job_as(first, "alice").await.unwrap() }),
+            tokio::spawn(async move { two.upsert_job_as(second, "bob").await.unwrap() }),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let stored = hub.job("orders").await.unwrap().unwrap();
+        let actor = hub
+            .job_actors
+            .read()
+            .await
+            .get("orders")
+            .cloned()
+            .expect("every volatile Job mutation records its requester");
+        // The last record write wins; its requester must be the stored one.
+        let expected = if stored.version == first.version {
+            "alice"
+        } else {
+            assert_eq!(stored.version, second.version);
+            "bob"
+        };
+        assert_eq!(actor, expected);
+    }
+}
+
 #[tokio::test]
 async fn deferred_resume_and_stop_keep_the_requesting_actor() {
     let (hub, storage, _, _) =
