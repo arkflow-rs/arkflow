@@ -76,6 +76,11 @@ impl Hub {
                 .map(|current| current.generation.saturating_add(1))
                 .unwrap_or_else(|| job.generation.max(1));
             jobs.insert(job.job_id.clone(), job.clone());
+            drop(jobs);
+            self.job_actors
+                .write()
+                .await
+                .insert(job.job_id.clone(), actor.to_owned());
         }
         if let Some(record) = version_record {
             let mut versions = self.job_versions.write().await;
@@ -287,7 +292,13 @@ impl Hub {
             job.convergence = "reconciling".into();
             job.generation = expected_generation.saturating_add(1);
             job.updated_at_ms = now_ms();
-            Some(job.clone())
+            let updated = job.clone();
+            drop(jobs);
+            self.job_actors
+                .write()
+                .await
+                .insert(job_id.to_owned(), actor.to_owned());
+            Some(updated)
         };
         if let Some(job) = &updated {
             self.jobs

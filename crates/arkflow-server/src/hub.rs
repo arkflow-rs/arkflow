@@ -155,6 +155,9 @@ pub struct Hub {
     jobs: Arc<RwLock<BTreeMap<String, JobRecord>>>,
     job_versions: Arc<RwLock<BTreeMap<String, Vec<JobVersionRecord>>>>,
     job_checkpoints: Arc<RwLock<BTreeMap<String, Vec<JobCheckpointRecord>>>>,
+    /// `requested_by` for a storage-less Hub, mirroring the durable
+    /// `cp_jobs.requested_by` column that storage-backed Hubs read.
+    job_actors: Arc<RwLock<BTreeMap<String, String>>>,
     /// The node order each Job's placement was actually dispatched in, so a
     /// retained placement re-dispatches with the identical task→node mapping
     /// (split round-robin and multi-component co-location are order
@@ -254,6 +257,7 @@ impl Hub {
             jobs: Arc::new(RwLock::new(BTreeMap::new())),
             job_versions: Arc::new(RwLock::new(BTreeMap::new())),
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
+            job_actors: Arc::new(RwLock::new(BTreeMap::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             plan_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),

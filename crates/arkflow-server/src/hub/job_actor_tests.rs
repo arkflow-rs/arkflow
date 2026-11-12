@@ -470,6 +470,44 @@ async fn deferred_dispatch_after_offline_targets_keeps_the_requesting_actor() {
 }
 
 #[tokio::test]
+async fn volatile_hub_deferred_dispatch_keeps_the_requesting_actor() {
+    let hub = Hub::new(config());
+    register(&hub, &["job_runtime", "state_backend"]).await;
+    hub.upsert_job(job("stopped")).await.unwrap();
+    hub.nodes
+        .write()
+        .await
+        .get_mut("compute-1")
+        .unwrap()
+        .resource
+        .lease_expires_at_ms = 0;
+    hub.update_job_desired_state_as("orders", "running", 1, "alice")
+        .await
+        .unwrap();
+    assert!(!hub
+        .operations(None)
+        .await
+        .iter()
+        .any(|operation| operation.operation == AgentOperation::JobStart));
+
+    hub.nodes
+        .write()
+        .await
+        .get_mut("compute-1")
+        .unwrap()
+        .resource
+        .lease_expires_at_ms = u64::MAX / 2;
+    hub.reconcile_jobs().await.unwrap();
+    let start = hub
+        .operations(None)
+        .await
+        .into_iter()
+        .find(|operation| operation.operation == AgentOperation::JobStart)
+        .unwrap();
+    assert_eq!(start.actor.as_deref(), Some("alice"));
+}
+
+#[tokio::test]
 async fn deferred_resume_and_stop_keep_the_requesting_actor() {
     let (hub, storage, _, _) =
         fixture("deferred_pause_actor", &["job_runtime", "state_backend"]).await;

@@ -550,7 +550,13 @@ impl Hub {
                     .await
                     .map_err(HubError::from)?
                     .unwrap_or_else(|| "system".into()),
-                None => "system".into(),
+                None => self
+                    .job_actors
+                    .read()
+                    .await
+                    .get(&job.job_id)
+                    .cloned()
+                    .unwrap_or_else(|| "system".into()),
             };
             match self.reconcile_job_as(&job, &actor).await {
                 Ok(count) => dispatched += count,
