@@ -108,9 +108,16 @@ fn job(desired_state: &str) -> JobRecord {
     }
 }
 
+fn resumable_spec() -> Value {
+    let mut spec = spec();
+    spec["recovery"] = json!("latest_checkpoint");
+    spec
+}
+
 fn paused_job(job_id: &str) -> JobRecord {
     let mut job = job("paused");
     job.job_id = job_id.into();
+    job.spec_json = resumable_spec().to_string();
     job.observed_state = "stopped".into();
     job.convergence = "converged".into();
     job.pause_phase = Some(crate::hub::job_pause::PAUSE_PAUSED.into());
@@ -513,6 +520,28 @@ async fn deferred_resume_and_stop_keep_the_requesting_actor() {
         fixture("deferred_pause_actor", &["job_runtime", "state_backend"]).await;
     hub.upsert_job(paused_job("orders")).await.unwrap();
     hub.upsert_job(paused_job("payments")).await.unwrap();
+    // The resume start needs a compatible completed artifact to select.
+    let artifact = JobCheckpointRecord {
+        job_id: "orders".into(),
+        job_version: 1,
+        checkpoint_id: "checkpoint-paused".into(),
+        kind: "checkpoint".into(),
+        status: "completed".into(),
+        manifest_uri: Some("file:///tmp/arkflow-actor-test/manifest.json".into()),
+        format_version: 1,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    storage
+        .upsert_job_checkpoint(artifact.clone())
+        .await
+        .unwrap();
+    hub.job_checkpoints
+        .write()
+        .await
+        .entry("orders".into())
+        .or_default()
+        .push(artifact);
     hub.nodes
         .write()
         .await
@@ -552,6 +581,15 @@ async fn deferred_resume_and_stop_keep_the_requesting_actor() {
         })
         .unwrap();
     assert_eq!(stop.actor.as_deref(), Some("carol"));
+    let start = hub
+        .operations(None)
+        .await
+        .into_iter()
+        .find(|operation| {
+            operation.operation == AgentOperation::JobStart && operation.resource_id == "orders"
+        })
+        .unwrap();
+    assert_eq!(start.actor.as_deref(), Some("bob"));
 
     hub.observe_job("orders", resumed.generation, "running", None, None)
         .await
