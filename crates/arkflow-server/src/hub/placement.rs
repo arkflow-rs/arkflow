@@ -544,6 +544,8 @@ impl Hub {
             .map(|job| job.job_id)
             .take(MAX_JOB_RECONCILIATIONS_PER_TICK)
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        Self::pass_test_gate(&self.test_list_gate).await;
         let mut dispatched = 0;
         for job_id in job_ids {
             // Re-read the record WITH its requester. The list snapshot above

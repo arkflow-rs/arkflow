@@ -2343,8 +2343,17 @@ impl SqliteBackend {
     /// already have deleted.
     pub fn update_job_with_expected_generation(
         &self,
+        job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
+        self.update_job_with_expected_generation_attributed(job, expected_generation, None)
+    }
+
+    pub fn update_job_with_expected_generation_attributed(
+        &self,
         mut job: JobRecord,
         expected_generation: u64,
+        requested_by: Option<&str>,
     ) -> Result<JobRecord, StorageError> {
         self.immediate_transaction(|connection| {
             job.generation = expected_generation.saturating_add(1);
@@ -2363,7 +2372,7 @@ impl SqliteBackend {
             // format, so preserving the newest pointer is both safe and the
             // only choice that cannot regress.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET version=?, spec_json=?, desired_state=?, observed_state=?, convergence=?, generation=?, node_ids_json=?, last_error=?, updated_at_ms=? WHERE job_id=? AND generation=?",
+                "UPDATE cp_jobs SET version=?, spec_json=?, desired_state=?, observed_state=?, convergence=?, generation=?, node_ids_json=?, last_error=?, updated_at_ms=?, requested_by=COALESCE(?, requested_by) WHERE job_id=? AND generation=?",
                 rusqlite::params![
                     job.version,
                     job.spec_json,
@@ -2374,6 +2383,7 @@ impl SqliteBackend {
                     node_ids,
                     job.last_error,
                     job.updated_at_ms,
+                    requested_by,
                     job.job_id,
                     expected_generation,
                 ],
@@ -3941,6 +3951,14 @@ impl StorageBackend for SqliteBackend {
         expected_generation: u64,
     ) -> Result<JobRecord, StorageError> {
         self.update_job_with_expected_generation(job, expected_generation)
+    }
+    async fn update_job_with_expected_generation_attributed(
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+        requested_by: Option<&str>,
+    ) -> Result<JobRecord, StorageError> {
+        self.update_job_with_expected_generation_attributed(job, expected_generation, requested_by)
     }
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError> {
         self.get_job(job_id)

@@ -158,6 +158,12 @@ pub struct Hub {
     /// `requested_by` for a storage-less Hub, mirroring the durable
     /// `cp_jobs.requested_by` column that storage-backed Hubs read.
     job_actors: Arc<RwLock<BTreeMap<String, String>>>,
+    /// Test-only rendezvous points for deterministically exercising the
+    /// Job/requester consistency boundaries.
+    #[cfg(test)]
+    pub(crate) test_write_gate: Arc<RwLock<Option<Arc<TestGate>>>>,
+    #[cfg(test)]
+    pub(crate) test_list_gate: Arc<RwLock<Option<Arc<TestGate>>>>,
     /// The node order each Job's placement was actually dispatched in, so a
     /// retained placement re-dispatches with the identical task→node mapping
     /// (split round-robin and multi-component co-location are order
@@ -204,6 +210,15 @@ struct HubLifecycle {
     last_error_at_ms: Option<u64>,
     last_duration_ms: Option<u64>,
     last_failure_class: Option<String>,
+}
+
+/// Test-only rendezvous: the production path announces `arrived` and waits
+/// for `release`, letting a test force one interleaving deterministically.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestGate {
+    pub(crate) arrived: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
 }
 
 async fn persist_operation(
@@ -258,6 +273,10 @@ impl Hub {
             job_versions: Arc::new(RwLock::new(BTreeMap::new())),
             job_checkpoints: Arc::new(RwLock::new(BTreeMap::new())),
             job_actors: Arc::new(RwLock::new(BTreeMap::new())),
+            #[cfg(test)]
+            test_write_gate: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            test_list_gate: Arc::new(RwLock::new(None)),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             plan_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),
@@ -274,6 +293,17 @@ impl Hub {
         let mut hub = Self::new(config);
         hub.storage = Some(storage);
         hub
+    }
+
+    /// Park at a test gate when one is installed. Production builds omit the
+    /// gate fields entirely, so this has no runtime cost outside tests.
+    #[cfg(test)]
+    pub(crate) async fn pass_test_gate(gate: &Arc<RwLock<Option<Arc<TestGate>>>>) {
+        let gate = gate.read().await.clone();
+        if let Some(gate) = gate {
+            gate.arrived.notify_one();
+            gate.release.notified().await;
+        }
     }
 
     /// Enables OIDC JWT bearer principals and (when client credentials are

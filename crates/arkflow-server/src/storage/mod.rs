@@ -923,6 +923,11 @@ storage_ops! {
         job: JobRecord as v,
         expected_generation: u64 as v,
     },
+    ("update_job_with_expected_generation_attributed", UpdateJobWithExpectedGenerationAttributed, update_job_with_expected_generation_attributed) fenced JobRecord {
+        job: JobRecord as v,
+        expected_generation: u64 as v,
+        requested_by: Option<String> as o,
+    },
     ("get_job", GetJob, get_job) plain Option<JobRecord> {
         job_id: String as s,
     },
@@ -1664,6 +1669,15 @@ pub trait StorageBackend: Send + Sync + 'static {
         &self,
         mut job: JobRecord,
         expected_generation: u64,
+    ) -> Result<JobRecord, StorageError>;
+    /// Generation-fenced replacement that also records the mutation's actor,
+    /// so the generation this write creates is never dispatched under an
+    /// earlier requester.
+    async fn update_job_with_expected_generation_attributed(
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+        requested_by: Option<&str>,
     ) -> Result<JobRecord, StorageError>;
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError>;
     /// Initiating principal of the Job's latest accepted desired-state
@@ -2748,6 +2762,33 @@ impl StorageBackend for ControlPlaneStore {
                     backend,
                     job,
                     expected_generation,
+                )
+                .await
+            }
+        }
+    }
+    async fn update_job_with_expected_generation_attributed(
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+        requested_by: Option<&str>,
+    ) -> Result<JobRecord, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::update_job_with_expected_generation_attributed(
+                    backend,
+                    job,
+                    expected_generation,
+                    requested_by,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::update_job_with_expected_generation_attributed(
+                    backend,
+                    job,
+                    expected_generation,
+                    requested_by,
                 )
                 .await
             }

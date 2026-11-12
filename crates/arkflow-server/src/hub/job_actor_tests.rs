@@ -12,6 +12,7 @@ use axum::Router;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tower::ServiceExt;
 
 fn config() -> HubConfig {
@@ -669,6 +670,126 @@ async fn volatile_reconcile_pairs_each_generation_with_its_actor() {
             operation.generation
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn volatile_mutation_publishes_the_record_and_actor_together() {
+    let hub = Hub::new(config());
+    hub.upsert_job(job("stopped")).await.unwrap();
+    let gate = Arc::new(crate::hub::TestGate::default());
+    *hub.test_write_gate.write().await = Some(gate.clone());
+    let writer = {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            hub.update_job_desired_state_as("orders", "running", 1, "alice")
+                .await
+        })
+    };
+    gate.arrived.notified().await;
+    let reader_hub = hub.clone();
+    let reader = tokio::spawn(async move { reader_hub.job("orders").await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), reader)
+            .await
+            .is_err(),
+        "a reader observed a half-applied mutation"
+    );
+    gate.release.notify_one();
+    writer.await.unwrap().unwrap().unwrap();
+    *hub.test_write_gate.write().await = None;
+    let stored = hub.job("orders").await.unwrap().unwrap();
+    let actor = hub.job_actors.read().await.get("orders").cloned().unwrap();
+    assert_eq!(stored.generation, 2);
+    assert_eq!(stored.desired_state, "running");
+    assert_eq!(actor, "alice");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_snapshot_reads_record_and_actor_after_a_concurrent_mutation() {
+    let hub = Hub::new(config());
+    register(&hub, &["job_runtime", "state_backend"]).await;
+    hub.upsert_job(job("stopped")).await.unwrap();
+    hub.nodes
+        .write()
+        .await
+        .get_mut("compute-1")
+        .unwrap()
+        .resource
+        .lease_expires_at_ms = 0;
+    let gate = Arc::new(crate::hub::TestGate::default());
+    *hub.test_list_gate.write().await = Some(gate.clone());
+    let reconciler = {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.reconcile_jobs().await })
+    };
+    gate.arrived.notified().await;
+    // The reconcile already listed the stopped generation; mutate and make
+    // the target reachable before letting it read the dispatch snapshot.
+    hub.update_job_desired_state_as("orders", "running", 1, "carol")
+        .await
+        .unwrap();
+    hub.nodes
+        .write()
+        .await
+        .get_mut("compute-1")
+        .unwrap()
+        .resource
+        .lease_expires_at_ms = u64::MAX / 2;
+    *hub.test_list_gate.write().await = None;
+    gate.release.notify_one();
+    reconciler.await.unwrap().unwrap();
+    let start = hub
+        .operations(None)
+        .await
+        .into_iter()
+        .find(|operation| operation.operation == AgentOperation::JobStart)
+        .unwrap();
+    assert_eq!(start.generation, 2);
+    assert_eq!(start.actor.as_deref(), Some("carol"));
+}
+
+#[tokio::test]
+async fn generation_fenced_replacement_records_the_upgrade_actor() {
+    let (hub, storage, _, _) = fixture("upgrade_actor", &["job_runtime", "state_backend"]).await;
+    hub.upsert_job(job("stopped")).await.unwrap();
+    let mut upgraded = job("running");
+    upgraded.version = 2;
+    let updated = hub
+        .update_job_with_expected_generation_as(upgraded.clone(), 1, "upgrader")
+        .await
+        .unwrap();
+    assert_eq!(updated.generation, 2);
+    assert_eq!(
+        storage.job_requested_by("orders").await.unwrap().as_deref(),
+        Some("upgrader")
+    );
+    hub.reconcile_jobs().await.unwrap();
+    let start = hub
+        .operations(None)
+        .await
+        .into_iter()
+        .find(|operation| operation.operation == AgentOperation::JobStart)
+        .unwrap();
+    assert_eq!(start.generation, 2);
+    assert_eq!(start.actor.as_deref(), Some("upgrader"));
+
+    let volatile = Hub::new(config());
+    volatile.upsert_job(job("stopped")).await.unwrap();
+    let updated = volatile
+        .update_job_with_expected_generation_as(upgraded, 1, "upgrader")
+        .await
+        .unwrap();
+    assert_eq!(updated.generation, 2);
+    assert_eq!(
+        volatile
+            .job_actors
+            .read()
+            .await
+            .get("orders")
+            .cloned()
+            .as_deref(),
+        Some("upgrader")
+    );
 }
 
 #[tokio::test]

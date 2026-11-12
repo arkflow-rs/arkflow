@@ -2191,8 +2191,18 @@ impl StorageBackend for PostgresBackend {
     /// already have deleted.
     async fn update_job_with_expected_generation(
         &self,
+        job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
+        self.update_job_with_expected_generation_attributed(job, expected_generation, None)
+            .await
+    }
+
+    async fn update_job_with_expected_generation_attributed(
+        &self,
         mut job: JobRecord,
         expected_generation: u64,
+        requested_by: Option<&str>,
     ) -> Result<JobRecord, StorageError> {
         {
             let mut connection = self.begin().await?;
@@ -2213,7 +2223,7 @@ impl StorageBackend for PostgresBackend {
             // format, so preserving the newest pointer is both safe and the
             // only choice that cannot regress.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET version=?1, spec_json=?2, desired_state=?3, observed_state=?4, convergence=?5, generation=?6, node_ids_json=?7, last_error=?8, updated_at_ms=?9 WHERE job_id=?10 AND generation=?11",
+                "UPDATE cp_jobs SET version=?1, spec_json=?2, desired_state=?3, observed_state=?4, convergence=?5, generation=?6, node_ids_json=?7, last_error=?8, updated_at_ms=?9, requested_by=COALESCE(?12, requested_by) WHERE job_id=?10 AND generation=?11",
                 binds![
                     job.version,
                     job.spec_json,
@@ -2226,6 +2236,7 @@ impl StorageBackend for PostgresBackend {
                     job.updated_at_ms,
                     job.job_id,
                     expected_generation,
+                    requested_by,
                 ],
             ).await?;
             if changed == 0 {

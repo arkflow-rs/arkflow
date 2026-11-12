@@ -681,7 +681,11 @@ pub(super) async fn hub_job_upgrade(
     // concurrent mutation that bumped the generation must surface as a
     // conflict instead of being silently overwritten by this older read.
     match hub
-        .update_job_with_expected_generation(upgraded, request.expected_generation)
+        .update_job_with_expected_generation_as(
+            upgraded,
+            request.expected_generation,
+            &principal.id,
+        )
         .await
     {
         Ok(job) => (
@@ -708,7 +712,7 @@ pub(super) async fn hub_job_upgrade_rollback(
     Path((job_id, upgrade_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::Operate,
@@ -717,8 +721,9 @@ pub(super) async fn hub_job_upgrade_rollback(
     )
     .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
         return response;
     }
@@ -863,7 +868,7 @@ pub(super) async fn hub_job_upgrade_rollback(
     // Same generation fence as the upgrade path: the version list may have
     // been read before a concurrent mutation bumped the generation.
     match hub
-        .update_job_with_expected_generation(restored, current.generation)
+        .update_job_with_expected_generation_as(restored, current.generation, &principal.id)
         .await
     {
         Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),

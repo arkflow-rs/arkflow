@@ -78,6 +78,8 @@ impl Hub {
             jobs.insert(job.job_id.clone(), job.clone());
             // Same critical section as the record: a concurrent mutation must
             // not leave the Job and its requester from different requests.
+            #[cfg(test)]
+            Self::pass_test_gate(&self.test_write_gate).await;
             self.job_actors
                 .write()
                 .await
@@ -112,6 +114,16 @@ impl Hub {
         job: JobRecord,
         expected_generation: u64,
     ) -> Result<JobRecord, HubError> {
+        self.update_job_with_expected_generation_as(job, expected_generation, "system")
+            .await
+    }
+
+    pub(crate) async fn update_job_with_expected_generation_as(
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+        actor: &str,
+    ) -> Result<JobRecord, HubError> {
         let version_record = serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json)
             .ok()
             .and_then(|spec| {
@@ -128,7 +140,11 @@ impl Hub {
             });
         let updated = if let Some(storage) = &self.storage {
             let updated = storage
-                .update_job_with_expected_generation(job.clone(), expected_generation)
+                .update_job_with_expected_generation_attributed(
+                    job.clone(),
+                    expected_generation,
+                    Some(actor.to_owned()),
+                )
                 .await
                 .map_err(HubError::from)?;
             if let Some(record) = version_record.clone() {
@@ -157,6 +173,14 @@ impl Hub {
                         updated.checkpoint_id = stored_checkpoint;
                     }
                     jobs.insert(updated.job_id.clone(), updated.clone());
+                    // Same critical section as the record, mirroring the
+                    // durable `requested_by` write.
+                    #[cfg(test)]
+                    Self::pass_test_gate(&self.test_write_gate).await;
+                    self.job_actors
+                        .write()
+                        .await
+                        .insert(updated.job_id.clone(), actor.to_owned());
                     updated
                 }
                 Some(current) => {
@@ -295,6 +319,8 @@ impl Hub {
             job.updated_at_ms = now_ms();
             let updated = job.clone();
             // Same critical section as the record (see `upsert_job_as`).
+            #[cfg(test)]
+            Self::pass_test_gate(&self.test_write_gate).await;
             self.job_actors
                 .write()
                 .await
