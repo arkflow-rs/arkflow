@@ -198,7 +198,7 @@ impl Hub {
             // intent is already committed, so a dispatch failure must not
             // surface as a rejection: the reconcile tick re-issues the
             // capture under the bounded retry budget.
-            if let Err(error) = self.record_job_checkpoint(record).await {
+            if let Err(error) = self.record_job_checkpoint_as(record, actor).await {
                 tracing::warn!(
                     job_id,
                     %error,
@@ -209,7 +209,7 @@ impl Hub {
             // No artifact to capture: dispatch the stop directly. Same rule:
             // post-commit dispatch failures are retryable by the reconcile
             // tick, not client-facing rejections.
-            if let Err(error) = self.reconcile_job(&job).await {
+            if let Err(error) = self.reconcile_job_as(&job, actor).await {
                 tracing::warn!(
                     job_id,
                     %error,
@@ -270,7 +270,7 @@ impl Hub {
         // Post-commit dispatch: the phase change is durable, so a dispatch
         // failure is deferred to the reconcile tick instead of surfacing as
         // a rejection for a mutation the Hub already accepted.
-        if let Err(error) = self.reconcile_job(&job).await {
+        if let Err(error) = self.reconcile_job_as(&job, actor).await {
             tracing::warn!(
                 job_id,
                 %error,
@@ -353,7 +353,7 @@ impl Hub {
         // Post-commit dispatch: the phase change is durable, so a dispatch
         // failure is deferred to the reconcile tick instead of surfacing as
         // a rejection for a mutation the Hub already accepted.
-        if let Err(error) = self.reconcile_job(&job).await {
+        if let Err(error) = self.reconcile_job_as(&job, actor).await {
             tracing::warn!(
                 job_id,
                 %error,
@@ -386,13 +386,20 @@ impl Hub {
 
     /// True while a capture round for this Job generation is still in flight.
     async fn pause_capture_in_flight(&self, job: &JobRecord, artifact_id: &str) -> bool {
+        // The round is not done when every Agent reports its capture: the
+        // commit round still has to make the artifact usable. Counting only
+        // JobCheckpoint/JobSavepoint would retry during that window, replace
+        // the artifact id, and exhaust the budget while commits keep landing.
         let operations = self.operations.read().await;
         operations.values().any(|operation| {
             operation.resource_id == job.job_id
                 && operation.generation == job.generation
                 && matches!(
                     operation.operation,
-                    AgentOperation::JobCheckpoint | AgentOperation::JobSavepoint
+                    AgentOperation::JobCheckpoint
+                        | AgentOperation::JobSavepoint
+                        | AgentOperation::JobCheckpointCommit
+                        | AgentOperation::JobSavepointCommit
                 )
                 && matches!(
                     operation.state,
@@ -453,7 +460,8 @@ impl Hub {
                 } else {
                     // Re-dispatch (idempotent) so offline nodes that came
                     // back converge; the dispatch-skip suppresses repeats.
-                    self.reconcile_job(job).await?;
+                    self.reconcile_job_as(job, job.paused_by.as_deref().unwrap_or("system"))
+                        .await?;
                     Ok(false)
                 }
             }
@@ -491,6 +499,12 @@ impl Hub {
                             format!("resumed at generation {}", cleared.generation),
                             None,
                         );
+                        // The phase write set `reconciling`; the start already
+                        // reported `running`, so settle convergence once the
+                        // pause bookkeeping is cleared.
+                        let _ = self
+                            .observe_job(&cleared.job_id, cleared.generation, "running", None, None)
+                            .await;
                         return Ok(true);
                     }
                 }
@@ -569,7 +583,8 @@ impl Hub {
             created_at_ms: now_ms(),
             updated_at_ms: now_ms(),
         };
-        self.record_job_checkpoint(record).await?;
+        self.record_job_checkpoint_as(record, job.paused_by.as_deref().unwrap_or("system"))
+            .await?;
         self.broadcast_pause_event(
             "job.pause_retrying",
             &updated.job_id,
@@ -605,7 +620,8 @@ impl Hub {
         self.cache_job(&updated).await;
         if to_phase == PAUSE_STOPPING {
             // Capture is durable: tell the Job to stop (idempotent).
-            self.reconcile_job(&updated).await?;
+            self.reconcile_job_as(&updated, updated.paused_by.as_deref().unwrap_or("system"))
+                .await?;
         } else if to_phase == PAUSE_PAUSED {
             self.record_job_pause_audit(
                 "job.pause",

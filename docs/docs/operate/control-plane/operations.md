@@ -36,9 +36,19 @@ Command dispatch metrics cover enqueue-to-acknowledgement latency
 vocabularies. These counters reset on Hub restart, consistent with Prometheus
 counter semantics. Job lifecycle mutations (`job_start`, `job_stop`,
 `job_checkpoint`, `job_savepoint`) are additionally audited with actor,
-correlation, outcome, and failure-code metadata; audit history is retained
+correlation, outcome, and failure-code metadata. Direct operator dispatches
+carry the authenticated principal id; background-only dispatches use `system`.
+Operation actor metadata survives persisted-operation recovery and retries.
+Audit history is retained
 within a bounded window (30 days, 100k records) and queryable at
-`/api/v1/audit`.
+`/api/v1/audit`. Reads require `ReadAudit` (admin and viewer roles; operator
+receives `403`) and an applicable `audit` resource scope. A credential scoped
+to `audit=orders` can query `?resource_id=orders` but cannot list the entire
+collection or another resource. Optional exact-match `actor` and `action`
+filters and inclusive Unix-millisecond `from_ms` / `to_ms` bounds combine with
+`resource_id` in storage before the 1024-record response window and pagination,
+so page totals reflect matching records within that window.
+An inverted time range returns `400 invalid_audit_query`.
 
 Job pause and resume are part of the same audit and metrics surface. Both
 mutations are audited as `job.pause` / `job.resume` with the actor, target Job,

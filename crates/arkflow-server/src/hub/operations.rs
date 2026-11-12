@@ -19,6 +19,10 @@ use subtle::ConstantTimeEq;
 /// longer re-enqueued.
 pub(crate) const MAX_JOB_OPERATION_RETRIES: u32 = 3;
 
+#[cfg(test)]
+#[path = "job_actor_tests.rs"]
+mod job_actor_tests;
+
 fn apply_intent_metadata(operation: &mut HubOperation, intent: IntentRecord) {
     operation.intent_id = Some(intent.intent_id);
     operation.generation = intent.generation;
@@ -53,6 +57,7 @@ fn operation_from_intent(intent: IntentRecord) -> HubOperation {
     };
     HubOperation {
         id: intent_id.clone(),
+        actor: None,
         intent_id: Some(intent_id.clone()),
         command_id: format!("intent:{intent_id}"),
         node_id: intent.node_id,
@@ -210,11 +215,75 @@ impl Hub {
         command_id_override: Option<String>,
         attempt_id: Option<String>,
     ) -> Result<HubOperation, HubError> {
+        self.enqueue_with_metadata_as(
+            node_id,
+            operation,
+            resource_id,
+            correlation_id,
+            payload,
+            generation,
+            action_id,
+            config_version_id,
+            operation_id_override,
+            command_id_override,
+            attempt_id,
+            "system",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn enqueue_with_metadata_as(
+        &self,
+        node_id: String,
+        operation: AgentOperation,
+        resource_id: String,
+        correlation_id: Option<String>,
+        payload: Option<serde_json::Value>,
+        generation: u64,
+        action_id: Option<String>,
+        config_version_id: Option<String>,
+        operation_id_override: Option<String>,
+        command_id_override: Option<String>,
+        attempt_id: Option<String>,
+        actor: &str,
+    ) -> Result<HubOperation, HubError> {
+        let requested_checkpoint_id = payload
+            .as_ref()
+            .and_then(|payload| payload.get("checkpoint_id"))
+            .and_then(serde_json::Value::as_str);
+        // A retry belongs to the original mutation, including when placement
+        // moves it to another node. Never replace its actor with the caller
+        // of a later reconcile tick; historical unattributed rows stay system.
+        let actor = if operation.is_job() {
+            self.operations
+                .read()
+                .await
+                .values()
+                .filter(|existing| {
+                    existing.resource_id == resource_id
+                        && existing.operation == operation
+                        && existing.generation == generation
+                        && (existing.checkpoint_id.as_deref() == requested_checkpoint_id
+                            || (!operation.as_str().starts_with("job_checkpoint")
+                                && !operation.as_str().starts_with("job_savepoint")))
+                })
+                .min_by(|left, right| {
+                    left.created_at_ms
+                        .cmp(&right.created_at_ms)
+                        .then(left.id.cmp(&right.id))
+                })
+                .map(|existing| existing.actor.as_deref().unwrap_or("system").to_owned())
+                .unwrap_or_else(|| actor.to_owned())
+        } else {
+            actor.to_owned()
+        };
         let now = now_ms();
         let mut nodes = self.nodes.write().await;
         if !nodes.contains_key(&node_id) {
             drop(nodes);
             self.reject_enqueue(
+                &actor,
                 operation.as_str(),
                 &resource_id,
                 &node_id,
@@ -234,6 +303,7 @@ impl Hub {
         {
             drop(nodes);
             self.reject_enqueue(
+                &actor,
                 operation.as_str(),
                 &resource_id,
                 &node_id,
@@ -280,6 +350,7 @@ impl Hub {
                 .record_outcome(operation.as_str(), "rejected");
             if Self::job_audit_action(operation.as_str()).is_some() {
                 self.record_job_operation_audit(
+                    &actor,
                     operation.as_str(),
                     &resource_id,
                     Some(&node_id),
@@ -310,10 +381,6 @@ impl Hub {
             return Err(HubError::Invalid(message));
         }
         let mut operations = self.operations.write().await;
-        let requested_checkpoint_id = payload
-            .as_ref()
-            .and_then(|payload| payload.get("checkpoint_id"))
-            .and_then(serde_json::Value::as_str);
         if let Some(operation_id) = operation_id_override.as_deref() {
             if let Some(existing) = operations.get(operation_id) {
                 if existing.generation == generation {
@@ -364,6 +431,7 @@ impl Hub {
             drop(nodes);
             drop(operations);
             self.reject_enqueue(
+                &actor,
                 operation.as_str(),
                 &resource_id,
                 &node_id,
@@ -399,6 +467,7 @@ impl Hub {
             drop(nodes);
             drop(operations);
             self.reject_enqueue(
+                &actor,
                 operation.as_str(),
                 &resource_id,
                 &node_id,
@@ -413,6 +482,7 @@ impl Hub {
         }
         let operation_record = HubOperation {
             id,
+            actor: operation.is_job().then(|| actor.clone()),
             intent_id,
             command_id: command_id.clone(),
             node_id: node_id.clone(),
@@ -526,6 +596,7 @@ impl Hub {
             )
         {
             self.record_job_operation_audit(
+                operation_record.actor.as_deref().unwrap_or("system"),
                 operation_record.operation.as_str(),
                 &operation_record.resource_id,
                 Some(&operation_record.node_id),
@@ -547,8 +618,10 @@ impl Hub {
     /// Account and audit an enqueue that never reached the node's command
     /// queue. Metrics record every command class; the audit trail records
     /// Job lifecycle operations only, per the Actor-aware audit scope.
+    #[allow(clippy::too_many_arguments)]
     async fn reject_enqueue(
         &self,
+        actor: &str,
         operation: &str,
         resource_id: &str,
         node_id: &str,
@@ -558,6 +631,7 @@ impl Hub {
     ) {
         self.command_metrics.record_outcome(operation, failure_code);
         self.record_job_operation_audit(
+            actor,
             operation,
             resource_id,
             Some(node_id),
@@ -744,7 +818,7 @@ impl Hub {
                         let coordinator = completed_operations.first().ok_or_else(|| {
                             HubError::Invalid("checkpoint has no successful agent".into())
                         })?;
-                        self.enqueue_with_metadata(
+                        self.enqueue_with_metadata_as(
                             coordinator.node_id.clone(),
                             commit_operation,
                             updated.resource_id.clone(),
@@ -763,6 +837,7 @@ impl Hub {
                             None,
                             None,
                             None,
+                            updated.actor.as_deref().unwrap_or("system"),
                         )
                         .await?;
                     }

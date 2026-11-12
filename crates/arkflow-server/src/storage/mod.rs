@@ -212,6 +212,16 @@ pub struct StoredEvent {
     pub actor: Option<String>,
 }
 
+/// Query predicates applied before the bounded audit-history result window.
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    pub resource_id: Option<String>,
+    pub actor: Option<String>,
+    pub action: Option<String>,
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuditRecord {
     pub event_id: i64,
@@ -1133,6 +1143,9 @@ storage_ops! {
     ("list_audit", ListAudit, list_audit) plain Vec<AuditRecord> {
         resource_id: Option<String> as q,
     },
+    ("list_audit_filtered", ListAuditFiltered, list_audit_filtered) plain Vec<AuditRecord> {
+        filter: AuditFilter as v,
+    },
     ("create_rollout", CreateRollout, create_rollout) fenced () {
         rollout: RolloutRecord as v,
         targets: Vec<RolloutTargetRecord> as v,
@@ -1495,6 +1508,10 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn record_audit(&self, record: AuditRecord) -> Result<i64, StorageError>;
     async fn list_audit(&self, resource_id: Option<&str>)
         -> Result<Vec<AuditRecord>, StorageError>;
+    async fn list_audit_filtered(
+        &self,
+        filter: AuditFilter,
+    ) -> Result<Vec<AuditRecord>, StorageError>;
     async fn create_rollout(
         &self,
         rollout: RolloutRecord,
@@ -2253,6 +2270,15 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::list_audit(backend, resource_id).await,
             Self::Postgres(backend) => StorageBackend::list_audit(backend, resource_id).await,
+        }
+    }
+    async fn list_audit_filtered(
+        &self,
+        filter: AuditFilter,
+    ) -> Result<Vec<AuditRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_audit_filtered(backend, filter).await,
+            Self::Postgres(backend) => StorageBackend::list_audit_filtered(backend, filter).await,
         }
     }
     async fn create_rollout(

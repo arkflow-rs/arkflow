@@ -758,6 +758,7 @@ async fn current_generation_recovery_required_failure_overrides_running_observat
         "recovery-required-start".into(),
         HubOperation {
             id: "recovery-required-start".into(),
+            actor: None,
             intent_id: None,
             command_id: "command-recovery-required".into(),
             node_id: "node-a".into(),
@@ -1084,6 +1085,7 @@ async fn stale_operation_and_checkpoint_records_are_reclaimed() {
     .unwrap();
     let stale_op = HubOperation {
         id: "op-stale".into(),
+        actor: None,
         intent_id: None,
         command_id: "command-stale".into(),
         node_id: "node-a".into(),

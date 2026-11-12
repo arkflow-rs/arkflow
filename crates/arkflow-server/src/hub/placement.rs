@@ -563,6 +563,14 @@ impl Hub {
     }
 
     pub async fn reconcile_job(&self, job: &JobRecord) -> Result<usize, HubError> {
+        self.reconcile_job_as(job, "system").await
+    }
+
+    pub(crate) async fn reconcile_job_as(
+        &self,
+        job: &JobRecord,
+        actor: &str,
+    ) -> Result<usize, HubError> {
         // Atomic-upgrade fence: while an orchestration owns the Job's
         // dispatch state (savepoint, commit, pause) the general reconciler
         // must not touch it — a re-placement here would bump the generation
@@ -1010,7 +1018,7 @@ impl Hub {
                         && node.resource.maintenance_state == NodeMaintenanceState::Active
                 });
                 if is_online {
-                    self.enqueue_with_metadata(
+                    self.enqueue_with_metadata_as(
                         node_id.clone(),
                         AgentOperation::JobStop,
                         job.job_id.clone(),
@@ -1022,6 +1030,7 @@ impl Hub {
                         None,
                         None,
                         None,
+                        actor,
                     )
                     .await?;
                 }
@@ -1138,7 +1147,7 @@ impl Hub {
             } else {
                 None
             };
-            self.enqueue_with_metadata(
+            self.enqueue_with_metadata_as(
                 node_id,
                 operation.clone(),
                 job.job_id.clone(),
@@ -1150,6 +1159,7 @@ impl Hub {
                 None,
                 None,
                 None,
+                actor,
             )
             .await?;
             if let Some((node_id, fingerprint)) = fingerprint {

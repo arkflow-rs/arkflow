@@ -1451,11 +1451,27 @@ impl SqliteBackend {
     }
 
     pub fn list_audit(&self, resource_id: Option<&str>) -> Result<Vec<AuditRecord>, StorageError> {
+        self.list_audit_filtered(AuditFilter {
+            resource_id: resource_id.map(str::to_owned),
+            ..Default::default()
+        })
+    }
+
+    pub fn list_audit_filtered(
+        &self,
+        filter: AuditFilter,
+    ) -> Result<Vec<AuditRecord>, StorageError> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT event_id, actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms FROM cp_audit_events WHERE (?1 IS NULL OR resource_id = ?1) ORDER BY event_id DESC LIMIT 1024",
+                "SELECT event_id, actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms FROM cp_audit_events WHERE (?1 IS NULL OR resource_id = ?1) AND (?2 IS NULL OR actor = ?2) AND (?3 IS NULL OR action = ?3) AND (?4 IS NULL OR occurred_at_ms >= ?4) AND (?5 IS NULL OR occurred_at_ms <= ?5) ORDER BY event_id DESC LIMIT 1024",
             )?;
-            let rows = statement.query_map([resource_id], |row| {
+            let rows = statement.query_map(rusqlite::params![
+                filter.resource_id.as_deref(),
+                filter.actor.as_deref(),
+                filter.action.as_deref(),
+                filter.from_ms,
+                filter.to_ms,
+            ], |row| {
                 Ok(AuditRecord {
                     event_id: row.get(0)?,
                     actor: row.get(1)?,
@@ -3651,6 +3667,12 @@ impl StorageBackend for SqliteBackend {
         resource_id: Option<&str>,
     ) -> Result<Vec<AuditRecord>, StorageError> {
         self.list_audit(resource_id)
+    }
+    async fn list_audit_filtered(
+        &self,
+        filter: AuditFilter,
+    ) -> Result<Vec<AuditRecord>, StorageError> {
+        self.list_audit_filtered(filter)
     }
     async fn create_rollout(
         &self,

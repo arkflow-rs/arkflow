@@ -1,10 +1,13 @@
 //! Event list/stream (SSE) and audit handlers for the local plane and the Hub.
-use super::{hub_problem, page_items, AuditQuery, EventQuery, PageQuery};
+use super::{
+    hub_problem, page_items, problem, require_operator_action, AuditQuery, EventQuery, PageQuery,
+};
+use crate::api_contract::OperatorAction;
 use crate::hub;
 use arkflow_core::control::Page;
 use arkflow_core::control_plane::ControlPlane;
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -142,9 +145,38 @@ pub(super) fn event_matches(event: &hub::HubEvent, query: &EventQuery) -> bool {
 pub(super) async fn hub_audit(
     State(hub): State<hub::Hub>,
     Query(query): Query<AuditQuery>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
-    match hub.audit(query.resource_id.as_deref()).await {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ReadAudit,
+        "audit",
+        query.resource_id.clone(),
+    )
+    .await
+    {
+        return response;
+    }
+    if query
+        .from_ms
+        .zip(query.to_ms)
+        .is_some_and(|(from, to)| from > to)
+    {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_audit_query",
+            "from_ms must not be greater than to_ms".into(),
+        );
+    }
+    let filter = crate::storage::AuditFilter {
+        resource_id: query.resource_id,
+        actor: query.actor,
+        action: query.action,
+        from_ms: query.from_ms,
+        to_ms: query.to_ms,
+    };
+    match hub.audit_filtered(filter).await {
         Ok(records) => Json(page_items(
             records,
             &PageQuery {

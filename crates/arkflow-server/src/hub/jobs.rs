@@ -19,7 +19,15 @@ impl Hub {
         Ok(self.jobs.read().await.get(job_id).cloned())
     }
 
-    pub async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, HubError> {
+    pub async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, HubError> {
+        self.upsert_job_as(job, "system").await
+    }
+
+    pub(crate) async fn upsert_job_as(
+        &self,
+        mut job: JobRecord,
+        actor: &str,
+    ) -> Result<JobRecord, HubError> {
         // A pinned placement has nothing to relocate to: rebalancing is a
         // scheduler decision over unpinned Jobs, so an explicit pin combined
         // with the auto policy is a configuration contradiction, not a
@@ -80,7 +88,7 @@ impl Hub {
                 .insert(job.job_id.clone(), job.clone());
         }
         if job.desired_state != "stopped" {
-            self.reconcile_job(&job).await?;
+            self.reconcile_job_as(&job, actor).await?;
         }
         Ok(job)
     }
@@ -234,6 +242,17 @@ impl Hub {
         desired_state: &str,
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, HubError> {
+        self.update_job_desired_state_as(job_id, desired_state, expected_generation, "system")
+            .await
+    }
+
+    pub(crate) async fn update_job_desired_state_as(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+        actor: &str,
+    ) -> Result<Option<JobRecord>, HubError> {
         let updated = if let Some(storage) = &self.storage {
             storage
                 .update_job_desired_state(job_id, desired_state, expected_generation)
@@ -267,7 +286,7 @@ impl Hub {
                 .write()
                 .await
                 .insert(job.job_id.clone(), job.clone());
-            self.reconcile_job(job).await?;
+            self.reconcile_job_as(job, actor).await?;
         }
         Ok(updated)
     }

@@ -15,8 +15,10 @@ Hub 在 `/liveness` 暴露进程存活,在 `/readiness` 暴露存储/恢复就�
 命令分发指标覆盖从入队到确认的延迟(`arkflow_command_duration_bucket`/`_count`/`_sum`)以及按结果分类的计数器
 (`arkflow_command_total`),标签使用固定的 `command` 与 `outcome` 词表。这些计数器在 Hub
 重启时归零,符合 Prometheus 计数器语义。作业生命周期变更(`job_start`、`job_stop`、
-`job_checkpoint`、`job_savepoint`)还会以执行者、关联、结果与失败码元数据进行审计;
-审计历史在有界窗口内保留(30 天、10 万条),可在 `/api/v1/audit` 查询。持久化调和历史同样有界:
+`job_checkpoint`、`job_savepoint`)还会以执行者、关联、结果与失败码元数据进行审计。操作员直接触发的派发携带真实 principal id,纯后台派发使用 `system`;操作身份随持久化记录恢复和重试保留。
+审计历史在有界窗口内保留(30 天、10 万条),可在 `/api/v1/audit` 查询。读取要求 `ReadAudit`(admin、viewer 角色具备,operator 返回 `403`)和适用的 `audit` 资源 scope。限定为 `audit=orders` 的凭证可查询 `?resource_id=orders`,不能读取整个集合或其他资源。可选的 `actor`、`action` 精确匹配和包含端点的 Unix 毫秒时间范围 `from_ms` / `to_ms` 与 `resource_id` 在存储层组合,先过滤再取最多 1024 条结果并分页,总数表示该窗口内的匹配记录数;起始时间晚于结束时间返回 `400 invalid_audit_query`。
+
+持久化调和历史同样有界:
 终态操作记录、已处理的 outbox 行与终态 Attempt 记录在 24 小时后或超过 4096 行上限后被回收;
 pending/failed 检查点记录在 24 小时后被回收;事件只保留最新的 2048 行。
 未处理的 outbox 行与活跃的 Attempt 永远不会被回收;一个专用的 60 秒维护任务执行这些保留清理,

@@ -266,7 +266,7 @@ PUT /api/v1/jobs/{job_id}/desired-state
 | `GET` | `/operations/status` | 面向仪表盘的运维状态摘要。 |
 | `GET` | `/events` | 查询集群事件日志。 |
 | `GET` | `/events/stream` | 实时事件的 Server-Sent Events 流。 |
-| `GET` | `/audit` | 有界审计历史(`?resource_id={id}`),包含被接受与被拒绝的变更。 |
+| `GET` | `/audit` | 有界审计历史,要求 `ReadAudit`。支持 `resource_id`、`actor`、`action`、`from_ms`、`to_ms` 过滤及分页。 |
 | `GET`/`PUT` | `/webhooks` | 列出/全量替换 webhook 告警订阅集(参见[Webhook 告警](#webhook-告警))。 |
 | `POST` | `/webhooks/{id}/test` | 同步投递一条合成 `webhook.test` 测试事件。 |
 
@@ -288,6 +288,7 @@ HMAC-SHA256)。完整契约参见
 `DELETE /operations/{intent_id}` 取消的是 Intent,而不是已经执行的副作用:派发之前会抑制待处理的工作;派发之后,Attempt 的结果仍然可见。
 
 审计记录包含操作者、目标资源、节点、关联 ID、结果(`accepted`/`rejected`)以及稳定的失败码(`node_unavailable`、`capacity`、`incompatible_capability`、`expired`)。消息只包含标量操作元数据——绝不含凭据或作业配置体。
+`GET /audit` 要求 `ReadAudit`(admin 或 viewer)及目标 `resource_id` 对应的 `audit` scope;不指定资源的查询要求集合级审计权限。operator 角色返回 `403`。可选 `actor`、`action` 为精确匹配,`from_ms`、`to_ms` 为包含端点的 Unix 毫秒时间范围。所有条件在存储层组合,先过滤再取最多 1024 条结果并分页,`total` 为该结果窗口内的匹配数;`from_ms > to_ms` 返回 `400 invalid_audit_query`。
 
 ### 用户与凭证 {#users-and-credentials}
 

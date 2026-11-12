@@ -256,6 +256,17 @@ impl Hub {
             .map_err(HubError::from)
     }
 
+    pub async fn audit_filtered(
+        &self,
+        filter: crate::storage::AuditFilter,
+    ) -> Result<Vec<crate::storage::AuditRecord>, HubError> {
+        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
+        storage
+            .list_audit_filtered(filter)
+            .await
+            .map_err(HubError::from)
+    }
+
     pub async fn record_audit_event(
         &self,
         record: crate::storage::AuditRecord,
@@ -280,6 +291,7 @@ impl Hub {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_job_operation_audit(
         &self,
+        actor: &str,
         operation: &str,
         resource_id: &str,
         node_id: Option<&str>,
@@ -293,7 +305,7 @@ impl Hub {
         };
         let record = crate::storage::AuditRecord {
             event_id: 0,
-            actor: Some("operator".into()),
+            actor: Some(actor.to_owned()),
             action,
             resource_type: "job".into(),
             resource_id: Some(resource_id.to_owned()),
