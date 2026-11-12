@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # Tumbling Window
 
-The Tumbling Window buffer groups messages into fixed-size, non-overlapping time windows. Every configured `interval`, all messages accumulated within the current window are emitted together as a single batch; each message belongs to exactly one window. An optional `join` configuration lets you run a SQL join across multiple input sources at emission time.
+The Tumbling Window buffer groups messages into fixed-size, non-overlapping time windows. Every configured `interval`, all messages accumulated within the current window are emitted together as a single batch; each message belongs to exactly one window. A legacy `join` option exists, but the stream compiler rejects window buffers that declare it (see the warning below).
 
 ## Configuration
 
@@ -13,7 +13,16 @@ The Tumbling Window buffer groups messages into fixed-size, non-overlapping time
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | `tumbling_window` |
 | interval | duration | yes | — | Fixed duration of each window. When it elapses, all accumulated messages are emitted. Examples: `1ms`, `1s`, `1m`, `1h`. |
-| join | object | no | — | Optional SQL join configuration applied to emitted batches. |
+| join | object | no | — | Legacy SQL join configuration; rejected by the stream compiler (see warning below). |
+
+:::warning Legacy `join` — rejected by the stream compiler
+
+Declaring `join` on a `tumbling_window` buffer fails compilation with
+`legacy window buffers with 'join' cannot compile`. Stream-stream join is not
+supported in Stream configs; use the SQL processor's per-batch joins against
+temporary tables instead.
+
+:::
 
 ### `join`
 

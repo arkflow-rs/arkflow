@@ -123,6 +123,14 @@ impl ControlPlane {
         supplied.is_some_and(|value| value.as_bytes().ct_eq(expected.as_bytes()).into())
     }
 
+    /// Whether an API credential is configured. When it is not, the control
+    /// API accepts every request, so a presented Bearer value is not an
+    /// identity — consumers that bucket by credential (request rate limiting)
+    /// must treat all callers as one anonymous identity instead.
+    pub fn credential_enforced(&self) -> bool {
+        self.api_token.is_some()
+    }
+
     pub async fn system(&self) -> SystemResource {
         let streams = self.runtime_manager.snapshots().await;
         let operations = self.operations.list().await;

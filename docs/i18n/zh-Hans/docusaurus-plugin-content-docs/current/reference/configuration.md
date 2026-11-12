@@ -82,12 +82,28 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 | `metrics_path` | string | 否 | `/metrics` | Prometheus 暴露端点(格式 0.0.4)。 |
 | `ready_path` | string | 否 | `/ready` | 就绪探针:引擎完成启动所配置的流与作业后即成功。 |
 | `live_path` | string | 否 | `/live` | 存活探针:进程运行期间即成功。 |
+| `tracing` | object | 否 | — | OTel 追踪导出(OTLP HTTP-JSON;默认关闭):`enabled`、`endpoint`、`service_name`。参见[追踪](/zh-Hans/docs/operate/observability#追踪)。 |
 
 ### 独立 Hub 的启动安全
 
 独立的 `arkflow-server` 控制平面默认 fail-closed。在把 Hub 绑定到环回地址之外之前,请将 `ARKFLOW_HUB_STORAGE` 设为持久化的 SQLite 路径,为操作员 API 设置 `ARKFLOW_OPERATOR_TOKEN`,为 Agent 注册设置 `ARKFLOW_NODE_TOKEN`。仅限明确的本地开发场景:在保持 `ARKFLOW_HUB_ADDRESS` 为环回地址的同时设置 `ARKFLOW_HUB_INSECURE_LOCAL=1`,这才允许易失状态与省略凭据。Hub 在绑定监听器之前会先恢复持久化状态,因此恢复错误会让服务器不可用,而不是提供一份残缺视图。
 
 独立的 `arkflow` 引擎对其本地控制 API 施加同样的边界:`health_check.address` 为非回环地址且未设置 `health_check.api_token` 时拒绝启动。请设置 token,或用 `health_check.insecure_local: true` 显式确认(引擎随后启动并输出 error 级警告)。配置了 token 后,`/api/v1` 下的所有端点——含读端点——都要求该 Bearer 令牌;健康探针与顶层 `/metrics` 保持开放,供探针与抓取器使用。
+
+### Hub 身份环境变量
+
+Hub 的托管用户目录与 OIDC 联邦通过环境变量配置,而不是引擎配置文件:
+
+| 变量 | 默认 | 说明 |
+|----------|---------|-------------|
+| `ARKFLOW_OPERATOR_TOKEN` | — | 静态 operator 凭证与应急(break-glass)访问。接受原始 admin token 或结构化的 `principal\|role\|secret` 形式;以常量时间比较。 |
+| `ARKFLOW_HUB_STORAGE` | — | 托管身份 API 所需的持久化存储。未设置时 Hub 为易失模式:`/api/v1/users*` 与 `/api/v1/credentials*` 返回 `503 identity_store_unavailable`,托管凭证也无法认证。 |
+| `ARKFLOW_OIDC_ISSUER` / `ARKFLOW_OIDC_AUDIENCE` | — | 启用 OIDC JWT 联邦;参见[部署](../operate/control-plane/deploy.md#oidc-jwt-federation)。 |
+| `ARKFLOW_OIDC_MANAGED_USERS_ONLY` | `false` | 要求每个联邦 subject 都绑定到托管用户(`oidc_subject`)。启用后未绑定的 subject 收到 `401`;默认值保留 claim 映射访问。 |
+
+身份生命周期(签发一次性凭证、轮换与吊销、绑定 OIDC subject、吊销已签发 JWT)见
+[用户与凭证](../operate/control-plane/users-and-credentials.md);完整的启动环境变量
+清单见 [CLI 参考](./cli.md#startup-environment-variables)。
 
 :::note
 启用控制平面服务器时,`/ready` 与 `/live` 也会挂载在服务器地址上,与旧的 `/health`、`/readiness`、`/liveness` 端点并列(后者保持原有语义)。
@@ -148,7 +164,7 @@ streams: []
 
 | 字段 | 类型 | 必填 | 默认值 | 描述 |
 |-------|------|----------|---------|-------------|
-| `thread_num` | integer | 否 | `1` | 处理器工作任务数量。 |
+| `thread_num` | integer | 否 | CPU 核数 | 处理器工作任务数量。 |
 | `processors` | array&lt;object&gt; | 是 | — | 处理器组件的有序列表。 |
 
 ## job
@@ -191,6 +207,10 @@ jobs:
 | `state` | object | 否 | — | `backend`(例如 `embedded_kv`)、`durability`(默认 `durable`,或显式 `ephemeral`)、可选的稳定 `root`(或 `ARKFLOW_STATE_ROOT`)、`namespace`、`ttl_ms`、`format_version`、`max_pending_transactions`(正数;默认 4096;当窗口看到非常高的每窗口键基数时应调大,因为每个打开的窗口组或未确认的输出都会占用一个事务)、可选的正数 `max_bytes` 活动状态预算。有状态算子必需;持久状态还要求 `checkpoint`。 |
 | `checkpoint` | object | 否 | — | `interval_ms`、`retention`、`object_store_uri`(例如 `file://...` 或 `s3://...`)。 |
 | `recovery` | string | 否 | `latest_checkpoint` | `latest_checkpoint`、`latest_savepoint` 或 `fail`。 |
+| `rescale` | boolean | 否 | `false` | 显式开启扩缩容恢复:恢复工件在不同并行度下写入时,键控状态按键组归属重分布到新任务集,而不是直接失败(参见[分布式作业](/zh-Hans/docs/build/distributed-jobs))。 |
+| `placement` | string | 否 | `colocated` | 跨计算节点的任务放置:`colocated`(默认)或 `split`(跨节点边经由 shuffle 数据面)。 |
+| `rebalance` | object | 否 | — | 显式开启的压力再均衡:节点持续上报资源压力时,Hub 会把作业迁走。缺省等同于 `off`。 |
+| `resources` | object | 否 | — | 可选的每任务资源请求(`cpu_millicores`、`memory_bytes`);声明后参与放置核算与 Agent 运行时尺寸计算。 |
 
 ### `time`(source 的事件时间声明)
 

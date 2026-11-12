@@ -5,7 +5,7 @@ description: ArkFlow 文档页。
 
 # 会话窗口(Session Window)
 
-会话窗口(Session Window)缓冲按活动间隙把消息(Message)划分成会话。新消息会延长当前会话;若在配置的 `gap` 时长内没有消息到达,该会话即关闭,其累积的全部消息会作为一个批次(Batch)发出。可选的 `join` 配置允许你在发出时跨多个输入(Input)源执行 SQL 连接(Join)。
+会话窗口(Session Window)缓冲按活动间隙把消息(Message)划分成会话。新消息会延长当前会话;若在配置的 `gap` 时长内没有消息到达,该会话即关闭,其累积的全部消息会作为一个批次(Batch)发出。旧式 `join` 选项仍然存在,但流编译器会拒绝声明了它的窗口缓冲(见下方警告)。
 
 ## 配置
 
@@ -13,7 +13,15 @@ description: ArkFlow 文档页。
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | `session_window` |
 | gap | duration | yes | — | 会话内消息之间的最大空闲时间。当 `gap` 时长耗尽且没有新消息时,会话被刷新。示例:`1ms`、`1s`、`1m`、`1h`。 |
-| join | object | no | — | 应用于发出批次的可选 SQL 连接配置。 |
+| join | object | no | — | 旧式 SQL 连接配置;会被流编译器拒绝(见下方警告)。 |
+
+:::warning 旧式 `join` —— 被流编译器拒绝
+
+在 `session_window` 缓冲上声明 `join` 会在编译时报错
+`legacy window buffers with 'join' cannot compile`。Stream 配置不支持流-流
+连接;请改用 SQL 处理器针对临时表的逐批次连接。
+
+:::
 
 ### `join`
 

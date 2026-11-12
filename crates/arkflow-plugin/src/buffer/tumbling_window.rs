@@ -182,7 +182,7 @@ pub fn init() -> Result<(), Error> {
     register_buffer_metadata(
         ComponentMetadata::with_schema(
             "tumbling_window",
-            "Fixed-size, non-overlapping time windows. Supports SQL joins across sources.",
+            "Fixed-size, non-overlapping time windows.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,

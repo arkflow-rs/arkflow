@@ -1,6 +1,16 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, JOB_DETAIL_INTERVAL_MS, ROLLOUT_DETAIL_INTERVAL_MS, SNAPSHOT_INTERVAL_MS } from './api'
+import {
+  api,
+  errorMessage,
+  isPermissionError,
+  type AuditListQuery,
+  type EventListQuery,
+  type OperationListQuery,
+  JOB_DETAIL_INTERVAL_MS,
+  ROLLOUT_DETAIL_INTERVAL_MS,
+  SNAPSHOT_INTERVAL_MS,
+} from './api'
 
 // The last error raised by any mounted ['live', ...] query, or null while all
 // live resources are healthy. Lets the shell mark the view stale even when the
@@ -29,6 +39,26 @@ export function useLiveError(): Error | null {
   return error
 }
 
+// Shared mutation failure path: report the message, and on a 403 despite an
+// enabled control refresh the echoed identity — the action list went stale
+// (role changed mid-session), and role gating must recover without a manual
+// reload. The mutation itself is never retried.
+export function useMutationFailure(): (
+  onError: ((message: string) => void) | undefined,
+  cause: unknown,
+) => void {
+  const queryClient = useQueryClient()
+  return useCallback(
+    (onError, cause) => {
+      if (isPermissionError(cause)) {
+        void queryClient.invalidateQueries({ queryKey: ['live', 'system'] })
+      }
+      onError?.(errorMessage(cause))
+    },
+    [queryClient],
+  )
+}
+
 // Live resources refetch on the snapshot cadence and keep the previous payload
 // visible on refetch failure so the UI can show a stale banner over the last
 // safe snapshot. Key prefix `['live', ...]` marks the resources the SSE-driven
@@ -52,6 +82,22 @@ const DEFAULT_PREVIEW_SIZE = 256
 // not 'live': refreshed by invalidation, not on the snapshot cadence.
 export function useWebhooks() {
   return useQuery({ queryKey: ['webhooks'], queryFn: api.webhooks })
+}
+
+// The user directory is Hub-only and changes through this page's mutations;
+// like webhooks it refreshes by invalidation rather than on the live cadence.
+export function useUsers(enabled = true) {
+  return useQuery({ queryKey: ['users'], queryFn: api.users, enabled })
+}
+
+// Credential metadata for the selected user; plaintext tokens never appear in
+// this response, so caching the list cannot leak a secret.
+export function useUserCredentials(userId: string | undefined) {
+  return useQuery({
+    queryKey: ['user-credentials', userId ?? null],
+    queryFn: () => api.userCredentials(userId!),
+    enabled: Boolean(userId),
+  })
 }
 
 export function useNodes(label?: string) {
@@ -84,18 +130,18 @@ export function useJobDetail(jobId: string | undefined) {
   })
 }
 
-export function useOperations(nodeId?: string) {
+export function useOperations(query: OperationListQuery = {}) {
   return useQuery({
-    queryKey: ['live', 'operations', nodeId ?? null],
-    queryFn: () => api.operations(nodeId),
+    queryKey: ['live', 'operations', query],
+    queryFn: () => api.operations(query),
     ...live,
   })
 }
 
-export function useEvents(nodeId?: string) {
+export function useEvents(query: EventListQuery = {}) {
   return useQuery({
-    queryKey: ['live', 'events', nodeId ?? null],
-    queryFn: () => api.events(nodeId),
+    queryKey: ['live', 'events', query],
+    queryFn: () => api.events(query),
     ...live,
   })
 }
@@ -110,6 +156,17 @@ export function useMetrics(nodeId?: string) {
 
 export function useRollouts() {
   return useQuery({ queryKey: ['live', 'rollouts'], queryFn: () => api.rollouts(), ...live })
+}
+
+// Audit history is append-only and paged server-side: not 'live' (no SSE
+// invalidation or snapshot polling), but every distinct page/filter is its
+// own cache entry so paging never serves a stale first page forever.
+export function useAudit(query: AuditListQuery = {}) {
+  return useQuery({
+    queryKey: ['audit', query],
+    queryFn: () => api.audit(query),
+    placeholderData: keepPreviousData,
+  })
 }
 
 export function useConfigApprovals(status?: string) {

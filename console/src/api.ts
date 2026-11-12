@@ -37,6 +37,36 @@ export type StreamStatus = {
   metrics: StreamMetrics
 }
 export type Page<T> = { items: T[]; page: number; page_size: number; total: number }
+
+// List queries pass the backend's own parameter names straight through, so
+// the URL state, the fetch, and the API contract stay one vocabulary.
+export type EventListQuery = {
+  node_id?: string
+  event_type?: string
+  stream_id?: string
+  correlation_id?: string
+  page?: number
+  page_size?: number
+}
+export type OperationListQuery = {
+  node_id?: string
+  resource_id?: string
+  operation?: string
+  state?: string
+  correlation_id?: string
+  page?: number
+  page_size?: number
+}
+export type AuditListQuery = { resource_id?: string; page?: number; page_size?: number }
+
+function withQuery(path: string, query: Record<string, string | number | undefined>): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  }
+  const search = params.toString()
+  return search ? `${path}?${search}` : path
+}
 export type SystemHaStatus = {
   enabled: boolean
   role: string
@@ -52,6 +82,24 @@ export type EngineStatus = {
   streams_failed: number
   approval_required?: boolean
 }
+/** Operator actions the control plane can authorize, mirroring the v1 wire
+ * contract (serde snake_case). The echo lists what the caller may do. */
+export type OperatorAction =
+  | 'read'
+  | 'operate'
+  | 'configure'
+  | 'manage_nodes'
+  | 'manage_rollouts'
+  | 'manage_webhooks'
+  | 'approve_rollouts'
+  | 'read_audit'
+  | 'manage_users'
+
+/** The `/system` identity echo: who is calling, their roles, and the actions
+ * the same enforcement predicate grants them. Absent on older control
+ * planes — the console then stays ungated rather than locking everything. */
+export type PrincipalEcho = { id: string; roles: string[]; actions: OperatorAction[] }
+
 export type SystemResource = {
   id: string
   version: string
@@ -62,6 +110,7 @@ export type SystemResource = {
   active_operations: number
   capabilities: string[]
   ha?: SystemHaStatus
+  principal?: PrincipalEcho | null
 }
 export type NodeMaintenanceState = 'active' | 'draining' | 'maintenance'
 export type ControlNode = {
@@ -104,6 +153,55 @@ export type WebhookTestOutcome = {
   status?: number
   error?: string
 }
+/** Roles in the Hub user directory; `admin` is the only role that holds
+ * `manage_users`. */
+export type UserRole = 'admin' | 'operator' | 'viewer'
+/** A resource-type scope, optionally narrowed to one resource id. */
+export type ResourceScope = { resource_type: string; resource_id?: string }
+/** A managed directory user. Responses carry metadata only: the credential
+ * secrets and their hashes are never part of the wire contract. */
+export type User = {
+  user_id: string
+  display_name: string
+  role: UserRole | string
+  scopes: ResourceScope[]
+  disabled: boolean
+  oidc_subject: string | null
+  tokens_valid_after_ms: number
+  created_at_ms: number
+  updated_at_ms: number
+}
+/** Credential metadata; plaintext tokens exist only in the issuance/rotation
+ * response (`IssuedCredential.token`). */
+export type CredentialView = {
+  credential_id: string
+  label: string
+  created_at_ms: number
+  expires_at_ms: number | null
+  last_used_at_ms: number | null
+  revoked_at_ms: number | null
+}
+/** The one and only response that carries a plaintext credential token. */
+export type IssuedCredential = { credential: CredentialView; token: string }
+export type RevokedTokens = { revoked_sessions: number }
+export type CreateUserInput = {
+  user_id: string
+  display_name?: string
+  role: UserRole
+  scopes?: ResourceScope[]
+  oidc_subject?: string
+}
+/** Partial update: omitted fields are left unchanged; an empty `oidc_subject`
+ * clears the directory binding. */
+export type UpdateUserInput = {
+  display_name?: string
+  role?: UserRole
+  scopes?: ResourceScope[]
+  disabled?: boolean
+  oidc_subject?: string
+}
+/** Optional credential issuance parameters: `expires_at_ms` is absolute. */
+export type IssueCredentialInput = { label?: string; expires_at_ms?: number }
 export type OperationState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
 export type Operation = {
   id: string
@@ -234,6 +332,10 @@ export type AuditRecord = {
   message?: string
   occurred_at_ms: number
 }
+/** Durable Job pause state machine phase. `paused` is the settled state;
+ * `capturing`/`stopping` mark a pause in flight and `resuming` means the Job
+ * is being brought back. Absent on Jobs that were never paused. */
+export type JobPausePhase = 'capturing' | 'stopping' | 'paused' | 'resuming'
 export type Job = {
   job_id: string
   version: number
@@ -246,6 +348,16 @@ export type Job = {
   checkpoint_id?: string
   last_error?: string
   updated_at_ms: number
+  /** Present only while the Job carries durable pause bookkeeping. */
+  pause_phase?: JobPausePhase
+  /** Recovery artifact (checkpoint/savepoint) captured at the pause generation. */
+  pause_artifact_id?: string
+  /** Recovery pointer before the pause captured its artifact. */
+  pause_prev_checkpoint_id?: string
+  /** Bounded capture re-dispatch counter (additive on the wire). */
+  pause_retry_count?: number
+  paused_at_ms?: number
+  paused_by?: string
 }
 export type JobMetrics = {
   watermark_lag_ms?: number
@@ -332,9 +444,18 @@ export const JOB_DETAIL_INTERVAL_MS = 5_000
 export const ROLLOUT_DETAIL_INTERVAL_MS = 5_000
 export const DEFAULT_PAGE_SIZE = 50
 
+/** True when a mutation was rejected for authorization (403): show the
+ * permission degradation instead of a raw server error, and never retry. */
+export function isPermissionError(cause: unknown): boolean {
+  return (cause as ApiError | null)?.status === 403
+}
+
 export function errorMessage(cause: unknown): string {
   if (typeof cause === 'object' && cause && 'message' in cause) {
     const error = cause as ApiError
+    if (isPermissionError(error)) {
+      return translate(currentLocale(), 'perm.denied', { message: error.message })
+    }
     return `${error.message}${error.correlation_id ? ` (ref ${error.correlation_id})` : ''}`
   }
   return cause instanceof Error ? cause.message : translate(currentLocale(), 'api.controlApiUnavailable')
@@ -345,7 +466,90 @@ export function formatTime(value?: number): string {
 }
 
 const base = import.meta.env.VITE_API_BASE ?? '/api/v1'
-const token = import.meta.env.VITE_API_TOKEN
+
+// --- Runtime bearer credential -----------------------------------------
+//
+// `VITE_API_TOKEN` is only the optional build-time default (it is inlined in
+// the public bundle, so it is not a secret store). Operators type a bearer
+// token at runtime instead; it is kept in sessionStorage so it never outlives
+// the browser tab and is never read by a later session (unlike localStorage).
+export const RUNTIME_TOKEN_STORAGE_KEY = 'arkflow.console.api_token'
+
+function storedRuntimeToken(): string | null {
+  try {
+    return sessionStorage.getItem(RUNTIME_TOKEN_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+let runtimeToken: string | null = storedRuntimeToken()
+
+/** The bearer token sent with every request: a runtime-entered token wins
+ * over the optional build-time default. `null` means unauthenticated. */
+export function currentBearerToken(): string | null {
+  const envToken = import.meta.env.VITE_API_TOKEN
+  return runtimeToken ?? (envToken ? envToken : null)
+}
+
+/** Where the active bearer credential comes from, for the Settings panel. */
+export function bearerTokenSource(): 'runtime' | 'environment' | 'none' {
+  if (runtimeToken) return 'runtime'
+  return import.meta.env.VITE_API_TOKEN ? 'environment' : 'none'
+}
+
+/** Replaces (or, with null/empty, clears) the runtime bearer token. The next
+ * request uses it immediately; callers refetch to retry the failed call. */
+export function setRuntimeBearerToken(value: string | null): void {
+  runtimeToken = value && value.trim() ? value.trim() : null
+  try {
+    if (runtimeToken) sessionStorage.setItem(RUNTIME_TOKEN_STORAGE_KEY, runtimeToken)
+    else sessionStorage.removeItem(RUNTIME_TOKEN_STORAGE_KEY)
+  } catch {
+    // Storage unavailable: the token still works for this page lifetime.
+  }
+}
+
+export type AuthChallenge = {
+  /** The console must ask for a credential before it can continue. */
+  required: boolean
+  /** A credential was sent and rejected, as opposed to none being sent. */
+  tokenRejected: boolean
+}
+
+const NO_AUTH_CHALLENGE: AuthChallenge = { required: false, tokenRejected: false }
+
+let authChallenge: AuthChallenge = NO_AUTH_CHALLENGE
+const authChallengeListeners = new Set<(challenge: AuthChallenge) => void>()
+
+function publishAuthChallenge(next: AuthChallenge): void {
+  if (authChallenge.required === next.required && authChallenge.tokenRejected === next.tokenRejected) return
+  authChallenge = next
+  for (const listener of authChallengeListeners) listener(next)
+}
+
+export function currentAuthChallenge(): AuthChallenge {
+  return authChallenge
+}
+
+export function subscribeAuthChallenge(listener: (challenge: AuthChallenge) => void): () => void {
+  authChallengeListeners.add(listener)
+  listener(authChallenge)
+  return () => {
+    authChallengeListeners.delete(listener)
+  }
+}
+
+/** Dismisses the token prompt once a credential has been accepted. */
+export function clearAuthChallenge(): void {
+  publishAuthChallenge(NO_AUTH_CHALLENGE)
+}
+
+/** Test hook: forgets the cached challenge and its listeners. */
+export function resetAuthChallengeForTests(): void {
+  authChallengeListeners.clear()
+  authChallenge = NO_AUTH_CHALLENGE
+}
 
 /** Default per-request budget: a connection black hole must fail the call
  * (with a readable message) instead of freezing the UI forever. */
@@ -366,6 +570,7 @@ function requestSignal(init?: RequestInit): AbortSignal | undefined {
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const correlationId = `console-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const signal = requestSignal(init)
+  const token = currentBearerToken()
   // The timeout signal covers the FULL exchange: fetch resolves on headers,
   // and a stalled body rejects `response.json()` with the same
   // TimeoutError, so every read stays inside the translated window.
@@ -396,9 +601,10 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let body: unknown
   try {
     if (!response.ok) {
-      if (response.status === 401 && !token) {
-        void redirectToOidcLogin()
-      }
+      // A 401 has two recoveries: the Hub's OIDC browser login when it is
+      // enabled (unchanged), otherwise the console asks for a runtime bearer
+      // token. A sent-but-rejected token never redirects away from the prompt.
+      if (response.status === 401) void handleUnauthorized(Boolean(token))
       // A stalled error-body read rejects with the shared TimeoutError —
       // it must surface as request_timeout, not be flattened into an empty
       // body that reports a generic request_failed.
@@ -420,7 +626,17 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
         },
       )
     }
-    body = response.status === 204 ? undefined : await response.json()
+    // A successful call proves the active credential works; drop the prompt.
+    if (authChallenge.required) clearAuthChallenge()
+    body =
+      response.status === 204
+        ? undefined
+        : await response.json().catch((error: unknown) => {
+            // Idempotent mutations (DELETE) may answer 200 with no body; that
+            // is a success, not a parse failure.
+            if (error instanceof SyntaxError) return undefined
+            throw error
+          })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'TimeoutError') {
       throw timeoutError()
@@ -465,10 +681,8 @@ export const api = {
     request<ControlNode>(`/nodes/${encodeURIComponent(id)}/maintenance`, { method: 'DELETE' }),
   streams: (nodeId?: string) =>
     request<Page<StreamStatus>>(`/streams${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
-  events: (nodeId?: string) =>
-    request<Page<ControlEvent>>(`/events${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
-  operations: (nodeId?: string) =>
-    request<Page<Operation>>(`/operations${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
+  events: (query: EventListQuery = {}) => request<Page<ControlEvent>>(withQuery('/events', query)),
+  operations: (query: OperationListQuery = {}) => request<Page<Operation>>(withQuery('/operations', query)),
   operation: (id: string) => request<Operation>(`/operations/${encodeURIComponent(id)}`),
   config: (nodeId?: string) =>
     request<Record<string, unknown>>(
@@ -534,6 +748,13 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ state }),
     }),
+  /** Durable pause: captures the recovery artifact, then stops the Job (202).
+   * The Hub returns the updated Job as soon as the pause intent is recorded. */
+  pauseJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}/actions/pause`, { method: 'POST' }),
+  /** Resume a paused Job from its pause artifact (202). The generation is
+   * bumped by the Hub; events after the artifact barrier are replayed. */
+  resumeJob: (id: string) =>
+    request<Job>(`/jobs/${encodeURIComponent(id)}/actions/resume`, { method: 'POST' }),
   checkpoint: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}/checkpoints`, { method: 'POST' }),
   savepoint: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}/savepoints`, { method: 'POST' }),
   upgradeJob: (
@@ -618,8 +839,35 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ action, ...(configVersion ? { config_version: configVersion } : {}) }),
     }),
-  audit: (resourceId?: string) =>
-    request<Page<AuditRecord>>(`/audit${resourceId ? `?resource_id=${encodeURIComponent(resourceId)}` : ''}`),
+  audit: (query: AuditListQuery = {}) => request<Page<AuditRecord>>(withQuery('/audit', query)),
+  // --- Managed users & credentials (Hub only, `manage_users`) -------------
+  users: () => request<User[]>('/users'),
+  createUser: (input: CreateUserInput) =>
+    request<User>('/users', { method: 'POST', body: JSON.stringify(input) }),
+  updateUser: (id: string, input: UpdateUserInput) =>
+    request<User>(`/users/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
+  deleteUser: (id: string) => request<void>(`/users/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  userCredentials: (id: string) => request<CredentialView[]>(`/users/${encodeURIComponent(id)}/credentials`),
+  /** Issues a credential; the plaintext `token` in the response is the only
+   * time the secret leaves the Hub. */
+  issueCredential: (userId: string, input: IssueCredentialInput = {}) =>
+    request<IssuedCredential>(`/users/${encodeURIComponent(userId)}/credentials`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  /** Rotates a credential: the old token stops working, the response carries
+   * the replacement plaintext token once. */
+  rotateCredential: (credentialId: string) =>
+    request<IssuedCredential>(`/credentials/${encodeURIComponent(credentialId)}/rotate`, {
+      method: 'POST',
+    }),
+  /** Idempotent revocation; succeeds even when the credential is already gone. */
+  revokeCredential: (credentialId: string) =>
+    request<unknown>(`/credentials/${encodeURIComponent(credentialId)}`, { method: 'DELETE' }),
+  /** Invalidates every browser session for a user and bumps the validity
+   * boundary, so already-issued tokens stop authenticating too. */
+  revokeUserTokens: (userId: string) =>
+    request<RevokedTokens>(`/users/${encodeURIComponent(userId)}/revoke-tokens`, { method: 'POST' }),
 }
 
 export function streamEvents(
@@ -651,6 +899,9 @@ export function streamEvents(
         }, REQUEST_TIMEOUT_MS)
         let response: Response
         try {
+          // Read the credential per attempt: a token switched at runtime
+          // applies on the next reconnect without recreating the stream.
+          const token = currentBearerToken()
           response = await fetch(`${base}${path}`, {
             headers: {
               Accept: 'text/event-stream',
@@ -841,4 +1092,18 @@ export async function oidcLogout(): Promise<void> {
   await fetch(`${base}/auth/oidc/logout`)
   sessionStorage.removeItem('arkflow_oidc_redirected_at')
   window.location.reload()
+}
+
+/** 401 recovery: the Hub's OIDC login flow keeps its redirect behaviour, but
+ * when no browser login is configured (or the Hub rejected the token the
+ * caller sent) the console asks for a runtime bearer token instead. */
+async function handleUnauthorized(tokenWasSent: boolean): Promise<void> {
+  if (!tokenWasSent) {
+    const status = await oidcStatus()
+    if (status.login_enabled) {
+      await redirectToOidcLogin()
+      return
+    }
+  }
+  publishAuthChallenge({ required: true, tokenRejected: tokenWasSent })
 }

@@ -26,12 +26,19 @@ impl Hub {
         if generation != current.generation {
             return Ok(Some(current));
         }
-        let convergence =
-            if generation == current.generation && current.desired_state == observed_state {
-                "converged"
-            } else {
-                "reconciling"
-            };
+        // A paused Job is stopped on the wire, so string equality between the
+        // desired and observed state never holds: the pause state machine
+        // owns convergence (only a settled `paused` phase counts).
+        let pause_converged = current.desired_state == "paused"
+            && current.pause_phase.as_deref() == Some(super::job_pause::PAUSE_PAUSED)
+            && observed_state == "stopped";
+        let convergence = if generation == current.generation
+            && (current.desired_state == observed_state || pause_converged)
+        {
+            "converged"
+        } else {
+            "reconciling"
+        };
         let updated = if let Some(storage) = &self.storage {
             // The observation is a compare-and-set on the generation the
             // caller read. A concurrent desired-state change or placement

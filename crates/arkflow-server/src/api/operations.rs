@@ -21,6 +21,22 @@ pub(super) async fn hub_operations(
     if let Some(value) = query.operation {
         items.retain(|item| item.operation.as_str() == value);
     }
+    // The Hub's own state set is a superset of the control-plane states the
+    // query accepts; map onto it so the list and total honour the filter.
+    if let Some(state) = query.state {
+        let state = match state {
+            arkflow_core::control::OperationState::Queued => hub::HubOperationState::Queued,
+            arkflow_core::control::OperationState::Running => hub::HubOperationState::Running,
+            arkflow_core::control::OperationState::Succeeded => hub::HubOperationState::Succeeded,
+            arkflow_core::control::OperationState::Failed => hub::HubOperationState::Failed,
+            arkflow_core::control::OperationState::Cancelled => hub::HubOperationState::Cancelled,
+            arkflow_core::control::OperationState::TimedOut => hub::HubOperationState::TimedOut,
+        };
+        items.retain(|item| item.state == state);
+    }
+    if let Some(correlation_id) = query.correlation_id {
+        items.retain(|item| item.correlation_id.as_deref() == Some(correlation_id.as_str()));
+    }
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(50).clamp(1, 100);

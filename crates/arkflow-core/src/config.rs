@@ -213,10 +213,68 @@ pub struct ControlApiConfig {
     /// before it expires (milliseconds). Default 24 hours.
     #[serde(default = "default_approval_ttl_ms")]
     pub approval_ttl_ms: u64,
+    /// Per-credential request rate limiting for the versioned API (see the
+    /// `control-plane-rate-limiting` capability). Default limits sit orders
+    /// of magnitude above legitimate deployment traffic.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 pub fn default_approval_ttl_ms() -> u64 {
     86_400_000
+}
+
+/// Per-credential request rate limiting (`control-plane-rate-limiting`
+/// capability): one token bucket per credential identity with a configured
+/// refill rate and burst capacity. Defaults are deliberately generous — the
+/// limiter protects against runaway clients, not legitimate load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    /// Master switch; `false` restores the pre-limiting behavior exactly.
+    #[serde(default = "default_rate_limit_enabled")]
+    pub enabled: bool,
+    /// Token refill rate per second for operator-credential buckets
+    /// (static/structured credentials and browser sessions).
+    #[serde(default = "default_principal_rps")]
+    pub principal_rps: f64,
+    /// Burst capacity of an operator-credential bucket.
+    #[serde(default = "default_principal_burst")]
+    pub principal_burst: f64,
+    /// Token refill rate per second for agent node buckets. Must cover the
+    /// register/heartbeat/report/commands/observations cadence of one node.
+    #[serde(default = "default_node_rps")]
+    pub node_rps: f64,
+    /// Burst capacity of an agent node bucket.
+    #[serde(default = "default_node_burst")]
+    pub node_burst: f64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rate_limit_enabled(),
+            principal_rps: default_principal_rps(),
+            principal_burst: default_principal_burst(),
+            node_rps: default_node_rps(),
+            node_burst: default_node_burst(),
+        }
+    }
+}
+
+pub fn default_rate_limit_enabled() -> bool {
+    true
+}
+pub fn default_principal_rps() -> f64 {
+    100.0
+}
+pub fn default_principal_burst() -> f64 {
+    200.0
+}
+pub fn default_node_rps() -> f64 {
+    500.0
+}
+pub fn default_node_burst() -> f64 {
+    1000.0
 }
 
 /// Compute-node Agent mode configuration.
@@ -468,6 +526,7 @@ impl Default for ControlApiConfig {
             cors_origins: Vec::new(),
             approval_required: false,
             approval_ttl_ms: default_approval_ttl_ms(),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -715,6 +774,7 @@ mod tests {
                 cors_origins: Vec::new(),
                 approval_required: false,
                 approval_ttl_ms: default_approval_ttl_ms(),
+                rate_limit: RateLimitConfig::default(),
             },
             agent: AgentConfig::default(),
             data_plane: DataPlaneConfig::default(),

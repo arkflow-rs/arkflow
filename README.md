@@ -15,7 +15,7 @@ English | [中文](README_zh.md)
 
 High performance Rust stream processing engine seamlessly integrates AI capabilities, 
 providing powerful real-time data processing and intelligent analysis. 
-It not only supports multiple input/output sources and processors, but also enables easy loading and execution of machine learning models, 
+It not only supports multiple input/output sources and processors, but also integrates LLM, embedding, and vector-search services, 
 enabling streaming data and inference, anomaly detection, and complex event processing.
 
 ##  Cloud Native Landscape
@@ -30,7 +30,7 @@ ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/
 ## Features
 
 - **High Performance**: Built on Rust and Tokio async runtime, offering excellent performance and low latency
-- **Durable Delivery**: At-least-once by default via per-stream WAL durability, with optional exactly-once for transactional sinks
+- **Durable Delivery**: Opt-in per-stream WAL durability for at-least-once delivery, with optional exactly-once for transactional sinks
 - **Multiple Data Sources**: Support for Kafka, MQTT, HTTP, files, SQL databases, and many other input/output sources
 - **Powerful Processing**: Built-in SQL queries, Python UDFs, JSON processing, Protobuf encoding/decoding, batch processing, and VRL
 - **Streaming Codecs**: JSON and Protobuf codecs, plus Debezium CDC envelopes and Confluent Schema Registry wire-format
@@ -209,9 +209,7 @@ output:
     - localhost:9092
   topic:
     type: value
-    value:
-      type: value
-      value: test-topic
+    value: test-topic
   client_id: arkflow-producer
 ```
 

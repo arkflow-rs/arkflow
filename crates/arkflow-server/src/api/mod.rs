@@ -18,8 +18,12 @@ mod jobs;
 mod node_labels_api_tests;
 mod nodes;
 mod operations;
+#[cfg(test)]
+mod principal_echo_api_tests;
+pub(crate) mod rate_limit;
 mod rollouts;
 mod streams;
+mod users;
 mod webhooks;
 #[cfg(test)]
 mod webhooks_api_tests;
@@ -66,6 +70,11 @@ use rollouts::{create_rollout, hub_rollout, hub_rollouts, rollout_action};
 use streams::{
     hub_desired_state, hub_restart_action, hub_stream, hub_streams, hub_targeted_command,
     restart_stream, start_stream, stop_stream, stream, streams,
+};
+use users::{
+    hub_create_credential, hub_create_user, hub_delete_user, hub_revoke_credential,
+    hub_revoke_user_tokens, hub_rotate_credential, hub_update_user, hub_user, hub_user_credentials,
+    hub_users,
 };
 use webhooks::{hub_replace_webhooks, hub_test_webhook, hub_webhooks};
 
@@ -152,6 +161,10 @@ pub struct ServerConfig {
     /// How long a pending approval request stays decidable (milliseconds).
     #[serde(default = "default_approval_ttl_ms")]
     pub approval_ttl_ms: u64,
+    /// Per-credential request rate limiting for the versioned API (see the
+    /// `control-plane-rate-limiting` capability).
+    #[serde(default)]
+    pub rate_limit: arkflow_core::config::RateLimitConfig,
     #[serde(default)]
     pub observability: arkflow_core::config::ObservabilityConfig,
 }
@@ -181,6 +194,7 @@ impl ServerConfig {
             session_ttl_ms: agent.agent_session_ttl_ms,
             approval_required: control_api.approval_required,
             approval_ttl_ms: control_api.approval_ttl_ms,
+            rate_limit: control_api.rate_limit.clone(),
             observability: config.node.observability.clone(),
         }
     }
@@ -264,6 +278,7 @@ impl Default for ServerConfig {
             session_ttl_ms: default_session_ttl_ms(),
             approval_required: false,
             approval_ttl_ms: default_approval_ttl_ms(),
+            rate_limit: arkflow_core::config::RateLimitConfig::default(),
             observability: arkflow_core::config::ObservabilityConfig::default(),
         }
     }
@@ -406,6 +421,14 @@ fn page_items<T>(items: Vec<T>, query: &PageQuery) -> Page<T> {
 
 pub fn router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
     let prefix = config.api_prefix.trim_end_matches('/');
+    // Rate limiting sits inside authentication (every request that reaches it
+    // presented a valid credential) and inside the versioned prefix, so the
+    // outer health/readiness/liveness and top-level `/metrics` stay unlimited.
+    let rate_limiter = rate_limit::RateLimiter::new(
+        rate_limit::Plane::Local,
+        &config.rate_limit,
+        control_plane.credential_enforced(),
+    );
     let api = Router::new()
         .route("/system", get(system))
         .route("/status", get(status))
@@ -444,7 +467,13 @@ pub fn router(control_plane: ControlPlane, config: &ServerConfig) -> Router {
         // write endpoints are protected identically (the old per-handler
         // checks left reads unauthenticated). `route_layer` stays inside the
         // nest, so the outer health/readiness/liveness probes and the
-        // top-level `/metrics` remain unauthenticated by design.
+        // top-level `/metrics` remain unauthenticated by design. Layer order
+        // is reverse-addition: authentication (added last) runs first, then
+        // rate limiting, then the handler.
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit::rate_limit_middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(
             control_plane.clone(),
             local_auth_middleware,
@@ -661,6 +690,27 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         )
         .route("/jobs/{id}/desired-state", put(hub_job_desired_state))
         .route("/jobs/{id}/actions/{action}", post(hub_job_action))
+        .route("/users", get(hub_users).post(hub_create_user))
+        .route(
+            "/users/{user_id}",
+            get(hub_user).patch(hub_update_user).delete(hub_delete_user),
+        )
+        .route(
+            "/users/{user_id}/credentials",
+            get(hub_user_credentials).post(hub_create_credential),
+        )
+        .route(
+            "/users/{user_id}/revoke-tokens",
+            post(hub_revoke_user_tokens),
+        )
+        .route(
+            "/credentials/{credential_id}",
+            delete(hub_revoke_credential),
+        )
+        .route(
+            "/credentials/{credential_id}/rotate",
+            post(hub_rotate_credential),
+        )
         .route("/nodes/{node_id}/streams/{id}", get(hub_stream))
         .route("/nodes/{node_id}/configuration", get(hub_configuration))
         .route(
@@ -738,6 +788,18 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         api
     }
     .with_state(hub.clone())
+    // Layer order is reverse-addition: operator authentication (added last)
+    // runs first, then rate limiting, then the handler. The limiter switches
+    // to the agent key space by path prefix, covering the auth-exempt agent
+    // routes with per-node buckets.
+    .layer(middleware::from_fn_with_state(
+        rate_limit::RateLimiter::new(
+            rate_limit::Plane::Hub,
+            &config.rate_limit,
+            hub.operator_credential_enforced(),
+        ),
+        rate_limit::rate_limit_middleware,
+    ))
     .layer(axum::middleware::from_fn_with_state(
         auth_hub,
         operator_auth_middleware,
@@ -1058,6 +1120,12 @@ pub async fn serve_hub(
                         reconcile_hub.reconcile_job_upgrades().await,
                     );
                     sweep_logged("reconcile_jobs", reconcile_hub.reconcile_jobs().await);
+                    // Pause transitions act on observations the job pass just
+                    // produced (stop aggregation, resumed start convergence).
+                    sweep_logged(
+                        "reconcile_job_pauses",
+                        reconcile_hub.reconcile_job_pauses().await,
+                    );
                     sweep_logged("reconcile_rollouts", reconcile_hub.reconcile_rollouts().await);
                     sweep_logged(
                         "expire_stale_job_operations",
@@ -1084,6 +1152,10 @@ pub async fn serve_hub(
                         continue;
                     }
                     sweep_logged("prune_events", maintenance_hub.prune_events(2048).await);
+                    sweep_logged(
+                        "prune_identity_sessions",
+                        maintenance_hub.prune_identity_sessions().await,
+                    );
                     sweep_logged(
                         "prune_operation_history",
                         maintenance_hub.prune_operation_history().await,
@@ -1313,6 +1385,20 @@ fn hub_problem(error: hub::HubError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE
         }
         hub::HubError::GenerationConflict { .. } => StatusCode::CONFLICT,
+        hub::HubError::JobNotRunning
+        | hub::HubError::PauseInProgress
+        | hub::HubError::JobAlreadyPaused
+        | hub::HubError::PauseNotPaused
+        | hub::HubError::JobPaused
+        | hub::HubError::PauseRequiresRecoveryPolicy
+        | hub::HubError::JobPauseConflict => StatusCode::CONFLICT,
+        hub::HubError::PauseRequiresDurableStorage | hub::HubError::IdentityStoreUnavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        hub::HubError::LastAdminRequired
+        | hub::HubError::UserLimit
+        | hub::HubError::CredentialLimit
+        | hub::HubError::OidcSubjectConflict => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
     let code = match error {
@@ -1321,6 +1407,19 @@ fn hub_problem(error: hub::HubError) -> Response {
         hub::HubError::StaleLeader { .. } => "stale_leader",
         hub::HubError::StorageUnavailable | hub::HubError::Storage(_) => "storage_unavailable",
         hub::HubError::GenerationConflict { .. } => "generation_conflict",
+        hub::HubError::JobNotRunning => "job_not_running",
+        hub::HubError::PauseInProgress => "pause_in_progress",
+        hub::HubError::JobAlreadyPaused => "job_already_paused",
+        hub::HubError::PauseNotPaused => "pause_not_paused",
+        hub::HubError::JobPaused => "job_paused",
+        hub::HubError::PauseRequiresRecoveryPolicy => "pause_requires_recovery_policy",
+        hub::HubError::PauseRequiresDurableStorage => "pause_requires_durable_storage",
+        hub::HubError::JobPauseConflict => "pause_conflict",
+        hub::HubError::IdentityStoreUnavailable => "identity_store_unavailable",
+        hub::HubError::LastAdminRequired => "last_admin_required",
+        hub::HubError::UserLimit => "user_limit",
+        hub::HubError::CredentialLimit => "credential_limit",
+        hub::HubError::OidcSubjectConflict => "oidc_subject_conflict",
         _ => "agent_request_rejected",
     };
     problem(status, code, error.to_string().chars().take(256).collect())

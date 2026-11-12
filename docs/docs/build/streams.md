@@ -124,5 +124,5 @@ see the [CLI reference](../reference/cli.md).
 ## Next steps
 
 - [Streaming jobs](./jobs.md) — multi-step DAGs with event time and state.
-- [Components](../components.md) — browse all 41 registered components.
+- [Components](../components.md) — browse all 50 registered components.
 - [Top-level configuration](../reference/configuration.md) — every engine option.

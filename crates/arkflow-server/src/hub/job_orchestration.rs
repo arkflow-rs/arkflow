@@ -598,6 +598,13 @@ impl Hub {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: now,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         };
         match self
             .update_job_with_expected_generation(upgraded, job.generation)
@@ -808,6 +815,13 @@ impl Hub {
             checkpoint_id: None,
             last_error: None,
             updated_at_ms: now,
+
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
         };
         match self
             .update_job_with_expected_generation(restored, job.generation)

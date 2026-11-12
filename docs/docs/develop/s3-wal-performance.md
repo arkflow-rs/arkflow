@@ -329,26 +329,24 @@ will be lower than these synthetic benchmarks but still substantial.
 
 | Metric | Description | Alert Threshold |
 |--------|-------------|-----------------|
-| `segment_put_latency` | Time to PUT a segment | >500ms p99 |
-| `segment_put_frequency` | PUTs per second | >10/sec (may need tuning) |
-| `segment_size` | Average segment bytes | `<100KB or >10MB` |
-| `cursor_lag` | Cursor vs max written seq | >10,000 entries |
-| `recovery_latency` | Time to replay WAL on startup | >5s |
+| `arkflow_stream_wal_flush_failures_total` | Background flush failures of the stream's input WAL | any increase |
+| `arkflow_job_wal_flush_failures_total` | Background flush failures of a Job's input WAL | any increase |
 
 ### Logging
 
 Key log lines to monitor:
 
 ```
-[DEBUG] Sealing segment: entries={n}, bytes={size}
-[INFO]  Segment PUT complete: {segment_key}, {size} bytes in {duration_ms}ms
-[INFO]  Recovery: replayed {n} entries from {m} segments in {duration_ms}ms
-[WARN]  Segment PUT failed: {error}, retrying...
+[DEBUG] PUT worker {id} uploaded segment {segment_index}
+[ERROR] PUT worker {id} segment {segment_index} failed: {error}
+[WARN]  manifest write recovered after contention
+[WARN]  manifest write experiencing sustained contention (>= 3 retries)
+[WARN]  manifest backend does not support conditional PUT; falling back to unconditional Overwrite — coordination disabled, concurrent writers may lose updates
 ```
 
 ## References
 
-- User-facing tuning guide: `docs/docs/components/0-inputs/wal-optimization.md`
+- User-facing tuning guide: `docs/docs/build/wal.md`
 - Design: `openspec/changes/archive/2026-07-27-add-wal-s3-backend/design.md`
 - Design: `openspec/changes/archive/2026-07-28-comprehensive-wal-optimization/design.md`
 - Spec: `openspec/specs/input-durability/spec.md`

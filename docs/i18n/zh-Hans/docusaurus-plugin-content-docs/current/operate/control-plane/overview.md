@@ -29,6 +29,34 @@ ArkFlow 提供一个可选的控制平面,用于把多个计算节点当作机�
 顶层 `/metrics`,它对抓取器保持免 token)。健康探针 `/health`、`/readiness`、`/liveness`
 同样保持免认证,以便编排系统探测。
 
+## 认证与身份
+
+在 Bearer 边界之后,Hub 按以下顺序通过分层身份来源解析请求所出示的凭证:
+
+1. **静态 operator 凭证**(`ARKFLOW_OPERATOR_TOKEN`)——兼容与应急(break-glass)访问;
+2. 从 Hub 用户目录签发的**托管 per-user 凭证**(token 形如
+   `ark_<credential_id>_<secret>`,Hub 只保存哈希);
+3. 由 OIDC 登录流创建的**浏览器会话**;
+4. 针对所配置身份提供方校验的 **OIDC Bearer JWT**。
+
+各层可以叠加:没有目录、也没有 OIDC 时,静态凭证就是全部;配置 OIDC 后,人工访问
+可迁移到身份提供方,静态凭证继续用于自动化与恢复。每一层都默认拒绝(fail-closed);
+看起来像托管凭证的 token 绝不会再当作 JWT 重试——已吊销、已过期或未知的托管 token
+一律硬性 `401`,解析期间存储故障同样如此。
+
+授权基于角色:`admin`、`operator`、`viewer`,并可由资源 scope 进一步收窄。
+`GET /api/v1/system` 回显的动作(`read`、`operate`、`configure`、`manage_nodes`、
+`manage_rollouts`、`manage_webhooks`、`approve_rollouts`、`read_audit`、
+`manage_users`)与 Hub 执行变更时使用的判据是同一套。`manage_users` 动作仅由
+`admin` 持有,用于门控托管身份 API:用户 CRUD、凭证签发/轮换/吊销与令牌吊销。
+
+托管身份需要持久化存储——易失(volatile)Hub 在这些路由上返回
+`503 identity_store_unavailable`,托管凭证也无法完成认证。改变身份的运维动作
+(创建/更新/删除用户,签发/轮换/吊销凭证,吊销令牌)只以标量元数据进入审计,
+绝不包含 secret 材料。完整生命周期——引导与应急访问、一次性明文 token、OIDC
+subject 绑定、JWT 吊销与会话持久化——见
+[用户与凭证](./users-and-credentials.md)。
+
 ## API 端点
 
 资源端点包括 `/api/v1/system`、`/nodes`、分页的 `/streams`、`/operations`、`/events`、
@@ -82,6 +110,7 @@ Hub 在两个层次上调和**期望与观测**状态:
 ## 后续步骤
 
 - [部署](./deploy.md) —— 运行 Hub、计算节点与控制台。
+- [用户与凭证](./users-and-credentials.md) —— 托管身份目录。
 - [运维](./operations.md) —— 上线后的运维手册。
 - [HTTP API v1](/zh-Hans/docs/reference/api) —— 端点参考。
 - [调和灰度发布与恢复](./reconciliation.md)。

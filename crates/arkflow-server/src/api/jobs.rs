@@ -88,7 +88,7 @@ pub(super) async fn hub_job_action(
     Path((job_id, action)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::Operate,
@@ -97,21 +97,8 @@ pub(super) async fn hub_job_action(
     )
     .await
     {
-        return response;
-    }
-    if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
-        return response;
-    }
-    let state = match action.as_str() {
-        "start" | "restart" => "running",
-        "stop" => "stopped",
-        _ => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "invalid_job_action",
-                "action must be start, stop, or restart".into(),
-            )
-        }
+        Ok(principal) => principal,
+        Err(response) => return response,
     };
     let current = match hub.job(&job_id).await {
         Ok(Some(job)) => job,
@@ -124,18 +111,110 @@ pub(super) async fn hub_job_action(
         }
         Err(error) => return hub_problem(error),
     };
-    match hub
-        .update_job_desired_state(&job_id, state, current.generation)
-        .await
-    {
-        Ok(Some(job)) => Json(job).into_response(),
-        Ok(None) => problem(
-            StatusCode::NOT_FOUND,
-            "job_not_found",
-            format!("Unknown Job {job_id}"),
+    let pausing = current.pause_phase.is_some();
+    match action.as_str() {
+        "pause" => match hub.pause_job(&job_id, &principal.id).await {
+            Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+            Err(error) => {
+                pause_action_rejection(&hub, &job_id, "job.pause", &principal.id, error).await
+            }
+        },
+        "resume" => match hub.resume_job(&job_id, &principal.id).await {
+            Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+            Err(error) => {
+                pause_action_rejection(&hub, &job_id, "job.resume", &principal.id, error).await
+            }
+        },
+        // A paused Job only understands resume/stop: start and restart both
+        // mean "bring the paused Job back", and stop settles it as stopped.
+        "start" | "restart" if pausing => match hub.resume_job(&job_id, &principal.id).await {
+            Ok(job) => Json(job).into_response(),
+            Err(error) => {
+                pause_action_rejection(&hub, &job_id, "job.resume", &principal.id, error).await
+            }
+        },
+        "stop" if pausing => match hub.stop_paused_job(&job_id, &principal.id).await {
+            Ok(job) => Json(job).into_response(),
+            Err(error) => {
+                pause_action_rejection(&hub, &job_id, "job.stop", &principal.id, error).await
+            }
+        },
+        "start" | "restart" | "stop" => {
+            if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
+                return response;
+            }
+            let state = if action == "stop" {
+                "stopped"
+            } else {
+                "running"
+            };
+            match hub
+                .update_job_desired_state(&job_id, state, current.generation)
+                .await
+            {
+                Ok(Some(job)) => Json(job).into_response(),
+                Ok(None) => problem(
+                    StatusCode::NOT_FOUND,
+                    "job_not_found",
+                    format!("Unknown Job {job_id}"),
+                ),
+                Err(error) => hub_problem(error),
+            }
+        }
+        _ => problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_action",
+            "action must be start, stop, restart, pause, or resume".into(),
         ),
-        Err(error) => hub_problem(error),
     }
+}
+
+/// Stable problem mapping for pause/resume rejections, plus a persisted audit
+/// record carrying the real actor (the shared lifecycle audit helper owns no
+/// actor yet).
+async fn pause_action_rejection(
+    hub: &hub::Hub,
+    job_id: &str,
+    action: &str,
+    actor: &str,
+    error: hub::HubError,
+) -> Response {
+    let (status, code) = match &error {
+        hub::HubError::JobNotRunning => (StatusCode::CONFLICT, "job_not_running"),
+        hub::HubError::PauseInProgress => (StatusCode::CONFLICT, "pause_in_progress"),
+        hub::HubError::JobAlreadyPaused => (StatusCode::CONFLICT, "job_already_paused"),
+        hub::HubError::PauseNotPaused => (StatusCode::CONFLICT, "pause_not_paused"),
+        hub::HubError::JobPaused => (StatusCode::CONFLICT, "job_paused"),
+        hub::HubError::PauseRequiresRecoveryPolicy => {
+            (StatusCode::CONFLICT, "pause_requires_recovery_policy")
+        }
+        hub::HubError::PauseRequiresDurableStorage => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pause_requires_durable_storage",
+        ),
+        hub::HubError::JobPauseConflict => (StatusCode::CONFLICT, "pause_conflict"),
+        hub::HubError::OrchestrationInProgress => {
+            (StatusCode::CONFLICT, "orchestration_in_progress")
+        }
+        hub::HubError::GenerationConflict { .. } => (StatusCode::CONFLICT, "generation_conflict"),
+        hub::HubError::NotFound => (StatusCode::NOT_FOUND, "job_not_found"),
+        hub::HubError::StorageUnavailable | hub::HubError::Storage(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+        }
+        hub::HubError::StaleLeader { .. } => (StatusCode::SERVICE_UNAVAILABLE, "stale_leader"),
+        _ => (StatusCode::CONFLICT, "agent_request_rejected"),
+    };
+    hub.record_pause_outcome("rejected");
+    hub.record_job_pause_audit(
+        action,
+        job_id,
+        actor,
+        "rejected",
+        Some(code),
+        format!("{action} rejected: {code}"),
+    )
+    .await;
+    problem(status, code, error.to_string().chars().take(256).collect())
 }
 
 pub(super) async fn hub_job_checkpoint(
@@ -431,6 +510,13 @@ pub(super) async fn hub_job_upgrade(
     if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
         return response;
     }
+    if current.pause_phase.is_some() {
+        return problem(
+            StatusCode::CONFLICT,
+            "job_paused",
+            "Resume or stop the paused Job before upgrading it".into(),
+        );
+    }
     let mode = request.mode.as_deref().unwrap_or("stopped");
     if !matches!(mode, "stopped" | "atomic") {
         return problem(
@@ -584,6 +670,13 @@ pub(super) async fn hub_job_upgrade(
         checkpoint_id: Some(checkpoint.checkpoint_id.clone()),
         last_error: None,
         updated_at_ms: hub::now_ms_for_metrics(),
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     };
     // The generation fence covers the whole read-validate-write sequence: a
     // concurrent mutation that bumped the generation must surface as a
@@ -760,6 +853,13 @@ pub(super) async fn hub_job_upgrade_rollback(
         checkpoint_id: current.checkpoint_id,
         last_error: None,
         updated_at_ms: hub::now_ms_for_metrics(),
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     };
     // Same generation fence as the upgrade path: the version list may have
     // been read before a concurrent mutation bumped the generation.
@@ -1015,6 +1115,13 @@ pub(super) async fn hub_create_job(
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: hub::now_ms_for_metrics(),
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     };
     match hub.upsert_job(job).await {
         Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
@@ -1028,7 +1135,7 @@ pub(super) async fn hub_job_desired_state(
     headers: HeaderMap,
     Json(request): Json<JobDesiredStateRequest>,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::Operate,
@@ -1037,13 +1144,14 @@ pub(super) async fn hub_job_desired_state(
     )
     .await
     {
-        return response;
-    }
-    if !matches!(request.state.as_str(), "stopped" | "running") {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if !matches!(request.state.as_str(), "stopped" | "running" | "paused") {
         return problem(
             StatusCode::BAD_REQUEST,
             "invalid_job_state",
-            "state must be stopped or running".into(),
+            "state must be stopped, running, or paused".into(),
         );
     }
     if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
@@ -1060,10 +1168,31 @@ pub(super) async fn hub_job_desired_state(
         }
         Err(error) => return hub_problem(error),
     };
-    match hub
+    // `paused` is the pause intent; `running`/`stopped` on a paused Job go
+    // through the pause state machine so the bookkeeping is cleared with the
+    // mutation rather than left stale. These branches must reject exactly
+    // like the pause actions route: same audit records and rejection metric
+    // via `pause_action_rejection`.
+    let pausing = current.pause_phase.is_some();
+    let paused_action = match request.state.as_str() {
+        "paused" => Some(("job.pause", hub.pause_job(&job_id, &principal.id).await)),
+        "running" if pausing => Some(("job.resume", hub.resume_job(&job_id, &principal.id).await)),
+        "stopped" if pausing => Some((
+            "job.stop",
+            hub.stop_paused_job(&job_id, &principal.id).await,
+        )),
+        _ => None,
+    };
+    if let Some((action, outcome)) = paused_action {
+        return match outcome {
+            Ok(job) => Json(job).into_response(),
+            Err(error) => pause_action_rejection(&hub, &job_id, action, &principal.id, error).await,
+        };
+    }
+    let result = hub
         .update_job_desired_state(&job_id, request.state.as_str(), current.generation)
-        .await
-    {
+        .await;
+    match result {
         Ok(Some(job)) => Json(job).into_response(),
         Ok(None) => problem(
             StatusCode::NOT_FOUND,

@@ -14,7 +14,21 @@ const COMMAND_METRIC_BUCKETS_MS: &[u64] = &[5, 10, 25, 50, 100, 250, 500, 1000, 
 pub struct CommandMetrics {
     latencies: std::sync::Mutex<BTreeMap<String, CommandLatency>>,
     outcomes: std::sync::Mutex<BTreeMap<(String, String), u64>>,
+    /// Durable Job pause/resume outcomes (see `job-pause-resume`). The label
+    /// vocabulary is closed: `requested`, `paused`, `resumed`, `failed`,
+    /// `rejected`.
+    pause_outcomes: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// Operator authentication outcomes by source (closed vocabulary).
+    auth_outcomes: std::sync::Mutex<BTreeMap<(String, String), u64>>,
 }
+
+/// Closed label set for the pause outcome counter.
+pub(crate) const PAUSE_OUTCOMES: &[&str] =
+    &["requested", "paused", "resumed", "failed", "rejected"];
+
+/// Closed label sets for the operator-authentication counter.
+pub(crate) const AUTH_SOURCES: &[&str] = &["static", "managed", "oidc", "session", "anonymous"];
+pub(crate) const AUTH_OUTCOMES: &[&str] = &["ok", "denied"];
 
 #[derive(Default)]
 struct CommandLatency {
@@ -118,6 +132,50 @@ impl CommandMetrics {
                 ));
             }
         }
+        if let Ok(auth) = self.auth_outcomes.lock() {
+            for source in AUTH_SOURCES {
+                for outcome in AUTH_OUTCOMES {
+                    if let Some(total) = auth.get(&((*source).to_owned(), (*outcome).to_owned())) {
+                        body.push_str(&format!(
+                            "arkflow_operator_auth_total{{source=\"{source}\",outcome=\"{outcome}\"}} {total}\n"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Ok(pauses) = self.pause_outcomes.lock() {
+            for outcome in PAUSE_OUTCOMES {
+                if let Some(total) = pauses.get(*outcome) {
+                    body.push_str(&format!(
+                        "arkflow_job_pause_total{{outcome=\"{outcome}\"}} {total}\n"
+                    ));
+                }
+            }
+        }
         body
+    }
+
+    /// Record one operator authentication outcome; unknown labels are
+    /// dropped so the series space stays closed.
+    pub(crate) fn record_auth_outcome(&self, source: &str, outcome: &str) {
+        if !AUTH_SOURCES.contains(&source) || !AUTH_OUTCOMES.contains(&outcome) {
+            return;
+        }
+        if let Ok(mut outcomes) = self.auth_outcomes.lock() {
+            *outcomes
+                .entry((source.to_owned(), outcome.to_owned()))
+                .or_insert(0) += 1;
+        }
+    }
+
+    /// Record a durable Job pause/resume outcome; unknown labels are dropped
+    /// so the series space stays closed.
+    pub(crate) fn record_pause_outcome(&self, outcome: &str) {
+        if !PAUSE_OUTCOMES.contains(&outcome) {
+            return;
+        }
+        if let Ok(mut outcomes) = self.pause_outcomes.lock() {
+            *outcomes.entry(outcome.to_owned()).or_insert(0) += 1;
+        }
     }
 }

@@ -8,7 +8,10 @@ Kubernetes 安装推荐使用 [Helm Chart](../helm.md) 的 `control-plane` 模�
 `node_token` 启动每个计算节点。然后用 `cd console && npm ci && npm run build` 构建控制台,
 并通过受保护的反向代理提供 `console/dist`。开发用 Vite 服务器把 `/api` 与 `/metrics` 代理到
 `127.0.0.1:8080`;生产环境应保持同源路径,仅在 API 前缀不同时才设置 `VITE_API_BASE`。
-仅当 ArkFlow 监听器配置了运维凭据时,才在受控的构建环境中设置 `VITE_API_TOKEN`。
+`VITE_API_TOKEN` 只是控制台的构建期默认值:API 返回 `401` 且未配置 OIDC 登录流时,
+控制台会索要 Bearer 凭证并保存在 `sessionStorage`(绝不使用 `localStorage`),因此
+生产构建不必把 token 打进 bundle。仅当 ArkFlow 监听器配置了运维凭据时,才在受控的
+构建环境中设置 `VITE_API_TOKEN`。
 兼容凭据可以是原始令牌(admin),也可以是 `principal|role|secret`,例如
 `readonly|viewer|viewer-secret`;viewer 凭据可以读取资源与审计历史,但不能变更 Stream、节点或灰度发布。包含 `|` 但解析失败的值(未知角色、空字段、字段数错误)会在启动期以脱敏报错拒绝,而不会静默降级为 admin 凭据。
 
@@ -30,6 +33,42 @@ arkflow-server migrate --from sqlite:/var/lib/arkflow/hub.sqlite \
 
 该工具按外键序以 1000 行事务逐表拷贝 `cp_*` 表,把 identity 序列重置到已迁移最大 id 之上,任何行数不一致都会非零退出。迁移成功后再把 `ARKFLOW_HUB_STORAGE` 指向 PostgreSQL URL 并重启 Hub。全新的 PostgreSQL 部署不需要该工具——启动 DDL 会创建 schema。
 
+### 备份与恢复
+
+`arkflow-server backup` 把控制面存储生成一份一致性快照(单个 SQLite 数据库文件);`arkflow-server restore` 把快照导入空库。两者都是离线 CLI 子命令——从不与运行中的 Hub 通信。
+
+```bash
+arkflow-server backup --from /var/lib/arkflow/hub.sqlite --to /backups/hub-2026-10-31.sqlite
+arkflow-server backup --from postgres://user:pass@db/hub --to /backups/hub-2026-10-31.sqlite
+arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to /var/lib/arkflow/hub.sqlite
+arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to postgres://user:pass@db/hub-restored
+```
+
+存储参数沿用 `ARKFLOW_HUB_STORAGE` 的 scheme 分派(`postgres://` URL 或 SQLite 路径),因此源与目标后端任意组合均可用:无论源后端是什么,快照恒为 SQLite 数据库文件。
+
+一致性语义:
+
+- **SQLite 源**:快照经 storage actor 串行化连接执行 `VACUUM INTO` 产生——捕获的行数与文件拷贝共享同一锁窗口。若 Hub 在另一个进程中持续写同一存储文件,备份期间落进来的写会使行数校验失败;此时在写入静止后重试或先停 Hub。失败的尝试不会留下半成品快照文件。
+- **PostgreSQL 源**:所有表都在单个 `REPEATABLE READ` 事务内读取,快照反映跨表同一时间点。长读会持有 MVCC 快照;建议低峰备份。目标数据库必须已存在——该工具建表,不建库。
+- 每张表的行数在命令报告成功前逐表校验;任何不一致都会以指明问题表的方式失败。
+
+快照属性:
+
+- 租约表(`cp_hub_lease`)永不进快照:恢复后的 Hub 经既有比较交换路径重建租约,陈旧的 fencing epoch 不会随恢复存活。
+- 托管身份表 `cp_users` 与 `cp_credentials` 会随快照/迁移/恢复拷贝——用户、角色、scope、OIDC 绑定、吊销阈值与凭证哈希都能在灾难恢复后保留。浏览器会话(`cp_sessions`)则有意排除:会话 id 是活跃的 Bearer secret,灾难恢复后让旧登录复活是安全反模式。
+- 快照携带源库当时的 schema 版本。比运行中二进制更新的快照在恢复时被拒绝;更旧的快照在拷贝前经正常的打开时迁移路径升级。
+
+恢复要求:
+
+- 目标必须为空。`restore` 先检查所有业务表,任一已含行都会拒绝——逐个列出非空表——并且不写任何数据。
+- 先停止针对目标数据库的每一个 Hub 实例——空闲的 Hub 不持任何锁、不会被检出,这条规则仍由运维承担。恢复确实强制的部分:SQLite 侧以单个 immediate 事务执行,PostgreSQL 侧在其单个事务内对每张业务表加 `ACCESS EXCLUSIVE ... NOWAIT` 锁——此刻有活动事务的 Hub 会让恢复立刻以 busy 错误失败,恢复期间没有写入者能插进来,且任何失败都会整体回滚,重试总是从干净空库开始。
+- identity 序列重置到已恢复最大 id 之上,恢复出的存储立即可接受新事件与 outbox 行;未处理的 reconciliation intents 在 Hub 于恢复库上启动后经既有恢复路径重放。
+- SQLite 目标必须已经是控制面数据库(或全新路径)——该命令拒绝往无关的 SQLite 文件里建 `cp_*` 表。
+
+调度:该工具只做单次一致性快照;定时备份、轮换与保留策略属于调度层(cron、Kubernetes CronJob)。
+
+**快照密级**:快照包含存储里的一切,包括配置版本 payload 原文与托管身份表(用户元数据、审计历史,以及凭证**哈希**——绝不含明文 token)。secret 引用(`secret:`/`env:`/`file:`)保持未解析形态,但 operator 写入配置的**字面**凭据会明文进入快照。请按数据库同等的密级保管快照文件(文件系统权限、加密存储)。
+
 ### TLS
 
 **控制面。**同时设置 `ARKFLOW_HUB_TLS_CERT` 与 `ARKFLOW_HUB_TLS_KEY`(PEM 文件路径),Hub 即以 TLS 承载全部请求——路由、认证与 readiness 语义不变。只配置其一会拒绝启动。Agent 用 `hub_urls` 中的 `https://` 条目访问 TLS Hub,无需额外配置。未同时配置时保持明文监听,行为与之前逐字节一致。
@@ -48,6 +87,34 @@ openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
 ```
 
 请在全部计算节点上启用 TLS 后再依赖 split 放置:滚动启用期间明文与 TLS 节点互连失败(连接 fail-closed)。证书轮换意味着重启进程(自动续期不在范围内)。
+
+### 限速
+
+两个控制面都对版本化 API 按凭证限速(健康探针、`/metrics`、OIDC 登录流豁免)。桶是以哈希凭证为键的令牌桶:每个 operator 凭证或浏览器会话一桶,每个 agent 节点一桶。桶表容量有界——呈现超过上限的不同凭证数的流量共享一个慢速 catch-all 桶,伪造凭证洪泛无法撑大内存。超限请求收到带 `Retry-After` 头的 `429`,并计入 `arkflow_control_plane_rate_limit_rejections_total` 指标。
+
+Hub 环境变量:
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ARKFLOW_RATE_LIMIT_ENABLED` | `true` | 总开关;`false` 精确恢复不限速处理。 |
+| `ARKFLOW_RATE_LIMIT_PRINCIPAL_RPS` | `100` | 每个 operator 凭证/浏览器会话的每秒令牌补充速率。 |
+| `ARKFLOW_RATE_LIMIT_PRINCIPAL_BURST` | `200` | principal 桶的突发容量。 |
+| `ARKFLOW_RATE_LIMIT_NODE_RPS` | `500` | 每个 agent 节点的每秒令牌补充速率;须覆盖 register/heartbeat/report/commands/observations 的节奏。 |
+| `ARKFLOW_RATE_LIMIT_NODE_BURST` | `1000` | node 桶的突发容量。 |
+
+standalone(本地)节点在 `health_check.rate_limit` 下配置同一组参数(control_api 节已 flatten 并入 `health_check`):
+
+```yaml validate=full
+health_check:
+  rate_limit:
+      enabled: true
+      principal_rps: 100
+      principal_burst: 200
+      node_rps: 500
+      node_burst: 1000
+```
+
+默认值比合法流量(含默认 1s agent 轮询节奏)高出两个数量级;配置出非正数或非有限值时回退默认值并记录启动告警。
 
 ### Hub 高可用(租约选主)
 
@@ -92,7 +159,7 @@ health_check:
 
 单条目的 `hub_urls` 与原先单地址配置行为完全一致——包括有界、带抖动的重连退避。
 
-### OIDC JWT 联邦
+### OIDC JWT 联邦 {#oidc-jwt-federation}
 
 除了(或配合)静态运维凭据,Hub 还接受由组织 OIDC 身份提供方签发的 bearer JWT。通过环境变量配置:
 
@@ -104,6 +171,7 @@ health_check:
 | `ARKFLOW_OIDC_JWKS_REFRESH_MS` | 否 | JWKS 周期性整表刷新间隔(毫秒,默认 3600000,最小 1000)。刷新会吊销 IdP 已轮换移除的签名密钥;刷新失败时保留旧密钥集并记录告警。 |
 | `ARKFLOW_OIDC_ROLE_CLAIM` | 否 | 携带角色的 claim;缺省为 `roles`。 |
 | `ARKFLOW_OIDC_SCOPES_CLAIM` | 否 | 携带资源 scope 的 claim;缺省为 `scopes`。 |
+| `ARKFLOW_OIDC_MANAGED_USERS_ONLY` | 否 | 设为 `true` 时要求每个联邦 subject 都绑定到 Hub 用户(`oidc_subject`);未绑定的 subject 不再走 claim 映射,而是收到 `401`。默认 `false`。见 [用户与凭证](./users-and-credentials.md#oidc-binding-and-revocation)。 |
 | `ARKFLOW_OIDC_CLIENT_ID` | 登录流 | 浏览器授权码流的 OAuth2 client id。 |
 | `ARKFLOW_OIDC_CLIENT_SECRET` | 登录流 | OAuth2 client secret。 |
 | `ARKFLOW_OIDC_REDIRECT_URI` | 登录流 | 已注册的重定向 URI,例如 `https://hub.example.com/api/v1/auth/oidc/callback`。 |
@@ -120,16 +188,20 @@ health_check:
   cookie(redirect URI 为 https 时附加 `Secure`)。
 - `GET /api/v1/auth/oidc/logout` —— 删除服务端会话并清除 cookie。
 
-浏览器会话与其他凭据走同一套 RBAC 模型(角色来自角色 claim)。Console
+浏览器会话与其他凭据走同一套 RBAC 模型:角色来自角色 claim,除非该 subject 已绑定到
+托管用户——此时以目录的角色与 scope 为准(见
+[用户与凭证](./users-and-credentials.md))。Console
 会自动集成:它探测 `GET /api/v1/auth/oidc/status`(公开端点,报告
 `login_enabled`、`authenticated` 与 principal),遇到 401 时跳转到登录
 流,并为已认证会话显示登出控件。`VITE_API_TOKEN` 部署保持不变——配置了
-静态令牌时控制台不会重定向。会话
-保存在内存中:重启 Hub 会强制所有人重新登录,也没有吊销列表——建议在
-身份提供方侧签发短时令牌。未配置 client 变量时 Hub 保持仅 bearer 模式,
-登录路由不存在。
+静态令牌时控制台不会重定向——控制台也可以在运行期输入 Bearer 凭证,而无需构建期注入。
+Hub 具备持久化存储时会话落盘(`cp_sessions`,schema v5):跨 Hub 重启存活,
+登出即删除,用户被禁用、删除或调用 `POST /api/v1/users/{id}/revoke-tokens`
+时立即失效。易失 Hub 保持旧的纯内存行为,重启即登出所有人。备份与恢复有意
+排除 `cp_sessions`,因此灾难恢复绝不会让旧登录复活。未配置 client 变量时 Hub
+保持仅 bearer 模式,登录路由不存在。
 
-claims 映射到既有 RBAC 模型:`sub` 作为主 id;角色 claim 接受数组或单个字符串(`admin`、`operator`、`viewer`,取最高匹配角色);scope claim(数组或逗号分隔)沿用与静态凭据相同的 `type=id` 文法,例如 `["node=node-a", "stream"]`。仅接受非对称算法(ES256/RS256);签名、有效期、签发方与受众全部校验,JWKS 带缓存并在出现未知 key id 时按需刷新。建议在身份提供方侧签发短时令牌——Hub 没有吊销列表。配置了静态凭据时它仍然生效,因此自动化用的应急令牌可以保留,人工访问则迁移到身份提供方。
+claims 映射到既有 RBAC 模型:`sub` 作为主 id;角色 claim 接受数组或单个字符串(`admin`、`operator`、`viewer`,取最高匹配角色);scope claim(数组或逗号分隔)沿用与静态凭据相同的 `type=id` 文法,例如 `["node=node-a", "stream"]`。仅接受非对称算法(ES256/RS256);签名、有效期、签发方与受众全部校验,JWKS 带缓存并在出现未知 key id 时按需刷新。绑定到托管用户(`oidc_subject`)的 subject 改由目录治理:角色与 scope 取自用户记录,已禁用用户被 `401` 拒绝,`iat` 早于用户 `tokens_valid_after_ms`(60 秒时钟偏斜容差)的 token 被拒绝,绑定用户缺少 `iat` 的 token 直接拒绝。设置 `ARKFLOW_OIDC_MANAGED_USERS_ONLY=true` 可要求每个联邦 subject 都必须绑定。建议在身份提供方侧签发短时令牌,并用托管目录的 `revoke-tokens` 对已签发 JWT 与会话做集中吊销。配置了静态凭据时它仍然生效,因此自动化用的应急令牌可以保留,人工访问则迁移到身份提供方。
 
 自带的 `console/Dockerfile` 构建静态资源并通过 Nginx 提供服务。其 `/api/` 与 `/metrics`
 位置代理到 `arkflow-hub:8080` 服务;请将其部署在带有 TLS 和认证层的私有网络上。

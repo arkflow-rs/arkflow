@@ -4,9 +4,11 @@ Define the operator-facing Console for discovering, observing, and administering
 ## Requirements
 ### Requirement: Operations application shell
 
-The console SHALL provide persistent navigation and route-level pages for Overview, Runtime, Configuration, Components, Events, and Settings. It SHALL show global connection, permission, stale-data, loading, empty, and error states. The console SHALL use the same node collection contract in local and Hub mode, SHALL persist the selected `node_id` as a query parameter in the current URL state, and SHALL address each page by URL path (e.g. `/jobs`), support browser back and forward navigation, and redirect legacy `?page=` links to the corresponding path. When live updates arrive over SSE, the console SHALL refresh live resources (system, nodes, streams, jobs, operations, events, metrics, tracked operation and rollout details) without discarding local editing state such as configuration drafts, and SHALL poll live resources on their configured intervals.
+The console SHALL provide persistent navigation and route-level pages for Overview, Runtime, Configuration, Components, Events, and Settings, plus Jobs, Rollouts, Approvals, and Audit when reachable. It SHALL show global connection, permission, stale-data, loading, empty, and error states. The console SHALL use the same node collection contract in local and Hub mode, SHALL persist the selected `node_id` as a query parameter in the current URL state, and SHALL address each page by URL path (e.g. `/jobs`), support browser back and forward navigation, and redirect legacy `?page=` links to the corresponding path. When live updates arrive over SSE, the console SHALL refresh live resources (system, nodes, streams, jobs, operations, events, metrics, tracked operation and rollout details) without discarding local editing state such as configuration drafts, and SHALL poll live resources on their configured intervals.
 
 Every live resource the overview loads SHALL resolve against a healthy Hub exactly as against a local control plane: the console MUST NOT poll endpoints that exist only in local mode, and a fully healthy deployment MUST NOT produce a persistent stale-data banner. When the system identity advertises High-Availability information, the console SHALL present the leadership role (leader or standby) with its epoch; when the control plane rejects requests with the `hub_standby` problem code, the console SHALL show a dedicated standby state that names the condition and advises retrying against the elected leader, while continuing to poll so the state self-clears when the connected Hub acquires the lease.
+
+Navigation SHALL reflect the reachability advertised by the system identity's capabilities: pages whose backing APIs exist only in Hub mode (Jobs, Rollouts, Approvals, Audit, and the webhook management area of Settings) SHALL NOT be offered as navigation entries in local mode, and opening such a page by URL in local mode SHALL render an explainer state naming the Hub-only requirement instead of an error. Until the system identity resolves, the console SHALL render the full navigation so capabilities-dependent hiding causes no startup flash.
 
 #### Scenario: Open the overview
 
@@ -53,21 +55,34 @@ Every live resource the overview loads SHALL resolve against a healthy Hub exact
 - **WHEN** the system identity reports HA enabled with role and epoch
 - **THEN** the overview displays the leadership role and epoch alongside system identity
 
+#### Scenario: Local mode hides Hub-only pages
+
+- **WHEN** the console is connected to a local control plane whose capabilities lack the Hub fleet markers
+- **THEN** navigation omits Jobs, Rollouts, Approvals, and Audit, Settings omits its webhook management area, and opening any of those paths renders an explainer state naming the Hub-only requirement
+
 ### Requirement: Runtime administration
 
-The Runtime page SHALL support filtering and pagination over Streams, topology/resource summaries, desired/observed state, metrics, recent errors, operation history, and lifecycle actions. Actions SHALL display operation progress, target node, correlation ID, and terminal results. Mutations SHALL be disabled for stale or unavailable nodes and SHALL not be retried automatically after a permission or availability error.
+The Runtime page SHALL support filtering and pagination over Streams, topology/resource summaries, desired/observed state, metrics, recent errors, operation history, and lifecycle actions. Actions SHALL display operation progress, target node, correlation ID, and terminal results. Mutations SHALL be disabled for stale or unavailable nodes or when the authenticated principal lacks the action required by the mutation, and SHALL not be retried automatically after a permission or availability error.
 
 #### Scenario: Operate one Stream from the runtime page
+
 - **WHEN** an operator starts, stops, or restarts a Stream
 - **THEN** the UI confirms the action, tracks its operation ID, refreshes the affected resource, and reports success or failure without blocking other Streams
 
 #### Scenario: Inspect a failed Stream
+
 - **WHEN** an operator opens a failed Stream
 - **THEN** the UI shows last error, transition timeline, metrics, recent related events, and available recovery actions
 
 #### Scenario: Target a stale node
+
 - **WHEN** an operator selects a stale or unavailable node
 - **THEN** lifecycle controls are disabled and the UI explains that the node must reconnect before mutation
+
+#### Scenario: Principal lacks the lifecycle action
+
+- **WHEN** the echoed principal lacks the action required by a lifecycle control
+- **THEN** the control is disabled and the UI names the required permission, independent of node availability
 
 ### Requirement: Configuration workflow
 
@@ -97,13 +112,20 @@ In Hub mode the page's node-scoped actions — version comparison and rollback �
 
 ### Requirement: Components, events, and settings
 
-The console SHALL provide component catalogue/schema display, filterable event/audit history, and settings for API endpoint, authentication status, CORS/security posture, node identity, and capability information. It SHALL preserve redaction and never put secrets in URLs, browser logs, or client-side error messages.
+The console SHALL provide component catalogue/schema display, server-side paginated and filtered event/audit history whose filter and page state is carried in the URL, and settings for API endpoint, authentication status, CORS/security posture, node identity, and capability information. Event and audit lists SHALL pass the control plane's pagination and filter query parameters instead of filtering client-side over a single fetched page, so records beyond the first page remain reachable. It SHALL preserve redaction and never put secrets in URLs, browser logs, or client-side error messages.
 
 #### Scenario: Investigate an administrative event
-- **WHEN** an operator filters events by Stream, operation, type, or outcome
-- **THEN** the UI shows ordered event details and links to the related resource/operation without exposing credentials
+
+- **WHEN** an operator filters events by type, stream, correlation ID, or node, or filters audit history by resource, or paginates either list
+- **THEN** the console issues the corresponding server-side query parameters, reflects them in the URL, and shows ordered event details with links to the related resource/operation without exposing credentials
+
+#### Scenario: Reach records beyond the first page
+
+- **WHEN** more events or audit records exist than one page contains
+- **THEN** pagination controls navigate the full result set on the server, and no client-side filter can silently hide unread pages
 
 #### Scenario: View security settings
+
 - **WHEN** an operator opens Settings
 - **THEN** the console shows whether the session is authenticated and the server's effective security/capability status without rendering token values
 
@@ -245,4 +267,90 @@ Console 的 app 路由出口 SHALL 被 Error Boundary 包裹：任何组件 rend
 
 - **WHEN** 等待超过 60 秒上限
 - **THEN** 错误信息提示操作可能仍在执行并建议刷新查看（而非 "Operation timed out"）
+
+### Requirement: Role-aware console surfaces
+
+The console SHALL display the authenticated principal identity (id and roles) whenever the system identity echoes a principal. Every mutating entry point (stream lifecycle, configuration publish/rollback, job operations, rollout creation, approval decisions, node maintenance, webhook management) SHALL be gated on the echoed action list for its required operator action: entries the principal lacks SHALL be rendered disabled with an explanation naming the required permission, not hidden. When the system identity does not echo a principal (older control plane), the console SHALL fall back to ungated mutating entry points and display an unknown-identity indication. When a mutation is rejected with 403 despite being enabled, the console SHALL present a permission error, SHALL NOT retry automatically, and SHALL refresh the system identity.
+
+#### Scenario: Viewer session
+
+- **WHEN** the echoed principal holds only the viewer role
+- **THEN** mutating controls across pages render disabled with the required action named, while read views remain fully usable
+
+#### Scenario: Identity is visible
+
+- **WHEN** the system identity echoes a principal
+- **THEN** the console shows the principal id and roles on a persistent surface
+
+#### Scenario: Older control plane without principal echo
+
+- **WHEN** the system identity response carries no principal field
+- **THEN** the console keeps mutating entry points enabled and marks the session identity as unknown
+
+#### Scenario: Permission rejection at execution time
+
+- **WHEN** a mutation is rejected with 403 despite the control being enabled
+- **THEN** the console shows a permission error without retrying the mutation and refreshes the system identity
+
+### Requirement: Job pause and resume SHALL be controllable from the console
+
+The Job views SHALL expose pause and resume actions gated by the caller's authorized actions, render the pause phase (in flight, paused, resuming) distinctly from stopped and running, keep actions disabled while a pause or resume transition is in flight, and surface rejected transitions with the problem code instead of silently ignoring them. The strings SHALL be translated in the English and Simplified Chinese dictionaries.
+
+#### Scenario: Pause a running Job from the console
+
+- **WHEN** an operator with the operate action opens the Jobs page for a converged running Job
+- **THEN** a pause control is offered, invoking it sends the pause mutation, and the Job row shows the pause in-flight phase until it converges to paused
+
+#### Scenario: Resume a paused Job from the console
+
+- **WHEN** an operator opens the Jobs page for a paused Job
+- **THEN** a resume control is offered and the row shows the resuming phase until the Job converges back to running
+
+#### Scenario: Unauthorized or conflicting action feedback
+
+- **WHEN** a user without the operate action, or against a Job with an active orchestration, invokes pause
+- **THEN** the console disables the action for unauthorized callers, and for a rejected mutation surfaces the returned problem code
+
+### Requirement: Users and credentials SHALL be administrable from the console
+
+The console SHALL provide a user and credential administration area visible and usable only for principals authorized with `ManageUsers` in Hub mode. It SHALL list users with their role, scope summary, and disabled state; create and edit users; disable, enable, and delete users; list credentials by metadata only; issue a credential with a one-time plaintext display and copy affordance; rotate and revoke credentials; and revoke all of a user's tokens. Destructive actions SHALL use the existing in-app confirmation pattern, rejected mutations SHALL surface the returned problem code, and the strings SHALL be translated in the English and Simplified Chinese dictionaries.
+
+#### Scenario: Administrator manages users
+
+- **WHEN** an admin opens the console Settings area in Hub mode
+- **THEN** the user and credential administration area is offered and lists users without any credential material
+
+#### Scenario: Issued credential is shown once
+
+- **WHEN** an admin issues a credential for a user
+- **THEN** the console displays the plaintext token once with a copy action and does not display it again on later list views
+
+#### Scenario: Non-administrators see no administration area
+
+- **WHEN** a principal without `ManageUsers` opens the console
+- **THEN** the administration area is not offered, matching the existing action-gated navigation pattern
+
+#### Scenario: Rejected administration surfaces the problem code
+
+- **WHEN** an administration mutation is rejected (for example `last_admin_required`)
+- **THEN** the console displays the returned problem code instead of silently ignoring the failure
+
+### Requirement: The console SHALL support runtime operator credential entry
+
+The console SHALL allow an operator to enter or replace the bearer credential it uses at runtime, without requiring a build-time token, and SHALL keep that credential only for the browser session. When a request fails with 401 and no OIDC login flow is available, the console SHALL prompt for a credential and retry the failed navigation after a successful entry; it SHALL also offer an explicit sign-out that clears the stored credential. The build-time token SHALL remain an optional default for existing deployments.
+
+#### Scenario: Runtime credential entry recovers from 401
+
+- **WHEN** the console has no credential and a Hub returns 401 while no OIDC login flow is configured
+- **THEN** the console prompts for a bearer credential, stores it for the browser session, and retries the request successfully
+
+#### Scenario: Sign-out clears the runtime credential
+
+- **WHEN** an operator signs out of the console
+- **THEN** the stored credential is cleared and subsequent requests prompt again
+
+#### Scenario: Build-time token keeps working
+
+- **WHEN** the console is built with a default token and the operator does not enter a runtime credential
+- **THEN** existing authentication behavior is unchanged
 

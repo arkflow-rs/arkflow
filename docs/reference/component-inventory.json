@@ -3049,7 +3049,7 @@
     {
       "kind": "buffer",
       "name": "session_window",
-      "description": "Groups messages into sessions based on a maximum gap between messages. Supports SQL joins across sources.",
+      "description": "Groups messages into sessions based on a maximum gap between messages.",
       "config_optional": false,
       "config_schema": {
         "type": "object",
@@ -3126,7 +3126,7 @@
     {
       "kind": "buffer",
       "name": "tumbling_window",
-      "description": "Fixed-size, non-overlapping time windows. Supports SQL joins across sources.",
+      "description": "Fixed-size, non-overlapping time windows.",
       "config_optional": false,
       "config_schema": {
         "type": "object",

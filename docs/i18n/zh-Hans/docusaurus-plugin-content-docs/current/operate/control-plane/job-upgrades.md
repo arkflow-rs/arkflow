@@ -21,6 +21,26 @@ POST /api/v1/jobs/{id}/upgrades
 
 Hub 编排以下阶段并立即返回 `202`。作业在保存点期间继续处理；停机窗口压缩为“保存点 + 恢复”的时长。停止模式（stopped）原样保留，供计划内维护使用。
 
+## 暂停：升级编排暂停与作业暂停 {#pause-orchestration-vs-job}
+
+「暂停」指两套不同的机制，归属与生命周期都不同——不要把其中一个当作另一个的证据：
+
+| | 升级编排暂停 | 作业暂停 |
+| --- | --- | --- |
+| 路由 | `POST /jobs/{id}/upgrades/{upgrade_id}/actions`，体为 `{"action":"pause"}` | `POST /jobs/{id}/actions/pause`（或 `PUT /jobs/{id}/desired-state {"state":"paused"}`） |
+| 被暂停的对象 | 升级阶段机：停止推进并冻结阶段超时 | 作业本身：Hub 先落恢复工件，再停止作业 |
+| 数据处理 | 保存点阶段暂停时旧代仍在继续处理 | 作业停止消费并释放计算资源 |
+| 对 `desired_state` 的影响 | 无 | `running` → `paused`（resume 后回到 `running`） |
+| resume 的含义 | 重新武装阶段超时并继续升级 | 提升世代并从暂停工件重新起跑 |
+| 持续时间 | 应尽量短；长时间暂停会拉长重放窗口 | 可以任意长（工件被保留期 pin 住） |
+
+两者双向互斥：
+
+- 升级编排未进入终态期间，暂停与恢复会以 `409 orchestration_in_progress` 被拒绝，与下文列出的 desired-state 和生命周期动作拒绝并列。
+- 暂停相位存在期间（`capturing`、`stopping`、`paused` 或 `resuming`），原子模式与停止模式的升级都会以 `409 job_paused` 被拒绝。先 resume，或 stop 以清除暂停记账；之后既有升级前置条件照常适用。
+
+不要把编排暂停理解为作业已静默：旧代可能仍在处理数据。需要作业停止并在之后从某个已捕获点继续时，请使用作业暂停；捕获后停机序列与重放边界参见[流式作业 → 暂停与恢复](/zh-Hans/docs/build/jobs#pause-and-resume)。
+
 ## 阶段状态机
 
 ```text
@@ -56,6 +76,7 @@ saving_savepoint ──▶ committing_version ──▶ verifying ──▶ succ
 
 - `PUT /jobs/{id}/desired-state`
 - `POST /jobs/{id}/actions/{start|stop|restart}`
+- `POST /jobs/{id}/actions/{pause|resume}`
 - 再次升级（原子或停止模式）与手动版本回滚
 
 观察阶段（`verifying`、`rolling_back`）刻意放行普通调和——它正是那里的启动机制。

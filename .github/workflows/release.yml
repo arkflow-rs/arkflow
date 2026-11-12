@@ -17,6 +17,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Same rationale as rust.yml: sasl2-sys vendors Cyrus SASL 2.1.28, whose
+  # K&R prototypes are invalid under the C23 default of recent GCC on the
+  # runner image; pin the C dialect for the build-script-compiled sources.
+  CFLAGS: "-std=gnu17"
   # Release builds are LTO + codegen-units=1: keep artifacts lean and link
   # times bounded in CI the same way coverage.yml does.
   CARGO_PROFILE_RELEASE_DEBUG: line-tables-only

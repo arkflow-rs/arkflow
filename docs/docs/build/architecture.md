@@ -26,9 +26,12 @@ Input → Buffer → [Processor → Processor → …] → Output
 ```
 
 - **Input** — reads raw messages from a source (Kafka, MQTT, HTTP, file, …).
-- **Buffer** — holds batches between the input and the processors. It can be a
-  simple in-memory queue or a windowing strategy (tumbling, sliding, session),
-  optionally joining multiple sources.
+- **Buffer** — optional windowing between the input and the processors. In
+  compiled Streams the plain `memory` buffer is a no-op pass-through (bounded
+  channels already provide buffering), `tumbling_window`/`session_window`
+  compile to a processing-time window operator, and the legacy
+  `sliding_window` and `join` buffers are rejected by the stream compiler
+  with a migration error.
 - **Pipeline** — an ordered list of **processors** applied to each batch, run by
   `thread_num` worker tasks in parallel.
 - **Output** — writes each processed batch to a sink. An optional

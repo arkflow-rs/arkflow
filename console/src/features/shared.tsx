@@ -1,7 +1,8 @@
 import { useQueryClient } from '@tanstack/react-query'
-import { api, errorMessage, formatTime } from '../api'
+import { api, formatTime } from '../api'
 import type { ControlEvent, Operation } from '../api'
 import { currentLocale, intlLocale, useT } from '../i18n'
+import { useMutationFailure } from '../queries'
 
 export const number = (value: number | undefined) =>
   value === undefined ? '—' : new Intl.NumberFormat(intlLocale(currentLocale())).format(value)
@@ -11,12 +12,15 @@ export const active = (state: Operation['state']) =>
 export function OperationRow({
   operation,
   onError,
+  canMutate = true,
 }: {
   operation: Operation
   onError?: (message: string) => void
+  canMutate?: boolean
 }) {
   const t = useT()
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   return (
     <div className="operation-row">
       <div>
@@ -40,11 +44,13 @@ export function OperationRow({
       <div>
         {active(operation.state) && (
           <button
+            disabled={!canMutate}
+            title={!canMutate ? t('perm.requires', { action: 'operate' }) : undefined}
             onClick={() =>
               void api
                 .cancel(operation.id)
                 .then(() => queryClient.invalidateQueries({ queryKey: ['live', 'operations'] }))
-                .catch((cause) => onError?.(errorMessage(cause)))
+                .catch((cause) => reportMutationFailure(onError, cause))
             }
           >
             {t('common.cancel')}
@@ -70,6 +76,20 @@ export function EventRow({ event }: { event: ControlEvent }) {
       </small>
       {event.message && <p>{event.message}</p>}
     </div>
+  )
+}
+/** Page sizes the server accepts and the selects render: the Hub clamps
+ * `page_size` to 1..=100, so an arbitrary URL value must be snapped onto
+ * one of these or the page count and the returned rows diverge. */
+export const PAGE_SIZES = [25, 50, 100]
+
+/** The page size a list should request and paginate by: a URL-supplied
+ * value outside the supported set is snapped to the nearest supported size
+ * (missing/invalid values fall back to 50). */
+export function pageSizeParam(searchParams: URLSearchParams): number {
+  const requested = Number(searchParams.get('page_size')) || 50
+  return PAGE_SIZES.reduce((closest, size) =>
+    Math.abs(size - requested) < Math.abs(closest - requested) ? size : closest,
   )
 }
 export function Pagination({

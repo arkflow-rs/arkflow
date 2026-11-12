@@ -145,7 +145,11 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
             max_bytes: None,
         }),
         checkpoint: Some(CheckpointSpec {
-            interval_ms: 60_000,
+            // The 1_000 ms value is the minimum gap between periodic
+            // checkpoint rounds enforced by schedule_periodic_checkpoints().
+            // The loop re-triggers after each 5-second wait; 60_000 ms
+            // previously blocked re-triggers for the full test budget.
+            interval_ms: 1_000,
             retention: 3,
             object_store_uri: checkpoint_uri,
         }),
@@ -293,6 +297,13 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();
@@ -591,6 +602,13 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
         checkpoint_id: None,
         last_error: None,
         updated_at_ms: 0,
+
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
     })
     .await
     .unwrap();

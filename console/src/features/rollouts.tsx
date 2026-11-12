@@ -4,12 +4,15 @@ import { toast } from 'sonner'
 import { api, AuditRecord, errorMessage, formatTime, RolloutDetail } from '../api'
 import { useT } from '../i18n'
 import { usePrompt } from './confirm'
-import { useNodes, useRolloutDetail, useRollouts } from '../queries'
+import { useNodes, useMutationFailure, useRolloutDetail, useRollouts } from '../queries'
 import { useStatus } from '../queries'
 
-export function Rollouts({ onError }: { onError: (message: string) => void }) {
+type RolloutsProps = { onError: (message: string) => void; canMutate?: boolean }
+
+export function Rollouts({ onError, canMutate = true }: RolloutsProps) {
   const t = useT()
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   const prompt = usePrompt()
   const nodes = useNodes().data?.items ?? []
   const rollouts = useRollouts().data ?? []
@@ -67,7 +70,7 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
         void queryClient.invalidateQueries({ queryKey: ['live', 'config-approvals'] })
       } catch (cause) {
         setBusy(false)
-        onError(errorMessage(cause))
+        reportMutationFailure(onError, cause)
       }
       return
     }
@@ -88,7 +91,7 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
       void queryClient.invalidateQueries({ queryKey: ['live', 'config-approvals'] })
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   const action = async (id: string, operation: 'pause' | 'resume' | 'cancel' | 'rollback') => {
@@ -110,7 +113,7 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
       toast.success(t('toast.accepted'))
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   return (
@@ -140,10 +143,12 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
           </select>
           <button
             disabled={
+              !canMutate ||
               busy ||
               !version.trim() ||
               (targetMode === 'nodes' ? targets.length === 0 : !labelSelector.trim())
             }
+            title={!canMutate ? t('perm.requires', { action: 'manage_rollouts' }) : undefined}
             onClick={() => void create()}
           >
             {approvalRequired ? t('rollouts.submitForApproval') : t('rollouts.create')}
@@ -220,6 +225,7 @@ export function Rollouts({ onError }: { onError: (message: string) => void }) {
       </section>
       {selected && (
         <RolloutDetailPanel
+          canMutate={canMutate}
           detail={selected}
           pollError={pollError}
           audit={audit}
@@ -239,6 +245,7 @@ function RolloutDetailPanel({
   audit,
   setAudit,
   busy,
+  canMutate,
   onAction,
   onClose,
 }: {
@@ -247,17 +254,22 @@ function RolloutDetailPanel({
   audit: AuditRecord[]
   setAudit: (records: AuditRecord[]) => void
   busy: boolean
+  canMutate: boolean
   onAction: (id: string, action: 'pause' | 'resume' | 'cancel' | 'rollback') => void
   onClose: () => void
 }) {
   const t = useT()
   useEffect(() => {
     void api
-      .audit(detail.rollout.rollout_id)
+      .audit({ resource_id: detail.rollout.rollout_id })
       .then((page) => setAudit(page.items))
       .catch(() => setAudit([]))
   }, [detail.rollout.rollout_id, setAudit])
-  const canAct = !['converged', 'cancelled', 'rolled_back'].includes(detail.rollout.state)
+  // Role gating disables actions; it never hides them (control-plane-console
+  // spec: unauthorized entries stay visible with their permission named).
+  // Only a terminal rollout has no actions to show at all.
+  const terminal = ['converged', 'cancelled', 'rolled_back'].includes(detail.rollout.state)
+  const gatedTitle = !canMutate ? t('perm.requires', { action: 'manage_rollouts' }) : undefined
   return (
     <section className="panel detail">
       <div className="panel-title">
@@ -267,9 +279,10 @@ function RolloutDetailPanel({
         </div>
         <div className="actions">
           <button onClick={onClose}>{t('rollouts.close')}</button>
-          {canAct && (
+          {!terminal && (
             <button
-              disabled={busy}
+              disabled={!canMutate || busy}
+              title={gatedTitle}
               onClick={() =>
                 onAction(detail.rollout.rollout_id, detail.rollout.state === 'paused' ? 'resume' : 'pause')
               }
@@ -277,13 +290,21 @@ function RolloutDetailPanel({
               {detail.rollout.state === 'paused' ? t('rollouts.resume') : t('rollouts.pause')}
             </button>
           )}
-          {canAct && (
-            <button disabled={busy} onClick={() => onAction(detail.rollout.rollout_id, 'cancel')}>
+          {!terminal && (
+            <button
+              disabled={!canMutate || busy}
+              title={gatedTitle}
+              onClick={() => onAction(detail.rollout.rollout_id, 'cancel')}
+            >
               {t('rollouts.cancel')}
             </button>
           )}
-          {canAct && (
-            <button disabled={busy} onClick={() => onAction(detail.rollout.rollout_id, 'rollback')}>
+          {!terminal && (
+            <button
+              disabled={!canMutate || busy}
+              title={gatedTitle}
+              onClick={() => onAction(detail.rollout.rollout_id, 'rollback')}
+            >
               {t('rollouts.rollback')}
             </button>
           )}

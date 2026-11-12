@@ -14,7 +14,7 @@
 <a href="https://www.producthunt.com/posts/arkflow?embed=true&utm_source=badge-featured&utm_medium=badge&utm_souce=badge-arkflow" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=942804&theme=light&t=1743136262336" alt="ArkFlow - High&#0045;performance&#0032;rust&#0032;stream&#0032;processing&#0032;engine | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 
 高性能Rust流处理引擎，无缝集成AI能力，提供强大的实时数据处理与智能分析。
-它不仅支持多种输入/输出源和处理器，更能轻松加载和执行机器学习模型，实现流式数据和推理、异常检测和复杂事件处理。
+它不仅支持多种输入/输出源和处理器，更集成了 LLM、向量嵌入与向量检索等 AI 服务，实现流式数据和推理、异常检测和复杂事件处理。
 
 ##  CNCF 云原生技术全景图
 
@@ -28,7 +28,7 @@ ArkFlow 已收录在 [CNCF Cloud Native 云原生技术全景图](https://landsc
 ## 特性
 
 - **高性能**：基于Rust和Tokio异步运行时构建，提供卓越的性能和低延迟
-- **可靠投递**：默认通过每流 WAL 持久化提供 at-least-once，可选地为事务型 sink 启用 exactly-once
+- **可靠投递**：可选的每流 WAL 持久化提供 at-least-once 投递，并可为事务型 sink 启用 exactly-once
 - **多种数据源**：支持Kafka、MQTT、HTTP、文件、SQL 数据库等多种输入输出源
 - **强大的处理能力**：内置SQL查询、Python UDF、JSON处理、Protobuf编解码、批处理和 VRL 等处理器
 - **流编解码**：JSON 与 Protobuf 编解码，以及 Debezium CDC 信封和 Confluent Schema Registry 线格式

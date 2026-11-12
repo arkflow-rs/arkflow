@@ -42,6 +42,43 @@ the same listener, which stays token-less for scrapers). The health probes
 `/health`, `/readiness`, and `/liveness` also stay unauthenticated so
 orchestrators can probe them.
 
+## Authentication and identity
+
+Behind the Bearer boundary the Hub resolves a presented credential through
+layered identity sources, in this order:
+
+1. the **static operator credential** (`ARKFLOW_OPERATOR_TOKEN`) —
+   compatibility and break-glass access;
+2. a **managed per-user credential** issued from the Hub's user directory
+   (tokens are shaped `ark_<credential_id>_<secret>` and only a hash is
+   stored);
+3. a **browser session** created by the OIDC login flow;
+4. an **OIDC bearer JWT** validated against the configured identity provider.
+
+The layers compose: with no directory and no OIDC, the static credential is
+all there is; with OIDC, human access can move to the identity provider while
+the static credential stays available for automation and recovery. Authentication
+is fail-closed at every layer, and a token that looks like a managed credential
+is never retried as a JWT — a revoked, expired, or unknown managed token is a
+hard `401`, as is a storage failure while resolving it.
+
+Authorization is role-based: `admin`, `operator`, and `viewer`, optionally
+narrowed by resource scopes. The actions echoed by `GET /api/v1/system`
+(`read`, `operate`, `configure`, `manage_nodes`, `manage_rollouts`,
+`manage_webhooks`, `approve_rollouts`, `read_audit`, and `manage_users`) are
+enforced by the same predicate the Hub uses for mutations. The
+`manage_users` action is held by `admin` only and gates the managed identity
+API: user CRUD, credential issuance/rotation/revocation, and token revocation.
+
+Managed identity requires durable storage — a volatile Hub answers
+`503 identity_store_unavailable` on those routes and managed credentials never
+authenticate there. Operations that change identity (create/update/delete
+user, issue/rotate/revoke credential, revoke tokens) are audited with scalar
+metadata only, never secret material. The full lifecycle — bootstrap and
+break-glass, one-time plaintext tokens, OIDC subject binding, JWT revocation,
+and session persistence — is documented in
+[Users and credentials](./users-and-credentials.md).
+
 ## API endpoints
 
 Resource endpoints include `/api/v1/system`, `/nodes`, paginated `/streams`,
@@ -117,6 +154,7 @@ it.
 ## Next steps
 
 - [Deploy](./deploy.md) — run the Hub, compute nodes, and console.
+- [Users and credentials](./users-and-credentials.md) — the managed identity directory.
 - [Operations](./operations.md) — day-2 operations runbook.
 - [HTTP API v1](../../reference/api.md) — endpoint reference.
 - [Reconciliation rollout & recovery](./reconciliation.md).

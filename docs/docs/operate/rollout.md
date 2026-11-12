@@ -41,16 +41,18 @@ the exact `JobSpec` the Hub will distribute.
 
 ## 2. Start the Hub and register agents
 
-`examples/control_plane_hub.yaml` configures a Hub with its API and
-health-check endpoints; `examples/control_plane_example.yaml` shows an
-agent-side deployment configuration:
+The Hub is the standalone `arkflow-server` binary, configured through
+environment variables — `ARKFLOW_NODE_TOKEN` must match the agents' shared
+`node_token` (see [deployment](./control-plane/deploy.md)).
+`examples/control_plane_node.yaml` shows an agent-side deployment
+configuration:
 
 ```bash
 # terminal 1 — the Hub
-./target/release/arkflow --config examples/control_plane_hub.yaml
+ARKFLOW_NODE_TOKEN=replace-with-node-token ./target/release/arkflow-server
 
 # terminal 2+ — one Agent per compute node
-./target/release/arkflow --config examples/control_plane_example.yaml
+./target/release/arkflow --config examples/control_plane_node.yaml
 ```
 
 Expected result: each agent appears as a leased node in the Hub's fleet API

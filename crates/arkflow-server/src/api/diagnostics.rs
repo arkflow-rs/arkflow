@@ -114,6 +114,9 @@ pub(super) async fn hub_metrics(
     body.push_str(&crate::metrics::encode_families(
         crate::metrics::storage_families(),
     ));
+    body.push_str(&crate::metrics::encode_families(
+        crate::metrics::rate_limit_families(),
+    ));
     // Data-plane series reported by Agents: the kernel Job vocabulary with an
     // extra `node` label. Expired-lease nodes are excluded by the Hub.
     for (node_id, jobs) in hub.job_metrics().await {
@@ -209,8 +212,12 @@ pub(super) async fn hub_liveness() -> Json<serde_json::Value> {
 
 pub(crate) async fn hub_oidc_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
     let login_enabled = hub.oidc_login().is_some();
-    let principal = cookie_value(&headers, "arkflow_session")
-        .and_then(|session_id| hub.oidc_session_principal(&session_id));
+    // Durable sessions live in storage (`cp_sessions`); the in-memory
+    // federation map only knows volatile-Hub sessions.
+    let principal = match cookie_value(&headers, "arkflow_session") {
+        Some(session_id) => hub.resolve_session(&session_id).await,
+        None => None,
+    };
     let body = serde_json::json!({
         "login_enabled": login_enabled,
         "authenticated": principal.is_some(),
@@ -341,12 +348,35 @@ pub(crate) async fn hub_oidc_callback(
     let Some(principal) = federation.authenticate(&id_token).await else {
         return unauthorized();
     };
-    let Some(session_id) = federation.create_session(principal) else {
-        return problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "session_create_failed",
-            "OS random source is unavailable; session cannot be created".into(),
-        );
+    // Session ids are persisted (hashed) when the Hub has durable storage so
+    // they survive restarts and can be revoked per user; without storage the
+    // federation's in-memory fallback is used. On a durable Hub the fallback
+    // would create a session that `resolve_session` can never see, so a
+    // storage failure must fail the login instead.
+    let session_id = match hub.create_session(principal.clone()).await {
+        Some(session_id) => session_id,
+        None if hub.storage().is_none() => {
+            match hub
+                .oidc_login()
+                .and_then(|federation| federation.create_session(principal))
+            {
+                Some(session_id) => session_id,
+                None => {
+                    return problem(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "session_create_failed",
+                        "session cannot be created".into(),
+                    )
+                }
+            }
+        }
+        None => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_create_failed",
+                "session cannot be created".into(),
+            )
+        }
     };
     let max_age = oidc::session_ttl_secs();
     Response::builder()
@@ -370,9 +400,7 @@ pub(crate) async fn hub_oidc_callback(
 pub(crate) async fn hub_oidc_logout(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
     if let Some(token) = bearer(&headers) {
         if let Some(session_id) = token.strip_prefix("session:") {
-            if let Some(federation) = hub.oidc_login() {
-                federation.remove_session(session_id);
-            }
+            hub.remove_session(session_id).await;
         }
     }
     Response::builder()
@@ -401,10 +429,16 @@ pub(super) fn prometheus_label(value: &str) -> String {
         .collect()
 }
 
-pub(super) async fn system(
-    State(cp): State<ControlPlane>,
-) -> Json<arkflow_core::control::SystemResource> {
-    Json(cp.system().await)
+pub(super) async fn system(State(cp): State<ControlPlane>) -> Response {
+    // The standalone plane has one all-powerful operator — the api token
+    // holder, or loopback/insecure_local when no token is configured — and
+    // no role model of its own; the echo says so with the legacy admin
+    // principal instead of fabricating roles the plane cannot enforce.
+    let mut body = serde_json::to_value(cp.system().await).expect("SystemResource serializes");
+    body["principal"] =
+        serde_json::to_value(crate::api_contract::OperatorPrincipal::legacy_operator().echo())
+            .expect("principal echo serializes");
+    Json(body).into_response()
 }
 pub(super) async fn status(
     State(cp): State<ControlPlane>,
@@ -456,7 +490,10 @@ pub(super) async fn metrics(State(cp): State<ControlPlane>) -> Response {
         .collect();
     streams.sort_by(|left, right| left.0.cmp(&right.0));
     let jobs = runtime.job_metrics().snapshots();
-    let body = crate::metrics::data_plane_exposition(&streams, &jobs);
+    let mut body = crate::metrics::data_plane_exposition(&streams, &jobs);
+    body.push_str(&crate::metrics::encode_families(
+        crate::metrics::rate_limit_families(),
+    ));
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 

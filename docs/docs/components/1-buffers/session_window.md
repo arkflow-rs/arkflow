@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # Session Window
 
-The Session Window buffer groups messages into sessions defined by activity gaps. A new message extends the current session; if no message arrives within the configured `gap` duration the session is closed and all of its accumulated messages are emitted as a single batch. An optional `join` configuration lets you run a SQL join across multiple input sources at emission time.
+The Session Window buffer groups messages into sessions defined by activity gaps. A new message extends the current session; if no message arrives within the configured `gap` duration the session is closed and all of its accumulated messages are emitted as a single batch. A legacy `join` option exists, but the stream compiler rejects window buffers that declare it (see the warning below).
 
 ## Configuration
 
@@ -13,7 +13,16 @@ The Session Window buffer groups messages into sessions defined by activity gaps
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | `session_window` |
 | gap | duration | yes | — | Maximum idle time between messages in a session. When the gap elapses with no new messages, the session is flushed. Examples: `1ms`, `1s`, `1m`, `1h`. |
-| join | object | no | — | Optional SQL join configuration applied to emitted batches. |
+| join | object | no | — | Legacy SQL join configuration; rejected by the stream compiler (see warning below). |
+
+:::warning Legacy `join` — rejected by the stream compiler
+
+Declaring `join` on a `session_window` buffer fails compilation with
+`legacy window buffers with 'join' cannot compile`. Stream-stream join is not
+supported in Stream configs; use the SQL processor's per-batch joins against
+temporary tables instead.
+
+:::
 
 ### `join`
 

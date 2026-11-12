@@ -104,20 +104,25 @@ arkflow schema > arkflow.schema.json
 
 `arkflow-server` 二进制运行控制面 Hub。它没有命令行标志;全部启动配置来自环境变量,外加用于存储 schema 迁移的单一 `migrate` 子命令。
 
-### 启动环境变量
+### 启动环境变量 {#startup-environment-variables}
 
 | 环境变量 | 默认值 | 说明 |
 |----------|---------|-------------|
 | `ARKFLOW_HUB_ADDRESS` | `127.0.0.1:8080` | Hub API 监听地址。 |
-| `ARKFLOW_OPERATOR_TOKEN` | — | 供人工/管理员访问 API 的 operator token。支持 `role\|token` 凭据格式;参见 [Hub 认证](../operate/control-plane/overview.md)。 |
+| `ARKFLOW_OPERATOR_TOKEN` | — | 供人工/管理员访问 API 的 operator token。支持 `role\|token` 凭据格式;参见 [Hub 认证](../operate/control-plane/overview.md)与[用户与凭证](../operate/control-plane/users-and-credentials.md)。 |
 | `ARKFLOW_NODE_TOKEN` | — | Agent 向 Hub 认证使用的共享 token。 |
 | `ARKFLOW_HUB_INSECURE_LOCAL` | 关 | 设为 `1`/`true`/`yes` 以放宽校验,仅限本地开发。 |
-| `ARKFLOW_HUB_STORAGE` | — | 存储后端描述:SQLite 路径或 PostgreSQL URL。启用 HA 时必须设置。 |
+| `ARKFLOW_HUB_STORAGE` | — | 存储后端描述:SQLite 路径或 PostgreSQL URL。启用 HA 时必须设置,托管身份 API(用户/凭证/会话)也需要它。 |
 | `ARKFLOW_HUB_TLS_CERT` / `ARKFLOW_HUB_TLS_KEY` | — | Hub 监听器的 TLS 证书与私钥路径。 |
 | `ARKFLOW_HUB_HA_ENABLED` | 关 | 设为 `1`/`true`/`yes` 启用基于租约的 HA。要求设置 `ARKFLOW_HUB_STORAGE`;多实例 HA 使用 PostgreSQL URL(SQLite 路径仅记录一条仅供开发的警告)。 |
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | `15000` | 租约 TTL(毫秒);低于 1000 会被拒绝。 |
 | `ARKFLOW_HUB_HA_HOLDER_ID` | — | 显式租约持有者身份;缺省时由主机名、PID 与启动时间自动生成。 |
 | `ARKFLOW_HUB_HA_ADVERTISE_URL` | — | 带主机的绝对 `http(s)://` URL,Agent 通过它访问该 Hub 实例(多 Hub 发现)。 |
+
+不在上述基础项内的身份相关变量——OIDC 联邦相关(`ARKFLOW_OIDC_*`,含
+`ARKFLOW_OIDC_MANAGED_USERS_ONLY`)——见
+[部署](../operate/control-plane/deploy.md#oidc-jwt-federation)。
+托管用户目录及其凭证见[用户与凭证](../operate/control-plane/users-and-credentials.md)。
 
 ### `migrate` 子命令
 

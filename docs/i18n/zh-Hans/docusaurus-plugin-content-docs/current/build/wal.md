@@ -284,9 +284,9 @@ durability:
 
 ## 监控
 
-启用这些优化后需要关注的关键指标:
+WAL 导出后台刷洗失败计数——关注其任何增长:
 
-- `segment_put_latency` —— p99 应低于 200 ms;过高则检查 region
-- `segment_put_frequency` —— 使用 `aggressive` 策略后应下降
-- `cursor_lag` —— 应保持在 10,000 条以内
-- `recovery_latency` —— 重启后应低于 5 s
+- `arkflow_stream_wal_flush_failures_total` —— 流输入 WAL 的后台刷洗失败(未启用持久化时为 0)
+- `arkflow_job_wal_flush_failures_total` —— 作业输入 WAL 的后台刷洗失败(无 WAL 时为 0)
+
+完整指标列表参见[可观测性](../operate/observability.md)。

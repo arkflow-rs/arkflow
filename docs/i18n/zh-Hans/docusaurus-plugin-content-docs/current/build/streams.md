@@ -92,5 +92,5 @@ streams:
 ## 下一步
 
 - [流式作业](./jobs.md) —— 带事件时间与状态的多步骤 DAG。
-- [组件](/zh-Hans/docs/components) —— 浏览全部 41 个已注册组件。
+- [组件](/zh-Hans/docs/components) —— 浏览全部 50 个已注册组件。
 - [顶层配置](/zh-Hans/docs/reference/configuration) —— 每一个引擎选项。

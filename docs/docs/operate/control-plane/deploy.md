@@ -10,8 +10,13 @@ with `health_check.hub_urls`, `node_id`, and `node_token`. Then build the consol
 `console/dist` from a protected reverse proxy. The development Vite server
 proxies `/api` and `/metrics` to `127.0.0.1:8080`; production should preserve
 the same-origin paths and set `VITE_API_BASE` only when the API prefix differs.
-Set `VITE_API_TOKEN` only in a controlled build environment when the ArkFlow
-listener has an operator credential configured. The compatibility credential
+`VITE_API_TOKEN` is only a build-time default for the console: when the API
+answers `401` and no OIDC login flow is configured, the console asks for a
+bearer credential and keeps it in `sessionStorage` (never `localStorage`), so
+production builds do not have to bake a token into the bundle. Set
+`VITE_API_TOKEN` only in a controlled build
+environment when the ArkFlow listener has an operator credential configured.
+The compatibility credential
 may be a raw token (admin) or `principal|role|secret`, for example
 `readonly|viewer|viewer-secret`; viewer credentials can read resources and
 audit history but cannot mutate Streams, nodes, or rollouts. A value that
@@ -52,6 +57,88 @@ non-zero on any row-count mismatch. Point `ARKFLOW_HUB_STORAGE` at the
 PostgreSQL URL and restart the Hub only after a successful migration. Fresh
 PostgreSQL deployments never need the tool — startup DDL creates the schema.
 
+### Backup and restore
+
+`arkflow-server backup` produces a consistent snapshot of the control-plane
+store as a single SQLite database file; `arkflow-server restore` imports one
+into an empty store. Both are offline CLI subcommands — they never contact a
+running Hub.
+
+```bash
+arkflow-server backup --from /var/lib/arkflow/hub.sqlite --to /backups/hub-2026-10-31.sqlite
+arkflow-server backup --from postgres://user:pass@db/hub --to /backups/hub-2026-10-31.sqlite
+arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to /var/lib/arkflow/hub.sqlite
+arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to postgres://user:pass@db/hub-restored
+```
+
+The store argument follows the same scheme dispatch as `ARKFLOW_HUB_STORAGE`
+(`postgres://` URL or SQLite path), so both source and target backends work
+in every combination: a snapshot is always a SQLite database file regardless
+of the source backend.
+
+Consistency semantics:
+
+- **SQLite source**: the snapshot is produced by `VACUUM INTO` on the storage
+  actor's serialized connection — the captured row counts and the file copy
+  share one lock window. Running `backup` against a store that a Hub in
+  another process is actively writing can fail the row-count verification
+  when a write lands mid-copy; retry while writes are quiesced or stop the
+  Hub. A failed attempt leaves no partial file behind.
+- **PostgreSQL source**: every table is read inside a single
+  `REPEATABLE READ` transaction, so the snapshot reflects one point in time
+  across all tables. The long read holds an MVCC snapshot; schedule backups
+  off-peak. The target database must already exist — the tool creates
+  tables, not databases.
+- Every per-table row count is verified before the command reports success;
+  any mismatch fails the command with the offending table named.
+
+Snapshot properties:
+
+- The lease table (`cp_hub_lease`) is never copied: a restored Hub rebuilds
+  its lease through the existing compare-and-swap path, so no stale fencing
+  epoch survives the restore.
+- The managed identity tables `cp_users` and `cp_credentials` are copied —
+  users, roles, scopes, OIDC bindings, revocation thresholds, and credential
+  hashes survive a disaster recovery. Browser sessions (`cp_sessions`) are
+  deliberately excluded: a session id is a live bearer secret, and restoring
+  old login state after a disaster is a security anti-pattern.
+- The snapshot carries the schema version of the source store. A snapshot
+  newer than the running binary is refused at restore time; an older one is
+  upgraded through the normal open-time migration path before copying.
+
+Restore requirements:
+
+- The target must be EMPTY. `restore` checks every business table first and
+  refuses — naming each non-empty table — if any already holds rows, without
+  writing anything.
+- Stop every Hub instance against the target database first — an idle Hub
+  holds no locks and is not detected, so this rule stays with the operator.
+  What the restore does enforce: SQLite runs as one immediate transaction
+  and PostgreSQL locks every business table `ACCESS EXCLUSIVE ... NOWAIT`
+  for its single transaction — a Hub transaction active at that moment
+  fails the restore with a busy error, no writer can interleave while it
+  runs, and any failure rolls the whole restore back so a retry starts
+  from a clean, empty target.
+- Identity sequences are reset above the restored max ids, so a restored
+  store accepts new events and outbox rows immediately; unprocessed
+  reconciliation intents replay through the existing recovery path once a
+  Hub starts on the restored store.
+- A SQLite target must already be a control-plane database (or a fresh
+  path) — the command refuses to create `cp_*` tables inside an unrelated
+  SQLite file.
+
+Scheduling: the tool performs a single consistent snapshot; recurring
+backups, rotation, and retention are the scheduler's job (cron, Kubernetes
+CronJob).
+
+**Snapshot sensitivity**: a snapshot contains everything the store does,
+including configuration-version payloads verbatim and the managed identity
+tables (user metadata, audit history, and credential *hashes* — never a
+plaintext token). Secret references (`secret:`/`env:`/`file:`) stay unresolved,
+but any literal credential an operator typed into a configuration is present
+in the clear. Treat snapshot files with the same care as the database itself
+(filesystem permissions, encrypted storage).
+
 ### TLS
 
 **Control plane.** Set both `ARKFLOW_HUB_TLS_CERT` and `ARKFLOW_HUB_TLS_KEY`
@@ -84,6 +171,46 @@ Enable TLS on every compute node before relying on split placement:
 during a rolling enable, plaintext and TLS nodes cannot talk to each other
 (connections fail closed). Certificate rotation means restarting the
 process (automatic renewal is out of scope).
+
+### Rate limiting
+
+Both control planes rate-limit requests per credential over the versioned API
+(health probes, `/metrics`, and the OIDC login flow are exempt). Buckets are
+token buckets keyed on a hashed credential: one bucket per operator
+credential or browser session, one per agent node. The bucket table is
+capacity-bounded — traffic presenting more distinct credentials than the
+bound shares one slow catch-all bucket, so a forged-credential flood cannot
+grow memory. Over-limit requests get `429` with a `Retry-After` header and
+are counted by the `arkflow_control_plane_rate_limit_rejections_total`
+metric.
+
+Hub environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ARKFLOW_RATE_LIMIT_ENABLED` | `true` | Master switch; `false` restores unlimited handling exactly. |
+| `ARKFLOW_RATE_LIMIT_PRINCIPAL_RPS` | `100` | Token refill per second per operator credential or browser session. |
+| `ARKFLOW_RATE_LIMIT_PRINCIPAL_BURST` | `200` | Burst capacity of a principal bucket. |
+| `ARKFLOW_RATE_LIMIT_NODE_RPS` | `500` | Token refill per second per agent node; must cover the register/heartbeat/report/commands/observations cadence. |
+| `ARKFLOW_RATE_LIMIT_NODE_BURST` | `1000` | Burst capacity of a node bucket. |
+
+A standalone (local-plane) node configures the same knobs under
+`health_check.rate_limit` (the control-API section is flattened into
+`health_check`):
+
+```yaml validate=full
+health_check:
+  rate_limit:
+      enabled: true
+      principal_rps: 100
+      principal_burst: 200
+      node_rps: 500
+      node_burst: 1000
+```
+
+Defaults sit two orders of magnitude above legitimate traffic (including the
+default 1s agent polling cadence); misconfigured non-positive or non-finite
+values fall back to the defaults with a startup warning.
 
 ### Hub high availability (lease election)
 
@@ -186,6 +313,7 @@ it with environment variables:
 | `ARKFLOW_OIDC_JWKS_REFRESH_MS` | no | Periodic whole-table JWKS refresh cadence in milliseconds (default 3600000, minimum 1000). The refresh revokes signing keys the provider rotated away; a failed refresh keeps the previous keys and logs a warning. |
 | `ARKFLOW_OIDC_ROLE_CLAIM` | no | Claim carrying the role(s); defaults to `roles`. |
 | `ARKFLOW_OIDC_SCOPES_CLAIM` | no | Claim carrying resource scopes; defaults to `scopes`. |
+| `ARKFLOW_OIDC_MANAGED_USERS_ONLY` | no | Set `true` to require every federated subject to be bound to a Hub user (`oidc_subject`); unbound subjects get `401` instead of claim-mapped access. Default `false`. See [Users and credentials](./users-and-credentials.md#oidc-binding-and-revocation). |
 | `ARKFLOW_OIDC_CLIENT_ID` | login | OAuth2 client id for the browser authorization-code flow. |
 | `ARKFLOW_OIDC_CLIENT_SECRET` | login | OAuth2 client secret. |
 | `ARKFLOW_OIDC_REDIRECT_URI` | login | Registered redirect URI, e.g. `https://hub.example.com/api/v1/auth/oidc/callback`. |
@@ -206,15 +334,23 @@ authorization/token endpoints at startup and serves a browser login flow:
   clears the cookie.
 
 Browser sessions participate in the same RBAC model as every other
-credential (the role comes from the role claim). The Console integrates
-automatically: it probes `GET /api/v1/auth/oidc/status` (a public endpoint
-reporting `login_enabled`, `authenticated`, and the principal), redirects
-to the login flow on a 401, and shows a sign-out control for
-authenticated sessions. `VITE_API_TOKEN` deployments keep working
-unchanged — with a static token configured the console never redirects. Sessions live in memory:
-restarting the Hub signs everyone out, and there is no revocation list —
-prefer short-lived tokens at the identity provider. Without the client
-variables the Hub stays bearer-only and the login routes are absent.
+credential: the role comes from the role claim unless the subject is bound to a
+managed user, in which case the directory's role and scopes are authoritative
+(see [Users and credentials](./users-and-credentials.md)). The Console
+integrates automatically: it probes `GET /api/v1/auth/oidc/status` (a public
+endpoint reporting `login_enabled`, `authenticated`, and the principal),
+redirects to the login flow on a 401, and shows a sign-out control for
+authenticated sessions. `VITE_API_TOKEN` deployments keep working unchanged —
+with a static token configured the console never redirects — and the console
+can also accept a bearer token at runtime instead of at build time. Sessions
+are persisted in the control-plane database when the Hub has durable storage
+(`cp_sessions`, schema v5): they survive Hub restarts, are deleted on logout,
+and are invalidated immediately when the user is disabled, deleted, or
+`POST /api/v1/users/{id}/revoke-tokens` is called. A volatile Hub keeps the
+old in-memory behavior and signs everyone out on restart. Backup and restore
+exclude `cp_sessions` on purpose, so a disaster recovery never resurrects
+logins. Without the client variables the Hub stays bearer-only and the login
+routes are absent.
 
 Claims map onto the existing RBAC model: `sub` becomes the principal id,
 the role claim accepts an array or a single string (`admin`, `operator`, or
@@ -223,8 +359,15 @@ comma-separated) uses the same `type=id` grammar as static credentials,
 for example `["node=node-a", "stream"]`. Only asymmetric algorithms
 (ES256/RS256) are accepted; signature, expiry, issuer, and audience are all
 validated, and the JWKS is cached with on-demand refresh when an unknown key
-id appears. Prefer short-lived tokens at your identity provider — there is
-no revocation list. The static credential still works when configured, so
+id appears. A subject bound to a managed user (`oidc_subject`) is governed by
+the directory instead: role and scopes come from the user record, a disabled
+user is rejected with `401`, a token whose `iat` predates the user's
+`tokens_valid_after_ms` (60-second clock-skew tolerance) is rejected, and a
+bound token without `iat` is rejected outright. Set
+`ARKFLOW_OIDC_MANAGED_USERS_ONLY=true` to require that every federated subject
+be bound. Prefer short-lived tokens at your identity provider, and use the
+managed directory's `revoke-tokens` for central revocation of already-issued
+JWTs and sessions. The static credential still works when configured, so
 you can keep break-glass automation tokens while human access moves to the
 identity provider.
 

@@ -3,16 +3,33 @@ import { useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { api, errorMessage, formatTime } from '../api'
+import { api, formatTime } from '../api'
 import type { ControlNode } from '../api'
 import { useT } from '../i18n'
-import { useEvents, useMetrics, useNodes, useOperations, useStatus, useStreams, useSystem } from '../queries'
+import {
+  useEvents,
+  useMetrics,
+  useMutationFailure,
+  useNodes,
+  useOperations,
+  useStatus,
+  useStreams,
+  useSystem,
+} from '../queries'
 import { useConfirm } from './confirm'
 import { Card, EventRow, SkeletonRows, active, number } from './shared'
 
-export function Overview({ onError }: { onError?: (message: string) => void }) {
+export function Overview({
+  onError,
+  canManageNodes = true,
+}: {
+  onError?: (message: string) => void
+  canManageNodes?: boolean
+}) {
   const t = useT()
+  const nodeActionTitle = canManageNodes ? undefined : t('perm.requires', { action: 'manage_nodes' })
   const queryClient = useQueryClient()
+  const reportMutationFailure = useMutationFailure()
   const confirm = useConfirm()
   const [searchParams] = useSearchParams()
   const nodeId = searchParams.get('node_id') ?? undefined
@@ -20,8 +37,8 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
   const statusQuery = useStatus()
   const nodesQuery = useNodes()
   const streamsQuery = useStreams(nodeId)
-  const operationsQuery = useOperations(nodeId)
-  const eventsQuery = useEvents(nodeId)
+  const operationsQuery = useOperations({ node_id: nodeId })
+  const eventsQuery = useEvents({ node_id: nodeId })
   const metricsQuery = useMetrics(nodeId)
   const system = systemQuery.data ?? null
   const status = statusQuery.data ?? null
@@ -51,7 +68,7 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
         void queryClient.invalidateQueries({ queryKey: ['live', 'nodes'] })
         toast.success(t('toast.accepted'))
       })
-      .catch((cause) => onError?.(errorMessage(cause)))
+      .catch((cause) => reportMutationFailure(onError, cause))
   }
   const [editingLabels, setEditingLabels] = useState<ControlNode | null>(null)
   const running = streams.filter((stream) => stream.state === 'running').length
@@ -144,18 +161,36 @@ export function Overview({ onError }: { onError?: (message: string) => void }) {
                       </div>
                     )}
                     <div className="actions">
-                      <button onClick={() => setEditingLabels(node)}>{t('overview.labels')}</button>
+                      <button
+                        disabled={!canManageNodes}
+                        title={nodeActionTitle}
+                        onClick={() => setEditingLabels(node)}
+                      >
+                        {t('overview.labels')}
+                      </button>
                       {maintenance === 'active' ? (
                         <>
-                          <button onClick={() => void setMaintenance(node, 'drain')}>
+                          <button
+                            disabled={!canManageNodes}
+                            title={nodeActionTitle}
+                            onClick={() => void setMaintenance(node, 'drain')}
+                          >
                             {t('overview.drain')}
                           </button>
-                          <button onClick={() => void setMaintenance(node, 'maintain')}>
+                          <button
+                            disabled={!canManageNodes}
+                            title={nodeActionTitle}
+                            onClick={() => void setMaintenance(node, 'maintain')}
+                          >
                             {t('overview.maintain')}
                           </button>
                         </>
                       ) : (
-                        <button onClick={() => void setMaintenance(node, 'resume')}>
+                        <button
+                          disabled={!canManageNodes}
+                          title={nodeActionTitle}
+                          onClick={() => void setMaintenance(node, 'resume')}
+                        >
                           {t('overview.resume')}
                         </button>
                       )}
@@ -232,6 +267,7 @@ function LabelsEditor({
   onError: (message: string) => void
 }) {
   const t = useT()
+  const reportMutationFailure = useMutationFailure()
   const [draft, setDraft] = useState(
     Object.entries(node.labels ?? {})
       .map(([key, value]) => `${key}=${value}`)
@@ -259,7 +295,7 @@ function LabelsEditor({
       onSaved()
     } catch (cause) {
       setBusy(false)
-      onError(errorMessage(cause))
+      reportMutationFailure(onError, cause)
     }
   }
   return (

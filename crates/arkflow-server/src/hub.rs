@@ -4,7 +4,6 @@
 //! the transport-neutral state machine used by the HTTP handlers and Agent
 //! client protocol.
 
-use crate::api_contract::OperatorPrincipal;
 use crate::storage::{
     JobCheckpointRecord, JobRecord, JobUpgradeRecord, JobVersionRecord, PersistedOperation,
     RolloutRecord, StorageActor, StorageError,
@@ -20,7 +19,9 @@ mod approval;
 mod checkpoint;
 mod command_metrics;
 mod error;
+mod identity;
 mod job_orchestration;
+mod job_pause;
 mod jobs;
 mod leadership;
 mod lifecycle;
@@ -37,7 +38,11 @@ mod wire;
 #[cfg(test)]
 mod approval_tests;
 #[cfg(test)]
+mod identity_tests;
+#[cfg(test)]
 mod job_orchestration_tests;
+#[cfg(test)]
+mod job_pause_tests;
 #[cfg(test)]
 mod session_report_tests;
 #[cfg(test)]
@@ -278,12 +283,6 @@ impl Hub {
     pub fn oidc_login(&self) -> Option<Arc<crate::oidc::OidcFederation>> {
         let federation = self.oidc.as_ref()?;
         federation.login_enabled().then(|| federation.clone())
-    }
-
-    /// Resolves an `arkflow_session` cookie value to its principal.
-    pub fn oidc_session_principal(&self, session_id: &str) -> Option<OperatorPrincipal> {
-        let federation = self.oidc.as_ref()?;
-        federation.resolve_session(session_id)
     }
 
     pub fn has_storage(&self) -> bool {

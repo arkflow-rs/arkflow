@@ -273,6 +273,49 @@ pub fn storage_families() -> Vec<MetricFamily> {
     .collect()
 }
 
+/// Control-plane rate-limit rejection counters (`control-plane-rate-limiting`
+/// capability): one series per plane and bucket class. Series render only
+/// after their first rejection, so a fresh process (and the observability-only
+/// router, where no API is served) exports an empty exposition; labels are a
+/// closed vocabulary and never carry credential-derived values.
+pub fn rate_limit_families() -> Vec<MetricFamily> {
+    use crate::api::rate_limit::{rejection_total, KeyKind, Plane};
+    let planes = [("local", Plane::Local), ("hub", Plane::Hub)];
+    let kinds = [
+        ("principal", KeyKind::Principal),
+        ("node", KeyKind::Node),
+        ("catch_all", KeyKind::CatchAll),
+    ];
+    let series: Vec<(Vec<Label>, u64)> = planes
+        .iter()
+        .flat_map(|(plane_label, plane)| {
+            kinds
+                .iter()
+                .filter_map(move |(kind_label, kind)| {
+                    let total = rejection_total(*plane, *kind);
+                    (total > 0).then(|| {
+                        (
+                            vec![
+                                ("plane", (*plane_label).to_string()),
+                                ("key_kind", (*kind_label).to_string()),
+                            ],
+                            total,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    family(
+        "arkflow_control_plane_rate_limit_rejections_total",
+        "Requests rejected by control-plane rate limiting.",
+        MetricType::COUNTER,
+        series,
+    )
+    .into_iter()
+    .collect()
+}
+
 /// Encode families as Prometheus text format 0.0.4 (HELP/TYPE included).
 pub fn encode_families(families: Vec<MetricFamily>) -> String {
     let encoder = TextEncoder::new();
@@ -455,6 +498,27 @@ mod tests {
                 "arkflow_job_wal_flush_failures_total{node=\"node-a\",job=\"orders-job\"} 2"
             ),
             "the WAL counter must carry the reporting node's label on the Hub export"
+        );
+    }
+
+    #[test]
+    fn rate_limit_rejections_render_a_closed_low_cardinality_family() {
+        // Fresh process: no rejections, no family. (Cannot be asserted here —
+        // the counters are process-global statics and other tests in this
+        // binary record rejections concurrently.)
+        use crate::api::rate_limit::{record_rejection_for_tests, KeyKind, Plane};
+        record_rejection_for_tests(Plane::Local, KeyKind::Principal);
+        let text = encode_families(rate_limit_families());
+        assert!(text.contains("# TYPE arkflow_control_plane_rate_limit_rejections_total counter"));
+        assert!(
+            text.contains(
+                "arkflow_control_plane_rate_limit_rejections_total{plane=\"local\",key_kind=\"principal\"}"
+            ),
+            "rejected series must render: {text}"
+        );
+        assert!(
+            !text.contains("credential") && !text.contains("cred-"),
+            "labels must never carry credential-derived values: {text}"
         );
     }
 }

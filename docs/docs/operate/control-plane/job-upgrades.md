@@ -27,6 +27,36 @@ keeps processing during the savepoint; the stop-the-world window shrinks to
 the savepoint-plus-restore interval. The stopped mode remains available and
 unchanged for planned maintenance.
 
+## Pause: orchestration vs. Job {#pause-orchestration-vs-job}
+
+"Pause" names two different mechanisms with different owners and lifetimes —
+do not use one as evidence of the other:
+
+| | Upgrade-orchestration pause | Job pause |
+| --- | --- | --- |
+| Route | `POST /jobs/{id}/upgrades/{upgrade_id}/actions` with `{"action":"pause"}` | `POST /jobs/{id}/actions/pause` (or `PUT /jobs/{id}/desired-state {"state":"paused"}`) |
+| What is paused | The upgrade phase machine: it stops advancing, freezing the phase deadline | The Job itself: the Hub captures a recovery artifact, then stops the Job |
+| Data processing | The old generation keeps processing while the savepoint phase is paused | The Job stops consuming and releases its compute |
+| Effect on `desired_state` | None | `running` → `paused` (and back to `running` on resume) |
+| Resume means | Re-arm the phase deadline and continue the upgrade | Bump the generation and restart from the pause artifact |
+| Duration | Should be short; a long pause stretches the replay window | Can last arbitrarily long (the artifact is retention-pinned) |
+
+The two are mutually exclusive in both directions:
+
+- While a non-terminal upgrade orchestration owns the Job, pause and resume are
+  rejected with `409 orchestration_in_progress`, alongside the desired-state
+  and lifecycle-action rejections listed below.
+- While a pause phase is present (`capturing`, `stopping`, `paused`, or
+  `resuming`), both atomic and stopped-mode upgrades are rejected with
+  `409 job_paused`. Resume the Job first, or stop it to clear the pause
+  bookkeeping; the ordinary upgrade preconditions then apply again.
+
+A paused Job is quiesced (once its phase settles) and can be left in that
+state; an orchestration-paused Job is still owned by the in-flight cutover —
+possibly still running, possibly frozen between the old and the new version.
+For the capture-then-stop sequence and the replay boundary of a Job pause, see
+[Streaming jobs → Pause and resume](../../build/jobs.md#pause-and-resume).
+
 ## Phase machine
 
 ```text
@@ -72,6 +102,7 @@ to), and job-level mutations are rejected with
 
 - `PUT /jobs/{id}/desired-state`
 - `POST /jobs/{id}/actions/{start|stop|restart}`
+- `POST /jobs/{id}/actions/{pause|resume}`
 - further upgrades (atomic or stopped mode) and manual version rollback
 
 The observation phases (`verifying`, `rolling_back`) deliberately let ordinary

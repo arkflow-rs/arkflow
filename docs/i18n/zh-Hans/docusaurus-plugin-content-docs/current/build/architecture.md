@@ -20,7 +20,7 @@ Input → Buffer → [Processor → Processor → …] → Output
 ```
 
 - **输入(Input)** —— 从数据源读取原始消息(Kafka、MQTT、HTTP、文件等)。
-- **缓冲(Buffer)** —— 在输入与处理器之间保存批次。可以是简单的内存队列,也可以是窗口策略(滚动、滑动、会话),还可选地连接多个数据源。
+- **缓冲(Buffer)** —— 输入与处理器之间的可选窗口。编译后的 Stream 中,普通 `memory` 缓冲退化为直通(有界通道本身已提供缓冲),`tumbling_window`/`session_window` 编译为处理时间窗口算子,而旧式 `sliding_window` 与 `join` 缓冲会被流编译器以迁移错误拒绝。
 - **流水线(Pipeline)** —— 应用于每个批次的**处理器**有序列表,由 `thread_num` 个工作任务并行执行。
 - **输出(Output)** —— 将每个处理完的批次写到下游。可选的 `error_output` 接收处理器处理失败的批次。
 - **持久化(Durability)** —— 可选的流级预写日志(WAL),在输入边界持久化消息,使其在崩溃后幸存(参见[投递语义](/zh-Hans/docs/build/delivery-semantics))。
