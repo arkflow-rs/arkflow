@@ -2288,6 +2288,23 @@ impl StorageBackend for PostgresBackend {
         }
     }
 
+    async fn job_dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by, requested_by FROM cp_jobs WHERE job_id = ?1",
+                    binds![job_id],
+                    |row| Ok((row_to_job_pg(row)?, row.get::<Option<String>>(17)?)),
+                )
+                .await
+                .optional()
+        }
+    }
+
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
         {
             let mut connection = self.lease().await?;

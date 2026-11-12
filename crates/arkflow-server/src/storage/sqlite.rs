@@ -2430,6 +2430,21 @@ impl SqliteBackend {
         })
     }
 
+    pub fn job_dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by, requested_by FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    |row| Ok((row_to_job(row)?, row.get::<_, Option<String>>(17)?)),
+                )
+                .optional()
+        })
+    }
+
     pub fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
         self.with_connection(|connection| {
             connection.execute(
@@ -3932,6 +3947,12 @@ impl StorageBackend for SqliteBackend {
     }
     async fn job_requested_by(&self, job_id: &str) -> Result<Option<String>, StorageError> {
         self.job_requested_by(job_id)
+    }
+    async fn job_dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, StorageError> {
+        self.job_dispatch_snapshot(job_id)
     }
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
         self.upsert_job_version(record)

@@ -929,6 +929,9 @@ storage_ops! {
     ("job_requested_by", JobRequestedBy, job_requested_by) plain Option<String> {
         job_id: String as s,
     },
+    ("job_dispatch_snapshot", JobDispatchSnapshot, job_dispatch_snapshot) plain Option<(JobRecord, Option<String>)> {
+        job_id: String as s,
+    },
     ("list_jobs", ListJobs, list_jobs) plain Vec<JobRecord> {},
     ("upsert_job_version", UpsertJobVersion, upsert_job_version) fenced () {
         record: JobVersionRecord as v,
@@ -1666,6 +1669,12 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Initiating principal of the Job's latest accepted desired-state
     /// mutation, used to attribute dispatch deferred to reconciliation.
     async fn job_requested_by(&self, job_id: &str) -> Result<Option<String>, StorageError>;
+    /// The Job record and its requester from one atomic read, so a deferred
+    /// dispatch can never pair a generation with another mutation's actor.
+    async fn job_dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, StorageError>;
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError>;
     async fn list_job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, StorageError>;
     async fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError>;
@@ -2754,6 +2763,15 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::job_requested_by(backend, job_id).await,
             Self::Postgres(backend) => StorageBackend::job_requested_by(backend, job_id).await,
+        }
+    }
+    async fn job_dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::job_dispatch_snapshot(backend, job_id).await,
+            Self::Postgres(backend) => StorageBackend::job_dispatch_snapshot(backend, job_id).await,
         }
     }
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {

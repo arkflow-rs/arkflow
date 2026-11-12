@@ -302,12 +302,38 @@ impl Hub {
             Some(updated)
         };
         if let Some(job) = &updated {
-            self.jobs
-                .write()
-                .await
-                .insert(job.job_id.clone(), job.clone());
+            // The in-memory branch already cached the record and its actor in
+            // one critical section; re-inserting here would let an older
+            // record overwrite a newer concurrent mutation.
+            if self.storage.is_some() {
+                self.jobs
+                    .write()
+                    .await
+                    .insert(job.job_id.clone(), job.clone());
+            }
             self.reconcile_job_as(job, actor).await?;
         }
         Ok(updated)
+    }
+
+    /// The Job record and its requester from one consistent snapshot. A
+    /// deferred dispatch must never pair one mutation's generation with
+    /// another mutation's actor.
+    pub(crate) async fn dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, HubError> {
+        if let Some(storage) = &self.storage {
+            return storage
+                .job_dispatch_snapshot(job_id.to_owned())
+                .await
+                .map_err(HubError::from);
+        }
+        let jobs = self.jobs.read().await;
+        let Some(job) = jobs.get(job_id).cloned() else {
+            return Ok(None);
+        };
+        let actor = self.job_actors.read().await.get(job_id).cloned();
+        Ok(Some((job, actor)))
     }
 }

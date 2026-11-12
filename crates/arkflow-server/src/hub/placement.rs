@@ -537,28 +537,25 @@ impl Hub {
     }
 
     pub async fn reconcile_jobs(&self) -> Result<usize, HubError> {
-        let jobs = self.jobs().await?;
+        let job_ids = self
+            .jobs()
+            .await?
+            .into_iter()
+            .map(|job| job.job_id)
+            .take(MAX_JOB_RECONCILIATIONS_PER_TICK)
+            .collect::<Vec<_>>();
         let mut dispatched = 0;
-        for job in jobs.into_iter().take(MAX_JOB_RECONCILIATIONS_PER_TICK) {
-            // A mutation accepted while every target was offline has no
-            // operation to inherit from; its attribution is stored on the Job.
-            // A lookup failure must not be laundered into `system`: abort the
-            // tick so the next one retries with the stored requester.
-            let actor = match &self.storage {
-                Some(storage) => storage
-                    .job_requested_by(job.job_id.clone())
-                    .await
-                    .map_err(HubError::from)?
-                    .unwrap_or_else(|| "system".into()),
-                None => self
-                    .job_actors
-                    .read()
-                    .await
-                    .get(&job.job_id)
-                    .cloned()
-                    .unwrap_or_else(|| "system".into()),
+        for job_id in job_ids {
+            // Re-read the record WITH its requester. The list snapshot above
+            // may predate a concurrent mutation; pairing that older Job with
+            // a newer actor would misattribute the deferred dispatch.
+            let Some((job, actor)) = self.dispatch_snapshot(&job_id).await? else {
+                continue;
             };
-            match self.reconcile_job_as(&job, &actor).await {
+            match self
+                .reconcile_job_as(&job, actor.as_deref().unwrap_or("system"))
+                .await
+            {
                 Ok(count) => dispatched += count,
                 // One Job whose target is at capacity, whose node expired
                 // between the online pre-check and the enqueue, or whose

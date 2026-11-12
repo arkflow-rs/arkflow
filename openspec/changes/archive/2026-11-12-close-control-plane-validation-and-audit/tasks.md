@@ -42,4 +42,4 @@
 
 - 延迟派发归因：`cp_jobs` 新增 `requested_by`（schema v6），期望状态与暂停写入原子保存最近一次已接受变更的发起人；节点恢复后 `reconcile_jobs` 按该字段派发，离线期间接受的 start/stop/resume 不再回退为 `system`；resume 收敛审计记录恢复请求者而非暂停发起人。
 - 新增 `job_actor_tests` 两项回归（离线目标恢复后的延迟 start、延迟 resume/stop 与收敛审计）；SQLite 8 项与真实 PostgreSQL 8 项通过，审计 API 4 项在两种后端通过。
-- 暂停 E2E 的断言按既有规格的 capture→stop replay 边界收敛为：每个 sequence 至少投递一次、顺序与 keyed 计数单调，不宣称 exactly-once；双策略重复 6 轮稳定通过。
+- 并发一致性（PR review 追加）：volatile Hub 的 Job 记录与发起人写入收敛到同一 jobs-lock 临界区，期望状态路径不再在锁外回写；reconcile 改用 `job_dispatch_snapshot`（SQLite/PostgreSQL 单查询、volatile 同一读锁）原子配对记录与发起人。新增两例并发回归，SQLite 与真实 PostgreSQL 12 项身份测试通过。

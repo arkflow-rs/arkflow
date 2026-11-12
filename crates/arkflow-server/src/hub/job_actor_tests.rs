@@ -10,6 +10,8 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 fn config() -> HubConfig {
@@ -546,6 +548,126 @@ async fn volatile_job_and_actor_writes_stay_consistent() {
             "bob"
         };
         assert_eq!(actor, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn volatile_upsert_and_desired_state_stay_generation_consistent() {
+    for _ in 0..20 {
+        let hub = Hub::new(config());
+        hub.upsert_job(job("stopped")).await.unwrap();
+        let one = hub.clone();
+        let two = hub.clone();
+        let (upsert, update) = tokio::join!(
+            tokio::spawn(async move { one.upsert_job_as(job("stopped"), "alice").await }),
+            tokio::spawn(async move {
+                two.update_job_desired_state_as("orders", "running", 1, "bob")
+                    .await
+            }),
+        );
+        let mut writers = vec![(upsert.unwrap().unwrap().generation, "alice")];
+        match update.unwrap() {
+            Ok(Some(job)) => writers.push((job.generation, "bob")),
+            Ok(None) => panic!("the seeded Job must exist"),
+            Err(HubError::GenerationConflict { .. }) => {}
+            Err(error) => panic!("{error}"),
+        }
+        let stored = hub.job("orders").await.unwrap().unwrap();
+        let actor = hub.job_actors.read().await.get("orders").cloned().unwrap();
+        let winner = writers
+            .iter()
+            .max_by_key(|(generation, _)| *generation)
+            .unwrap();
+        assert_eq!(winner.0, stored.generation, "{writers:?}");
+        assert_eq!(
+            actor, winner.1,
+            "generation {} paired with another mutation's actor: {writers:?}",
+            stored.generation
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn volatile_reconcile_pairs_each_generation_with_its_actor() {
+    let hub = Hub::new(config());
+    let auth = register(&hub, &["job_runtime", "state_backend"]).await;
+    hub.upsert_job(job("stopped")).await.unwrap();
+    let history = Arc::new(Mutex::new(BTreeMap::from([(1u64, "system".to_owned())])));
+    let mutator = {
+        let hub = hub.clone();
+        let history = history.clone();
+        tokio::spawn(async move {
+            for step in 0..200u64 {
+                let current = hub.job("orders").await.unwrap().unwrap();
+                let state = if current.desired_state == "running" {
+                    "stopped"
+                } else {
+                    "running"
+                };
+                let actor = format!("writer-{step}");
+                match hub
+                    .update_job_desired_state_as("orders", state, current.generation, &actor)
+                    .await
+                {
+                    Ok(Some(job)) => {
+                        history.lock().unwrap().insert(job.generation, actor);
+                    }
+                    Ok(None) => break,
+                    Err(HubError::GenerationConflict { .. }) => continue,
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        })
+    };
+    for _ in 0..500 {
+        // No Agent consumes commands here: settle them so the per-node
+        // capacity bound does not interfere with the attribution race.
+        for command in hub.commands(auth.clone()).await.unwrap() {
+            hub.command_result(
+                auth.clone(),
+                CommandResult {
+                    command_id: command.id,
+                    operation_id: command.operation_id,
+                    state: HubOperationState::Succeeded,
+                    progress: 100,
+                    error: None,
+                    correlation_id: None,
+                    generation: command.generation,
+                    observed_generation: Some(command.generation),
+                    action_id: None,
+                    failure_class: None,
+                    config_version_id: None,
+                    rollout_id: None,
+                    observed_checkpoint_id: None,
+                    checkpoint_manifest_uri: None,
+                    result: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        hub.reconcile_jobs().await.unwrap();
+        tokio::task::yield_now().await;
+    }
+    mutator.await.unwrap();
+    let operations = hub.operations(None).await;
+    let history = history.lock().unwrap();
+    for operation in operations {
+        if operation.resource_id != "orders"
+            || !matches!(
+                operation.operation,
+                AgentOperation::JobStart | AgentOperation::JobStop
+            )
+        {
+            continue;
+        }
+        assert_eq!(
+            operation.actor.clone(),
+            history.get(&operation.generation).cloned(),
+            "{:?} generation {} paired with another mutation's actor",
+            operation.operation,
+            operation.generation
+        );
     }
 }
 
