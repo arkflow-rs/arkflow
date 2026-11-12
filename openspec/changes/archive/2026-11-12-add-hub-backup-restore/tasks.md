@@ -20,7 +20,7 @@
 ## 4. CLI 与验证
 
 - [x] 4.1 `bin/arkflow-server.rs` 分发 `backup`/`restore` 参数（与 `migrate` 同构）+ `--help`；`cargo test -p arkflow-server` 全绿 + clippy/fmt 干净
-- [ ] 4.2 真实运行验证：本地起 SQLite Hub 写入数据 → backup → 新库 restore → 起Hub → 节点注册/配置版本/审计可见；migrate 漏 webhooks 修复实测（含订阅的库迁移后订阅仍在）
+- [x] 4.2 真实运行验证：本地起 SQLite Hub 写入数据 → backup → 新库 restore → 起Hub → 节点注册/配置版本/审计可见；migrate 漏 webhooks 修复实测（含订阅的库迁移后订阅仍在）（2026-11-12 实测：debug 二进制真实 Hub 起停；快照 integrity ok + 逐表行数等价 + cp_hub_lease 0 行；非空目标恢复拒绝并列出全部非空表、已存在快照文件拒绝；恢复后审计 5 条/webhook 订阅/job 立即可见，节点重注册后可见，未处理 outbox 的 job_start 命令经 reconciliation 重放投递，配置版本经 agent 上报后可见；sqlite→PG 迁移后 cp_webhooks 1 行完整；附加快照→PG 空库恢复 + PG Hub 启动全数据可见）
 
 ## 5. 文档
 

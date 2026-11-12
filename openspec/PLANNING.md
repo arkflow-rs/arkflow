@@ -611,7 +611,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 1. ~~**节点标签体系**~~ → ✅ 已由 #1336（`add-node-labels`）落地：Hub 管理标签 + 列表过滤 + selector rollout；剩余「按标签批量流命令」「标签分组审批策略」仍开放。
 2. ~~**告警/webhook/事件订阅**~~ → ✅ 已由 #1338（`add-alerting-webhooks`，2026-10-25 归档，新 spec `webhook-alerting`）落地：订阅全量替换 + 前缀过滤转发 + HMAC 签名 + 退避重试 + 连续失败自动暂停 + leader-only 投递 + Console Settings 管理面。5.7 阶段 4 中 Slack/邮件原生通道仍开放（可经 webhook 接入）。
 3. **限流/配额**：无任何 per-principal/per-node 请求限速或资源配额，仅请求体大小限制（本地 1MB/Hub 4MB）与内存硬上限（`MAX_NODES=256`、`MAX_COMMANDS_PER_NODE=128`、`MAX_OPERATIONS=1024`，`hub.rs:56-59`）。
-4. **控制面 DB 备份/恢复**：无快照/导出/恢复工具，仅停机 sqlite→pg 一次性迁移（`migrate_tool.rs`）。注意 Job 级 checkpoint/savepoint 恢复是完整的，勿混淆。
+4. ~~**控制面 DB 备份/恢复**~~ → ✅ 已由 #1349（`add-hub-backup-restore`，2026-11-12 归档，spec `hub-backup-restore`）落地：`backup --from <store> --to <file>` 统一 SQLite 快照（SQLite 源 VACUUM INTO / PG 源 REPEATABLE READ 单事务，cp_hub_lease 不进快照）+ `restore --from <file> --to <store>` 空库 fail-closed（跨后端恢复成立）；附修 migrate 漏 cp_webhooks（sqlite→pg 迁移曾静默丢全部订阅）。任务 4.2 真机验证：恢复后审计/webhook/job 立即可见、节点重注册可见、未处理 outbox 经 reconciliation 重放、快照→PG 恢复 + PG Hub 启动全数据可见。
 5. **用户/凭证管理面**：RBAC 三角色 + 资源 scope + OIDC（bearer + 浏览器登录）已实现，但无用户 CRUD、无 token 签发/吊销/轮换 API，JWT 无吊销（`oidc.rs:41` 注释自认取舍）；租户/团队隔离未做。
 6. **mTLS/客户端证书**：TLS 仅服务端加密，显式 `with_no_client_auth`（`api/mod.rs:974`）。
 7. ~~**Job 级 pause/resume**~~ → ✅ 2026-11-01 `add-job-pause-resume` 归档：`desired_state` 三值（running/stopped/paused）+ 持久暂停相位（capturing/stopping/paused/resuming），先按 `spec.recovery` 落工件再停机、resume 从工件恢复（replay 边界与无 checkpoint 冷启动已文档化），保留期 pin、崩溃续跑、升级双向互斥、审计/指标/SSE、Console 与 en/zh 文档齐备。剩余：真实双 Agent 端到端与 operations-level 审计 actor 参数化（后续专项）。
@@ -635,7 +635,7 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 | P0 | ~~`add-node-labels`~~ | 节点标签体系 + 按标签批量操作 | ✅ 已落地 #1336（标签 + 过滤 + selector rollout；审批分组策略仍留 `add-approval-label-scoping`） |
 | P0 | ~~`add-alerting-webhooks`~~ | webhook/事件订阅转发 | ✅ 已落地：订阅全量替换 + 前缀过滤转发（HMAC 签名头、3 次退避重试、连续 5 败自动暂停 + `webhook.paused/resumed` 生命周期事件、leader-only 投递、Console Settings 管理面；新动作 `ManageWebhooks`；新 spec `webhook-alerting`，`control-plane-identity` RBAC 动作面扩展）|
 | P1 | 控制面限流/配额 | per-principal/per-node 限速 | 企业入场券 |
-| P1 | 控制面 DB 备份/恢复 | 快照/导出/恢复工具 | 企业入场券 |
+| P1 | ~~控制面 DB 备份/恢复~~ | 快照/导出/恢复工具 | ✅ 已落地 #1349（`add-hub-backup-restore`），见 11.2-4 |
 | P1 | `console-rbac-and-pagination` | 角色感知 UI + 服务端分页/过滤 + 本地死页面清理 | 纯前端消费，后端零改动 |
 | P2 | ~~Job 级 pause/resume~~ | ✅ 2026-11-01 落地（`add-job-pause-resume`）：三值 desired + 持久相位 + 工件 pin + 崩溃续跑 + Console/文档 | 见 §11.2-7 |
 | P2 | server 二进制可观测 | arkflow-server tracing/OTel 初始化 + 配置文件 | 小工程 |
