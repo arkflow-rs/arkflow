@@ -14,8 +14,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   support exact `actor`/`action` filters and inclusive `from_ms`/`to_ms`
   bounds before pagination; inverted ranges return `400 invalid_audit_query`.
 - Job operation audits carry the authenticated principal for direct operator
-  dispatches and `system` for background work. Optional operation actor metadata
-  survives persistence and retry; historical operation JSON remains readable.
+  dispatches, including dispatches deferred until a target reconnects;
+  operations with no originating request use `system`. Optional operation actor
+  metadata survives persistence and retry; historical operation JSON remains
+  readable.
 - Job-level pause/resume (`POST /api/v1/jobs/{id}/actions/pause` and
   `/resume`, plus `PUT /jobs/{id}/desired-state {"state":"paused"}`):
   pausing is a durable quiesce, not a bare stop. The Hub captures a recovery

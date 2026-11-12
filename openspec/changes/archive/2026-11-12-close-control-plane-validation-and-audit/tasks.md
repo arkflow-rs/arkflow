@@ -37,3 +37,9 @@
 - 双 Agent 实跑通过：`two_node_pause_resume_latest_checkpoint_survives_sqlite_hub_restart` 与 `..._latest_savepoint_...` 各 2 轮 capture，首轮 paused 时重启 SQLite Hub，第二轮在重启后完成；真实 manifest、state snapshot、恢复指针、`job_start` payload、逐条 sequence 与 state_count、两 source 最终 24 条均通过。`hub::job_pause_tests` 12 项同时通过。
 - 实跑发现并修复两处生产缺陷（`hub/job_pause.rs`）：① capture 在途判定只覆盖 checkpoint/savepoint，未含 commit，协调器会在 commit 窗口内误判无在途并替换工件，导致重试耗尽后 `pause_savepoint_failed`；② 相位写入一律置 `reconciling`，但 resume 清除路径缺少收敛校正，恢复成功后 Job 永久停在 `reconciling`。两处均由新 E2E 确定性复现，修复后两种恢复策略实跑通过。
 - PostgreSQL 测试资源已清理：隔离 schema 由测试自行删除；临时容器 `arkflow-closure-postgres` 经用户确认后停止（`--rm`，已移除）。
+
+## 后续跟进（2026-11-12，PR #1355 review）
+
+- 延迟派发归因：`cp_jobs` 新增 `requested_by`（schema v6），期望状态与暂停写入原子保存最近一次已接受变更的发起人；节点恢复后 `reconcile_jobs` 按该字段派发，离线期间接受的 start/stop/resume 不再回退为 `system`；resume 收敛审计记录恢复请求者而非暂停发起人。
+- 新增 `job_actor_tests` 两项回归（离线目标恢复后的延迟 start、延迟 resume/stop 与收敛审计）；SQLite 8 项与真实 PostgreSQL 8 项通过，审计 API 4 项在两种后端通过。
+- 暂停 E2E 的断言按既有规格的 capture→stop replay 边界收敛为：每个 sequence 至少投递一次、顺序与 keyed 计数单调，不宣称 exactly-once；双策略重复 6 轮稳定通过。

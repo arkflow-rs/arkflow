@@ -37,7 +37,9 @@ vocabularies. These counters reset on Hub restart, consistent with Prometheus
 counter semantics. Job lifecycle mutations (`job_start`, `job_stop`,
 `job_checkpoint`, `job_savepoint`) are additionally audited with actor,
 correlation, outcome, and failure-code metadata. Direct operator dispatches
-carry the authenticated principal id; background-only dispatches use `system`.
+carry the authenticated principal id; a dispatch deferred until a target
+reconnects keeps the identity of the mutation's requester, while operations
+with no originating request use `system`.
 Operation actor metadata survives persisted-operation recovery and retries.
 Audit history is retained
 within a bounded window (30 days, 100k records) and queryable at

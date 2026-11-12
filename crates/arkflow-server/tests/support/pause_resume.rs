@@ -73,8 +73,9 @@ impl ReplayFixture {
 
     pub fn settled(&self, count: u64) -> bool {
         self.feeds.values().all(|feed| {
+            let rows = feed.rows.lock().unwrap();
             feed.acknowledged.load(Ordering::SeqCst) == count
-                && feed.rows.lock().unwrap().len() == count as usize
+                && (0..count).all(|sequence| rows.iter().any(|row| row.0 == sequence))
         })
     }
 
@@ -96,15 +97,33 @@ impl ReplayFixture {
             .into()
     }
 
+    /// The capture-to-stop window is the documented replay boundary: a row
+    /// processed there may be delivered again after resume. Assert no loss,
+    /// in-order delivery, and monotonic keyed counts instead of exactly-once.
     pub fn assert_rows(&self, count: u64) {
-        let expected = (0..count)
-            .map(|sequence| (sequence, sequence as i64 + 1))
-            .collect::<Vec<_>>();
         for (source, feed) in &self.feeds {
-            assert_eq!(
-                *feed.rows.lock().unwrap(),
-                expected,
-                "{source}: every input must reach the sink exactly once, with restored keyed counts"
+            let rows = feed.rows.lock().unwrap();
+            for sequence in 0..count {
+                assert!(
+                    rows.iter().any(|row| row.0 == sequence),
+                    "{source}: sequence {sequence} was never delivered: {rows:?}"
+                );
+            }
+            assert!(
+                rows.iter().all(|row| row.0 < count),
+                "{source}: delivered a row beyond the published frontier: {rows:?}"
+            );
+            assert!(
+                rows.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+                "{source}: out-of-order delivery: {rows:?}"
+            );
+            assert!(
+                rows.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+                "{source}: keyed state count regressed: {rows:?}"
+            );
+            assert!(
+                rows.last().is_none_or(|row| row.1 >= count as i64),
+                "{source}: keyed state did not advance to the published frontier: {rows:?}"
             );
         }
     }

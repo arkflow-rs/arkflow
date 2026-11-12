@@ -540,7 +540,18 @@ impl Hub {
         let jobs = self.jobs().await?;
         let mut dispatched = 0;
         for job in jobs.into_iter().take(MAX_JOB_RECONCILIATIONS_PER_TICK) {
-            match self.reconcile_job(&job).await {
+            // A mutation accepted while every target was offline has no
+            // operation to inherit from; its attribution is stored on the Job.
+            let actor = match &self.storage {
+                Some(storage) => storage
+                    .job_requested_by(job.job_id.clone())
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "system".into()),
+                None => "system".into(),
+            };
+            match self.reconcile_job_as(&job, &actor).await {
                 Ok(count) => dispatched += count,
                 // One Job whose target is at capacity, whose node expired
                 // between the online pre-check and the enqueue, or whose

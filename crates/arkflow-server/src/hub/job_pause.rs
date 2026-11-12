@@ -239,6 +239,7 @@ impl Hub {
             desired_state: Some("running".into()),
             phase: Some(PAUSE_RESUMING.into()),
             bump_generation: true,
+            requested_by: Some(actor.to_owned()),
             ..JobPauseUpdate::default()
         };
         let job = storage
@@ -310,6 +311,7 @@ impl Hub {
             desired_state: Some("stopped".into()),
             clear_pause: true,
             bump_generation: true,
+            requested_by: Some(actor.to_owned()),
             ..JobPauseUpdate::default()
         };
         if abandoned_artifact.is_some() {
@@ -484,10 +486,17 @@ impl Hub {
                         .map_err(HubError::from)?;
                     if let Some(cleared) = cleared {
                         self.cache_job(&cleared).await;
+                        let resume_actor = storage
+                            .job_requested_by(job.job_id.clone())
+                            .await
+                            .ok()
+                            .flatten()
+                            .or_else(|| job.paused_by.clone())
+                            .unwrap_or_else(|| "hub".into());
                         self.record_job_pause_audit(
                             "job.resume",
                             &job.job_id,
-                            job.paused_by.as_deref().unwrap_or("hub"),
+                            &resume_actor,
                             "accepted",
                             None,
                             format!("resume converged at generation {}", cleared.generation),

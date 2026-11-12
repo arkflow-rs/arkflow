@@ -400,6 +400,10 @@ pub struct JobPauseUpdate {
     pub retry_count: Option<u32>,
     pub paused_at_ms: Option<u64>,
     pub paused_by: Option<String>,
+    /// Principal of the latest accepted desired-state mutation. Survives
+    /// pause-phase writes so a dispatch deferred to reconciliation is still
+    /// attributed to its requester; `None` falls back to `system`.
+    pub requested_by: Option<String>,
     pub clear_pause: bool,
     pub restore_pointer: bool,
     pub restore_checkpoint_id: Option<String>,
@@ -429,6 +433,7 @@ impl JobPauseUpdate {
             retry_count: Some(0),
             paused_at_ms: Some(paused_at_ms),
             paused_by: Some(paused_by.to_owned()),
+            requested_by: Some(paused_by.to_owned()),
             ..Default::default()
         }
     }
@@ -688,7 +693,7 @@ pub enum StorageError {
 /// Schema version this binary's DDL understands. Each backend stamps it
 /// into the database during initialization and refuses to start when the
 /// stored stamp is newer (an older binary must not operate a newer schema).
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Outcome of `begin_write_fence`: a lock held until `end_write_fence`
 /// (`Held`) or a verified passthrough with nothing to release.
@@ -910,11 +915,18 @@ storage_ops! {
     ("upsert_job", UpsertJob, upsert_job) fenced JobRecord {
         job: JobRecord as v,
     },
+    ("upsert_job_attributed", UpsertJobAttributed, upsert_job_attributed) fenced JobRecord {
+        job: JobRecord as v,
+        requested_by: Option<String> as o,
+    },
     ("update_job_with_expected_generation", UpdateJobWithExpectedGeneration, update_job_with_expected_generation) fenced JobRecord {
         job: JobRecord as v,
         expected_generation: u64 as v,
     },
     ("get_job", GetJob, get_job) plain Option<JobRecord> {
+        job_id: String as s,
+    },
+    ("job_requested_by", JobRequestedBy, job_requested_by) plain Option<String> {
         job_id: String as s,
     },
     ("list_jobs", ListJobs, list_jobs) plain Vec<JobRecord> {},
@@ -946,6 +958,12 @@ storage_ops! {
         job_id: String as s,
         desired_state: String as s,
         expected_generation: u64 as v,
+    },
+    ("update_job_desired_state_attributed", UpdateJobDesiredStateAttributed, update_job_desired_state_attributed) fenced Option<JobRecord> {
+        job_id: String as s,
+        desired_state: String as s,
+        expected_generation: u64 as v,
+        requested_by: Option<String> as o,
     },
     ("update_job_pause", UpdateJobPause, update_job_pause) fenced Option<JobRecord> {
         job_id: String as s,
@@ -1632,12 +1650,22 @@ pub trait StorageBackend: Send + Sync + 'static {
         resource_id: &str,
     ) -> Result<Vec<PersistedOperation>, StorageError>;
     async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError>;
+    /// Upsert with the initiating principal of this mutation, persisted so a
+    /// dispatch deferred to reconciliation keeps its attribution.
+    async fn upsert_job_attributed(
+        &self,
+        job: JobRecord,
+        requested_by: Option<&str>,
+    ) -> Result<JobRecord, StorageError>;
     async fn update_job_with_expected_generation(
         &self,
         mut job: JobRecord,
         expected_generation: u64,
     ) -> Result<JobRecord, StorageError>;
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError>;
+    /// Initiating principal of the Job's latest accepted desired-state
+    /// mutation, used to attribute dispatch deferred to reconciliation.
+    async fn job_requested_by(&self, job_id: &str) -> Result<Option<String>, StorageError>;
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError>;
     async fn list_job_versions(&self, job_id: &str) -> Result<Vec<JobVersionRecord>, StorageError>;
     async fn list_jobs(&self) -> Result<Vec<JobRecord>, StorageError>;
@@ -1668,6 +1696,13 @@ pub trait StorageBackend: Send + Sync + 'static {
         job_id: &str,
         desired_state: &str,
         expected_generation: u64,
+    ) -> Result<Option<JobRecord>, StorageError>;
+    async fn update_job_desired_state_attributed(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+        requested_by: Option<&str>,
     ) -> Result<Option<JobRecord>, StorageError>;
     /// CAS-guarded mutation of the durable pause state machine: guarded by
     /// `(expected_generation, expected_phase)`, optionally bumping the
@@ -2671,6 +2706,20 @@ impl StorageBackend for ControlPlaneStore {
             Self::Postgres(backend) => StorageBackend::upsert_job(backend, job).await,
         }
     }
+    async fn upsert_job_attributed(
+        &self,
+        job: JobRecord,
+        requested_by: Option<&str>,
+    ) -> Result<JobRecord, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::upsert_job_attributed(backend, job, requested_by).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::upsert_job_attributed(backend, job, requested_by).await
+            }
+        }
+    }
     async fn update_job_with_expected_generation(
         &self,
         job: JobRecord,
@@ -2699,6 +2748,12 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::get_job(backend, job_id).await,
             Self::Postgres(backend) => StorageBackend::get_job(backend, job_id).await,
+        }
+    }
+    async fn job_requested_by(&self, job_id: &str) -> Result<Option<String>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::job_requested_by(backend, job_id).await,
+            Self::Postgres(backend) => StorageBackend::job_requested_by(backend, job_id).await,
         }
     }
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
@@ -2819,6 +2874,36 @@ impl StorageBackend for ControlPlaneStore {
                     job_id,
                     desired_state,
                     expected_generation,
+                )
+                .await
+            }
+        }
+    }
+    async fn update_job_desired_state_attributed(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+        requested_by: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::update_job_desired_state_attributed(
+                    backend,
+                    job_id,
+                    desired_state,
+                    expected_generation,
+                    requested_by,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::update_job_desired_state_attributed(
+                    backend,
+                    job_id,
+                    desired_state,
+                    expected_generation,
+                    requested_by,
                 )
                 .await
             }

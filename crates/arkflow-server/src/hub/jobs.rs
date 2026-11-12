@@ -59,7 +59,10 @@ impl Hub {
                     })
             });
         if let Some(storage) = &self.storage {
-            job = storage.upsert_job(job).await.map_err(HubError::from)?;
+            job = storage
+                .upsert_job_attributed(job, Some(actor.to_owned()))
+                .await
+                .map_err(HubError::from)?;
             if let Some(record) = version_record.clone() {
                 storage
                     .upsert_job_version(record)
@@ -255,7 +258,12 @@ impl Hub {
     ) -> Result<Option<JobRecord>, HubError> {
         let updated = if let Some(storage) = &self.storage {
             storage
-                .update_job_desired_state(job_id, desired_state, expected_generation)
+                .update_job_desired_state_attributed(
+                    job_id,
+                    desired_state,
+                    expected_generation,
+                    Some(actor.to_owned()),
+                )
                 .await
                 .map_err(HubError::from)?
         } else {

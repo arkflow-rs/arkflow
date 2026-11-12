@@ -108,6 +108,18 @@ fn job(desired_state: &str) -> JobRecord {
     }
 }
 
+fn paused_job(job_id: &str) -> JobRecord {
+    let mut job = job("paused");
+    job.job_id = job_id.into();
+    job.observed_state = "stopped".into();
+    job.convergence = "converged".into();
+    job.pause_phase = Some(crate::hub::job_pause::PAUSE_PAUSED.into());
+    job.pause_artifact_id = Some("checkpoint-paused".into());
+    job.checkpoint_id = Some("checkpoint-paused".into());
+    job.paused_by = Some("pauser".into());
+    job
+}
+
 async fn request(
     app: &Router,
     method: &str,
@@ -402,6 +414,120 @@ async fn historical_job_json_restores_without_fabricating_a_user() {
         .await
         .unwrap();
     assert_eq!(retry.actor.as_deref(), Some("system"));
+}
+
+#[tokio::test]
+async fn deferred_dispatch_after_offline_targets_keeps_the_requesting_actor() {
+    let (hub, _, _, _) = fixture("deferred_job_actor", &["job_runtime", "state_backend"]).await;
+    hub.upsert_job(job("stopped")).await.unwrap();
+    // The only target is offline: the accepted mutation cannot dispatch yet.
+    hub.nodes
+        .write()
+        .await
+        .get_mut("compute-1")
+        .unwrap()
+        .resource
+        .lease_expires_at_ms = 0;
+    let desired = hub
+        .update_job_desired_state_as("orders", "running", 1, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(desired.desired_state, "running");
+    assert!(!hub
+        .operations(None)
+        .await
+        .iter()
+        .any(|operation| operation.operation == AgentOperation::JobStart));
+
+    // The target returns; background reconciliation must not fall back to
+    // `system` when the Job records an attributed request.
+    hub.nodes
+        .write()
+        .await
+        .get_mut("compute-1")
+        .unwrap()
+        .resource
+        .lease_expires_at_ms = u64::MAX / 2;
+    hub.reconcile_jobs().await.unwrap();
+    let start = hub
+        .operations(None)
+        .await
+        .into_iter()
+        .find(|operation| operation.operation == AgentOperation::JobStart)
+        .unwrap();
+    assert_eq!(start.actor.as_deref(), Some("alice"));
+    assert!(hub
+        .audit(Some("orders"))
+        .await
+        .unwrap()
+        .iter()
+        .any(|record| {
+            record.action == "job.start"
+                && record.outcome == "accepted"
+                && record.actor.as_deref() == Some("alice")
+        }));
+}
+
+#[tokio::test]
+async fn deferred_resume_and_stop_keep_the_requesting_actor() {
+    let (hub, storage, _, _) =
+        fixture("deferred_pause_actor", &["job_runtime", "state_backend"]).await;
+    hub.upsert_job(paused_job("orders")).await.unwrap();
+    hub.upsert_job(paused_job("payments")).await.unwrap();
+    hub.nodes
+        .write()
+        .await
+        .get_mut("compute-1")
+        .unwrap()
+        .resource
+        .lease_expires_at_ms = 0;
+    let resumed = hub.resume_job("orders", "bob").await.unwrap();
+    hub.stop_paused_job("payments", "carol").await.unwrap();
+    assert_eq!(
+        storage.job_requested_by("orders").await.unwrap().as_deref(),
+        Some("bob")
+    );
+    assert_eq!(
+        storage
+            .job_requested_by("payments")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("carol")
+    );
+
+    hub.nodes
+        .write()
+        .await
+        .get_mut("compute-1")
+        .unwrap()
+        .resource
+        .lease_expires_at_ms = u64::MAX / 2;
+    hub.reconcile_jobs().await.unwrap();
+    let stop = hub
+        .operations(None)
+        .await
+        .into_iter()
+        .find(|operation| {
+            operation.operation == AgentOperation::JobStop && operation.resource_id == "payments"
+        })
+        .unwrap();
+    assert_eq!(stop.actor.as_deref(), Some("carol"));
+
+    hub.observe_job("orders", resumed.generation, "running", None, None)
+        .await
+        .unwrap();
+    hub.reconcile_job_pauses().await.unwrap();
+    let audits = hub.audit(Some("orders")).await.unwrap();
+    let resume_audits = audits
+        .iter()
+        .filter(|record| record.action == "job.resume" && record.outcome == "accepted")
+        .collect::<Vec<_>>();
+    assert!(resume_audits.len() >= 2, "{resume_audits:?}");
+    assert!(resume_audits
+        .iter()
+        .all(|record| record.actor.as_deref() == Some("bob")));
 }
 
 #[tokio::test]
