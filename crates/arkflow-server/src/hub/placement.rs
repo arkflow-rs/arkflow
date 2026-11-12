@@ -542,12 +542,13 @@ impl Hub {
         for job in jobs.into_iter().take(MAX_JOB_RECONCILIATIONS_PER_TICK) {
             // A mutation accepted while every target was offline has no
             // operation to inherit from; its attribution is stored on the Job.
+            // A lookup failure must not be laundered into `system`: abort the
+            // tick so the next one retries with the stored requester.
             let actor = match &self.storage {
                 Some(storage) => storage
                     .job_requested_by(job.job_id.clone())
                     .await
-                    .ok()
-                    .flatten()
+                    .map_err(HubError::from)?
                     .unwrap_or_else(|| "system".into()),
                 None => "system".into(),
             };

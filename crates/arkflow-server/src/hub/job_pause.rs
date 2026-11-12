@@ -474,6 +474,15 @@ impl Hub {
                     && job.convergence == "converged"
                 {
                     let storage = self.require_durable_storage()?.clone();
+                    // Read the requester BEFORE the phase-clear write: once
+                    // the pause is cleared a later desired-state mutation may
+                    // replace it, which must not retag this resume's audit.
+                    let resume_actor = storage
+                        .job_requested_by(job.job_id.clone())
+                        .await
+                        .map_err(HubError::from)?
+                        .or_else(|| job.paused_by.clone())
+                        .unwrap_or_else(|| "hub".into());
                     let update = JobPauseUpdate {
                         expected_generation: job.generation,
                         expected_phase: Some(PAUSE_RESUMING.into()),
@@ -486,13 +495,6 @@ impl Hub {
                         .map_err(HubError::from)?;
                     if let Some(cleared) = cleared {
                         self.cache_job(&cleared).await;
-                        let resume_actor = storage
-                            .job_requested_by(job.job_id.clone())
-                            .await
-                            .ok()
-                            .flatten()
-                            .or_else(|| job.paused_by.clone())
-                            .unwrap_or_else(|| "hub".into());
                         self.record_job_pause_audit(
                             "job.resume",
                             &job.job_id,
