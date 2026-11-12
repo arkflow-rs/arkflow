@@ -164,6 +164,8 @@ pub struct Hub {
     pub(crate) test_write_gate: Arc<RwLock<Option<Arc<TestGate>>>>,
     #[cfg(test)]
     pub(crate) test_list_gate: Arc<RwLock<Option<Arc<TestGate>>>>,
+    #[cfg(test)]
+    pub(crate) test_after_write_gate: Arc<RwLock<Option<Arc<TestGate>>>>,
     /// The node order each Job's placement was actually dispatched in, so a
     /// retained placement re-dispatches with the identical task→node mapping
     /// (split round-robin and multi-component co-location are order
@@ -277,6 +279,8 @@ impl Hub {
             test_write_gate: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             test_list_gate: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            test_after_write_gate: Arc::new(RwLock::new(None)),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             plan_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),

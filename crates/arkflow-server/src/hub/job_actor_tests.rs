@@ -748,6 +748,39 @@ async fn reconcile_snapshot_reads_record_and_actor_after_a_concurrent_mutation()
     assert_eq!(start.actor.as_deref(), Some("carol"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_mutation_survives_an_earlier_mutation_finishing_late() {
+    let hub = Hub::new(config());
+    hub.upsert_job(job("stopped")).await.unwrap();
+    let gate = Arc::new(crate::hub::TestGate::default());
+    *hub.test_after_write_gate.write().await = Some(gate.clone());
+    let first = {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            hub.update_job_desired_state_as("orders", "running", 1, "alice")
+                .await
+        })
+    };
+    // The first mutation has written (and released the lock) and is parked
+    // before finishing. A second mutation completes while it is parked.
+    gate.arrived.notified().await;
+    // Future mutations skip the gate; the first is already parked inside it.
+    *hub.test_after_write_gate.write().await = None;
+    let second = hub
+        .update_job_desired_state_as("orders", "stopped", 2, "bob")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.generation, 3);
+    gate.release.notify_one();
+    first.await.unwrap().unwrap().unwrap();
+    let stored = hub.job("orders").await.unwrap().unwrap();
+    let actor = hub.job_actors.read().await.get("orders").cloned().unwrap();
+    assert_eq!(stored.generation, 3);
+    assert_eq!(stored.desired_state, "stopped");
+    assert_eq!(actor, "bob");
+}
+
 #[tokio::test]
 async fn generation_fenced_replacement_records_the_upgrade_actor() {
     let (hub, storage, _, _) = fixture("upgrade_actor", &["job_runtime", "state_backend"]).await;

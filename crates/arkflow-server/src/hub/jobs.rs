@@ -327,6 +327,8 @@ impl Hub {
                 .insert(job_id.to_owned(), actor.to_owned());
             Some(updated)
         };
+        #[cfg(test)]
+        Self::pass_test_gate(&self.test_after_write_gate).await;
         if let Some(job) = &updated {
             // The in-memory branch already cached the record and its actor in
             // one critical section; re-inserting here would let an older
