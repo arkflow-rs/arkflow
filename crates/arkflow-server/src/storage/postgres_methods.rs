@@ -1339,13 +1339,20 @@ impl StorageBackend for PostgresBackend {
 
 
     async fn list_audit(&self, resource_id: Option<&str>) -> Result<Vec<AuditRecord>, StorageError> {
+        self.list_audit_filtered(AuditFilter {
+            resource_id: resource_id.map(str::to_owned),
+            ..Default::default()
+        }).await
+    }
+
+    async fn list_audit_filtered(&self, filter: AuditFilter) -> Result<Vec<AuditRecord>, StorageError> {
         {
             let mut connection = self.lease().await?;
             let rows = connection.query_all(
                 &q(
-                    "SELECT event_id, actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms FROM cp_audit_events WHERE (?1 IS NULL OR resource_id = ?1) ORDER BY event_id DESC LIMIT 1024",
+                    "SELECT event_id, actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms FROM cp_audit_events WHERE (?1 IS NULL OR resource_id = ?1) AND (?2 IS NULL OR actor = ?2) AND (?3 IS NULL OR action = ?3) AND (?4 IS NULL OR occurred_at_ms >= ?4) AND (?5 IS NULL OR occurred_at_ms <= ?5) ORDER BY event_id DESC LIMIT 1024",
                 ),
-                binds![resource_id],
+                binds![filter.resource_id.as_deref(), filter.actor.as_deref(), filter.action.as_deref(), filter.from_ms, filter.to_ms],
                 |row| {
                 Ok(AuditRecord {
                     event_id: row.get(0)?,
@@ -2117,7 +2124,15 @@ impl StorageBackend for PostgresBackend {
     }
 
 
-    async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
+    async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
+        self.upsert_job_attributed(job, None).await
+    }
+
+    async fn upsert_job_attributed(
+        &self,
+        mut job: JobRecord,
+        requested_by: Option<&str>,
+    ) -> Result<JobRecord, StorageError> {
         {
             let mut connection = self.begin().await?;
             let __ret = async {
@@ -2135,7 +2150,7 @@ impl StorageBackend for PostgresBackend {
                 StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
             })?;
             connection.execute(
-                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms, pause_phase=excluded.pause_phase, pause_artifact_id=excluded.pause_artifact_id, pause_prev_checkpoint_id=excluded.pause_prev_checkpoint_id, pause_retry_count=excluded.pause_retry_count, paused_at_ms=excluded.paused_at_ms, paused_by=excluded.paused_by",
+                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by, requested_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms, pause_phase=excluded.pause_phase, pause_artifact_id=excluded.pause_artifact_id, pause_prev_checkpoint_id=excluded.pause_prev_checkpoint_id, pause_retry_count=excluded.pause_retry_count, paused_at_ms=excluded.paused_at_ms, paused_by=excluded.paused_by, requested_by=excluded.requested_by",
                 binds![
                     job.job_id,
                     job.version,
@@ -2154,6 +2169,7 @@ impl StorageBackend for PostgresBackend {
                     job.pause_retry_count,
                     job.paused_at_ms,
                     job.paused_by,
+                    requested_by,
                 ],
             ).await?;
             Ok(job)
@@ -2175,8 +2191,18 @@ impl StorageBackend for PostgresBackend {
     /// already have deleted.
     async fn update_job_with_expected_generation(
         &self,
+        job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
+        self.update_job_with_expected_generation_attributed(job, expected_generation, None)
+            .await
+    }
+
+    async fn update_job_with_expected_generation_attributed(
+        &self,
         mut job: JobRecord,
         expected_generation: u64,
+        requested_by: Option<&str>,
     ) -> Result<JobRecord, StorageError> {
         {
             let mut connection = self.begin().await?;
@@ -2197,7 +2223,7 @@ impl StorageBackend for PostgresBackend {
             // format, so preserving the newest pointer is both safe and the
             // only choice that cannot regress.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET version=?1, spec_json=?2, desired_state=?3, observed_state=?4, convergence=?5, generation=?6, node_ids_json=?7, last_error=?8, updated_at_ms=?9 WHERE job_id=?10 AND generation=?11",
+                "UPDATE cp_jobs SET version=?1, spec_json=?2, desired_state=?3, observed_state=?4, convergence=?5, generation=?6, node_ids_json=?7, last_error=?8, updated_at_ms=?9, requested_by=COALESCE(?12, requested_by) WHERE job_id=?10 AND generation=?11",
                 binds![
                     job.version,
                     job.spec_json,
@@ -2210,6 +2236,7 @@ impl StorageBackend for PostgresBackend {
                     job.updated_at_ms,
                     job.job_id,
                     expected_generation,
+                    requested_by,
                 ],
             ).await?;
             if changed == 0 {
@@ -2256,6 +2283,38 @@ impl StorageBackend for PostgresBackend {
         }
     }
 
+
+    async fn job_requested_by(&self, job_id: &str) -> Result<Option<String>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            connection
+                .query_row(
+                    "SELECT requested_by FROM cp_jobs WHERE job_id = ?1",
+                    binds![job_id],
+                    |row| row.get::<Option<String>>(0),
+                )
+                .await
+                .optional()
+                .map(Option::flatten)
+        }
+    }
+
+    async fn job_dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, StorageError> {
+        {
+            let mut connection = self.lease().await?;
+            connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by, requested_by FROM cp_jobs WHERE job_id = ?1",
+                    binds![job_id],
+                    |row| Ok((row_to_job_pg(row)?, row.get::<Option<String>>(17)?)),
+                )
+                .await
+                .optional()
+        }
+    }
 
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
         {
@@ -2405,6 +2464,22 @@ impl StorageBackend for PostgresBackend {
         desired_state: &str,
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, StorageError> {
+        self.update_job_desired_state_attributed(
+            job_id,
+            desired_state,
+            expected_generation,
+            None,
+        )
+        .await
+    }
+
+    async fn update_job_desired_state_attributed(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+        requested_by: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
         {
             let mut connection = self.begin().await?;
             let __ret = async {
@@ -2412,13 +2487,14 @@ impl StorageBackend for PostgresBackend {
             // against an in-progress pause (pausing does not bump the
             // generation); see the sqlite backend for the full rationale.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5 AND pause_phase IS NULL",
+                "UPDATE cp_jobs SET desired_state=?2, requested_by=COALESCE(?6, requested_by), convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5 AND pause_phase IS NULL",
                 binds![
                     job_id,
                     desired_state,
                     expected_generation.saturating_add(1),
                     now_ms(),
                     expected_generation,
+                    requested_by,
                 ],
             ).await?;
             if changed == 0 {
@@ -2477,6 +2553,7 @@ impl StorageBackend for PostgresBackend {
                     convergence = 'reconciling', \
                     generation = CASE WHEN ?12 THEN generation + 1 ELSE generation END, \
                     last_error = COALESCE(?13, last_error), \
+                    requested_by = COALESCE(?17, requested_by), \
                     updated_at_ms = ?14 \
                  WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS NOT DISTINCT FROM ?16",
                 binds![
@@ -2496,6 +2573,7 @@ impl StorageBackend for PostgresBackend {
                     now_ms(),
                     update.expected_generation,
                     update.expected_phase,
+                    update.requested_by,
                 ],
             ).await?;
             if changed == 0 {

@@ -607,7 +607,11 @@ impl Hub {
             paused_by: None,
         };
         match self
-            .update_job_with_expected_generation(upgraded, job.generation)
+            .update_job_with_expected_generation_as(
+                upgraded,
+                job.generation,
+                record.actor.as_deref().unwrap_or("system"),
+            )
             .await
         {
             Ok(_) => {
@@ -824,7 +828,11 @@ impl Hub {
             paused_by: None,
         };
         match self
-            .update_job_with_expected_generation(restored, job.generation)
+            .update_job_with_expected_generation_as(
+                restored,
+                job.generation,
+                record.actor.as_deref().unwrap_or("system"),
+            )
             .await
         {
             Ok(_) | Err(HubError::GenerationConflict { .. }) => {

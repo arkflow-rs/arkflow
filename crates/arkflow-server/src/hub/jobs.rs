@@ -19,7 +19,15 @@ impl Hub {
         Ok(self.jobs.read().await.get(job_id).cloned())
     }
 
-    pub async fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, HubError> {
+    pub async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, HubError> {
+        self.upsert_job_as(job, "system").await
+    }
+
+    pub(crate) async fn upsert_job_as(
+        &self,
+        mut job: JobRecord,
+        actor: &str,
+    ) -> Result<JobRecord, HubError> {
         // A pinned placement has nothing to relocate to: rebalancing is a
         // scheduler decision over unpinned Jobs, so an explicit pin combined
         // with the auto policy is a configuration contradiction, not a
@@ -51,7 +59,10 @@ impl Hub {
                     })
             });
         if let Some(storage) = &self.storage {
-            job = storage.upsert_job(job).await.map_err(HubError::from)?;
+            job = storage
+                .upsert_job_attributed(job, Some(actor.to_owned()))
+                .await
+                .map_err(HubError::from)?;
             if let Some(record) = version_record.clone() {
                 storage
                     .upsert_job_version(record)
@@ -65,6 +76,14 @@ impl Hub {
                 .map(|current| current.generation.saturating_add(1))
                 .unwrap_or_else(|| job.generation.max(1));
             jobs.insert(job.job_id.clone(), job.clone());
+            // Same critical section as the record: a concurrent mutation must
+            // not leave the Job and its requester from different requests.
+            #[cfg(test)]
+            Self::pass_test_gate(&self.test_write_gate).await;
+            self.job_actors
+                .write()
+                .await
+                .insert(job.job_id.clone(), actor.to_owned());
         }
         if let Some(record) = version_record {
             let mut versions = self.job_versions.write().await;
@@ -80,7 +99,7 @@ impl Hub {
                 .insert(job.job_id.clone(), job.clone());
         }
         if job.desired_state != "stopped" {
-            self.reconcile_job(&job).await?;
+            self.reconcile_job_as(&job, actor).await?;
         }
         Ok(job)
     }
@@ -94,6 +113,16 @@ impl Hub {
         &self,
         job: JobRecord,
         expected_generation: u64,
+    ) -> Result<JobRecord, HubError> {
+        self.update_job_with_expected_generation_as(job, expected_generation, "system")
+            .await
+    }
+
+    pub(crate) async fn update_job_with_expected_generation_as(
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+        actor: &str,
     ) -> Result<JobRecord, HubError> {
         let version_record = serde_json::from_str::<arkflow_core::job::JobSpec>(&job.spec_json)
             .ok()
@@ -111,7 +140,11 @@ impl Hub {
             });
         let updated = if let Some(storage) = &self.storage {
             let updated = storage
-                .update_job_with_expected_generation(job.clone(), expected_generation)
+                .update_job_with_expected_generation_attributed(
+                    job.clone(),
+                    expected_generation,
+                    Some(actor.to_owned()),
+                )
                 .await
                 .map_err(HubError::from)?;
             if let Some(record) = version_record.clone() {
@@ -140,6 +173,14 @@ impl Hub {
                         updated.checkpoint_id = stored_checkpoint;
                     }
                     jobs.insert(updated.job_id.clone(), updated.clone());
+                    // Same critical section as the record, mirroring the
+                    // durable `requested_by` write.
+                    #[cfg(test)]
+                    Self::pass_test_gate(&self.test_write_gate).await;
+                    self.job_actors
+                        .write()
+                        .await
+                        .insert(updated.job_id.clone(), actor.to_owned());
                     updated
                 }
                 Some(current) => {
@@ -234,9 +275,25 @@ impl Hub {
         desired_state: &str,
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, HubError> {
+        self.update_job_desired_state_as(job_id, desired_state, expected_generation, "system")
+            .await
+    }
+
+    pub(crate) async fn update_job_desired_state_as(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+        actor: &str,
+    ) -> Result<Option<JobRecord>, HubError> {
         let updated = if let Some(storage) = &self.storage {
             storage
-                .update_job_desired_state(job_id, desired_state, expected_generation)
+                .update_job_desired_state_attributed(
+                    job_id,
+                    desired_state,
+                    expected_generation,
+                    Some(actor.to_owned()),
+                )
                 .await
                 .map_err(HubError::from)?
         } else {
@@ -260,15 +317,51 @@ impl Hub {
             job.convergence = "reconciling".into();
             job.generation = expected_generation.saturating_add(1);
             job.updated_at_ms = now_ms();
-            Some(job.clone())
-        };
-        if let Some(job) = &updated {
-            self.jobs
+            let updated = job.clone();
+            // Same critical section as the record (see `upsert_job_as`).
+            #[cfg(test)]
+            Self::pass_test_gate(&self.test_write_gate).await;
+            self.job_actors
                 .write()
                 .await
-                .insert(job.job_id.clone(), job.clone());
-            self.reconcile_job(job).await?;
+                .insert(job_id.to_owned(), actor.to_owned());
+            Some(updated)
+        };
+        #[cfg(test)]
+        Self::pass_test_gate(&self.test_after_write_gate).await;
+        if let Some(job) = &updated {
+            // The in-memory branch already cached the record and its actor in
+            // one critical section; re-inserting here would let an older
+            // record overwrite a newer concurrent mutation.
+            if self.storage.is_some() {
+                self.jobs
+                    .write()
+                    .await
+                    .insert(job.job_id.clone(), job.clone());
+            }
+            self.reconcile_job_as(job, actor).await?;
         }
         Ok(updated)
+    }
+
+    /// The Job record and its requester from one consistent snapshot. A
+    /// deferred dispatch must never pair one mutation's generation with
+    /// another mutation's actor.
+    pub(crate) async fn dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, HubError> {
+        if let Some(storage) = &self.storage {
+            return storage
+                .job_dispatch_snapshot(job_id.to_owned())
+                .await
+                .map_err(HubError::from);
+        }
+        let jobs = self.jobs.read().await;
+        let Some(job) = jobs.get(job_id).cloned() else {
+            return Ok(None);
+        };
+        let actor = self.job_actors.read().await.get(job_id).cloned();
+        Ok(Some((job, actor)))
     }
 }

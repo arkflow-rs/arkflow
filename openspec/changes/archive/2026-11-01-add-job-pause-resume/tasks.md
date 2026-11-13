@@ -24,7 +24,7 @@
 - [x] 3.3 `crates/arkflow-server/src/hub/job_orchestration.rs`：升级入口显式拒绝 pause 相位非空（`job_paused`）；暂停入口拒绝编排非终态（`orchestration_in_progress`）；单测覆盖 atomic/stopped 两模式
 - [x] 3.4 `crates/arkflow-server/src/api_contract.rs`：Job 响应 additive 字段（pause_phase/pause_artifact_id/paused_at_ms/paused_by）；wire-shape 单测；`job.paused` 后 `GET` 契约测试
 - [x] 3.5 并发测试：pause vs resume vs stop vs upgrade 各一条（generation fence 落败方 409，最终状态唯一且合法）
-- [ ] 3.6 端到端：`two_node_job_smoke` 形态下 running → pause（真实双 node 观察）→ paused → resume → running；断言暂停工件存在（kind 与 `spec.recovery` 一致）、resume 的 `job_start` payload 携带该工件、无数据丢失、replay 边界符合文档；两条恢复策略（latest_checkpoint / latest_savepoint）各覆盖一次
+- [x] 3.6 端到端：`two_node_job_smoke` 形态下 running → pause（真实双 node 观察）→ paused → resume → running；断言暂停工件存在（kind 与 `spec.recovery` 一致）、resume 的 `job_start` payload 携带该工件、无数据丢失、replay 边界符合文档；两条恢复策略（latest_checkpoint / latest_savepoint）各覆盖一次
 
 ## 4. 可观测
 
@@ -58,11 +58,17 @@
 ## 7. 验证与归档
 
 - [x] 7.1 `cargo test -p arkflow-server`、`cargo test -p arkflow-core`、clippy、fmt 全绿
-- [ ] 7.2 手动端到端：本地 Hub（SQLite）建 Job → pause → 校验工件与 paused 状态 → resume → running；重启 Hub 后再走一轮验证相位续跑
+- [x] 7.2 手动端到端：本地 Hub（SQLite）建 Job → pause → 校验工件与 paused 状态 → resume → running；重启 Hub 后再走一轮验证相位续跑
 - [x] 7.3 `openspec validate add-job-pause-resume --strict`；归档后 `openspec/changes/` 清空
 
 
 ## 归档说明（2026-11-01）
 
-- 3.6（真实双 Agent pause 端到端）与 7.2（本地手动端到端）未执行：pause 的 resume 恢复选择需要对象存储上的真实 manifest，而既有 `two_node_job_smoke` 已覆盖内核/barrier 路径；这两项以手工验证项保留，不阻塞归档（规格中的行为由 11 个状态机/API 测试覆盖）。
-- 4.1 的 `record_job_operation_audit` actor 硬编码修复不在本变更：JobStart/JobStop 派发记录不含发起 principal，参数化需要扩展命令/操作记录协议；pause/resume 自身审计已携带真实 actor。作为后续专项记录。
+- 归档当时的 3.6 与 7.2 未执行：pause 的 resume 恢复选择需要对象存储上的真实 manifest；后于 2026-11-12 随 `close-control-plane-validation-and-audit` 补齐，见后续收尾记录。
+- 4.1 的 `record_job_operation_audit` actor 硬编码修复不在本变更；后于 2026-11-12 随同一收尾 change 完成（真实 principal 经请求、持久化与重试保留，后台使用 `system`）。
+
+## 后续收尾记录（2026-11-12）
+
+- 3.6 已完成：`two_node_job_smoke` 新增 `two_node_pause_resume_latest_checkpoint_survives_sqlite_hub_restart` 与 `..._latest_savepoint_...`，使用真实双 Agent、统一内核和 `file://` 工件。两策略各 2 轮 capture，首轮 paused 时重启 SQLite Hub，第二轮在重启后完成；断言 manifest/state snapshot、暂停 pin、resume `job_start` payload、恢复游标以及两 source 逐条 `sequence` 与 `state_count`（最终各 24 条），两种策略均实跑通过。
+- 7.2 由上述 Hub 重启回归覆盖：持久 SQLite 上同地址重启后，暂停字段、工件记录、恢复指针与第二轮完整暂停/恢复均验证通过。
+- 实跑发现并修复两处既有缺陷（`hub/job_pause.rs`）：① capture 在途判定漏掉 commit 操作，协调器会在 commit 窗口内替换工件并最终以 `pause_savepoint_failed` 回滚；② 相位写入置 `reconciling` 后，resume 清除路径未重新校正收敛，恢复成功后 Job 停在 `reconciling`。修复后 `hub::job_pause_tests` 12 项与两种恢复策略 E2E 全部通过。

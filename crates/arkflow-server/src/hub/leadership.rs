@@ -227,6 +227,7 @@ impl Hub {
         self.operations.write().await.clear();
         self.rollouts.write().await.clear();
         self.jobs.write().await.clear();
+        self.job_actors.write().await.clear();
         self.job_versions.write().await.clear();
         self.job_checkpoints.write().await.clear();
         self.lifecycle.write().await.recovered = false;

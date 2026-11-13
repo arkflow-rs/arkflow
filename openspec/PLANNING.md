@@ -610,22 +610,22 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 
 1. ~~**节点标签体系**~~ → ✅ 已由 #1336（`add-node-labels`）落地：Hub 管理标签 + 列表过滤 + selector rollout；剩余「按标签批量流命令」「标签分组审批策略」仍开放。
 2. ~~**告警/webhook/事件订阅**~~ → ✅ 已由 #1338（`add-alerting-webhooks`，2026-10-25 归档，新 spec `webhook-alerting`）落地：订阅全量替换 + 前缀过滤转发 + HMAC 签名 + 退避重试 + 连续失败自动暂停 + leader-only 投递 + Console Settings 管理面。5.7 阶段 4 中 Slack/邮件原生通道仍开放（可经 webhook 接入）。
-3. **限流/配额**：无任何 per-principal/per-node 请求限速或资源配额，仅请求体大小限制（本地 1MB/Hub 4MB）与内存硬上限（`MAX_NODES=256`、`MAX_COMMANDS_PER_NODE=128`、`MAX_OPERATIONS=1024`，`hub.rs:56-59`）。
+3. ~~**控制面限流**~~ → ✅ `add-control-plane-rate-limiting` 已于 2026-10-31 归档：两 API 面按 operator 凭证/浏览器会话与 Agent 节点身份分桶，429 + Retry-After、有界桶表及拒绝计数器；#1346 补身份 keying。per-principal 资源配额在立项时由维护者明确从范围中移除，不作为本轮遗留。
 4. ~~**控制面 DB 备份/恢复**~~ → ✅ 已由 #1349（`add-hub-backup-restore`，2026-11-12 归档，spec `hub-backup-restore`）落地：`backup --from <store> --to <file>` 统一 SQLite 快照（SQLite 源 VACUUM INTO / PG 源 REPEATABLE READ 单事务，cp_hub_lease 不进快照）+ `restore --from <file> --to <store>` 空库 fail-closed（跨后端恢复成立）；附修 migrate 漏 cp_webhooks（sqlite→pg 迁移曾静默丢全部订阅）。任务 4.2 真机验证：恢复后审计/webhook/job 立即可见、节点重注册可见、未处理 outbox 经 reconciliation 重放、快照→PG 恢复 + PG Hub 启动全数据可见。
-5. **用户/凭证管理面**：RBAC 三角色 + 资源 scope + OIDC（bearer + 浏览器登录）已实现，但无用户 CRUD、无 token 签发/吊销/轮换 API，JWT 无吊销（`oidc.rs:41` 注释自认取舍）；租户/团队隔离未做。
+5. ~~**用户/凭证管理面**~~ → ✅ 2026-11-01 `add-multi-user-credential-management` 已归档：用户目录、托管凭证签发/轮换/吊销、持久会话与 OIDC 主体吊销、Console 用户面板及运行期 token。租户/团队隔离、自助服务仍为 Non-goals；HA 吊销跨 leader 验证与 operations-level actor 已于 2026-11-12 随 `close-control-plane-validation-and-audit` 补齐（真实 PostgreSQL 双 Hub 选主、旧 epoch 身份写拒绝、请求身份持久化与重试）。
 6. **mTLS/客户端证书**：TLS 仅服务端加密，显式 `with_no_client_auth`（`api/mod.rs:974`）。
-7. ~~**Job 级 pause/resume**~~ → ✅ 2026-11-01 `add-job-pause-resume` 归档：`desired_state` 三值（running/stopped/paused）+ 持久暂停相位（capturing/stopping/paused/resuming），先按 `spec.recovery` 落工件再停机、resume 从工件恢复（replay 边界与无 checkpoint 冷启动已文档化），保留期 pin、崩溃续跑、升级双向互斥、审计/指标/SSE、Console 与 en/zh 文档齐备。剩余：真实双 Agent 端到端与 operations-level 审计 actor 参数化（后续专项）。
+7. ~~**Job 级 pause/resume**~~ → ✅ 2026-11-01 `add-job-pause-resume` 归档：`desired_state` 三值（running/stopped/paused）+ 持久暂停相位（capturing/stopping/paused/resuming），先按 `spec.recovery` 落工件再停机、resume 从工件恢复（replay 边界与无 checkpoint 冷启动已文档化），保留期 pin、崩溃续跑、升级双向互斥、审计/指标/SSE、Console 与 en/zh 文档齐备。真实双 Agent 端到端与 operations-level 审计 actor 已于 2026-11-12 随 `close-control-plane-validation-and-audit` 补齐；E2E 同时修复 capture 在途判定漏 commit 与 resume 收敛校正两处缺陷。
 8. **arkflow-server 独立二进制短板**：无 tracing/OTel 初始化（引擎二进制有，Hub 二进制没有）；仅环境变量配置、无配置文件支持（`bin/arkflow-server.rs`）。
 9. **OpenAPI 文档生成**：仅 `api_contract.rs:4` 意向注释，未实现。
 10. 小项：本地 standalone 面无 `/audit` 路由（审计仅 Hub 面）；Agent query-param 传 token 旧通道处弃用兼容期（`agent_endpoints.rs:85`）。
 
 ### 11.3 Console 缺口（后端 API 已有、前端未消费或空壳）
 
-1. **角色感知 UI**：后端模型完备（三角色七动作，`api_contract.rs:34-46`），前端零消费——按钮无条件渲染、`canMutate` 只反映节点在线（`app.tsx:146-147`）、403 无友好降级、principal 身份不显示（`api.ts:742` 已返回 roles）。
-2. **服务端分页/过滤**：`EventQuery`/`AuditQuery`/`OperationQuery` 参数齐全（`api/mod.rs:347-373`），前端固定取第 1 页 50 条后客户端过滤——**第 51 条起 UI 不可达**；audit 连 resource_id 参数都不传。
+1. ~~**角色感知 UI**~~ → ✅ `console-rbac-and-pagination` 已于 2026-10-31 归档：`/system` principal/actions 回显、按动作门控、身份展示、403 友好降级。
+2. ~~**服务端分页/过滤**~~ → ✅ 同上：Events/Audit/Operations 透传后端分页和过滤参数，URL 持久化查询状态，第 51 条起可达。
 3. **监控时序图表**：无图表库，Overview/Runtime 仅最新标量快照（`overview.tsx:163-176`）。
-4. **本地模式死页面**：导航 10 项常驻，本地路由仅 5 个（`mod.rs:402-435`）——连本地引擎时 Jobs/Rollouts/Approvals/Audit/Events 五页 404。
-5. **运行时 token 输入/身份切换**：静态 token 仅构建期 `VITE_API_TOKEN` 注入（`api.ts:322`），无运行时输入；OIDC 401 自动跳转已有。
+4. ~~**本地模式死页面**~~ → ✅ `console-rbac-and-pagination` 按 capabilities 隐藏 Hub-only 的 Jobs/Rollouts/Approvals/Audit，并隐藏 Settings 的 Webhook 区；本地 Events 本来已有路由，原盘点将其列为死页面不准确。
+5. ~~**运行时 token 输入/身份切换**~~ → ✅ `add-multi-user-credential-management` 已交付 Settings/401 运行期 Bearer 输入、sessionStorage 保存、清除与切换；`VITE_API_TOKEN` 仅为可选默认值。
 6. 小项：Rollout 创建手输版本号（未接现成版本选择器，`rollouts.tsx:81-86`）；每节点指标下钻、`/operations/status` 协议/能力兼容矩阵页、流 desired-state（含 generation CAS）入口、TOML 编辑（后端 `ConfigCandidate` 支持 toml）均无 UI；~~Settings 页空壳~~（#1338 已填入 Webhook 管理面）；~~zh 字典为 Partial，缺 key 静默回落英文无完整性校验~~（2026-10-25 核实：`zh.ts` 自 #1261 起 `satisfies Record<keyof typeof en, string>`，缺 key 编译期报错）。
 
 ### 11.4 补齐 Roadmap（价值优先序）
@@ -634,13 +634,13 @@ linear-sql 676K rows/s、groupby-sql 832K、filter-project 849K、codec-json 往
 | --- | --- | --- | --- |
 | P0 | ~~`add-node-labels`~~ | 节点标签体系 + 按标签批量操作 | ✅ 已落地 #1336（标签 + 过滤 + selector rollout；审批分组策略仍留 `add-approval-label-scoping`） |
 | P0 | ~~`add-alerting-webhooks`~~ | webhook/事件订阅转发 | ✅ 已落地：订阅全量替换 + 前缀过滤转发（HMAC 签名头、3 次退避重试、连续 5 败自动暂停 + `webhook.paused/resumed` 生命周期事件、leader-only 投递、Console Settings 管理面；新动作 `ManageWebhooks`；新 spec `webhook-alerting`，`control-plane-identity` RBAC 动作面扩展）|
-| P1 | 控制面限流/配额 | per-principal/per-node 限速 | 企业入场券 |
+| P1 | ~~控制面限流~~ | per-principal/per-node 限速 | ✅ `add-control-plane-rate-limiting` 已归档，资源配额按维护者决策不做 |
 | P1 | ~~控制面 DB 备份/恢复~~ | 快照/导出/恢复工具 | ✅ 已落地 #1349（`add-hub-backup-restore`），见 11.2-4 |
-| P1 | `console-rbac-and-pagination` | 角色感知 UI + 服务端分页/过滤 + 本地死页面清理 | 纯前端消费，后端零改动 |
+| P1 | ~~`console-rbac-and-pagination`~~ | 角色感知 UI + 服务端分页/过滤 + 本地死页面清理 | ✅ 2026-10-31 归档（#1343）；含 `/system` principal/actions 回显后端增量 |
 | P2 | ~~Job 级 pause/resume~~ | ✅ 2026-11-01 落地（`add-job-pause-resume`）：三值 desired + 持久相位 + 工件 pin + 崩溃续跑 + Console/文档 | 见 §11.2-7 |
 | P2 | server 二进制可观测 | arkflow-server tracing/OTel 初始化 + 配置文件 | 小工程 |
 | P2 | mTLS | 客户端证书认证 | 等企业需求信号 |
-| P2 | Console 监控增强 | 时序图表、per-node 指标下钻、`/operations/status` 页、token 运行时输入、rollout 版本选择器 | 可拆分交付 |
+| P2 | Console 监控增强 | 时序图表、per-node 指标下钻、`/operations/status` 页、rollout 版本选择器 | 可拆分交付；运行期 token 已交付，见 11.3-5 |
 | P3 | ~~多用户/凭证管理面~~ | ✅ 2026-11-01 落地（`add-multi-user-credential-management`）：`cp_users`/`cp_credentials`/`cp_sessions`、`ark_` 托管凭证签发/轮换/吊销、会话持久化、OIDC 主体吊销（epoch/iat + `MANAGED_USERS_ONLY`）、`ManageUsers` 管理 API、Console `/users` 面板 + 运行期 token、en/zh 文档 | 租户隔离/自助服务/纯目录启动仍为 Non-goals |
 | P3 | 外部 Secret Manager | Vault/K8s Secret 集成（现为 Hub env 预解析 `${secret:}`） | 阶段 4 |
 | P3 | OpenAPI 生成 + Agent 自升级编排 | API 文档生成；Agent 二进制升级编排（区别于 Job 升级） | 低频，按需 |

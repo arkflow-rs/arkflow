@@ -149,7 +149,7 @@ pub(super) async fn hub_job_action(
                 "running"
             };
             match hub
-                .update_job_desired_state(&job_id, state, current.generation)
+                .update_job_desired_state_as(&job_id, state, current.generation, &principal.id)
                 .await
             {
                 Ok(Some(job)) => Json(job).into_response(),
@@ -170,8 +170,7 @@ pub(super) async fn hub_job_action(
 }
 
 /// Stable problem mapping for pause/resume rejections, plus a persisted audit
-/// record carrying the real actor (the shared lifecycle audit helper owns no
-/// actor yet).
+/// record carrying the real actor.
 async fn pause_action_rejection(
     hub: &hub::Hub,
     job_id: &str,
@@ -682,7 +681,11 @@ pub(super) async fn hub_job_upgrade(
     // concurrent mutation that bumped the generation must surface as a
     // conflict instead of being silently overwritten by this older read.
     match hub
-        .update_job_with_expected_generation(upgraded, request.expected_generation)
+        .update_job_with_expected_generation_as(
+            upgraded,
+            request.expected_generation,
+            &principal.id,
+        )
         .await
     {
         Ok(job) => (
@@ -709,7 +712,7 @@ pub(super) async fn hub_job_upgrade_rollback(
     Path((job_id, upgrade_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::Operate,
@@ -718,8 +721,9 @@ pub(super) async fn hub_job_upgrade_rollback(
     )
     .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     if let Err(response) = reject_if_job_upgrade_active(&hub, &job_id).await {
         return response;
     }
@@ -864,7 +868,7 @@ pub(super) async fn hub_job_upgrade_rollback(
     // Same generation fence as the upgrade path: the version list may have
     // been read before a concurrent mutation bumped the generation.
     match hub
-        .update_job_with_expected_generation(restored, current.generation)
+        .update_job_with_expected_generation_as(restored, current.generation, &principal.id)
         .await
     {
         Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
@@ -986,7 +990,7 @@ pub(super) async fn hub_job_recovery_artifact(
     headers: HeaderMap,
     kind: &str,
 ) -> Response {
-    if let Err(response) = require_operator_action(
+    let principal = match require_operator_action(
         &hub,
         &headers,
         OperatorAction::Operate,
@@ -995,8 +999,9 @@ pub(super) async fn hub_job_recovery_artifact(
     )
     .await
     {
-        return response;
-    }
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     let Some(current) = (match hub.job(&job_id).await {
         Ok(job) => job,
         Err(error) => return hub_problem(error),
@@ -1026,12 +1031,13 @@ pub(super) async fn hub_job_recovery_artifact(
         created_at_ms: hub::now_ms_for_metrics(),
         updated_at_ms: hub::now_ms_for_metrics(),
     };
-    match hub.record_job_checkpoint(record).await {
+    match hub.record_job_checkpoint_as(record, &principal.id).await {
         Ok(Some(job)) => {
             // The operator-triggered recovery artifact is the audited
             // mutation; periodic scheduling and the dispatch funnel are
             // mechanics and stay out of the audit trail.
             hub.record_job_operation_audit(
+                &principal.id,
                 if kind == "savepoint" {
                     "job_savepoint"
                 } else {
@@ -1064,11 +1070,12 @@ pub(super) async fn hub_create_job(
     headers: HeaderMap,
     Json(request): Json<CreateJobRequest>,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Configure, "job", None).await
-    {
-        return response;
-    }
+    let principal =
+        match require_operator_action(&hub, &headers, OperatorAction::Configure, "job", None).await
+        {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
     let spec: arkflow_core::job::JobSpec = match serde_json::from_value(request.spec.clone()) {
         Ok(spec) => spec,
         Err(error) => {
@@ -1123,7 +1130,7 @@ pub(super) async fn hub_create_job(
         paused_at_ms: None,
         paused_by: None,
     };
-    match hub.upsert_job(job).await {
+    match hub.upsert_job_as(job, &principal.id).await {
         Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
         Err(error) => hub_problem(error),
     }
@@ -1190,7 +1197,12 @@ pub(super) async fn hub_job_desired_state(
         };
     }
     let result = hub
-        .update_job_desired_state(&job_id, request.state.as_str(), current.generation)
+        .update_job_desired_state_as(
+            &job_id,
+            request.state.as_str(),
+            current.generation,
+            &principal.id,
+        )
         .await;
     match result {
         Ok(Some(job)) => Json(job).into_response(),

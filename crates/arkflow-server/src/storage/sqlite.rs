@@ -1451,11 +1451,27 @@ impl SqliteBackend {
     }
 
     pub fn list_audit(&self, resource_id: Option<&str>) -> Result<Vec<AuditRecord>, StorageError> {
+        self.list_audit_filtered(AuditFilter {
+            resource_id: resource_id.map(str::to_owned),
+            ..Default::default()
+        })
+    }
+
+    pub fn list_audit_filtered(
+        &self,
+        filter: AuditFilter,
+    ) -> Result<Vec<AuditRecord>, StorageError> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT event_id, actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms FROM cp_audit_events WHERE (?1 IS NULL OR resource_id = ?1) ORDER BY event_id DESC LIMIT 1024",
+                "SELECT event_id, actor, action, resource_type, resource_id, node_id, stream_id, correlation_id, outcome, failure_code, message, occurred_at_ms FROM cp_audit_events WHERE (?1 IS NULL OR resource_id = ?1) AND (?2 IS NULL OR actor = ?2) AND (?3 IS NULL OR action = ?3) AND (?4 IS NULL OR occurred_at_ms >= ?4) AND (?5 IS NULL OR occurred_at_ms <= ?5) ORDER BY event_id DESC LIMIT 1024",
             )?;
-            let rows = statement.query_map([resource_id], |row| {
+            let rows = statement.query_map(rusqlite::params![
+                filter.resource_id.as_deref(),
+                filter.actor.as_deref(),
+                filter.action.as_deref(),
+                filter.from_ms,
+                filter.to_ms,
+            ], |row| {
                 Ok(AuditRecord {
                     event_id: row.get(0)?,
                     actor: row.get(1)?,
@@ -2265,7 +2281,15 @@ impl SqliteBackend {
         })
     }
 
-    pub fn upsert_job(&self, mut job: JobRecord) -> Result<JobRecord, StorageError> {
+    pub fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
+        self.upsert_job_attributed(job, None)
+    }
+
+    pub fn upsert_job_attributed(
+        &self,
+        mut job: JobRecord,
+        requested_by: Option<&str>,
+    ) -> Result<JobRecord, StorageError> {
         self.immediate_transaction(|connection| {
             let current_generation = connection
                 .query_row(
@@ -2281,7 +2305,7 @@ impl SqliteBackend {
                 StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
             })?;
             connection.execute(
-                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms, pause_phase=excluded.pause_phase, pause_artifact_id=excluded.pause_artifact_id, pause_prev_checkpoint_id=excluded.pause_prev_checkpoint_id, pause_retry_count=excluded.pause_retry_count, paused_at_ms=excluded.paused_at_ms, paused_by=excluded.paused_by",
+                "INSERT INTO cp_jobs (job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by, requested_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) ON CONFLICT(job_id) DO UPDATE SET version=excluded.version, spec_json=excluded.spec_json, desired_state=excluded.desired_state, observed_state=excluded.observed_state, convergence=excluded.convergence, generation=excluded.generation, node_ids_json=excluded.node_ids_json, checkpoint_id=excluded.checkpoint_id, last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms, pause_phase=excluded.pause_phase, pause_artifact_id=excluded.pause_artifact_id, pause_prev_checkpoint_id=excluded.pause_prev_checkpoint_id, pause_retry_count=excluded.pause_retry_count, paused_at_ms=excluded.paused_at_ms, paused_by=excluded.paused_by, requested_by=excluded.requested_by",
                 rusqlite::params![
                     job.job_id,
                     job.version,
@@ -2300,6 +2324,7 @@ impl SqliteBackend {
                     job.pause_retry_count,
                     job.paused_at_ms,
                     job.paused_by,
+                    requested_by,
                 ],
             )?;
             Ok(job)
@@ -2318,8 +2343,17 @@ impl SqliteBackend {
     /// already have deleted.
     pub fn update_job_with_expected_generation(
         &self,
+        job: JobRecord,
+        expected_generation: u64,
+    ) -> Result<JobRecord, StorageError> {
+        self.update_job_with_expected_generation_attributed(job, expected_generation, None)
+    }
+
+    pub fn update_job_with_expected_generation_attributed(
+        &self,
         mut job: JobRecord,
         expected_generation: u64,
+        requested_by: Option<&str>,
     ) -> Result<JobRecord, StorageError> {
         self.immediate_transaction(|connection| {
             job.generation = expected_generation.saturating_add(1);
@@ -2338,7 +2372,7 @@ impl SqliteBackend {
             // format, so preserving the newest pointer is both safe and the
             // only choice that cannot regress.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET version=?, spec_json=?, desired_state=?, observed_state=?, convergence=?, generation=?, node_ids_json=?, last_error=?, updated_at_ms=? WHERE job_id=? AND generation=?",
+                "UPDATE cp_jobs SET version=?, spec_json=?, desired_state=?, observed_state=?, convergence=?, generation=?, node_ids_json=?, last_error=?, updated_at_ms=?, requested_by=COALESCE(?, requested_by) WHERE job_id=? AND generation=?",
                 rusqlite::params![
                     job.version,
                     job.spec_json,
@@ -2349,6 +2383,7 @@ impl SqliteBackend {
                     node_ids,
                     job.last_error,
                     job.updated_at_ms,
+                    requested_by,
                     job.job_id,
                     expected_generation,
                 ],
@@ -2387,6 +2422,34 @@ impl SqliteBackend {
                     "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by FROM cp_jobs WHERE job_id = ?1",
                     [job_id],
                     row_to_job,
+                )
+                .optional()
+        })
+    }
+
+    pub fn job_requested_by(&self, job_id: &str) -> Result<Option<String>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT requested_by FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(Option::flatten)
+        })
+    }
+
+    pub fn job_dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT job_id, version, spec_json, desired_state, observed_state, convergence, generation, node_ids_json, checkpoint_id, last_error, updated_at_ms, pause_phase, pause_artifact_id, pause_prev_checkpoint_id, pause_retry_count, paused_at_ms, paused_by, requested_by FROM cp_jobs WHERE job_id = ?1",
+                    [job_id],
+                    |row| Ok((row_to_job(row)?, row.get::<_, Option<String>>(17)?)),
                 )
                 .optional()
         })
@@ -2524,6 +2587,16 @@ impl SqliteBackend {
         desired_state: &str,
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, StorageError> {
+        self.update_job_desired_state_attributed(job_id, desired_state, expected_generation, None)
+    }
+
+    pub fn update_job_desired_state_attributed(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+        requested_by: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
         self.immediate_transaction(|connection| {
             // `pause_phase IS NULL` fences the generic desired-state write
             // against an in-progress pause: pausing does not bump the
@@ -2531,13 +2604,14 @@ impl SqliteBackend {
             // read the Job before the pause began overwrite the pause intent
             // and leave the bookkeeping stale.
             let changed = connection.execute(
-                "UPDATE cp_jobs SET desired_state=?2, convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5 AND pause_phase IS NULL",
+                "UPDATE cp_jobs SET desired_state=?2, requested_by=COALESCE(?6, requested_by), convergence='reconciling', generation=?3, updated_at_ms=?4 WHERE job_id=?1 AND generation=?5 AND pause_phase IS NULL",
                 rusqlite::params![
                     job_id,
                     desired_state,
                     expected_generation.saturating_add(1),
                     now_ms(),
                     expected_generation,
+                    requested_by,
                 ],
             )?;
             if changed == 0 {
@@ -2600,6 +2674,7 @@ impl SqliteBackend {
                     convergence = 'reconciling', \
                     generation = CASE WHEN ?12 THEN generation + 1 ELSE generation END, \
                     last_error = COALESCE(?13, last_error), \
+                    requested_by = COALESCE(?17, requested_by), \
                     updated_at_ms = ?14 \
                  WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS ?16",
                 rusqlite::params![
@@ -2619,6 +2694,7 @@ impl SqliteBackend {
                     now_ms(),
                     update.expected_generation,
                     update.expected_phase,
+                    update.requested_by,
                 ],
             )?;
             if changed == 0 {
@@ -2752,7 +2828,8 @@ impl SqliteBackend {
                 pause_prev_checkpoint_id TEXT,
                 pause_retry_count INTEGER NOT NULL DEFAULT 0,
                 paused_at_ms INTEGER,
-                paused_by TEXT
+                paused_by TEXT,
+                requested_by TEXT
             );
 
             CREATE INDEX IF NOT EXISTS cp_jobs_updated
@@ -3151,6 +3228,7 @@ impl SqliteBackend {
             ("pause_retry_count", "INTEGER NOT NULL DEFAULT 0"),
             ("paused_at_ms", "INTEGER"),
             ("paused_by", "TEXT"),
+            ("requested_by", "TEXT"),
         ] {
             if !job_columns.iter().any(|name| name == column) {
                 connection.execute(
@@ -3652,6 +3730,12 @@ impl StorageBackend for SqliteBackend {
     ) -> Result<Vec<AuditRecord>, StorageError> {
         self.list_audit(resource_id)
     }
+    async fn list_audit_filtered(
+        &self,
+        filter: AuditFilter,
+    ) -> Result<Vec<AuditRecord>, StorageError> {
+        self.list_audit_filtered(filter)
+    }
     async fn create_rollout(
         &self,
         rollout: RolloutRecord,
@@ -3854,6 +3938,13 @@ impl StorageBackend for SqliteBackend {
     async fn upsert_job(&self, job: JobRecord) -> Result<JobRecord, StorageError> {
         self.upsert_job(job)
     }
+    async fn upsert_job_attributed(
+        &self,
+        job: JobRecord,
+        requested_by: Option<&str>,
+    ) -> Result<JobRecord, StorageError> {
+        self.upsert_job_attributed(job, requested_by)
+    }
     async fn update_job_with_expected_generation(
         &self,
         job: JobRecord,
@@ -3861,8 +3952,25 @@ impl StorageBackend for SqliteBackend {
     ) -> Result<JobRecord, StorageError> {
         self.update_job_with_expected_generation(job, expected_generation)
     }
+    async fn update_job_with_expected_generation_attributed(
+        &self,
+        job: JobRecord,
+        expected_generation: u64,
+        requested_by: Option<&str>,
+    ) -> Result<JobRecord, StorageError> {
+        self.update_job_with_expected_generation_attributed(job, expected_generation, requested_by)
+    }
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StorageError> {
         self.get_job(job_id)
+    }
+    async fn job_requested_by(&self, job_id: &str) -> Result<Option<String>, StorageError> {
+        self.job_requested_by(job_id)
+    }
+    async fn job_dispatch_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(JobRecord, Option<String>)>, StorageError> {
+        self.job_dispatch_snapshot(job_id)
     }
     async fn upsert_job_version(&self, record: JobVersionRecord) -> Result<(), StorageError> {
         self.upsert_job_version(record)
@@ -3920,6 +4028,20 @@ impl StorageBackend for SqliteBackend {
         expected_generation: u64,
     ) -> Result<Option<JobRecord>, StorageError> {
         self.update_job_desired_state(job_id, desired_state, expected_generation)
+    }
+    async fn update_job_desired_state_attributed(
+        &self,
+        job_id: &str,
+        desired_state: &str,
+        expected_generation: u64,
+        requested_by: Option<&str>,
+    ) -> Result<Option<JobRecord>, StorageError> {
+        self.update_job_desired_state_attributed(
+            job_id,
+            desired_state,
+            expected_generation,
+            requested_by,
+        )
     }
     async fn update_job_pause(
         &self,

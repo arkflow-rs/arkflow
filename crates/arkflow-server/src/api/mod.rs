@@ -9,6 +9,8 @@
 mod agent_endpoints;
 #[cfg(test)]
 mod approval_api_tests;
+#[cfg(test)]
+mod audit_api_tests;
 mod config_approvals;
 mod configuration;
 mod diagnostics;
@@ -392,6 +394,10 @@ struct AuditQuery {
     page: Option<usize>,
     page_size: Option<usize>,
     resource_id: Option<String>,
+    actor: Option<String>,
+    action: Option<String>,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

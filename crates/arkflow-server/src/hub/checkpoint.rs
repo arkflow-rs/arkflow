@@ -31,6 +31,14 @@ impl Hub {
         &self,
         record: JobCheckpointRecord,
     ) -> Result<Option<JobRecord>, HubError> {
+        self.record_job_checkpoint_as(record, "system").await
+    }
+
+    pub(crate) async fn record_job_checkpoint_as(
+        &self,
+        record: JobCheckpointRecord,
+        actor: &str,
+    ) -> Result<Option<JobRecord>, HubError> {
         let record_for_dispatch = record.clone();
         // A checkpoint produced by a different Job deployment (version) must
         // never repoint the live record's recovery pointer: the artifact row
@@ -77,7 +85,7 @@ impl Hub {
                     .entry(record.job_id.clone())
                     .or_default()
                     .push(record.clone());
-                self.dispatch_job_artifact(job, &record_for_dispatch)
+                self.dispatch_job_artifact(job, &record_for_dispatch, actor)
                     .await?;
                 self.enforce_checkpoint_retention_for_job(&record.job_id)
                     .await?;
@@ -106,7 +114,7 @@ impl Hub {
             .entry(record.job_id.clone())
             .or_default()
             .push(record);
-        self.dispatch_job_artifact(&result, &record_for_dispatch)
+        self.dispatch_job_artifact(&result, &record_for_dispatch, actor)
             .await?;
         self.enforce_checkpoint_retention_for_job(&record_for_dispatch.job_id)
             .await?;
@@ -117,6 +125,7 @@ impl Hub {
         &self,
         job: &JobRecord,
         record: &JobCheckpointRecord,
+        actor: &str,
     ) -> Result<usize, HubError> {
         let spec: arkflow_core::job::JobSpec = serde_json::from_str(&job.spec_json)
             .map_err(|error| HubError::Invalid(format!("invalid persisted Job spec: {error}")))?;
@@ -184,7 +193,7 @@ impl Hub {
             if node_assignments.is_empty() {
                 continue;
             }
-            self.enqueue_with_metadata(
+            self.enqueue_with_metadata_as(
                 node_id,
                 operation.clone(),
                 job.job_id.clone(),
@@ -201,6 +210,7 @@ impl Hub {
                 None,
                 None,
                 None,
+                actor,
             )
             .await?;
             dispatched += 1;
