@@ -82,7 +82,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 | `metrics_path` | string | 否 | `/metrics` | Prometheus 暴露端点(格式 0.0.4)。 |
 | `ready_path` | string | 否 | `/ready` | 就绪探针:引擎完成启动所配置的流与作业后即成功。 |
 | `live_path` | string | 否 | `/live` | 存活探针:进程运行期间即成功。 |
-| `tracing` | object | 否 | — | OTel 追踪导出(OTLP HTTP-JSON;默认关闭):`enabled`、`endpoint`、`service_name`。参见[追踪](/zh-Hans/docs/operate/observability#追踪)。 |
+| `tracing` | object | 否 | — | OTel 追踪导出(OTLP HTTP-JSON;默认关闭):`enabled`、`endpoint`、`service_name`。参见[追踪](/zh-Hans/docs/operate/observability#tracing)。 |
 
 ### 独立 Hub 的启动安全
 
