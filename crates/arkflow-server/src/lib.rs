@@ -10,11 +10,15 @@ pub mod bootstrap;
 pub mod hub;
 pub mod metrics;
 pub mod oidc;
+pub mod startup_config;
 pub mod storage;
 
 pub use api::{
     hub_router, observability_router, router, serve, serve_hub, serve_observability, ServerConfig,
     API_VERSION,
+};
+pub use startup_config::{
+    apply_env_overrides, load_startup_config, HubFileConfig, HubStartupConfig, StartupConfigError,
 };
 
 // Root path kept alive for `hub::job_orchestration`.

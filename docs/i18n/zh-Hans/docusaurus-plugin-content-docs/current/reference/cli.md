@@ -102,7 +102,44 @@ arkflow schema > arkflow.schema.json
 
 ## `arkflow-server`
 
-`arkflow-server` 二进制运行控制面 Hub。它没有命令行标志;全部启动配置来自环境变量,外加用于存储 schema 迁移的单一 `migrate` 子命令。
+`arkflow-server` 二进制运行控制面 Hub。启动配置来自环境变量与可选的完整配置文件(`--config <FILE>`);`migrate`、`backup`、`restore` 子命令负责存储数据库管理。
+
+### `--config <FILE>` {#config-file}
+
+`--config` 从 YAML、JSON 或 TOML 文件(按扩展名分派)加载完整启动配置。文件覆盖全部启动字段,包括环境变量无法设置的项(`api_prefix`、health 路径、`cors_origins`、`session_ttl_ms`、`lease_ttl_ms`、日志与可观测性):
+
+```yaml validate=foreign reason="arkflow-server --config startup file; parsed by the server binary, not the engine parser"
+# hub.yaml — full arkflow-server startup configuration
+address: 0.0.0.0:8080
+tls_cert: /etc/arkflow/hub.crt
+tls_key: /etc/arkflow/hub.key
+hub_storage: postgres://user:pass@db:5432/arkflow
+node_token: ${env:ARKFLOW_NODE_TOKEN}
+cors_origins:
+  - https://console.example.com
+logging:
+  level: info
+  format: json
+observability:
+  tracing:
+    enabled: true
+    endpoint: http://127.0.0.1:4318/v1/traces
+    service_name: arkflow-hub
+hub:
+  operator_token: ${secret:OPERATOR_TOKEN}
+ha:
+  enabled: true
+  lease_ttl_ms: 15000
+  advertise_url: https://hub.example.com
+```
+
+规则:
+
+- **优先级**:显式设置的环境变量覆盖文件值;未设置的变量回落到文件值,再回落到内置默认。仅用环境变量的部署行为与之前完全一致。
+- **secret 引用**:`${env:VAR}`、`${file:PATH}`、`${secret:NAME}` 在文件加载时解析(与引擎配置同一语法)。secret 解析之后的校验错误绝不回显已解析的值。
+- **未知顶层键会启动失败**并指名键——`adress:` 这类拼写错误会被捕获,而不是被静默忽略。
+- `enabled` 字段被接受但被忽略:独立 Hub 被调用时总是启动服务。
+- 格式语法错误带行列信息;字段级类型错误不带(secret 解析后整体校验)。
 
 ### 启动环境变量 {#startup-environment-variables}
 
@@ -118,11 +155,25 @@ arkflow schema > arkflow.schema.json
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | `15000` | 租约 TTL(毫秒);低于 1000 会被拒绝。 |
 | `ARKFLOW_HUB_HA_HOLDER_ID` | — | 显式租约持有者身份;缺省时由主机名、PID 与启动时间自动生成。 |
 | `ARKFLOW_HUB_HA_ADVERTISE_URL` | — | 带主机的绝对 `http(s)://` URL,Agent 通过它访问该 Hub 实例(多 Hub 发现)。 |
+| `ARKFLOW_LOG_LEVEL` | `info` | Hub 日志级别(`trace`/`debug`/`info`/`warn`/`error`)。 |
+| `ARKFLOW_OTEL_TRACING_ENABLED` | 关 | 设为 `1`/`true`/`yes` 以经 OTLP/HTTP-JSON 导出 Hub span。 |
+| `ARKFLOW_OTEL_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | OTLP/HTTP-JSON span 导出端点。 |
+| `ARKFLOW_OTEL_SERVICE_NAME` | `arkflow` | 导出 span 的 Resource `service.name`。当 collector 同时接收引擎 trace 时建议显式设置(如 `arkflow-hub`)。 |
+
+`RUST_LOG` 环境变量设为可解析的 `EnvFilter` 指令(如 `RUST_LOG=info` 或
+`arkflow=debug`)时,在引擎与 Hub 中都覆盖静态日志级别。优先级:
+`RUST_LOG` > `ARKFLOW_LOG_LEVEL` > `logging.level`(文件)> 默认 `info`。
+无法解析的值在 stderr 告警并回落到静态级别。Hub 的追踪行为见
+[可观测性](../operate/observability.md#tracing)。
 
 不在上述基础项内的身份相关变量——OIDC 联邦相关(`ARKFLOW_OIDC_*`,含
 `ARKFLOW_OIDC_MANAGED_USERS_ONLY`)——见
 [部署](../operate/control-plane/deploy.md#oidc-jwt-federation)。
 托管用户目录及其凭证见[用户与凭证](../operate/control-plane/users-and-credentials.md)。
+
+### 用法错误 {#usage-errors}
+
+serve 路径的未知标志或多余参数、缺失的 `--config` 取值、不可读/无法解析/扩展名未知的配置文件,都会向 stderr 打印消息并以**退出码 `2`** 退出——未知参数绝不会静默启动 Hub。
 
 ### `migrate` 子命令
 

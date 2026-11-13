@@ -112,9 +112,57 @@ arkflow schema > arkflow.schema.json
 
 ## `arkflow-server`
 
-The `arkflow-server` binary runs the control-plane Hub. It has no flags; all
-startup configuration comes from environment variables, plus the single
-`migrate` subcommand for storage schema migration.
+The `arkflow-server` binary runs the control-plane Hub. Startup configuration
+comes from environment variables plus an optional full configuration file
+(`--config <FILE>`); the `migrate`, `backup`, and `restore` subcommands
+manage the storage database.
+
+### `--config <FILE>`
+
+`--config` loads the full startup configuration from a YAML, JSON, or TOML
+file (selected by file extension). The file covers every startup field,
+including ones no environment variable can set (`api_prefix`, health paths,
+`cors_origins`, `session_ttl_ms`, `lease_ttl_ms`, logging and observability):
+
+```yaml validate=foreign reason="arkflow-server --config startup file; parsed by the server binary, not the engine parser"
+# hub.yaml — full arkflow-server startup configuration
+address: 0.0.0.0:8080
+tls_cert: /etc/arkflow/hub.crt
+tls_key: /etc/arkflow/hub.key
+hub_storage: postgres://user:pass@db:5432/arkflow
+node_token: ${env:ARKFLOW_NODE_TOKEN}
+cors_origins:
+  - https://console.example.com
+logging:
+  level: info
+  format: json
+observability:
+  tracing:
+    enabled: true
+    endpoint: http://127.0.0.1:4318/v1/traces
+    service_name: arkflow-hub
+hub:
+  operator_token: ${secret:OPERATOR_TOKEN}
+ha:
+  enabled: true
+  lease_ttl_ms: 15000
+  advertise_url: https://hub.example.com
+```
+
+Rules:
+
+- **Precedence**: an environment variable that is explicitly set overrides
+  the file; an unset variable falls back to the file value and then to the
+  built-in default. Environment-only deployments behave exactly as before.
+- **Secret references**: `${env:VAR}`, `${file:PATH}`, and `${secret:NAME}`
+  are resolved while the file loads (same syntax as the engine config). A
+  validation error after secret resolution never echoes the resolved value.
+- **Unknown keys fail startup**, naming the key — a typo like `adress:` is
+  caught instead of silently ignored.
+- The `enabled` field is accepted but ignored: the standalone Hub always
+  serves when invoked.
+- Format syntax errors carry line information; field-level type errors do
+  not (the document is validated as a whole after secret resolution).
 
 ### Startup environment variables
 
@@ -130,6 +178,18 @@ startup configuration comes from environment variables, plus the single
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | `15000` | Lease TTL in milliseconds; values below 1000 are rejected. |
 | `ARKFLOW_HUB_HA_HOLDER_ID` | — | Explicit lease holder identity; by default one is generated from hostname, PID, and boot time. |
 | `ARKFLOW_HUB_HA_ADVERTISE_URL` | — | Absolute `http(s)://` URL with a host that agents use to reach this Hub instance (multi-Hub discovery). |
+| `ARKFLOW_LOG_LEVEL` | `info` | Hub log level (`trace`/`debug`/`info`/`warn`/`error`). |
+| `ARKFLOW_OTEL_TRACING_ENABLED` | off | Set to `1`/`true`/`yes` to export Hub spans via OTLP/HTTP-JSON. |
+| `ARKFLOW_OTEL_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | OTLP/HTTP-JSON span export endpoint. |
+| `ARKFLOW_OTEL_SERVICE_NAME` | `arkflow` | Resource `service.name` on exported spans. Set it (e.g. `arkflow-hub`) when a collector also receives engine traces. |
+
+The `RUST_LOG` environment variable, when set to parseable `EnvFilter`
+directives (e.g. `RUST_LOG=info` or `arkflow=debug`), overrides the static
+log level in both the engine and the Hub. Precedence:
+`RUST_LOG` > `ARKFLOW_LOG_LEVEL` > `logging.level` (file) > default `info`.
+An unparsable value warns on stderr and falls back to the static level. See
+[Observability](../operate/observability.md#tracing) for the Hub tracing
+behavior.
 
 Identity-related variables that are not Hub startup basics — the OIDC
 federation block (`ARKFLOW_OIDC_*`, including
@@ -137,6 +197,13 @@ federation block (`ARKFLOW_OIDC_*`, including
 [deployment](../operate/control-plane/deploy.md#oidc-jwt-federation).
 The managed user directory and its credentials are documented in
 [Users and credentials](../operate/control-plane/users-and-credentials.md).
+
+### Usage errors
+
+Unknown flags or stray arguments on the serve path, a missing `--config`
+value, and an unreadable/unparseable/unknown-extension config file print a
+message to stderr and **exit with code `2`** — an unknown argument never
+silently starts the Hub.
 
 ### `migrate` subcommand
 

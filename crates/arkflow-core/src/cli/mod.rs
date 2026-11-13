@@ -13,7 +13,7 @@
  */
 
 use crate::component::{self, ComponentKind};
-use crate::config::{EngineConfig, LogFormat};
+use crate::config::{EngineConfig, LoggingConfig, TracingConfig};
 use crate::engine::Engine;
 use clap::{Arg, ArgMatches, Command};
 use std::process;
@@ -22,7 +22,7 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
+use tracing_subscriber::{EnvFilter, Layer};
 
 #[derive(Default)]
 pub struct Cli {
@@ -351,19 +351,76 @@ fn print_component_details(
 
 use crate::Error;
 pub fn init_logging(config: &EngineConfig) {
-    let log_level = match config.logging.level.as_str() {
+    init_logging_from(&config.logging, &config.node.observability.tracing);
+}
+
+/// The effective event filter: `RUST_LOG` EnvFilter directives when set and
+/// parseable, otherwise the static `logging.level`. An enum rather than a
+/// generic parameter: `LevelFilter` and `EnvFilter` implement `Layer<S>` for
+/// any subscriber, but `Filter` alone has no blanket `Layer` impl to chain
+/// generically.
+enum EffectiveFilter {
+    Env(Box<EnvFilter>),
+    Level(LevelFilter),
+}
+
+/// Initializes the process-global tracing subscriber from the logging and
+/// OTel-tracing configuration fragments. Shared by the engine binary and the
+/// `arkflow-server` Hub binary: the fmt layer reproduces the (writer x
+/// format) behavior matrix, the optional OTel layer adds span export without
+/// touching it.
+///
+/// When `RUST_LOG` is set to parseable EnvFilter directives it overrides the
+/// static level; unset (or empty) keeps the configured `logging.level`, and
+/// an unparsable value warns on stderr and falls back to that level.
+pub fn init_logging_from(logging: &LoggingConfig, tracing_config: &TracingConfig) {
+    let filter = match rust_log_filter() {
+        Some(Ok(env)) => EffectiveFilter::Env(Box::new(env)),
+        Some(Err(directives)) => {
+            eprintln!("Ignoring invalid RUST_LOG='{directives}'; using the configured log level");
+            EffectiveFilter::Level(LevelFilter::from(parse_level(&logging.level)))
+        }
+        None => EffectiveFilter::Level(LevelFilter::from(parse_level(&logging.level))),
+    };
+    build_subscriber(logging, tracing_config, filter);
+}
+
+/// Maps the configured level name to a [`Level`]; unknown names fall back to
+/// `info` (the original `init_logging` behavior).
+fn parse_level(level: &str) -> Level {
+    match level {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
         "info" => Level::INFO,
         "warn" => Level::WARN,
         "error" => Level::ERROR,
         _ => Level::INFO,
-    };
-    let level_filter = LevelFilter::from(log_level);
+    }
+}
 
+/// Reads and parses `RUST_LOG`. `None` when unset or blank; `Some(Err)`
+/// carries the raw directives for the warning message.
+fn rust_log_filter() -> Option<Result<EnvFilter, String>> {
+    std::env::var("RUST_LOG")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|directives| EnvFilter::try_new(&directives).map_err(|_| directives.clone()))
+}
+
+/// Assembles the registry (fmt layer per writer/format, optional OTel layer)
+/// under the given filter and installs it. The filter is composed as a
+/// global layer wrapping the assembled stack — the same events/spans the
+/// previous per-layer `with_filter` gated are gated identically. `try_init`
+/// keeps the first subscriber when a second initialization is attempted
+/// (tests, engine restart in the same process) instead of panicking.
+fn build_subscriber(
+    logging: &LoggingConfig,
+    tracing_config: &TracingConfig,
+    filter: EffectiveFilter,
+) {
     // Open the log file when a path is configured; failures fall back to
     // console logging like before.
-    let file = config.logging.file_path.as_ref().and_then(|file_path| {
+    let file = logging.file_path.as_ref().and_then(|file_path| {
         if let Some(parent) = std::path::Path::new(file_path).parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -383,34 +440,35 @@ pub fn init_logging(config: &EngineConfig) {
         }
     });
 
-    // The fmt layer reproduces the original subscriber behavior matrix
-    // (writer x format); the optional OTel layer adds span export without
-    // touching it.
     let fmt_layer: Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync> =
-        match (file, config.logging.format.clone()) {
-            (Some(writer), LogFormat::JSON) => fmt::layer()
-                .with_writer(writer)
-                .json()
-                .with_filter(level_filter)
-                .boxed(),
-            (Some(writer), LogFormat::PLAIN) => fmt::layer()
-                .with_writer(writer)
-                .pretty()
-                .with_filter(level_filter)
-                .boxed(),
-            (None, LogFormat::JSON) => fmt::layer().json().with_filter(level_filter).boxed(),
-            (None, LogFormat::PLAIN) => fmt::layer().pretty().with_filter(level_filter).boxed(),
+        match (file, logging.format) {
+            (Some(writer), crate::config::LogFormat::JSON) => {
+                fmt::layer().with_writer(writer).json().boxed()
+            }
+            (Some(writer), crate::config::LogFormat::PLAIN) => {
+                fmt::layer().with_writer(writer).pretty().boxed()
+            }
+            (None, crate::config::LogFormat::JSON) => fmt::layer().json().boxed(),
+            (None, crate::config::LogFormat::PLAIN) => fmt::layer().pretty().boxed(),
         };
 
-    let otel_layer = build_otel_layer(&config.node.observability.tracing)
-        .map(|layer| layer.with_filter(level_filter));
+    let otel_layer = build_otel_layer(tracing_config);
 
-    // try_init: a second initialization (e.g. tests, or an engine restart in
-    // the same process) keeps the first subscriber instead of panicking.
-    let _ = tracing_subscriber::registry()
-        .with(fmt_layer)
-        .with(otel_layer)
-        .try_init();
+    let _ = match filter {
+        // The filter goes last: both concrete filter types implement
+        // `Layer<S>` for any subscriber, so they wrap the assembled stack
+        // globally.
+        EffectiveFilter::Env(env) => tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(otel_layer)
+            .with(env)
+            .try_init(),
+        EffectiveFilter::Level(level) => tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(otel_layer)
+            .with(level)
+            .try_init(),
+    };
 }
 
 /// Builds the OTel span-export layer when tracing is enabled. Any build
@@ -721,6 +779,45 @@ mod tests {
     #[test]
     fn shutdown_without_provider_is_a_no_op() {
         shutdown_otel_tracing();
+    }
+
+    #[test]
+    fn parse_level_maps_known_names_and_falls_back_to_info() {
+        assert_eq!(parse_level("trace"), Level::TRACE);
+        assert_eq!(parse_level("debug"), Level::DEBUG);
+        assert_eq!(parse_level("info"), Level::INFO);
+        assert_eq!(parse_level("warn"), Level::WARN);
+        assert_eq!(parse_level("error"), Level::ERROR);
+        assert_eq!(parse_level("bogus"), Level::INFO);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rust_log_filter_parses_valid_directives() {
+        std::env::set_var("RUST_LOG", "arkflow_core=debug");
+        assert!(matches!(rust_log_filter(), Some(Ok(_))));
+        std::env::remove_var("RUST_LOG");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rust_log_filter_flags_invalid_directives() {
+        std::env::set_var("RUST_LOG", "arkflow_core=definitely_not_a_level");
+        match rust_log_filter() {
+            Some(Err(directives)) => {
+                assert_eq!(directives, "arkflow_core=definitely_not_a_level")
+            }
+            other => panic!("expected Some(Err), got {other:?}"),
+        }
+        std::env::remove_var("RUST_LOG");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rust_log_filter_treats_blank_as_unset() {
+        std::env::set_var("RUST_LOG", "   ");
+        assert!(rust_log_filter().is_none());
+        std::env::remove_var("RUST_LOG");
     }
 
     const DUPLICATE_STREAM_ID_CONFIG: &str = "logging:\n  level: info\nstreams:\n  - id: dup\n    input: {type: generate}\n    pipeline: {processors: []}\n    output: {type: stdout}\n  - id: dup\n    input: {type: generate}\n    pipeline: {processors: []}\n    output: {type: stdout}\n";

@@ -2,10 +2,10 @@
 name = "arkflow-plugin"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 license.workspace = true
 
 
@@ -47,7 +47,6 @@ tower = "0.5"
 tower-http = { version = "0.7.0", features = ["cors", "trace"] }
 base64 = "0.22"
 subtle = { workspace = true }
-colored = { workspace = true }
 flume = { workspace = true }
 dashmap = { workspace = true }
 tempfile = { workspace = true }
@@ -56,7 +55,6 @@ rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
 
 # Kafka
-aws-msk-iam-sasl-signer = "1.0.0"
 rdkafka = { version = "0.39", features = [
     "cmake-build",
     "tracing",

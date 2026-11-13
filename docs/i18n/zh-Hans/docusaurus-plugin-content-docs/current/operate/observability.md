@@ -117,7 +117,35 @@ logging:
 `json` 格式适合日志采集器(Vector、Fluent Bit、Loki);`plain` 适合交互式调试。
 当 `file_path` 无法打开时,引擎会退回 stdout 日志,并在 stderr 上说明。
 
-## 追踪
+### Hub 进程日志(`arkflow-server`)
+
+Hub 二进制在启动时即初始化 tracing subscriber——不做任何配置也会以
+`info` 级别向控制台输出日志,选主、租约、会话与 webhook 输出均可见。
+(HTTP 中间件 `TraceLayer` 默认以 `debug` 发射:HTTP span 与逐请求事件
+只在级别允许时可见,例如 `RUST_LOG=tower_http=debug`。)
+级别、文件与格式与引擎同构,可经 `--config`
+启动文件或环境变量配置:
+
+```yaml validate=foreign reason="arkflow-server --config startup file; parsed by the server binary, not the engine parser"
+logging:
+  level: info
+  format: json
+  file_path: /var/log/arkflow/hub.log
+observability:
+  tracing:
+    enabled: true
+    endpoint: "http://localhost:4318/v1/traces"
+    service_name: "arkflow-hub"
+```
+
+级别优先级为 `RUST_LOG` > `ARKFLOW_LOG_LEVEL` > `logging.level` > 默认
+`info`;无法解析的 `RUST_LOG` 会告警并回落。环境变量
+`ARKFLOW_LOG_LEVEL`、`ARKFLOW_OTEL_TRACING_ENABLED`、
+`ARKFLOW_OTEL_ENDPOINT`、`ARKFLOW_OTEL_SERVICE_NAME` 为纯 env 部署
+(Helm 的 env-only 配置保持不变)提供文件字段的镜像。完整变量表与
+`--config` 文件 schema 见 [CLI 参考](../reference/cli.md#arkflow-server)。
+
+## 追踪 {#tracing}
 
 在 `health_check.observability.tracing` 下启用 OTel trace 导出。span 经
 OTLP HTTP-JSON 批量导出;默认关闭该节,对行为没有任何影响。
@@ -146,6 +174,16 @@ v1 的 span 模型是每次 Job 执行的生命周期骨架:
 
 已知的 v1 边界:没有 worker 池 span(池的上下文传播是后续工作)。
 导出器故障绝不影响数据面。
+
+### Hub 进程追踪(`arkflow-server`)
+
+`observability.tracing` 启用时(经 `--config` 启动文件或
+`ARKFLOW_OTEL_TRACING_ENABLED=1`),Hub 将其 HTTP span 经 OTLP/HTTP-JSON
+导出到配置的端点。生效日志级别同样门控 span 导出——低于级别的 span
+不会被导出。导出器构建失败会告警并禁用导出,不阻塞启动;优雅关闭
+(Ctrl-C)时缓冲的 span 在进程退出前冲刷。追踪关闭(默认)时不构建任何
+OTel 对象、不发起 OTLP 请求。当 collector 同时接收引擎 trace 时,设置
+`service_name: arkflow-hub`(或 `ARKFLOW_OTEL_SERVICE_NAME`)以区分两个进程。
 
 ## 面向仪表盘的运维状态
 

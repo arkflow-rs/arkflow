@@ -333,14 +333,23 @@ pub fn validate_ha_config(ha: &HubHaConfig, config: &ServerConfig) -> Result<(),
     if !ha.enabled {
         return Ok(());
     }
+    if ha.lease_ttl_ms < 1_000 {
+        return Err(format!(
+            "ha.lease_ttl_ms must be at least 1000 ms (got {})",
+            ha.lease_ttl_ms
+        ));
+    }
     if let Some(url) = ha.advertise_url.as_deref() {
         let parsed = url::Url::parse(url).map_err(|error| {
-            format!("ARKFLOW_HUB_HA_ADVERTISE_URL is not a valid URL ({url}): {error}")
+            format!(
+                "ha.advertise_url (ARKFLOW_HUB_HA_ADVERTISE_URL) is not a valid absolute http(s) URL: {error}"
+            )
         })?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return Err(format!(
-                "ARKFLOW_HUB_HA_ADVERTISE_URL must be an absolute http(s) URL with a host: {url}"
-            ));
+            return Err(
+                "ha.advertise_url (ARKFLOW_HUB_HA_ADVERTISE_URL) must be an absolute http(s) URL with a host"
+                    .to_string(),
+            );
         }
     }
     if config.hub_storage.is_none() {

@@ -15,6 +15,12 @@ Kubernetes 安装推荐使用 [Helm Chart](../helm.md) 的 `control-plane` 模�
 兼容凭据可以是原始令牌(admin),也可以是 `principal|role|secret`,例如
 `readonly|viewer|viewer-secret`;viewer 凭据可以读取资源与审计历史,但不能变更 Stream、节点或灰度发布。包含 `|` 但解析失败的值(未知角色、空字段、字段数错误)会在启动期以脱敏报错拒绝,而不会静默降级为 admin 凭据。
 
+### 启动配置文件
+
+除环境变量外,`arkflow-server` 接受 `--config <FILE>`——一个 YAML、JSON 或 TOML 文件,承载完整启动配置,包括环境变量无法设置的项(`api_prefix`、health 路径、`cors_origins`、`session_ttl_ms`、日志、追踪)。优先级规则:**显式设置的环境变量覆盖文件值**,其余回落到文件值再回落到内置默认,既有纯 env 部署(包括无需改动的 Helm chart)行为完全不变。secret 引用(`${env:VAR}`、`${file:PATH}`、`${secret:NAME}`)在文件加载时解析;未知顶层键会启动失败并指名键。完整字段参考、示例文件与退出码契约见 [CLI 参考](../../reference/cli.md#arkflow-server)。
+
+env-only 与文件配置可以自由混用:把部署特定的小值(token)经 secret 引用留在环境变量里,把部署拓扑(地址、TLS 路径、存储、追踪端点)放进挂载文件。
+
 ### 存储后端
 
 Hub 默认把控制面状态(节点、作业、intents、操作、审计历史)持久化在 SQLite。`ARKFLOW_HUB_STORAGE` 按 scheme 选择后端:

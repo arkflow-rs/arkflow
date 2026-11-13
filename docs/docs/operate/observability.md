@@ -138,6 +138,37 @@ logging:
 `plain` is for interactive debugging. When `file_path` cannot be opened the
 engine falls back to stdout logging and says so on stderr.
 
+### Hub process logging (`arkflow-server`)
+
+The Hub binary initializes a tracing subscriber at startup — with no
+configuration it already logs to the console at `info` level, so election,
+lease, session, and webhook output is visible. (The HTTP middleware
+`TraceLayer` emits at `debug` by default: HTTP spans and per-request events
+appear only when the level allows them, e.g. `RUST_LOG=tower_http=debug`.)
+Level, file, and format follow the same shape as the engine, either through
+the `--config` startup file or through environment variables:
+
+```yaml validate=foreign reason="arkflow-server --config startup file; parsed by the server binary, not the engine parser"
+logging:
+  level: info
+  format: json
+  file_path: /var/log/arkflow/hub.log
+observability:
+  tracing:
+    enabled: true
+    endpoint: "http://localhost:4318/v1/traces"
+    service_name: "arkflow-hub"
+```
+
+Level precedence is `RUST_LOG` > `ARKFLOW_LOG_LEVEL` > `logging.level` >
+default `info`; an unparsable `RUST_LOG` warns and falls back. The
+environment variables `ARKFLOW_LOG_LEVEL`, `ARKFLOW_OTEL_TRACING_ENABLED`,
+`ARKFLOW_OTEL_ENDPOINT`, and `ARKFLOW_OTEL_SERVICE_NAME` mirror the file
+fields for env-only deployments (Helm's env-only configuration keeps
+working unchanged). See the
+[CLI reference](../reference/cli.md#arkflow-server) for the full variable
+table and the `--config` file schema.
+
 ## Tracing
 
 Enable OTel trace export under `health_check.observability.tracing`. Spans
@@ -172,6 +203,19 @@ The v1 span model is a lifecycle skeleton per Job execution:
 
 Known v1 boundaries: there are no worker-pool spans (pool context
 propagation is future work). Exporter failures never affect the data plane.
+
+### Hub process tracing (`arkflow-server`)
+
+When `observability.tracing` is enabled (through the `--config` startup
+file or `ARKFLOW_OTEL_TRACING_ENABLED=1`), the Hub exports its HTTP spans
+over OTLP/HTTP-JSON to the configured endpoint. The effective log level
+gates span export the same way it gates log output — spans below the level
+are not exported. Exporter build failures warn and disable export without
+preventing startup; on graceful shutdown (Ctrl-C) buffered spans are
+flushed before exit. With tracing off (the default) no OTel objects are
+built and no OTLP requests are made. When a collector also receives engine
+traces, set `service_name: arkflow-hub` (or `ARKFLOW_OTEL_SERVICE_NAME`)
+to tell the two processes apart.
 
 ## Operational status for dashboards
 
