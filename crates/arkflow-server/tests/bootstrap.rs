@@ -220,3 +220,36 @@ async fn serve_from_config_starts_and_stops_on_cancellation() {
     cancelled.cancel();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_config_feeds_serve_from_config() {
+    // The binary's serve path: load a file, apply env overrides, serve from
+    // the resulting config, cancel cleanly.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hub.yaml");
+    std::fs::write(&path, "address: 127.0.0.1:0\ninsecure_local: true\n").unwrap();
+    let mut startup = arkflow_server::load_startup_config(path.to_str().unwrap()).unwrap();
+    arkflow_server::apply_env_overrides(&mut startup, &|_| None);
+    assert_eq!(startup.server.address, "127.0.0.1:0");
+    let hub_config = HubConfig {
+        operator_token: startup.hub.operator_token,
+        node_token: startup.server.node_token.clone(),
+        insecure_local: startup.server.insecure_local,
+        lease_ttl_ms: startup.server.lease_ttl_ms,
+        poll_interval_ms: startup.server.poll_interval_ms,
+        session_ttl_ms: startup.server.session_ttl_ms,
+        approval_required: startup.server.approval_required,
+        approval_ttl_ms: startup.server.approval_ttl_ms,
+    };
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let cancelled = cancellation.clone();
+    let task = tokio::spawn(bootstrap::serve_from_config(
+        hub_config,
+        startup.server,
+        startup.ha,
+        cancellation,
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    cancelled.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
+}

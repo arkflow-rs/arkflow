@@ -144,7 +144,7 @@ kubectl get svc arkflow
 ## 配置说明
 
 - **镜像配置**:在 Deployment 配置中,将 `image: arkflow:latest` 替换为你的实际镜像地址
-- **环境变量**:可通过 env 字段配置环境变量,当前配置了 RUST_LOG=info
+- **环境变量**:可通过 env 字段配置环境变量;清单中设置的 `RUST_LOG=info` 会作为 `logging.level` 之上的过滤覆盖,被引擎与 `arkflow-server` 同时遵守
 - **端口配置**:Service 默认暴露 8080 端口(ArkFlow HTTP 服务器的默认端口)。确保 `health_check.address` 绑定到 `0.0.0.0:8080`,以便 kubelet 探针可以访问。
 - **配置文件**:通过 ConfigMap 挂载到容器的 /app/etc 目录
 - **资源限制**:设置了默认的资源请求与上限,以防止资源争用

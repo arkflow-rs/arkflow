@@ -37,7 +37,7 @@ humantime = "2.3.0"
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json"] }
+tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json", "env-filter"] }
 prometheus = "0.14"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 apache-avro = { version = "0.22", default-features = false }

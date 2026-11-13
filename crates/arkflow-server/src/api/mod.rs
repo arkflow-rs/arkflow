@@ -116,7 +116,7 @@ use tower_http::trace::TraceLayer;
 
 pub const API_VERSION: &str = "v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// PEM file path for the control-plane TLS certificate. Both this and
     /// `tls_key` must be set to serve TLS; one without the other fails
@@ -169,6 +169,11 @@ pub struct ServerConfig {
     pub rate_limit: arkflow_core::config::RateLimitConfig,
     #[serde(default)]
     pub observability: arkflow_core::config::ObservabilityConfig,
+    /// Process logging (level, file, format). The standalone Hub binary
+    /// applies this at startup via `arkflow_core::cli::init_logging_from`;
+    /// other `ServerConfig` consumers do not re-initialize logging from it.
+    #[serde(default)]
+    pub logging: arkflow_core::config::LoggingConfig,
 }
 
 impl ServerConfig {
@@ -198,6 +203,7 @@ impl ServerConfig {
             approval_ttl_ms: control_api.approval_ttl_ms,
             rate_limit: control_api.rate_limit.clone(),
             observability: config.node.observability.clone(),
+            logging: config.logging.clone(),
         }
     }
 
@@ -282,6 +288,7 @@ impl Default for ServerConfig {
             approval_ttl_ms: default_approval_ttl_ms(),
             rate_limit: arkflow_core::config::RateLimitConfig::default(),
             observability: arkflow_core::config::ObservabilityConfig::default(),
+            logging: arkflow_core::config::LoggingConfig::default(),
         }
     }
 }

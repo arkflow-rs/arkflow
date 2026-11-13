@@ -11,10 +11,16 @@ use super::error::HubError;
 use super::wire::HubEvent;
 use super::{now_ms, Hub, MAX_EVENTS};
 use arkflow_core::control::ControlEvent;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 
 /// HA election configuration. Default is disabled.
-#[derive(Debug, Clone)]
+///
+/// Serde-derived so the `arkflow-server --config` startup file can carry the
+/// `ha` section; the container-level `#[serde(default)]` keeps missing
+/// fields on the handwritten `Default` (lease TTL 15000 semantics unchanged).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HubHaConfig {
     pub enabled: bool,
     /// Lease lifetime. Renewal cadence is ttl/3 (min 1s); the failover window

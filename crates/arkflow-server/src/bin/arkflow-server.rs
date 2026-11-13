@@ -1,60 +1,20 @@
 use arkflow_server::bootstrap;
 use arkflow_server::hub::{HubConfig, HubHaConfig};
-use arkflow_server::ServerConfig;
+use arkflow_server::{apply_env_overrides, load_startup_config, ServerConfig};
 use tokio_util::sync::CancellationToken;
-
-/// Rate-limit overrides for the Hub plane; unset variables fall back to the
-/// defaults in `arkflow_core::config::RateLimitConfig`. Unrecognized boolean
-/// spellings and unparseable numbers warn on stderr instead of silently
-/// flipping a default: a typo in `ARKFLOW_RATE_LIMIT_ENABLED` must not turn
-/// a protection off unnoticed.
-fn env_rate_limit_config() -> arkflow_core::config::RateLimitConfig {
-    use arkflow_core::config::{
-        default_node_burst, default_node_rps, default_principal_burst, default_principal_rps,
-        default_rate_limit_enabled, RateLimitConfig,
-    };
-    let warn = |name: &str, value: &str, expected: &str| {
-        eprintln!("warning: {name}='{value}' is not {expected}; using the default");
-    };
-    let flag = |name: &str| -> Option<bool> {
-        std::env::var(name).ok().map(|value| match value.as_str() {
-            "1" | "true" | "yes" => true,
-            "0" | "false" | "no" => false,
-            _ => {
-                warn(name, &value, "one of 1/true/yes/0/false/no");
-                true
-            }
-        })
-    };
-    let number = |name: &str| -> Option<f64> {
-        match std::env::var(name) {
-            Ok(value) => match value.parse::<f64>() {
-                Ok(parsed) => Some(parsed),
-                Err(_) => {
-                    warn(name, &value, "a number");
-                    None
-                }
-            },
-            Err(_) => None,
-        }
-    };
-    RateLimitConfig {
-        enabled: flag("ARKFLOW_RATE_LIMIT_ENABLED").unwrap_or_else(default_rate_limit_enabled),
-        principal_rps: number("ARKFLOW_RATE_LIMIT_PRINCIPAL_RPS")
-            .unwrap_or_else(default_principal_rps),
-        principal_burst: number("ARKFLOW_RATE_LIMIT_PRINCIPAL_BURST")
-            .unwrap_or_else(default_principal_burst),
-        node_rps: number("ARKFLOW_RATE_LIMIT_NODE_RPS").unwrap_or_else(default_node_rps),
-        node_burst: number("ARKFLOW_RATE_LIMIT_NODE_BURST").unwrap_or_else(default_node_burst),
-    }
-}
 
 const USAGE: &str = "\
 arkflow-server — ArkFlow control-plane Hub
 
 Usage:
-  arkflow-server
-      Run the Hub (configured through ARKFLOW_* environment variables).
+  arkflow-server [--config <FILE>]
+      Run the Hub. Startup configuration comes from environment variables
+      (ARKFLOW_*) plus, with --config <FILE>, a full configuration file in
+      YAML/JSON/TOML. Variables that are explicitly set override the file;
+      everything else falls back to the file and then built-in defaults.
+      Secret references (${env:VAR}, ${file:PATH}, ${secret:NAME}) are
+      resolved while loading the file. See the CLI reference for the file
+      schema and the precedence rules.
   arkflow-server migrate --from sqlite:<path> --to postgres:<url>
       One-shot offline store migration (Hub stopped; see the deploy docs).
   arkflow-server backup --from <store> --to <snapshot-file>
@@ -66,15 +26,56 @@ Usage:
       Hub instance against the target first.
   arkflow-server --help
       Show this help.
+
+Usage errors (an unknown flag or stray argument, a missing --config value,
+or an unreadable/unparseable config file) print a message to stderr and
+exit with code 2.
 ";
+
+/// Parses serve-path arguments: only `--config <FILE>` is recognized; any
+/// unknown flag or stray positional argument is a usage error (exit 2)
+/// instead of silently starting the Hub. `first` is the already-consumed
+/// first argument (None when there were no arguments).
+fn parse_serve_args(
+    first: Option<String>,
+    mut rest: impl Iterator<Item = String>,
+) -> Option<String> {
+    match first.as_deref() {
+        None => None,
+        Some("--config") => {
+            let path = rest.next();
+            if path.is_none() {
+                eprintln!("error: --config requires a file path\n\n{USAGE}");
+                std::process::exit(2);
+            }
+            if let Some(extra) = rest.next() {
+                eprintln!("error: unexpected argument '{extra}' after --config <FILE>\n\n{USAGE}");
+                std::process::exit(2);
+            }
+            path
+        }
+        Some(arg) => {
+            eprintln!("error: unrecognized argument '{arg}'\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut args = std::env::args().skip(1);
-    let subcommand = args.next();
+    let result = run(std::env::args().skip(1).collect()).await;
+    // Flush buffered OTel spans on every terminal path (serve return or
+    // early error); a no-op when tracing was never enabled.
+    arkflow_core::cli::shutdown_otel_tracing();
+    result
+}
+
+async fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut iter = args.into_iter();
+    let subcommand = iter.next();
     match subcommand.as_deref() {
         Some("migrate" | "backup" | "restore") => {
-            let rest: Vec<String> = args.collect();
+            let rest: Vec<String> = iter.collect();
             let mut stderr = |message: String| eprintln!("{message}");
             let code = match subcommand.as_deref() {
                 Some("migrate") => bootstrap::run_migrate(&rest, &mut stderr).await?,
@@ -92,54 +93,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         _ => {}
     }
+    serve_with_config(parse_serve_args(subcommand, iter)).await
+}
 
-    let cancellation = CancellationToken::new();
-    let shutdown = cancellation.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        shutdown.cancel();
-    });
-    let config = ServerConfig {
-        address: std::env::var("ARKFLOW_HUB_ADDRESS").unwrap_or_else(|_| "127.0.0.1:8080".into()),
-        node_token: std::env::var("ARKFLOW_NODE_TOKEN").ok(),
-        insecure_local: std::env::var("ARKFLOW_HUB_INSECURE_LOCAL")
-            .ok()
-            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
-        hub_storage: std::env::var("ARKFLOW_HUB_STORAGE").ok(),
-        tls_cert: std::env::var("ARKFLOW_HUB_TLS_CERT").ok(),
-        tls_key: std::env::var("ARKFLOW_HUB_TLS_KEY").ok(),
-        approval_required: std::env::var("ARKFLOW_APPROVAL_REQUIRED")
-            .ok()
-            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
-        approval_ttl_ms: std::env::var("ARKFLOW_APPROVAL_TTL_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|ttl| *ttl >= 1_000)
-            .unwrap_or_else(arkflow_server::hub::default_approval_ttl_ms),
-        rate_limit: env_rate_limit_config(),
-        ..ServerConfig::default()
+async fn serve_with_config(
+    config_path: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut startup = match config_path.as_deref() {
+        Some(path) => match load_startup_config(path) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        },
+        None => arkflow_server::HubStartupConfig::default(),
     };
-    let ha = HubHaConfig {
-        enabled: std::env::var("ARKFLOW_HUB_HA_ENABLED")
-            .ok()
-            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
-        lease_ttl_ms: std::env::var("ARKFLOW_HUB_HA_LEASE_TTL_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|ttl| *ttl >= 1_000)
-            .unwrap_or(15_000),
-        holder_id: std::env::var("ARKFLOW_HUB_HA_HOLDER_ID").ok(),
-        advertise_url: std::env::var("ARKFLOW_HUB_HA_ADVERTISE_URL")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty()),
-    };
+    apply_env_overrides(&mut startup, &|name| std::env::var(name).ok());
+    arkflow_core::cli::init_logging_from(
+        &startup.server.logging,
+        &startup.server.observability.tracing,
+    );
+
+    let config: ServerConfig = startup.server;
+    let ha: HubHaConfig = startup.ha;
     bootstrap::validate_ha_config(&ha, &config).map_err(|message| {
         eprintln!("{message}");
         message
     })?;
     let hub_config = HubConfig {
-        operator_token: std::env::var("ARKFLOW_OPERATOR_TOKEN").ok(),
+        operator_token: startup.hub.operator_token,
         node_token: config.node_token.clone(),
         insecure_local: config.insecure_local,
         lease_ttl_ms: config.lease_ttl_ms,
@@ -148,5 +131,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         approval_required: config.approval_required,
         approval_ttl_ms: config.approval_ttl_ms,
     };
+    let cancellation = CancellationToken::new();
+    let shutdown = cancellation.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown.cancel();
+    });
     bootstrap::serve_from_config(hub_config, config, ha, cancellation).await
 }
