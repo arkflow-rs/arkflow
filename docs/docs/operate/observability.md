@@ -142,9 +142,11 @@ engine falls back to stdout logging and says so on stderr.
 
 The Hub binary initializes a tracing subscriber at startup — with no
 configuration it already logs to the console at `info` level, so election,
-lease, session, webhook, and HTTP (`TraceLayer`) output is visible. Level,
-file, and format follow the same shape as the engine, either through the
-`--config` startup file or through environment variables:
+lease, session, and webhook output is visible. (The HTTP middleware
+`TraceLayer` emits at `debug` by default: HTTP spans and per-request events
+appear only when the level allows them, e.g. `RUST_LOG=tower_http=debug`.)
+Level, file, and format follow the same shape as the engine, either through
+the `--config` startup file or through environment variables:
 
 ```yaml validate=foreign reason="arkflow-server --config startup file; parsed by the server binary, not the engine parser"
 logging:

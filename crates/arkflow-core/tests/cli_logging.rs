@@ -4,6 +4,12 @@
  *    You may obtain a copy of the License at
  *
  *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
  */
 
 //! Runs `init_logging` in its own process: it installs the process-global
@@ -61,17 +67,14 @@ fn logging_initializes_from_config_for_each_format_and_writer() {
 /// RUST_LOG semantics, re-executed as a child process so the env var and the
 /// global subscriber cannot leak into sibling tests: with parseable
 /// directives the EnvFilter overrides the static level; with an unparsable
-/// value a warning is printed and the static level applies.
+/// value a warning is printed and the static level applies. The parent
+/// controls the child's `RUST_LOG` entirely via `Command::env`/`env_remove`,
+/// so a developer's own `RUST_LOG` never leaks into a child.
 #[test]
 fn rust_log_overrides_static_level_and_falls_back_when_invalid() {
-    if let Ok(case) = std::env::var("ARKFLOW_TEST_RUST_LOG_CHILD") {
-        // Child mode: the parent re-executed this exact test with the env
+    if std::env::var("ARKFLOW_TEST_RUST_LOG_CHILD").is_ok() {
+        // Child mode: the parent re-executed this exact test with RUST_LOG
         // already prepared. Emit one event per level and stop.
-        if case == "override" {
-            std::env::set_var("RUST_LOG", "warn");
-        } else if case == "fallback" {
-            std::env::set_var("RUST_LOG", "arkflow_core=definitely_not_a_level");
-        }
         init_logging_from(
             &LoggingConfig {
                 level: "info".to_string(),
@@ -86,16 +89,34 @@ fn rust_log_overrides_static_level_and_falls_back_when_invalid() {
     }
 
     let exe = std::env::current_exe().unwrap();
-    for (case, expect_info) in [("override", false), ("fallback", true), ("unset", true)] {
-        let child = std::process::Command::new(&exe)
+    // (case, RUST_LOG value for the child, info event expected)
+    let cases: [(&str, Option<&str>, bool); 3] = [
+        ("override", Some("warn"), false),
+        (
+            "fallback",
+            Some("arkflow_core=definitely_not_a_level"),
+            true,
+        ),
+        ("unset", None, true),
+    ];
+    for (case, rust_log, expect_info) in cases {
+        let mut command = std::process::Command::new(&exe);
+        command
             .args([
                 "--exact",
                 "rust_log_overrides_static_level_and_falls_back_when_invalid",
                 "--nocapture",
             ])
-            .env("ARKFLOW_TEST_RUST_LOG_CHILD", case)
-            .output()
-            .unwrap();
+            .env("ARKFLOW_TEST_RUST_LOG_CHILD", case);
+        match rust_log {
+            Some(directives) => {
+                command.env("RUST_LOG", directives);
+            }
+            None => {
+                command.env_remove("RUST_LOG");
+            }
+        }
+        let child = command.output().unwrap();
         let stdout = String::from_utf8_lossy(&child.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&child.stderr).into_owned();
         assert_eq!(

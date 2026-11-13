@@ -251,5 +251,52 @@ async fn startup_config_feeds_serve_from_config() {
     ));
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     cancelled.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("serve_from_config did not stop within 10s of cancellation")
+        .expect("serve_from_config task panicked");
+    result.expect("serve_from_config failed on graceful shutdown");
+}
+
+#[test]
+fn ha_validation_rejects_sub_second_lease_ttl_after_merge() {
+    // The env path filters sub-1000 values before validation; a config file
+    // has no such filter, so validate_ha_config itself must fail closed on a
+    // TTL that would make every lease expire at acquisition.
+    let enabled = HubHaConfig {
+        enabled: true,
+        lease_ttl_ms: 0,
+        ..HubHaConfig::default()
+    };
+    let config = ServerConfig {
+        hub_storage: Some("postgres://127.0.0.1:1/db".into()),
+        ..ServerConfig::default()
+    };
+    let error = bootstrap::validate_ha_config(&enabled, &config).unwrap_err();
+    assert!(error.contains("at least 1000 ms"), "{error}");
+    // Disabled HA keeps skipping the check.
+    let disabled = HubHaConfig {
+        enabled: false,
+        lease_ttl_ms: 0,
+        ..HubHaConfig::default()
+    };
+    bootstrap::validate_ha_config(&disabled, &config).unwrap();
+}
+
+#[test]
+fn ha_validation_errors_do_not_echo_advertise_url() {
+    // The advertise URL may carry a secret-resolved credential; the
+    // validation error must name the field, not print the value.
+    let enabled = HubHaConfig {
+        enabled: true,
+        advertise_url: Some("ftp://user:secret@host".to_string()),
+        ..HubHaConfig::default()
+    };
+    let config = ServerConfig {
+        hub_storage: Some("postgres://127.0.0.1:1/db".into()),
+        ..ServerConfig::default()
+    };
+    let error = bootstrap::validate_ha_config(&enabled, &config).unwrap_err();
+    assert!(!error.contains("ftp://user:secret@host"), "{error}");
+    assert!(error.contains("ha.advertise_url"), "{error}");
 }

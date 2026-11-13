@@ -115,8 +115,12 @@ async fn serve_with_config(
         &startup.server.observability.tracing,
     );
 
-    let config: ServerConfig = startup.server;
+    let mut config: ServerConfig = startup.server;
     let ha: HubHaConfig = startup.ha;
+    // The standalone Hub always serves when invoked; the documented
+    // `enabled` field is ignored (serve_hub treats false as a silent no-op,
+    // which must not happen from an explicit binary invocation).
+    config.enabled = true;
     bootstrap::validate_ha_config(&ha, &config).map_err(|message| {
         eprintln!("{message}");
         message

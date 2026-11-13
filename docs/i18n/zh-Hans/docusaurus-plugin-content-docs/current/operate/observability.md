@@ -120,8 +120,10 @@ logging:
 ### Hub 进程日志(`arkflow-server`)
 
 Hub 二进制在启动时即初始化 tracing subscriber——不做任何配置也会以
-`info` 级别向控制台输出日志,选主、租约、会话、webhook 与 HTTP
-(`TraceLayer`)输出均可见。级别、文件与格式与引擎同构,可经 `--config`
+`info` 级别向控制台输出日志,选主、租约、会话与 webhook 输出均可见。
+(HTTP 中间件 `TraceLayer` 默认以 `debug` 发射:HTTP span 与逐请求事件
+只在级别允许时可见,例如 `RUST_LOG=tower_http=debug`。)
+级别、文件与格式与引擎同构,可经 `--config`
 启动文件或环境变量配置:
 
 ```yaml validate=foreign reason="arkflow-server --config startup file; parsed by the server binary, not the engine parser"
