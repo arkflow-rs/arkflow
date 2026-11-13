@@ -56,7 +56,6 @@ rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
 
 # Kafka
-aws-msk-iam-sasl-signer = "1.0.0"
 rdkafka = { version = "0.39", features = [
     "cmake-build",
     "tracing",

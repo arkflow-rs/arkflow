@@ -30,10 +30,8 @@ tracing-subscriber = { workspace = true }
 datafusion = { workspace = true }
 lazy_static = { workspace = true }
 clap = { workspace = true }
-colored = { workspace = true }
 flume = { workspace = true }
 axum = { workspace = true }
-tower-http = { workspace = true }
 subtle = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
