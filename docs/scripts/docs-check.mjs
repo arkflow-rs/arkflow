@@ -375,7 +375,8 @@ try {
 const FRONT_MATTER_PARITY_KEYS = ['id', 'slug', 'sidebar_position', 'sidebar_label'];
 
 function frontMatterBlock(text) {
-  const match = /^---\n([\s\S]*?)\n---/.exec(text);
+  const normalizedText = text.replace(/\r\n?/g, '\n');
+  const match = /^---\n([\s\S]*?)\n---/.exec(normalizedText);
   return match ? match[1] : null;
 }
 
