@@ -58,9 +58,10 @@ fn registry() -> &'static std::sync::Mutex<BTreeMap<String, GroupRegistration>> 
 /// therefore also outlives the output that declared it — the validation is
 /// a startup gate for declared configuration, liveness stays a write-time
 /// check.
-fn committers() -> &'static std::sync::Mutex<BTreeSet<String>> {
-    static COMMITTERS: OnceLock<std::sync::Mutex<BTreeSet<String>>> = OnceLock::new();
-    COMMITTERS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+fn committers() -> &'static std::sync::Mutex<BTreeMap<String, std::sync::Weak<()>>> {
+    static COMMITTERS: OnceLock<std::sync::Mutex<BTreeMap<String, std::sync::Weak<()>>>> =
+        OnceLock::new();
+    COMMITTERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 /// Lazily install the pairing validator in the core's startup validation
@@ -158,14 +159,28 @@ pub(crate) fn single_topic(group_id: &str) -> Option<String> {
 }
 
 /// Declare that a Kafka output commits the source offsets of `group_id`
-/// inside its producer transactions (`offset_commit_group`). Called at
-/// output build time so the startup pairing validation sees the claim.
-pub(crate) fn declare_offset_committer(group_id: &str) {
+/// inside its producer transactions (`offset_commit_group`). The claim is
+/// WEAK: the output instance owns `claim` for its whole lifetime, so a
+/// removed/dropped output stops satisfying the pairing validation at the
+/// next check instead of pinning the group for the rest of the process —
+/// the previous strong set let a once-built-and-dropped output keep an
+/// unpaired input permanently silent about its missing committer.
+/// Validation runs at graph connect, where the graph still holds every
+/// output instance, so live configurations never see a false negative.
+pub(crate) fn declare_offset_committer(group_id: &str, claim: &Arc<()>) {
     ensure_pairing_validator_registered();
     committers()
         .lock()
         .expect("kafka txn committers lock")
-        .insert(group_id.to_owned());
+        .insert(group_id.to_owned(), Arc::downgrade(claim));
+}
+
+/// Live committer groups: claims whose owning output instance is gone
+/// (dry builds, removed configs) are pruned before the decision.
+fn live_committers() -> BTreeSet<String> {
+    let mut committers = committers().lock().expect("kafka txn committers lock");
+    committers.retain(|_, claim| claim.strong_count() > 0);
+    committers.keys().cloned().collect()
 }
 
 /// Startup pairing validation (fail-closed): every consumer group declared
@@ -191,10 +206,7 @@ pub(crate) fn validate_pairings() -> Result<(), Error> {
     if groups.is_empty() {
         return Ok(());
     }
-    let committers = committers()
-        .lock()
-        .expect("kafka txn committers lock")
-        .clone();
+    let committers = live_committers();
     let unpaired: Vec<String> = groups
         .into_iter()
         .filter(|group| !committers.contains(group))
@@ -302,7 +314,8 @@ mod tests {
             "explains the distributed-deployment meaning: {message}"
         );
 
-        declare_offset_committer(&group);
+        let claim = Arc::new(());
+        declare_offset_committer(&group, &claim);
         match validate_pairings() {
             Ok(()) => {}
             Err(e) => assert!(
@@ -312,13 +325,41 @@ mod tests {
         }
     }
 
+    /// A committer claim is WEAK: dropping the output instance must stop it
+    /// from satisfying validation (the previous strong set pinned the group
+    /// for the process lifetime, so a removed output left its paired input
+    /// silently skipping offset storage).
+    #[test]
+    fn dropped_output_claim_no_longer_satisfies_pairing() {
+        let group = unique_group("ktx-weak-claim");
+        let frontier = Arc::new(CommitFrontier::new());
+        let _slot = register_group(&group, vec!["orders".into()], frontier.clone());
+        {
+            let claim = Arc::new(());
+            declare_offset_committer(&group, &claim);
+            match validate_pairings() {
+                Ok(()) => {}
+                Err(e) => assert!(
+                    !e.to_string().contains(&group),
+                    "a live output claim satisfies the pairing: {e}"
+                ),
+            }
+        }
+        // The output instance is gone: the claim must no longer count.
+        let err = validate_pairings().expect_err("a dropped claim must fail validation");
+        assert!(
+            err.to_string().contains(&group),
+            "the unpaired group is reported again: {err}"
+        );
+        drop(frontier);
+    }
+
     /// CR follow-up: a dead registration (its input dropped without any
     /// output ever claiming the group) must be pruned by validation instead
     /// of poisoning every later `connect` in this process with the
     /// "unpaired" error.
     #[test]
-    fn pairing_validation_prunes_dead_registrations() {
-        let group = unique_group("ktx-dead-unclaimed");
+    fn pairing_validation_prunes_dead_registrations() {        let group = unique_group("ktx-dead-unclaimed");
         let frontier = Arc::new(CommitFrontier::new());
         let _slot = register_group(&group, vec!["orders".into()], frontier.clone());
         // Live registration: reachable through the registry.

@@ -453,13 +453,23 @@ impl WalStore for RedbStore {
             .db
             .begin_read()
             .map_err(|e| Error::Process(format!("WAL read failed: {}", e)))?;
-        let cursor = tx
-            .open_table(META)
-            .ok()
-            .and_then(|t| t.get(CURSOR_KEY).ok().flatten().map(|g| g.value()))
-            .unwrap_or(0);
-        let Some(entries) = tx.open_table(ENTRIES).ok() else {
-            return Ok(Vec::new());
+        // Distinguish "table not created yet" (an empty WAL) from every
+        // other open failure: swallowing corruption/IO errors here made
+        // recovery see an EMPTY WAL and start from scratch, silently
+        // skipping everything a damaged store still held.
+        let cursor = match tx.open_table(META) {
+            Ok(table) => table
+                .get(CURSOR_KEY)
+                .map_err(|e| Error::Process(format!("WAL cursor read failed: {}", e)))?
+                .map(|guard| guard.value())
+                .unwrap_or(0),
+            Err(redb::TableError::TableDoesNotExist(_)) => 0,
+            Err(e) => return Err(Error::Process(format!("WAL table open failed: {}", e))),
+        };
+        let entries = match tx.open_table(ENTRIES) {
+            Ok(entries) => entries,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(Error::Process(format!("WAL table open failed: {}", e))),
         };
 
         let mut out = Vec::new();

@@ -31,13 +31,12 @@ FROM debian:bookworm-slim AS arkflow
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies. ca-certificates is required: the debian
+# slim image ships no CA bundle, so without it every engine-side TLS
+# connection (Kafka SASL_SSL, https outputs, schema registry) fails
+# certificate verification (the server image already carries it).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-0 python3 python3-dev ca-certificates \
-# ca-certificates: the runtime image is debian slim (no CA bundle by
-# default); without it every engine-side TLS connection (Kafka SASL_SSL,
-# https outputs, schema registry) fails certificate verification. The
-# server image already carries it.
  && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled binary from builder stage

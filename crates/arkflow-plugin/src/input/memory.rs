@@ -45,6 +45,43 @@ pub struct MemoryInput {
     codec: Option<Arc<dyn Codec>>,
 }
 
+/// Decode one initial message from a SYNC constructor.
+///
+/// - inside a multi-thread runtime: `block_in_place` keeps the runtime
+///   driving the decode;
+/// - inside a current-thread runtime: blocking would deadlock the only
+///   worker — fail with a configuration error instead of panicking;
+/// - outside any runtime: a temporary current-thread runtime decodes it.
+fn decode_initial_message(
+    codec: &Arc<dyn Codec>,
+    payload: Vec<u8>,
+) -> Result<MessageBatch, Error> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| handle.block_on(codec.decode(vec![payload])))
+            } else {
+                Err(Error::Config(
+                    "memory input cannot decode initial messages inside a current-thread \
+                     runtime; build it outside the async context or omit the codec"
+                        .into(),
+                ))
+            }
+        }
+        Err(_) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    Error::Config(format!(
+                        "memory input decode runtime build failed: {e}"
+                    ))
+                })?;
+            runtime.block_on(codec.decode(vec![payload]))
+        }
+    }
+}
+
 impl MemoryInput {
     /// Create a new memory input component
     pub fn new(
@@ -59,14 +96,12 @@ impl MemoryInput {
             for msg_str in messages {
                 // Apply codec if configured
                 let msg_batch = if let Some(c) = &codec {
-                    // Codec decode is async; `new()` is sync (called from `InputBuilder::build`).
-                    // Block-on the runtime to decode initial messages at construction.
-                    // Requires a multi-thread tokio runtime; memory input is a test component
-                    // and this path is only hit when a codec + initial messages are configured.
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(c.decode(vec![msg_str.as_bytes().to_vec()]))
-                    })?
+                    // Codec decode is async; `new()` is sync (called from
+                    // `InputBuilder::build`). `block_in_place` only exists
+                    // on a multi-thread runtime and `Handle::current()` PANICS
+                    // with no runtime — the old code did both
+                    // unconditionally. Pick the safe path per context.
+                    decode_initial_message(c, msg_str.as_bytes().to_vec())?
                 } else {
                     MessageBatch::from_string(msg_str)?
                 };

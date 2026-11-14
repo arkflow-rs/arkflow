@@ -119,6 +119,10 @@ struct KafkaOutput {
     inner_kafka_output: Arc<InnerKafkaOutput>,
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
+    /// Weak-claim anchor for the L3 pairing registry: the registry only
+    /// counts this output as a live offset committer while this Arc is held
+    /// (see `kafka_txn::declare_offset_committer`).
+    _offset_committer_claim: Option<Arc<()>>,
     /// L3 monotonic guard: the last transactional offset commit sent per
     /// partition by the CURRENT producer (cleared when `connect` installs a
     /// new producer). Keeps the commit sequence non-regressing even when
@@ -188,6 +192,18 @@ impl KafkaOutput {
 
     /// Create a new Kafka output component
     pub fn new(config: KafkaOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
+        Self::new_with_claim(config, codec, None)
+    }
+
+    /// [`Self::new`] with the L3 pairing claim anchor supplied by the
+    /// builder (the builder declares the claim BEFORE returning the
+    /// instance; an instance built without one — tests, direct
+    /// construction — is not a declared committer).
+    pub fn new_with_claim(
+        config: KafkaOutputConfig,
+        codec: Option<Arc<dyn Codec>>,
+        offset_committer_claim: Option<Arc<()>>,
+    ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         let inner_kafka_output = Arc::new(InnerKafkaOutput {
             producer: Arc::new(RwLock::new(None)),
@@ -215,6 +231,7 @@ impl KafkaOutput {
             inner_kafka_output,
             cancellation_token,
             codec,
+            _offset_committer_claim: offset_committer_claim,
             last_sent_offsets: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
@@ -739,9 +756,16 @@ impl OutputBuilder for KafkaOutputBuilder {
         // rejects an input that declares `transactional_offsets` for a group
         // no output ever claims — such a group's broker offsets would never
         // be committed by anyone.
-        if let Some(group) = &config.offset_commit_group {
-            crate::kafka_txn::declare_offset_committer(group);
-        }
+        let offset_committer_claim = if let Some(group) = &config.offset_commit_group {
+            // The claim lives exactly as long as the output instance: a
+            // removed/dropped output must stop satisfying pairing
+            // validation (the previous strong set never released it).
+            let claim = Arc::new(());
+            crate::kafka_txn::declare_offset_committer(group, &claim);
+            Some(claim)
+        } else {
+            None
+        };
 
         // Fail before any stream starts on an inconsistent security block
         // (spec: 构建期校验与错误语义) — `--validate` reaches this path.
@@ -749,7 +773,11 @@ impl OutputBuilder for KafkaOutputBuilder {
             security.validate()?;
         }
 
-        Ok(Arc::new(KafkaOutput::new(config, codec)?))
+        Ok(Arc::new(KafkaOutput::new_with_claim(
+            config,
+            codec,
+            offset_committer_claim,
+        )?))
     }
 
     fn placement_affinity(

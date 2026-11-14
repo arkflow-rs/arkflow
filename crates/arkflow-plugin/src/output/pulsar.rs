@@ -29,7 +29,7 @@ use arkflow_core::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -39,6 +39,13 @@ use tokio::sync::{Mutex, RwLock};
 /// unbounded wait would hang `write` forever on broker loss instead of
 /// surfacing an error.
 const WRITE_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Upper bound on cached per-topic producers. The topic expression may mint
+/// an unbounded number of distinct values over a long run; each cached
+/// producer pins a broker connection, so the cache evicts oldest-first
+/// (dropping a producer only closes its connection when no in-flight send
+/// still holds it).
+const MAX_CACHED_PRODUCERS: usize = 1024;
 
 /// Pulsar output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +74,8 @@ pub struct PulsarOutput {
     /// the map lock only guards get-or-build, so one stalled topic's
     /// bounded receipt wait cannot block sends to healthy topics.
     producers: Arc<Mutex<HashMap<String, Arc<Mutex<PulsarProducer>>>>>,
+    /// Insertion order for the bounded cache (oldest first to evict).
+    producer_order: Arc<Mutex<VecDeque<String>>>,
     codec: Option<Arc<dyn Codec>>,
 }
 
@@ -77,18 +86,18 @@ impl PulsarOutput {
             config,
             client: Arc::new(RwLock::new(None)),
             producers: Arc::new(Mutex::new(HashMap::new())),
+            producer_order: Arc::new(Mutex::new(VecDeque::new())),
             codec,
         })
     }
 
     /// Fetch (or build) the producer for a topic and send one payload,
     /// awaiting the broker receipt before returning.
-    async fn send_to_topic(
+    async fn producer_for(
         &self,
         client: &PulsarClient,
         topic: &str,
-        payload: Vec<u8>,
-    ) -> Result<(), Error> {
+    ) -> Result<Arc<Mutex<PulsarProducer>>, Error> {
         let producer = {
             let mut producers = self.producers.lock().await;
             match producers.get(topic) {
@@ -115,36 +124,20 @@ impl PulsarOutput {
                     })?;
                     let producer = Arc::new(Mutex::new(producer));
                     producers.insert(topic.to_string(), Arc::clone(&producer));
+                    drop(producers);
+                    let mut order = self.producer_order.lock().await;
+                    order.push_back(topic.to_string());
+                    while order.len() > MAX_CACHED_PRODUCERS {
+                        if let Some(oldest) = order.pop_front() {
+                            self.producers.lock().await.remove(&oldest);
+                        }
+                    }
                     producer
                 }
             }
         };
 
-        let mut producer = producer.lock().await;
-
-        // `send_non_blocking` only enqueues; the returned future resolves
-        // with the broker receipt. Awaiting it is what makes write reliable
-        // — fire-and-forget would report success for messages the broker
-        // never accepted. The wait is bounded so a lost broker surfaces as
-        // an error instead of an indefinite hang (the client itself keeps
-        // reconnecting and never fails the pending receipt).
-        let receipt = producer
-            .send_non_blocking(payload)
-            .await
-            .map_err(|e| Error::Process(format!("Failed to send to Pulsar topic {topic}: {e}")))?;
-        tokio::time::timeout(WRITE_RECEIPT_TIMEOUT, receipt)
-            .await
-            .map_err(|_| {
-                Error::Connection(format!(
-                    "Timed out waiting for Pulsar receipt on topic {topic}"
-                ))
-            })?
-            .map_err(|e| {
-                Error::Process(format!(
-                    "Pulsar broker rejected message on topic {topic}: {e}"
-                ))
-            })?;
-        Ok(())
+        Ok(producer)
     }
 }
 
@@ -187,6 +180,7 @@ impl Output for PulsarOutput {
         // Producers are built lazily per topic on first write; drop any
         // producers left over from a previous connection.
         self.producers.lock().await.clear();
+        self.producer_order.lock().await.clear();
 
         Ok(())
     }
@@ -219,6 +213,14 @@ impl Output for PulsarOutput {
         // expression semantics: a scalar sends every message to the same
         // topic, a vector is indexed per message.
         let topics = self.config.topic.evaluate_expr(&msg).await?;
+        // Enqueue every payload first, then await ALL broker receipts
+        // concurrently under ONE bounded window. Awaiting each receipt
+        // inside the row loop cost one broker round trip per row — a
+        // 1024-row batch at ~300 ms RTT blew through the kernel's
+        // whole-batch timeout even on a healthy broker. `send_non_blocking`
+        // only enqueues; the receipt future owns its state, so the producer
+        // lock is released before any wait.
+        let mut receipts = Vec::with_capacity(owned_payloads.len());
         for (index, payload) in owned_payloads.into_iter().enumerate() {
             let topic = match &topics {
                 crate::expr::EvaluateResult::Scalar(topic) => topic.clone(),
@@ -233,15 +235,36 @@ impl Output for PulsarOutput {
                     })?
                     .clone(),
             };
-            self.send_to_topic(&client, &topic, payload).await?;
+            let producer = self.producer_for(&client, &topic).await?;
+            let mut producer = producer.lock().await;
+            let receipt = producer.send_non_blocking(payload).await.map_err(|e| {
+                Error::Process(format!("Failed to send to Pulsar topic {topic}: {e}"))
+            })?;
+            drop(producer);
+            receipts.push((topic, receipt));
         }
-
-        Ok(())
+        let waits = futures::future::join_all(receipts.into_iter().map(|(topic, receipt)| async move {
+            receipt.await.map(|_| ()).map_err(|e| {
+                Error::Process(format!(
+                    "Pulsar broker rejected message on topic {topic}: {e}"
+                ))
+            })
+        }));
+        tokio::time::timeout(WRITE_RECEIPT_TIMEOUT, waits)
+            .await
+            .map_err(|_| {
+                Error::Connection(
+                    "Timed out waiting for Pulsar receipts for the batch".to_string(),
+                )
+            })?
+            .into_iter()
+            .collect::<Result<(), Error>>()
     }
 
     async fn close(&self) -> Result<(), Error> {
         // Close producers if active
         self.producers.lock().await.clear();
+        self.producer_order.lock().await.clear();
 
         // Close Pulsar client
         let mut client_guard = self.client.write().await;
