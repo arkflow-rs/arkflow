@@ -816,15 +816,20 @@ impl StateBackend for RedbStateBackend {
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
             let mut freed_bytes = 0_u64;
             let mut freed_keys = 0_u64;
-            // A configured byte budget must reclaim expired bytes before the
-            // check (the exact contract of the budget tests); without a
-            // budget the purge is amortized space reclamation.
-            if self.max_bytes.is_some()
-                || self
-                    .writes
-                    .fetch_add(1, Ordering::Relaxed)
-                    .is_multiple_of(PURGE_INTERVAL_WRITES)
-            {
+            let write_index = self.writes.fetch_add(1, Ordering::Relaxed);
+            // A byte budget used to force a full-table expired purge AND a
+            // second full-table byte scan on EVERY write (quadratic over a
+            // workload). Track live bytes incrementally; only pay for an
+            // exact scan when the tracked budget is under pressure, and
+            // reclaim expired rows periodically otherwise.
+            let budget_pressure = self.max_bytes.is_some_and(|max_bytes| {
+                self.bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(value.len() as u64)
+                    > max_bytes
+            });
+            let periodic = write_index.is_multiple_of(PURGE_INTERVAL_WRITES);
+            if budget_pressure || periodic {
                 let (bytes, keys) = Self::remove_expired_in_table(&mut table, now_ms)?;
                 freed_bytes += bytes;
                 freed_keys += keys;
@@ -852,7 +857,7 @@ impl StateBackend for RedbStateBackend {
             // drifted would reject every future write. `max_bytes` is the one
             // configuration that needs an exact answer, so it pays for the
             // scan and reconciles the counter to the measurement afterwards.
-            let budget_delta = if self.max_bytes.is_some() {
+            let budget_delta = if self.max_bytes.is_some() && (budget_pressure || periodic) {
                 let mut live_bytes = 0_u64;
                 let mut live_keys = 0_u64;
                 for item in table
@@ -945,15 +950,14 @@ impl StateBackend for RedbStateBackend {
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
             let mut freed_bytes = 0_u64;
             let mut freed_keys = 0_u64;
-            // A configured byte budget must reclaim expired bytes before the
-            // check; without a budget the purge is amortized space
-            // reclamation (reads hide expired values either way).
-            if self.max_bytes.is_some()
-                || self
-                    .writes
-                    .fetch_add(1, Ordering::Relaxed)
-                    .is_multiple_of(PURGE_INTERVAL_WRITES)
-            {
+            let write_index = self.writes.fetch_add(1, Ordering::Relaxed);
+            // Same amortization as `put_with_ttl`: no full-table scan on every
+            // write; scan only under budget pressure or periodically.
+            let budget_pressure = self.max_bytes.is_some_and(|max_bytes| {
+                self.bytes.load(Ordering::Relaxed).saturating_add(8) > max_bytes
+            });
+            let periodic = write_index.is_multiple_of(PURGE_INTERVAL_WRITES);
+            if budget_pressure || periodic {
                 let (bytes, keys) = Self::remove_expired_in_table(&mut table, current_time_ms)?;
                 freed_bytes += bytes;
                 freed_keys += keys;
@@ -986,7 +990,7 @@ impl StateBackend for RedbStateBackend {
             // The budget is measured inside the write transaction for the same
             // reason as `put_with_ttl`: the tracked counters are observability
             // only, and a drifted counter must not reject a legal write.
-            let budget_delta = if self.max_bytes.is_some() {
+            let budget_delta = if self.max_bytes.is_some() && (budget_pressure || periodic) {
                 let mut live_bytes = 0_u64;
                 let mut live_keys = 0_u64;
                 for item in table

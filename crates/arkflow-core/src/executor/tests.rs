@@ -7330,7 +7330,9 @@ fn barrier_hooked_graph(
 fn source_hook(
     barrier_rx: flume::Receiver<Envelope>,
     state: Option<Arc<dyn crate::state::StateBackend>>,
-    failure_tx: Option<tokio::sync::mpsc::UnboundedSender<Error>>,
+    failure_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<(Option<crate::checkpoint::CheckpointBarrier>, Error)>,
+    >,
 ) -> BTreeMap<String, crate::executor::task::ChainHooks> {
     BTreeMap::from([(
         "source-0".to_string(),
@@ -7466,7 +7468,7 @@ async fn source_barrier_snapshot_failure_reports_and_forwards_the_barrier() {
             trace_context: None,
         }))
         .await;
-    let failure = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
+    let (_, failure) = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
         .await
         .expect("the snapshot failure must be reported")
         .expect("the failure channel stays open");
@@ -8652,7 +8654,7 @@ async fn barrier_alignment_overflow_releases_the_buffered_data() {
     assert!(
         failure
             .as_ref()
-            .map(|error| error.to_string())
+            .map(|(_, error)| error.to_string())
             .unwrap_or_default()
             .contains("exceeded"),
         "the overflow error names the bound: {failure:?}"
@@ -8722,7 +8724,7 @@ async fn interior_barrier_snapshot_failure_reports_and_forwards() {
             trace_context: None,
         }))
         .await;
-    let failure = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
+    let (_, failure) = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
         .await
         .expect("the interior snapshot failure must be reported")
         .expect("the failure channel stays open");

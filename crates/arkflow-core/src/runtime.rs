@@ -115,6 +115,25 @@ impl OperationStore {
         record
     }
 
+    /// Atomically claim a queued operation for execution. Concurrent callers
+    /// that received the same Queued record must not each spawn a worker for
+    /// it; only the caller that wins this CAS executes it.
+    pub async fn claim_for_dispatch(&self, id: &str) -> bool {
+        let mut operations = self.operations.write().await;
+        let Some(record) = operations.get_mut(id) else {
+            return false;
+        };
+        if record.state != OperationState::Queued {
+            return false;
+        }
+        record.state = OperationState::Running;
+        record.progress = 10;
+        if record.started_at_ms.is_none() {
+            record.started_at_ms = Some(now_ms());
+        }
+        true
+    }
+
     pub async fn update(
         &self,
         id: &str,
@@ -567,9 +586,17 @@ impl RuntimeManager {
 
         let metrics = entry.lock().await.metrics.clone();
         let index = entry.lock().await.index;
-        // Unified kernel: the StreamConfig compiles to a JobSpec and runs
-        // through the same executor as declared Jobs and Agent subgraphs.
-        let spec = match crate::executor::stream_compiler::compile_stream(&config, index) {
+        // An unnamed Stream's control-plane id is `stream-{config_index}`.
+        // Hot replacement assigns a fresh registry index, so compiling with
+        // that index could collide with an explicit `stream-N` id. Derive the
+        // compile index from the stable control-plane id instead.
+        let compile_index = config
+            .id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("stream-"))
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+            .unwrap_or(index);
+        let spec = match crate::executor::stream_compiler::compile_stream(&config, compile_index) {
             Ok(spec) => spec,
             Err(error) => {
                 let mut runtime = entry.lock().await;

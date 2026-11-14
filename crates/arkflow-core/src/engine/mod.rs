@@ -102,7 +102,28 @@ impl Engine {
                 .await?;
         }
 
-        if let Err(error) = self.runtime_manager.start_all().await {
+        // A token cancelled before startup (immediate shutdown request) is a
+        // clean no-op, not a startup failure.
+        if token.is_cancelled() {
+            let _ = self.runtime_manager.stop_all().await;
+            return Ok(());
+        }
+        // Install signal handling BEFORE component startup: a SIGTERM that
+        // arrives while a connector is still connecting must cancel startup
+        // instead of waiting for it to finish.
+        spawn_signal_watchers(token.clone());
+
+        let start_result = tokio::select! {
+            _ = token.cancelled() => {
+                let _ = self.runtime_manager.stop_all().await;
+                return Err(Box::new(crate::Error::Process(
+                    "engine cancelled during stream startup".into(),
+                )));
+            }
+            result = self.runtime_manager.start_all() => result,
+        };
+        if let Err(error) = start_result {
+            token.cancel();
             let _ = self.runtime_manager.stop_all().await;
             return Err(Box::new(error));
         }
@@ -123,7 +144,7 @@ impl Engine {
             tokio::sync::mpsc::unbounded_channel::<String>();
         for job in &self.config.jobs {
             let spec = job.clone();
-            let token = local_jobs_token.clone();
+            let job_token = local_jobs_token.clone();
             let failure_tx = local_job_failure_tx.clone();
             let metrics_registry = job_metrics_registry.clone();
             let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
@@ -138,7 +159,7 @@ impl Engine {
                     &spec,
                     &adapter,
                     &mut resource,
-                    token,
+                    job_token,
                     Some(startup_tx),
                     Some(metrics_registry),
                 )
@@ -149,7 +170,20 @@ impl Engine {
                 result
             });
             job_handles.push(handle);
-            match startup_rx.await {
+            let startup = tokio::select! {
+                _ = token.cancelled() => {
+                    local_jobs_token.cancel();
+                    let _ = self.runtime_manager.stop_all().await;
+                    for handle in job_handles.drain(..) {
+                        let _ = handle.await;
+                    }
+                    return Err(Box::new(crate::Error::Process(
+                        "engine cancelled during local Job startup".into(),
+                    )));
+                }
+                result = startup_rx => result,
+            };
+            match startup {
                 Ok(Ok(())) => {}
                 Ok(Err(message)) => {
                     local_jobs_token.cancel();
@@ -174,8 +208,6 @@ impl Engine {
 
         self.control_plane.health().set_ready(true);
         self.control_plane.health().set_running(true);
-
-        spawn_signal_watchers(token.clone());
 
         tokio::select! {
             _ = token.cancelled() => {}

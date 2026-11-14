@@ -69,6 +69,9 @@ pub(crate) struct Aligner {
     /// Last completed barrier, used to reject an accidental duplicate after a
     /// one-input vertex has already forwarded it.
     last_completed: Option<CheckpointBarrier>,
+    /// Barrier whose alignment attempt just failed, used to attribute a
+    /// checkpoint failure to the round that actually observed it.
+    failed_barrier: Option<CheckpointBarrier>,
 }
 
 impl Aligner {
@@ -82,7 +85,14 @@ impl Aligner {
             passthrough: None,
             in_flight: None,
             last_completed: None,
+            failed_barrier: None,
         }
+    }
+
+    /// Barrier whose alignment attempt most recently failed. `None` when the
+    /// failure cannot be attributed to a specific round.
+    pub fn failed_barrier(&self) -> Option<CheckpointBarrier> {
+        self.failed_barrier.clone()
     }
 
     /// Feed one envelope from input `index`. Returns `Some(barrier)` when the
@@ -162,6 +172,7 @@ impl Aligner {
             }
             if let Some(expected) = self.in_flight.clone() {
                 if expected != barrier {
+                    self.failed_barrier = Some(expected.clone());
                     self.in_flight = None;
                     self.aligned.clear();
                     return Err(crate::Error::Process(format!(
@@ -185,6 +196,7 @@ impl Aligner {
             if self.barrier_complete() {
                 self.aligned.clear();
                 self.in_flight = None;
+                self.failed_barrier = None;
                 self.last_completed = Some(barrier.clone());
                 return Ok(Some(barrier));
             }
@@ -218,6 +230,7 @@ impl Aligner {
             // Drop the alignment attempt; the buffered envelopes are released
             // by `release` and the checkpoint fails upstream rather than
             // growing memory without bound.
+            self.failed_barrier = self.in_flight.clone();
             self.aligned.clear();
             self.in_flight = None;
             return Err(crate::Error::Process(format!(

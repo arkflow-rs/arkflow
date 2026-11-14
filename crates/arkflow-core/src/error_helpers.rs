@@ -61,9 +61,27 @@ where
         .ok_or_else(|| Error::Config(format!("{} configuration is missing", component_name)))?;
 
     serde_json::from_value(config_value.clone()).map_err(|e| {
+        // Do not echo the offending value: plugin configs are kept as raw
+        // JSON and may contain resolved secrets. Field-only diagnostics
+        // (missing/unknown/duplicate field) stay, type/value mismatches are
+        // reported without the value.
+        let message = e.to_string();
+        let safe_message = if message.starts_with("missing field")
+            || message.starts_with("unknown field")
+            || message.starts_with("duplicate field")
+        {
+            message
+        } else {
+            format!(
+                "{:?} error at line {}, column {}",
+                e.classify(),
+                e.line(),
+                e.column()
+            )
+        };
         Error::Config(format!(
             "Failed to parse {} configuration: {}",
-            component_name, e
+            component_name, safe_message
         ))
     })
 }

@@ -99,7 +99,9 @@ pub(crate) struct CheckpointHook {
     /// Report a checkpoint-local snapshot failure without terminating the
     /// data-plane chain. A failed checkpoint must leave normal processing
     /// running so the next barrier can retry.
-    pub failure_reporter: Option<tokio::sync::mpsc::UnboundedSender<Error>>,
+    pub failure_reporter: Option<
+        tokio::sync::mpsc::UnboundedSender<(Option<crate::checkpoint::CheckpointBarrier>, Error)>,
+    >,
     /// Barrier reception point for source chains (injected by a coordinator).
     pub barrier_rx: Option<Arc<tokio::sync::Mutex<flume::Receiver<super::envelope::Envelope>>>>,
     /// State backend to snapshot when a barrier passes this chain.
@@ -587,10 +589,13 @@ async fn run_source_chain(
                         _ = drain => {}
                         _ = tokio::time::sleep(BARRIER_DRAIN_TIMEOUT) => {
                             if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                                let _ = reporter.send(Error::Process(format!(
-                                    "checkpoint barrier drain timed out with {} acknowledgements still in flight",
-                                    tracker.blocking()
-                                )));
+                                let _ = reporter.send((
+                                    Some(barrier.clone()),
+                                    Error::Process(format!(
+                                        "checkpoint barrier drain timed out with {} acknowledgements still in flight",
+                                        tracker.blocking()
+                                    )),
+                                ));
                             }
                             // Abort the round: the barrier is consumed but not
                             // sealed and not forwarded, so no cut can persist
@@ -617,7 +622,7 @@ async fn run_source_chain(
                             // timeout, so no cut can persist positions this chain
                             // cannot vouch for.
                             if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                                let _ = reporter.send(error);
+                                let _ = reporter.send((Some(barrier.clone()), error));
                             }
                             continue;
                         }
@@ -685,7 +690,7 @@ async fn run_source_chain(
                     }
                     Err(error) => {
                         if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                            let _ = reporter.send(error);
+                            let _ = reporter.send((Some(barrier.clone()), error));
                         }
                         tokio::select! {
                             _ = cancellation.cancelled() => {
@@ -1444,7 +1449,18 @@ async fn run_interior_chain_loop(
                 // Upstream chains also observe cancellation and close their
                 // senders. Drain all queued envelopes before forwarding EOS so
                 // no receiver task is left behind and bounded producers can
-                // finish their shutdown path.
+                // finish their shutdown path. Deliveries parked in the
+                // alignment buffer (or the passthrough slot) are explicit
+                // aborts: they were removed from the input channel, so the
+                // channel drain below cannot reach their acknowledgements.
+                for (_, envelope) in aligner.release() {
+                    if let Envelope::Data(_, ack) = envelope {
+                        let _ = ack.abort().await;
+                    }
+                }
+                if let Some(Envelope::Data(_, ack)) = aligner.take_passthrough() {
+                    let _ = ack.abort().await;
+                }
                 let pool = pool.take();
                 return shutdown_interior_chain(chain, pool).await;
             }
@@ -1609,7 +1625,8 @@ async fn run_interior_chain_loop(
                 // Alignment overflow: release what was buffered and keep the
                 // data flowing; the barrier round fails upstream.
                 if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                    let _ = reporter.send(Error::Process(error.to_string()));
+                    let _ = reporter
+                        .send((aligner.failed_barrier(), Error::Process(error.to_string())));
                 }
                 if let Some(pool) = pool.as_ref() {
                     pool.flush().await?;
@@ -1761,7 +1778,7 @@ async fn handle_completed_barrier_inner(
         }
         Err(error) => {
             if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                let _ = reporter.send(error);
+                let _ = reporter.send((Some(barrier.clone()), error));
             }
             send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
         }
@@ -5402,7 +5419,7 @@ mod task_loop_tests {
             .send_async(barrier("c-1", 1))
             .await
             .expect("barrier queued");
-        let report = tokio::time::timeout(4 * BUDGET, fail_rx.recv())
+        let (_, report) = tokio::time::timeout(4 * BUDGET, fail_rx.recv())
             .await
             .expect("the drain timeout reports a checkpoint failure")
             .expect("reporter alive");
@@ -6045,7 +6062,7 @@ mod task_loop_tests {
                 .unwrap();
         }
         let task = tokio::spawn(run_chain(chain, hook, CancellationToken::new()));
-        let report = tokio::time::timeout(BUDGET, fail_rx.recv())
+        let (_, report) = tokio::time::timeout(BUDGET, fail_rx.recv())
             .await
             .expect("the overflow reports a checkpoint failure")
             .expect("reporter alive");

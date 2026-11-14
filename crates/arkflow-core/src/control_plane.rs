@@ -268,6 +268,11 @@ impl ControlPlane {
         if !matches!(record.state, OperationState::Queued) {
             return Ok(record);
         }
+        // Two concurrent requests can both observe the same Queued record;
+        // only the atomic claim winner may spawn the lifecycle task.
+        if !self.operations.claim_for_dispatch(&record.id).await {
+            return Ok(self.operations.get(&record.id).await.unwrap_or(record));
+        }
         let store = self.operations.clone();
         let manager = self.runtime_manager.clone();
         let events = self.events.clone();
@@ -423,6 +428,18 @@ impl ControlPlane {
         if !report.valid {
             return Err(Error::Config("Configuration validation failed".into()));
         }
+        // Hot reconciliation covers streams only. Accepting a jobs change but
+        // publishing it while the old local Jobs keep running would make the
+        // version history disagree with the runtime; reject it explicitly.
+        {
+            let current = self.configuration.read().await;
+            if serde_json::to_value(&config.jobs).ok() != serde_json::to_value(&current.jobs).ok() {
+                return Err(Error::Config(
+                    "jobs cannot be hot-applied; restart the engine with the new configuration"
+                        .into(),
+                ));
+            }
+        }
         let parent = self
             .version_store
             .list()
@@ -467,6 +484,16 @@ impl ControlPlane {
         let report = validate_config(&config);
         if !report.valid {
             return Err(Error::Config("Configuration validation failed".into()));
+        }
+        {
+            let current = self.configuration.read().await;
+            if serde_json::to_value(&config.jobs).ok() != serde_json::to_value(&current.jobs).ok() {
+                return Err(Error::Config(
+                    "jobs cannot be hot-applied by rollback; restart the engine with the target \
+                     configuration"
+                        .into(),
+                ));
+            }
         }
         let version = self
             .version_store
