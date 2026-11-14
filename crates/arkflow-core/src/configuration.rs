@@ -90,16 +90,27 @@ impl ConfigVersionStore {
     }
 
     pub fn list(&self) -> Result<Vec<ConfigVersion>, Error> {
-        if !self.root.exists() {
-            return Ok(Vec::new());
-        }
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            // The whole history directory can be pruned concurrently with a
+            // listing; an absent directory is an empty history, not an error.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
         let mut versions = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
+        for entry in entries {
             let path = entry?.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let stored: StoredConfigVersion = serde_json::from_slice(&fs::read(path)?)?;
+            // A concurrent retraction (`delete_version`) can remove the file
+            // between the directory scan and this read. The version no longer
+            // exists, so skipping it IS the correct listing.
+            let stored: StoredConfigVersion = match fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             versions.push(stored.metadata);
         }
         versions.sort_by_key(|version| std::cmp::Reverse(version.created_at_ms));
