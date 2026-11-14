@@ -111,22 +111,35 @@ pub async fn evaluate_expr(
 ) -> Result<ColumnarValue, DataFusionError> {
     let df_schema = DFSchema::try_from(batch.schema())?;
 
+    // The physical expression binds columns by INDEX at plan time, so the
+    // cache key must include the schema: a text-only key made a reordered or
+    // retyped schema reuse the first plan and silently route values to the
+    // wrong columns.
+    let schema_key = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| format!("{}:{:?}", field.name(), field.data_type()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let cache_key = format!("{schema_key}\u{0}{expr_str}");
+
     {
-        if let Some(expr) = EXPR_CACHE.read().await.get(expr_str) {
+        if let Some(expr) = EXPR_CACHE.read().await.get(&cache_key) {
             return expr.evaluate(batch);
         }
     }
 
     let physical_expr = {
         let mut cache = EXPR_CACHE.write().await;
-        if let Some(expr) = cache.get(expr_str) {
+        if let Some(expr) = cache.get(&cache_key) {
             expr.clone()
         } else {
             // TODO: Maybe you can reuse session_context?
             let session_context = SessionContext::new();
             let expr = session_context.parse_sql_expr(expr_str, &df_schema)?;
             let physical_expr = session_context.create_physical_expr(expr, &df_schema)?;
-            cache.insert(expr_str.to_string(), physical_expr.clone());
+            cache.insert(cache_key.clone(), physical_expr.clone());
             physical_expr
         }
     };

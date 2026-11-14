@@ -379,6 +379,9 @@ pub(super) async fn run_session(
         node_id: config.node_id.clone(),
         session_token: session.session_token,
     };
+    // The Hub reports its command lease in the registration response; the
+    // progress reporter and the local lifecycle deadline both need it.
+    let lease_ttl_ms = session.lease_ttl_ms;
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     let mut report_tick = tokio::time::interval(config.report_interval);
     let mut poll = tokio::time::interval(config.poll_interval);
@@ -435,13 +438,30 @@ pub(super) async fn run_session(
                             error,
                         },
                     ).await {
-                        // Park this observation and everything behind it: the
-                        // task is already removed from the runtime map, so
-                        // dropping the observation would leave the Hub
+                        // Park this observation and everything behind it:
+                        // the task is already removed from the runtime map,
+                        // so dropping the observation would leave the Hub
                         // reporting the job as running forever.
                         let mut undelivered = finished[index..].to_vec();
                         undelivered[0] = (job_id.clone(), *generation, outcome.clone());
-                        job_runtime.park_observations(undelivered).await;
+                        // A Hub that ANSWERS with a client error (e.g. 401 for
+                        // an observation whose in-memory dispatch fingerprint
+                        // was lost in a Hub restart) rejects the same report on
+                        // every retry: re-registering cannot fix it and only
+                        // churns sessions. Requeue it behind the reports it was
+                        // blocking and stay in the session; a transport
+                        // failure keeps the original order and still tears the
+                        // session down so the agent re-registers.
+                        let hub_rejected = delivery
+                            .downcast_ref::<reqwest::Error>()
+                            .and_then(reqwest::Error::status)
+                            .is_some_and(|status| status.is_client_error());
+                        job_runtime
+                            .requeue_undelivered(undelivered, hub_rejected)
+                            .await;
+                        if hub_rejected {
+                            break;
+                        }
                         return Err(delivery);
                     }
                 }
@@ -469,6 +489,7 @@ pub(super) async fn run_session(
                             &command_auth,
                             &command,
                             &command_runtime,
+                            lease_ttl_ms,
                         )
                         .await;
                         (command_id, result)

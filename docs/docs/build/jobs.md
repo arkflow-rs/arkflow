@@ -103,6 +103,13 @@ Key points:
   window firing and state cleanup forever. An idle input that resumes with
   a stale watermark is clamped to the monotonic downstream frontier; its
   late rows follow the configured late policy.
+- Sources feeding one window are tracked **independently per source chain**,
+  even when two chains read the same topic/partition (for example one Kafka
+  topic consumed by two consumer groups into one window). The window fires
+  on the minimum across all chains, so a fast chain cannot close a window
+  the slow one still has events for. Checkpoints persist each partition's
+  watermark under its raw `(topic, partition)` shape, so a later graph
+  re-grouping still restores the stored progress into every gate.
 - Rows held by an event-time gate while waiting for their window to open
   are bounded (1,048,576 rows per gate). If the bound is exceeded while the
   watermark is stalled, the oldest held deliveries are aborted as a last

@@ -17,13 +17,59 @@ use crate::MessageBatchRef;
 use crate::ProcessResult;
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, StringArray, UInt64Array,
+    new_null_array, Array, ArrayRef, BooleanArray, Int64Array, StringArray, UInt64Array,
 };
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
+
+/// Field-name union across batches (first-seen order). Restored legacy
+/// window payloads may have been written under drifted schemas; positional
+/// concat against the first schema would panic on narrower batches and
+/// silently drop extra columns on wider ones.
+fn union_window_schema(batches: &[RecordBatch]) -> Result<Schema, Error> {
+    let mut fields: Vec<Field> = Vec::new();
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    for batch in batches {
+        for field in batch.schema().fields() {
+            match positions.get(field.name()) {
+                None => {
+                    positions.insert(field.name().to_string(), fields.len());
+                    fields.push(field.as_ref().clone().with_nullable(true));
+                }
+                Some(&index) => {
+                    if fields[index].data_type() != field.data_type() {
+                        return Err(Error::Process(format!(
+                            "window batch merge: column `{}` has conflicting types: {} vs {}",
+                            field.name(),
+                            fields[index].data_type(),
+                            field.data_type()
+                        )));
+                    }
+                    if !fields[index].is_nullable() {
+                        fields[index] = fields[index].clone().with_nullable(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Schema::new(fields))
+}
+
+/// Project one batch onto the union schema (missing columns null-filled).
+fn project_to_window_union(batch: &RecordBatch, schema: &Schema) -> Result<RecordBatch, Error> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        match batch.column_by_name(field.name()) {
+            Some(column) => columns.push(Arc::clone(column)),
+            None => columns.push(new_null_array(field.data_type(), batch.num_rows())),
+        }
+    }
+    RecordBatch::try_new(Arc::new(schema.clone()), columns)
+        .map_err(|error| Error::Process(format!("window batch merge: {error}")))
+}
 
 /// Minimum spacing between two `max_buffered_keys` eviction warn lines.
 const WINDOW_EVICTION_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1254,12 +1300,20 @@ impl ColumnarWindowOperator {
                     "legacy window payload is unavailable in the restored state".into(),
                 ));
             }
-            let schema = legacy_messages[0].schema();
             let batches = legacy_messages
                 .iter()
                 .map(|batch| batch.record_batch().clone())
                 .collect::<Vec<_>>();
-            let merged = datafusion::arrow::compute::concat_batches(&schema, &batches)
+            // concat_batches matches columns POSITIONALLY against the first
+            // schema: a narrower later batch panics and a wider one silently
+            // drops its extra columns. Project every batch onto the
+            // field-name union (null-filled) before concatenating.
+            let union_schema = Arc::new(union_window_schema(&batches)?);
+            let projected = batches
+                .iter()
+                .map(|batch| project_to_window_union(batch, &union_schema))
+                .collect::<Result<Vec<_>, Error>>()?;
+            let merged = datafusion::arrow::compute::concat_batches(&union_schema, &projected)
                 .map_err(|error| Error::Process(format!("merge legacy window batches: {error}")))?;
             let mut merged = crate::MessageBatch::new_arrow(merged);
             merged.set_input_name(legacy_messages[0].get_input_name());

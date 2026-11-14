@@ -107,6 +107,24 @@ fn decode_name(payload: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Live deliveries awaiting the next read's WAL hand-off (see
+/// [`LiveDeliveryLease`]): shared by the input and its cancellation guard.
+/// Admission bound for the WAL's not-yet-durable buffer. A failing backend
+/// parks segments in the store; reading more input while the backlog exceeds
+/// this bound would buffer without limit, so `WalInput::read` waits for the
+/// flusher instead (backpressure, never unbounded buffering).
+const WAL_RETAINED_BYTES_LIMIT: u64 = 512 * 1024 * 1024;
+
+type PendingRetryQueue = Arc<
+    std::sync::Mutex<
+        std::collections::VecDeque<(
+            crate::MessageBatchRef,
+            Arc<dyn crate::input::Ack>,
+            Option<u64>,
+        )>,
+    >,
+>;
+
 /// Wrap an input with the adapter's WAL: replays unacknowledged entries
 /// before new reads (crash recovery), appends each batch, and gates the ack
 /// on the WAL commit — exactly like the legacy `Stream::do_input` path.
@@ -114,15 +132,22 @@ pub(crate) struct WalInput {
     inner: Arc<dyn Input>,
     wal: Arc<Wal>,
     /// Unacked-entry replay queue, initialized on the first read (the
-    /// component-builder trait is sync; WAL reads are async).
+    /// component-builder trait is sync; WAL reads are async). A std mutex:
+    /// it is only ever held across a synchronous pop/push (no awaits), so
+    /// the cancellation guards below can re-queue entries from `drop`.
     replay: tokio::sync::OnceCell<
-        tokio::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>,
+        std::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>,
     >,
     /// Checkpoint positions are installed before the first read.  WAL
     /// entries are durable independently of the connector cursor, so the
     /// replay queue must discard entries already covered by a checkpoint
     /// while retaining entries that were read but not acknowledged.
     checkpoint_positions: tokio::sync::RwLock<Option<Vec<crate::checkpoint::SourcePosition>>>,
+    /// Live deliveries whose read future was cancelled between the inner
+    /// claim and the durable WAL hand-off: re-appended by the next read
+    /// (at-least-once; a partially appended batch may replay as a duplicate,
+    /// which is the contract floor, never a loss).
+    pending_retry: PendingRetryQueue,
 }
 
 impl WalInput {
@@ -132,6 +157,7 @@ impl WalInput {
             wal,
             replay: tokio::sync::OnceCell::new(),
             checkpoint_positions: tokio::sync::RwLock::new(None),
+            pending_retry: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -214,7 +240,7 @@ impl WalInput {
     /// time even with concurrent first reads.
     async fn replay_queue(
         &self,
-    ) -> Result<&tokio::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>, Error>
+    ) -> Result<&std::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>, Error>
     {
         self.replay
             .get_or_try_init(|| async {
@@ -248,11 +274,74 @@ impl WalInput {
                 if !replay.is_empty() {
                     tracing::info!(count = replay.len(), "WAL recovery: replaying entries");
                 }
-                Ok::<_, Error>(tokio::sync::Mutex::new(replay.into_iter().collect()))
+                Ok::<_, Error>(std::sync::Mutex::new(replay.into_iter().collect()))
             })
             .await?;
         // SAFETY-free: OnceCell::get is Some after get_or_init resolves.
         Ok(self.replay.get().expect("replay queue initialized"))
+    }
+}
+
+/// Cancellation guard for a replayed WAL entry: the entry was popped from
+/// the replay queue, so a read future dropped before the caller takes
+/// ownership must push it BACK — otherwise the record stops flowing until
+/// the next process restart even though it was never acknowledged.
+struct ReplayLease<'a> {
+    queue: &'a std::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>,
+    entry: Option<(u64, crate::MessageBatchRef)>,
+}
+
+impl ReplayLease<'_> {
+    /// Disarm: ownership of the entry has moved to the caller.
+    fn take(&mut self) {
+        self.entry = None;
+    }
+}
+
+impl Drop for ReplayLease<'_> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.push_front(entry);
+            }
+        }
+    }
+}
+
+/// Cancellation guard for a live delivery claimed from the wrapped input:
+/// if the read future is dropped between the claim and the durable WAL
+/// hand-off, the delivery is re-queued and the next read completes the
+/// hand-off — delayed by one read, never lost. The WAL sequence is recorded
+/// as soon as `append` returns: re-appending would mint a NEW sequence and
+/// leave the first one as a permanent unacknowledged hole (the ack frontier
+/// only advances through contiguous sequences).
+struct LiveDeliveryLease {
+    retry: PendingRetryQueue,
+    batch: crate::MessageBatchRef,
+    source_ack: Arc<dyn crate::input::Ack>,
+    appended_seq: std::sync::Mutex<Option<u64>>,
+    disarmed: std::sync::atomic::AtomicBool,
+}
+
+impl LiveDeliveryLease {
+    fn record_appended(&self, seq: u64) {
+        *self.appended_seq.lock().expect("wal retry seq poisoned") = Some(seq);
+    }
+
+    fn disarm(&self) {
+        self.disarmed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for LiveDeliveryLease {
+    fn drop(&mut self) {
+        if !self.disarmed.load(std::sync::atomic::Ordering::Acquire) {
+            let seq = *self.appended_seq.lock().expect("wal retry seq poisoned");
+            if let Ok(mut queue) = self.retry.lock() {
+                queue.push_back((self.batch.clone(), self.source_ack.clone(), seq));
+            }
+        }
     }
 }
 
@@ -263,13 +352,26 @@ impl Input for WalInput {
     }
 
     async fn read(&self) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+        // The kernel cancels a read future at any await (idle tick / barrier
+        // select). Every hand-off below therefore carries a drop guard that
+        // re-queues the delivery on cancellation: a record may be delayed by
+        // one read, never lost.
+        //
         // Replay unacked WAL entries before reading new input (spec:
         // recovery forwards pending entries before do_input starts).
         {
-            let queue = self.replay_queue().await?;
-            let mut queue = queue.lock().await;
-            if let Some((seq, msg)) = queue.pop_front() {
-                drop(queue);
+            let queue_mutex = self.replay_queue().await?;
+            // The guard is confined to this await-free scope; the lease keeps
+            // only the Mutex reference so the awaits below stay Send.
+            let popped = queue_mutex
+                .lock()
+                .expect("wal replay queue poisoned")
+                .pop_front();
+            if let Some((seq, msg)) = popped {
+                let mut lease = ReplayLease {
+                    queue: queue_mutex,
+                    entry: Some((seq, Arc::clone(&msg))),
+                };
                 // A replayed WAL record still represents the original source
                 // delivery. Rebuild its source-position acknowledgement when
                 // the connector supports it; using NoopAck here would leave
@@ -278,15 +380,70 @@ impl Input for WalInput {
                 let source_ack = self.replay_source_ack(&msg).await?;
                 let ack: Arc<dyn crate::input::Ack> =
                     Arc::new(WalAck::new(self.wal.clone(), seq, source_ack));
+                lease.take();
                 return Ok((msg, ack));
             }
         }
+        // Admission control: while the WAL cannot confirm what it already
+        // buffers (failed seals, deferred acknowledgements), stop claiming
+        // new input and let the flusher drain. Dropping this future claims
+        // nothing, so the kernel's idle-tick cancellation is safe here.
+        while self.wal.retained_bytes().await? >= WAL_RETAINED_BYTES_LIMIT {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // A delivery re-queued by a cancelled read re-appends before new
+        // input: at-least-once with ordering preserved.
+        {
+            let popped = self
+                .pending_retry
+                .lock()
+                .expect("wal retry queue poisoned")
+                .pop_front();
+            if let Some((batch, source_ack, appended_seq)) = popped {
+                let lease = LiveDeliveryLease {
+                    retry: Arc::clone(&self.pending_retry),
+                    batch: Arc::clone(&batch),
+                    source_ack: Arc::clone(&source_ack),
+                    appended_seq: std::sync::Mutex::new(appended_seq),
+                    disarmed: std::sync::atomic::AtomicBool::new(false),
+                };
+                // The cancelled read may already have appended this batch to
+                // the WAL: reuse that sequence. Appending again would mint a
+                // new sequence and leave the first one permanently unacked,
+                // parking every later acknowledgement behind the gap.
+                let seq = match appended_seq {
+                    Some(seq) => seq,
+                    None => {
+                        let seq = self.wal.append(&batch).await?;
+                        lease.record_appended(seq);
+                        seq
+                    }
+                };
+                self.wal.flush().await?;
+                lease.disarm();
+                return Ok((
+                    batch,
+                    Arc::new(WalAck::new(self.wal.clone(), seq, source_ack)),
+                ));
+            }
+        }
         let (batch, ack) = self.inner.read().await?;
+        let lease = LiveDeliveryLease {
+            retry: Arc::clone(&self.pending_retry),
+            batch: Arc::clone(&batch),
+            source_ack: Arc::clone(&ack),
+            appended_seq: std::sync::Mutex::new(None),
+            disarmed: std::sync::atomic::AtomicBool::new(false),
+        };
         let seq = self.wal.append(&batch).await?;
+        // Record the assigned sequence before the flush await: a cancelled
+        // flush must retry the flush, not append the batch a second time.
+        lease.record_appended(seq);
         // Group-commit and periodic WALs stage appends asynchronously. The
         // record is now being published to downstream processing, so force the
         // durable hand-off before returning it from read().
         self.wal.flush().await?;
+        lease.disarm();
         Ok((batch, Arc::new(WalAck::new(self.wal.clone(), seq, ack))))
     }
 
@@ -1128,11 +1285,12 @@ mod tests {
             .await
             .unwrap();
         let queue = input.replay_queue().await.unwrap();
-        let entries = queue.lock().await;
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries.front().unwrap().0, 2);
+        {
+            let entries = queue.lock().expect("wal replay queue poisoned");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries.front().unwrap().0, 2);
+        }
         assert_eq!(wal.cursor().await.unwrap(), 1);
-        drop(entries);
 
         // The covered prefix is now part of the local cursor. A replay of
         // sequence 2 can complete, and the first newly appended sequence 3

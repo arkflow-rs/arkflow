@@ -12,9 +12,109 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-pub(super) async fn hub_jobs(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
+/// Redact secret-looking values inside a persisted spec/plan JSON string.
+/// The stored `spec_json`/`plan_json` carry the plaintext connector
+/// credentials the execution path needs — a viewer-facing response must
+/// never return them verbatim. An unparseable payload is fully masked
+/// (fail closed) instead of leaked.
+fn redact_spec_string(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map(|value| arkflow_core::configuration::redacted_value(&value).to_string())
+        .unwrap_or_else(|_| "******".into())
+}
+
+/// Restore secret values that the read API masked and the console echoed
+/// back: the spec editor round-trips `spec_json`, so a masked value must
+/// resolve to the persisted secret instead of being written verbatim.
+fn restore_masked_secrets(submitted: &mut serde_json::Value, stored: &serde_json::Value) {
+    match (submitted, stored) {
+        (serde_json::Value::Object(submitted), serde_json::Value::Object(stored)) => {
+            for (key, value) in submitted.iter_mut() {
+                if let Some(stored_value) = stored.get(key) {
+                    restore_masked_secrets(value, stored_value);
+                }
+            }
+        }
+        (serde_json::Value::Array(submitted), serde_json::Value::Array(stored)) => {
+            // Match array elements by their stable `id`, never by position:
+            // an upgrade may reorder operators, and a positional zip would
+            // hand one operator another operator's persisted secret.
+            for element in submitted.iter_mut() {
+                let Some(identity) = element
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                if let Some(stored_element) = stored.iter().find(|candidate| {
+                    candidate.get("id").and_then(serde_json::Value::as_str)
+                        == Some(identity.as_str())
+                }) {
+                    restore_masked_secrets(element, stored_element);
+                }
+            }
+        }
+        (submitted @ serde_json::Value::String(_), stored) => {
+            let masked = arkflow_core::configuration::redacted_value(stored);
+            if submitted
+                .as_str()
+                .is_some_and(|value| value == "******" || Some(value) == masked.as_str())
+            {
+                *submitted = stored.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when a value still carries a redaction placeholder: the masked value
+/// could not be matched to the persisted spec (e.g. an element of an array
+/// without a stable id), so writing it would persist the mask as the real
+/// credential. Such an upgrade is rejected instead.
+fn contains_redaction_mask(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            text == "******" || text.contains(":******@") || text.contains("=******")
+        }
+        serde_json::Value::Object(object) => object.values().any(contains_redaction_mask),
+        serde_json::Value::Array(items) => items.iter().any(contains_redaction_mask),
+        _ => false,
+    }
+}
+
+/// Redact the spec/plan string fields of one record-shaped JSON value.
+fn redact_record_fields(record: &mut serde_json::Value) {
+    if let Some(object) = record.as_object_mut() {
+        for key in ["spec_json", "plan_json", "target_spec_json"] {
+            if let Some(serde_json::Value::String(raw)) = object.get(key).cloned() {
+                object.insert(
+                    key.into(),
+                    serde_json::Value::String(redact_spec_string(&raw)),
+                );
+            }
+        }
+    }
+}
+
+pub(super) async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "job", None).await
+    {
+        return response;
+    }
     match hub.jobs().await {
-        Ok(jobs) => Json(jobs).into_response(),
+        Ok(jobs) => {
+            let items = jobs
+                .into_iter()
+                .map(|job| {
+                    let mut value = serde_json::to_value(&job).unwrap_or_default();
+                    redact_record_fields(&mut value);
+                    value
+                })
+                .collect::<Vec<_>>();
+            Json(items).into_response()
+        }
         Err(error) => hub_problem(error),
     }
 }
@@ -32,10 +132,25 @@ pub(crate) fn deep_validate_job(spec: &arkflow_core::job::JobSpec) -> Result<(),
 pub(super) async fn hub_job(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
     match hub.job(&job_id).await {
-        Ok(Some(job)) => Json(job).into_response(),
+        Ok(Some(job)) => {
+            let mut value = serde_json::to_value(&job).unwrap_or_default();
+            redact_record_fields(&mut value);
+            Json(value).into_response()
+        }
         Ok(None) => problem(
             StatusCode::NOT_FOUND,
             "job_not_found",
@@ -48,8 +163,19 @@ pub(super) async fn hub_job(
 pub(super) async fn hub_job_plan(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
     let Some(job) = (match hub.job(&job_id).await {
         Ok(job) => job,
         Err(error) => return hub_problem(error),
@@ -72,8 +198,15 @@ pub(super) async fn hub_job_plan(
     };
     match arkflow_core::job::JobPlan::compile(spec) {
         Ok(plan) => {
-            Json(serde_json::json!({ "job_id": job.job_id, "version": job.version, "plan": plan }))
-                .into_response()
+            // The compiled plan embeds every operator's configuration —
+            // redact it like the raw spec.
+            let plan_value = serde_json::to_value(&plan).unwrap_or_default();
+            Json(serde_json::json!({
+                "job_id": job.job_id,
+                "version": job.version,
+                "plan": arkflow_core::configuration::redacted_value(&plan_value)
+            }))
+            .into_response()
         }
         Err(error) => problem(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -235,8 +368,19 @@ pub(super) async fn hub_job_savepoint(
 pub(super) async fn hub_job_checkpoints(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
     match hub.job_checkpoints(&job_id).await {
         Ok(records) => Json(records).into_response(),
         Err(error) => hub_problem(error),
@@ -327,8 +471,19 @@ pub(super) async fn hub_validate_job(
 pub(super) async fn hub_job_detail(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
     let Some(job) = (match hub.job(&job_id).await {
         Ok(job) => job,
         Err(error) => return hub_problem(error),
@@ -425,7 +580,7 @@ pub(super) async fn hub_job_detail(
         })
         .collect::<Vec<_>>();
     let metrics = hub.job_detail_metrics(&job_id).await;
-    Json(serde_json::json!({
+    let mut payload = serde_json::json!({
         "job": job,
         "plan": plan,
         "tasks": tasks,
@@ -446,15 +601,37 @@ pub(super) async fn hub_job_detail(
                 })
             }),
         "metrics": metrics
-    }))
-    .into_response()
+    });
+    // Viewers must never receive the persisted plaintext credentials: the
+    // detail view embeds both the raw job record (spec_json) and the
+    // compiled plan (operator configurations).
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(job) = object.get_mut("job") {
+            redact_record_fields(job);
+        }
+        if let Some(plan) = object.get_mut("plan") {
+            *plan = arkflow_core::configuration::redacted_value(plan);
+        }
+    }
+    Json(payload).into_response()
 }
 
 pub(super) async fn hub_job_versions(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
     if matches!(hub.job(&job_id).await, Ok(None)) {
         return problem(
             StatusCode::NOT_FOUND,
@@ -463,7 +640,17 @@ pub(super) async fn hub_job_versions(
         );
     }
     match hub.job_versions(&job_id).await {
-        Ok(versions) => Json(versions).into_response(),
+        Ok(versions) => {
+            let items = versions
+                .into_iter()
+                .map(|version| {
+                    let mut value = serde_json::to_value(&version).unwrap_or_default();
+                    redact_record_fields(&mut value);
+                    value
+                })
+                .collect::<Vec<_>>();
+            Json(items).into_response()
+        }
         Err(error) => hub_problem(error),
     }
 }
@@ -472,7 +659,7 @@ pub(super) async fn hub_job_upgrade(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<JobUpgradeRequest>,
+    Json(mut request): Json<JobUpgradeRequest>,
 ) -> Response {
     let principal = match require_operator_action(
         &hub,
@@ -496,6 +683,19 @@ pub(super) async fn hub_job_upgrade(
             format!("Unknown Job {job_id}"),
         );
     };
+    // The console prepares the upgrade from the REDACTED spec_json it read
+    // back, so any secret field it did not edit still carries the mask.
+    // Resolve those from the persisted spec before parsing the request.
+    if let Ok(stored) = serde_json::from_str::<serde_json::Value>(&current.spec_json) {
+        restore_masked_secrets(&mut request.spec, &stored);
+    }
+    if contains_redaction_mask(&request.spec) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "credentials_masked",
+            "The upgrade spec still contains masked credentials that could not be matched to the persisted spec; re-enter them".into(),
+        );
+    }
     if current.generation != request.expected_generation {
         return problem_with_details(
             StatusCode::CONFLICT,
@@ -898,7 +1098,14 @@ pub(super) async fn hub_job_upgrade_status(
         return response;
     }
     match hub.job_upgrade(&upgrade_id).await {
-        Ok(Some(record)) if record.job_id == job_id => Json(record).into_response(),
+        Ok(Some(record)) if record.job_id == job_id => {
+            // The target spec carries the same plaintext connector
+            // credentials as the Job spec; a Read-scoped caller must not
+            // receive them (the detail view removes the field entirely).
+            let mut value = serde_json::to_value(&record).unwrap_or_default();
+            redact_record_fields(&mut value);
+            Json(value).into_response()
+        }
         Ok(Some(_)) | Ok(None) => problem(
             StatusCode::NOT_FOUND,
             "job_upgrade_not_found",
@@ -1231,4 +1438,86 @@ pub(super) async fn reject_if_job_upgrade_active(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{contains_redaction_mask, restore_masked_secrets};
+
+    /// The console prepares an upgrade from the REDACTED spec it read back:
+    /// masked values must resolve to the persisted secret instead of being
+    /// written verbatim as the connector credential.
+    #[test]
+    fn masked_secrets_are_restored_from_the_stored_spec() {
+        let stored = serde_json::json!({
+            "output": {
+                "url": "postgres://user:secret@db/app",
+                "password": "s3cret",
+            },
+            "source": {"max_tokens": 512},
+        });
+        let mut submitted = serde_json::json!({
+            "output": {
+                "url": "postgres://user:******@db/app",
+                "password": "******",
+            },
+            "source": {"max_tokens": 512},
+        });
+        restore_masked_secrets(&mut submitted, &stored);
+        assert_eq!(submitted, stored);
+    }
+
+    /// Reordered operators must each keep their own persisted secret: the
+    /// arrays are matched by stable id, never by position.
+    #[test]
+    fn reordered_operators_keep_their_own_secrets() {
+        let stored = serde_json::json!({
+            "operators": [
+                {"id": "a", "password": "secret-a"},
+                {"id": "b", "password": "secret-b"},
+            ],
+        });
+        let mut submitted = serde_json::json!({
+            "operators": [
+                {"id": "b", "password": "******"},
+                {"id": "a", "password": "******"},
+            ],
+        });
+        restore_masked_secrets(&mut submitted, &stored);
+        assert_eq!(submitted["operators"][0]["password"], "secret-b");
+        assert_eq!(submitted["operators"][1]["password"], "secret-a");
+    }
+
+    /// A masked value in an array without stable ids cannot be matched: it
+    /// must be reported, not silently assigned another element's secret.
+    #[test]
+    fn unmatched_masked_values_are_reported() {
+        let stored = serde_json::json!({
+            "urls": [
+                "postgres://a:one@db",
+                "postgres://b:two@db",
+            ],
+        });
+        let mut submitted = serde_json::json!({
+            "urls": [
+                "postgres://a:******@db",
+                "postgres://b:******@db",
+            ],
+        });
+        restore_masked_secrets(&mut submitted, &stored);
+        assert!(contains_redaction_mask(&submitted));
+    }
+
+    /// Values the caller actually edited (not the mask) must be kept.
+    #[test]
+    fn edited_values_are_not_overwritten() {
+        let stored = serde_json::json!({"output": {"url": "postgres://user:secret@db/app"}});
+        let mut submitted =
+            serde_json::json!({"output": {"url": "postgres://user:newpass@db/other"}});
+        restore_masked_secrets(&mut submitted, &stored);
+        assert_eq!(
+            submitted["output"]["url"],
+            "postgres://user:newpass@db/other"
+        );
+    }
 }

@@ -64,6 +64,7 @@ impl DataPlaneCredentials {
             generation,
             quad,
             shared_secret: self.shared_secret.clone(),
+            sent_nonce: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -124,6 +125,14 @@ pub(crate) struct SessionAuth {
     generation: u64,
     pub(crate) quad: Quad,
     pub(crate) shared_secret: Arc<[u8]>,
+    /// The nonce of the handshake this connection last SENT — the server ack
+    /// must echo it. Comparing against the recorded nonce (not merely the
+    /// length) makes a replayed, validly-MACed ack from an EARLIER handshake
+    /// for the same quad fail: without it a plaintext connection could accept
+    /// a captured old receipt as the fresh handshake acknowledgement. Shared
+    /// across clones: every clone represents the same session, and the most
+    /// recent handshake (reconnects included) defines the expected nonce.
+    sent_nonce: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +170,11 @@ impl SessionAuth {
             mac: Vec::new(),
         };
         payload.mac = handshake_mac(&self.shared_secret, &payload, b"client");
+        // Record the sent nonce: the server ack for THIS connection must echo
+        // it (see the field docs).
+        if let Ok(mut sent) = self.sent_nonce.lock() {
+            *sent = Some(payload.nonce.clone());
+        }
         Ok(payload)
     }
 
@@ -185,6 +199,14 @@ impl SessionAuth {
     }
 
     pub(crate) fn verify_server_ack(&self, payload: &HandshakePayload) -> Result<(), Error> {
+        // The ack must echo the nonce of the handshake THIS connection sent:
+        // a length-only check accepted a replayed, validly-MACed ack from an
+        // earlier handshake for the same quad.
+        let expected_nonce = self
+            .sent_nonce
+            .lock()
+            .map(|sent| sent.clone())
+            .unwrap_or_default();
         if payload.protocol_version != DATA_PLANE_PROTOCOL_VERSION
             || payload.source_node != self.destination_node
             || payload.destination_node != self.source_node
@@ -192,7 +214,9 @@ impl SessionAuth {
             || payload.generation != self.generation
             || payload.quad != self.quad
             || !payload.acknowledgement
-            || payload.nonce.len() != HANDSHAKE_NONCE_LEN
+            || expected_nonce
+                .as_deref()
+                .is_none_or(|sent| payload.nonce != sent)
         {
             return Err(Error::Process(
                 "remote edge handshake acknowledgement identity mismatch".into(),

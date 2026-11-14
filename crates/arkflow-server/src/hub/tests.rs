@@ -1614,6 +1614,78 @@ async fn operator_credential_can_limit_resource_scope() {
     );
 }
 
+/// Regression (scope escalation): a node scope covers only the node's
+/// livespace resources (its streams/configuration/operations/events). It
+/// must NOT reach a `user`/`credential`/`job` whose id merely equals the
+/// node id — that let a node-scoped credential rewrite the user's stored
+/// scopes to `[]` (which `can_scope` treats as unrestricted) and mint
+/// unrestricted credentials.
+#[tokio::test]
+async fn node_scope_does_not_reach_identity_resources() {
+    let hub = Hub::new(HubConfig {
+        operator_token: Some("nodeops|operator|node-secret|node=user-7".into()),
+        ..config()
+    });
+    assert!(
+        !hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::ManageUsers,
+            "user",
+            Some("user-7")
+        )
+        .await,
+        "a node scope must not act on the user sharing its id"
+    );
+    assert!(
+        !hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::ManageUsers,
+            "credential",
+            Some("user-7")
+        )
+        .await,
+        "a node scope must not mint credentials for the user sharing its id"
+    );
+    assert!(
+        !hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::Operate,
+            "job",
+            Some("user-7")
+        )
+        .await,
+        "jobs live in their own id namespace, not the node livespace"
+    );
+    // Node-livespace resources still match by equality/prefix.
+    assert!(
+        hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::Read,
+            "configuration",
+            Some("user-7")
+        )
+        .await
+    );
+    assert!(
+        hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::Read,
+            "stream",
+            Some("user-7/orders")
+        )
+        .await
+    );
+    assert!(
+        !hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::Read,
+            "stream",
+            Some("other/orders")
+        )
+        .await
+    );
+}
+
 #[test]
 fn agent_wire_contract_round_trips_reconciliation_fields() {
     let command = AgentCommand {
@@ -3485,6 +3557,42 @@ async fn running_job_is_dispatched_to_compatible_agent() {
             .as_deref(),
         Some("checkpoint-7")
     );
+    // An in-flight `running` progress report must not settle the checkpoint
+    // as failed: only the terminal result decides.
+    hub.command_result(
+        AgentAuth {
+            node_id: "compute-1".into(),
+            session_token: registration.session_token.clone(),
+        },
+        CommandResult {
+            command_id: checkpoint_command.id.clone(),
+            operation_id: checkpoint_command.operation_id.clone(),
+            state: HubOperationState::Running,
+            progress: 40,
+            error: None,
+            correlation_id: checkpoint_command.correlation_id.clone(),
+            generation: checkpoint_command.generation,
+            observed_generation: Some(checkpoint_command.generation),
+            action_id: None,
+            failure_class: None,
+            config_version_id: None,
+            rollout_id: None,
+            observed_checkpoint_id: Some("checkpoint-7".into()),
+            checkpoint_manifest_uri: None,
+            result: None,
+        },
+    )
+    .await
+    .unwrap();
+    let records = hub.job_checkpoints("orders").await.unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record.checkpoint_id == "checkpoint-7")
+            .map(|record| record.status.as_str()),
+        Some("pending"),
+        "a running progress report must not fail the checkpoint"
+    );
     hub.command_result(
         AgentAuth {
             node_id: "compute-1".into(),
@@ -5174,6 +5282,7 @@ async fn complete_savepoint(hub: &Hub, job_id: &str, savepoint_id: &str) {
         generation: job.generation,
         task_attempts: attempts,
         source_positions: Vec::new(),
+        source_positions_by_task: Default::default(),
         watermarks_ms: Default::default(),
         watermark_partitions: Default::default(),
         in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
@@ -5675,6 +5784,7 @@ async fn complete_artifact(hub: &Hub, job_id: &str, artifact_id: &str, kind: &st
         generation: job.generation,
         task_attempts: attempts,
         source_positions: Vec::new(),
+        source_positions_by_task: Default::default(),
         watermarks_ms: Default::default(),
         watermark_partitions: Default::default(),
         in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {

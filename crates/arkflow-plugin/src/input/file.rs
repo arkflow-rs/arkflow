@@ -295,7 +295,33 @@ impl FileInput {
         let mut google_cloud_storage_builder =
             GoogleCloudStorageBuilder::new().with_bucket_name(&config.bucket_name);
         if let Some(url) = &config.url {
-            google_cloud_storage_builder = google_cloud_storage_builder.with_url(url);
+            // The bucket identity is `bucket_name` (DataFusion registers
+            // `gs://{bucket_name}`); the URL only names the ENDPOINT.
+            // `with_url` parses `gs://host/...` and OVERRIDES the bucket with
+            // its host, so it is only safe when the host matches; plain
+            // HTTPS endpoints (a local emulator) map onto `base_url` instead
+            // of failing builder construction.
+            if url.starts_with("gs://") {
+                let host = url
+                    .strip_prefix("gs://")
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or_default();
+                if host != config.bucket_name {
+                    return Err(Error::Config(format!(
+                        "GCS url '{}' names bucket '{}' but bucket_name is '{}'; the endpoint URL must not rename the bucket",
+                        url, host, config.bucket_name
+                    )));
+                }
+                google_cloud_storage_builder = google_cloud_storage_builder.with_url(url);
+            } else if url.starts_with("http://") || url.starts_with("https://") {
+                google_cloud_storage_builder = google_cloud_storage_builder
+                    .with_config(object_store::gcp::GoogleConfigKey::BaseUrl, url);
+            } else {
+                return Err(Error::Config(format!(
+                    "GCS url '{}' must be gs://bucket or an http(s) endpoint",
+                    url
+                )));
+            }
         }
 
         match (&config.service_account_path, &config.service_account_key) {
@@ -359,11 +385,30 @@ impl FileInput {
     }
 
     fn http_store(&self, ctx: &SessionContext, config: &HttpConfig) -> Result<(), Error> {
-        let http_builder = HttpBuilder::new().with_url(&config.url);
-        let http_storage = http_builder
+        // `url` is the STORE ORIGIN (scheme + authority). A path prefix
+        // belongs to the data path (the file URL), where DataFusion turns it
+        // into the object key relative to this origin. A prefixed `url` was
+        // previously forwarded verbatim to DataFusion's registration, which
+        // rejects any path — failing initialization with a generic error;
+        // it is now rejected with the contract spelled out.
+        let mut origin = Url::parse(&config.url)
+            .map_err(|e| Error::Config(format!("Failed to parse HTTP URL: {}", e)))?;
+        let had_path =
+            origin.path() != "/" || origin.query().is_some() || origin.fragment().is_some();
+        origin.set_path("/");
+        origin.set_query(None);
+        origin.set_fragment(None);
+        if had_path {
+            return Err(Error::Config(format!(
+                "http object store url '{}' must be an origin (scheme://host[:port]); put the path prefix in the data path instead (e.g. path: {}/prefix/file.parquet)",
+                config.url, origin
+            )));
+        }
+        let http_storage = HttpBuilder::new()
+            .with_url(origin.as_str())
             .build()
             .map_err(|e| Error::Config(format!("Failed to create HTTP client: {}", e)))?;
-        let object_store_url = ObjectStoreUrl::parse(&config.url)
+        let object_store_url = ObjectStoreUrl::parse(origin.as_str())
             .map_err(|e| Error::Config(format!("Failed to parse HTTP URL: {}", e)))?;
         let url: &Url = object_store_url.as_ref();
         ctx.register_object_store(url, Arc::new(http_storage));

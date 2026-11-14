@@ -736,10 +736,11 @@ impl JobRuntime {
                 task.checkpoint_store_uri.clone(),
             )
         };
-        let (snapshot, source_positions, task_watermarks, watermark_partitions) = kernel
-            .checkpoint_barrier_with_details(checkpoint_id, generation)
-            .await
-            .map_err(|error| error.to_string())?;
+        let (snapshot, _flat_positions, task_watermarks, watermark_partitions, positions_by_task) =
+            kernel
+                .checkpoint_barrier_with_details(checkpoint_id, generation)
+                .await
+                .map_err(|error| error.to_string())?;
         let store_uri = checkpoint_store_uri
             .as_deref()
             .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?;
@@ -778,7 +779,7 @@ impl JobRuntime {
         let barrier = coordinator
             .start(checkpoint_id)
             .map_err(|error| error.to_string())?;
-        for (index, assignment) in assignments.iter().enumerate() {
+        for assignment in assignments.iter() {
             coordinator
                 .acknowledge(TaskCheckpointAck {
                     task_id: assignment.task_id.clone(),
@@ -790,11 +791,14 @@ impl JobRuntime {
                     checkpoint_id: barrier.checkpoint_id.clone(),
                     generation: barrier.generation,
                     state: snapshot.clone(),
-                    source_positions: if index == 0 {
-                        source_positions.clone()
-                    } else {
-                        Vec::new()
-                    },
+                    // Each source task carries ONLY its own chain's positions;
+                    // folding the flat list into the first task would let a
+                    // second source sharing topic/partition restore from the
+                    // first one's offsets.
+                    source_positions: positions_by_task
+                        .get(&assignment.task_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     watermark_ms: task_watermarks.get(&assignment.task_id).copied(),
                     watermark_partitions: watermark_partitions
                         .get(&assignment.task_id)
@@ -935,6 +939,13 @@ impl JobRuntime {
                     target.task_attempts.push(attempt);
                 }
                 target.source_positions.extend(manifest.source_positions);
+                for (task_id, positions) in manifest.source_positions_by_task {
+                    target
+                        .source_positions_by_task
+                        .entry(task_id)
+                        .or_default()
+                        .extend(positions);
+                }
                 target.watermarks_ms.extend(manifest.watermarks_ms);
                 for (task_id, partitions) in manifest.watermark_partitions {
                     target
@@ -1021,6 +1032,32 @@ impl JobRuntime {
             return;
         }
         self.pending_observations.lock().await.extend(observations);
+    }
+
+    /// Park one observation at the BACK of the queue, behind reports that
+    /// have not been rejected. The Hub rejecting one report (e.g. after a
+    /// restart cleared its dispatch fingerprints) must not block delivery of
+    /// the reports behind it; the rejected entry is retried on a later poll.
+    pub(super) async fn park_observation_after(&self, observation: FinishedJob) {
+        self.pending_observations.lock().await.push(observation);
+    }
+
+    /// Requeue an undelivered observation batch after a delivery failure.
+    /// A Hub rejection (`hub_rejected`) rotates the rejected entry behind the
+    /// rest so it cannot block them, retrying it on a later poll; a transport
+    /// failure keeps the original delivery order for the reconnect replay.
+    pub(super) async fn requeue_undelivered(
+        &self,
+        mut observations: Vec<FinishedJob>,
+        hub_rejected: bool,
+    ) {
+        if hub_rejected && !observations.is_empty() {
+            let rejected = observations.remove(0);
+            self.park_observations(observations).await;
+            self.park_observation_after(rejected).await;
+        } else {
+            self.park_observations(observations).await;
+        }
     }
 
     pub(super) async fn stop_all(&self) {
@@ -1182,6 +1219,24 @@ async fn spawn_kernel_job(
     // installed for the task's REAL partition, never a synthesized
     // partition 0.
     let mut gate_partitions: BTreeMap<String, u32> = BTreeMap::new();
+    // Chains sharing one watermark group must track their physical
+    // partitions under a per-chain namespace: otherwise one chain's observed
+    // event time advances the shared minimum and closes windows the other
+    // chain still holds. Mirrors the local runner's gate builder.
+    let mut group_sizes: BTreeMap<String, usize> = BTreeMap::new();
+    for chain in &graph.chains {
+        if chain
+            .source_time
+            .as_ref()
+            .is_some_and(|time| time.mode == arkflow_core::job::TimeMode::EventTime)
+        {
+            let group = chain
+                .watermark_group
+                .clone()
+                .unwrap_or_else(|| chain.entry_task_id().to_owned());
+            *group_sizes.entry(group).or_insert(0) += 1;
+        }
+    }
     for chain in &graph.chains {
         if let Some(source_time) = chain
             .source_time
@@ -1192,6 +1247,7 @@ async fn spawn_kernel_job(
                 .watermark_group
                 .clone()
                 .unwrap_or_else(|| chain.entry_task_id().to_owned());
+            let gate_shared = group_sizes.get(group.as_str()).copied().unwrap_or(0) > 1;
             let tracker = match shared_trackers.entry(group) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1203,13 +1259,16 @@ async fn spawn_kernel_job(
                     tracker
                 }
             };
-            let gate =
+            let mut gate =
                 arkflow_core::executor::event_time_gate::EventTimeGate::new_with_shared_tracker(
                     source_time,
                     chain.window_timings.clone(),
                     tracker,
                 )
                 .map_err(|error| error.to_string())?;
+            if gate_shared {
+                gate = gate.with_namespace(chain.entry_task_id());
+            }
             if let Some(partition) = chain.source_partition {
                 gate_partitions.insert(chain.entry_task_id().to_owned(), partition);
             }
@@ -1267,8 +1326,19 @@ async fn spawn_kernel_job(
                 }
             }
         }
-        for input in &inputs {
-            if let Err(error) = input.restore_positions(&recovery.source_positions).await {
+        for chain in &graph.chains {
+            let Some(input) = chain.source.as_ref() else {
+                continue;
+            };
+            // Per-task positions first (task identity preserved in the
+            // manifest); legacy manifests without the map fall back to the
+            // flat list.
+            let positions = recovery
+                .source_positions_by_task
+                .get(chain.entry_task_id())
+                .map(|positions| positions.as_slice())
+                .unwrap_or(recovery.source_positions.as_slice());
+            if let Err(error) = input.restore_positions(positions).await {
                 close_inputs(&inputs).await;
                 return Err(error.to_string());
             }

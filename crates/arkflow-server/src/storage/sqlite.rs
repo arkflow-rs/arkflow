@@ -1118,9 +1118,8 @@ impl SqliteBackend {
             } else {
                 "stop"
             };
-            let suffix = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let attempt_id = format!("attempt-{suffix}");
-            let command_id = format!("cmd-{suffix}");
+            let attempt_id = crate::hub::next_control_plane_id("attempt");
+            let command_id = crate::hub::next_control_plane_id("cmd");
             let now = now_ms();
             transaction.execute(
                 "INSERT INTO cp_attempts (attempt_id, intent_id, command_id, node_id, stream_id, generation, operation, state, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8)",
@@ -3565,6 +3564,33 @@ impl SqliteBackend {
     }
 }
 
+/// Max numeric suffix among ids carrying `prefix` — the id floor scan for
+/// one namespace (non-numeric suffixes are ignored, not errors).
+fn sqlite_suffix_max(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    prefix: &str,
+) -> Result<u64, StorageError> {
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| StorageError::Encoding(format!("id sequence floor scan: {error}")))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| StorageError::Encoding(format!("id sequence floor scan: {error}")))?;
+    let mut max = 0u64;
+    for id in rows {
+        let id =
+            id.map_err(|error| StorageError::Encoding(format!("id sequence floor scan: {error}")))?;
+        if let Some(value) = id
+            .strip_prefix(prefix)
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+        {
+            max = max.max(value);
+        }
+    }
+    Ok(max)
+}
+
 #[async_trait]
 impl StorageBackend for SqliteBackend {
     async fn set_desired(&self, mutation: DesiredMutation) -> Result<IntentRecord, StorageError> {
@@ -3585,6 +3611,73 @@ impl StorageBackend for SqliteBackend {
     }
     async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError> {
         self.get_node_maintenance(node_id)
+    }
+    async fn id_sequence_floor(&self) -> Result<u64, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut floor = sqlite_suffix_max(
+            &connection,
+            "SELECT intent_id FROM cp_intents WHERE intent_id LIKE 'hop-%'",
+            "hop-",
+        )?;
+        floor = floor.max(sqlite_suffix_max(
+            &connection,
+            "SELECT attempt_id FROM cp_attempts WHERE attempt_id LIKE 'attempt-%'",
+            "attempt-",
+        )?);
+        floor = floor.max(sqlite_suffix_max(
+            &connection,
+            "SELECT command_id FROM cp_attempts WHERE command_id LIKE 'cmd-%'",
+            "cmd-",
+        )?);
+        // HUB_SEQUENCE also mints hop- operation ids (persisted in
+        // cp_operations, not cp_intents), rollout-, approval- and
+        // job-upgrade- ids. Leaving them out re-enters the counter at 1
+        // after a restart: the new id collides with a durable PRIMARY KEY,
+        // and upsert_operation's ON CONFLICT DO UPDATE overwrites the old
+        // record.
+        for (sql, prefix) in [
+            (
+                "SELECT operation_id FROM cp_operations WHERE operation_id LIKE 'hop-%'",
+                "hop-",
+            ),
+            (
+                "SELECT rollout_id FROM cp_rollouts WHERE rollout_id LIKE 'rollout-%'",
+                "rollout-",
+            ),
+            (
+                "SELECT request_id FROM cp_config_approval_requests WHERE request_id LIKE 'approval-%'",
+                "approval-",
+            ),
+            (
+                "SELECT upgrade_id FROM cp_job_upgrades WHERE upgrade_id LIKE 'job-upgrade-%'",
+                "job-upgrade-",
+            ),
+        ] {
+            floor = floor.max(sqlite_suffix_max(&connection, sql, prefix)?);
+        }
+        Ok(floor)
+    }
+    async fn intent_counter_floor(&self) -> Result<u64, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection
+            .prepare("SELECT intent_id FROM cp_intents WHERE intent_id LIKE 'intent-%'")
+            .map_err(|error| StorageError::Encoding(format!("intent floor scan: {error}")))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| StorageError::Encoding(format!("intent floor scan: {error}")))?;
+        let mut max = 0u64;
+        for id in rows {
+            let id =
+                id.map_err(|error| StorageError::Encoding(format!("intent floor scan: {error}")))?;
+            // intent-{generation}-{counter}: the counter is the third segment.
+            let parts: Vec<&str> = id.split('-').collect();
+            if parts.len() == 3 && parts[0] == "intent" {
+                if let Ok(counter) = parts[2].parse::<u64>() {
+                    max = max.max(counter);
+                }
+            }
+        }
+        Ok(max)
     }
     async fn replace_node_labels(
         &self,

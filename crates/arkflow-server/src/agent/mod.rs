@@ -13,7 +13,10 @@ pub use config::NodeAgentConfig;
 pub use session::run;
 
 // Paths referenced by `crate::hub`.
-pub(crate) use checkpoint::{delete_checkpoint_artifact, recovery_record_is_valid};
+pub(crate) use checkpoint::{
+    checkpoint_record_is_valid_at_own_uri, delete_checkpoint_artifact,
+    delete_checkpoint_artifact_at, recovery_record_is_valid,
+};
 
 // Names the moved test module reaches through `use super::*`.
 #[cfg(test)]

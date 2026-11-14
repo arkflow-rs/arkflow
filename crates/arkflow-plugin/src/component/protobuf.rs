@@ -166,6 +166,18 @@ pub fn protobuf_to_arrow(
 
     for field in descriptor_fields {
         let field_name = field.name();
+        // Contract (module docs): oneof members and proto3 `optional` fields
+        // are not supported. Both materialize as members of a (possibly
+        // synthetic) oneof, and this scalar dispatch loses their presence
+        // bit — a later encode would activate a previously absent optional
+        // or clear another active oneof arm.
+        if let Some(oneof) = field.containing_oneof() {
+            return Err(Error::Process(format!(
+                "Protobuf field '{}' is a member of oneof '{}': oneof and proto3 `optional` fields are not supported",
+                field_name,
+                oneof.name()
+            )));
+        }
         // Look up the value; an absent field becomes a null column (descriptor-driven schema).
         let field_value_opt = proto_msg.get_field_by_name(field_name);
 
@@ -549,6 +561,17 @@ impl ProtobufBatchConverter {
         if !self.started {
             for field in self.descriptor.fields() {
                 let field_name = field.name();
+                // Contract (module docs): oneof members and proto3 `optional`
+                // fields are not supported by the scalar column plan — the
+                // presence bit would be lost. Reject on the production path
+                // too, not only in the test-only per-message oracle.
+                if let Some(oneof) = field.containing_oneof() {
+                    return Err(Error::Process(format!(
+                        "Protobuf field '{}' is a member of oneof '{}': oneof and proto3 `optional` fields are not supported",
+                        field_name,
+                        oneof.name()
+                    )));
+                }
                 let (plan, mut builder) = proto_plan(field_name, field.number(), &field.kind())?;
                 proto_append_value(
                     field_name,
@@ -645,6 +668,16 @@ pub fn arrow_to_protobuf(
         let field_name = field.name();
 
         if let Some(proto_field) = descriptor.get_field_by_name(field_name) {
+            // Same oneof/optional rejection as the decode dispatch (see
+            // there): setting these through the scalar path would clear
+            // another active arm or activate an absent optional.
+            if let Some(oneof) = proto_field.containing_oneof() {
+                return Err(Error::Process(format!(
+                    "Protobuf field '{}' is a member of oneof '{}': oneof and proto3 `optional` fields are not supported",
+                    field_name,
+                    oneof.name()
+                )));
+            }
             let column = batch.column(i);
 
             match proto_field.kind() {
@@ -1366,6 +1399,24 @@ message Holder { Nested inner = 1; }
         assert!(err.to_string().contains("Unsupported field type"), "{err}");
     }
 
+    #[test]
+    fn batch_converter_rejects_oneof_members_like_single_path() {
+        let schema = r#"syntax = "proto3";
+package t;
+message Choice { oneof pick { int32 a = 1; string b = 2; } }
+"#;
+        let descriptor = parse_proto_source(schema, "t.Choice").unwrap();
+        let encoded = DynamicMessage::new(descriptor.clone()).encode_to_vec();
+
+        // Both decode paths must reject the same descriptors: the production
+        // converter lost the presence bit just like the test oracle would.
+        let err = protobuf_to_arrow(&descriptor, &encoded).unwrap_err();
+        assert!(err.to_string().contains("oneof"), "{err}");
+        let mut conv = ProtobufBatchConverter::new(descriptor);
+        let err = conv.push(&encoded).unwrap_err();
+        assert!(err.to_string().contains("oneof"), "{err}");
+    }
+
     /// Ad-hoc release timing (NOT run by CI): per-message batches +
     /// normalize_and_concat vs the columnar batch converter on the same
     /// payloads. Run with:
@@ -1470,6 +1521,15 @@ message Wide {
             let Some(proto_field) = descriptor.get_field_by_name(field_name) else {
                 continue;
             };
+            // Same oneof/optional rejection as the decode dispatch (see
+            // there).
+            if let Some(oneof) = proto_field.containing_oneof() {
+                return Err(Error::Process(format!(
+                    "Protobuf field '{}' is a member of oneof '{}': oneof and proto3 `optional` fields are not supported",
+                    field_name,
+                    oneof.name()
+                )));
+            }
             let column = batch.column(i);
             match proto_field.kind() {
                 prost_reflect::Kind::Bool => {

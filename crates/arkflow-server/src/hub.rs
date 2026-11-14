@@ -186,8 +186,10 @@ pub struct Hub {
     /// requires a matching fingerprint so a Succeeded start can never keep
     /// suppressing starts for a drifted mapping (e.g. after a Hub restart
     /// lost the placement order). In-memory: a restart re-dispatches once
-    /// and Agents no-op matching assignments.
-    start_dispatch_fingerprints: Arc<RwLock<StartDispatchFingerprints>>,
+    /// and Agents no-op matching assignments. Also the assignment authority
+    /// for agent job observations (an authenticated session is not an
+    /// assignment).
+    pub(crate) start_dispatch_fingerprints: Arc<RwLock<StartDispatchFingerprints>>,
     command_metrics: Arc<CommandMetrics>,
     /// Lease-election configuration (hub-ha stage 2). Default is disabled,
     /// which keeps single-instance behavior byte-identical.
@@ -199,6 +201,14 @@ pub struct Hub {
     /// Optional OIDC JWT bearer federation (see `crate::oidc`). Static
     /// operator credentials keep priority when both are configured.
     oidc: Option<Arc<crate::oidc::OidcFederation>>,
+    /// Serializes identity administration (user save/delete and the
+    /// last-admin reachability check). The check reads `list_users` and the
+    /// write lands in a separate storage request: without the lock, two
+    /// concurrent demotions of the last two admins each observe "the other
+    /// admin still exists" and both succeed, leaving zero admins. Hub clones
+    /// share the lock; HA deployments elect a single leader, which keeps
+    /// identity writes single-writer in practice.
+    identity_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Process start of this Hub instance, for `/status` uptime reporting.
     started_at: std::time::Instant,
 }
@@ -245,7 +255,31 @@ async fn persist_operation(
         .await
 }
 
+/// The process-wide control-plane id sequence: `hop-N` operations, `cmd-N`
+/// commands, and `attempt-N` attempts all draw from ONE counter, so two
+/// independent counters can never mint the SAME `cmd-N` for different
+/// commands — the Agent's completed-command cache is keyed by id alone and
+/// a collision would replay the wrong result.
 static HUB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Mint the next shared control-plane id (`{prefix}-{n}`).
+pub(crate) fn next_control_plane_id(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}",
+        HUB_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Seed the id sequence above everything a previous process persisted:
+/// reusing a durable primary key either fails the insert (plain INSERT) or
+/// silently overwrites an older record (ON CONFLICT UPDATE). Idempotent for
+/// repeated attaches (HA promotion, restart).
+pub(crate) fn seed_control_plane_floor(floor: u64) {
+    HUB_SEQUENCE.fetch_max(
+        floor.saturating_add(1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -289,6 +323,7 @@ impl Hub {
             leadership: Arc::new(RwLock::new(Leadership::Disabled)),
             leadership_transitions: Arc::new(AtomicU64::new(0)),
             oidc: None,
+            identity_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             started_at: std::time::Instant::now(),
         }
     }

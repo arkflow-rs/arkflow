@@ -501,24 +501,41 @@ impl Wal {
     /// thread (redb's flock must not contend with the blocking pool), while
     /// the object-store backend is driven on the blocking pool.
     pub async fn append(&self, msg: &MessageBatchRef) -> Result<u64, Error> {
-        let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+        // Serialize BEFORE reserving a sequence: a serialization error must
+        // not consume one (the gap would park every later acknowledgement).
         let bytes = serialize(msg)?;
 
         match &self.policy {
             SyncPolicy::PerEntry => {
-                // The local backend's `commit` is briefly blocking (~µs–ms)
-                // and stays inline (see `call_store` for why redb must not
-                // touch the blocking pool); the object-store backend is
-                // driven on the blocking pool by `call_store`.
+                // Local backend's `commit` is briefly blocking (~µs–ms) and
+                // stays inline (see `call_store` for why redb must not touch
+                // the blocking pool); the object-store backend is driven on
+                // the blocking pool by `call_store`.
+                let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
                 self.call_store(move |store| store.append_batch(vec![(seq, bytes)]))
                     .await?;
+                Ok(seq)
             }
             SyncPolicy::GroupCommit | SyncPolicy::Periodic(_) => {
-                self.pending.lock().await.push((seq, bytes));
+                // Reserve the sequence only AFTER the staging lock is held:
+                // a read cancelled while waiting here would otherwise leave
+                // a reserved sequence that is never staged (a permanent ack
+                // gap). Past the lock there is no await before the push.
+                let mut pending = self.pending.lock().await;
+                let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+                pending.push((seq, bytes));
+                drop(pending);
                 self.pending_notify.notify_one();
+                Ok(seq)
             }
         }
-        Ok(seq)
+    }
+
+    /// Bytes this WAL is buffering but cannot yet confirm durable. Admission
+    /// control uses it to apply backpressure (wait for the flusher) instead
+    /// of buffering without bound while a backend keeps failing to seal.
+    pub async fn retained_bytes(&self) -> Result<u64, Error> {
+        self.call_store(|store| Ok(store.retained_bytes())).await
     }
 
     /// Advance the committed cursor to `seq` (monotonic). Called by the ack

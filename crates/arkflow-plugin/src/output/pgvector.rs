@@ -101,7 +101,7 @@ fn default_timeout_ms() -> u64 {
     30000
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum IdValue {
     Int(i64),
     Text(String),
@@ -162,10 +162,41 @@ impl Output for PgVectorOutput {
             })
             .collect();
 
+        // A repeated id INSIDE one INSERT statement trips PostgreSQL's
+        // "cannot affect row a second time" (ON CONFLICT cardinality
+        // violation); whether two duplicates shared a chunk was luck of the
+        // bind-count chunking. Keep only the LAST row per id — the upsert
+        // already makes later rows win on replay — and let id-less rows
+        // through unchanged (NULLs never conflict).
+        let point_rows: Vec<PointRow> = if self.config.id_field.is_some() {
+            let mut last_index: std::collections::HashMap<IdValue, usize> =
+                std::collections::HashMap::new();
+            for (index, row) in point_rows.iter().enumerate() {
+                if let Some(id) = &row.id {
+                    last_index.insert(id.clone(), index);
+                }
+            }
+            let keep: std::collections::HashSet<usize> = last_index.into_values().collect();
+            point_rows
+                .into_iter()
+                .enumerate()
+                .filter(|(index, row)| row.id.is_none() || keep.contains(index))
+                .map(|(_, row)| row)
+                .collect()
+        } else {
+            point_rows
+        };
+
         // Postgres caps a statement at 65,535 bind parameters; chunk the rows
-        // so each INSERT stays under it. Slices preserve row order and a
-        // chunk failure stops the rest (at-least-once redelivery re-writes
-        // the batch; the upsert clause keeps re-writes idempotent).
+        // so each INSERT stays under it. All chunks run in ONE transaction: a
+        // mid-batch failure rolls the committed prefix back, so the
+        // at-least-once replay re-writes the whole batch instead of
+        // duplicating (plain INSERT) or conflicting (upsert) with rows a
+        // failed chunk left behind.
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|e| Error::Process(format!("pgvector output: begin failed: {e}")))?;
         let binds_per_row = usize::from(self.config.id_field.is_some())
             + 1
             + usize::from(!self.config.payload_field.is_empty());
@@ -173,10 +204,14 @@ impl Output for PgVectorOutput {
         for chunk in point_rows.chunks(rows_per_chunk) {
             build_insert(&self.config, chunk)
                 .build()
-                .execute(pool)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|e| Error::Process(format!("pgvector output: insert failed: {}", e)))?;
         }
+        transaction
+            .commit()
+            .await
+            .map_err(|e| Error::Process(format!("pgvector output: commit failed: {e}")))?;
         Ok(())
     }
 

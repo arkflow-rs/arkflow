@@ -333,6 +333,23 @@ pub enum HubOperationState {
     Superseded,
 }
 
+impl HubOperationState {
+    /// Terminal states: the operation will not change again and a command
+    /// lease may be released. One definition replaces the per-site copies
+    /// whose drift left leases pinned or operations unfinished.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::Failed
+                | Self::TimedOut
+                | Self::NodeUnavailable
+                | Self::Cancelled
+                | Self::Superseded
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubOperation {
     pub id: String,

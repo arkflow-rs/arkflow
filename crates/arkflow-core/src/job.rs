@@ -767,12 +767,21 @@ impl JobSpec {
         }
 
         let mut outgoing = BTreeMap::<String, Vec<String>>::new();
+        // Ordinary-data adjacency EXCLUDES the late-event side links: only
+        // late events follow a Route, so a source whose sole path to a sink
+        // runs through one cannot acknowledge ordinary records against that
+        // sink (the reachability check below must use `data_outgoing`).
+        let mut data_outgoing = BTreeMap::<String, Vec<String>>::new();
         let mut indegree = operator_ids
             .iter()
             .map(|operator_id| (operator_id.clone(), 0usize))
             .collect::<BTreeMap<_, _>>();
         for edge in &self.edges {
             outgoing
+                .entry(edge.from.clone())
+                .or_default()
+                .push(edge.to.clone());
+            data_outgoing
                 .entry(edge.from.clone())
                 .or_default()
                 .push(edge.to.clone());
@@ -830,6 +839,11 @@ impl JobSpec {
             source.time.validate(&source.operator_id)?;
         }
 
+        // One operator binds at most ONE component role: duplicate source or
+        // sink records for the same operator validate here but the runtime
+        // only ever uses the first match, silently ignoring the rest.
+        let mut bound_operators = BTreeSet::new();
+
         for sink in &self.sinks {
             let Some(operator) = self
                 .operators
@@ -847,16 +861,32 @@ impl JobSpec {
                     sink.operator_id
                 )));
             }
+            if !bound_operators.insert(sink.operator_id.as_str()) {
+                return Err(Error::Config(format!(
+                    "Job '{}' binds operator '{}' more than once (duplicate source/sink binding)",
+                    self.id, sink.operator_id
+                )));
+            }
+        }
+
+        for source in &self.sources {
+            if !bound_operators.insert(source.operator_id.as_str()) {
+                return Err(Error::Config(format!(
+                    "Job '{}' binds operator '{}' more than once (duplicate source/sink binding)",
+                    self.id, source.operator_id
+                )));
+            }
         }
 
         // Every declared source must have a path to a sink. Otherwise the
         // runner can acknowledge input from an executable source without ever
-        // dispatching the batch to an output.
+        // dispatching the batch to an output. Ordinary-data reachability only:
+        // late-event side links are not ordinary paths.
         for source in &self.sources {
             let mut reachable = BTreeSet::from([source.operator_id.as_str()]);
             let mut pending = std::collections::VecDeque::from([source.operator_id.as_str()]);
             while let Some(operator_id) = pending.pop_front() {
-                for downstream in outgoing.get(operator_id).into_iter().flatten() {
+                for downstream in data_outgoing.get(operator_id).into_iter().flatten() {
                     if reachable.insert(downstream.as_str()) {
                         pending.push_back(downstream.as_str());
                     }
@@ -874,6 +904,10 @@ impl JobSpec {
             }
         }
 
+        // Backward reachability KEEPS the late-event side links: a sink fed
+        // only by a late-event Route is a legal deployment (late events are
+        // real records), unlike the forward check where ordinary records
+        // never follow the route.
         let mut incoming = BTreeMap::<&str, Vec<&str>>::new();
         for edge in &self.edges {
             incoming
@@ -3183,6 +3217,63 @@ mod coverage_tests {
             .unwrap_err()
             .to_string()
             .contains("sink 'aggregate' must reference a Sink operator"));
+    }
+
+    /// Regression (duplicate bindings): one operator bound twice — as two
+    /// sources or two sinks — validated before, but the runtime only ever
+    /// used the first match and silently ignored the rest.
+    #[test]
+    fn rejects_duplicate_source_and_sink_bindings() {
+        let mut job = base_job();
+        let duplicate = job.sources[0].clone();
+        job.sources.push(duplicate);
+        let error = job.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("more than once"),
+            "duplicate source binding must be rejected: {error}"
+        );
+
+        let mut job = base_job();
+        let duplicate = job.sinks[0].clone();
+        job.sinks.push(duplicate);
+        let error = job.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("more than once"),
+            "duplicate sink binding must be rejected: {error}"
+        );
+    }
+
+    /// Regression (ordinary reachability): a source whose ONLY path to a sink
+    /// ran through the late-event Route validated before — but ordinary
+    /// records never follow a Route, so they were acknowledged with no
+    /// downstream at all.
+    #[test]
+    fn rejects_source_whose_only_sink_is_behind_a_late_event_route() {
+        let mut job = base_job();
+        job.operators.push(OperatorSpec {
+            id: "late_sink".into(),
+            kind: OperatorKind::Sink,
+            stateful: false,
+            key_field: None,
+            config: serde_json::json!({}),
+        });
+        // Remove every ordinary edge: the late-event Route is the source's
+        // ONLY link to anything.
+        job.edges.clear();
+        job.sources[0].time.late_event_route = Some("late_sink".into());
+        job.sinks = vec![SinkSpec {
+            codec: None,
+            operator_id: "late_sink".into(),
+            output_type: "drop".into(),
+            config: serde_json::json!({}),
+        }];
+        let error = job.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot reach any executable sink"),
+            "{error}"
+        );
     }
 
     #[test]

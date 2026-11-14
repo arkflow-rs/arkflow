@@ -102,6 +102,10 @@ impl Temporary for RedisTemporary {
                         redis::Value::SimpleString(s) => Ok(s),
                         redis::Value::BulkString(v) => String::from_utf8(v)
                             .map_err(|_| Error::Process("unexpected data".to_string())),
+                        // An absent key is a normal lookup miss — the List
+                        // path's lrange returns an empty vector for one too —
+                        // not a batch failure.
+                        redis::Value::Nil => Ok(String::new()),
                         _ => Err(Error::Process("unexpected type".to_string())),
                     })
                     .collect::<Result<Vec<_>, Error>>()?;

@@ -170,6 +170,14 @@ pub trait WalStore: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Bytes buffered for durability that are not yet confirmed durable.
+    /// The object-store backend counts its active segment plus parked
+    /// (failed-upload) segments; `WalInput` uses this for admission control,
+    /// so a down backend applies backpressure instead of unbounded buffering.
+    fn retained_bytes(&self) -> u64 {
+        0
+    }
+
     /// Read all entries with sequence strictly greater than the committed
     /// cursor, in ascending order. Used by recovery replay.
     fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error>;
@@ -453,13 +461,23 @@ impl WalStore for RedbStore {
             .db
             .begin_read()
             .map_err(|e| Error::Process(format!("WAL read failed: {}", e)))?;
-        let cursor = tx
-            .open_table(META)
-            .ok()
-            .and_then(|t| t.get(CURSOR_KEY).ok().flatten().map(|g| g.value()))
-            .unwrap_or(0);
-        let Some(entries) = tx.open_table(ENTRIES).ok() else {
-            return Ok(Vec::new());
+        // Distinguish "table not created yet" (an empty WAL) from every
+        // other open failure: swallowing corruption/IO errors here made
+        // recovery see an EMPTY WAL and start from scratch, silently
+        // skipping everything a damaged store still held.
+        let cursor = match tx.open_table(META) {
+            Ok(table) => table
+                .get(CURSOR_KEY)
+                .map_err(|e| Error::Process(format!("WAL cursor read failed: {}", e)))?
+                .map(|guard| guard.value())
+                .unwrap_or(0),
+            Err(redb::TableError::TableDoesNotExist(_)) => 0,
+            Err(e) => return Err(Error::Process(format!("WAL table open failed: {}", e))),
+        };
+        let entries = match tx.open_table(ENTRIES) {
+            Ok(entries) => entries,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(Error::Process(format!("WAL table open failed: {}", e))),
         };
 
         let mut out = Vec::new();

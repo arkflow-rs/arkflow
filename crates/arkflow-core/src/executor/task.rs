@@ -3123,23 +3123,42 @@ fn partition_batch_by_key_hash(
     // claimed by no range — or a row with no group — lands nowhere, exactly
     // like the previous per-subtask membership filter).
     let no_owner = u32::MAX;
-    let mut owner_by_group = vec![no_owner; max_parallelism as usize];
-    for (subtask, range) in key_group_ranges.iter().take(subtasks).enumerate() {
-        for group in range.start..=range.end {
-            if (group as usize) < owner_by_group.len() {
-                owner_by_group[group as usize] = subtask as u32;
-            }
-        }
-    }
-    // One pass buckets each row into its owning subtask (row order
-    // preserved); each non-empty subtask then gathers once, replacing the
-    // previous per-subtask full-batch mask + filter (O(subtasks × rows)).
+    // The subtask ranges tile the key-group space contiguously in subtask
+    // order, so ownership is a binary search over ≤ subtasks entries. The
+    // previous dense `vec![no_owner; max_parallelism]` turned a huge
+    // configured max_parallelism (accepted up to u32::MAX) into a
+    // multi-gigabyte allocation even for two physical subtasks.
+    let mut ranges: Vec<(usize, &crate::job::KeyGroupRange)> = key_group_ranges
+        .iter()
+        .take(subtasks)
+        .enumerate()
+        // Degenerate (empty) ranges — start > end when max_parallelism is
+        // smaller than the subtask count — would break the binary search's
+        // ordering; they own nothing and are dropped.
+        .filter(|(_, range)| range.start <= range.end)
+        .collect();
+    // Split placement concatenates the local runs and the remote tasks, so
+    // the ranges are NOT ordered by key group; sort them and keep each
+    // entry's ORIGINAL subtask index (the post-filter position is not the
+    // subtask id, and a binary search needs group order to work at all).
+    ranges.sort_by_key(|(_, range)| range.start);
     let mut buckets: Vec<Vec<u32>> = (0..subtasks).map(|_| Vec::new()).collect();
     for (row, group) in key_groups.iter().enumerate() {
         let Some(group) = group else {
             continue;
         };
-        let owner = owner_by_group[*group as usize];
+        let owner = ranges
+            .binary_search_by(|(_, range)| {
+                if range.end < *group {
+                    std::cmp::Ordering::Less
+                } else if range.start > *group {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .map(|index| ranges[index].0 as u32)
+            .unwrap_or(no_owner);
         if owner != no_owner {
             buckets[owner as usize].push(row as u32);
         }

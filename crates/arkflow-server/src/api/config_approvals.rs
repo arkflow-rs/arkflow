@@ -61,8 +61,19 @@ pub(super) async fn submit_approval(
 pub(super) async fn list_approvals(
     State(hub): State<hub::Hub>,
     Query(query): Query<ApprovalListQuery>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "config_approval",
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let status = query.status.as_deref();
     if let Some(status) = status {
         if crate::storage::ConfigApprovalStatus::parse(status).is_none() {
@@ -84,8 +95,19 @@ pub(super) async fn list_approvals(
 pub(super) async fn get_approval(
     State(hub): State<hub::Hub>,
     Path(id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "config_approval",
+        Some(id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
     match hub.config_approval(&id).await {
         Ok(Some(approval)) => Json(approval).into_response(),
         Ok(None) => problem(

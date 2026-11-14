@@ -1,6 +1,7 @@
 //! Health/readiness/liveness probes, system and fleet status, component
 //! catalog, schema, metrics exposition, and the OIDC login flow.
-use super::{bearer, hub_problem, page_items, problem, PageQuery};
+use super::{bearer, hub_problem, page_items, problem, require_operator_action, PageQuery};
+use crate::api_contract::OperatorAction;
 use crate::hub;
 use crate::oidc;
 use arkflow_core::component::{self, ComponentKind};
@@ -131,8 +132,13 @@ pub(super) async fn hub_metrics(
 
 pub(super) async fn hub_operational_status(
     State(hub): State<hub::Hub>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "node", None).await
+    {
+        return response;
+    }
     match hub.operational_status().await {
         Ok(status) => {
             let mut value = serde_json::to_value(status).unwrap_or_default();
@@ -267,9 +273,13 @@ pub(crate) async fn hub_oidc_login(State(hub): State<hub::Hub>) -> Response {
         );
     };
     use sha2::{Digest, Sha256};
+    // RFC 7636 S256: BASE64URL-ENCODE(SHA256(ASCII(code_verifier))), no
+    // padding. The previous hex digest is not a valid `code_challenge` —
+    // conformant IdPs reject the login outright.
     let challenge: String = {
         let digest = Sha256::digest(verifier.as_bytes());
-        digest.iter().map(|b| format!("{b:02x}")).collect()
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
     };
     let location = federation.authorization_redirect(&state, &challenge, &nonce);
     let cookie_value = format!("{state}.{verifier}.{nonce}");
@@ -345,7 +355,23 @@ pub(crate) async fn hub_oidc_callback(
     {
         return unauthorized();
     }
-    let Some(principal) = federation.authenticate(&id_token).await else {
+    // Full validation (signature/iss/aud) plus the issued-at claim; the
+    // single-use nonce was already checked above.
+    let Some((principal, issued_at)) = federation.authenticate_with_iat(&id_token).await else {
+        return unauthorized();
+    };
+    // The browser login traverses the SAME directory enforcement as the
+    // API-token path (hub/operator.rs): managed_users_only admission,
+    // directory role/scope binding, and revocation. A claim-only session
+    // skipped all of it and bound sessions by raw subject instead of the
+    // directory user.
+    let issued_at_ms = issued_at
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .map(|seconds| seconds.saturating_mul(1000));
+    let Some(principal) = hub
+        .apply_federated_directory(principal, issued_at_ms, federation.managed_users_only())
+        .await
+    else {
         return unauthorized();
     };
     // Session ids are persisted (hashed) when the Hub has durable storage so

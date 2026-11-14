@@ -100,6 +100,17 @@ impl Output for HttpOutput {
     }
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
+        // A configured `body_field` replaces the codec path: each row sends
+        // the value of that field as the request body (documented behavior —
+        // the field was declared and described but never read, so the option
+        // silently did nothing).
+        if let Some(body_field) = self.config.body_field.as_deref() {
+            let payloads = crate::output::payload::field_payloads("http", &msg, body_field)?;
+            for x in payloads {
+                self.send(&x).await?;
+            }
+            return Ok(());
+        }
         // Apply codec encoding if configured
         let payloads = crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?;
         if payloads.is_empty() {
@@ -167,13 +178,16 @@ impl HttpOutput {
             }
         }
 
-        // Add content type header (if not specified)
-        // 始终添加Content-Type头（如果未指定）
-        if let Some(headers) = &self.config.headers {
-            if !headers.contains_key("Content-Type") {
-                request_builder = request_builder.header(header::CONTENT_TYPE, "application/json");
-            }
-        } else {
+        // Add content type header when the user did not configure one —
+        // compared CASE-INSENSITIVELY: HTTP header names are
+        // case-insensitive, and a lowercase "content-type" previously let
+        // the default application/json append a SECOND content-type header.
+        let has_content_type = self.config.headers.as_ref().is_some_and(|headers| {
+            headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("content-type"))
+        });
+        if !has_content_type {
             request_builder = request_builder.header(header::CONTENT_TYPE, "application/json");
         }
 
@@ -183,15 +197,34 @@ impl HttpOutput {
 
         while retry_count <= self.config.retry_count {
             match request_builder.try_clone().unwrap().send().await {
-                Ok(response) => {
+                Ok(mut response) => {
                     if response.status().is_success() {
                         return Ok(());
                     } else {
                         let status = response.status();
-                        let body = response
-                            .text()
-                            .await
-                            .unwrap_or_else(|_| "<Unable to read response body>".to_string());
+                        // Bound the captured error body: a broken or hostile
+                        // endpoint must not stream unbounded bytes into
+                        // memory (the text also reaches logs/status via the
+                        // error string).
+                        const MAX_ERROR_BODY: usize = 64 * 1024;
+                        let mut raw: Vec<u8> = Vec::new();
+                        let mut truncated = false;
+                        while raw.len() < MAX_ERROR_BODY {
+                            match response.chunk().await {
+                                Ok(Some(chunk)) => {
+                                    let remaining = MAX_ERROR_BODY - raw.len();
+                                    let take = chunk.len().min(remaining);
+                                    raw.extend_from_slice(&chunk[..take]);
+                                    truncated |= take < chunk.len();
+                                }
+                                Ok(None) => break,
+                                Err(_) => break, // best-effort capture
+                            }
+                        }
+                        let mut body = String::from_utf8_lossy(&raw).to_string();
+                        if truncated {
+                            body.push_str("…(truncated)");
+                        }
                         last_error = Some(Error::Process(format!(
                             "HTTP Request Failed: Status code {}, response: {}",
                             status, body

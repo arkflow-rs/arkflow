@@ -111,6 +111,32 @@ impl Hub {
             return Err(HubError::Unauthorized);
         }
         drop(nodes);
+        // An authenticated session is not an assignment: a node may only
+        // observe Jobs it was actually DISPATCHED at this generation. Without
+        // this check any registered agent could falsify another node's Job
+        // convergence — or fabricate a failure to force re-dispatch churn on
+        // the owning node.
+        if !self
+            .start_dispatch_fingerprints
+            .read()
+            .await
+            .contains_key(&(
+                request.job_id.clone(),
+                request.auth.node_id.clone(),
+                request.generation,
+            ))
+        {
+            return Err(HubError::Unauthorized);
+        }
+        // The observed-state vocabulary is fixed; anything else would be
+        // persisted verbatim into `observed_state` and poison convergence
+        // comparisons.
+        if !matches!(request.state.as_str(), "running" | "stopped" | "failed") {
+            return Err(HubError::Invalid(format!(
+                "unknown observed state '{}'; expected running, stopped, or failed",
+                request.state
+            )));
+        }
         let observed = self
             .observe_job(
                 &request.job_id,
