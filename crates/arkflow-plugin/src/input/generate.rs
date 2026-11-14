@@ -59,6 +59,19 @@ impl GenerateInput {
                 "generate input 'batch_size' must be at least 1".to_string(),
             ));
         }
+        // The counters are i64 and every read replicates the template
+        // `batch_size` times; reject values that cannot be represented or
+        // would require an unbounded preallocation.
+        if batch_size > i64::MAX as usize || batch_size > 1_000_000 {
+            return Err(Error::Config(format!(
+                "generate input 'batch_size' {batch_size} is outside the supported range 1..=1000000"
+            )));
+        }
+        if config.count.is_some_and(|count| count > i64::MAX as usize) {
+            return Err(Error::Config(
+                "generate input 'count' exceeds the supported i64 range".to_string(),
+            ));
+        }
         Ok(Self {
             input_name: name.map(str::to_string),
             config,

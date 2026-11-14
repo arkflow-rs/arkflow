@@ -347,6 +347,11 @@ fn append_vector_column(
     ));
 
     let schema = batch.schema();
+    if schema.column_with_name(target_field).is_some() {
+        return Err(Error::Process(format!(
+            "embedding processor: target field '{target_field}' already exists"
+        )));
+    }
     let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(
         target_field,

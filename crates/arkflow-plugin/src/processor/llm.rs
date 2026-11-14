@@ -466,6 +466,11 @@ fn append_column(
     completions: &[String],
 ) -> Result<MessageBatch, Error> {
     let schema = batch.schema();
+    if schema.column_with_name(target_field).is_some() {
+        return Err(Error::Process(format!(
+            "llm processor: target field '{target_field}' already exists"
+        )));
+    }
     let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(target_field, DataType::Utf8, true)));
     let mut columns: Vec<ArrayRef> = (0..batch.num_columns())
