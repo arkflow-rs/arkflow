@@ -1178,23 +1178,32 @@ impl SqliteBackend {
                     | "cancelled"
                     | "superseded"
             );
-            transaction.execute(
-                "UPDATE cp_attempts SET state = ?1, failure_class = ?2, finished_at_ms = CASE WHEN ?3 THEN ?4 ELSE finished_at_ms END WHERE attempt_id = ?5",
+            let attempt_updated = transaction.execute(
+                "UPDATE cp_attempts SET state = ?1, failure_class = ?2, finished_at_ms = CASE WHEN ?3 THEN ?4 ELSE finished_at_ms END WHERE attempt_id = ?5 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'node_unavailable', 'cancelled', 'superseded')",
                 rusqlite::params![state, failure_class, terminal, now_ms(), attempt_id],
             )?;
+            // A duplicate terminal report must not re-run the accounting
+            // below (retry counter increments / duplicate outbox rows).
+            if attempt_updated == 0 {
+                return Ok(());
+            }
             if terminal {
                 match failure_class {
                     Some("temporary_execution") | Some("transport") | Some("node_unavailable") => {
                         let retry_at = now_ms() + 1_000;
-                        transaction.execute(
+                        let intent_updated = transaction.execute(
                             "UPDATE cp_intents SET state = 'retrying', convergence_state = 'degraded', retry_count = retry_count + 1, next_retry_at_ms = ?1, last_failure_class = ?2, updated_at_ms = ?1 WHERE intent_id = ?3 AND state IN ('accepted', 'converging', 'retrying')",
                             rusqlite::params![retry_at, failure_class, intent_id],
                         )?;
-                        let event_key = format!("reconcile:retry:{attempt_id}");
-                        transaction.execute(
-                            "INSERT OR IGNORE INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) VALUES (?1, 'retry_intent', ?2, ?3, ?4, ?5, ?5)",
-                            rusqlite::params![event_key, node_id, stream_id, intent_id, retry_at],
-                        )?;
+                        // A superseded/terminal intent updates zero rows: do
+                        // not enqueue a retry for a state that can never run.
+                        if intent_updated == 1 {
+                            let event_key = format!("reconcile:retry:{attempt_id}");
+                            transaction.execute(
+                                "INSERT OR IGNORE INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) VALUES (?1, 'retry_intent', ?2, ?3, ?4, ?5, ?5)",
+                                rusqlite::params![event_key, node_id, stream_id, intent_id, retry_at],
+                            )?;
+                        }
                     }
                     Some("stale_generation") => {
                         transaction.execute(

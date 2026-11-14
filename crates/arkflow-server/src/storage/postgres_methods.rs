@@ -719,7 +719,7 @@ impl StorageBackend for PostgresBackend {
             let mut transaction = self.begin().await?;
             let __ret = async {
             transaction.execute(
-                "INSERT OR IGNORE INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) SELECT 'reconcile:register:' || i.intent_id, 'reconcile_intent', i.node_id, i.stream_id, i.intent_id, ?1, ?1 FROM cp_intents i WHERE i.node_id = ?2 AND i.state IN ('accepted', 'converging', 'retrying') AND (i.last_failure_class IS NULL OR i.last_failure_class <> 'ambiguous') AND NOT EXISTS (SELECT 1 FROM cp_outbox o WHERE o.intent_id = i.intent_id AND o.processed_at_ms IS NULL)",
+                "INSERT INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) SELECT 'reconcile:register:' || i.intent_id, 'reconcile_intent', i.node_id, i.stream_id, i.intent_id, ?1, ?1 FROM cp_intents i WHERE i.node_id = ?2 AND i.state IN ('accepted', 'converging', 'retrying') AND (i.last_failure_class IS NULL OR i.last_failure_class <> 'ambiguous') AND NOT EXISTS (SELECT 1 FROM cp_outbox o WHERE o.intent_id = i.intent_id AND o.processed_at_ms IS NULL) ON CONFLICT (event_key) DO NOTHING",
                 binds![now_ms, node_id],
             ).await?;
             Ok(())
@@ -1049,23 +1049,29 @@ impl StorageBackend for PostgresBackend {
                     | "cancelled"
                     | "superseded"
             );
-            transaction.execute(
-                "UPDATE cp_attempts SET state = ?1, failure_class = ?2, finished_at_ms = CASE WHEN ?3 THEN ?4 ELSE finished_at_ms END WHERE attempt_id = ?5",
+            let attempt_updated = transaction.execute(
+                "UPDATE cp_attempts SET state = ?1, failure_class = ?2, finished_at_ms = CASE WHEN ?3 THEN ?4 ELSE finished_at_ms END WHERE attempt_id = ?5 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'node_unavailable', 'cancelled', 'superseded')",
                 binds![state, failure_class, terminal, now_ms(), attempt_id],
             ).await?;
+            // Duplicate terminal reports must not repeat the accounting.
+            if attempt_updated == 0 {
+                return Ok(());
+            }
             if terminal {
                 match failure_class {
                     Some("temporary_execution") | Some("transport") | Some("node_unavailable") => {
                         let retry_at = now_ms() + 1_000;
-                        transaction.execute(
+                        let intent_updated = transaction.execute(
                             "UPDATE cp_intents SET state = 'retrying', convergence_state = 'degraded', retry_count = retry_count + 1, next_retry_at_ms = ?1, last_failure_class = ?2, updated_at_ms = ?1 WHERE intent_id = ?3 AND state IN ('accepted', 'converging', 'retrying')",
                             binds![retry_at, failure_class, intent_id],
                         ).await?;
-                        let event_key = format!("reconcile:retry:{attempt_id}");
-                        transaction.execute(
-                            "INSERT OR IGNORE INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) VALUES (?1, 'retry_intent', ?2, ?3, ?4, ?5, ?5)",
-                            binds![event_key, node_id, stream_id, intent_id, retry_at],
-                        ).await?;
+                        if intent_updated == 1 {
+                            let event_key = format!("reconcile:retry:{attempt_id}");
+                            transaction.execute(
+                                "INSERT INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) VALUES (?1, 'retry_intent', ?2, ?3, ?4, ?5, ?5) ON CONFLICT (event_key) DO NOTHING",
+                                binds![event_key, node_id, stream_id, intent_id, retry_at],
+                            ).await?;
+                        }
                     }
                     Some("stale_generation") => {
                         transaction.execute(
@@ -1305,7 +1311,7 @@ impl StorageBackend for PostgresBackend {
                 mutation.report_seq
             );
             transaction.execute(
-                "INSERT OR IGNORE INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) SELECT ?1, 'reconcile_intent', d.node_id, d.stream_id, i.intent_id, ?2, ?2 FROM cp_stream_desired d JOIN cp_intents i ON i.node_id = d.node_id AND i.stream_id = d.stream_id AND i.generation = d.generation WHERE d.node_id = ?3 AND d.stream_id = ?4 AND i.state IN ('accepted', 'converging', 'retrying') AND NOT EXISTS (SELECT 1 FROM cp_outbox o WHERE o.intent_id = i.intent_id AND o.processed_at_ms IS NULL)",
+                "INSERT INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) SELECT ?1, 'reconcile_intent', d.node_id, d.stream_id, i.intent_id, ?2, ?2 FROM cp_stream_desired d JOIN cp_intents i ON i.node_id = d.node_id AND i.stream_id = d.stream_id AND i.generation = d.generation WHERE d.node_id = ?3 AND d.stream_id = ?4 AND i.state IN ('accepted', 'converging', 'retrying') AND NOT EXISTS (SELECT 1 FROM cp_outbox o WHERE o.intent_id = i.intent_id AND o.processed_at_ms IS NULL) ON CONFLICT (event_key) DO NOTHING",
                 binds![wake_key, now, mutation.node_id, mutation.stream_id],
             ).await?;
             Ok(())
@@ -2204,6 +2210,15 @@ impl StorageBackend for PostgresBackend {
             ).await?;
             Ok(job)
             }.await;
+            // Do not commit a transaction whose business step failed: a
+            // decode/validation error after the write must roll back, not
+            // persist a mutation the caller was told had failed.
+            if __ret.is_err() {
+                // Dropping the sqlx transaction rolls it back; the wrapper
+                // exposes no explicit rollback.
+                drop(connection);
+                return __ret;
+            }
             connection.commit().await?;
             __ret
         }
@@ -2294,6 +2309,15 @@ impl StorageBackend for PostgresBackend {
                 .optional()?;
             Ok(stored.unwrap_or(job))
             }.await;
+            // Do not commit a transaction whose business step failed: a
+            // decode/validation error after the write must roll back, not
+            // persist a mutation the caller was told had failed.
+            if __ret.is_err() {
+                // Dropping the sqlx transaction rolls it back; the wrapper
+                // exposes no explicit rollback.
+                drop(connection);
+                return __ret;
+            }
             connection.commit().await?;
             __ret
         }
@@ -2482,6 +2506,15 @@ impl StorageBackend for PostgresBackend {
                 ).await
                 .optional()
             }.await;
+            // Do not commit a transaction whose business step failed: a
+            // decode/validation error after the write must roll back, not
+            // persist a mutation the caller was told had failed.
+            if __ret.is_err() {
+                // Dropping the sqlx transaction rolls it back; the wrapper
+                // exposes no explicit rollback.
+                drop(connection);
+                return __ret;
+            }
             connection.commit().await?;
             __ret
         }
@@ -2556,6 +2589,15 @@ impl StorageBackend for PostgresBackend {
                 ).await
                 .optional()
             }.await;
+            // Do not commit a transaction whose business step failed: a
+            // decode/validation error after the write must roll back, not
+            // persist a mutation the caller was told had failed.
+            if __ret.is_err() {
+                // Dropping the sqlx transaction rolls it back; the wrapper
+                // exposes no explicit rollback.
+                drop(connection);
+                return __ret;
+            }
             connection.commit().await?;
             __ret
         }
@@ -2637,6 +2679,15 @@ impl StorageBackend for PostgresBackend {
                 ).await
                 .optional()
             }.await;
+            // Do not commit a transaction whose business step failed: a
+            // decode/validation error after the write must roll back, not
+            // persist a mutation the caller was told had failed.
+            if __ret.is_err() {
+                // Dropping the sqlx transaction rolls it back; the wrapper
+                // exposes no explicit rollback.
+                drop(connection);
+                return __ret;
+            }
             connection.commit().await?;
             __ret
         }
@@ -3038,12 +3089,19 @@ impl StorageBackend for PostgresBackend {
                 return Ok(HubLeaseAcquire::Acquired { epoch });
             }
             if expires_at_ms <= now_ms {
-                let updated = connection.execute(
-                    "UPDATE cp_hub_lease SET holder = ?1, epoch = epoch + 1, expires_at_ms = ?2, updated_at_ms = ?3, advertise_url = ?4 WHERE id = 1 AND expires_at_ms <= ?5",
-                    binds![holder, now_ms + ttl_ms, now_ms, advertise_url, now_ms],
-                ).await?;
-                if updated == 1 {
-                    return Ok(HubLeaseAcquire::Acquired { epoch: epoch + 1 });
+                // RETURNING the new epoch keeps the value atomic with the
+                // claim; returning the pre-UPDATE read + 1 could hand the
+                // Hub an epoch a concurrent re-acquisition already advanced.
+                let claimed_epoch = connection
+                    .query_row(
+                        "UPDATE cp_hub_lease SET holder = ?1, epoch = epoch + 1, expires_at_ms = ?2, updated_at_ms = ?3, advertise_url = ?4 WHERE id = 1 AND expires_at_ms <= ?5 RETURNING epoch",
+                        binds![holder, now_ms + ttl_ms, now_ms, advertise_url, now_ms],
+                        |row| row.get::<u64>(0),
+                    )
+                    .await
+                    .optional()?;
+                if let Some(epoch) = claimed_epoch {
+                    return Ok(HubLeaseAcquire::Acquired { epoch });
                 }
             }
             let snapshot = connection.query_row(

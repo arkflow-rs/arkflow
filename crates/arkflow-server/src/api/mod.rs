@@ -1411,6 +1411,9 @@ fn hub_problem(error: hub::HubError) -> Response {
         hub::HubError::StorageUnavailable | hub::HubError::Storage(_) => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        // Registry exhaustion is a transient server-side admission limit,
+        // not a malformed request; the Agent must retry with backoff.
+        hub::HubError::Capacity => StatusCode::SERVICE_UNAVAILABLE,
         hub::HubError::GenerationConflict { .. } => StatusCode::CONFLICT,
         hub::HubError::JobNotRunning
         | hub::HubError::PauseInProgress
@@ -1433,6 +1436,7 @@ fn hub_problem(error: hub::HubError) -> Response {
         hub::HubError::OrchestrationPhaseConflict => "orchestration_conflict",
         hub::HubError::StaleLeader { .. } => "stale_leader",
         hub::HubError::StorageUnavailable | hub::HubError::Storage(_) => "storage_unavailable",
+        hub::HubError::Capacity => "capacity",
         hub::HubError::GenerationConflict { .. } => "generation_conflict",
         hub::HubError::JobNotRunning => "job_not_running",
         hub::HubError::PauseInProgress => "pause_in_progress",

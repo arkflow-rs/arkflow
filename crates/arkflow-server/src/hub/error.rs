@@ -61,6 +61,7 @@ impl HubError {
         match self {
             Self::Unauthorized => "authorization",
             Self::NodeUnavailable => "node_unavailable",
+            Self::Capacity => "capacity",
             Self::StorageUnavailable | Self::Storage(_) => "repository",
             Self::StaleLeader { .. } => "stale_leader",
             Self::NotFound => "not_found",

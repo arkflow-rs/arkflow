@@ -14,7 +14,7 @@
 use super::error::HubError;
 use super::wire::{AgentOperation, HubEvent, HubOperationState};
 use super::{now_ms, Hub};
-use crate::storage::{AuditRecord, JobCheckpointRecord, JobPauseUpdate, JobRecord};
+use crate::storage::{AuditRecord, JobCheckpointRecord, JobPauseUpdate, JobRecord, StorageError};
 use arkflow_core::control::ControlEvent;
 
 pub(crate) const PAUSE_CAPTURING: &str = "capturing";
@@ -82,7 +82,9 @@ impl Hub {
                 resource_id: Some(job_id.to_owned()),
                 node_id: None,
                 stream_id: None,
-                correlation_id: None,
+                // The pause's stable operation correlation: the audit trail
+                // must be joinable with the pause/resume lifecycle.
+                correlation_id: Some(format!("job-pause:{job_id}")),
                 outcome: outcome.to_owned(),
                 failure_code: failure_code.map(str::to_owned),
                 message: Some(message),
@@ -555,7 +557,7 @@ impl Hub {
                     .map(|start| start.saturating_add(PAUSE_CAPTURE_TIMEOUT_MS))
                     .unwrap_or_else(|| now_ms().saturating_add(PAUSE_CAPTURE_TIMEOUT_MS));
                 if now_ms() >= deadline {
-                    return self.abort_pause(job, "pause_savepoint_timeout").await;
+                    return self.abort_pause(job, "pause_savepoint_failed").await;
                 }
                 if self.pause_capture_in_flight(job, &artifact_id).await {
                     return Ok(false);
@@ -733,21 +735,24 @@ impl Hub {
             )
             .await;
         // Observation writes clear `last_error`; the abort's stable failure
-        // code is the operator's only signal, so restore it afterwards.
-        if let Some(restored) = storage
-            .update_job(
-                &updated.job_id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(failure_code.into()),
-            )
+        // code is the operator's only signal, so restore it afterwards under
+        // the abort's generation fence — a stale abort must not overwrite a
+        // newer job generation's error state.
+        let mut restore = updated.clone();
+        restore.last_error = Some(failure_code.into());
+        match storage
+            .update_job_with_expected_generation(restore, updated.generation)
             .await
-            .map_err(HubError::from)?
         {
-            self.cache_job(&restored).await;
+            Ok(restored) => self.cache_job(&restored).await,
+            Err(StorageError::GenerationConflict { .. }) => {
+                tracing::warn!(
+                    job_id = %updated.job_id,
+                    generation = updated.generation,
+                    "pause abort error code not restored: a newer job generation won"
+                );
+            }
+            Err(error) => return Err(HubError::from(error)),
         }
         Ok(true)
     }

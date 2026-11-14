@@ -705,16 +705,20 @@ impl Hub {
         }
         if matches!(result.state, HubOperationState::Acknowledged) {
             operation.progress = result.progress;
-            let now = now_ms();
-            operation.acknowledged_at_ms = Some(now);
-            // Enqueue-to-acknowledgement latency, the metric the spec
-            // commits to; terminal outcomes settle the outcome counters.
-            self.command_metrics.record_latency(
-                operation.operation.as_str(),
-                now.saturating_sub(operation.created_at_ms),
-            );
-            self.command_metrics
-                .record_outcome(operation.operation.as_str(), "acknowledged");
+            // A retried/duplicated Acknowledged report must not move the
+            // first-confirmation time or count the latency twice.
+            if operation.acknowledged_at_ms.is_none() {
+                let now = now_ms();
+                operation.acknowledged_at_ms = Some(now);
+                // Enqueue-to-acknowledgement latency, the metric the spec
+                // commits to; terminal outcomes settle the outcome counters.
+                self.command_metrics.record_latency(
+                    operation.operation.as_str(),
+                    now.saturating_sub(operation.created_at_ms),
+                );
+                self.command_metrics
+                    .record_outcome(operation.operation.as_str(), "acknowledged");
+            }
         }
         if matches!(
             result.state,

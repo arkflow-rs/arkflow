@@ -105,10 +105,13 @@ impl CommandMetrics {
         let mut body = String::new();
         if let Ok(latencies) = self.latencies.lock() {
             for (command, latency) in latencies.iter() {
+                // Prometheus buckets are cumulative: le=10 includes every
+                // observation also counted in le=5.
+                let mut cumulative = 0u64;
                 for (index, bound) in COMMAND_METRIC_BUCKETS_MS.iter().enumerate() {
+                    cumulative += latency.buckets[index];
                     body.push_str(&format!(
-                        "arkflow_command_duration_bucket{{command=\"{command}\",le=\"{bound}\"}} {}\n",
-                        latency.buckets[index]
+                        "arkflow_command_duration_bucket{{command=\"{command}\",le=\"{bound}\"}} {cumulative}\n",
                     ));
                 }
                 body.push_str(&format!(
