@@ -82,7 +82,11 @@ async fn authorize_operation(
     let allowed = principal.as_ref().is_some_and(|principal| {
         principal.can_scope(action, "operation", Some(id))
             || operation.as_ref().is_some_and(|operation| {
-                principal.can_scope(action, "operation", Some(&operation.node_id))
+                // Ownership lives in the NODE namespace: an
+                // `operation=<node-id>` scope names one operation, not a
+                // node, and must not widen into every operation that node
+                // owns.
+                principal.can_scope(action, "node", Some(&operation.node_id))
             })
     });
     if !allowed {

@@ -369,41 +369,77 @@ pub(crate) fn redact_secrets(value: &Value) -> Value {
     }
 }
 
-/// Masks the password of a URL userinfo component (`scheme://user:pass@…`)
-/// so connection strings keep their scheme/user/host readable without
-/// leaking the credential. Returns `None` when the value carries no
-/// userinfo password.
+/// Masks credentials in connector URLs — the userinfo password
+/// (`scheme://user:pass@…`) and any `password=` query parameter
+/// (`scheme://host/app?password=…`, accepted by sqlx) — so connection
+/// strings keep their scheme/user/host readable without leaking the
+/// credential. Returns `None` when the value carries no password.
 fn redact_url_password(text: &str) -> Option<String> {
     let (scheme, rest) = text.split_once("://")?;
     if scheme.is_empty() || scheme.contains(['/', '@', ':']) {
         return None;
     }
-    // The authority ends at the first '/', '?' or '#'; a userinfo component
-    // is everything before the last '@' inside it (usernames may contain
-    // none, but passwords may contain '@'-adjacent quirks — take the LAST
-    // '@' so an '@' inside the password still splits correctly... the
-    // password itself follows the ':' inside the userinfo).
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
-    // The userinfo is everything before the LAST '@' of the authority (the
+    let tail = &rest[authority_end..];
+
+    let mut redacted = String::with_capacity(text.len() + 16);
+    let mut changed = false;
+    redacted.push_str(scheme);
+    redacted.push_str("://");
+
+    // Userinfo: everything before the LAST '@' of the authority (the
     // password itself may contain '@'); its password follows the FIRST ':'
     // (the username cannot contain an unencoded ':', so masking from the
     // first colon hides the whole password even when it contains colons).
-    let at = authority.rfind('@')?;
-    let userinfo = &authority[..at];
-    let colon = userinfo.find(':')?;
-    if colon == userinfo.len() - 1 {
-        // Empty password segment: nothing to redact.
-        return None;
+    match authority.rfind('@') {
+        Some(at) => {
+            let userinfo = &authority[..at];
+            match userinfo.find(':') {
+                Some(colon) if colon + 1 < userinfo.len() => {
+                    redacted.push_str(&authority[..colon]);
+                    redacted.push_str(":******");
+                    redacted.push_str(&authority[at..]);
+                    changed = true;
+                }
+                _ => redacted.push_str(authority),
+            }
+        }
+        None => redacted.push_str(authority),
     }
-    let mut redacted = String::with_capacity(text.len() + 4);
-    redacted.push_str(scheme);
-    redacted.push_str("://");
-    redacted.push_str(&authority[..colon]);
-    redacted.push_str(":******");
-    redacted.push_str(&authority[at..]);
-    redacted.push_str(&rest[authority_end..]);
-    Some(redacted)
+
+    // Query string: mask every `password=` parameter value. The path and
+    // the fragment are preserved verbatim.
+    match tail.find('?') {
+        Some(query_start) => {
+            redacted.push_str(&tail[..query_start]);
+            redacted.push('?');
+            let after = &tail[query_start + 1..];
+            let (query, fragment) = match after.find('#') {
+                Some(fragment_start) => (&after[..fragment_start], &after[fragment_start..]),
+                None => (after, ""),
+            };
+            for (index, pair) in query.split('&').enumerate() {
+                if index > 0 {
+                    redacted.push('&');
+                }
+                match pair.split_once('=') {
+                    Some((key, value))
+                        if key.eq_ignore_ascii_case("password") && !value.is_empty() =>
+                    {
+                        redacted.push_str(key);
+                        redacted.push_str("=******");
+                        changed = true;
+                    }
+                    _ => redacted.push_str(pair),
+                }
+            }
+            redacted.push_str(fragment);
+        }
+        None => redacted.push_str(tail),
+    }
+
+    changed.then_some(redacted)
 }
 
 fn is_secret_key(key: &str) -> bool {
@@ -510,6 +546,8 @@ mod tests {
                 "url": "mysql://root:s3cret@localhost/app"
             },
             "multi_colon_url": "postgres://u:pa:ss:word@db.internal/app",
+            "query_only_url": "postgres://db.internal/app?password=hunter2&sslmode=require",
+            "userinfo_and_query_url": "postgres://u:pa:ss:word@db.internal/app?password=s3cret&x=1",
             "name": "not a url"
         });
         let redacted = redact_secrets(&value);
@@ -531,6 +569,16 @@ mod tests {
         assert_eq!(
             redacted["multi_colon_url"],
             "postgres://u:******@db.internal/app"
+        );
+        // sqlx also accepts the credential as a query parameter: a URL with
+        // no userinfo password must still mask it.
+        assert_eq!(
+            redacted["query_only_url"],
+            "postgres://db.internal/app?password=******&sslmode=require"
+        );
+        assert_eq!(
+            redacted["userinfo_and_query_url"],
+            "postgres://u:******@db.internal/app?password=******&x=1"
         );
         assert_eq!(redacted["name"], "not a url");
     }

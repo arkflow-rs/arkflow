@@ -109,7 +109,19 @@ impl PulsarOutput {
                     // hang before the receipt wait even starts.
                     let producer = tokio::time::timeout(
                         WRITE_RECEIPT_TIMEOUT,
-                        client.producer().with_topic(topic).build(),
+                        client
+                            .producer()
+                            .with_topic(topic)
+                            // Blocking admission: a full pending queue waits
+                            // for the sender task instead of returning
+                            // `SlowDown`, which failed the whole batch while
+                            // already-admitted payloads could still reach the
+                            // broker (a retry then duplicated them).
+                            .with_options(pulsar::producer::ProducerOptions {
+                                block_queue_if_full: true,
+                                ..Default::default()
+                            })
+                            .build(),
                     )
                     .await
                     .map_err(|_| {
@@ -219,30 +231,38 @@ impl Output for PulsarOutput {
         // 1024-row batch at ~300 ms RTT blew through the kernel's
         // whole-batch timeout even on a healthy broker. `send_non_blocking`
         // only enqueues; the receipt future owns its state, so the producer
-        // lock is released before any wait.
-        let mut receipts = Vec::with_capacity(owned_payloads.len());
-        for (index, payload) in owned_payloads.into_iter().enumerate() {
-            let topic = match &topics {
-                crate::expr::EvaluateResult::Scalar(topic) => topic.clone(),
-                crate::expr::EvaluateResult::Vec(topics_vec) => topics_vec
-                    .get(index)
-                    .ok_or_else(|| {
-                        Error::Config(format!(
-                            "pulsar topic expression resolved to {} topics for {} messages",
-                            topics_vec.len(),
-                            index + 1
-                        ))
-                    })?
-                    .clone(),
-            };
-            let producer = self.producer_for(&client, &topic).await?;
-            let mut producer = producer.lock().await;
-            let receipt = producer.send_non_blocking(payload).await.map_err(|e| {
-                Error::Process(format!("Failed to send to Pulsar topic {topic}: {e}"))
-            })?;
-            drop(producer);
-            receipts.push((topic, receipt));
-        }
+        // lock is released before any wait. The producer uses blocking
+        // admission (`block_queue_if_full`), so enqueueing past its pending
+        // queue waits for the sender task instead of failing the batch with
+        // `SlowDown`; both phases share the same bounded window.
+        let receipts = tokio::time::timeout(WRITE_RECEIPT_TIMEOUT, async {
+            let mut receipts = Vec::with_capacity(owned_payloads.len());
+            for (index, payload) in owned_payloads.into_iter().enumerate() {
+                let topic = match &topics {
+                    crate::expr::EvaluateResult::Scalar(topic) => topic.clone(),
+                    crate::expr::EvaluateResult::Vec(topics_vec) => topics_vec
+                        .get(index)
+                        .ok_or_else(|| {
+                            Error::Config(format!(
+                                "pulsar topic expression resolved to {} topics for {} messages",
+                                topics_vec.len(),
+                                index + 1
+                            ))
+                        })?
+                        .clone(),
+                };
+                let producer = self.producer_for(&client, &topic).await?;
+                let mut producer = producer.lock().await;
+                let receipt = producer.send_non_blocking(payload).await.map_err(|e| {
+                    Error::Process(format!("Failed to send to Pulsar topic {topic}: {e}"))
+                })?;
+                drop(producer);
+                receipts.push((topic, receipt));
+            }
+            Ok::<_, Error>(receipts)
+        })
+        .await
+        .map_err(|_| Error::Connection("Timed out enqueueing the Pulsar batch".to_string()))??;
         let waits =
             futures::future::join_all(receipts.into_iter().map(|(topic, receipt)| async move {
                 receipt.await.map(|_| ()).map_err(|e| {

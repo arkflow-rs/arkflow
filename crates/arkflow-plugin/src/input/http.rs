@@ -161,7 +161,23 @@ impl HttpInput {
 impl Input for HttpInput {
     async fn connect(&self) -> Result<(), Error> {
         if self.connected.load(Ordering::SeqCst) {
-            return Ok(());
+            // A listener that died leaves `connected` set: `read()` reports
+            // the disconnection and the supervisor reconnects by calling
+            // this again. Reap the dead listener and fall through to rebind
+            // instead of short-circuiting — returning Ok here would keep
+            // `server_down` set and every later read would report the same
+            // disconnection forever.
+            if !self.server_down.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let previous = self.server_handle.lock().await.take();
+            self.connected.store(false, Ordering::SeqCst);
+            if let Some(handle) = previous {
+                handle.abort();
+                // Wait until the dead task is dropped so its death guard
+                // cannot flip the freshly cleared marker back to "down".
+                let _ = handle.await;
+            }
         }
 
         let path = self.config.path.clone();

@@ -213,7 +213,20 @@ impl Processor for StatefulOperator {
                 return Err(error);
             }
         };
-        let result = self.inner.process(enriched).await;
+        // Pass the journal-gated ack INTO the inner processor: a buffering
+        // processor (the batch processor) holds the delivery and returns
+        // `Deferred`; its later flush emission carries this ack, so the
+        // source is acknowledged only once the buffered rows were written
+        // downstream. Calling `process` here acknowledged the source and
+        // committed the increments immediately, while the rows were still
+        // buffered — a restart or a rejected downstream write lost them.
+        let commit_ack: Arc<dyn crate::input::Ack> = Arc::new(
+            super::state_journal::CommitOnAck::new(journal.clone(), txn, ack),
+        );
+        let result = self
+            .inner
+            .process_with_ack(enriched, Arc::clone(&commit_ack))
+            .await;
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -221,13 +234,13 @@ impl Processor for StatefulOperator {
                 return Err(error);
             }
         };
-        let commit_ack: Arc<dyn crate::input::Ack> = Arc::new(
-            super::state_journal::CommitOnAck::new(journal.clone(), txn, ack),
-        );
         match result {
             crate::ProcessResult::Single(output) => {
                 Ok(crate::ProcessResult::SingleWithAck(output, commit_ack))
             }
+            // The inner holds the input (and our ack): it settles both when
+            // the buffered rows are emitted and acknowledged.
+            crate::ProcessResult::Deferred => Ok(crate::ProcessResult::Deferred),
             crate::ProcessResult::Multiple(outputs) if outputs.is_empty() => {
                 if let Err(error) = commit_ack.ack().await {
                     let _ = commit_ack.abort().await;
@@ -258,7 +271,7 @@ impl Processor for StatefulOperator {
                     )),
                 ))
             }
-            crate::ProcessResult::MultipleWithAck(_) | crate::ProcessResult::Deferred => {
+            crate::ProcessResult::MultipleWithAck(_) => {
                 journal.rollback(txn);
                 Err(Error::Process(
                     "stateful operator's inner processor returned an unsupported ack variant"
@@ -357,6 +370,59 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingAck {
+        acks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingAck {
+        fn acks(&self) -> usize {
+            self.acks.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    #[async_trait]
+    impl crate::input::Ack for RecordingAck {
+        async fn ack(&self) -> Result<(), Error> {
+            self.acks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    /// Buffers like the batch processor: holds the delivery (and its ack)
+    /// until `finish` emits it.
+    struct BufferingProcessor {
+        held: tokio::sync::Mutex<Option<(MessageBatchRef, Arc<dyn crate::input::Ack>)>>,
+    }
+
+    #[async_trait]
+    impl Processor for BufferingProcessor {
+        async fn process(&self, _batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+            Ok(ProcessResult::None)
+        }
+
+        async fn process_with_ack(
+            &self,
+            batch: MessageBatchRef,
+            ack: Arc<dyn crate::input::Ack>,
+        ) -> Result<ProcessResult, Error> {
+            ack.mark_held();
+            *self.held.lock().await = Some((batch, ack));
+            Ok(ProcessResult::Deferred)
+        }
+
+        async fn finish(&self) -> Result<ProcessResult, Error> {
+            match self.held.lock().await.take() {
+                Some((batch, ack)) => Ok(ProcessResult::SingleWithAck(batch, ack)),
+                None => Ok(ProcessResult::None),
+            }
+        }
+
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
     fn batch(keys: Vec<&str>) -> MessageBatchRef {
         Arc::new(crate::MessageBatch::new_arrow(
             RecordBatch::try_new(
@@ -367,6 +433,57 @@ mod tests {
             )
             .unwrap(),
         ))
+    }
+
+    /// A buffering inner processor holds the input, so the stateful wrapper
+    /// must NOT acknowledge the source or commit the increment yet: the
+    /// buffered rows are emitted later, and only the acknowledgement of that
+    /// emission settles both.
+    #[tokio::test]
+    async fn buffering_inner_processor_defers_the_source_ack_until_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(crate::state::RedbStateBackend::open(dir.path(), 1).unwrap());
+        let journal = Arc::new(super::super::state_journal::StateJournal::new(
+            backend.clone(),
+        ));
+        let operator = StatefulOperator::with_journal(
+            Arc::new(BufferingProcessor {
+                held: tokio::sync::Mutex::new(None),
+            }),
+            journal.clone(),
+            "job:t:task:m-0".into(),
+            "key".into(),
+            None,
+            "count".into(),
+        );
+
+        let source_ack = Arc::new(RecordingAck::default());
+        let deferred = operator
+            .process_with_ack(batch(vec!["a"]), source_ack.clone())
+            .await
+            .unwrap();
+        assert!(matches!(deferred, ProcessResult::Deferred));
+        assert_eq!(source_ack.acks(), 0, "buffered rows must not be acked");
+        assert!(
+            backend.scan("job:t:task:m-0").unwrap().is_empty(),
+            "a buffered mutation must stay staged"
+        );
+
+        // The flush emission carries the ack: settling it commits the
+        // increment and acknowledges the source exactly once.
+        let flushed = operator.finish().await.unwrap();
+        let ProcessResult::SingleWithAck(_output, flush_ack) = flushed else {
+            panic!("the buffered emission must carry the acknowledgement");
+        };
+        flush_ack.ack().await.unwrap();
+        assert_eq!(source_ack.acks(), 1);
+        assert_eq!(
+            crate::state::KeyedCounter::new(backend, "job:t:task:m-0")
+                .get(b"utf8:a")
+                .unwrap(),
+            Some(1)
+        );
     }
 
     /// Task 1.2: a failed sink write must not persist a replayed increment

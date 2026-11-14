@@ -328,6 +328,85 @@ impl Output for KafkaOutput {
     }
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
+        let delivery_futures = self.enqueue(msg).await?;
+        // Wait for the broker's delivery reports before reporting success.
+        // Returning `Ok` after mere enqueueing let the kernel acknowledge the
+        // source while the records were still in flight, so a failed delivery
+        // silently lost data even with `acks=all`. An error here fails the
+        // batch; the source replays it (at-least-once).
+        observe_delivery_futures(delivery_futures).await
+    }
+
+    async fn write_batch(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
+        if !self.config.exactly_once.unwrap_or(false) {
+            // Non-transactional path: enqueue every message first, then
+            // await all receipts together. Awaiting each message's delivery
+            // inside the loop cost one broker round trip per batch, which
+            // could exceed the kernel's whole-batch timeout even though
+            // every delivery succeeded. Per-message enqueue failures keep
+            // the previous continue-on-error behavior.
+            let mut delivery_futures = Vec::new();
+            let mut err = None;
+            for msg in msgs {
+                match self.enqueue(msg.clone()).await {
+                    Ok(futures) => delivery_futures.extend(futures),
+                    Err(e) => err = Some(e),
+                }
+            }
+            // Observe the receipts of everything that was enqueued before
+            // deciding: the payloads are already in flight, so reporting the
+            // enqueue failure without draining them would leave deliveries
+            // unconfirmed (a replay may duplicate them either way, but the
+            // confirmed ones must not be reported as failed).
+            let observed = observe_delivery_futures(delivery_futures).await;
+            return match err {
+                Some(e) => Err(e),
+                None => observed,
+            };
+        }
+        self.write_batch_transactional(msgs).await
+    }
+
+    async fn close(&self) -> Result<(), Error> {
+        self.cancellation_token.cancel();
+        // Get the producer and close
+        let producer_arc = self.inner_kafka_output.producer.clone();
+        let mut producer_guard = producer_arc.write().await;
+
+        if let Some(producer) = producer_guard.take() {
+            producer.poll(Timeout::After(Duration::ZERO));
+            // Drain synchronously first: the lock must never be held across
+            // the receipt awaits below.
+            let pending: Vec<_> = {
+                let mut send_futures = self
+                    .inner_kafka_output
+                    .send_futures
+                    .lock()
+                    .expect("kafka send_futures lock poisoned");
+                send_futures.drain(..).collect()
+            };
+            if let Err(e) = observe_delivery_futures(pending).await {
+                error!("Kafka output close observed a delivery failure: {e}");
+            }
+
+            // Wait for all messages to be sent
+            producer.flush(Duration::from_secs(30)).map_err(|e| {
+                Error::Connection(format!(
+                    "Failed to refresh the message when the Kafka producer is disabled: {}",
+                    e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+impl KafkaOutput {
+    /// Enqueue every record of one message batch and return the broker's
+    /// delivery futures. Awaiting them is the caller's job: `write` awaits
+    /// immediately, while `write_batch` awaits every message's receipts
+    /// together so the total wait is bounded by the slowest receipt instead
+    /// of the sum over messages.
+    async fn enqueue(&self, msg: MessageBatchRef) -> Result<Vec<DeliveryFuture>, Error> {
         let producer_arc = self.inner_kafka_output.producer.clone();
         let producer_guard = producer_arc.read().await;
         let producer = producer_guard.as_ref().ok_or_else(|| {
@@ -343,7 +422,7 @@ impl Output for KafkaOutput {
             crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?
         };
         if payloads.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let topic = self.get_topic(&msg).await?;
@@ -404,66 +483,9 @@ impl Output for KafkaOutput {
             }
         }
 
-        // Wait for the broker's delivery reports before reporting success.
-        // Returning `Ok` after mere enqueueing let the kernel acknowledge the
-        // source while the records were still in flight, so a failed delivery
-        // silently lost data even with `acks=all`. An error here fails the
-        // batch; the source replays it (at-least-once).
-        observe_delivery_futures(delivery_futures).await
+        Ok(delivery_futures)
     }
 
-    async fn write_batch(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
-        if !self.config.exactly_once.unwrap_or(false) {
-            // Non-transactional path: default per-message behavior
-            // (continue-on-error), inlined to avoid a Default-trait dance.
-            let mut err = None;
-            for msg in msgs {
-                if let Err(e) = self.write(msg.clone()).await {
-                    err = Some(e);
-                }
-            }
-            return match err {
-                Some(e) => Err(e),
-                None => Ok(()),
-            };
-        }
-        self.write_batch_transactional(msgs).await
-    }
-
-    async fn close(&self) -> Result<(), Error> {
-        self.cancellation_token.cancel();
-        // Get the producer and close
-        let producer_arc = self.inner_kafka_output.producer.clone();
-        let mut producer_guard = producer_arc.write().await;
-
-        if let Some(producer) = producer_guard.take() {
-            producer.poll(Timeout::After(Duration::ZERO));
-            // Drain synchronously first: the lock must never be held across
-            // the receipt awaits below.
-            let pending: Vec<_> = {
-                let mut send_futures = self
-                    .inner_kafka_output
-                    .send_futures
-                    .lock()
-                    .expect("kafka send_futures lock poisoned");
-                send_futures.drain(..).collect()
-            };
-            if let Err(e) = observe_delivery_futures(pending).await {
-                error!("Kafka output close observed a delivery failure: {e}");
-            }
-
-            // Wait for all messages to be sent
-            producer.flush(Duration::from_secs(30)).map_err(|e| {
-                Error::Connection(format!(
-                    "Failed to refresh the message when the Kafka producer is disabled: {}",
-                    e
-                ))
-            })?;
-        }
-        Ok(())
-    }
-}
-impl KafkaOutput {
     /// Best-effort transaction abort (blocking broker round-trip →
     /// spawn_blocking). The broker fences zombie producers on restart
     /// anyway; both the join failure and the abort result are logged, never

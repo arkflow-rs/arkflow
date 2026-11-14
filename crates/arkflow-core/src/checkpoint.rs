@@ -136,8 +136,13 @@ impl CheckpointManifest {
         // Manifests written before `source_positions_by_task` existed carry
         // a checksum over the LEGACY tuple (without that field). Accept both
         // encodings so an upgrade can still recover old checkpoints and
-        // savepoints; new seals always use the current encoding.
-        self.checksum == manifest_checksum(self) || self.checksum == legacy_manifest_checksum(self)
+        // savepoints; new seals always use the current encoding. The legacy
+        // checksum cannot cover the map, so it is only accepted while the
+        // map is empty — otherwise an injected or corrupted map would be
+        // preferred by recovery without being verified.
+        self.checksum == manifest_checksum(self)
+            || (self.source_positions_by_task.is_empty()
+                && self.checksum == legacy_manifest_checksum(self))
     }
 
     pub fn seal(&mut self) {
@@ -1119,8 +1124,15 @@ mod tests {
         // (checksum over the legacy tuple without source_positions_by_task)
         // must still verify, while tampering with the new field still fails.
         let mut legacy = manifest.clone();
+        legacy.source_positions_by_task.clear();
         legacy.checksum = legacy_manifest_checksum(&legacy);
         assert!(legacy.verify());
+        // The legacy checksum does not cover the map, so a manifest that
+        // carries one alongside a legacy checksum must not verify: recovery
+        // would otherwise prefer offsets the checksum never checked.
+        let mut injected = manifest.clone();
+        injected.checksum = legacy_manifest_checksum(&injected);
+        assert!(!injected.verify());
         // New seals cover the field, so tampering with it still fails.
         let mut tampered = manifest.clone();
         tampered

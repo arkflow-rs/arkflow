@@ -58,8 +58,8 @@ fn registry() -> &'static std::sync::Mutex<BTreeMap<String, GroupRegistration>> 
 /// therefore also outlives the output that declared it — the validation is
 /// a startup gate for declared configuration, liveness stays a write-time
 /// check.
-fn committers() -> &'static std::sync::Mutex<BTreeMap<String, std::sync::Weak<()>>> {
-    static COMMITTERS: OnceLock<std::sync::Mutex<BTreeMap<String, std::sync::Weak<()>>>> =
+fn committers() -> &'static std::sync::Mutex<BTreeMap<String, Vec<std::sync::Weak<()>>>> {
+    static COMMITTERS: OnceLock<std::sync::Mutex<BTreeMap<String, Vec<std::sync::Weak<()>>>>> =
         OnceLock::new();
     COMMITTERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
@@ -169,17 +169,25 @@ pub(crate) fn single_topic(group_id: &str) -> Option<String> {
 /// output instance, so live configurations never see a false negative.
 pub(crate) fn declare_offset_committer(group_id: &str, claim: &Arc<()>) {
     ensure_pairing_validator_registered();
+    // EVERY live claim is retained: two outputs configured with the same
+    // group must not overwrite each other — dropping the newer one would
+    // otherwise un-pair a group whose older output is still running.
     committers()
         .lock()
         .expect("kafka txn committers lock")
-        .insert(group_id.to_owned(), Arc::downgrade(claim));
+        .entry(group_id.to_owned())
+        .or_default()
+        .push(Arc::downgrade(claim));
 }
 
 /// Live committer groups: claims whose owning output instance is gone
 /// (dry builds, removed configs) are pruned before the decision.
 fn live_committers() -> BTreeSet<String> {
     let mut committers = committers().lock().expect("kafka txn committers lock");
-    committers.retain(|_, claim| claim.strong_count() > 0);
+    committers.retain(|_, claims| {
+        claims.retain(|claim| claim.strong_count() > 0);
+        !claims.is_empty()
+    });
     committers.keys().cloned().collect()
 }
 
@@ -351,6 +359,35 @@ mod tests {
             err.to_string().contains(&group),
             "the unpaired group is reported again: {err}"
         );
+        drop(frontier);
+    }
+
+    /// Two outputs may declare the same consumer group (a temporary/dry
+    /// output next to the real one). Each claim is retained separately:
+    /// dropping the newer claim must not un-pair a group whose older claim
+    /// is still alive.
+    #[test]
+    fn multiple_live_claims_keep_the_group_paired() {
+        let group = unique_group("ktx-multi-claim");
+        let frontier = Arc::new(CommitFrontier::new());
+        let _slot = register_group(&group, vec!["orders".into()], frontier.clone());
+        let older = Arc::new(());
+        declare_offset_committer(&group, &older);
+        {
+            let newer = Arc::new(());
+            declare_offset_committer(&group, &newer);
+        }
+        // The newer claim is gone; the older claim still pairs the group.
+        match validate_pairings() {
+            Ok(()) => {}
+            Err(e) => assert!(
+                !e.to_string().contains(&group),
+                "the older live claim keeps the group paired: {e}"
+            ),
+        }
+        drop(older);
+        let err = validate_pairings().expect_err("no live claim must fail validation");
+        assert!(err.to_string().contains(&group), "{err}");
         drop(frontier);
     }
 

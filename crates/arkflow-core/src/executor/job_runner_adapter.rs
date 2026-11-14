@@ -825,6 +825,30 @@ impl RescaleContext {
         if let Some(rest) = key.strip_prefix(b"utf8:") {
             return Ok(rest.to_vec());
         }
+        // Persisted integer keys are a BARE tag followed by the fixed-width
+        // big-endian payload. Match the exact length FIRST: the first payload
+        // byte can be ':' (0x3a), so a bare i8 key for value 58 is exactly
+        // `b"i8:"` and would otherwise be taken for the colon-delimited form,
+        // yielding an empty routing key. No tag is a prefix of another, so
+        // the match is unambiguous.
+        for (tag, width) in [
+            (&b"i8"[..], 1usize),
+            (&b"i16"[..], 2),
+            (&b"i32"[..], 4),
+            (&b"i64"[..], 8),
+            (&b"u8"[..], 1),
+            (&b"u16"[..], 2),
+            (&b"u32"[..], 4),
+            (&b"u64"[..], 8),
+        ] {
+            if key.len() == tag.len() + width {
+                if let Some(rest) = key.strip_prefix(tag) {
+                    return Ok(rest.to_vec());
+                }
+            }
+        }
+        // Colon-delimited tags: string/binary keys and the tagged integer
+        // forms written by intermediate builds.
         for tag in [
             &b"binary:"[..],
             b"i8:",
@@ -835,22 +859,6 @@ impl RescaleContext {
             b"u16:",
             b"u32:",
             b"u64:",
-        ] {
-            if let Some(rest) = key.strip_prefix(tag) {
-                return Ok(rest.to_vec());
-            }
-        }
-        // Legacy integer keys (bare tag, no colon). No tag is a prefix of
-        // another, so the match is unambiguous.
-        for tag in [
-            &b"i8"[..],
-            b"i16",
-            b"i32",
-            b"i64",
-            b"u8",
-            b"u16",
-            b"u32",
-            b"u64",
         ] {
             if let Some(rest) = key.strip_prefix(tag) {
                 return Ok(rest.to_vec());
@@ -1492,6 +1500,40 @@ mod validation_tests {
             };
             let moved = context.redistribute(entry).unwrap();
             assert_eq!(moved.namespace, expected);
+            assert_eq!(moved.key, state_key);
+        }
+
+        // Regression: a bare integer payload whose FIRST byte is ':' (0x3a)
+        // must not be mistaken for the colon-delimited tag. The bare key is
+        // exactly tag+width bytes long, so the length check disambiguates it
+        // from the tagged form (tag+':'+width).
+        let colon_leading: i64 = 0x3a02_0304_0506_0708;
+        let colon_group = crate::job::key_group_for_key(&colon_leading.to_be_bytes(), 16).unwrap();
+        let colon_owner = new_plan
+            .tasks
+            .iter()
+            .find(|task| {
+                task.operator_id == "agg"
+                    && task
+                        .partitions
+                        .iter()
+                        .any(|partition| partition.key_group.contains(colon_group))
+            })
+            .unwrap();
+        let colon_expected =
+            crate::job::effective_state_namespace(&new_plan.spec.id, None, "agg", &colon_owner.id);
+        for state_key in [
+            [b"i64".as_slice(), colon_leading.to_be_bytes().as_slice()].concat(),
+            [b"i64:".as_slice(), colon_leading.to_be_bytes().as_slice()].concat(),
+        ] {
+            let entry = crate::state::StateEntry {
+                namespace: old_namespace.clone(),
+                key: state_key.clone(),
+                value: b"1".to_vec(),
+                expires_at_ms: None,
+            };
+            let moved = context.redistribute(entry).unwrap();
+            assert_eq!(moved.namespace, colon_expected);
             assert_eq!(moved.key, state_key);
         }
     }

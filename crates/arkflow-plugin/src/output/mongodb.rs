@@ -174,9 +174,15 @@ impl Output for MongoDBOutput {
 /// True when a write error is the duplicate of the document `_id` index:
 /// the idempotent echo of an at-least-once replay. A conflict on any OTHER
 /// unique index means this document was never written, so it must propagate
-/// instead of being reported as a successful replay.
+/// instead of being reported as a successful replay. The index name is
+/// compared as a whole: a prefix match would also accept a custom index
+/// named `_id_email` and drop an uninserted document.
 fn is_id_duplicate(code: i32, message: &str) -> bool {
-    code == 11000 && message.contains("index: _id_")
+    code == 11000
+        && message
+            .split_once("index: ")
+            .and_then(|(_, rest)| rest.split_once(" dup key"))
+            .is_some_and(|(index, _)| index == "_id_")
 }
 
 /// True when EVERY write error the driver reports is a duplicate of the
@@ -409,6 +415,13 @@ mod tests {
         assert!(!is_id_duplicate(
             11000,
             "E11000 duplicate key error collection: db.c index: email_1 dup key: { email: \"a\" }"
+        ));
+        // A custom index whose name merely starts with `_id_` is a secondary
+        // index: the same prefix check would report success for a document
+        // that was never inserted.
+        assert!(!is_id_duplicate(
+            11000,
+            "E11000 duplicate key error collection: db.c index: _id_email dup key: { _id_email: 1 }"
         ));
         assert!(!is_id_duplicate(121, "document validation failure"));
     }

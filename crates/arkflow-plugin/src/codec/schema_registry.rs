@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use datafusion::arrow;
 use datafusion::arrow::datatypes::Schema;
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use prost_reflect::MessageDescriptor;
 use serde::Deserialize;
@@ -441,8 +441,16 @@ impl Decoder for SchemaRegistryCodec {
                 .map_err(|e| Error::Process(format!("schema registry decode reorder: {e}")))?;
             columns.push(interleaved);
         }
-        let merged = RecordBatch::try_new(schema, columns)
-            .map_err(|e| Error::Process(format!("schema registry decode reorder: {e}")))?;
+        // The union of two zero-field messages has no columns, so the row
+        // count cannot be derived from the column vector: state it
+        // explicitly, otherwise the whole decode fails for a legal
+        // (empty) message schema.
+        let merged = RecordBatch::try_new_with_options(
+            schema,
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(row_order.len())),
+        )
+        .map_err(|e| Error::Process(format!("schema registry decode reorder: {e}")))?;
         Ok(MessageBatch::new_arrow(merged))
     }
 }
