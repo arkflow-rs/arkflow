@@ -45,6 +45,10 @@ struct ReaderGeneration {
     tracker: TaskTracker,
 }
 
+/// One child's pending delivery: a batch read from the source but not yet
+/// enqueued, carried across a reader-generation switch.
+type DeliveryHandoff = Arc<Mutex<Option<(MessageBatchRef, Arc<dyn Ack>)>>>;
+
 struct MultipleInputs {
     #[allow(unused)]
     input_name: Option<String>,
@@ -65,7 +69,7 @@ struct MultipleInputs {
     /// The next generation re-queues it before reading again — the source
     /// has already removed it (e.g. a Redis BLPOP), so dropping it here
     /// would lose data on every reconnect.
-    handoffs: Vec<Arc<Mutex<Option<(MessageBatchRef, Arc<dyn Ack>)>>>>,
+    handoffs: Vec<DeliveryHandoff>,
 }
 
 enum Msg {

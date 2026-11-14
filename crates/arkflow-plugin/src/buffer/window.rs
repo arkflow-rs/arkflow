@@ -24,6 +24,13 @@ use tokio::sync::Notify;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+/// Window queue shared by the buffer's inputs, each batch paired with its
+/// source acknowledgement.
+type WindowQueue = DashMap<String, VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>;
+
+/// Batches (with acks) drained from the queue, restorable on cancellation.
+type PendingWindow = (Vec<MessageBatchRef>, Vec<Arc<dyn Ack>>);
+
 pub(crate) struct BaseWindow {
     /// Thread-safe queue to store message batches and their acknowledgments
     /// Using DashMap instead of nested RwLock for better performance
@@ -177,8 +184,8 @@ impl BaseWindow {
         // queues; a synchronous drop guard restores them because Drop cannot
         // await.
         struct RestorePending<'a> {
-            queue: &'a DashMap<String, VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>,
-            pending: Option<(Vec<MessageBatchRef>, Vec<Arc<dyn Ack>>)>,
+            queue: &'a WindowQueue,
+            pending: Option<PendingWindow>,
         }
         impl Drop for RestorePending<'_> {
             fn drop(&mut self) {

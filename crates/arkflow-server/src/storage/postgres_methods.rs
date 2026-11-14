@@ -1056,7 +1056,8 @@ impl StorageBackend for PostgresBackend {
             // Duplicate terminal reports must not repeat the accounting.
             if attempt_updated == 0 {
                 return Ok(());
-            }            if terminal {
+            }
+            if terminal {
                 match failure_class {
                     Some("temporary_execution") | Some("transport") | Some("node_unavailable") => {
                         let retry_at = now_ms() + 1_000;

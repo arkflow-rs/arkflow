@@ -386,27 +386,20 @@ impl Hub {
         // Commands queued for an old process belong to a runtime that no
         // longer exists. Reconciliation below will enqueue the desired
         // state for the new boot.
-        let (commands, leased_commands) = match old.as_ref() {
+        //
+        // A same-boot session refresh keeps its leases AS leases. Re-queuing
+        // a still-valid lease looked attractive (a poll response issued under
+        // the expired token might never have reached the Agent), but a
+        // command the Agent already executed but whose result post raced the
+        // session expiry would then be re-executed under the SAME command and
+        // checkpoint id. Checkpoint rounds are not idempotent — the kernel
+        // rejects the repeated barrier ("stale duplicate barrier") — so the
+        // pause capture would fail. The expiry sweep is the recovery path: it
+        // settles the timed-out operation and the caller re-dispatches a
+        // FRESH capture id.
+        let (commands, leased_commands) = match &old {
             Some(record) if !boot_changed => {
-                let mut commands: VecDeque<AgentCommand> = VecDeque::new();
-                let mut leased = BTreeMap::new();
-                // A session refresh of the SAME process gets a new token; a
-                // poll response issued under the old one may never have
-                // reached the Agent. Re-deliver still-valid leases under
-                // their original command ids — the Agent dedupes by id
-                // (completed cache + in-flight set), so a command it did
-                // receive is never executed twice.
-                for (id, command) in &record.leased_commands {
-                    if command.expires_at_ms > now {
-                        commands.push_back(command.clone());
-                    } else {
-                        // Expired leases follow the expiry sweep, which
-                        // re-enqueues them as retries with a fresh operation.
-                        leased.insert(id.clone(), command.clone());
-                    }
-                }
-                commands.extend(record.commands.iter().cloned());
-                (commands, leased)
+                (record.commands.clone(), record.leased_commands.clone())
             }
             _ => (VecDeque::new(), BTreeMap::new()),
         };

@@ -55,6 +55,13 @@ impl CompletionSlot {
     }
 }
 
+/// One checkpoint failure reported by a chain: the barrier it belongs to
+/// (`None` for a failure that cannot be attributed to a round) plus the error.
+type CheckpointErrorReport = (Option<crate::checkpoint::CheckpointBarrier>, Error);
+
+/// Receiver for the per-chain checkpoint failure reports above.
+type CheckpointErrorReceiver = tokio::sync::mpsc::UnboundedReceiver<CheckpointErrorReport>;
+
 /// Handle to a running kernel Job: snapshot/restore/stop without consuming
 /// the handle; completion is observed via `watcher`.
 pub struct KernelJobHandle {
@@ -75,14 +82,7 @@ pub struct KernelJobHandle {
     reports: Arc<
         tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<super::barrier::ChainSnapshot>>,
     >,
-    checkpoint_errors: Arc<
-        tokio::sync::Mutex<
-            tokio::sync::mpsc::UnboundedReceiver<(
-                Option<crate::checkpoint::CheckpointBarrier>,
-                Error,
-            )>,
-        >,
-    >,
+    checkpoint_errors: Arc<tokio::sync::Mutex<CheckpointErrorReceiver>>,
     /// Exit notifications from chains, used to exempt ended chains from
     /// barrier rounds. The handle holds a keep-alive sender so the receiver
     /// only reports real notifications, never channel closure.

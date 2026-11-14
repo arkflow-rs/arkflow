@@ -576,14 +576,9 @@ async fn multi_node_cluster() -> Option<MultiNodeCluster> {
             "ADDSLOTS failed on node {index}: {reply}"
         );
     }
-    for index in 1..3 {
+    for ip in &ips[1..] {
         let reply = clients[0]
-            .cmd(&[
-                "CLUSTER".into(),
-                "MEET".into(),
-                ips[index].clone(),
-                "6379".into(),
-            ])
+            .cmd(&["CLUSTER".into(), "MEET".into(), ip.clone(), "6379".into()])
             .await;
         assert!(reply.starts_with('+'), "CLUSTER MEET failed: {reply}");
     }

@@ -830,7 +830,7 @@ impl JobRuntime {
         };
         let manifest_key = format!(
             "{prefix}/{checkpoint_id}/manifests/{}.json",
-            arkflow_core::checkpoint::encode_node_key(&node_id)
+            arkflow_core::checkpoint::encode_node_key(node_id)
         );
         let manifest_key_owned = manifest_key.clone();
         let store_uri_for_manifest = store_uri.to_owned();
@@ -897,7 +897,7 @@ impl JobRuntime {
         for node_id in manifest_nodes {
             let key = format!(
                 "{prefix}/{checkpoint_id}/manifests/{}.json",
-                arkflow_core::checkpoint::encode_node_key(&node_id)
+                arkflow_core::checkpoint::encode_node_key(node_id)
             );
             let artifact = RecoveryArtifact {
                 id: checkpoint_id.to_owned(),

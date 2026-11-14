@@ -916,9 +916,7 @@ impl RescaleContext {
             .find(marker)
             .ok_or_else(|| Error::Process("state namespace lacks a task segment".into()))?
             + marker.len();
-        Ok(percent_decode(
-            namespace[start..].split(':').next().unwrap_or_default(),
-        )?)
+        percent_decode(namespace[start..].split(':').next().unwrap_or_default())
     }
 }
 

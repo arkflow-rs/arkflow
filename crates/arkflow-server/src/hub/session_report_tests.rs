@@ -346,13 +346,11 @@ async fn expired_session_mid_command_still_settles_one_terminal_result() {
         node_id: "agent-a".into(),
         session_token: reauth.session_token.clone(),
     };
-    // A same-boot re-registration re-delivers the still-valid lease under
-    // its original id: the poll response sent under the expired session may
-    // never have reached the Agent. The Agent dedupes by command id, so a
-    // command it did receive is not executed twice.
-    let redelivered_after_reregister = hub.commands(auth_b.clone()).await.unwrap();
-    assert_eq!(redelivered_after_reregister.len(), 1);
-    assert_eq!(redelivered_after_reregister[0].id, command.id);
+    // The command lease is still valid, so nothing is redelivered yet: a
+    // same-boot session refresh keeps leases leased. Early re-delivery could
+    // re-execute a non-idempotent checkpoint command whose result post raced
+    // the session expiry; the expiry sweep and a fresh capture id recover it.
+    assert!(hub.commands(auth_b.clone()).await.unwrap().is_empty());
 
     // Let the command lease expire. Session B's own TTL also elapses
     // during the wait — with a hard TTL every long gap ends in another
