@@ -14,6 +14,61 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::warn;
 
+/// Interval between "running" progress reports for an executing command.
+const COMMAND_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Keeps a "running" progress report ticking while a command executes. The
+/// Hub renews the command lease on Acknowledged/Running results, so an
+/// operation that outlives `lease_ttl_ms` (a configuration apply, a Job
+/// start) is not swept as TimedOut and dispatched a second time. Dropping
+/// the guard stops the reports; every early-return path is covered.
+struct ProgressReports {
+    cancel: tokio_util::sync::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ProgressReports {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        // A report in flight is harmless: the Hub ignores non-terminal
+        // updates once the operation is terminal.
+        self.handle.abort();
+    }
+}
+
+fn spawn_progress_reports(
+    client: &Client,
+    config: &NodeAgentConfig,
+    auth: &AgentAuth,
+    template: &CommandResult,
+) -> ProgressReports {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let client = client.clone();
+    let config = config.clone();
+    let auth = auth.clone();
+    let mut update = template.clone();
+    update.state = HubOperationState::Running;
+    let handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(COMMAND_PROGRESS_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick fires immediately; the caller just sent the
+        // Acknowledged report, so skip it.
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = task_cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    // A failed report is retried on the next tick; the Hub's
+                    // lease sweep remains the fallback for an unreachable Hub.
+                    let _ = send_result(&client, &config, &auth, update.clone()).await;
+                }
+            }
+        }
+    });
+    ProgressReports { cancel, handle }
+}
+
 pub(super) async fn execute_command(
     client: &Client,
     cp: &ControlPlane,
@@ -68,6 +123,8 @@ pub(super) async fn execute_command(
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
         }
+        // Long Job operations keep the command lease alive while they run.
+        let _progress = spawn_progress_reports(client, config, auth, &result);
         let operation = execute_job_operation(command, config, job_runtime).await;
         if let Ok(Some(manifest_uri)) = &operation {
             result.checkpoint_manifest_uri = Some(manifest_uri.clone());
@@ -98,7 +155,10 @@ pub(super) async fn execute_command(
         result.failure_class = Some("stale_generation".into());
         return deliver_result(client, config, auth, result).await;
     }
-    send_result(client, config, auth, result).await?;
+    send_result(client, config, auth, result.clone()).await?;
+    // Configuration/lifecycle execution can outlive the lease; report
+    // progress until the terminal result is delivered.
+    let _progress = spawn_progress_reports(client, config, auth, &result);
     match &command.operation {
         AgentOperation::ValidateConfiguration | AgentOperation::DiffConfiguration => {
             // Read-only reports dispatched by the Hub for console clients.
