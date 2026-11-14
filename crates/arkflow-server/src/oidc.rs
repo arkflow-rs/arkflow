@@ -1567,11 +1567,9 @@ mod tests {
         assert_eq!(scopes[0].resource_id.as_deref(), Some("node-a"));
         assert_eq!(scopes[1].resource_type, "stream");
         let absent = json!({ "other": 1 });
-        assert!(
-            scopes_from_claims(&absent, "permissions")
-                .expect("missing claim keeps the no-scopes contract")
-                .is_empty()
-        );
+        assert!(scopes_from_claims(&absent, "permissions")
+            .expect("missing claim keeps the no-scopes contract")
+            .is_empty());
     }
 
     #[tokio::test]

@@ -3554,17 +3554,14 @@ async fn hub_job_action_and_recovery_artifact_routes_validate_input() {
     // Job observation from the executing node flips observed state. The
     // node may only observe a Job it was dispatched: seed the dispatch
     // fingerprint the dispatch path records.
-    hub.start_dispatch_fingerprints
-        .write()
-        .await
-        .insert(
-            (
-                "acted-job".into(),
-                "node-a".into(),
-                detail["job"]["generation"].as_u64().unwrap_or(1),
-            ),
-            0,
-        );
+    hub.start_dispatch_fingerprints.write().await.insert(
+        (
+            "acted-job".into(),
+            "node-a".into(),
+            detail["job"]["generation"].as_u64().unwrap_or(1),
+        ),
+        0,
+    );
     let (status, _) = post_json(
         &app,
         "/api/v1/agent/job-observations",

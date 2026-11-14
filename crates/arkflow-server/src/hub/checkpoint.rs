@@ -492,15 +492,13 @@ impl Hub {
             // catalog debris, not a retention failure — the row removal below
             // is what keeps the catalog consistent.
             let deletion = match record.manifest_uri.clone() {
-                Some(manifest_uri) => {
-                    tokio::task::spawn_blocking(move || {
-                        crate::agent::delete_checkpoint_artifact_at(&manifest_uri, &artifact)
-                    })
-                    .await
-                    .map_err(|error| {
-                        HubError::Invalid(format!("checkpoint retention task failed: {error}"))
-                    })?
-                }
+                Some(manifest_uri) => tokio::task::spawn_blocking(move || {
+                    crate::agent::delete_checkpoint_artifact_at(&manifest_uri, &artifact)
+                })
+                .await
+                .map_err(|error| {
+                    HubError::Invalid(format!("checkpoint retention task failed: {error}"))
+                })?,
                 None => {
                     // Legacy rows without a reported manifest location fall
                     // back to the current spec.

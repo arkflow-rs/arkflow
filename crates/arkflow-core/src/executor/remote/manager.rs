@@ -1061,8 +1061,7 @@ impl NetworkManager {
                                     drop(permit);
                                     match accepted {
                                         Ok(Ok(tls_stream)) => {
-                                            handshake_manager
-                                                .accept_stream(Box::new(tls_stream));
+                                            handshake_manager.accept_stream(Box::new(tls_stream));
                                         }
                                         Ok(Err(error)) => handshake_manager.report_failure(error),
                                         Err(_) => handshake_manager.report_failure(Error::Process(

@@ -116,8 +116,9 @@ impl<T: MqttClient> MqttOutput<T> {
         if let Some(keep_alive) = self.config.keep_alive {
             // See the input side: the CONNECT field is u16 seconds and
             // rumqttc narrows silently — reject overflow at build.
-            u16::try_from(keep_alive)
-                .map_err(|_| Error::Config("mqtt keep_alive must be at most 65535 seconds".into()))?;
+            u16::try_from(keep_alive).map_err(|_| {
+                Error::Config("mqtt keep_alive must be at most 65535 seconds".into())
+            })?;
             mqtt_options.set_keep_alive(std::time::Duration::from_secs(keep_alive));
         }
         if let Some(clean_session) = self.config.clean_session {

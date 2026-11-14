@@ -299,13 +299,11 @@ fn build_struct_array<'a, 'de>(
     // the children (`try_new` rejects empty children outright), so an
     // `after: {}`-style empty object failed whenever rows were present.
     // Pass the row count explicitly.
-    let array = StructArray::try_new_with_length(
-        fields.clone(),
-        children,
-        nulls.finish(),
-        values.len(),
-    )
-    .map_err(|e| Error::Process(format!("JSON decode failed for column `{}`: {}", path, e)))?;
+    let array =
+        StructArray::try_new_with_length(fields.clone(), children, nulls.finish(), values.len())
+            .map_err(|e| {
+                Error::Process(format!("JSON decode failed for column `{}`: {}", path, e))
+            })?;
     Ok(Arc::new(array))
 }
 

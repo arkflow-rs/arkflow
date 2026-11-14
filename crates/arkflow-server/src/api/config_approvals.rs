@@ -91,9 +91,14 @@ pub(super) async fn get_approval(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "approval", Some(id.clone()))
-            .await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "approval",
+        Some(id.clone()),
+    )
+    .await
     {
         return response;
     }

@@ -114,7 +114,10 @@ pub(super) async fn hub_event_stream(
                             .unwrap_or_else(|_| SseEvent::default().event("resync").data("{}"))
                     })
                     .unwrap_or_else(|| SseEvent::default().event("resync").data("{}"));
-                return Some((Ok::<_, Infallible>(event), (replay, receiver, query, dedup_through)));
+                return Some((
+                    Ok::<_, Infallible>(event),
+                    (replay, receiver, query, dedup_through),
+                ));
             }
             loop {
                 match receiver.recv().await {

@@ -812,11 +812,9 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let report = finalize_sqlite_snapshot(
-            path.to_str().unwrap(),
-            vec![("cp_users".to_string(), 1)],
-        )
-        .unwrap();
+        let report =
+            finalize_sqlite_snapshot(path.to_str().unwrap(), vec![("cp_users".to_string(), 1)])
+                .unwrap();
         assert_eq!(report.rows_per_table, vec![("cp_users".to_string(), 1)]);
         let connection = rusqlite::Connection::open(&path).unwrap();
         let sessions: i64 = connection

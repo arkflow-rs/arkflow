@@ -3641,8 +3641,8 @@ impl StorageBackend for SqliteBackend {
             .map_err(|error| StorageError::Encoding(format!("intent floor scan: {error}")))?;
         let mut max = 0u64;
         for id in rows {
-            let id = id
-                .map_err(|error| StorageError::Encoding(format!("intent floor scan: {error}")))?;
+            let id =
+                id.map_err(|error| StorageError::Encoding(format!("intent floor scan: {error}")))?;
             // intent-{generation}-{counter}: the counter is the third segment.
             let parts: Vec<&str> = id.split('-').collect();
             if parts.len() == 3 && parts[0] == "intent" {

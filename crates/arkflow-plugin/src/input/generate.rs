@@ -86,8 +86,7 @@ impl Input for GenerateInput {
             // The FINAL batch may be a partial one: emitting only whole
             // multiples silently dropped the remainder (count=10 with
             // batch_size=4 produced 8 records and stopped at EOF).
-            batch_size =
-                batch_size.min((count as i64 - current_count.max(0)).max(0) as usize);
+            batch_size = batch_size.min((count as i64 - current_count.max(0)).max(0) as usize);
         }
 
         // One read's payloads are byte-identical copies of the template, so

@@ -200,7 +200,9 @@ pub(crate) fn repository_for_manifest_uri(
     let root = manifest_uri
         .strip_suffix(manifest_key)
         .ok_or_else(|| "manifest uri does not match the recovery layout".to_string())?;
-    Ok(CheckpointRepository::new(SharedCheckpointStore::from_uri(root)?))
+    Ok(CheckpointRepository::new(SharedCheckpointStore::from_uri(
+        root,
+    )?))
 }
 
 /// Delete one artifact at the location its record reports.

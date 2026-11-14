@@ -89,7 +89,8 @@ impl DatabaseConnection {
                     build_mysql_insert(output_config, columns, chunk)
                         .build()
                         .execute(&mut *conn)
-                        .await.map_err(|e| {
+                        .await
+                        .map_err(|e| {
                             Error::Process(format!("Failed to execute MySQL query: {}", e))
                         })?;
                 }
@@ -100,7 +101,8 @@ impl DatabaseConnection {
                     build_postgres_insert(output_config, columns, chunk)
                         .build()
                         .execute(&mut *conn)
-                        .await.map_err(|e| {
+                        .await
+                        .map_err(|e| {
                             Error::Process(format!("Failed to execute PostgresSQL query: {}", e))
                         })?;
                 }
@@ -153,9 +155,10 @@ async fn execute_insert_transactional(
                     build_mysql_insert(output_config, columns, chunk)
                         .build()
                         .execute(&mut *transaction)
-                        .await.map_err(|e| Error::Process(format!(
-                            "Failed to execute MySQL query: {}", e
-                        )))?;
+                        .await
+                        .map_err(|e| {
+                            Error::Process(format!("Failed to execute MySQL query: {}", e))
+                        })?;
                 }
             }
             transaction
@@ -172,9 +175,10 @@ async fn execute_insert_transactional(
                     build_postgres_insert(output_config, columns, chunk)
                         .build()
                         .execute(&mut *transaction)
-                        .await.map_err(|e| Error::Process(format!(
-                            "Failed to execute PostgresSQL query: {}", e
-                        )))?;
+                        .await
+                        .map_err(|e| {
+                            Error::Process(format!("Failed to execute PostgresSQL query: {}", e))
+                        })?;
                 }
             }
             transaction.commit().await.map_err(|e| {

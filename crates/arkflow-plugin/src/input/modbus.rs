@@ -115,10 +115,7 @@ impl Input for ModbusInput {
         };
 
         let due = {
-            let mut next_due = self
-                .next_due
-                .lock()
-                .expect("modbus next_due lock poisoned");
+            let mut next_due = self.next_due.lock().expect("modbus next_due lock poisoned");
             match *next_due {
                 Some(due) => due,
                 None => {

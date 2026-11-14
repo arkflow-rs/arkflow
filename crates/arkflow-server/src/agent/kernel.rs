@@ -736,16 +736,11 @@ impl JobRuntime {
                 task.checkpoint_store_uri.clone(),
             )
         };
-        let (
-            snapshot,
-            _flat_positions,
-            task_watermarks,
-            watermark_partitions,
-            positions_by_task,
-        ) = kernel
-            .checkpoint_barrier_with_details(checkpoint_id, generation)
-            .await
-            .map_err(|error| error.to_string())?;
+        let (snapshot, _flat_positions, task_watermarks, watermark_partitions, positions_by_task) =
+            kernel
+                .checkpoint_barrier_with_details(checkpoint_id, generation)
+                .await
+                .map_err(|error| error.to_string())?;
         let store_uri = checkpoint_store_uri
             .as_deref()
             .ok_or_else(|| "Job has no checkpoint object_store_uri".to_string())?;

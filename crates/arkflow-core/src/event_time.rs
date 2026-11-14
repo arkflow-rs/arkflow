@@ -56,6 +56,31 @@ impl EventTimePartition {
             Self::for_source(source_id, self.partition)
         }
     }
+    /// Prefix this partition's topic with a source-chain namespace. Gates
+    /// that share one watermark tracker use this so two chains observing the
+    /// SAME connector topic/partition keep independent progress: otherwise
+    /// the faster chain advances the shared entry and closes windows the
+    /// slower chain still has events for.
+    pub fn in_namespace(&self, namespace: &str) -> Self {
+        let topic = self.topic.as_deref().unwrap_or("");
+        Self::new(Some(format!("{namespace}\u{1f}{topic}")), self.partition)
+    }
+
+    /// Inverse of [`Self::in_namespace`]; `None` when this partition does
+    /// not belong to `namespace` (or carries no topic at all).
+    pub fn strip_namespace(&self, namespace: &str) -> Option<Self> {
+        let topic = self.topic.as_deref()?;
+        let rest = topic.strip_prefix(namespace)?.strip_prefix('\u{1f}')?;
+        Some(Self::new(
+            (!rest.is_empty()).then(|| rest.to_string()),
+            self.partition,
+        ))
+    }
+
+    /// True when [`Self::in_namespace`] with `namespace` was already applied.
+    pub fn is_in_namespace(&self, namespace: &str) -> bool {
+        self.strip_namespace(namespace).is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,9 +156,8 @@ impl WatermarkTracker {
         // a value above i64::MAX would become NEGATIVE (negative allowed
         // lateness / idle timeout), corrupting watermark firing. Fail the
         // configuration loudly instead.
-        let out_of_orderness_ms = i64::try_from(watermark.out_of_orderness_ms).map_err(|_| {
-            Error::Config("watermark.out_of_orderness_ms exceeds i64::MAX".into())
-        })?;
+        let out_of_orderness_ms = i64::try_from(watermark.out_of_orderness_ms)
+            .map_err(|_| Error::Config("watermark.out_of_orderness_ms exceeds i64::MAX".into()))?;
         let idle_timeout_ms = watermark
             .idle_timeout_ms
             .map(|value| {

@@ -190,7 +190,10 @@ impl KafkaOutput {
         Ok(client_config)
     }
 
-    /// Create a new Kafka output component
+    /// Create a Kafka output without an L3 pairing claim (tests and direct
+    /// construction). The production path goes through the builder, which
+    /// uses [`Self::new_with_claim`] so pairing validation sees the claim.
+    #[cfg(test)]
     pub fn new(config: KafkaOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
         Self::new_with_claim(config, codec, None)
     }

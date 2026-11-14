@@ -52,10 +52,7 @@ pub struct MemoryInput {
 /// - inside a current-thread runtime: blocking would deadlock the only
 ///   worker — fail with a configuration error instead of panicking;
 /// - outside any runtime: a temporary current-thread runtime decodes it.
-fn decode_initial_message(
-    codec: &Arc<dyn Codec>,
-    payload: Vec<u8>,
-) -> Result<MessageBatch, Error> {
+fn decode_initial_message(codec: &Arc<dyn Codec>, payload: Vec<u8>) -> Result<MessageBatch, Error> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
@@ -73,9 +70,7 @@ fn decode_initial_message(
                 .enable_all()
                 .build()
                 .map_err(|e| {
-                    Error::Config(format!(
-                        "memory input decode runtime build failed: {e}"
-                    ))
+                    Error::Config(format!("memory input decode runtime build failed: {e}"))
                 })?;
             runtime.block_on(codec.decode(vec![payload]))
         }

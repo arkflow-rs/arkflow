@@ -297,7 +297,8 @@ fn expr_folds_time(expr: &LogicalExpr) -> bool {
             // was cached. Recurse into every subquery form.
             LogicalExpr::ScalarSubquery(subquery)
             | LogicalExpr::InSubquery(datafusion::logical_expr::expr::InSubquery {
-                subquery, ..
+                subquery,
+                ..
             })
             | LogicalExpr::Exists(datafusion::logical_expr::expr::Exists { subquery, .. }) => {
                 if plan_folds_time(&subquery.subquery) {
@@ -306,7 +307,8 @@ fn expr_folds_time(expr: &LogicalExpr) -> bool {
                 }
             }
             LogicalExpr::SetComparison(datafusion::logical_expr::expr::SetComparison {
-                subquery, ..
+                subquery,
+                ..
             }) => {
                 if plan_folds_time(&subquery.subquery) {
                     found = true;

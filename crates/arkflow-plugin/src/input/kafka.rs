@@ -2766,10 +2766,7 @@ mod tests {
         value["transactional_offsets"] = serde_json::json!(true);
         let input = input_with(value);
         let committer_claim = std::sync::Arc::new(());
-        crate::kafka_txn::declare_offset_committer(
-            &input.config.consumer_group,
-            &committer_claim,
-        );
+        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group, &committer_claim);
         // The acknowledged frontier stands at the ack's next offset.
         input.frontier.seed(&[SourcePosition {
             topic: Some("orders".into()),
@@ -2815,10 +2812,7 @@ mod tests {
         value["transactional_offsets"] = serde_json::json!(true);
         let input = input_with(value);
         let committer_claim = std::sync::Arc::new(());
-        crate::kafka_txn::declare_offset_committer(
-            &input.config.consumer_group,
-            &committer_claim,
-        );
+        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group, &committer_claim);
         let registered = crate::kafka_txn::group_frontier(&input.config.consumer_group)
             .expect("transactional input registers its frontier");
         assert!(
@@ -3289,10 +3283,7 @@ mod tests {
         value["transactional_offsets"] = serde_json::json!(true);
         let input = input_with(value);
         let committer_claim = std::sync::Arc::new(());
-        crate::kafka_txn::declare_offset_committer(
-            &input.config.consumer_group,
-            &committer_claim,
-        );
+        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group, &committer_claim);
         // The acknowledged frontier stands at the segment's next offset (8).
         input.frontier.seed(&[SourcePosition {
             topic: Some("orders".into()),

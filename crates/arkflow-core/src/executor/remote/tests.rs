@@ -2702,7 +2702,10 @@ async fn pump_register_rejection_with_failing_abort_combines_errors() {
     .await
     .unwrap();
     drop(tx);
-    let result = pump_edge(rx, writer, quad, pending, shutdown, config, None, false, None, false).await;
+    let result = pump_edge(
+        rx, writer, quad, pending, shutdown, config, None, false, None, false,
+    )
+    .await;
     let error = result.unwrap_err();
     assert!(
         error
@@ -3807,9 +3810,11 @@ async fn pump_register_rejection_with_a_clean_abort_reports_the_limit() {
     .await
     .unwrap();
     drop(tx);
-    let error = pump_edge(rx, writer, quad, pending, shutdown, config, None, false, None, false)
-        .await
-        .unwrap_err();
+    let error = pump_edge(
+        rx, writer, quad, pending, shutdown, config, None, false, None, false,
+    )
+    .await
+    .unwrap_err();
     assert!(
         error
             .to_string()

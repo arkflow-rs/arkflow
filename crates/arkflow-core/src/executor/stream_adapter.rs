@@ -129,10 +129,11 @@ pub(crate) struct WalInput {
     /// claim and the durable WAL hand-off: re-appended by the next read
     /// (at-least-once; a partially appended batch may replay as a duplicate,
     /// which is the contract floor, never a loss).
-    pending_retry: Arc<std::sync::Mutex<std::collections::VecDeque<(
-        crate::MessageBatchRef,
-        Arc<dyn crate::input::Ack>,
-    )>>>,
+    pending_retry: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>)>,
+        >,
+    >,
 }
 
 impl WalInput {
@@ -142,9 +143,7 @@ impl WalInput {
             wal,
             replay: tokio::sync::OnceCell::new(),
             checkpoint_positions: tokio::sync::RwLock::new(None),
-            pending_retry: Arc::new(std::sync::Mutex::new(
-                std::collections::VecDeque::new(),
-            )),
+            pending_retry: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -303,10 +302,7 @@ impl Drop for ReplayLease<'_> {
 struct LiveDeliveryLease {
     retry: Arc<
         std::sync::Mutex<
-            std::collections::VecDeque<(
-                crate::MessageBatchRef,
-                Arc<dyn crate::input::Ack>,
-            )>,
+            std::collections::VecDeque<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>)>,
         >,
     >,
     batch: crate::MessageBatchRef,
@@ -388,7 +384,10 @@ impl Input for WalInput {
                 let seq = self.wal.append(&batch).await?;
                 self.wal.flush().await?;
                 lease.disarm();
-                return Ok((batch, Arc::new(WalAck::new(self.wal.clone(), seq, source_ack))));
+                return Ok((
+                    batch,
+                    Arc::new(WalAck::new(self.wal.clone(), seq, source_ack)),
+                ));
             }
         }
         let (batch, ack) = self.inner.read().await?;

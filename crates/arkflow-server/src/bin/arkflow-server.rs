@@ -143,8 +143,7 @@ async fn serve_with_config(
         // stalls HA takeover until the lease TTL expires.
         #[cfg(unix)]
         {
-            let sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+            let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
             match sigterm {
                 Ok(mut sigterm) => {
                     tokio::select! {

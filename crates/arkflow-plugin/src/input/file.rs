@@ -393,7 +393,8 @@ impl FileInput {
         // it is now rejected with the contract spelled out.
         let mut origin = Url::parse(&config.url)
             .map_err(|e| Error::Config(format!("Failed to parse HTTP URL: {}", e)))?;
-        let had_path = origin.path() != "/" || origin.query().is_some() || origin.fragment().is_some();
+        let had_path =
+            origin.path() != "/" || origin.query().is_some() || origin.fragment().is_some();
         origin.set_path("/");
         origin.set_query(None);
         origin.set_fragment(None);

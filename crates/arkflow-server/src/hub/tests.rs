@@ -1627,36 +1627,33 @@ async fn node_scope_does_not_reach_identity_resources() {
         ..config()
     });
     assert!(
-        !hub
-            .operator_can_scope(
-                Some("node-secret"),
-                OperatorAction::ManageUsers,
-                "user",
-                Some("user-7")
-            )
-            .await,
+        !hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::ManageUsers,
+            "user",
+            Some("user-7")
+        )
+        .await,
         "a node scope must not act on the user sharing its id"
     );
     assert!(
-        !hub
-            .operator_can_scope(
-                Some("node-secret"),
-                OperatorAction::ManageUsers,
-                "credential",
-                Some("user-7")
-            )
-            .await,
+        !hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::ManageUsers,
+            "credential",
+            Some("user-7")
+        )
+        .await,
         "a node scope must not mint credentials for the user sharing its id"
     );
     assert!(
-        !hub
-            .operator_can_scope(
-                Some("node-secret"),
-                OperatorAction::Operate,
-                "job",
-                Some("user-7")
-            )
-            .await,
+        !hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::Operate,
+            "job",
+            Some("user-7")
+        )
+        .await,
         "jobs live in their own id namespace, not the node livespace"
     );
     // Node-livespace resources still match by equality/prefix.
@@ -1679,14 +1676,13 @@ async fn node_scope_does_not_reach_identity_resources() {
         .await
     );
     assert!(
-        !hub
-            .operator_can_scope(
-                Some("node-secret"),
-                OperatorAction::Read,
-                "stream",
-                Some("other/orders")
-            )
-            .await
+        !hub.operator_can_scope(
+            Some("node-secret"),
+            OperatorAction::Read,
+            "stream",
+            Some("other/orders")
+        )
+        .await
     );
 }
 

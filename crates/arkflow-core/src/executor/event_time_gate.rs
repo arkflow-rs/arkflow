@@ -80,6 +80,14 @@ impl WindowTiming {
 pub struct EventTimeGate {
     extractor: Option<FieldTimestampExtractor>,
     tracker: Option<Arc<std::sync::Mutex<WatermarkTracker>>>,
+    /// Source-chain namespace applied to every tracker key when this gate
+    /// SHARES its tracker with other chains (see `with_namespace`). Two
+    /// chains observing the same connector topic/partition would otherwise
+    /// collapse onto one tracker entry and the faster one would close
+    /// windows the slower one still has events for. Persisted checkpoint
+    /// partitions stay RAW (`watermark_positions`/`known_partitions` strip
+    /// the namespace; restore re-applies it).
+    namespace: Option<String>,
     late_policy: LateEventPolicy,
     allowed_lateness_ms: u64,
     window_timings: Vec<WindowTiming>,
@@ -243,6 +251,7 @@ impl EventTimeGate {
         Self {
             extractor: None,
             tracker: None,
+            namespace: None,
             late_policy: LateEventPolicy::Drop,
             allowed_lateness_ms: 0,
             window_timings: Vec::new(),
@@ -298,6 +307,7 @@ impl EventTimeGate {
                 })?,
             }),
             tracker: Some(tracker),
+            namespace: None,
             late_policy: time.late_event_policy,
             allowed_lateness_ms: time.allowed_lateness_ms,
             window_timings: window_timings.into_iter().map(Into::into).collect(),
@@ -316,6 +326,35 @@ impl EventTimeGate {
 
     pub fn is_event_time(&self) -> bool {
         self.tracker.is_some()
+    }
+
+    /// Namespace this gate's tracker keys under `namespace`. Used only when
+    /// the tracker is shared by more than one source chain (see
+    /// `job_runner_adapter::event_time_gates`); single-chain gates keep raw
+    /// keys so existing behavior and checkpoint content are unchanged.
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
+    }
+
+    /// Tracker key for one source-side partition (identity when the gate is
+    /// not namespaced).
+    fn map_partition(&self, partition: &EventTimePartition) -> EventTimePartition {
+        match &self.namespace {
+            Some(namespace) if !partition.is_in_namespace(namespace) => {
+                partition.in_namespace(namespace)
+            }
+            _ => partition.clone(),
+        }
+    }
+
+    /// Raw (persisted-shape) partition; `None` when a namespaced gate sees a
+    /// key from another chain's namespace.
+    fn unmap_partition(&self, partition: &EventTimePartition) -> Option<EventTimePartition> {
+        match &self.namespace {
+            Some(namespace) => partition.strip_namespace(namespace),
+            None => Some(partition.clone()),
+        }
     }
 
     /// Current watermark (restored or observed).
@@ -348,11 +387,12 @@ impl EventTimeGate {
     }
 
     pub fn physical_partition_watermark(&self, partition: &EventTimePartition) -> Option<i64> {
+        let key = self.map_partition(partition);
         self.tracker
             .as_ref()?
             .lock()
             .ok()?
-            .partition_progress_for(partition)
+            .partition_progress_for(&key)
             .map(|progress| progress.watermark_ms)
     }
 
@@ -367,12 +407,16 @@ impl EventTimeGate {
         tracker
             .physical_partition_progress()
             .iter()
-            .map(|(partition, progress)| {
-                WatermarkPosition::new(
-                    partition.topic.clone(),
-                    partition.partition,
+            // Persist RAW keys: namespaced gates report only their OWN
+            // chain's entries, stripped back to connector shape, so a
+            // restore into a differently-grouped graph still matches.
+            .filter_map(|(partition, progress)| {
+                let raw = self.unmap_partition(partition)?;
+                Some(WatermarkPosition::new(
+                    raw.topic.clone(),
+                    raw.partition,
                     progress.watermark_ms,
-                )
+                ))
             })
             .collect()
     }
@@ -392,14 +436,18 @@ impl EventTimeGate {
         tracker
             .physical_partition_progress()
             .keys()
-            .cloned()
+            .filter_map(|partition| self.unmap_partition(partition))
             .collect()
     }
 
     pub fn seed_partitions(&mut self, partitions: &[EventTimePartition]) {
         if let Some(tracker) = &self.tracker {
             if let Ok(mut tracker) = tracker.lock() {
-                tracker.seed_partitions(partitions);
+                let mapped = partitions
+                    .iter()
+                    .map(|partition| self.map_partition(partition))
+                    .collect::<Vec<_>>();
+                tracker.seed_partitions(&mapped);
             }
         }
     }
@@ -416,7 +464,8 @@ impl EventTimeGate {
     pub fn restore_partition_key(&mut self, partition: &EventTimePartition, watermark_ms: i64) {
         if let Some(tracker) = &self.tracker {
             if let Ok(mut tracker) = tracker.lock() {
-                tracker.restore_partition_key(partition, watermark_ms);
+                let mapped = self.map_partition(partition);
+                tracker.restore_partition_key(&mapped, watermark_ms);
             }
         }
     }
@@ -501,7 +550,7 @@ impl EventTimeGate {
         let mut observed = Vec::with_capacity(partitions.len());
         for (partition, batch, ack) in partitions {
             let event_times_ms = extractor.extract_timestamps_ms(&batch)?;
-            observed.push((partition, batch, ack, event_times_ms));
+            observed.push((self.map_partition(&partition), batch, ack, event_times_ms));
         }
         let now_ms = crate::state::now_ms() as i64;
         // Advance the watermark with THIS batch's observations first, then
@@ -2003,6 +2052,116 @@ mod tests {
             Some(i64::MIN),
             "a seeded silent partition is active at the minimum watermark"
         );
+    }
+
+    /// Two chains of one job share a window-group tracker while observing
+    /// the SAME connector topic/partition (one Kafka input feeding two
+    /// streams). Without per-chain namespacing the faster chain overwrites
+    /// the shared tracker entry and the downstream window closes before the
+    /// slower chain has delivered its events.
+    #[test]
+    fn shared_tracker_namespaces_same_topic_partition_per_chain() {
+        let tracker = Arc::new(std::sync::Mutex::new(
+            WatermarkTracker::from_time_spec(&time_spec(LateEventPolicy::Drop)).unwrap(),
+        ));
+        let partition = EventTimePartition::new(Some("orders".into()), 0);
+        let mut fast = EventTimeGate::new_with_shared_tracker(
+            &time_spec(LateEventPolicy::Drop),
+            vec![3_000],
+            tracker.clone(),
+        )
+        .unwrap()
+        .with_namespace("chain-fast");
+        let mut slow = EventTimeGate::new_with_shared_tracker(
+            &time_spec(LateEventPolicy::Drop),
+            vec![3_000],
+            tracker.clone(),
+        )
+        .unwrap()
+        .with_namespace("chain-slow");
+        fast.seed_partitions(std::slice::from_ref(&partition));
+        slow.seed_partitions(std::slice::from_ref(&partition));
+
+        // The fast chain advances its own copy of orders/0 to 4000 while the
+        // slow chain is still at the seeded minimum: nothing may be released.
+        let decision = fast
+            .observe_physical_partitioned_with_ack(vec![(
+                partition.clone(),
+                batch(vec![4_000]),
+                Arc::new(NoopAck),
+            )])
+            .unwrap();
+        assert!(
+            decision.ready.is_empty(),
+            "the shared frontier must stay at the slow chain's minimum"
+        );
+        assert!(fast.has_held());
+
+        // The slow chain's older event is held, not emitted as late: the fast
+        // chain's progress must not leak into the shared frontier.
+        let decision = slow
+            .observe_physical_partitioned_with_ack(vec![(
+                partition.clone(),
+                batch(vec![100]),
+                Arc::new(NoopAck),
+            )])
+            .unwrap();
+        assert!(
+            decision.ready.is_empty(),
+            "event 100 must not be released by another chain's progress"
+        );
+        assert!(slow.has_held());
+
+        // Advancing the slow chain releases its held event; the shared
+        // frontier moves to min(4000, 5000) = 4000.
+        let decision = slow
+            .observe_physical_partitioned_with_ack(vec![(
+                partition.clone(),
+                batch(vec![5_000]),
+                Arc::new(NoopAck),
+            )])
+            .unwrap();
+        let emitted: Vec<i64> = decision
+            .ready
+            .iter()
+            .flat_map(|(batch, _)| {
+                batch
+                    .record_batch()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(emitted, vec![100]);
+
+        // Checkpoints persist RAW connector keys: each chain reports only its
+        // own copy of orders/0, stripped back to the connector shape.
+        for gate in [&fast, &slow] {
+            let positions = gate.watermark_positions();
+            assert_eq!(positions.len(), 1, "one raw partition per chain");
+            assert_eq!(positions[0].topic.as_deref(), Some("orders"));
+            assert_eq!(positions[0].partition, 0);
+            assert_eq!(gate.known_partitions(), vec![partition.clone()]);
+        }
+        assert_eq!(fast.physical_partition_watermark(&partition), Some(4_000));
+        assert_eq!(slow.physical_partition_watermark(&partition), Some(5_000));
+
+        // Restore maps the raw checkpoint key back into the chain's namespace.
+        let mut restored = EventTimeGate::new(&time_spec(LateEventPolicy::Drop), vec![3_000])
+            .unwrap()
+            .with_namespace("chain-slow");
+        restored.restore_partition_key(&partition, 4_000);
+        assert_eq!(
+            restored.physical_partition_watermark(&partition),
+            Some(4_000)
+        );
+        let positions = restored.watermark_positions();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].topic.as_deref(), Some("orders"));
+        assert_eq!(positions[0].watermark_ms, 4_000);
     }
 
     #[test]

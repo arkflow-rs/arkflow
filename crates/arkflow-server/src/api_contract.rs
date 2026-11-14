@@ -120,8 +120,10 @@ impl OperatorPrincipal {
                     // identity whose id merely equaled the node id and
                     // escalate past its scope (stored scopes [] are
                     // unrestricted).
-                    let node_livespace_resource =
-                        matches!(resource_type, "stream" | "configuration" | "operation" | "event" | "checkpoint");
+                    let node_livespace_resource = matches!(
+                        resource_type,
+                        "stream" | "configuration" | "operation" | "event" | "checkpoint"
+                    );
                     let node_contains_resource = scope.resource_type == "node"
                         && resource_type != "node"
                         && node_livespace_resource

@@ -28,7 +28,10 @@ fn redact_record_fields(record: &mut serde_json::Value) {
     if let Some(object) = record.as_object_mut() {
         for key in ["spec_json", "plan_json", "target_spec_json"] {
             if let Some(serde_json::Value::String(raw)) = object.get(key).cloned() {
-                object.insert(key.into(), serde_json::Value::String(redact_spec_string(&raw)));
+                object.insert(
+                    key.into(),
+                    serde_json::Value::String(redact_spec_string(&raw)),
+                );
             }
         }
     }
@@ -71,9 +74,14 @@ pub(super) async fn hub_job(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
-            .await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
     {
         return response;
     }
@@ -97,9 +105,14 @@ pub(super) async fn hub_job_plan(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
-            .await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
     {
         return response;
     }
@@ -297,9 +310,14 @@ pub(super) async fn hub_job_checkpoints(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
-            .await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
     {
         return response;
     }
@@ -395,9 +413,14 @@ pub(super) async fn hub_job_detail(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
-            .await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
     {
         return response;
     }
@@ -538,9 +561,14 @@ pub(super) async fn hub_job_versions(
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
-            .await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "job",
+        Some(job_id.clone()),
+    )
+    .await
     {
         return response;
     }

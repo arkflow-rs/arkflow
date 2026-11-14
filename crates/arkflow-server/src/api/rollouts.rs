@@ -81,9 +81,14 @@ pub(super) async fn hub_rollout(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "rollout", Some(id.clone()))
-            .await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "rollout",
+        Some(id.clone()),
+    )
+    .await
     {
         return response;
     }

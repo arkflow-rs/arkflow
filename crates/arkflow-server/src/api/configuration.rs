@@ -18,9 +18,14 @@ pub(super) async fn hub_configuration(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "configuration", Some(node_id.clone()))
-            .await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "configuration",
+        Some(node_id.clone()),
+    )
+    .await
     {
         return response;
     }
@@ -39,9 +44,14 @@ pub(super) async fn hub_configuration_versions(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "configuration", Some(node_id.clone()))
-            .await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "configuration",
+        Some(node_id.clone()),
+    )
+    .await
     {
         return response;
     }

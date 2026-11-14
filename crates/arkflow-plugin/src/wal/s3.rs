@@ -2573,14 +2573,20 @@ mod tests {
             let pending = store.pending_seal.lock().unwrap();
             assert_eq!(pending.len(), 1, "the failed batch is parked for retry");
             let batch = &pending[0];
-            assert_eq!(batch.next_index, 5, "the failed batch keeps its segment index");
+            assert_eq!(
+                batch.next_index, 5,
+                "the failed batch keeps its segment index"
+            );
             assert_eq!(batch.first_seq, 1);
             assert_eq!(batch.last_seq, 3);
             assert_eq!(batch.entries, 3);
             assert!(!batch.bytes.is_empty(), "bytes preserved");
         }
         let active = store.active.lock().unwrap();
-        assert_eq!(active.entries, 0, "active stays rotated; no restore clobber");
+        assert_eq!(
+            active.entries, 0,
+            "active stays rotated; no restore clobber"
+        );
         assert_eq!(
             active.next_index, 6,
             "active's next index moved past the parked batch"

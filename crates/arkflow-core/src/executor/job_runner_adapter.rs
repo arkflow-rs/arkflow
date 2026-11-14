@@ -459,6 +459,25 @@ fn event_time_gates(
     let mut gates = BTreeMap::new();
     let mut shared_trackers =
         BTreeMap::<String, Arc<std::sync::Mutex<crate::event_time::WatermarkTracker>>>::new();
+    // Chains per watermark group: a group with MORE THAN ONE chain shares a
+    // tracker, and its members' keys must be namespaced per chain so two
+    // chains observing the same connector topic/partition keep independent
+    // progress (otherwise the faster chain advances the shared entry and
+    // closes windows the slower one still has events for).
+    let mut group_sizes = BTreeMap::<String, usize>::new();
+    for chain in &graph.chains {
+        if chain
+            .source_time
+            .as_ref()
+            .is_some_and(|time| time.mode == crate::job::TimeMode::EventTime)
+        {
+            let group = chain
+                .watermark_group
+                .clone()
+                .unwrap_or_else(|| chain.entry_task_id().to_owned());
+            *group_sizes.entry(group).or_insert(0) += 1;
+        }
+    }
     for chain in &graph.chains {
         let Some(source_time) = chain
             .source_time
@@ -475,8 +494,8 @@ fn event_time_gates(
         // Source edges feeding the same Window must classify lateness against
         // one shared minimum, even when their local source contracts or
         // timing vectors were constructed independently.
-        let tracker_key = group;
-        let tracker = match shared_trackers.entry(tracker_key) {
+        let gate_shared = group_sizes.get(&group).copied().unwrap_or(0) > 1;
+        let tracker = match shared_trackers.entry(group) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let tracker = crate::event_time::WatermarkTracker::from_time_spec(source_time)?;
@@ -485,11 +504,14 @@ fn event_time_gates(
                 tracker
             }
         };
-        let gate = crate::executor::event_time_gate::EventTimeGate::new_with_shared_tracker(
+        let mut gate = crate::executor::event_time_gate::EventTimeGate::new_with_shared_tracker(
             source_time,
             chain.window_timings.clone(),
             tracker,
         )?;
+        if gate_shared {
+            gate = gate.with_namespace(chain.entry_task_id());
+        }
         gates.insert(
             chain.entry_task_id().to_owned(),
             Arc::new(tokio::sync::Mutex::new(Some(gate))),

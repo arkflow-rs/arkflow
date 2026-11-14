@@ -359,7 +359,8 @@ mod tests {
     /// of poisoning every later `connect` in this process with the
     /// "unpaired" error.
     #[test]
-    fn pairing_validation_prunes_dead_registrations() {        let group = unique_group("ktx-dead-unclaimed");
+    fn pairing_validation_prunes_dead_registrations() {
+        let group = unique_group("ktx-dead-unclaimed");
         let frontier = Arc::new(CommitFrontier::new());
         let _slot = register_group(&group, vec!["orders".into()], frontier.clone());
         // Live registration: reachable through the registry.

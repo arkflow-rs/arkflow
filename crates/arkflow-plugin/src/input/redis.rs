@@ -139,9 +139,7 @@ impl redis::aio::AsyncPushSender for ClusterPushForwarder {
             return Ok(());
         }
         // redis 1.x's FromRedisValue takes the Value by value.
-        let message: Vec<u8> = match Vec::from_redis_value(
-            msg.data.swap_remove(payload_index),
-        ) {
+        let message: Vec<u8> = match Vec::from_redis_value(msg.data.swap_remove(payload_index)) {
             Ok(message) => message,
             Err(error) => {
                 error!("redis cluster push message failed to parse: {}", error);
@@ -649,11 +647,10 @@ mod tests {
             "push handling never signals connection loss"
         );
 
-        let payload =
-            tokio::time::timeout(std::time::Duration::from_secs(2), raw_rx.recv_async())
-                .await
-                .expect("payload arrives")
-                .expect("channel stays open");
+        let payload = tokio::time::timeout(std::time::Duration::from_secs(2), raw_rx.recv_async())
+            .await
+            .expect("payload arrives")
+            .expect("channel stays open");
         assert_eq!(payload, b"payload".to_vec());
     }
 

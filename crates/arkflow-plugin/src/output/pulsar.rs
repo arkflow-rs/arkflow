@@ -243,19 +243,18 @@ impl Output for PulsarOutput {
             drop(producer);
             receipts.push((topic, receipt));
         }
-        let waits = futures::future::join_all(receipts.into_iter().map(|(topic, receipt)| async move {
-            receipt.await.map(|_| ()).map_err(|e| {
-                Error::Process(format!(
-                    "Pulsar broker rejected message on topic {topic}: {e}"
-                ))
-            })
-        }));
+        let waits =
+            futures::future::join_all(receipts.into_iter().map(|(topic, receipt)| async move {
+                receipt.await.map(|_| ()).map_err(|e| {
+                    Error::Process(format!(
+                        "Pulsar broker rejected message on topic {topic}: {e}"
+                    ))
+                })
+            }));
         tokio::time::timeout(WRITE_RECEIPT_TIMEOUT, waits)
             .await
             .map_err(|_| {
-                Error::Connection(
-                    "Timed out waiting for Pulsar receipts for the batch".to_string(),
-                )
+                Error::Connection("Timed out waiting for Pulsar receipts for the batch".to_string())
             })?
             .into_iter()
             .collect::<Result<(), Error>>()
