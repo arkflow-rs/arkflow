@@ -239,6 +239,11 @@ pub(crate) struct S3Store {
     cursor_cfg: CursorFlushConfig,
     /// Parallel PUT workers pool (task 3.3).
     put_workers: Option<ParallelPutWorkers>,
+    /// Segment compression selected by configuration. Applied on every
+    /// append; a per-segment magic tag lets recovery decode files written
+    /// under a different setting (including legacy untagged segments).
+    compression_kind: &'static str,
+    compression_level: i32,
 
     /// In-memory active segment (bytes + parsed entry records so the cursor
     /// can flush without re-reading).
@@ -473,6 +478,8 @@ impl S3Store {
         );
         let segments_prefix = format!("{}/segments", ns);
         let manifest_key = format!("{}/manifest.json", ns);
+        let (compression_kind, compression_level) =
+            crate::wal::compression::kind_from_config(&osc.compression);
 
         let runtime = runtime_slot.as_ref().expect("construction runtime present");
         let first_index = block_on_init(runtime, async {
@@ -510,6 +517,8 @@ impl S3Store {
                     },
                 ))
             },
+            compression_kind,
+            compression_level,
             active: StdMutex::new(ActiveSegment {
                 first_seq: 0,
                 last_seq: 0,
@@ -694,7 +703,7 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
                     .bytes()
                     .await
                     .map_err(|e| Error::Process(format!("S3 GET segment body: {}", e)))?;
-                let decoded = segment::decode(&bytes)?;
+                let decoded = decode_segment_object(&bytes)?;
                 if let Some((last, _)) = decoded.entries.last() {
                     if *last > max_seq_seen {
                         max_seq_seen = *last;
@@ -912,7 +921,7 @@ impl WalStore for S3Store {
                 Err(object_store::Error::NotFound { .. }) => continue,
                 Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
             };
-            let decoded = segment::decode(&bytes)?;
+            let decoded = decode_segment_object(&bytes)?;
             for (seq, mb) in decoded.entries {
                 if seq > manifest.cursor {
                     out.push((seq, mb));
@@ -1057,6 +1066,72 @@ fn segment_index(name: &str) -> u64 {
 /// publication order keeps matching sequence order. Entries lost on a crash
 /// while parked were never acknowledged (the gate never advanced past them),
 /// so the source replays them.
+/// Magic prefix identifying a segment object written by this build. Legacy
+/// objects start directly with the entry header (a sequence number), so an
+/// object without the prefix stays decodable as uncompressed.
+const SEGMENT_OBJECT_MAGIC: &[u8; 6] = b"AKWAL1";
+
+fn compression_tag(kind: &str) -> Option<u8> {
+    match kind {
+        "none" => Some(0),
+        "zstd" => Some(1),
+        "lz4" => Some(2),
+        _ => None,
+    }
+}
+
+fn compression_kind_from_tag(tag: u8) -> Option<&'static str> {
+    match tag {
+        0 => Some("none"),
+        1 => Some("zstd"),
+        2 => Some("lz4"),
+        _ => None,
+    }
+}
+
+fn segment_compression_for(kind: &str) -> crate::wal::manifest::SegmentCompression {
+    match kind {
+        "zstd" => crate::wal::manifest::SegmentCompression::Zstd,
+        "lz4" => crate::wal::manifest::SegmentCompression::Lz4,
+        _ => crate::wal::manifest::SegmentCompression::None,
+    }
+}
+
+/// Compress one complete raw segment and add the magic+algorithm tag.
+fn encode_segment_object(store: &S3Store, raw: &[u8]) -> Result<Vec<u8>, Error> {
+    let tag = compression_tag(store.compression_kind).ok_or_else(|| {
+        Error::Config(format!(
+            "unknown WAL compression kind '{}'",
+            store.compression_kind
+        ))
+    })?;
+    let compressed =
+        crate::wal::compression::compress(store.compression_kind, store.compression_level, raw)?;
+    let mut out = Vec::with_capacity(SEGMENT_OBJECT_MAGIC.len() + 1 + compressed.len());
+    out.extend_from_slice(SEGMENT_OBJECT_MAGIC);
+    out.push(tag);
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+fn decode_segment_object(bytes: &[u8]) -> Result<segment::DecodedSegment, Error> {
+    let Some(rest) = bytes.strip_prefix(SEGMENT_OBJECT_MAGIC) else {
+        // Pre-tag objects were written uncompressed.
+        return segment::decode(bytes);
+    };
+    let Some((&tag, payload)) = rest.split_first() else {
+        return Err(Error::Process(
+            "WAL segment object has a magic prefix but no compression tag".into(),
+        ));
+    };
+    let kind = compression_kind_from_tag(tag).ok_or_else(|| {
+        Error::Process(format!(
+            "WAL segment object has unknown compression tag {tag}"
+        ))
+    })?;
+    segment::decode_with_kind(payload, kind)
+}
+
 /// Move the active segment's bytes into a sealed batch, resetting the active
 /// buffer. `None` when the segment holds no entries.
 ///
@@ -1135,11 +1210,17 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
 async fn publish_sealed_segment(store: &S3Store, batch: &SealedBatch) -> Result<(), Error> {
     let name = format!("{:08}.wal", batch.next_index);
     let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, name).as_str());
+    // Compress at publication, not append: the active buffer accumulates
+    // raw entry bytes across many appends, so only the complete segment can
+    // be compressed as one block. The magic+tag prefix lets recovery decode
+    // this object even if the configured algorithm changed since (and keeps
+    // legacy untagged objects readable).
+    let object_bytes = encode_segment_object(store, &batch.bytes)?;
     // Clone for the PUT so the original bytes survive a failed upload in the
     // caller's parked batch.
     store
         .client
-        .put(&key, PutPayload::from(Bytes::from(batch.bytes.clone())))
+        .put(&key, PutPayload::from(Bytes::from(object_bytes)))
         .await
         .map_err(|e| {
             Error::Process(format!(
@@ -1155,11 +1236,13 @@ async fn publish_sealed_segment(store: &S3Store, batch: &SealedBatch) -> Result<
     // guards against out-of-order seals regressing the active pointer).
     let name_for_mutator = name.clone();
     let last_seq = batch.last_seq;
+    let active_compression = segment_compression_for(store.compression_kind);
     write_manifest_with_etag(store, move |m| {
         apply_seal(m, &name_for_mutator);
         if last_seq > m.max_sealed_seq {
             m.max_sealed_seq = last_seq;
         }
+        m.active_segment_compression = Some(active_compression);
     })
     .await?;
 

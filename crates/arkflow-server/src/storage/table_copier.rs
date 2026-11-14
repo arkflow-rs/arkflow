@@ -431,10 +431,23 @@ async fn pg_insert_rows(
     rows: &[Vec<PgVal>],
 ) -> Result<(), StorageError> {
     let column_list = columns.join(", ");
+    // Existing target rows must take the SOURCE values: `DO NOTHING` kept
+    // stale values while the row-count check still passed. DO UPDATE makes
+    // the copy idempotent and source-of-truth for every key.
+    let update_list = columns
+        .iter()
+        .map(|column| format!("{column} = EXCLUDED.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conflict_clause = if update_list.is_empty() {
+        "ON CONFLICT DO NOTHING".to_string()
+    } else {
+        format!("ON CONFLICT DO UPDATE SET {update_list}")
+    };
     for values in rows {
         let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${i}")).collect();
         let sql = format!(
-            "INSERT INTO {table} ({column_list}) VALUES ({}) ON CONFLICT DO NOTHING",
+            "INSERT INTO {table} ({column_list}) VALUES ({}) {conflict_clause}",
             placeholders.join(", ")
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
