@@ -183,8 +183,30 @@ impl EmbeddingProcessor {
         // The API contract returns items in input order; honour explicit
         // indices when present so out-of-order responses stay correct.
         let mut items = parsed.data;
-        if items.iter().all(|item| item.index.is_some()) {
+        let indexed = items.iter().filter(|item| item.index.is_some()).count();
+        if indexed == items.len() {
+            // Indices must be a permutation of 0..N; duplicates or
+            // out-of-range values would attach wrong embeddings to rows.
+            let mut seen = std::collections::BTreeSet::new();
+            for item in &items {
+                let index = item.index.unwrap_or_default();
+                if index >= chunk.len() {
+                    return Err(Error::Process(format!(
+                        "Embedding API returned out-of-range index {index} for {} inputs",
+                        chunk.len()
+                    )));
+                }
+                if !seen.insert(index) {
+                    return Err(Error::Process(format!(
+                        "Embedding API returned duplicate index {index}"
+                    )));
+                }
+            }
             items.sort_by_key(|item| item.index.unwrap_or(0));
+        } else if indexed > 0 {
+            return Err(Error::Process(
+                "Embedding API returned a mix of indexed and unindexed vectors".to_string(),
+            ));
         }
         let dim = items[0].embedding.len();
         for item in &items {

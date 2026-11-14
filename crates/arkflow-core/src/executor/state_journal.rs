@@ -417,6 +417,10 @@ impl StateJournal {
     /// owns the key) are already embedded in the backend value and are
     /// excluded, so the overlay does not count them twice either.
     fn overlay_value(&self, namespace: &str, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, Error> {
+        // Serialize with apply/undo: a read must not observe the window where
+        // a transaction's mutations are already in the backend but its state
+        // is still Staged, which would apply the same increment twice.
+        let _commit_guard = self.commit_lock.lock().unwrap();
         let inner = self.inner.lock().unwrap();
         let mut value = self.backend.get(namespace, key)?;
         let mut touched = false;

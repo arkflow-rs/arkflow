@@ -194,6 +194,7 @@ impl Engine {
         }
         if let Err(error) = self.runtime_manager.stop_all().await {
             error!("Failed to stop all Stream runtimes: {}", error);
+            self.control_plane.health().set_ready(false);
             return Err(Box::new(error));
         }
         self.runtime_manager.wait_all().await?;
@@ -205,6 +206,7 @@ impl Engine {
                 Err(error) => error!("Local Job task panicked: {}", error),
             }
         }
+        self.control_plane.health().set_ready(false);
         self.control_plane.health().set_running(false);
         info!("All flow tasks have been complete");
         Ok(())

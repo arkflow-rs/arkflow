@@ -102,7 +102,12 @@ impl MqttTlsConfig {
                     "mqtt tls: no valid certificate in ca".to_string(),
                 ));
             }
-            roots.add_parsable_certificates(certs);
+            let (added, _ignored) = roots.add_parsable_certificates(certs);
+            if added == 0 {
+                return Err(Error::Config(
+                    "mqtt tls: ca contains no parsable certificate".to_string(),
+                ));
+            }
         } else {
             let loaded = rustls_native_certs::load_native_certs();
             // Tolerate individual trust-store load errors the same way
