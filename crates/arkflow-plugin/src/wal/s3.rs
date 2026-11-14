@@ -758,6 +758,20 @@ impl WalStore for S3Store {
         "object_store"
     }
 
+    fn retained_bytes(&self) -> u64 {
+        let active = self
+            .active
+            .lock()
+            .map(|active| active.bytes.len() as u64)
+            .unwrap_or(0);
+        let parked = self
+            .pending_seal
+            .lock()
+            .map(|pending| pending.iter().map(|batch| batch.bytes.len() as u64).sum())
+            .unwrap_or(0);
+        active.saturating_add(parked)
+    }
+
     fn append_batch(&self, entries: Vec<(u64, Vec<u8>)>) -> Result<(), Error> {
         if entries.is_empty() {
             return Ok(());
@@ -2613,6 +2627,27 @@ mod tests {
             active.next_index, 6,
             "active's next index moved past the parked batch"
         );
+    }
+
+    /// The admission bound must see both the active segment and the parked
+    /// (failed-upload) segments; counting only one lets the other grow
+    /// without limit while the backend is down.
+    #[test]
+    fn retained_bytes_counts_active_and_parked_segments() {
+        let store = build_failing_store();
+        {
+            let mut active = store.active.lock().unwrap();
+            active.bytes = vec![0; 10];
+            active.entries = 1;
+        }
+        store.pending_seal.lock().unwrap().push_back(SealedBatch {
+            bytes: vec![0; 20],
+            first_seq: 1,
+            last_seq: 1,
+            next_index: 3,
+            entries: 1,
+        });
+        assert_eq!(store.retained_bytes(), 30);
     }
 
     /// A failed retry of an already-parked segment returns before the normal

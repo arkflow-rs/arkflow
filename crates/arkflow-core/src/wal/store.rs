@@ -170,6 +170,14 @@ pub trait WalStore: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Bytes buffered for durability that are not yet confirmed durable.
+    /// The object-store backend counts its active segment plus parked
+    /// (failed-upload) segments; `WalInput` uses this for admission control,
+    /// so a down backend applies backpressure instead of unbounded buffering.
+    fn retained_bytes(&self) -> u64 {
+        0
+    }
+
     /// Read all entries with sequence strictly greater than the committed
     /// cursor, in ascending order. Used by recovery replay.
     fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error>;

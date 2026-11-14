@@ -435,20 +435,25 @@ pub(super) async fn run_session(
                             error,
                         },
                     ).await {
-                        // Park this observation and everything behind it: the
-                        // task is already removed from the runtime map, so
-                        // dropping the observation would leave the Hub
+                        // Park this observation and everything behind it:
+                        // the task is already removed from the runtime map,
+                        // so dropping the observation would leave the Hub
                         // reporting the job as running forever.
                         let mut undelivered = finished[index..].to_vec();
                         undelivered[0] = (job_id.clone(), *generation, outcome.clone());
+                        // A rejected report must not block the reports behind
+                        // it: queue the rest in order and retry the rejected
+                        // one after them on a later poll.
+                        let rejected = undelivered.remove(0);
                         job_runtime.park_observations(undelivered).await;
+                        job_runtime.park_observation_after(rejected).await;
                         // A Hub that ANSWERS with a client error (e.g. 401 for
                         // an observation whose in-memory dispatch fingerprint
                         // was lost in a Hub restart) rejects the same report on
                         // every retry: re-registering cannot fix it and only
-                        // churns sessions. Keep it parked for the reconciler
-                        // and stay in the session; transport failures still
-                        // tear the session down so the agent re-registers.
+                        // churns sessions. Keep it queued and stay in the
+                        // session; transport failures still tear the session
+                        // down so the agent re-registers.
                         let hub_rejected = delivery
                             .downcast_ref::<reqwest::Error>()
                             .and_then(reqwest::Error::status)

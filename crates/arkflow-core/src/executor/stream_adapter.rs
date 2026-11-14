@@ -109,6 +109,12 @@ fn decode_name(payload: &serde_json::Value) -> Option<String> {
 
 /// Live deliveries awaiting the next read's WAL hand-off (see
 /// [`LiveDeliveryLease`]): shared by the input and its cancellation guard.
+/// Admission bound for the WAL's not-yet-durable buffer. A failing backend
+/// parks segments in the store; reading more input while the backlog exceeds
+/// this bound would buffer without limit, so `WalInput::read` waits for the
+/// flusher instead (backpressure, never unbounded buffering).
+const WAL_RETAINED_BYTES_LIMIT: u64 = 512 * 1024 * 1024;
+
 type PendingRetryQueue = Arc<
     std::sync::Mutex<
         std::collections::VecDeque<(
@@ -377,6 +383,13 @@ impl Input for WalInput {
                 lease.take();
                 return Ok((msg, ack));
             }
+        }
+        // Admission control: while the WAL cannot confirm what it already
+        // buffers (failed seals, deferred acknowledgements), stop claiming
+        // new input and let the flusher drain. Dropping this future claims
+        // nothing, so the kernel's idle-tick cancellation is safe here.
+        while self.wal.retained_bytes().await? >= WAL_RETAINED_BYTES_LIMIT {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         // A delivery re-queued by a cancelled read re-appends before new
         // input: at-least-once with ordering preserved.

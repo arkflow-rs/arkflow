@@ -35,11 +35,24 @@ fn restore_masked_secrets(submitted: &mut serde_json::Value, stored: &serde_json
                 }
             }
         }
-        (serde_json::Value::Array(submitted), serde_json::Value::Array(stored))
-            if submitted.len() == stored.len() =>
-        {
-            for (value, stored_value) in submitted.iter_mut().zip(stored) {
-                restore_masked_secrets(value, stored_value);
+        (serde_json::Value::Array(submitted), serde_json::Value::Array(stored)) => {
+            // Match array elements by their stable `id`, never by position:
+            // an upgrade may reorder operators, and a positional zip would
+            // hand one operator another operator's persisted secret.
+            for element in submitted.iter_mut() {
+                let Some(identity) = element
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                if let Some(stored_element) = stored.iter().find(|candidate| {
+                    candidate.get("id").and_then(serde_json::Value::as_str)
+                        == Some(identity.as_str())
+                }) {
+                    restore_masked_secrets(element, stored_element);
+                }
             }
         }
         (submitted @ serde_json::Value::String(_), stored) => {
@@ -52,6 +65,21 @@ fn restore_masked_secrets(submitted: &mut serde_json::Value, stored: &serde_json
             }
         }
         _ => {}
+    }
+}
+
+/// True when a value still carries a redaction placeholder: the masked value
+/// could not be matched to the persisted spec (e.g. an element of an array
+/// without a stable id), so writing it would persist the mask as the real
+/// credential. Such an upgrade is rejected instead.
+fn contains_redaction_mask(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            text == "******" || text.contains(":******@") || text.contains("=******")
+        }
+        serde_json::Value::Object(object) => object.values().any(contains_redaction_mask),
+        serde_json::Value::Array(items) => items.iter().any(contains_redaction_mask),
+        _ => false,
     }
 }
 
@@ -660,6 +688,13 @@ pub(super) async fn hub_job_upgrade(
     // Resolve those from the persisted spec before parsing the request.
     if let Ok(stored) = serde_json::from_str::<serde_json::Value>(&current.spec_json) {
         restore_masked_secrets(&mut request.spec, &stored);
+    }
+    if contains_redaction_mask(&request.spec) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "credentials_masked",
+            "The upgrade spec still contains masked credentials that could not be matched to the persisted spec; re-enter them".into(),
+        );
     }
     if current.generation != request.expected_generation {
         return problem_with_details(
@@ -1407,7 +1442,7 @@ pub(super) async fn reject_if_job_upgrade_active(
 
 #[cfg(test)]
 mod tests {
-    use super::restore_masked_secrets;
+    use super::{contains_redaction_mask, restore_masked_secrets};
 
     /// The console prepares an upgrade from the REDACTED spec it read back:
     /// masked values must resolve to the persisted secret instead of being
@@ -1430,6 +1465,47 @@ mod tests {
         });
         restore_masked_secrets(&mut submitted, &stored);
         assert_eq!(submitted, stored);
+    }
+
+    /// Reordered operators must each keep their own persisted secret: the
+    /// arrays are matched by stable id, never by position.
+    #[test]
+    fn reordered_operators_keep_their_own_secrets() {
+        let stored = serde_json::json!({
+            "operators": [
+                {"id": "a", "password": "secret-a"},
+                {"id": "b", "password": "secret-b"},
+            ],
+        });
+        let mut submitted = serde_json::json!({
+            "operators": [
+                {"id": "b", "password": "******"},
+                {"id": "a", "password": "******"},
+            ],
+        });
+        restore_masked_secrets(&mut submitted, &stored);
+        assert_eq!(submitted["operators"][0]["password"], "secret-b");
+        assert_eq!(submitted["operators"][1]["password"], "secret-a");
+    }
+
+    /// A masked value in an array without stable ids cannot be matched: it
+    /// must be reported, not silently assigned another element's secret.
+    #[test]
+    fn unmatched_masked_values_are_reported() {
+        let stored = serde_json::json!({
+            "urls": [
+                "postgres://a:one@db",
+                "postgres://b:two@db",
+            ],
+        });
+        let mut submitted = serde_json::json!({
+            "urls": [
+                "postgres://a:******@db",
+                "postgres://b:******@db",
+            ],
+        });
+        restore_masked_secrets(&mut submitted, &stored);
+        assert!(contains_redaction_mask(&submitted));
     }
 
     /// Values the caller actually edited (not the mask) must be kept.

@@ -1034,6 +1034,14 @@ impl JobRuntime {
         self.pending_observations.lock().await.extend(observations);
     }
 
+    /// Park one observation at the BACK of the queue, behind reports that
+    /// have not been rejected. The Hub rejecting one report (e.g. after a
+    /// restart cleared its dispatch fingerprints) must not block delivery of
+    /// the reports behind it; the rejected entry is retried on a later poll.
+    pub(super) async fn park_observation_after(&self, observation: FinishedJob) {
+        self.pending_observations.lock().await.push(observation);
+    }
+
     pub(super) async fn stop_all(&self) {
         let _start_guard = self.starts.lock().await;
         let tasks = {
