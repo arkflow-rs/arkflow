@@ -91,6 +91,15 @@ impl MongoDBOutput {
         for (column_index, field) in msg.schema().fields().iter().enumerate() {
             let column = msg.column(column_index);
             let value = array_value_to_bson(column.as_ref(), row, field.name())?;
+            // A BSON document cannot carry duplicate keys: inserting the
+            // second column of the same name silently REPLACED the first
+            // (stale/incorrect data written). Fail loudly instead.
+            if document.contains_key(field.name().as_str()) {
+                return Err(Error::Process(format!(
+                    "MongoDB output: duplicate column '{}' cannot be represented in a BSON document",
+                    field.name()
+                )));
+            }
             document.insert(field.name().clone(), value);
         }
         Ok(document)

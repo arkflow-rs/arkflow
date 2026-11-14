@@ -73,6 +73,10 @@ export function Runtime({
   const [filter, setFilter] = useState('')
   const [state, setState] = useState('all')
   const [streamPage, setStreamPage] = useState(1)
+  // Row identity includes the NODE: two nodes may run a stream with the same
+  // id, and a node-less key selected the first match, mislabeling the detail
+  // and mixing both nodes' events into one history.
+  const streamKey = (stream: StreamStatus) => `${stream.node_id ?? ''}:${stream.id}`
   const [selected, setSelected] = useState<string>()
   const filtered = useMemo(
     () =>
@@ -88,7 +92,7 @@ export function Runtime({
   const pageSize = 8
   const pages = Math.max(1, Math.ceil(filtered.length / pageSize))
   const visible = filtered.slice((streamPage - 1) * pageSize, streamPage * pageSize)
-  const detail = streams.find((stream) => stream.id === selected)
+  const detail = streams.find((stream) => streamKey(stream) === selected)
   useEffect(() => {
     // Clamp the page when the filtered result shrinks: adjusting pagination
     // state on an external list change, not a render-derivable value.
@@ -151,10 +155,10 @@ export function Runtime({
           <div className="table">
             {visible.map((stream) => (
               <div
-                className={`row ${selected === stream.id ? 'selected' : ''}`}
+                className={`row ${selected === streamKey(stream) ? 'selected' : ''}`}
                 key={`${stream.node_id ?? 'local'}:${stream.id}`}
               >
-                <button className="link-button" onClick={() => setSelected(stream.id)}>
+                <button className="link-button" onClick={() => setSelected(streamKey(stream))}>
                   <strong>{stream.id}</strong>
                   <small>
                     {stream.node_id ?? t('common.localNode')} ·{' '}
@@ -199,11 +203,17 @@ export function Runtime({
       </section>
       {detail && (
         <RuntimeDetail
-          key={detail.id}
+          key={streamKey(detail)}
           stream={detail}
           onError={onError}
           canOperate={canOperate}
-          events={(events ?? []).filter((event) => event.stream_id === detail.id)}
+          events={(events ?? []).filter(
+            (event) =>
+              event.stream_id === detail.id &&
+              // Cross-node id collision: the detail's history is its OWN
+              // node's events.
+              (detail.node_id === undefined || event.node_id === detail.node_id),
+          )}
           onClose={() => setSelected(undefined)}
         />
       )}

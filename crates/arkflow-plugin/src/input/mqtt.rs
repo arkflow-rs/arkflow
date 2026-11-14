@@ -126,8 +126,13 @@ impl Input for MqttInput {
             mqtt_options.set_clean_session(clean_session);
         }
 
-        // Create an MQTT client
-        let (client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+        // Create an MQTT client. The request channel must hold EVERY
+        // queued subscription: subscriptions are enqueued BEFORE the
+        // event-loop task below starts polling, so a fixed small capacity
+        // deadlocked startup for topic counts above it (the previous
+        // capacity 10 hung on the 11th topic).
+        let request_capacity = self.config.topics.len().max(10);
+        let (client, mut eventloop) = AsyncClient::new(mqtt_options, request_capacity);
         // Subscribe to topics
         let qos_level = match self.config.qos {
             Some(0) => QoS::AtMostOnce,
