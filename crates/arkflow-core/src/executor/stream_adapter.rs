@@ -280,6 +280,15 @@ impl WalInput {
             });
         }
         let state = pager.as_mut().expect("replay pager initialized");
+        // The durable cursor may have advanced past the staged position when
+        // a previous page's `reconcile_covered` committed and the read future
+        // was then cancelled (the kernel cancels reads at its idle tick).
+        // Everything at or below the cursor is already committed or
+        // reconciled, so re-sync instead of leaving `next_expected` behind
+        // and replaying a checkpoint-covered prefix a second time.
+        let cursor = self.wal.cursor().await?;
+        state.after = state.after.max(cursor);
+        state.next_expected = state.next_expected.max(cursor.saturating_add(1));
         while !state.done {
             let page = self
                 .wal
@@ -1386,6 +1395,54 @@ mod tests {
             .unwrap();
         assert_eq!(wal.cursor().await.unwrap(), 3);
 
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_resyncs_after_a_reconcile_committed_before_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        for offset in 1..=4u64 {
+            wal.append(&metadata_batch(0, offset, "orders"))
+                .await
+                .unwrap();
+        }
+        // A previous page covered 1..=2 and its reconcile committed (cursor
+        // moved to 2) before the read future was cancelled, so the pager
+        // state still says after=0/next_expected=1.
+        wal.reconcile_covered(&[1, 2]).await.unwrap();
+        let input = WalInput::new(Arc::new(EmptyInput), wal.clone());
+        input
+            .restore_positions(&[SourcePosition::for_partition(0, 5)])
+            .await
+            .unwrap();
+        *input.replay_pager.lock().await = Some(ReplayPager {
+            after: 0,
+            next_expected: 1,
+            positions: Some(vec![SourcePosition::for_partition(0, 5)]),
+            done: false,
+        });
+
+        input.fill_replay_page().await.unwrap();
+        {
+            let queued = input.replay.lock().expect("wal replay queue poisoned");
+            assert!(
+                queued.is_empty(),
+                "entries 3..=4 are checkpoint-covered and must not be replayed \
+                 after the cursor re-sync (queued {})",
+                queued.len()
+            );
+        }
+        assert_eq!(
+            wal.cursor().await.unwrap(),
+            4,
+            "the covered tail is reconciled with the durable cursor"
+        );
         wal.close().await.unwrap();
     }
 

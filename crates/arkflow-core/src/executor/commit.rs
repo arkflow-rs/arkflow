@@ -283,6 +283,13 @@ impl CommitFrontier {
             frontier.next_offset = next;
             return AckAdvance::Advanced { next_offset: next };
         }
+        // The ack is not settled yet: restore the delivery anchor removed at
+        // the top so a retry can still tell that this record was delivered
+        // and may skip the sparse offsets below it (Kafka anchors only each
+        // segment's first offset).
+        if acked_was_delivered {
+            frontier.delivered.insert(acked_record);
+        }
         AckAdvance::Pending {
             gap: frontier.next_offset + 1,
         }
@@ -420,6 +427,15 @@ impl CommitFrontier {
             return false;
         }
         frontier.next_offset = expected_next_offset.saturating_sub(1);
+        // The rewound record must be delivered and acknowledged again: mark
+        // it in flight so a later delivery's sparse gap scan stops here
+        // instead of treating the rewound offsets as broker gaps that can be
+        // skipped (which committed past the compensated segment).
+        if frontier.track_deliveries {
+            frontier
+                .delivered
+                .insert(expected_next_offset.saturating_sub(1));
+        }
         frontier
             .pending
             .retain(|offset| *offset <= frontier.next_offset);
@@ -1326,6 +1342,46 @@ mod tests {
             AckAdvance::Pending { gap: 7 },
             "9 no longer sits in the pending set after the rewind"
         );
+    }
+
+    #[test]
+    fn a_rewound_segment_is_not_skipped_by_a_later_partition_ack() {
+        let frontier = CommitFrontier::new();
+        // Segment A covers 0..=2, anchored (as Kafka does) at its first
+        // offset, and is acknowledged.
+        frontier.anchor_delivery(&position("orders", 0, 0));
+        for offset in 1..=3 {
+            frontier.acknowledge(&position("orders", 0, offset));
+        }
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(3));
+        // Compensation rewinds the whole segment one step at a time.
+        for expected in (1..=3).rev() {
+            assert!(frontier.rewind_position(Some("orders"), 0, expected));
+        }
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(0));
+
+        // Segment B (anchored at 100) is acknowledged while A awaits
+        // redelivery: it must not skip the rewound segment.
+        frontier.anchor_delivery(&position("orders", 0, 100));
+        assert!(
+            matches!(
+                frontier.acknowledge(&position("orders", 0, 101)),
+                AckAdvance::Pending { gap: 1 }
+            ),
+            "a later ack must wait for the compensated segment"
+        );
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(0));
+
+        // A is redelivered and re-acknowledged; B's retry then closes the
+        // sparse gap and advances past its own record.
+        for offset in 1..=3 {
+            frontier.acknowledge(&position("orders", 0, offset));
+        }
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, 101)),
+            AckAdvance::Advanced { next_offset: 101 }
+        );
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(101));
     }
 
     #[test]

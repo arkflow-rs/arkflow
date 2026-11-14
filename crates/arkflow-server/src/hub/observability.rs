@@ -78,17 +78,19 @@ impl Hub {
             .into_values()
             .map(|(_, _, id)| id)
             .collect::<BTreeSet<_>>();
-        let stale: Vec<String> = operations
+        let stale: Vec<(String, String)> = operations
             .iter()
             .filter(|(_, record)| {
                 terminal(&record.state)
                     && !protected_ids.contains(&record.id)
                     && ((record.finished_at_ms.unwrap_or(record.created_at_ms)) as i64) < cutoff
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, record)| (id.clone(), record.command_id.clone()))
             .collect();
-        for id in stale {
+        let mut evicted_commands = Vec::with_capacity(stale.len());
+        for (id, command_id) in stale {
             operations.remove(&id);
+            evicted_commands.push(command_id);
         }
         let mut terminal_ids: Vec<(i64, String)> = operations
             .iter()
@@ -103,7 +105,17 @@ impl Hub {
         terminal_ids.sort();
         let excess = terminal_ids.len().saturating_sub(RETENTION_MAX as usize);
         for (_, id) in terminal_ids.into_iter().take(excess) {
-            operations.remove(&id);
+            if let Some(record) = operations.remove(&id) {
+                evicted_commands.push(record.command_id);
+            }
+        }
+        if !evicted_commands.is_empty() {
+            // Keep the settled-command markers bounded with the operations
+            // they describe.
+            let mut settled = self.settled_commands.write().await;
+            for command_id in evicted_commands {
+                settled.remove(&command_id);
+            }
         }
         Ok(())
     }

@@ -220,6 +220,9 @@ impl Output for PulsarOutput {
         if owned_payloads.is_empty() {
             return Ok(());
         }
+        // Per-row topics are indexed by payload; a skipped NULL row would
+        // send every later payload to an earlier row's topic.
+        crate::output::codec_helper::ensure_row_aligned(&owned_payloads, msg.num_rows(), "pulsar")?;
 
         // Resolve the topic per message, matching the kafka output's
         // expression semantics: a scalar sends every message to the same

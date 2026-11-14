@@ -172,7 +172,17 @@ impl Aligner {
             }
             if let Some(expected) = self.in_flight.clone() {
                 if expected != barrier {
-                    self.failed_barrier = Some(expected.clone());
+                    // Blame the barrier the coordinator is most likely
+                    // waiting for: a newer round was injected after the
+                    // in-flight one timed out, and the chain just consumed
+                    // it, so tagging the OLD round would let the coordinator
+                    // discard the failure as stale and wait out the full
+                    // round timeout for a report that can never arrive.
+                    self.failed_barrier = Some(if barrier.generation >= expected.generation {
+                        barrier.clone()
+                    } else {
+                        expected.clone()
+                    });
                     self.in_flight = None;
                     self.aligned.clear();
                     return Err(crate::Error::Process(format!(
@@ -572,6 +582,19 @@ mod tests {
         assert!(error.to_string().contains("barrier mismatch"), "{error}");
         // The failed alignment no longer holds data back.
         assert!(!aligner.is_aligning());
+    }
+
+    #[test]
+    fn a_mismatched_newer_barrier_is_the_one_reported_failed() {
+        let mut aligner = Aligner::new(2, 10);
+        aligner.observe(0, barrier("cp-1", 1)).unwrap();
+        let error = aligner.observe(1, barrier("cp-2", 2)).unwrap_err();
+        assert!(error.to_string().contains("barrier mismatch"), "{error}");
+        assert_eq!(
+            aligner.failed_barrier().map(|b| b.checkpoint_id),
+            Some("cp-2".to_string()),
+            "the newly received round is the one the coordinator waits for"
+        );
     }
 
     #[test]

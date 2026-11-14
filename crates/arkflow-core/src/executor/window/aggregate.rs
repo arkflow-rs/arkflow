@@ -84,9 +84,15 @@ pub(crate) struct AggregateBuffer {
     /// into the wider kind instead of silently dropping one side.
     #[serde(default)]
     pub int_observations: u64,
-    /// Number of float observations in this buffer.
+    /// Number of float observations in this buffer (finite values only:
+    /// these are the ones contributing to sum/min/max).
     #[serde(default)]
     pub float_observations: u64,
+    /// Rows whose float value was NaN/Infinity. They still count as rows
+    /// (COUNT is a row count) but are excluded from sum/min/max, whose JSON
+    /// state cannot represent a non-finite value.
+    #[serde(default)]
+    pub non_finite_observations: u64,
     /// Serialized input batches retained for legacy buffer compatibility. The
     /// old tumbling/session buffers emitted the original rows and schema, not
     /// aggregate metadata, so the unified operator keeps that payload beside
@@ -101,6 +107,9 @@ impl AggregateBuffer {
         let self_updated = self.updated_since_emit;
         let other_emitted = other.emitted;
         self.count += other.count;
+        self.non_finite_observations = self
+            .non_finite_observations
+            .saturating_add(other.non_finite_observations);
         self.sum_i64 = self.sum_i64.saturating_add(other.sum_i64);
         self.sum_float += other.sum_float;
         // Combine each representation only over the sides that actually
@@ -148,7 +157,8 @@ impl AggregateBuffer {
             || (other.count > 0 && self_emitted)
             || (self.count > 0 && other_emitted && !self_emitted);
         debug_assert!(
-            self.count == self.int_observations + self.float_observations,
+            self.count
+                == self.int_observations + self.float_observations + self.non_finite_observations,
             "window aggregate observation counters drifted from count"
         );
     }
@@ -173,7 +183,8 @@ impl AggregateBuffer {
         self.count += 1;
         self.updated_since_emit = self.emitted;
         debug_assert!(
-            self.count == self.int_observations + self.float_observations,
+            self.count
+                == self.int_observations + self.float_observations + self.non_finite_observations,
             "window aggregate observation counters drifted from count"
         );
     }
@@ -183,10 +194,26 @@ impl AggregateBuffer {
     /// Float32 aggregates. Float min/max seed from the first FLOAT value —
     /// integer observations share neither representation nor sentinel.
     pub fn observe_float(&mut self, value: f64, kind: NumericKind) {
-        // JSON persistence cannot represent NaN/Infinity; a non-finite value
-        // used to serialize as null and poison the restored aggregate. It is
-        // not a meaningful sum/min/max input, so it is ignored.
+        // The row is always counted: JSON persistence cannot represent
+        // NaN/Infinity, so the VALUE is excluded from sum/min/max (it used to
+        // serialize as null and poison the restored aggregate), but COUNT is
+        // a row count and must include it.
+        self.kind = match (self.kind, kind) {
+            (NumericKind::Float64, _) | (_, NumericKind::Float64) => NumericKind::Float64,
+            (NumericKind::Float32, _) | (_, NumericKind::Float32) => NumericKind::Float32,
+            (NumericKind::Int64, NumericKind::Int64) => NumericKind::Int64,
+        };
+        self.count += 1;
+        self.updated_since_emit = self.emitted;
         if !value.is_finite() {
+            self.non_finite_observations = self.non_finite_observations.saturating_add(1);
+            debug_assert!(
+                self.count
+                    == self.int_observations
+                        + self.float_observations
+                        + self.non_finite_observations,
+                "window aggregate observation counters drifted from count"
+            );
             return;
         }
         if self.float_observations == 0 {
@@ -198,15 +225,9 @@ impl AggregateBuffer {
         }
         self.sum_float += value;
         self.float_observations = self.float_observations.saturating_add(1);
-        self.kind = match (self.kind, kind) {
-            (NumericKind::Float64, _) | (_, NumericKind::Float64) => NumericKind::Float64,
-            (NumericKind::Float32, _) | (_, NumericKind::Float32) => NumericKind::Float32,
-            (NumericKind::Int64, NumericKind::Int64) => NumericKind::Int64,
-        };
-        self.count += 1;
-        self.updated_since_emit = self.emitted;
         debug_assert!(
-            self.count == self.int_observations + self.float_observations,
+            self.count
+                == self.int_observations + self.float_observations + self.non_finite_observations,
             "window aggregate observation counters drifted from count"
         );
     }
@@ -256,13 +277,16 @@ impl AggregateBuffer {
     /// widened `sum`/`min`/`max` honest (both sides contribute) at the cost of
     /// an approximate count split that only this unrecoverable input can see.
     fn normalize_observation_counters(&mut self) {
-        if self.count == 0 {
+        // Counters describe the FINITE rows only; non-finite rows are their
+        // own bucket.
+        let target = self.count.saturating_sub(self.non_finite_observations);
+        if target == 0 {
             self.int_observations = 0;
             self.float_observations = 0;
             return;
         }
         if matches!(self.kind, NumericKind::Int64) {
-            self.int_observations = self.count;
+            self.int_observations = target;
             self.float_observations = 0;
             return;
         }
@@ -271,7 +295,7 @@ impl AggregateBuffer {
             // A float-kind payload with no integer evidence: every observation
             // came from the float side.
             self.int_observations = 0;
-            self.float_observations = self.count;
+            self.float_observations = target;
             return;
         }
         let float_evidenced =
@@ -279,19 +303,19 @@ impl AggregateBuffer {
         let named = self
             .int_observations
             .saturating_add(self.float_observations);
-        let unnamed = self.count.saturating_sub(named);
+        let unnamed = target.saturating_sub(named);
         if self.float_observations > 0 {
             // The payload named its own float observations; the remainder is
             // integer-side state written before the counters existed.
             self.int_observations = self.int_observations.saturating_add(unnamed);
-        } else if float_evidenced && self.count > 1 {
+        } else if float_evidenced && target > 1 {
             // Both sides accumulated values but neither count survived: reserve
             // one observation for the integer side so its bounds keep
             // contributing.
             self.int_observations = 1;
-            self.float_observations = self.count.saturating_sub(1);
+            self.float_observations = target.saturating_sub(1);
         } else {
-            self.int_observations = self.count;
+            self.int_observations = target;
             self.float_observations = 0;
         }
         if self
@@ -299,7 +323,7 @@ impl AggregateBuffer {
             .saturating_add(self.float_observations)
             != self.count
         {
-            self.int_observations = self.count;
+            self.int_observations = target;
             self.float_observations = 0;
         }
     }
@@ -429,7 +453,9 @@ impl LegacyAggregateBuffer {
 /// restored range.
 pub(crate) fn decode_buffer(bytes: &[u8]) -> Result<AggregateBuffer, Error> {
     let mut buffer = decode_buffer_unchecked(bytes)?;
-    if buffer.count != buffer.int_observations + buffer.float_observations {
+    if buffer.count
+        != buffer.int_observations + buffer.float_observations + buffer.non_finite_observations
+    {
         buffer.normalize_observation_counters();
     }
     Ok(buffer)

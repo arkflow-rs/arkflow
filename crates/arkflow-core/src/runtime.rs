@@ -21,6 +21,12 @@ const MAX_RECENT_ERRORS: usize = 32;
 const MAX_EVENTS: usize = 128;
 const MAX_OPERATIONS: usize = 256;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on the startup handshake (component connect + WAL open/recovery).
+/// Deliberately separate from and much larger than the shutdown budget: an
+/// object-store WAL backlog can take minutes to recover, and timing that out
+/// fails the whole stream start (and leaves an unabortable blocking task
+/// holding the WAL lock).
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Default)]
 pub struct EventStore {
@@ -586,17 +592,16 @@ impl RuntimeManager {
 
         let metrics = entry.lock().await.metrics.clone();
         let index = entry.lock().await.index;
-        // An unnamed Stream's control-plane id is `stream-{config_index}`.
-        // Hot replacement assigns a fresh registry index, so compiling with
-        // that index could collide with an explicit `stream-N` id. Derive the
-        // compile index from the stable control-plane id instead.
-        let compile_index = config
-            .id
-            .as_deref()
-            .and_then(|id| id.strip_prefix("stream-"))
-            .and_then(|suffix| suffix.parse::<usize>().ok())
-            .unwrap_or(index);
-        let spec = match crate::executor::stream_compiler::compile_stream(&config, compile_index) {
+        // Compile under the Stream's stable control-plane id. An unnamed
+        // config would otherwise derive its kernel Job id from the registry
+        // index, which a hot replacement changes: the Job id would move
+        // (losing state) and could collide with an explicit `stream-N` id in
+        // the same configuration.
+        let mut compile_config = config.clone();
+        if compile_config.id.as_deref().is_none_or(str::is_empty) {
+            compile_config.id = Some(id.to_string());
+        }
+        let spec = match crate::executor::stream_compiler::compile_stream(&compile_config, index) {
             Ok(spec) => spec,
             Err(error) => {
                 let mut runtime = entry.lock().await;
@@ -743,7 +748,7 @@ impl RuntimeManager {
             entry.lock().await.handle = Some(handle);
         }
 
-        match timeout(SHUTDOWN_TIMEOUT, startup_rx).await {
+        match timeout(STARTUP_TIMEOUT, startup_rx).await {
             Ok(Ok(Ok(()))) => {
                 let mut runtime = entry.lock().await;
                 if runtime.state != StreamState::Starting {

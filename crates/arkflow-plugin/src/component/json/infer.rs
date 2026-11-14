@@ -362,11 +362,12 @@ fn infer_array_element_type(array: &[CowValue]) -> Result<InferredType, Error> {
         return Ok(InferredType::Any);
     }
     // The first element may be null while later elements carry the shape;
-    // infer from the first NON-null element. A null-only array follows
-    // Arrow's upstream choice of Utf8 so mixed batches keep matching the
-    // reference inference.
+    // infer from the first NON-null element. A null-only array is
+    // type-NEUTRAL (the upstream choice): marking it Utf8 here would force a
+    // later record's numeric element to coerce the whole list to Utf8, so
+    // `{"a":[null]}` followed by `{"a":[1,2]}` decoded numbers as strings.
     match array.iter().find(|value| !matches!(value, CowValue::Null)) {
-        None => Ok(InferredType::Scalar(ObjSet::from_iter([DataType::Utf8]))),
+        None => Ok(InferredType::Scalar(ObjSet::default())),
         Some(a) => match a {
             CowValue::Array(_) => infer_nested_array_type(array),
             CowValue::Object(_) => infer_struct_array_type(array),
@@ -589,6 +590,11 @@ mod tests {
         let incompatible = r#"{"a": {"x": 1}}
 {"a": 1}"#;
 
+        // A null-only array is type-neutral: the later numeric element must
+        // decide the list type (upstream infers List(Int64)).
+        let null_only_then_number = r#"{"a":[null]}
+{"a":[1,2]}"#;
+
         let corpus: Vec<&str> = vec![
             mixed_arrays,
             nested_structs,
@@ -599,6 +605,7 @@ mod tests {
             &bigger_than_i64,
             scalar_list_coercion,
             incompatible,
+            null_only_then_number,
             // invalid JSON / non-object records must fail identically
             "}",
             "42",

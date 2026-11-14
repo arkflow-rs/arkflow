@@ -716,8 +716,17 @@ pub async fn restore_postgres_target(
     if !non_empty.is_empty() {
         return Err(StorageError::NonEmptyTarget { tables: non_empty });
     }
-    // Sessions are outside TABLE_ORDER; clear any leftover rows so a restore
-    // cannot resurrect pre-restore browser sessions.
+    // Sessions are outside TABLE_ORDER; lock and clear them so a restore
+    // cannot resurrect pre-restore browser sessions. The lock is required:
+    // the DELETE alone races a live Hub's concurrent session insert (or an
+    // uncommitted insert that commits later), leaving a pre-restore token
+    // valid after the restore.
+    let session_lock = "LOCK TABLE cp_sessions IN ACCESS EXCLUSIVE MODE NOWAIT";
+    if let Err(error) = sqlx::query(session_lock).execute(&mut *tx).await {
+        return Err(StorageError::TargetBusy(format!(
+            "could not lock table cp_sessions exclusively: {error}"
+        )));
+    }
     sqlx::query("DELETE FROM cp_sessions")
         .execute(&mut *tx)
         .await?;

@@ -857,22 +857,72 @@ impl StateJournal {
         inner.replay_applied.remove(&txn.id);
         inner.failed_compensation.remove(&txn.id);
         if let Some(state) = inner.txns.remove(&txn.id) {
+            let (mutations, applied_versions) = match state {
+                // A rolled-back transaction never touched the backend: its
+                // staged fences belong to the PREVIOUS value and must stay.
+                TxnState::Staged(mutations) => (mutations, Vec::new()),
+                TxnState::Applied {
+                    mutations,
+                    applied_versions,
+                    ..
+                } => (mutations, applied_versions),
+            };
+            // A COMPLETED delete leaves no live value, so its fence can be
+            // reclaimed — but only when the fence still belongs to this
+            // delete and no pending transaction staged on top of it. Removing
+            // it unconditionally made a Put staged after the delete (fence =
+            // the delete's version) look stale and silently drop the write;
+            // removing a fence a newer commit now owns would break that
+            // transaction's undo ownership check.
+            for (index, mutation) in mutations.iter().enumerate() {
+                let StagedMutation::Delete { .. } = mutation else {
+                    continue;
+                };
+                let Some(version) = applied_versions.get(index).copied().flatten() else {
+                    continue;
+                };
+                let (namespace, key) = mutation.storage();
+                let version_key = (namespace.to_owned(), key.to_vec());
+                if inner.key_versions.get(&version_key).copied() != Some(version) {
+                    continue;
+                }
+                if Self::fence_referenced(&inner, txn.id, &version_key, version) {
+                    continue;
+                }
+                inner.key_versions.remove(&version_key);
+            }
+            inner.release_bytes(&mutations);
+        }
+    }
+
+    /// Whether another live transaction staged a mutation on `key` while the
+    /// key's fence was `version`. Such a transaction's apply is not stale:
+    /// the fence it captured is the value it intends to build on, so the
+    /// delete's fence must survive until that transaction settles.
+    fn fence_referenced(
+        inner: &JournalInner,
+        completed: u64,
+        key: &(String, Vec<u8>),
+        version: u64,
+    ) -> bool {
+        inner.txns.iter().any(|(id, state)| {
+            if *id == completed {
+                return false;
+            }
             let mutations = match state {
                 TxnState::Staged(mutations) => mutations,
                 TxnState::Applied { mutations, .. } => mutations,
             };
-            // A completed delete leaves no live value; retaining its version
-            // fence forever leaks one entry per deleted key.
-            for mutation in &mutations {
-                if matches!(mutation, StagedMutation::Delete { .. }) {
-                    let (namespace, key) = mutation.storage();
-                    inner
-                        .key_versions
-                        .remove(&(namespace.to_owned(), key.to_vec()));
-                }
-            }
-            inner.release_bytes(&mutations);
-        }
+            let Some(fences) = inner.apply_fences.get(id) else {
+                return false;
+            };
+            mutations.iter().enumerate().any(|(index, mutation)| {
+                let (namespace, candidate) = mutation.storage();
+                namespace == key.0.as_str()
+                    && candidate == key.1.as_slice()
+                    && fences.get(index).copied().flatten() == Some(version)
+            })
+        })
     }
 
     /// Compensating rollback of an applied transaction: restore the
@@ -1656,6 +1706,47 @@ mod tests {
             journal.backend().get("ns", b"k").unwrap(),
             Some(b"1".to_vec()),
             "the retried increment applies exactly once when the key was never taken over"
+        );
+    }
+
+    #[test]
+    fn delete_completion_keeps_fences_referenced_by_pending_transactions() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"k", b"old").unwrap();
+        // A deletes the key and applies; its wrapped ack is still pending.
+        let a = journal.begin().unwrap();
+        journal.delete(a, "ns", b"k").unwrap();
+        journal.apply(a).unwrap();
+        assert!(journal.backend().get("ns", b"k").unwrap().is_none());
+        // B stages a Put AFTER the delete applied: it captures A's fence.
+        let b = journal.begin().unwrap();
+        journal.put(b, "ns", b"k", b"new".to_vec(), None).unwrap();
+        // A's completion must not reclaim the fence B captured, or B's Put
+        // would look stale and be silently skipped.
+        journal.complete(a);
+        journal.apply(b).unwrap();
+        journal.complete(b);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"new".to_vec()),
+            "a Put staged after a completed delete must not be fenced out"
+        );
+    }
+
+    #[test]
+    fn delete_completion_reclaims_an_unreferenced_fence() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"k", b"old").unwrap();
+        let a = journal.begin().unwrap();
+        journal.delete(a, "ns", b"k").unwrap();
+        journal.apply(a).unwrap();
+        journal.complete(a);
+        let inner = journal.inner.lock().unwrap();
+        assert!(
+            !inner
+                .key_versions
+                .contains_key(&("ns".to_string(), b"k".to_vec())),
+            "a completed delete with no pending stager reclaims its fence"
         );
     }
 

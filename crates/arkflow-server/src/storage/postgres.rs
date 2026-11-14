@@ -829,11 +829,11 @@ impl PostgresBackend {
         // Read the version stamp BEFORE running any DDL: an old binary
         // pointed at a newer database must be refused without first taking
         // table locks or modifying the schema.
-        let version_table: Option<String> =
-            sqlx::query_scalar("SELECT to_regclass('cp_schema_meta')")
+        let version_table: bool =
+            sqlx::query_scalar("SELECT to_regclass('cp_schema_meta') IS NOT NULL")
                 .fetch_one(&pool)
                 .await?;
-        let stored: Option<i64> = if version_table.is_some() {
+        let stored: Option<i64> = if version_table {
             sqlx::query_scalar("SELECT value FROM cp_schema_meta WHERE key = 'schema_version'")
                 .fetch_optional(&pool)
                 .await?

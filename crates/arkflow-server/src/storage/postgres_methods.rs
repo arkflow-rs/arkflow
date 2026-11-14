@@ -1115,11 +1115,17 @@ impl StorageBackend for PostgresBackend {
             ).await?;
             Ok(())
             }.await;
+            // A failed body must not commit the half-applied attempt/intent
+            // changes (the event INSERT is the last step). Mirrors the other
+            // hand-written transactions in this file.
+            if __ret.is_err() {
+                drop(transaction);
+                return __ret;
+            }
             transaction.commit().await?;
             __ret
         }
     }
-
 
     async fn mark_attempt_dispatched(
         &self,

@@ -550,8 +550,16 @@ impl Hub {
                         .min_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then(a.id.cmp(&b.id)))
                 })
                 .map(|operation| operation.id.clone());
-            if let Some(oldest) = eviction {
-                operations.remove(&oldest);
+            let evicted_command = eviction.and_then(|oldest| {
+                operations
+                    .remove(&oldest)
+                    .map(|operation| operation.command_id)
+            });
+            if let Some(command_id) = evicted_command {
+                // The settled marker only needs to outlive its operation;
+                // evicting the operation without it leaks one command id per
+                // settled command for the whole Hub process lifetime.
+                self.settled_commands.write().await.remove(&command_id);
             }
         }
         // Audit the logical mutation once: reconciler re-dispatches of the
@@ -691,6 +699,14 @@ impl Hub {
             return Ok(operation.clone());
         }
         let already_terminal = operation.state.is_terminal();
+        // A terminal result that CONTRADICTS the recorded terminal state is
+        // stale (the operation was settled by the lease sweep or another
+        // path). Re-running the checkpoint side effects for it would
+        // overwrite an artifact with a late, unrelated outcome — e.g. a
+        // timed-out pause capture marked failed after it had completed.
+        if already_terminal && operation.state != result.state {
+            return Ok(operation.clone());
+        }
         if result.state.is_terminal() {
             // A terminal result settles the command lease. The check runs on
             // the validated, applied result — an acknowledged/running report

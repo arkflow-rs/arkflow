@@ -17,6 +17,13 @@ static CHECKPOINT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
 /// so two registered nodes could overwrite each other's intermediate
 /// manifests. Percent-encoding is reversible and keeps the safe ASCII set
 /// readable.
+/// The pre-`encode_node_key` mapping (`/` → `_`). Kept only so recovery and
+/// deletion can also look at intermediate manifests written by older builds,
+/// whose keys are not reproducible with the current encoding.
+pub fn legacy_encode_node_key(node_id: &str) -> String {
+    node_id.replace('/', "_")
+}
+
 pub fn encode_node_key(node_id: &str) -> String {
     let mut encoded = String::with_capacity(node_id.len());
     for byte in node_id.bytes() {
@@ -478,12 +485,22 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
             let intermediate_manifest_keys = manifest
                 .task_attempts
                 .iter()
-                .map(|attempt| {
-                    format!(
-                        "{prefix}/{}/manifests/{}.json",
-                        manifest.checkpoint_id,
-                        encode_node_key(&attempt.node_id)
-                    )
+                .flat_map(|attempt| {
+                    // Pre-encoding builds keyed intermediate manifests with
+                    // `/` replaced by `_`; both spellings must be reclaimed so
+                    // an upgrade does not orphan the old objects.
+                    [
+                        format!(
+                            "{prefix}/{}/manifests/{}.json",
+                            manifest.checkpoint_id,
+                            encode_node_key(&attempt.node_id)
+                        ),
+                        format!(
+                            "{prefix}/{}/manifests/{}.json",
+                            manifest.checkpoint_id,
+                            legacy_encode_node_key(&attempt.node_id)
+                        ),
+                    ]
                 })
                 .collect::<BTreeSet<_>>();
             let other_kind = match artifact.kind {
