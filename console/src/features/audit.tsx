@@ -99,11 +99,7 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
           )}
         </p>
       )}
-      <Pagination
-        page={displayPage}
-        pages={pages}
-        onChange={(next) => setParam('page', String(next))}
-      />
+      <Pagination page={displayPage} pages={pages} onChange={(next) => setParam('page', String(next))} />
     </section>
   )
 }

@@ -19,8 +19,18 @@ type PromptOptions = {
 }
 
 type PendingDialog =
-  | { kind: 'confirm'; options: ConfirmOptions; resolve: (value: boolean) => void }
-  | { kind: 'prompt'; options: PromptOptions; resolve: (value: string | null) => void }
+  | {
+      id: number
+      kind: 'confirm'
+      options: ConfirmOptions
+      resolve: (value: boolean) => void
+    }
+  | {
+      id: number
+      kind: 'prompt'
+      options: PromptOptions
+      resolve: (value: string | null) => void
+    }
 
 type ConfirmApi = {
   confirm: (options: ConfirmOptions) => Promise<boolean>
@@ -39,9 +49,16 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
   // overwrite the earlier resolver, leaving its caller pending forever.
   const [queue, setQueue] = useState<PendingDialog[]>([])
   const pending = queue[0]
-  const [inputValue, setInputValue] = useState('')
   const queueRef = useRef(queue)
-  queueRef.current = queue
+  const inputRef = useRef<HTMLInputElement>(null)
+  const nextDialogId = useRef(0)
+
+  // The unmount cleanup below must settle the latest committed queue.
+  // Syncing the ref in an effect keeps render pure (writing a ref during
+  // render trips react-hooks/refs).
+  useEffect(() => {
+    queueRef.current = queue
+  }, [queue])
 
   // Settle every outstanding caller when the provider unmounts.
   useEffect(
@@ -54,39 +71,40 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
     [],
   )
 
-  // Load the prompt's initial value when it becomes the head of the queue.
-  useEffect(() => {
-    if (pending?.kind === 'prompt') {
-      setInputValue(pending.options.initialValue ?? '')
-    }
-  }, [pending])
-
   const api: ConfirmApi = {
     confirm: (options) =>
       new Promise((resolve) => {
-        setQueue((current) => [...current, { kind: 'confirm', options, resolve }])
+        const id = nextDialogId.current++
+        setQueue((current) => [...current, { id, kind: 'confirm', options, resolve }])
       }),
     prompt: (options) =>
       new Promise((resolve) => {
-        setQueue((current) => [...current, { kind: 'prompt', options, resolve }])
+        const id = nextDialogId.current++
+        setQueue((current) => [...current, { id, kind: 'prompt', options, resolve }])
       }),
   }
 
-  const close = (value: boolean | string | null) => {
+  // Settle the dialog by id, not by queue position: Radix's close primitive
+  // also reports onOpenChange(false) for the same click, so the action and
+  // the close callback both run settle. Resolving by the dialog's own id
+  // makes the second call a no-op instead of resolving the NEXT queued
+  // caller with the wrong answer.
+  const close = (id: number, value: boolean | string | null) => {
     setQueue((current) => {
-      const [head, ...rest] = current
-      head?.resolve(value as never)
-      return rest
+      const index = current.findIndex((dialog) => dialog.id === id)
+      if (index === -1) return current
+      current[index].resolve(value as never)
+      return [...current.slice(0, index), ...current.slice(index + 1)]
     })
   }
 
   const settle = (accepted: boolean) => {
     if (!pending) return
     if (!accepted) {
-      close(pending.kind === 'prompt' ? null : false)
+      close(pending.id, pending.kind === 'prompt' ? null : false)
       return
     }
-    close(pending.kind === 'prompt' ? inputValue : true)
+    close(pending.id, pending.kind === 'prompt' ? (inputRef.current?.value ?? '') : true)
   }
 
   return (
@@ -108,10 +126,14 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
               {pending.kind === 'prompt' && (
                 <label className="dialog-input">
                   <span>{pending.options.label}</span>
+                  {/* Uncontrolled and keyed by the dialog: a queued prompt
+                      starts from its own initial value without a state-sync
+                      effect, and the settle handler reads the live value. */}
                   <input
+                    key={pending.id}
+                    ref={inputRef}
                     className="dialog-input"
-                    value={inputValue}
-                    onChange={(event) => setInputValue(event.target.value)}
+                    defaultValue={pending.options.initialValue ?? ''}
                     autoFocus
                   />
                 </label>

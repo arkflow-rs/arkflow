@@ -129,8 +129,7 @@ function ConsoleShell() {
   useEffect(() => {
     const onCredentialChanged = () => setCredentialEpoch((value) => value + 1)
     window.addEventListener('arkflow-credential-changed', onCredentialChanged)
-    return () =>
-      window.removeEventListener('arkflow-credential-changed', onCredentialChanged)
+    return () => window.removeEventListener('arkflow-credential-changed', onCredentialChanged)
   }, [])
 
   const refresh = useCallback(() => {
