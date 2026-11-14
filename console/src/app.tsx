@@ -163,9 +163,12 @@ function ConsoleShell() {
   // role gate is lenient while the echo is absent (older control plane).
   const canMutate = nodeReachable && can('operate')
 
-  const command = async (id: string, action: 'start' | 'stop' | 'restart') => {
+  // The ROW's node_id wins (the all-nodes view lists streams from every
+  // node; the URL filter may be empty there), falling back to the selected
+  // node filter for callers without a row context.
+  const command = async (id: string, action: 'start' | 'stop' | 'restart', nodeId?: string) => {
     try {
-      const operation = await api.command(id, action, selectedNode || undefined)
+      const operation = await api.command(id, action, nodeId ?? (selectedNode || undefined))
       await waitForOperation(operation.id)
       await queryClient.invalidateQueries({ queryKey: ['live'] })
     } catch (cause) {

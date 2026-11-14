@@ -75,7 +75,7 @@ pub(crate) fn decode_node_labels(json: &str) -> Result<BTreeMap<String, String>,
 /// A webhook alerting subscription (see the `webhook-alerting` capability).
 /// The signing secret is stored for delivery-time HMAC computation and is
 /// never part of any API response representation.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WebhookSubscription {
     pub id: String,
     pub url: String,
@@ -1435,6 +1435,16 @@ pub trait StorageBackend: Send + Sync + 'static {
         now_ms: u64,
     ) -> Result<bool, StorageError>;
     async fn get_node_maintenance(&self, node_id: &str) -> Result<Option<String>, StorageError>;
+    /// The highest numeric suffix ever persisted in the shared control-plane
+    /// id namespaces (`hop-N` operations, `cmd-N` commands, `attempt-N`
+    /// attempts). A restarting process seeds its id sequence above this
+    /// floor — reusing a durable primary key either fails the insert or
+    /// overwrites an older record.
+    async fn id_sequence_floor(&self) -> Result<u64, StorageError>;
+    /// The highest counter segment ever persisted in an
+    /// `intent-{generation}-{counter}` id, so the intent counter can be
+    /// seeded above it on restart.
+    async fn intent_counter_floor(&self) -> Result<u64, StorageError>;
     /// Replace a node's full label map. Returns the previous labels when the
     /// node row exists, `None` for an unknown node. Labels are never part of
     /// `upsert_node`: registration/report persistence must not touch them.
@@ -2048,6 +2058,18 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::get_node_maintenance(backend, node_id).await,
             Self::Postgres(backend) => StorageBackend::get_node_maintenance(backend, node_id).await,
+        }
+    }
+    async fn id_sequence_floor(&self) -> Result<u64, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::id_sequence_floor(backend).await,
+            Self::Postgres(backend) => StorageBackend::id_sequence_floor(backend).await,
+        }
+    }
+    async fn intent_counter_floor(&self) -> Result<u64, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::intent_counter_floor(backend).await,
+            Self::Postgres(backend) => StorageBackend::intent_counter_floor(backend).await,
         }
     }
     async fn replace_node_labels(
@@ -3244,6 +3266,13 @@ impl StorageBackend for ControlPlaneStore {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Seed the intent counter above every `intent-{generation}-{counter}` id a
+/// previous process persisted: the counter is global, so a fresh stream
+/// generation can never collide with an existing durable row. Idempotent.
+pub(crate) fn seed_intent_counter(floor: u64) {
+    NEXT_ID.fetch_max(floor.saturating_add(1), Ordering::Relaxed);
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()

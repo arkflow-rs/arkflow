@@ -66,6 +66,12 @@ pub struct HttpInput {
     server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>>,
     sender: Arc<Sender<MessageBatch>>,
     receiver: Arc<Receiver<MessageBatch>>,
+    /// Set when the listener task ends (error or abort). The input itself
+    /// holds `sender`, so the channel NEVER disconnects by itself: without
+    /// this signal a dead listener left `read` waiting forever instead of
+    /// surfacing the disconnection the engine reconnects on.
+    server_down: Arc<std::sync::atomic::AtomicBool>,
+    server_down_notify: Arc<tokio::sync::Notify>,
     connected: AtomicBool,
     auth: Option<AuthType>,
     codec: Option<Arc<dyn Codec>>,
@@ -75,6 +81,23 @@ struct AppStateInner {
     sender: Sender<MessageBatch>,
     auth: Option<AuthType>,
     codec: Option<Arc<dyn Codec>>,
+}
+
+/// Publishes the listener's death on EVERY exit path — normal return, serve
+/// error, task abort, and panic. `axum::serve(...).await` only returns on a
+/// listener error; an aborted or panicking task never reaches code placed
+/// after the await, and `read` would then stay parked on a channel whose
+/// sender this input itself keeps alive.
+struct ListenerDeathGuard {
+    down: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for ListenerDeathGuard {
+    fn drop(&mut self) {
+        self.down.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
 }
 
 type AppState = Arc<AppStateInner>;
@@ -95,6 +118,8 @@ impl HttpInput {
             connected: AtomicBool::new(false),
             sender: Arc::new(sender),
             receiver: Arc::new(receiver),
+            server_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            server_down_notify: Arc::new(tokio::sync::Notify::new()),
             auth,
             codec,
         })
@@ -136,7 +161,23 @@ impl HttpInput {
 impl Input for HttpInput {
     async fn connect(&self) -> Result<(), Error> {
         if self.connected.load(Ordering::SeqCst) {
-            return Ok(());
+            // A listener that died leaves `connected` set: `read()` reports
+            // the disconnection and the supervisor reconnects by calling
+            // this again. Reap the dead listener and fall through to rebind
+            // instead of short-circuiting — returning Ok here would keep
+            // `server_down` set and every later read would report the same
+            // disconnection forever.
+            if !self.server_down.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let previous = self.server_handle.lock().await.take();
+            self.connected.store(false, Ordering::SeqCst);
+            if let Some(handle) = previous {
+                handle.abort();
+                // Wait until the dead task is dropped so its death guard
+                // cannot flip the freshly cleared marker back to "down".
+                let _ = handle.await;
+            }
         }
 
         let path = self.config.path.clone();
@@ -169,7 +210,19 @@ impl Input for HttpInput {
             .await
             .map_err(|e| Error::Connection(format!("HTTP input failed to bind {addr}: {e}")))?;
 
+        // A reconnect rebinds: clear the previous listener's down marker.
+        self.server_down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let server_down = Arc::clone(&self.server_down);
+        let server_down_notify = Arc::clone(&self.server_down_notify);
         let server_handle = tokio::spawn(async move {
+            // Publishes the listener's death on return, error, abort, and
+            // panic: `axum::serve(...).await` never returns when the task is
+            // aborted, so a post-await store would miss that path.
+            let _death = ListenerDeathGuard {
+                down: server_down,
+                notify: server_down_notify,
+            };
             axum::serve(listener, app.into_make_service())
                 .await
                 .map_err(|e| Error::Connection(format!("HTTP server error: {}", e)))
@@ -187,16 +240,36 @@ impl Input for HttpInput {
         if !self.connected.load(Ordering::SeqCst) {
             return Err(Error::Connection("The input is not connected".to_string()));
         }
+        // A dead listener can never deliver again: report it up front (the
+        // channel itself stays open because this input holds the sender).
+        if self.server_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Disconnection);
+        }
 
-        if let Ok(mut msg) = self.receiver.recv_async().await {
-            msg.set_input_name(self.input_name.clone());
-            Ok((Arc::new(msg), Arc::new(NoopAck)))
-        } else {
-            // The channel disconnects only when the listener task (and every
-            // request handler) is gone — surface that as a disconnection so
-            // the engine's reconnect path re-binds instead of reading a
-            // misleading "empty queue" process error forever.
-            Err(Error::Disconnection)
+        // Register for the death notification BEFORE the receive so a
+        // listener exit between the check above and the wait is not missed.
+        let mut down = std::pin::pin!(self.server_down_notify.notified());
+        down.as_mut().enable();
+        // Re-check AFTER enabling: `notify_waiters` does not buffer a permit,
+        // so a death between the check above and `enable()` would otherwise
+        // be lost and this wait would park forever.
+        if self.server_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Disconnection);
+        }
+        tokio::select! {
+            result = self.receiver.recv_async() => {
+                if let Ok(mut msg) = result {
+                    msg.set_input_name(self.input_name.clone());
+                    Ok((Arc::new(msg), Arc::new(NoopAck)))
+                } else {
+                    // Only reachable once every sender is gone.
+                    Err(Error::Disconnection)
+                }
+            }
+            _ = &mut down => {
+                // The listener task ended (error or abort).
+                Err(Error::Disconnection)
+            }
         }
     }
 
@@ -204,6 +277,11 @@ impl Input for HttpInput {
         let mut server_handle_guard = self.server_handle.lock().await;
         if let Some(handle) = server_handle_guard.take() {
             handle.abort();
+            // Wait until the aborted task is dropped: its death guard then
+            // has already published the termination, so a reconnect cannot
+            // clear the marker and be flipped back to "down" by the stale
+            // guard afterwards.
+            let _ = handle.await;
         }
 
         self.connected.store(false, Ordering::SeqCst);

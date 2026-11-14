@@ -169,8 +169,21 @@ pub(crate) async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
                 .map(|sender| sender.send(Err(error.to_string())));
             return Err(error);
         }
-        for input in &inputs {
-            if let Err(error) = input.restore_positions(&manifest.source_positions).await {
+        // Restore each source from the positions ITS task reported: the
+        // flattened manifest list loses task identity, so two sources with
+        // the same topic/partition would otherwise consume each other's
+        // offsets. Manifests written before per-task positions existed carry
+        // an empty map and fall back to the flat list.
+        for chain in &graph.chains {
+            let Some(input) = chain.source.as_ref() else {
+                continue;
+            };
+            let positions = manifest
+                .source_positions_by_task
+                .get(chain.entry_task_id())
+                .map(|positions| positions.as_slice())
+                .unwrap_or(manifest.source_positions.as_slice());
+            if let Err(error) = input.restore_positions(positions).await {
                 close_inputs(&inputs).await;
                 let _ = startup
                     .take()
@@ -446,6 +459,25 @@ fn event_time_gates(
     let mut gates = BTreeMap::new();
     let mut shared_trackers =
         BTreeMap::<String, Arc<std::sync::Mutex<crate::event_time::WatermarkTracker>>>::new();
+    // Chains per watermark group: a group with MORE THAN ONE chain shares a
+    // tracker, and its members' keys must be namespaced per chain so two
+    // chains observing the same connector topic/partition keep independent
+    // progress (otherwise the faster chain advances the shared entry and
+    // closes windows the slower one still has events for).
+    let mut group_sizes = BTreeMap::<String, usize>::new();
+    for chain in &graph.chains {
+        if chain
+            .source_time
+            .as_ref()
+            .is_some_and(|time| time.mode == crate::job::TimeMode::EventTime)
+        {
+            let group = chain
+                .watermark_group
+                .clone()
+                .unwrap_or_else(|| chain.entry_task_id().to_owned());
+            *group_sizes.entry(group).or_insert(0) += 1;
+        }
+    }
     for chain in &graph.chains {
         let Some(source_time) = chain
             .source_time
@@ -462,8 +494,8 @@ fn event_time_gates(
         // Source edges feeding the same Window must classify lateness against
         // one shared minimum, even when their local source contracts or
         // timing vectors were constructed independently.
-        let tracker_key = group;
-        let tracker = match shared_trackers.entry(tracker_key) {
+        let gate_shared = group_sizes.get(&group).copied().unwrap_or(0) > 1;
+        let tracker = match shared_trackers.entry(group) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let tracker = crate::event_time::WatermarkTracker::from_time_spec(source_time)?;
@@ -472,11 +504,14 @@ fn event_time_gates(
                 tracker
             }
         };
-        let gate = crate::executor::event_time_gate::EventTimeGate::new_with_shared_tracker(
+        let mut gate = crate::executor::event_time_gate::EventTimeGate::new_with_shared_tracker(
             source_time,
             chain.window_timings.clone(),
             tracker,
         )?;
+        if gate_shared {
+            gate = gate.with_namespace(chain.entry_task_id());
+        }
         gates.insert(
             chain.entry_task_id().to_owned(),
             Arc::new(tokio::sync::Mutex::new(Some(gate))),
@@ -782,12 +817,38 @@ impl RescaleContext {
                 .ok_or_else(|| Error::Process("corrupt window state key during rescale".into()))?;
             return Ok(user_key.to_vec());
         }
-        // StatefulOperator state key = "<tag>:" + value encoding, where the
-        // post-tag bytes are exactly the routing hash input; the null
-        // sentinels ("null:<tag>") hash as-is.
+        // StatefulOperator state key = "<tag>:" + value encoding for
+        // string/binary keys, and the PERSISTED integer form is a BARE tag
+        // ("i64" + 8-byte BE) — released versions wrote that shape, so both
+        // forms parse here; the post-tag bytes are exactly the routing hash
+        // input and the null sentinels ("null:<tag>") hash as-is.
         if let Some(rest) = key.strip_prefix(b"utf8:") {
             return Ok(rest.to_vec());
         }
+        // Persisted integer keys are a BARE tag followed by the fixed-width
+        // big-endian payload. Match the exact length FIRST: the first payload
+        // byte can be ':' (0x3a), so a bare i8 key for value 58 is exactly
+        // `b"i8:"` and would otherwise be taken for the colon-delimited form,
+        // yielding an empty routing key. No tag is a prefix of another, so
+        // the match is unambiguous.
+        for (tag, width) in [
+            (&b"i8"[..], 1usize),
+            (&b"i16"[..], 2),
+            (&b"i32"[..], 4),
+            (&b"i64"[..], 8),
+            (&b"u8"[..], 1),
+            (&b"u16"[..], 2),
+            (&b"u32"[..], 4),
+            (&b"u64"[..], 8),
+        ] {
+            if key.len() == tag.len() + width {
+                if let Some(rest) = key.strip_prefix(tag) {
+                    return Ok(rest.to_vec());
+                }
+            }
+        }
+        // Colon-delimited tags: string/binary keys and the tagged integer
+        // forms written by intermediate builds.
         for tag in [
             &b"binary:"[..],
             b"i8:",
@@ -1003,7 +1064,13 @@ async fn run_local_checkpoint_loop(
                 let checkpoint_id = format!("local-{}-{timestamp}-{sequence}", plan.spec.id);
                 sequence = sequence.saturating_add(1);
                 match handle.checkpoint_barrier_with_details(checkpoint_id.clone(), 0).await {
-                    Ok((snapshot, source_positions, watermarks_ms, watermark_partitions)) => {
+                    Ok((
+                        snapshot,
+                        _flat_source_positions,
+                        watermarks_ms,
+                        watermark_partitions,
+                        source_positions_by_task,
+                    )) => {
                         if let Err(error) = persist_local_checkpoint(
                             &store,
                             &mut catalog,
@@ -1011,7 +1078,7 @@ async fn run_local_checkpoint_loop(
                             &participants,
                             &checkpoint,
                             snapshot,
-                            source_positions,
+                            source_positions_by_task,
                             watermarks_ms,
                             watermark_partitions,
                             &checkpoint_id,
@@ -1036,7 +1103,7 @@ fn persist_local_checkpoint(
     participants: &[String],
     checkpoint: &crate::job::CheckpointSpec,
     snapshot: crate::state::StateSnapshot,
-    source_positions: Vec<crate::checkpoint::SourcePosition>,
+    source_positions_by_task: BTreeMap<String, Vec<crate::checkpoint::SourcePosition>>,
     watermarks_ms: BTreeMap<String, i64>,
     watermark_partitions: BTreeMap<String, Vec<crate::checkpoint::WatermarkPosition>>,
     checkpoint_id: &str,
@@ -1058,17 +1125,7 @@ fn persist_local_checkpoint(
         participants.iter().cloned(),
     );
     let barrier = coordinator.start(checkpoint_id.to_owned())?;
-    let mut positions_pending = Some(source_positions);
     for task_id in participants {
-        let is_source = plan
-            .task(task_id)
-            .and_then(|task| {
-                plan.spec
-                    .operators
-                    .iter()
-                    .find(|operator| operator.id == task.operator_id)
-            })
-            .is_some_and(|operator| operator.kind == crate::job::OperatorKind::Source);
         coordinator.acknowledge(crate::checkpoint::TaskCheckpointAck {
             task_id: task_id.clone(),
             attempt_id: format!("{task_id}:local:0"),
@@ -1080,11 +1137,13 @@ fn persist_local_checkpoint(
             checkpoint_id: barrier.checkpoint_id.clone(),
             generation: barrier.generation,
             state: snapshot.clone(),
-            source_positions: if is_source {
-                positions_pending.take().unwrap_or_default()
-            } else {
-                Vec::new()
-            },
+            // Each source task carries ONLY the positions its own chain
+            // reported: handing the whole flat list to the first source task
+            // would mis-restore every other source sharing topic/partition.
+            source_positions: source_positions_by_task
+                .get(task_id)
+                .cloned()
+                .unwrap_or_default(),
             watermark_ms: watermarks_ms.get(task_id).copied(),
             watermark_partitions: watermark_partitions
                 .get(task_id)
@@ -1266,6 +1325,7 @@ mod validation_tests {
                 },
             ],
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: Default::default(),
             watermark_partitions: Default::default(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {
@@ -1391,6 +1451,90 @@ mod validation_tests {
             assert_eq!(moved.namespace, expected, "key {user_key}");
             assert_eq!(moved.key, state_key);
             assert_eq!(moved.value, b"42".to_vec());
+        }
+    }
+
+    /// Regression (integer key encoding): the rescale parser must accept
+    /// both the released BARE tag form ("i64" + big-endian bytes, still what
+    /// the stateful operator writes so restored checkpoints keep resolving)
+    /// and the tagged form written by intermediate builds. The stripped
+    /// post-tag bytes must be EXACTLY the routing-hash input (the raw
+    /// big-endian value, matching `hash_column`).
+    #[test]
+    fn integer_state_keys_rescale_with_both_tag_forms() {
+        let new_plan = JobPlan::compile(rescale_job_spec(4)).unwrap();
+        let context = RescaleContext::from_plan(&new_plan).unwrap();
+        let old_plan = JobPlan::compile(rescale_job_spec(1)).unwrap();
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let old_namespace =
+            crate::job::effective_state_namespace(&old_plan.spec.id, None, "agg", &old_task.id);
+        let value: i64 = 0x0102030405060708;
+        // The routing input is the bare big-endian value.
+        let group = crate::job::key_group_for_key(&value.to_be_bytes(), 16).unwrap();
+        let owner = new_plan
+            .tasks
+            .iter()
+            .find(|task| {
+                task.operator_id == "agg"
+                    && task
+                        .partitions
+                        .iter()
+                        .any(|partition| partition.key_group.contains(group))
+            })
+            .unwrap();
+        let expected =
+            crate::job::effective_state_namespace(&new_plan.spec.id, None, "agg", &owner.id);
+        for state_key in [
+            [b"i64".as_slice(), value.to_be_bytes().as_slice()].concat(),
+            [b"i64:".as_slice(), value.to_be_bytes().as_slice()].concat(),
+        ] {
+            let entry = crate::state::StateEntry {
+                namespace: old_namespace.clone(),
+                key: state_key.clone(),
+                value: b"1".to_vec(),
+                expires_at_ms: None,
+            };
+            let moved = context.redistribute(entry).unwrap();
+            assert_eq!(moved.namespace, expected);
+            assert_eq!(moved.key, state_key);
+        }
+
+        // Regression: a bare integer payload whose FIRST byte is ':' (0x3a)
+        // must not be mistaken for the colon-delimited tag. The bare key is
+        // exactly tag+width bytes long, so the length check disambiguates it
+        // from the tagged form (tag+':'+width).
+        let colon_leading: i64 = 0x3a02_0304_0506_0708;
+        let colon_group = crate::job::key_group_for_key(&colon_leading.to_be_bytes(), 16).unwrap();
+        let colon_owner = new_plan
+            .tasks
+            .iter()
+            .find(|task| {
+                task.operator_id == "agg"
+                    && task
+                        .partitions
+                        .iter()
+                        .any(|partition| partition.key_group.contains(colon_group))
+            })
+            .unwrap();
+        let colon_expected =
+            crate::job::effective_state_namespace(&new_plan.spec.id, None, "agg", &colon_owner.id);
+        for state_key in [
+            [b"i64".as_slice(), colon_leading.to_be_bytes().as_slice()].concat(),
+            [b"i64:".as_slice(), colon_leading.to_be_bytes().as_slice()].concat(),
+        ] {
+            let entry = crate::state::StateEntry {
+                namespace: old_namespace.clone(),
+                key: state_key.clone(),
+                value: b"1".to_vec(),
+                expires_at_ms: None,
+            };
+            let moved = context.redistribute(entry).unwrap();
+            assert_eq!(moved.namespace, colon_expected);
+            assert_eq!(moved.key, state_key);
         }
     }
 
@@ -1756,6 +1900,7 @@ mod validation_tests {
             generation: 1,
             task_attempts: Vec::new(),
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: Default::default(),
             watermark_partitions: Default::default(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {
@@ -1814,6 +1959,7 @@ mod validation_tests {
             generation: 1,
             task_attempts: Vec::new(),
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: Default::default(),
             watermark_partitions: Default::default(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {
@@ -1874,6 +2020,7 @@ mod validation_tests {
             generation: 1,
             task_attempts: Vec::new(),
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: Default::default(),
             watermark_partitions: Default::default(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {
@@ -3702,6 +3849,7 @@ mod runner_tests {
             manifest.generation,
             &manifest.task_attempts,
             &manifest.source_positions,
+            &manifest.source_positions_by_task,
             &manifest.watermarks_ms,
             &manifest.watermark_partitions,
             &manifest.in_flight_barrier,
@@ -3731,6 +3879,7 @@ mod runner_tests {
                 })
                 .collect(),
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: BTreeMap::new(),
             watermark_partitions: BTreeMap::new(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {

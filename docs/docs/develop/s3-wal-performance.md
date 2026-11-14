@@ -41,18 +41,18 @@ Input → append_batch (μs, memory) → segment buffer → channel → PUT work
 | Factor | Typical Range | Bottleneck |
 |--------|---------------|------------|
 | S3 PUT (single worker) | 50-150 MB/s | Network bandwidth |
-| S3 PUT (parallel, 4-8 workers) | 200-450 MB/s | Network bandwidth |
 | S3 LIST recovery | 20-100 MB/s | API rate limits |
 | Local encoding | 500+ MB/s | CPU (CRC32 + optional compression) |
 | Channel backpressure | 16 segments/worker | Configurable bounded channel |
 
-**Practical throughput**: 100-200 MB/s with the default 1-worker setup;
-up to 450 MB/s with `parallel_put.workers: 8`.
+**Practical throughput**: 100-200 MB/s with the default 1-worker setup.
 
-**Parallel PUT benefit**: Multiple workers operate on independent bounded
-channels and round-robin assign segments, increasing throughput up to
-2-3× for high-QPS workloads without changing the at-least-once
-contract. Watch for S3 per-prefix rate limits with 8 workers.
+**Seals are serialized**: segment seals run one at a time so the
+acknowledged frontier can never advance past an earlier unsealed segment
+(and a failed upload is retried in order). The throughput of a seal is
+therefore bounded by one PUT at a time; `parallel_put.workers` is accepted
+for configuration compatibility but currently has no effect (the store
+logs a warning when it is set above 1).
 
 ### Replay Window
 
@@ -237,32 +237,20 @@ segment_tuning:
 
 ## Parallel PUT Workers
 
-Configure multiple PUT workers for 2-3x throughput improvement.
+`parallel_put` remains part of the configuration schema, but seals are
+serialized (see above) so the worker count has no throughput effect today.
+Keep the default; the store logs a warning when more than one worker is
+configured.
 
-```yaml validate=foreign reason="WAL tuning option fragment"
-parallel_put:
-  workers: 4              # 1-8, default 1
-  shutdown_timeout: "30s" # how long to wait for in-flight uploads
-```
-
-**Benefits:**
-- Workers operate in parallel via independent channels
-- Round-robin assignment (oldest segments first)
-- Per-worker backpressure (16 segments each)
-
-**Watch for S3 rate limits**: 8 workers can hit per-prefix limits.
-
-**Manifest write safety**: With `workers > 1`, multiple workers can finish a
-segment upload and seal it concurrently, each rewriting `manifest.json`. These
-concurrent rewrites are coordinated with ETag-based optimistic concurrency
-(read ETag → conditional PUT → retry on mismatch, up to 8 attempts covering the
-worker ceiling), so no worker's cursor advancement or sealed-segment entry is
-silently overwritten — provided the backend supports conditional PUT. S3 and
-S3-compatible stores do; a backend that does not (e.g. `LocalFileSystem`)
-falls back to a single-writer unconditional write, so keep `workers: 1` there.
-This is invisible at `workers: 1` (the default): no contention, no retries,
-behavior unchanged. See `docs/docs/components/0-inputs/delivery-semantics.md`
-for the delivery-contract details.
+**Manifest write safety**: Seals are serialized, so at most one worker
+rewrites `manifest.json` at a time and concurrent rewrites cannot happen
+inside one process. The write still uses ETag-based optimistic concurrency
+(read ETag → conditional PUT → retry on mismatch) as a guard against another
+process or a manual edit touching the same prefix; a backend without
+conditional PUT (e.g. `LocalFileSystem`) falls back to a single-writer
+unconditional write, so keep `workers: 1` there. See
+`docs/docs/components/0-inputs/delivery-semantics.md` for the
+delivery-contract details.
 
 ## Compression
 

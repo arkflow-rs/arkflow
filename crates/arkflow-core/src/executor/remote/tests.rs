@@ -1849,6 +1849,40 @@ fn server_ack_verification_rejects_identity_mismatch() {
     assert!(error.to_string().contains("identity mismatch"), "{error}");
 }
 
+/// Regression (ack replay): an ack captured from an EARLIER handshake of the
+/// same quad is validly MACed, but it echoes the OLD nonce — the
+/// length-only check accepted it as the fresh connection's acknowledgement;
+/// the recorded-nonce comparison must reject it.
+#[test]
+fn server_ack_verification_rejects_a_replayed_older_ack() {
+    let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+    let auth = credentials.session("node-b", "job-1", 3, quad_a_to_b());
+    // Handshake #1 (an earlier connection) and its validly signed ack.
+    let earlier = auth.client_handshake().unwrap();
+    let earlier_ack = auth.server_ack(&earlier, "node-b");
+    // Handshake #2: the CURRENT connection replaces the recorded nonce.
+    let current = auth.client_handshake().unwrap();
+    let current_ack = auth.server_ack(&current, "node-b");
+    auth.verify_server_ack(&current_ack)
+        .expect("the current connection's ack verifies");
+    let error = auth.verify_server_ack(&earlier_ack).unwrap_err();
+    assert!(
+        error.to_string().contains("identity mismatch"),
+        "a replayed older ack must fail, got: {error}"
+    );
+    // An ack for a handshake that was never sent cannot verify either.
+    let unsent = auth.client_handshake().unwrap();
+    let unsent_ack = auth.server_ack(&unsent, "node-b");
+    // Simulate an ack arriving BEFORE any handshake was recorded: a fresh
+    // session with no sent nonce must fail closed.
+    let fresh = credentials.session("node-b", "job-1", 3, quad_a_to_b());
+    let error = fresh.verify_server_ack(&unsent_ack).unwrap_err();
+    assert!(
+        error.to_string().contains("identity mismatch"),
+        "no recorded nonce must fail closed, got: {error}"
+    );
+}
+
 #[test]
 fn wire_signal_ignores_data_envelopes_and_default_encoder_matches_new() {
     let batch = Arc::new(dictionary_batch(None));
@@ -2668,7 +2702,10 @@ async fn pump_register_rejection_with_failing_abort_combines_errors() {
     .await
     .unwrap();
     drop(tx);
-    let result = pump_edge(rx, writer, quad, pending, shutdown, config, None, false).await;
+    let result = pump_edge(
+        rx, writer, quad, pending, shutdown, config, None, false, None, false, false,
+    )
+    .await;
     let error = result.unwrap_err();
     assert!(
         error
@@ -2785,6 +2822,12 @@ async fn run_receipt_harness(
             false,
             failures_tx,
             &shutdown,
+            // The fixture builds the ack from the nonce of the handshake it
+            // wrote itself (`auth.client_handshake()` in the test body).
+            // Suppress the pump's own handshake so it cannot overwrite that
+            // recorded nonce before the read half verifies the ack.
+            true,
+            false,
         ),
     )
     .await
@@ -3100,15 +3143,14 @@ async fn authorize_inbound_rejects_identity_drift() {
     );
 }
 
-/// Authenticated transparent reconnect currently fails closed: the
-/// reconnect path writes the session handshake twice on the new wire —
-/// once by `replay_pending` and again by `pump_edge`'s startup handshake —
-/// and the peer's duplicate-handshake guard tears the connection down.
-/// The edge then exhausts its redial budget and fails closed (branches
-/// abort, failure surfaces), which is the safe outcome; the double
-/// handshake itself is a product defect this test pins observably.
+/// Authenticated transparent reconnect RECOVERS: the reconnect path writes
+/// the session handshake EXACTLY ONCE on the new wire (by `replay_pending`)
+/// and `pump_edge` must not duplicate it — the previous double handshake
+/// made the peer's duplicate-handshake guard tear every reconnection down,
+/// exhausting the redial budget and failing the edge closed (branches
+/// aborted, failure surfaced). This test pins the fixed recovery.
 #[tokio::test(flavor = "multi_thread")]
-async fn authenticated_reconnect_currently_fails_closed_after_handshake_duplication() {
+async fn authenticated_reconnect_recovers_without_handshake_duplication() {
     let quad = quad_a_to_b();
     let node_config = |node: &str| NetworkManagerConfig {
         credentials: Some(DataPlaneCredentials::new(node, "shuffle-secret").unwrap()),
@@ -3165,18 +3207,31 @@ async fn authenticated_reconnect_currently_fails_closed_after_handshake_duplicat
     };
     kill1.kill();
 
-    // The redial budget exhausts and the edge fails closed.
-    tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
-        while !branch.aborted.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the unrecoverable branch must abort");
-    let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+    // The edge transparently reconnects on the second transport entry and
+    // post-reconnect data flows: the replayed frame for the first envelope
+    // is deduplicated downstream, so the NEXT envelope is what arrives.
+    edge.sender
+        .send_async(Envelope::Data(
+            Arc::new(dictionary_batch(Some("auth-rc-2"))),
+            branch.clone(),
+        ))
+        .await
+        .unwrap();
+    let delivered = tokio::time::timeout(TEST_PROPAGATION_BUDGET, next_envelope(&input_rx))
+        .await
+        .expect("the reconnected edge must deliver data");
+    let Envelope::Data(_batch, _ack) = delivered else {
+        panic!("expected a data envelope after reconnect");
+    };
+    // A recovered edge must never abort its branches or surface a failure.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(
-        failure.contains("reconnect"),
-        "expected the reconnect budget failure, got: {failure}"
+        !branch.aborted.load(std::sync::atomic::Ordering::SeqCst),
+        "a recovered edge must not abort its branches"
+    );
+    assert!(
+        failures.try_recv().is_err(),
+        "a recovered edge must not surface a failure"
     );
     upstream.shutdown();
     downstream.shutdown();
@@ -3760,9 +3815,11 @@ async fn pump_register_rejection_with_a_clean_abort_reports_the_limit() {
     .await
     .unwrap();
     drop(tx);
-    let error = pump_edge(rx, writer, quad, pending, shutdown, config, None, false)
-        .await
-        .unwrap_err();
+    let error = pump_edge(
+        rx, writer, quad, pending, shutdown, config, None, false, None, false, false,
+    )
+    .await
+    .unwrap_err();
     assert!(
         error
             .to_string()
@@ -3796,6 +3853,9 @@ async fn pump_data_write_failures_fail_the_edge() {
         tokio_util::sync::CancellationToken::new(),
         NetworkManagerConfig::default(),
         None,
+        false,
+        None,
+        false,
         false,
     )
     .await

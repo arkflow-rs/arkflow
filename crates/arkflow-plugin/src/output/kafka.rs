@@ -119,6 +119,10 @@ struct KafkaOutput {
     inner_kafka_output: Arc<InnerKafkaOutput>,
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
+    /// Weak-claim anchor for the L3 pairing registry: the registry only
+    /// counts this output as a live offset committer while this Arc is held
+    /// (see `kafka_txn::declare_offset_committer`).
+    _offset_committer_claim: Option<Arc<()>>,
     /// L3 monotonic guard: the last transactional offset commit sent per
     /// partition by the CURRENT producer (cleared when `connect` installs a
     /// new producer). Keeps the commit sequence non-regressing even when
@@ -129,9 +133,12 @@ struct KafkaOutput {
 
 struct InnerKafkaOutput {
     producer: Arc<RwLock<Option<FutureProducer>>>,
-    /// Delivery receipts awaiting observation. Producers only push here
-    /// (never awaiting while holding the lock), so a std mutex suffices;
-    /// flush/close drain it synchronously before awaiting the receipts.
+    /// Delivery receipts that escaped per-write observation. `write` observes
+    /// its own receipts before returning, so nothing pushes here in
+    /// production; flush/close still drain it as a safety net for any future
+    /// fire-and-forget path. Producers only push here (never awaiting while
+    /// holding the lock), so a std mutex suffices; flush/close drain it
+    /// synchronously before awaiting the receipts.
     send_futures: Arc<std::sync::Mutex<Vec<DeliveryFuture>>>,
 }
 
@@ -183,8 +190,23 @@ impl KafkaOutput {
         Ok(client_config)
     }
 
-    /// Create a new Kafka output component
+    /// Create a Kafka output without an L3 pairing claim (tests and direct
+    /// construction). The production path goes through the builder, which
+    /// uses [`Self::new_with_claim`] so pairing validation sees the claim.
+    #[cfg(test)]
     pub fn new(config: KafkaOutputConfig, codec: Option<Arc<dyn Codec>>) -> Result<Self, Error> {
+        Self::new_with_claim(config, codec, None)
+    }
+
+    /// [`Self::new`] with the L3 pairing claim anchor supplied by the
+    /// builder (the builder declares the claim BEFORE returning the
+    /// instance; an instance built without one — tests, direct
+    /// construction — is not a declared committer).
+    pub fn new_with_claim(
+        config: KafkaOutputConfig,
+        codec: Option<Arc<dyn Codec>>,
+        offset_committer_claim: Option<Arc<()>>,
+    ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
         let inner_kafka_output = Arc::new(InnerKafkaOutput {
             producer: Arc::new(RwLock::new(None)),
@@ -212,31 +234,43 @@ impl KafkaOutput {
             inner_kafka_output,
             cancellation_token,
             codec,
+            _offset_committer_claim: offset_committer_claim,
             last_sent_offsets: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 }
 
-/// Observe every outstanding delivery receipt concurrently, then report the
-/// first error in submission order. The previous serial loop stopped
+/// Observe every outstanding delivery receipt concurrently and report the
+/// first failure in submission order. The previous serial loop stopped
 /// observing receipts after the first error even though librdkafka keeps
 /// delivering the rest; delivery behavior is unchanged — only the
 /// observation window widened, and the reported error is the first one by
-/// submission order.
-async fn observe_delivery_futures(pending: Vec<DeliveryFuture>) {
+/// submission order. `write` propagates the error so the kernel withholds
+/// the ack and replays the batch (at-least-once); the background flush and
+/// close paths log it as best-effort observation of stragglers.
+async fn observe_delivery_futures(pending: Vec<DeliveryFuture>) -> Result<(), Error> {
     let results = futures::future::join_all(pending).await;
-    for result in results {
+    let mut first_error: Option<Error> = None;
+    for (index, result) in results.into_iter().enumerate() {
         match result {
             Ok(Ok(_)) => {} // Success
             Ok(Err((e, _))) => {
-                error!("Kafka producer shut down: {:?}", e);
-                break;
+                error!("Kafka delivery failed for record #{index}: {e}");
+                first_error.get_or_insert_with(|| {
+                    Error::Connection(format!("Kafka delivery failed: {e}"))
+                });
             }
             Err(e) => {
-                error!("Future error during Kafka shutdown: {:?}", e);
-                break;
+                error!("Kafka delivery future cancelled for record #{index}: {e}");
+                first_error.get_or_insert_with(|| {
+                    Error::Connection(format!("Kafka delivery future cancelled: {e}"))
+                });
             }
         }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -251,7 +285,10 @@ impl InnerKafkaOutput {
                 .expect("kafka send_futures lock poisoned");
             send_futures.drain(..).collect()
         };
-        observe_delivery_futures(pending).await;
+        // The background flush is best-effort: individual failures are
+        // already logged inside `observe_delivery_futures`. The ack contract
+        // is enforced by `write`, which observes its own receipts.
+        observe_delivery_futures(pending).await.ok();
     }
 }
 
@@ -291,6 +328,85 @@ impl Output for KafkaOutput {
     }
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
+        let delivery_futures = self.enqueue(msg).await?;
+        // Wait for the broker's delivery reports before reporting success.
+        // Returning `Ok` after mere enqueueing let the kernel acknowledge the
+        // source while the records were still in flight, so a failed delivery
+        // silently lost data even with `acks=all`. An error here fails the
+        // batch; the source replays it (at-least-once).
+        observe_delivery_futures(delivery_futures).await
+    }
+
+    async fn write_batch(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
+        if !self.config.exactly_once.unwrap_or(false) {
+            // Non-transactional path: enqueue every message first, then
+            // await all receipts together. Awaiting each message's delivery
+            // inside the loop cost one broker round trip per batch, which
+            // could exceed the kernel's whole-batch timeout even though
+            // every delivery succeeded. Per-message enqueue failures keep
+            // the previous continue-on-error behavior.
+            let mut delivery_futures = Vec::new();
+            let mut err = None;
+            for msg in msgs {
+                match self.enqueue(msg.clone()).await {
+                    Ok(futures) => delivery_futures.extend(futures),
+                    Err(e) => err = Some(e),
+                }
+            }
+            // Observe the receipts of everything that was enqueued before
+            // deciding: the payloads are already in flight, so reporting the
+            // enqueue failure without draining them would leave deliveries
+            // unconfirmed (a replay may duplicate them either way, but the
+            // confirmed ones must not be reported as failed).
+            let observed = observe_delivery_futures(delivery_futures).await;
+            return match err {
+                Some(e) => Err(e),
+                None => observed,
+            };
+        }
+        self.write_batch_transactional(msgs).await
+    }
+
+    async fn close(&self) -> Result<(), Error> {
+        self.cancellation_token.cancel();
+        // Get the producer and close
+        let producer_arc = self.inner_kafka_output.producer.clone();
+        let mut producer_guard = producer_arc.write().await;
+
+        if let Some(producer) = producer_guard.take() {
+            producer.poll(Timeout::After(Duration::ZERO));
+            // Drain synchronously first: the lock must never be held across
+            // the receipt awaits below.
+            let pending: Vec<_> = {
+                let mut send_futures = self
+                    .inner_kafka_output
+                    .send_futures
+                    .lock()
+                    .expect("kafka send_futures lock poisoned");
+                send_futures.drain(..).collect()
+            };
+            if let Err(e) = observe_delivery_futures(pending).await {
+                error!("Kafka output close observed a delivery failure: {e}");
+            }
+
+            // Wait for all messages to be sent
+            producer.flush(Duration::from_secs(30)).map_err(|e| {
+                Error::Connection(format!(
+                    "Failed to refresh the message when the Kafka producer is disabled: {}",
+                    e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+impl KafkaOutput {
+    /// Enqueue every record of one message batch and return the broker's
+    /// delivery futures. Awaiting them is the caller's job: `write` awaits
+    /// immediately, while `write_batch` awaits every message's receipts
+    /// together so the total wait is bounded by the slowest receipt instead
+    /// of the sum over messages.
+    async fn enqueue(&self, msg: MessageBatchRef) -> Result<Vec<DeliveryFuture>, Error> {
         let producer_arc = self.inner_kafka_output.producer.clone();
         let producer_guard = producer_arc.read().await;
         let producer = producer_guard.as_ref().ok_or_else(|| {
@@ -306,7 +422,7 @@ impl Output for KafkaOutput {
             crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?
         };
         if payloads.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let topic = self.get_topic(&msg).await?;
@@ -314,6 +430,7 @@ impl Output for KafkaOutput {
 
         // Prepare all records for sending
         let payloads_len = payloads.len();
+        let mut delivery_futures: Vec<DeliveryFuture> = Vec::with_capacity(payloads_len);
         for (i, x) in payloads.into_iter().enumerate() {
             // Create record. The per-row topic must exist for every row:
             // index panicking here would take the whole stream down, so a
@@ -348,11 +465,7 @@ impl Output for KafkaOutput {
             loop {
                 match producer.send_result(record) {
                     Ok(future) => {
-                        self.inner_kafka_output
-                            .send_futures
-                            .lock()
-                            .expect("kafka send_futures lock poisoned")
-                            .push(future);
+                        delivery_futures.push(future);
                         debug!("Kafka record sent");
                         break;
                     }
@@ -370,59 +483,9 @@ impl Output for KafkaOutput {
             }
         }
 
-        Ok(())
+        Ok(delivery_futures)
     }
 
-    async fn write_batch(&self, msgs: &[MessageBatchRef]) -> Result<(), Error> {
-        if !self.config.exactly_once.unwrap_or(false) {
-            // Non-transactional path: default per-message behavior
-            // (continue-on-error), inlined to avoid a Default-trait dance.
-            let mut err = None;
-            for msg in msgs {
-                if let Err(e) = self.write(msg.clone()).await {
-                    err = Some(e);
-                }
-            }
-            return match err {
-                Some(e) => Err(e),
-                None => Ok(()),
-            };
-        }
-        self.write_batch_transactional(msgs).await
-    }
-
-    async fn close(&self) -> Result<(), Error> {
-        self.cancellation_token.cancel();
-        // Get the producer and close
-        let producer_arc = self.inner_kafka_output.producer.clone();
-        let mut producer_guard = producer_arc.write().await;
-
-        if let Some(producer) = producer_guard.take() {
-            producer.poll(Timeout::After(Duration::ZERO));
-            // Drain synchronously first: the lock must never be held across
-            // the receipt awaits below.
-            let pending: Vec<_> = {
-                let mut send_futures = self
-                    .inner_kafka_output
-                    .send_futures
-                    .lock()
-                    .expect("kafka send_futures lock poisoned");
-                send_futures.drain(..).collect()
-            };
-            observe_delivery_futures(pending).await;
-
-            // Wait for all messages to be sent
-            producer.flush(Duration::from_secs(30)).map_err(|e| {
-                Error::Connection(format!(
-                    "Failed to refresh the message when the Kafka producer is disabled: {}",
-                    e
-                ))
-            })?;
-        }
-        Ok(())
-    }
-}
-impl KafkaOutput {
     /// Best-effort transaction abort (blocking broker round-trip →
     /// spawn_blocking). The broker fences zombie producers on restart
     /// anyway; both the join failure and the abort result are logged, never
@@ -476,10 +539,6 @@ impl KafkaOutput {
             return Err(e);
         }
 
-        // Clamped L3 offsets awaiting a successful commit before they may
-        // advance the producer's monotonic `last_sent_offsets` base.
-        let mut remember_after_commit: Option<Vec<(i32, i64)>> = None;
-
         // L3: fold the covered source offsets into the transaction before
         // committing. Offsets come from the batches' source metadata
         // columns (partition, consumed offset); commit positions are the
@@ -491,7 +550,17 @@ impl KafkaOutput {
         // topologies cannot skip records still in flight elsewhere; the
         // lagging tail converges through later transactions (at-least-once
         // lower bound: at most one batch of tail duplication).
-        if let Some(group) = self.config.offset_commit_group.as_deref() {
+        //
+        // EVERY error in this section (topic extraction, offset derivation,
+        // group metadata/frontier, the offset send itself) aborts the open
+        // transaction before returning: the previous `?`s on the local
+        // extraction steps bypassed the abort path and left the producer's
+        // transaction OPEN — every later operation on it then fails and the
+        // producer is bricked.
+        let l3_result: Result<Option<Vec<(i32, i64)>>, Error> = async {
+            let Some(group) = self.config.offset_commit_group.as_deref() else {
+                return Ok(None);
+            };
             let group_topic = crate::kafka_txn::single_topic(group).ok_or_else(|| {
                 Error::Config(format!(
                     "Kafka offset commit group '{group}' does not declare exactly one topic; \
@@ -500,59 +569,66 @@ impl KafkaOutput {
             })?;
             let (offsets, covered) =
                 transactional_offsets_for_batches(msgs, Some(group_topic.as_str()))?;
-            if covered {
-                let metadata = crate::kafka_txn::group_metadata(group)
-                    .await
-                    .ok_or_else(|| {
-                        Error::Config(format!(
+            if !covered {
+                return Ok(None);
+            }
+            let metadata = crate::kafka_txn::group_metadata(group)
+                .await
+                .ok_or_else(|| {
+                    Error::Config(format!(
                         "Kafka offset commit group '{group}' has no live input in this process; \
                          the paired Kafka input must declare transactional_offsets (distributed \
                          deployments pin the pair onto one node — this error means the pairing \
                          was split across nodes)"
                     ))
-                    })?;
-                let frontier = crate::kafka_txn::group_frontier(group).ok_or_else(|| {
-                    Error::Config(format!(
-                        "Kafka offset commit group '{group}' has no live input frontier in this \
-                         process; the paired Kafka input must declare transactional_offsets \
-                         (distributed deployments pin the pair onto one node — this error means \
-                         the pairing was split across nodes)"
-                    ))
                 })?;
-                let clamped = {
-                    let last_sent = self
-                        .last_sent_offsets
-                        .lock()
-                        .expect("kafka last_sent lock poisoned");
-                    clamp_transactional_offsets(
-                        offsets,
-                        frontier.as_ref(),
-                        group_topic.as_str(),
-                        &last_sent,
-                    )
-                };
-                if let Some((offsets, committed)) = clamped {
-                    if let Err(e) = send_offsets_in_transaction(producer, offsets, metadata).await {
-                        // Fail closed (spec: offset 发送异步失败 fail-closed):
-                        // abort the transaction and return the error so the
-                        // batch replays — data and offsets must never diverge
-                        // with the data committed.
-                        let p = producer.clone();
-                        drop(producer_guard);
-                        Self::abort_transaction(p).await;
-                        return Err(e);
-                    }
-                    // Remember the clamped values only after the broker
-                    // accepts the commit below — `committed` travels to the
-                    // commit match and folds into `last_sent_offsets` on
-                    // `Ok(Ok(()))`. A failed or aborted transaction leaves
-                    // the base untouched, so a frontier rewind followed by
-                    // a partial replay cannot re-commit never-committed
-                    // offsets (which would skip records).
-                    remember_after_commit = Some(committed);
-                }
-            }
+            let frontier = crate::kafka_txn::group_frontier(group).ok_or_else(|| {
+                Error::Config(format!(
+                    "Kafka offset commit group '{group}' has no live input frontier in this \
+                     process; the paired Kafka input must declare transactional_offsets \
+                     (distributed deployments pin the pair onto one node — this error means \
+                     the pairing was split across nodes)"
+                ))
+            })?;
+            let clamped = {
+                let last_sent = self
+                    .last_sent_offsets
+                    .lock()
+                    .expect("kafka last_sent lock poisoned");
+                clamp_transactional_offsets(
+                    offsets,
+                    frontier.as_ref(),
+                    group_topic.as_str(),
+                    &last_sent,
+                )
+            };
+            let Some((offsets, committed)) = clamped else {
+                return Ok(None);
+            };
+            send_offsets_in_transaction(producer, offsets, metadata).await?;
+            // Remember the clamped values only after the broker accepts the
+            // commit below — `committed` travels to the commit match and
+            // folds into `last_sent_offsets` on `Ok(Ok(()))`. A failed or
+            // aborted transaction leaves the base untouched, so a frontier
+            // rewind followed by a partial replay cannot re-commit
+            // never-committed offsets (which would skip records).
+            Ok(Some(committed))
         }
+        .await;
+        let remember_after_commit = match l3_result {
+            Ok(committed) => committed,
+            Err(error) => {
+                // Fail closed (spec: offset 发送异步失败 fail-closed): abort
+                // the open transaction and return the error so the batch
+                // replays — data and offsets must never diverge with the
+                // data committed, and the producer must never be left in an
+                // open transaction.
+                let p = producer.clone();
+                drop(producer_guard);
+                Self::abort_transaction(p).await;
+                return Err(error);
+            }
+        };
 
         // Commit (blocking broker round-trip → spawn_blocking).
         let p = producer.clone();
@@ -563,7 +639,7 @@ impl KafkaOutput {
         .await
         {
             Ok(Ok(())) => {
-                if let Some(committed) = remember_after_commit.take() {
+                if let Some(committed) = remember_after_commit {
                     let mut last_sent = self
                         .last_sent_offsets
                         .lock()
@@ -705,9 +781,16 @@ impl OutputBuilder for KafkaOutputBuilder {
         // rejects an input that declares `transactional_offsets` for a group
         // no output ever claims — such a group's broker offsets would never
         // be committed by anyone.
-        if let Some(group) = &config.offset_commit_group {
-            crate::kafka_txn::declare_offset_committer(group);
-        }
+        let offset_committer_claim = if let Some(group) = &config.offset_commit_group {
+            // The claim lives exactly as long as the output instance: a
+            // removed/dropped output must stop satisfying pairing
+            // validation (the previous strong set never released it).
+            let claim = Arc::new(());
+            crate::kafka_txn::declare_offset_committer(group, &claim);
+            Some(claim)
+        } else {
+            None
+        };
 
         // Fail before any stream starts on an inconsistent security block
         // (spec: 构建期校验与错误语义) — `--validate` reaches this path.
@@ -715,7 +798,11 @@ impl OutputBuilder for KafkaOutputBuilder {
             security.validate()?;
         }
 
-        Ok(Arc::new(KafkaOutput::new(config, codec)?))
+        Ok(Arc::new(KafkaOutput::new_with_claim(
+            config,
+            codec,
+            offset_committer_claim,
+        )?))
     }
 
     fn placement_affinity(
@@ -1530,11 +1617,26 @@ mod tests {
         assert!(err.to_string().contains("not initialized"), "got: {err}");
     }
 
-    /// The non-transactional write path, offline: records are enqueued
-    /// through `send_result` (delivery reports resolve lazily) for both the
-    /// codec path and the `value_field` path, with scalar and per-row keys.
+    /// The non-transactional write path, offline: a broker-less producer with
+    /// a short message timeout resolves every delivery report as a failure,
+    /// and `write` must WAIT for those reports and fail instead of reporting
+    /// premature success (regression: enqueue-then-Ok let the kernel commit
+    /// the source before Kafka confirmed the write).
     #[tokio::test]
-    async fn write_enqueues_records_for_codec_and_value_field_paths() {
+    async fn write_waits_for_broker_delivery_and_fails_without_one() {
+        async fn install_short_timeout_producer(output: &KafkaOutput) {
+            let producer: FutureProducer = ClientConfig::new()
+                .set("bootstrap.servers", "localhost:9092")
+                .set("message.timeout.ms", "1000")
+                .create()
+                .expect("producer creation is offline");
+            *output.inner_kafka_output.producer.write().await = Some(producer);
+        }
+
+        // Codec path (no value_field): binary `__value__` rows with a
+        // per-row Utf8 key column.
+        use datafusion::arrow::array::{ArrayRef, BinaryArray, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
         let output = KafkaOutput::new(
             output_config(serde_json::json!({
                 "brokers": ["localhost:9092"],
@@ -1544,12 +1646,7 @@ mod tests {
             None,
         )
         .unwrap();
-        output.connect().await.unwrap();
-
-        // Codec path (no value_field): binary `__value__` rows with a
-        // per-row Utf8 key column.
-        use datafusion::arrow::array::{ArrayRef, BinaryArray, StringArray};
-        use datafusion::arrow::datatypes::{Field, Schema};
+        install_short_timeout_producer(&output).await;
         let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("k", datafusion::arrow::datatypes::DataType::Utf8, true),
@@ -1568,10 +1665,14 @@ mod tests {
             ],
         )
         .unwrap();
-        output
+        let err = output
             .write(Arc::new(MessageBatch::new_arrow(rb)))
             .await
-            .expect("codec path enqueues");
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("delivery failed"),
+            "write must fail on the delivery reports, got: {err}"
+        );
 
         // value_field path: one payload per row of the named column.
         let output = KafkaOutput::new(
@@ -1584,18 +1685,22 @@ mod tests {
             None,
         )
         .unwrap();
-        output.connect().await.unwrap();
-        output
+        install_short_timeout_producer(&output).await;
+        let err = output
             .write(binary_batch_in("payload", 2))
             .await
-            .expect("value_field path enqueues");
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("delivery failed"),
+            "write must fail on the delivery reports, got: {err}"
+        );
 
-        // An empty batch short-circuits before any record is built.
+        // An empty batch short-circuits before any record is built (and
+        // before any delivery wait).
         output
             .write(binary_batch_in("payload", 0))
             .await
             .expect("empty batch is a no-op");
-        // Do not close() here: unresolved delivery futures would block.
     }
 
     /// A codec producing more payloads than topic rows trips the
@@ -1617,7 +1722,9 @@ mod tests {
     }
 
     /// write_batch's non-transactional path aggregates per-message failures
-    /// (continue-on-error) and returns the last error.
+    /// (continue-on-error) and returns the last error. With a broker-less
+    /// producer every well-formed message fails at the delivery wait; a
+    /// broken value_field column fails before any delivery wait.
     #[tokio::test]
     async fn write_batch_non_transactional_aggregates_errors() {
         let good = output_config(serde_json::json!({
@@ -1625,15 +1732,21 @@ mod tests {
             "topic": {"type": "value", "value": "t"}
         }));
         let output = KafkaOutput::new(good, None).unwrap();
-        output.connect().await.unwrap();
-        // All-good batch.
-        output
-            .write_batch(&[binary_field_batch(1)])
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9092")
+            .set("message.timeout.ms", "1000")
+            .create()
+            .unwrap();
+        *output.inner_kafka_output.producer.write().await = Some(producer);
+        // Both messages fail on their delivery reports; the error surfaces.
+        let err = output
+            .write_batch(&[binary_field_batch(1), binary_field_batch(1)])
             .await
-            .expect("single good message");
+            .unwrap_err();
+        assert!(err.to_string().contains("delivery failed"), "got: {err}");
 
-        // A message whose value_field column is absent fails; the sibling
-        // still goes through.
+        // A message whose value_field column is absent fails before the
+        // delivery wait; the sibling still goes through.
         let bad = output_config(serde_json::json!({
             "brokers": ["localhost:9092"],
             "topic": {"type": "value", "value": "t"},
@@ -2164,10 +2277,10 @@ mod tests {
         assert_eq!(offsets.elements()[0].topic(), "");
     }
 
-    /// close() drains queued delivery futures: with a short message timeout
-    /// the broker-less producer resolves them as delivery failures (the
-    /// `Ok(Err(..))` arm), then the final flush completes over an empty
-    /// queue.
+    /// close() drains the send_futures safety net: with a short message
+    /// timeout the broker-less producer resolves `write`'s delivery reports
+    /// as delivery failures (the `Ok(Err(..))` arm), `write` fails, and the
+    /// final flush completes over an empty queue.
     #[tokio::test]
     async fn close_drains_delivery_futures_that_failed_on_timeout() {
         let output = KafkaOutput::new(
@@ -2185,13 +2298,11 @@ mod tests {
             .unwrap();
         *output.inner_kafka_output.producer.write().await = Some(producer);
 
-        // Two records → two delivery futures in the queue.
-        output
-            .write(binary_field_batch(2))
-            .await
-            .expect("records enqueue");
-        // Let the message timeout resolve the futures as failures.
-        tokio::time::sleep(Duration::from_millis(1800)).await;
+        // Two records; `write` waits for their delivery reports, which fail
+        // after the 1s message timeout.
+        let err = output.write(binary_field_batch(2)).await.unwrap_err();
+        assert!(err.to_string().contains("delivery failed"), "got: {err}");
+        // close() observes nothing left over and completes.
         output.close().await.expect("drain and flush complete");
     }
 

@@ -111,6 +111,14 @@ impl Input for MqttInput {
 
         // Set the keep-alive time
         if let Some(keep_alive) = self.config.keep_alive {
+            // The MQTT CONNECT packet encodes keep-alive as a u16 SECONDS
+            // field; rumqttc narrows `Duration::as_secs() as u16` silently,
+            // so a larger configured value would make the broker enforce a
+            // wrapped (much shorter) interval than the local timer keeps.
+            // The protocol caps the field at 65535 — reject more at build.
+            u16::try_from(keep_alive).map_err(|_| {
+                Error::Config("mqtt keep_alive must be at most 65535 seconds".into())
+            })?;
             mqtt_options.set_keep_alive(std::time::Duration::from_secs(keep_alive));
         }
 
@@ -119,8 +127,13 @@ impl Input for MqttInput {
             mqtt_options.set_clean_session(clean_session);
         }
 
-        // Create an MQTT client
-        let (client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+        // Create an MQTT client. The request channel must hold EVERY
+        // queued subscription: subscriptions are enqueued BEFORE the
+        // event-loop task below starts polling, so a fixed small capacity
+        // deadlocked startup for topic counts above it (the previous
+        // capacity 10 hung on the 11th topic).
+        let request_capacity = self.config.topics.len().max(10);
+        let (client, mut eventloop) = AsyncClient::new(mqtt_options, request_capacity);
         // Subscribe to topics
         let qos_level = match self.config.qos {
             Some(0) => QoS::AtMostOnce,

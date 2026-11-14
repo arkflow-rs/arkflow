@@ -19,7 +19,12 @@ export function Rollouts({ onError, canMutate = true }: RolloutsProps) {
   const approvalRequired = useStatus().data?.approval_required ?? false
   const [selectedId, setSelectedId] = useState<string>()
   const detailQuery = useRolloutDetail(selectedId)
-  const selected = detailQuery.data
+  // The detail query keeps the PREVIOUS rollout as placeholder data while a
+  // new selection loads; rendering that placeholder would expose pause /
+  // cancel / rollback actions targeting the previous rollout's id under the
+  // new selection. Treat a mismatched identity as "still loading".
+  const selected =
+    detailQuery.data && detailQuery.data.rollout.rollout_id === selectedId ? detailQuery.data : undefined
   const pollError = detailQuery.isError ? errorMessage(detailQuery.error) : ''
   const [version, setVersion] = useState('')
   const [targets, setTargets] = useState<string[]>([])

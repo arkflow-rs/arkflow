@@ -94,6 +94,13 @@ pub struct CheckpointManifest {
     pub generation: u64,
     pub task_attempts: Vec<TaskAttemptSnapshot>,
     pub source_positions: Vec<SourcePosition>,
+    /// Source positions keyed by the source task that reported them. The
+    /// flattened `source_positions` list loses task identity, so two sources
+    /// with the same topic/partition would restore from each other's
+    /// offsets; recovery prefers this map and only falls back to the flat
+    /// list for manifests written before it existed.
+    #[serde(default)]
+    pub source_positions_by_task: BTreeMap<String, Vec<SourcePosition>>,
     /// Watermarks keyed by stable source task identity. Partition numbers are
     /// only unique within one source operator and cannot identify a Job-wide
     /// watermark when multiple sources are present.
@@ -126,7 +133,16 @@ pub struct StateSnapshotRef {
 
 impl CheckpointManifest {
     pub fn verify(&self) -> bool {
+        // Manifests written before `source_positions_by_task` existed carry
+        // a checksum over the LEGACY tuple (without that field). Accept both
+        // encodings so an upgrade can still recover old checkpoints and
+        // savepoints; new seals always use the current encoding. The legacy
+        // checksum cannot cover the map, so it is only accepted while the
+        // map is empty — otherwise an injected or corrupted map would be
+        // preferred by recovery without being verified.
         self.checksum == manifest_checksum(self)
+            || (self.source_positions_by_task.is_empty()
+                && self.checksum == legacy_manifest_checksum(self))
     }
 
     pub fn seal(&mut self) {
@@ -520,6 +536,9 @@ impl CheckpointCatalog {
 pub struct RecoveryPlan {
     pub checkpoint_id: String,
     pub source_positions: Vec<SourcePosition>,
+    /// Per-task positions mirroring the manifest map; legacy manifests carry
+    /// an empty map and restore falls back to `source_positions`.
+    pub source_positions_by_task: BTreeMap<String, Vec<SourcePosition>>,
     pub watermarks_ms: BTreeMap<String, i64>,
     pub watermark_partitions: BTreeMap<String, Vec<WatermarkPosition>>,
     pub task_attempts: Vec<TaskAttemptSnapshot>,
@@ -753,6 +772,7 @@ impl RecoveryPlan {
         Ok(Self {
             checkpoint_id: manifest.checkpoint_id.clone(),
             source_positions: manifest.source_positions.clone(),
+            source_positions_by_task: manifest.source_positions_by_task.clone(),
             watermarks_ms: manifest.watermarks_ms.clone(),
             watermark_partitions: manifest.watermark_partitions.clone(),
             task_attempts: manifest.task_attempts.clone(),
@@ -870,6 +890,46 @@ impl CheckpointCoordinator {
                 "checkpoint task attempts do not cover all participating tasks".into(),
             ));
         }
+        // A duplicate attempt ROW for one task would collapse in the set
+        // above and seal state against an ambiguous dispatch record. Two
+        // rows for the same task (even with distinct attempt ids) are just
+        // as ambiguous: the acknowledgement pairing below would pick
+        // whichever row happens to come first.
+        if task_attempts.len() != self.participants.len() {
+            return Err(Error::Process(
+                "checkpoint task attempts contain multiple rows for a participating task".into(),
+            ));
+        }
+        let mut attempt_ids = BTreeSet::new();
+        for attempt in &task_attempts {
+            if !attempt_ids.insert(attempt.attempt_id.as_str()) {
+                return Err(Error::Process(format!(
+                    "checkpoint task attempts contain a duplicate attempt '{}'",
+                    attempt.attempt_id
+                )));
+            }
+        }
+        // Every acknowledgement must come from the attempt row DISPATCHED
+        // for its task: an ack from a stale attempt (a previous dispatch of
+        // the same generation) would otherwise seal state from a node that
+        // is no longer executing the task.
+        for ack in self.acknowledgements.values() {
+            let attempt = task_attempts
+                .iter()
+                .find(|attempt| attempt.task_id == ack.task_id)
+                .ok_or_else(|| {
+                    Error::Process(format!(
+                        "checkpoint acknowledgement from unknown task '{}'",
+                        ack.task_id
+                    ))
+                })?;
+            if attempt.attempt_id != ack.attempt_id {
+                return Err(Error::Process(format!(
+                    "checkpoint acknowledgement from task '{}' came from attempt '{}' but the dispatched attempt is '{}'",
+                    ack.task_id, ack.attempt_id, attempt.attempt_id
+                )));
+            }
+        }
         validate_state_snapshot_task_set(&state_snapshots, &self.participants)
             .map_err(Error::Process)?;
         let barrier = self
@@ -877,10 +937,12 @@ impl CheckpointCoordinator {
             .clone()
             .ok_or_else(|| Error::Process("checkpoint barrier is missing".into()))?;
         let mut source_positions = Vec::new();
+        let mut source_positions_by_task = BTreeMap::new();
         let mut watermarks_ms = BTreeMap::new();
         let mut watermark_partitions = BTreeMap::new();
         for ack in self.acknowledgements.values() {
             source_positions.extend(ack.source_positions.clone());
+            source_positions_by_task.insert(ack.task_id.clone(), ack.source_positions.clone());
             if let Some(watermark) = ack.watermark_ms {
                 watermarks_ms.insert(ack.task_id.clone(), watermark);
             }
@@ -895,6 +957,7 @@ impl CheckpointCoordinator {
             generation: self.generation,
             task_attempts,
             source_positions,
+            source_positions_by_task,
             watermarks_ms,
             watermark_partitions,
             in_flight_barrier: barrier,
@@ -938,6 +1001,7 @@ fn manifest_checksum(manifest: &CheckpointManifest) -> u64 {
         manifest.generation,
         &manifest.task_attempts,
         &manifest.source_positions,
+        &manifest.source_positions_by_task,
         &manifest.watermarks_ms,
         &manifest.watermark_partitions,
         &manifest.in_flight_barrier,
@@ -945,6 +1009,31 @@ fn manifest_checksum(manifest: &CheckpointManifest) -> u64 {
         manifest.format_version,
     ))
     .unwrap_or_default();
+    hash_manifest_bytes(&encoded)
+}
+
+/// The checksum contract released versions used: the same tuple WITHOUT
+/// `source_positions_by_task`. Verification accepts it for upgrade
+/// compatibility; sealing never produces it.
+fn legacy_manifest_checksum(manifest: &CheckpointManifest) -> u64 {
+    let encoded = serde_json::to_vec(&(
+        &manifest.checkpoint_id,
+        &manifest.job_id,
+        manifest.job_version,
+        manifest.generation,
+        &manifest.task_attempts,
+        &manifest.source_positions,
+        &manifest.watermarks_ms,
+        &manifest.watermark_partitions,
+        &manifest.in_flight_barrier,
+        &manifest.state_snapshots,
+        manifest.format_version,
+    ))
+    .unwrap_or_default();
+    hash_manifest_bytes(&encoded)
+}
+
+fn hash_manifest_bytes(encoded: &[u8]) -> u64 {
     encoded.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
         hash.wrapping_mul(0x100000001b3) ^ u64::from(*byte)
     })
@@ -1031,6 +1120,25 @@ mod tests {
             )
             .unwrap();
         assert!(manifest.verify());
+        // Upgrade compatibility: a manifest sealed by a released version
+        // (checksum over the legacy tuple without source_positions_by_task)
+        // must still verify, while tampering with the new field still fails.
+        let mut legacy = manifest.clone();
+        legacy.source_positions_by_task.clear();
+        legacy.checksum = legacy_manifest_checksum(&legacy);
+        assert!(legacy.verify());
+        // The legacy checksum does not cover the map, so a manifest that
+        // carries one alongside a legacy checksum must not verify: recovery
+        // would otherwise prefer offsets the checksum never checked.
+        let mut injected = manifest.clone();
+        injected.checksum = legacy_manifest_checksum(&injected);
+        assert!(!injected.verify());
+        // New seals cover the field, so tampering with it still fails.
+        let mut tampered = manifest.clone();
+        tampered
+            .source_positions_by_task
+            .insert("tampered".into(), Vec::new());
+        assert!(!tampered.verify());
         assert_eq!(manifest.watermarks_ms.len(), 2);
         assert_eq!(manifest.watermarks_ms.get("task-0"), Some(&100));
         assert_eq!(manifest.watermarks_ms.get("task-1"), Some(&100));
@@ -1109,6 +1217,7 @@ mod tests {
                 partition: 0,
                 offset: 10,
             }],
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: BTreeMap::new(),
             watermark_partitions: BTreeMap::new(),
             in_flight_barrier: CheckpointBarrier {
@@ -1213,6 +1322,7 @@ mod tests {
                 node_id: "node-a".into(),
             }],
             source_positions: vec![],
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: BTreeMap::new(),
             watermark_partitions: BTreeMap::new(),
             in_flight_barrier: CheckpointBarrier {
@@ -1259,6 +1369,7 @@ mod compatibility_tests {
                 })
                 .collect(),
             source_positions: vec![],
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: BTreeMap::new(),
             watermark_partitions: BTreeMap::new(),
             in_flight_barrier: CheckpointBarrier {
@@ -1739,6 +1850,15 @@ mod artifact_selection_tests {
                 node_id: "n".into(),
             })
             .collect::<Vec<_>>();
+        // Two dispatch rows for one task with distinct attempt ids pass the
+        // set-coverage check but make the ack→dispatch pairing ambiguous.
+        let mut conflicting = attempts.clone();
+        conflicting.push(TaskAttemptSnapshot {
+            task_id: "task-1".into(),
+            attempt_id: "task-1-other".into(),
+            node_id: "n".into(),
+        });
+        assert!(coordinator.complete(conflicting, vec![]).is_err());
         // Snapshot set has a duplicate task reference.
         let duplicate = vec![
             state_ref("checkpoints/ckpt-c/a.json", 1),

@@ -40,7 +40,7 @@ output:
 
 ## Notes
 
-- Schema inference covers **all records** of the batch being decoded, not just the first: numeric columns widen to the union type (a column mixing integers and floats decodes as `Float64` — values are never truncated), fields that first appear in later records still become columns (null-filled, nullable), and a column that is entirely integers stays `Int64`.
+- Schema inference covers **all records** of the batch being decoded, not just the first: numeric columns widen to the union type (a column mixing integers and floats decodes as `Float64` — integer values are not truncated, but IEEE-754 doubles only carry exact integers up to ±2^53, so keep identifiers beyond that range as strings; the same bound applies to unsigned values above `i64::MAX` in a widened column), fields that first appear in later records still become columns (null-filled, nullable), and a column that is entirely integers stays `Int64`.
 - Downstream note: a mixed int/float column that older ArkFlow versions silently truncated to `Int64` now decodes as `Float64` with the correct values; SQL or output schemas that relied on the old (wrongly narrowed) type need to adapt.
 - In the default `fail` mode, multiple byte payloads are concatenated with `\n` and handed to the Arrow JSON reader in a single pass; one malformed message fails the entire batch.
 - In `skip` mode each message is probed individually: parse-level bad messages are dropped with a warning (message index and error are logged), then the good messages are decoded together in one pass sharing the same full-batch schema inference as `fail` mode. A batch where every message fails still errors rather than returning an empty batch.

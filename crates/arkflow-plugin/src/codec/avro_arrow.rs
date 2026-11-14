@@ -27,7 +27,7 @@ use datafusion::arrow::array::{
     Time64MicrosecondBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use std::sync::Arc;
 
 const UTC: &str = "UTC";
@@ -485,8 +485,17 @@ impl AvroArrowAccumulator {
     pub fn finish(&mut self) -> Result<RecordBatch, Error> {
         let schema = Arc::new(Schema::new(self.fields.clone()));
         let columns: Vec<ArrayRef> = self.columns.iter_mut().map(Column::finish).collect();
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))
+        // A zero-field record schema tracks rows but produces NO columns —
+        // the plain try_new rejects an empty column list, so the row count
+        // is passed explicitly. (Empty Avro records are legal payloads.)
+        let options = RecordBatchOptions::new().with_row_count(Some(self.rows));
+        let batch = RecordBatch::try_new_with_options(schema, columns, &options)
+            .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
+        // The columns are drained by `Column::finish`; reset the row count so
+        // a reused accumulator's `len()`/`is_empty()` stay truthful and a
+        // second finish yields an empty batch instead of a length mismatch.
+        self.rows = 0;
+        Ok(batch)
     }
 
     pub fn len(&self) -> usize {

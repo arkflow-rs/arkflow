@@ -226,8 +226,11 @@ impl CommitFrontier {
         frontier.pending.insert(position.offset);
         if position.offset == frontier.next_offset + 1 {
             // Contiguous: drain every consecutive next-offset that followed.
+            // The u64::MAX guard keeps `next + 1` representable — a frontier
+            // that reaches the last representable offset must stop cleanly
+            // instead of wrapping (debug builds would panic on the overflow).
             let mut next = frontier.next_offset;
-            while frontier.pending.remove(&(next + 1)) {
+            while next != u64::MAX && frontier.pending.remove(&(next + 1)) {
                 next += 1;
             }
             frontier.next_offset = next;
@@ -517,11 +520,14 @@ impl TrackingAck {
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.tracker.completed.fetch_add(1, Ordering::AcqRel);
+        // Same ordering discipline as `ack`: release the held claim before
+        // counting the completion so the in-flight estimate never
+        // undercounts inside the transition window.
         let claims = self.held.swap(0, Ordering::AcqRel);
         if claims > 0 {
             self.tracker.held.fetch_sub(1, Ordering::AcqRel);
         }
+        self.tracker.completed.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -534,14 +540,18 @@ impl Ack for TrackingAck {
         }
         let result = self.inner.ack().await;
         if result.is_ok() {
-            self.completed.store(true, Ordering::Release);
-            self.tracker.completed.fetch_add(1, Ordering::AcqRel);
-            // A held acknowledgement that eventually completes (a window
-            // fired) no longer blocks later barriers.
+            // Release the held claim BEFORE counting the completion: in the
+            // window between the two counters, `dispatched - completed -
+            // held` must never UNDERCOUNT (a barrier-drain sample in that
+            // window would hide one unrelated outstanding delivery and exit
+            // early). The reverse order merely overcounts for an instant,
+            // which only makes the drain wait longer.
             let claims = self.held.swap(0, Ordering::AcqRel);
             if claims > 0 {
                 self.tracker.held.fetch_sub(1, Ordering::AcqRel);
             }
+            self.completed.store(true, Ordering::Release);
+            self.tracker.completed.fetch_add(1, Ordering::AcqRel);
         }
         result
     }
@@ -644,6 +654,31 @@ mod tests {
         assert_eq!(
             frontier.contiguous_positions(),
             vec![position("orders", 0, 11)]
+        );
+    }
+
+    /// A frontier that drains to the LAST representable offset must stop
+    /// cleanly: evaluating `next + 1` at u64::MAX wrapped past the
+    /// representable range (panicking in debug builds) instead of ending the
+    /// contiguous run.
+    #[test]
+    fn contiguous_drain_stops_at_the_last_representable_offset() {
+        let frontier = CommitFrontier::new();
+        frontier.anchor_delivery(&position("orders", 0, u64::MAX - 1));
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, u64::MAX)),
+            AckAdvance::Advanced {
+                next_offset: u64::MAX
+            }
+        );
+        assert_eq!(
+            frontier.contiguous_positions(),
+            vec![position("orders", 0, u64::MAX)]
+        );
+        // A further acknowledgement at the same offset stays covered.
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, u64::MAX)),
+            AckAdvance::AlreadyCovered
         );
     }
 

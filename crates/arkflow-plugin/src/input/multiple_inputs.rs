@@ -51,6 +51,10 @@ struct MultipleInputs {
     inputs: Vec<Arc<dyn Input>>,
     sender: Sender<Msg>,
     receiver: Receiver<Msg>,
+    /// Children that have not yet reached their natural EOF. One child's EOF
+    /// must not end the aggregate while the others still flow; the final
+    /// child to finish forwards EOF for all of them.
+    open_children: Arc<std::sync::atomic::AtomicUsize>,
     /// Cancelled only by `close()`. Each generation's token is a child of
     /// this one, so closing releases blocked sends and the consumer's
     /// pending read; a `connect()` after close gets a born-cancelled token.
@@ -95,12 +99,16 @@ impl Input for MultipleInputs {
             input.connect().await?;
         }
 
+        self.open_children
+            .store(self.inputs.len(), std::sync::atomic::Ordering::SeqCst);
         let token = self.closed.child_token();
         let tracker = TaskTracker::new();
+        let open_children = Arc::clone(&self.open_children);
         for input in &self.inputs {
             let input = Arc::clone(input);
             let sender = self.sender.clone();
             let cancellation_token = token.clone();
+            let open_children = Arc::clone(&open_children);
             tracker.spawn(async move {
                 loop {
                     tokio::select! {
@@ -123,9 +131,26 @@ impl Input for MultipleInputs {
                                     }
                                 }
                                 Err(e) => {
-                                    // Surface the error once and exit: the
-                                    // engine decides reconnect vs failure,
-                                    // exactly like a single input's read().
+                                    // A child reaching its natural end just
+                                    // exits: forwarding its EOF would end the
+                                    // aggregate while other children still
+                                    // flow. The LAST child to finish forwards
+                                    // EOF for all of them. Any other error is
+                                    // surfaced once and exits — the engine
+                                    // decides reconnect vs failure, exactly
+                                    // like a single input's read().
+                                    if matches!(e, Error::EOF) {
+                                        if open_children
+                                            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                                            == 1
+                                        {
+                                            tokio::select! {
+                                                _ = cancellation_token.cancelled() => return,
+                                                _ = sender.send_async(Msg::Err(Error::EOF)) => return,
+                                            }
+                                        }
+                                        return;
+                                    }
                                     tokio::select! {
                                         _ = cancellation_token.cancelled() => return,
                                         _ = sender.send_async(Msg::Err(e)) => return,
@@ -217,6 +242,7 @@ impl MultipleInputs {
             inputs,
             sender,
             receiver,
+            open_children: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             closed: CancellationToken::new(),
             generation: Mutex::new(None),
         })
@@ -357,6 +383,7 @@ mod tests {
             inputs,
             sender,
             receiver,
+            open_children: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             closed: CancellationToken::new(),
             generation: Mutex::new(None),
         })

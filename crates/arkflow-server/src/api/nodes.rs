@@ -31,8 +31,6 @@ impl From<&NodePageQuery> for PageQuery {
 }
 
 pub(super) async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
-    let nodes = hub.nodes().await;
-    let leadership = hub.leadership().await;
     // The auth middleware guarantees an authorized caller by the time the
     // handler runs; resolving again (rather than trusting an extension)
     // keeps the echo on the exact enforcement path. A None here still
@@ -40,15 +38,47 @@ pub(super) async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) 
     let principal = hub
         .operator_principal(super::bearer(&headers).as_deref())
         .await;
-    Json(
-        serde_json::json!({"id":"arkflow-control-hub", "version":env!("CARGO_PKG_VERSION"), "state":"running", "node_count":nodes.len(), "online_nodes":nodes.iter().filter(|node| node.state == hub::NodeConnectionState::Online).count(), "capabilities":["node_registry","command_dispatch","fleet_aggregation"], "ha": {"enabled": hub.ha_config().enabled, "role": leadership.role(), "epoch": leadership.epoch(), "transitions": hub.leadership_transitions()}, "principal": principal.as_ref().map(|principal| principal.echo())}),
-    ).into_response()
+    // Fleet-wide readings (node counts, HA leadership) are scoped like
+    // `hub_status`. The identity echo stays available to every authenticated
+    // principal — the console gates its own UI from it, including for
+    // node-scoped credentials — so the fields are omitted, never faked.
+    let fleet_visible = principal
+        .as_ref()
+        .is_some_and(|principal| principal.can_scope(OperatorAction::Read, "node", None));
+    let mut payload = serde_json::json!({
+        "id": "arkflow-control-hub",
+        "version": env!("CARGO_PKG_VERSION"),
+        "state": "running",
+        "capabilities": ["node_registry", "command_dispatch", "fleet_aggregation"],
+        "principal": principal.as_ref().map(|principal| principal.echo()),
+    });
+    if fleet_visible {
+        let nodes = hub.nodes().await;
+        let leadership = hub.leadership().await;
+        payload["node_count"] = serde_json::json!(nodes.len());
+        payload["online_nodes"] = serde_json::json!(nodes
+            .iter()
+            .filter(|node| node.state == hub::NodeConnectionState::Online)
+            .count());
+        payload["ha"] = serde_json::json!({
+            "enabled": hub.ha_config().enabled,
+            "role": leadership.role(),
+            "epoch": leadership.epoch(),
+            "transitions": hub.leadership_transitions(),
+        });
+    }
+    Json(payload).into_response()
 }
 
 /// Fleet-aggregated EngineStatus so console clients get one overview
 /// contract in local and Hub mode. Only a lease-holding Hub reaches this
 /// handler; standbys are rejected by the router's standby middleware.
-pub(super) async fn hub_status(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
+pub(super) async fn hub_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "node", None).await
+    {
+        return response;
+    }
     let nodes = hub.nodes().await;
     Json(arkflow_core::control::EngineStatus {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -65,8 +95,13 @@ pub(super) async fn hub_status(State(hub): State<hub::Hub>, _headers: HeaderMap)
 pub(super) async fn hub_nodes(
     State(hub): State<hub::Hub>,
     Query(query): Query<NodePageQuery>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "node", None).await
+    {
+        return response;
+    }
     let mut filters = Vec::new();
     if let Some(label) = &query.label {
         if !label.trim().is_empty() {

@@ -41,7 +41,7 @@ The File input reads JSON / CSV / Parquet / Avro / Arrow files via DataFusion. I
 |-------|------|----------|-------------|
 | type | string | yes | `"gs"` |
 | bucket_name | string | yes | GCS bucket name |
-| url | string | no | Custom endpoint |
+| url | string | no | Custom endpoint: a `gs://bucket` URL for the same bucket, or an `http(s)://` endpoint for an emulator (the bucket stays `bucket_name`) |
 | service_account_path | string | no | Path to the service account JSON key file |
 | service_account_key | string | no | Raw service account JSON content |
 
@@ -61,7 +61,7 @@ The File input reads JSON / CSV / Parquet / Avro / Arrow files via DataFusion. I
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | type | string | yes | `"http"` |
-| url | string | yes | HTTP endpoint URL |
+| url | string | yes | Store origin (`scheme://host[:port]`); any path prefix belongs in the data `path` (e.g. `path: http://host/prefix/file.parquet`) |
 
 #### HDFS
 

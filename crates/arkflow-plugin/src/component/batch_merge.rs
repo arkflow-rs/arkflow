@@ -38,6 +38,18 @@ pub(crate) fn normalize_and_concat(batches: &[RecordBatch]) -> Result<RecordBatc
         return Ok(batches[0].clone());
     }
 
+    let (schema, projected) = normalize_to_union(batches)?;
+    concat_batches(&schema, &projected).map_err(|e| Error::Process(format!("batch merge: {}", e)))
+}
+
+/// Project each batch onto the union schema (first-seen column order,
+/// missing columns null-filled) WITHOUT concatenating, returning the union
+/// schema and the projected batches so a caller can reassemble rows in a
+/// custom order (schema-registry message-order interleaving). A column name
+/// carrying two different types is an error rather than a guessed cast.
+pub(crate) fn normalize_to_union(
+    batches: &[RecordBatch],
+) -> Result<(Arc<Schema>, Vec<RecordBatch>), Error> {
     let mut fields: Vec<Field> = Vec::new();
     let mut positions: HashMap<String, usize> = HashMap::new();
     for batch in batches {
@@ -71,7 +83,7 @@ pub(crate) fn normalize_and_concat(batches: &[RecordBatch]) -> Result<RecordBatc
     for batch in batches {
         projected.push(project_to_schema(batch, &schema)?);
     }
-    concat_batches(&schema, &projected).map_err(|e| Error::Process(format!("batch merge: {}", e)))
+    Ok((schema, projected))
 }
 
 /// Rebuild `batch` with exactly `schema`'s columns: existing columns pass

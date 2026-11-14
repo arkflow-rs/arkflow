@@ -128,8 +128,17 @@ controlPlane:
       # Hub PVC switch (independent of the engine-mode persistence value):
       # true by default for SQLite durability, forced off by postgresURL.
       persistenceEnabled: true
-    # Optional operator API token (ARKFLOW_OPERATOR_TOKEN) from an existing
-    # Secret; unset keeps the Hub open to in-cluster callers only.
+    # Operator API token (ARKFLOW_OPERATOR_TOKEN) from an existing Secret.
+    # NOT optional in practice: the startup guard
+    # (validate_standalone_startup) refuses an unauthenticated non-loopback
+    # bind, and the hub container binds 0.0.0.0 — a stock install without
+    # this secret EXITS at startup. Create the Secret once, then point the
+    # chart at it so the env var is actually rendered (the chart generates
+    # its own node token separately):
+    #   kubectl create secret generic arkflow-hub-secrets \
+    #     --from-literal=operator_token="$(openssl rand -hex 32)"
+    #   helm upgrade --install <release> ./deploy/charts/arkflow \
+    #     --set controlPlane.hub.operatorToken.existingSecret=arkflow-hub-secrets
     operatorToken:
       existingSecret: ""
       existingSecretKey: operator_token
