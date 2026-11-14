@@ -336,6 +336,10 @@ pub enum HubOperationState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubOperation {
     pub id: String,
+    /// Originating principal id; historical records without attribution are
+    /// treated as system operations when retried. Never a bearer credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
     #[serde(default)]
     pub intent_id: Option<String>,
     pub command_id: String,

@@ -4,7 +4,6 @@ edition = "2021"
 description = "High-performance Rust flow processing engine"
 authors = ["chenquan <chenquan.dev@gmail.com>"]
 repository = "https://github.com/arkflow-rs/arkflow"
-homepage = "https://github.com/arkflow-rs/arkflow"
 license = "Apache-2.0"
 rust-version = "1.97"
 
@@ -35,9 +34,8 @@ indexmap = "2"
 rustc-hash = "2"
 humantime = "2.3.0"
 thiserror = "2.0"
-anyhow = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json"] }
+tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json", "env-filter"] }
 prometheus = "0.14"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 apache-avro = { version = "0.22", default-features = false }
@@ -65,7 +63,6 @@ tracing-opentelemetry = "0.34"
 reqwest = { version = "0.13", features = ["json", "query"] }
 percent-encoding = "2.3"
 clap = { version = "4.5", features = ["derive"] }
-colored = "3.0"
 flume = "=0.11"
 smallvec = "1"
 subtle = "2.6"

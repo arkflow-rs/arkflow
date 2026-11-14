@@ -145,7 +145,7 @@ kubectl get svc arkflow
 ## Configuration Details
 
 - **Image Configuration**: In the Deployment configuration, replace `image: arkflow:latest` with your actual image address
-- **Environment Variables**: Environment variables can be configured through the env field, currently configured with RUST_LOG=info
+- **Environment Variables**: Environment variables can be configured through the env field; the manifest sets `RUST_LOG=info`, which the engine (and `arkflow-server`) honor as a filter override on top of `logging.level`
 - **Port Configuration**: Service exposes port 8080 by default (the ArkFlow HTTP server default). Make sure `health_check.address` binds to `0.0.0.0:8080` so kubelet probes can reach it.
 - **Configuration File**: Mounted to the container's /app/etc directory via ConfigMap
 - **Resource Limits**: Default resource requests and limits are set to prevent resource contention

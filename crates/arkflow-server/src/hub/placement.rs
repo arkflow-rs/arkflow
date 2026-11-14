@@ -537,10 +537,27 @@ impl Hub {
     }
 
     pub async fn reconcile_jobs(&self) -> Result<usize, HubError> {
-        let jobs = self.jobs().await?;
+        let job_ids = self
+            .jobs()
+            .await?
+            .into_iter()
+            .map(|job| job.job_id)
+            .take(MAX_JOB_RECONCILIATIONS_PER_TICK)
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        Self::pass_test_gate(&self.test_list_gate).await;
         let mut dispatched = 0;
-        for job in jobs.into_iter().take(MAX_JOB_RECONCILIATIONS_PER_TICK) {
-            match self.reconcile_job(&job).await {
+        for job_id in job_ids {
+            // Re-read the record WITH its requester. The list snapshot above
+            // may predate a concurrent mutation; pairing that older Job with
+            // a newer actor would misattribute the deferred dispatch.
+            let Some((job, actor)) = self.dispatch_snapshot(&job_id).await? else {
+                continue;
+            };
+            match self
+                .reconcile_job_as(&job, actor.as_deref().unwrap_or("system"))
+                .await
+            {
                 Ok(count) => dispatched += count,
                 // One Job whose target is at capacity, whose node expired
                 // between the online pre-check and the enqueue, or whose
@@ -563,6 +580,14 @@ impl Hub {
     }
 
     pub async fn reconcile_job(&self, job: &JobRecord) -> Result<usize, HubError> {
+        self.reconcile_job_as(job, "system").await
+    }
+
+    pub(crate) async fn reconcile_job_as(
+        &self,
+        job: &JobRecord,
+        actor: &str,
+    ) -> Result<usize, HubError> {
         // Atomic-upgrade fence: while an orchestration owns the Job's
         // dispatch state (savepoint, commit, pause) the general reconciler
         // must not touch it — a re-placement here would bump the generation
@@ -1010,7 +1035,7 @@ impl Hub {
                         && node.resource.maintenance_state == NodeMaintenanceState::Active
                 });
                 if is_online {
-                    self.enqueue_with_metadata(
+                    self.enqueue_with_metadata_as(
                         node_id.clone(),
                         AgentOperation::JobStop,
                         job.job_id.clone(),
@@ -1022,6 +1047,7 @@ impl Hub {
                         None,
                         None,
                         None,
+                        actor,
                     )
                     .await?;
                 }
@@ -1138,7 +1164,7 @@ impl Hub {
             } else {
                 None
             };
-            self.enqueue_with_metadata(
+            self.enqueue_with_metadata_as(
                 node_id,
                 operation.clone(),
                 job.job_id.clone(),
@@ -1150,6 +1176,7 @@ impl Hub {
                 None,
                 None,
                 None,
+                actor,
             )
             .await?;
             if let Some((node_id, fingerprint)) = fingerprint {

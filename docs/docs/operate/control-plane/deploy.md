@@ -24,6 +24,26 @@ contains `|` but fails to parse (unknown role, empty field, wrong field
 count) refuses Hub startup with a redacted message instead of silently
 becoming an admin credential.
 
+### Startup configuration file
+
+Besides environment variables, `arkflow-server` accepts `--config <FILE>` —
+a YAML, JSON, or TOML file carrying the full startup configuration,
+including fields no environment variable can set (`api_prefix`, health
+paths, `cors_origins`, `session_ttl_ms`, logging, tracing). The precedence
+rule is: **an environment variable that is explicitly set overrides the
+file**, everything else falls back to the file value and then the built-in
+default, so existing env-only deployments (including the Helm chart, which
+needs no changes) behave exactly as before. Secret references
+(`${env:VAR}`, `${file:PATH}`, `${secret:NAME}`) resolve while the file
+loads; unknown top-level keys fail startup naming the key. The full field
+reference, an example file, and the exit-code contract live in the
+[CLI reference](../../reference/cli.md#arkflow-server).
+
+Env-only and file-based configuration can be mixed freely: keep the small
+deployment-specific values (tokens) in the environment via secret
+references, and put the deployment topology (address, TLS paths, storage,
+tracing endpoint) in a mounted file.
+
 ### Storage backends
 
 The Hub persists its control-plane state (nodes, jobs, intents, operations,

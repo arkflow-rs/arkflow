@@ -30,7 +30,7 @@ pub enum ConfigFormat {
     TOML,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     JSON,
@@ -39,7 +39,7 @@ pub enum LogFormat {
 
 /// Log configuration
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoggingConfig {
     /// Log level
     pub level: String,
@@ -54,7 +54,7 @@ pub struct LoggingConfig {
 /// Process-level observability endpoints (`/metrics`, `/ready`, `/live`).
 /// They stay available even when the control-plane API server is disabled.
 /// The default bind is loopback so enabling never exposes metrics off-host.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
     /// Whether the observability export is enabled
     #[serde(default = "default_enabled")]

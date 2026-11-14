@@ -1,21 +1,30 @@
+use arkflow_core::checkpoint::{
+    recovery_manifest_key, CheckpointManifest, CheckpointRepository, FileCheckpointStore,
+    RecoveryArtifactKind,
+};
 use arkflow_core::config::{EngineConfig, LoggingConfig, NodeConfig};
 use arkflow_core::control_plane::ControlPlane;
 use arkflow_core::job::{
-    CheckpointSpec, JobId, JobSpec, JobVersion, OperatorKind, OperatorSpec, SinkSpec, SourceSpec,
-    StateSpec, TimeMode, TimeSpec,
+    CheckpointSpec, JobId, JobPlan, JobSpec, JobVersion, OperatorKind, OperatorSpec,
+    RecoveryPolicy, SinkSpec, SourceSpec, StateSpec, TimeMode, TimeSpec,
 };
 use arkflow_core::runtime::RuntimeManager;
 use arkflow_server::agent::{self, NodeAgentConfig};
 use arkflow_server::hub::{Hub, HubConfig, HubOperationState};
 use arkflow_server::storage::JobRecord;
 use arkflow_server::{hub_router, ServerConfig};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-/// These two smoke tests each run a Hub, two Agents, and real kernels; in
+#[path = "support/pause_resume.rs"]
+mod pause_resume;
+use pause_resume::{start_agents, HubHarness, ReplayFixture};
+
+/// These smoke tests each run a Hub, two Agents, and real kernels; in
 /// parallel they saturate a shared CI runner and stretch the restart round
 /// trip past its budget (observed as a condition-4 timeout on #1264's CI).
 /// Serialize them: wall clock stays comparable, load halves.
@@ -702,4 +711,447 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     let _ = tokio::time::timeout(Duration::from_secs(5), reconcile_task).await;
     hub_cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+}
+
+async fn pause_resume_diagnostics(hub: &Hub, job_id: &str, fixture: &ReplayFixture) -> String {
+    let mut job = serde_json::to_value(hub.job(job_id).await.unwrap()).unwrap();
+    if let Some(fields) = job.as_object_mut() {
+        fields.remove("spec_json");
+    }
+    let operations = hub
+        .operations(None)
+        .await
+        .into_iter()
+        .filter(|operation| operation.resource_id == job_id)
+        .collect::<Vec<_>>();
+    format!(
+        "job: {job}\ntasks: {:?}\noperations: {operations:#?}\nartifacts: {:?}\nnodes: {:?}\nfixture: {}",
+        hub.observed_job_tasks(job_id).await,
+        hub.job_checkpoints(job_id).await,
+        hub.nodes().await,
+        fixture.diagnostics(),
+    )
+}
+
+async fn wait_for_pause_resume<F, Fut>(
+    hub: &Hub,
+    job_id: &str,
+    fixture: &ReplayFixture,
+    stage: &str,
+    mut condition: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if condition().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if result.is_err() {
+        panic!(
+            "{stage} timed out:\n{}",
+            pause_resume_diagnostics(hub, job_id, fixture).await
+        );
+    }
+}
+
+async fn wait_for_running_rows(
+    hub: &Hub,
+    plan: &JobPlan,
+    generation: u64,
+    fixture: &ReplayFixture,
+    count: u64,
+) {
+    let expected_tasks = plan
+        .tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<BTreeSet<_>>();
+    wait_for_pause_resume(
+        hub,
+        plan.spec.id.as_str(),
+        fixture,
+        &format!("running generation {generation}, acknowledged rows {count}"),
+        || {
+            let hub = hub.clone();
+            let job_id = plan.spec.id.as_str().to_owned();
+            let expected_tasks = expected_tasks.clone();
+            let fixture = fixture.clone();
+            async move {
+                let job = hub.job(&job_id).await.unwrap().unwrap();
+                let tasks = hub.observed_job_tasks(&job_id).await;
+                job.generation == generation
+                    && job.desired_state == "running"
+                    && job.observed_state == "running"
+                    && job.convergence == "converged"
+                    && job.pause_phase.is_none()
+                    && tasks.keys().cloned().collect::<BTreeSet<_>>() == expected_tasks
+                    && tasks.values().map(String::as_str).collect::<BTreeSet<_>>()
+                        == BTreeSet::from(["node-a", "node-b"])
+                    && fixture.settled(count)
+            }
+        },
+    )
+    .await;
+    fixture.assert_rows(count);
+}
+
+async fn exercise_two_node_pause_resume(recovery: RecoveryPolicy) {
+    let _serial = ONE_AT_A_TIME.lock().await;
+    arkflow_plugin::initialize().unwrap();
+    let (kind, artifact_kind) = match recovery {
+        RecoveryPolicy::LatestCheckpoint => ("checkpoint", RecoveryArtifactKind::Checkpoint),
+        RecoveryPolicy::LatestSavepoint => ("savepoint", RecoveryArtifactKind::Savepoint),
+        RecoveryPolicy::Fail => unreachable!("pause requires a recovery policy"),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let sqlite_path = directory.path().join("hub.sqlite");
+    let job_id = format!("two-node-pause-{kind}-{}", std::process::id());
+    let fixture = ReplayFixture::register(&job_id);
+    let mut spec = two_component_job(
+        JobId::new(&job_id).unwrap(),
+        format!("file://{}", directory.path().display()),
+        directory.path().join("state").display().to_string(),
+    );
+    spec.recovery = recovery;
+    for source in &mut spec.sources {
+        source.input_type = fixture.input_type.clone();
+        source.config = serde_json::json!({"source": source.operator_id});
+    }
+    for (sink, source) in spec.sinks.iter_mut().zip(&spec.sources) {
+        sink.output_type = fixture.output_type.clone();
+        sink.config = serde_json::json!({"source": source.operator_id});
+    }
+    for suffix in ["a", "b"] {
+        let counter_id = format!("count-{suffix}");
+        spec.operators.push(OperatorSpec {
+            id: counter_id.clone(),
+            kind: OperatorKind::Map,
+            stateful: true,
+            key_field: Some("key".into()),
+            config: serde_json::json!({"type": "sql", "query": "SELECT * FROM flow"}),
+        });
+        spec.edges
+            .iter_mut()
+            .find(|edge| edge.id == format!("edge-{suffix}"))
+            .unwrap()
+            .to = counter_id.clone();
+        spec.edges.push(arkflow_core::job::EdgeSpec {
+            id: format!("count-sink-{suffix}"),
+            from: counter_id,
+            to: format!("sink-{suffix}"),
+            partitioned: false,
+        });
+    }
+    let plan = JobPlan::compile(spec.clone()).unwrap();
+    let planned_tasks = plan
+        .tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mut server = HubHarness::start(
+        &sqlite_path,
+        "127.0.0.1:0".parse().unwrap(),
+        commands.clone(),
+    )
+    .await;
+    let agents = start_agents(&server.url);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    wait_until(|| {
+        let hub = server.hub.clone();
+        async move { hub.nodes().await.len() == 2 }
+    })
+    .await;
+    fixture.publish_through(8);
+    server
+        .hub
+        .upsert_job(JobRecord {
+            job_id: job_id.clone(),
+            version: 1,
+            spec_json: serde_json::to_string(&spec).unwrap(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: vec!["node-a".into(), "node-b".into()],
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
+        })
+        .await
+        .unwrap();
+    wait_for_running_rows(&server.hub, &plan, 1, &fixture, 8).await;
+
+    // Round one persists paused state across a Hub-only restart. The Agents
+    // keep their boot identities. Round two pauses and resumes the recovered
+    // running Job, exercising a complete new capture on the restarted Hub.
+    for generation in 1..=2 {
+        let cut = generation * 8;
+        let pausing = server.action(&client, &job_id, "pause").await;
+        assert_eq!(pausing.desired_state, "paused");
+        assert_eq!(pausing.generation, generation);
+        assert!(pausing.pause_artifact_id.is_some());
+        assert_eq!(pausing.checkpoint_id, pausing.pause_artifact_id);
+        wait_for_pause_resume(
+            &server.hub,
+            &job_id,
+            &fixture,
+            &format!("paused generation {generation}"),
+            || {
+                let hub = server.hub.clone();
+                let job_id = job_id.clone();
+                let fixture = fixture.clone();
+                async move {
+                    let job = hub.job(&job_id).await.unwrap().unwrap();
+                    if job.desired_state != "paused" {
+                        panic!(
+                            "pause aborted:\n{}",
+                            pause_resume_diagnostics(&hub, &job_id, &fixture).await
+                        );
+                    }
+                    let operations = hub.operations(None).await;
+                    job.pause_phase.as_deref() == Some("paused")
+                        && job.observed_state == "stopped"
+                        && job.convergence == "converged"
+                        && hub.observed_job_tasks(&job_id).await.is_empty()
+                        && ["node-a", "node-b"].iter().all(|node| {
+                            operations.iter().any(|operation| {
+                                operation.resource_id == job_id
+                                    && operation.node_id == *node
+                                    && operation.generation == generation
+                                    && operation.operation.as_str() == "job_stop"
+                                    && operation.state == HubOperationState::Succeeded
+                            })
+                        })
+                }
+            },
+        )
+        .await;
+        let paused = server.hub.job(&job_id).await.unwrap().unwrap();
+        // A bounded capture retry may replace the initial artifact. The pin
+        // that reached paused is the one resume must restore.
+        let artifact_id = paused.pause_artifact_id.clone().unwrap();
+        assert_eq!(paused.checkpoint_id, paused.pause_artifact_id);
+        assert_eq!(paused.node_ids, ["node-a", "node-b"]);
+        let artifact = server
+            .hub
+            .job_checkpoints(&job_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.checkpoint_id == artifact_id)
+            .unwrap();
+        assert_eq!(artifact.kind, kind);
+        assert_eq!(artifact.status, "completed");
+        assert_eq!(artifact.job_version, spec.version.0);
+        let manifest_key = recovery_manifest_key(artifact_kind, &artifact_id);
+        let manifest_path = directory.path().join(&manifest_key);
+        assert_eq!(
+            artifact.manifest_uri.as_deref(),
+            Some(format!("file://{}", manifest_path.display()).as_str())
+        );
+        let manifest: CheckpointManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(manifest.verify(), "kernel manifest checksum must verify");
+        assert_eq!(manifest.checkpoint_id, artifact_id);
+        assert_eq!(manifest.job_id, spec.id);
+        assert_eq!(manifest.job_version, spec.version);
+        assert_eq!(manifest.generation, generation);
+        assert_eq!(manifest.in_flight_barrier.generation, generation);
+        assert_eq!(manifest.in_flight_barrier.checkpoint_id, artifact_id);
+        assert_eq!(manifest.task_attempts.len(), planned_tasks.len());
+        assert_eq!(
+            manifest
+                .task_attempts
+                .iter()
+                .map(|attempt| attempt.task_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            planned_tasks
+        );
+        assert_eq!(
+            manifest
+                .task_attempts
+                .iter()
+                .map(|attempt| attempt.node_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["node-a", "node-b"])
+        );
+        assert_eq!(manifest.source_positions.len(), 2);
+        assert_eq!(
+            manifest
+                .source_positions
+                .iter()
+                .map(|position| (
+                    position.topic.as_deref(),
+                    position.partition,
+                    position.offset
+                ))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(Some("source-a"), 0, cut), (Some("source-b"), 0, cut)])
+        );
+        let repository =
+            CheckpointRepository::new(FileCheckpointStore::new(directory.path()).unwrap());
+        let mut state_nodes = BTreeSet::new();
+        for reference in &manifest.state_snapshots {
+            // Validate the actual files and their checksums, including every
+            // planned source/processor/sink reference in both node manifests.
+            let snapshot = repository.read_state_snapshot(reference).unwrap();
+            if !snapshot.entries.is_empty() {
+                state_nodes.insert(reference.node_id.as_deref().unwrap());
+            }
+        }
+        assert_eq!(state_nodes, BTreeSet::from(["node-a", "node-b"]));
+        let operations = server.hub.operations(None).await;
+        for node in ["node-a", "node-b"] {
+            assert!(operations.iter().any(|operation| {
+                operation.resource_id == job_id
+                    && operation.node_id == node
+                    && operation.generation == generation
+                    && operation.operation.as_str() == format!("job_{kind}")
+                    && operation.checkpoint_id.as_deref() == Some(artifact_id.as_str())
+                    && operation.state == HubOperationState::Succeeded
+            }));
+            assert!(
+                operations.iter().any(|operation| {
+                    operation.resource_id == job_id
+                        && operation.node_id == node
+                        && operation.generation == generation
+                        && operation.operation.as_str() == "job_stop"
+                        && operation.state == HubOperationState::Succeeded
+                        && operation.created_at_ms >= artifact.updated_at_ms
+                }),
+                "{node}: stop must follow durable artifact completion"
+            );
+        }
+
+        if generation == 1 {
+            let address = server.address;
+            server.shutdown().await;
+            server = HubHarness::start(&sqlite_path, address, commands.clone()).await;
+            let restored = server.hub.job(&job_id).await.unwrap().unwrap();
+            assert_eq!(restored.generation, paused.generation);
+            assert_eq!(restored.desired_state, "paused");
+            assert_eq!(restored.observed_state, "stopped");
+            assert_eq!(restored.convergence, "converged");
+            assert_eq!(restored.pause_phase.as_deref(), Some("paused"));
+            assert_eq!(restored.pause_artifact_id, paused.pause_artifact_id);
+            assert_eq!(restored.checkpoint_id, paused.checkpoint_id);
+            assert_eq!(
+                restored.pause_prev_checkpoint_id,
+                paused.pause_prev_checkpoint_id
+            );
+            assert_eq!(restored.pause_retry_count, paused.pause_retry_count);
+            assert_eq!(restored.paused_at_ms, paused.paused_at_ms);
+            assert_eq!(restored.paused_by, paused.paused_by);
+            assert_eq!(restored.node_ids, paused.node_ids);
+            assert!(server
+                .hub
+                .job_checkpoints(&job_id)
+                .await
+                .unwrap()
+                .contains(&artifact));
+            wait_until(|| {
+                let hub = server.hub.clone();
+                async move { hub.nodes().await.len() == 2 }
+            })
+            .await;
+        }
+
+        // Publish a backlog while paused and wait for fresh reports from both
+        // Agents: a stopped Job must neither consume it nor dispatch starts.
+        let command_count = commands.lock().unwrap().len();
+        let last_seen = server
+            .hub
+            .nodes()
+            .await
+            .iter()
+            .map(|node| node.last_seen_at_ms)
+            .max()
+            .unwrap();
+        fixture.publish_through(cut + 8);
+        for _ in 0..3 {
+            assert_eq!(server.hub.reconcile_jobs().await.unwrap(), 0);
+            assert_eq!(server.hub.reconcile_job_pauses().await.unwrap(), 0);
+        }
+        wait_until(|| {
+            let hub = server.hub.clone();
+            async move {
+                let nodes = hub.nodes().await;
+                nodes.len() == 2 && nodes.iter().all(|node| node.last_seen_at_ms > last_seen)
+            }
+        })
+        .await;
+        fixture.assert_rows(cut);
+        assert!(server.hub.observed_job_tasks(&job_id).await.is_empty());
+        assert_eq!(commands.lock().unwrap().len(), command_count);
+
+        let resuming = server.action(&client, &job_id, "resume").await;
+        assert_eq!(resuming.desired_state, "running");
+        assert_eq!(resuming.generation, generation + 1);
+        assert_eq!(
+            resuming.checkpoint_id.as_deref(),
+            Some(artifact_id.as_str())
+        );
+        wait_for_running_rows(&server.hub, &plan, generation + 1, &fixture, cut + 8).await;
+        {
+            let delivered = commands.lock().unwrap();
+            let starts = delivered
+                .iter()
+                .filter(|command| {
+                    command.resource_id == job_id
+                        && command.operation.as_str() == "job_start"
+                        && command.generation == generation + 1
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                starts
+                    .iter()
+                    .map(|command| command.node_id.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["node-a", "node-b"])
+            );
+            for command in starts {
+                let payload = command.payload.as_ref().unwrap();
+                assert_eq!(payload["recovery"]["checkpoint_id"], artifact_id);
+                assert_eq!(payload["recovery"]["savepoint"], kind == "savepoint");
+                assert_eq!(payload["recovery_required"], true);
+            }
+        }
+        fixture.assert_restored(&(1..=generation).map(|round| round * 8).collect::<Vec<_>>());
+        let running = server.hub.job(&job_id).await.unwrap().unwrap();
+        assert_eq!(running.checkpoint_id.as_deref(), Some(artifact_id.as_str()));
+        assert!(running.pause_artifact_id.is_none());
+        assert!(running.paused_at_ms.is_none());
+        assert!(running.paused_by.is_none());
+    }
+    fixture.assert_rows(24);
+    for agent in agents {
+        agent.shutdown().await;
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn two_node_pause_resume_latest_checkpoint_survives_sqlite_hub_restart() {
+    exercise_two_node_pause_resume(RecoveryPolicy::LatestCheckpoint).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn two_node_pause_resume_latest_savepoint_survives_sqlite_hub_restart() {
+    exercise_two_node_pause_resume(RecoveryPolicy::LatestSavepoint).await;
 }

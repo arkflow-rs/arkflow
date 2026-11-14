@@ -359,7 +359,7 @@ the same durable Intent pipeline.
 | `GET` | `/operations/status` | Operational status summary for dashboards. |
 | `GET` | `/events` | Query the fleet event log. |
 | `GET` | `/events/stream` | Server-Sent Events stream of live events. |
-| `GET` | `/audit` | Bounded audit history (`?resource_id={id}`), accepted and rejected mutations. |
+| `GET` | `/audit` | Bounded audit history; requires `ReadAudit`. Filters: `resource_id`, `actor`, `action`, `from_ms`, `to_ms`, plus pagination. |
 | `GET`/`PUT` | `/webhooks` | List / full-replace the webhook alerting subscription set (see [Webhook alerting](#webhook-alerting)). |
 | `POST` | `/webhooks/{id}/test` | One synchronous test delivery of a synthetic `webhook.test` event. |
 
@@ -389,6 +389,13 @@ Audit records carry actor, target resource, node, correlation ID, outcome
 (`accepted`/`rejected`), and a stable failure code (`node_unavailable`,
 `capacity`, `incompatible_capability`, `expired`). Messages contain scalar
 operation metadata only — never credentials or job configuration bodies.
+`GET /audit` requires `ReadAudit` (admin or viewer) and the `audit` scope for
+the requested `resource_id`; an unfiltered request requires collection-wide
+audit access. The operator role returns `403`. Optional `actor` and `action`
+are exact matches; `from_ms` and `to_ms` are inclusive Unix-millisecond bounds.
+All supplied filters are combined in storage before the 1024-record response
+window and pagination; `total` counts matches within that window.
+`from_ms > to_ms` returns `400 invalid_audit_query`.
 
 ### Users and credentials {#users-and-credentials}
 

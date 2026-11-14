@@ -471,7 +471,8 @@ const PG_DDL: &str = r#"
                 pause_prev_checkpoint_id TEXT,
                 pause_retry_count BIGINT NOT NULL DEFAULT 0,
                 paused_at_ms BIGINT,
-                paused_by TEXT
+                paused_by TEXT,
+                requested_by TEXT
             );
             ALTER TABLE cp_jobs ADD COLUMN IF NOT EXISTS pause_phase TEXT;
             ALTER TABLE cp_jobs ADD COLUMN IF NOT EXISTS pause_artifact_id TEXT;
@@ -479,6 +480,7 @@ const PG_DDL: &str = r#"
             ALTER TABLE cp_jobs ADD COLUMN IF NOT EXISTS pause_retry_count BIGINT NOT NULL DEFAULT 0;
             ALTER TABLE cp_jobs ADD COLUMN IF NOT EXISTS paused_at_ms BIGINT;
             ALTER TABLE cp_jobs ADD COLUMN IF NOT EXISTS paused_by TEXT;
+            ALTER TABLE cp_jobs ADD COLUMN IF NOT EXISTS requested_by TEXT;
 
             CREATE INDEX IF NOT EXISTS cp_jobs_updated
                 ON cp_jobs(updated_at_ms DESC, job_id);

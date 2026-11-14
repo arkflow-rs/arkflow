@@ -220,3 +220,83 @@ async fn serve_from_config_starts_and_stops_on_cancellation() {
     cancelled.cancel();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_config_feeds_serve_from_config() {
+    // The binary's serve path: load a file, apply env overrides, serve from
+    // the resulting config, cancel cleanly.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hub.yaml");
+    std::fs::write(&path, "address: 127.0.0.1:0\ninsecure_local: true\n").unwrap();
+    let mut startup = arkflow_server::load_startup_config(path.to_str().unwrap()).unwrap();
+    arkflow_server::apply_env_overrides(&mut startup, &|_| None);
+    assert_eq!(startup.server.address, "127.0.0.1:0");
+    let hub_config = HubConfig {
+        operator_token: startup.hub.operator_token,
+        node_token: startup.server.node_token.clone(),
+        insecure_local: startup.server.insecure_local,
+        lease_ttl_ms: startup.server.lease_ttl_ms,
+        poll_interval_ms: startup.server.poll_interval_ms,
+        session_ttl_ms: startup.server.session_ttl_ms,
+        approval_required: startup.server.approval_required,
+        approval_ttl_ms: startup.server.approval_ttl_ms,
+    };
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let cancelled = cancellation.clone();
+    let task = tokio::spawn(bootstrap::serve_from_config(
+        hub_config,
+        startup.server,
+        startup.ha,
+        cancellation,
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    cancelled.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("serve_from_config did not stop within 10s of cancellation")
+        .expect("serve_from_config task panicked");
+    result.expect("serve_from_config failed on graceful shutdown");
+}
+
+#[test]
+fn ha_validation_rejects_sub_second_lease_ttl_after_merge() {
+    // The env path filters sub-1000 values before validation; a config file
+    // has no such filter, so validate_ha_config itself must fail closed on a
+    // TTL that would make every lease expire at acquisition.
+    let enabled = HubHaConfig {
+        enabled: true,
+        lease_ttl_ms: 0,
+        ..HubHaConfig::default()
+    };
+    let config = ServerConfig {
+        hub_storage: Some("postgres://127.0.0.1:1/db".into()),
+        ..ServerConfig::default()
+    };
+    let error = bootstrap::validate_ha_config(&enabled, &config).unwrap_err();
+    assert!(error.contains("at least 1000 ms"), "{error}");
+    // Disabled HA keeps skipping the check.
+    let disabled = HubHaConfig {
+        enabled: false,
+        lease_ttl_ms: 0,
+        ..HubHaConfig::default()
+    };
+    bootstrap::validate_ha_config(&disabled, &config).unwrap();
+}
+
+#[test]
+fn ha_validation_errors_do_not_echo_advertise_url() {
+    // The advertise URL may carry a secret-resolved credential; the
+    // validation error must name the field, not print the value.
+    let enabled = HubHaConfig {
+        enabled: true,
+        advertise_url: Some("ftp://user:secret@host".to_string()),
+        ..HubHaConfig::default()
+    };
+    let config = ServerConfig {
+        hub_storage: Some("postgres://127.0.0.1:1/db".into()),
+        ..ServerConfig::default()
+    };
+    let error = bootstrap::validate_ha_config(&enabled, &config).unwrap_err();
+    assert!(!error.contains("ftp://user:secret@host"), "{error}");
+    assert!(error.contains("ha.advertise_url"), "{error}");
+}

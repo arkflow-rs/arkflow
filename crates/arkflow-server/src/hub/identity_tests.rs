@@ -464,3 +464,278 @@ async fn authorization_changes_revoke_durable_sessions() {
     hub.save_user(record, "admin").await.unwrap();
     assert!(hub.resolve_session(&session_id).await.is_none());
 }
+
+async fn identity_http_request(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    token: &str,
+    payload: Option<serde_json::Value>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"));
+    let request = match payload {
+        Some(payload) => request
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string())),
+        None => request.body(Body::empty()),
+    };
+    let response = app.clone().oneshot(request.unwrap()).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// Two independent PostgreSQL stores must observe the same revocation and
+/// reject identity writes stamped with the previous leader's fencing epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_identity_revocation_survives_failover_and_fences_stale_writes() {
+    use super::{HubError, HubHaConfig, Leadership};
+    use axum::http::StatusCode;
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let Ok(base) = std::env::var("ARKFLOW_TEST_POSTGRES_URL") else {
+        eprintln!("skipping: ARKFLOW_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let mut url =
+        url::Url::parse(&base).expect("ARKFLOW_TEST_POSTGRES_URL must be a PostgreSQL URL");
+    assert!(matches!(url.scheme(), "postgres" | "postgresql"));
+    // The identifier contains only a fixed prefix, pid, and hexadecimal RNG
+    // output. No public-schema fallback: every pool uses only this schema.
+    let schema = format!(
+        "ct_identity_ha_{}_{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    );
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-c search_path={schema}"));
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&base)
+        .await
+        .expect("connect to real PostgreSQL");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .expect("create isolated identity HA schema");
+    eprintln!("running PostgreSQL identity HA assertions in schema {schema}");
+
+    let mut pools = Vec::with_capacity(2);
+    // Keep teardown outside the caught assertions so a failed assertion (or
+    // scenario timeout) still closes both pools and drops the test schema.
+    let outcome = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(30), async {
+        let backend_a = crate::storage::postgres::PostgresBackend::open(url.as_str())
+            .await
+            .unwrap();
+        pools.push(backend_a.pool().clone());
+        let backend_b = crate::storage::postgres::PostgresBackend::open(url.as_str())
+            .await
+            .unwrap();
+        pools.push(backend_b.pool().clone());
+        for pool in &pools {
+            let actual_schema: String = sqlx::query_scalar("SELECT current_schema()")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(actual_schema, schema);
+        }
+        let storage_a = StorageActor::start(ControlPlaneStore::Postgres(backend_a), 8);
+        let storage_b = StorageActor::start(ControlPlaneStore::Postgres(backend_b), 8);
+        let claim_a = storage_a.leadership_epoch();
+        let claim_b = storage_b.leadership_epoch();
+        assert!(!std::sync::Arc::ptr_eq(&claim_a, &claim_b));
+        let ha = |holder: &str| HubHaConfig {
+            enabled: true,
+            holder_id: Some(holder.into()),
+            lease_ttl_ms: 60_000,
+            ..HubHaConfig::default()
+        };
+        let hub_a = Hub::with_storage(config(true), storage_a.clone()).with_ha(ha("identity-ha-a"));
+        let hub_b = Hub::with_storage(config(true), storage_b.clone()).with_ha(ha("identity-ha-b"));
+        hub_a.enter_election().await;
+        hub_b.enter_election().await;
+        let old_epoch = hub_a.run_election_tick().await.epoch().unwrap();
+        assert_eq!(old_epoch, 1);
+        assert!(matches!(
+            hub_b.run_election_tick().await,
+            Leadership::Standby { .. }
+        ));
+        assert_eq!(claim_a.load(Ordering::Acquire), old_epoch);
+        assert_eq!(claim_b.load(Ordering::Acquire), 0);
+        let lease = storage_b.hub_lease_snapshot().await.unwrap().unwrap();
+        assert_eq!(lease.holder, "identity-ha-a");
+        assert_eq!(lease.epoch, old_epoch);
+
+        let app_a = crate::hub_router(hub_a.clone(), &crate::ServerConfig::default());
+        let app_b = crate::hub_router(hub_b.clone(), &crate::ServerConfig::default());
+        let (status, standby) =
+            identity_http_request(&app_b, "GET", "/api/v1/system", "break-glass", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(standby["code"], "hub_standby");
+        let (status, _) = identity_http_request(
+            &app_a,
+            "POST",
+            "/api/v1/users",
+            "break-glass",
+            Some(serde_json::json!({"user_id": "alice", "role": "viewer"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, issued) = identity_http_request(
+            &app_a,
+            "POST",
+            "/api/v1/users/alice/credentials",
+            "break-glass",
+            Some(serde_json::json!({"label": "before-failover"})),
+        )
+        .await;
+        // Do not include an issuance response in assertion diagnostics: it
+        // contains the one-time plaintext credential.
+        assert_eq!(status, StatusCode::CREATED);
+        let token = issued["token"].as_str().unwrap();
+        let credential_id = issued["credential"]["credential_id"].as_str().unwrap();
+        let (status, identity) =
+            identity_http_request(&app_a, "GET", "/api/v1/system", token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(identity["principal"]["id"], "alice");
+        assert_eq!(
+            identity["principal"]["roles"],
+            serde_json::json!(["viewer"])
+        );
+        let (status, _) = identity_http_request(
+            &app_a,
+            "DELETE",
+            &format!("/api/v1/credentials/{credential_id}"),
+            "break-glass",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = identity_http_request(&app_a, "GET", "/api/v1/system", token, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        hub_a.release_leadership().await;
+        assert!(matches!(
+            hub_a.leadership().await,
+            Leadership::Standby { .. }
+        ));
+        assert_eq!(claim_a.load(Ordering::Acquire), 0);
+        let lease = storage_b.hub_lease_snapshot().await.unwrap().unwrap();
+        assert_eq!(lease.epoch, old_epoch);
+        assert!(lease.expires_at_ms <= super::now_ms());
+        let new_epoch = hub_b.run_election_tick().await.epoch().unwrap();
+        assert_eq!(new_epoch, old_epoch + 1);
+        assert_eq!(claim_b.load(Ordering::Acquire), new_epoch);
+        let lease = storage_a.hub_lease_snapshot().await.unwrap().unwrap();
+        assert_eq!(lease.holder, "identity-ha-b");
+        assert_eq!(lease.epoch, new_epoch);
+        let (status, _) =
+            identity_http_request(&app_b, "GET", "/api/v1/system", "break-glass", None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the new leader must serve HTTP requests"
+        );
+        let (status, _) = identity_http_request(&app_b, "GET", "/api/v1/system", token, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let users_before = hub_b.list_users().await.unwrap();
+        assert_eq!(users_before.len(), 1);
+        let credentials_before = hub_b.list_credentials("alice").await.unwrap();
+        assert_eq!(credentials_before.len(), 1);
+        assert_eq!(credentials_before[0].credential_id, credential_id);
+        assert!(credentials_before[0].revoked_at_ms.is_some());
+        let mut stale_user = users_before[0].clone();
+        stale_user.display_name = "stale leader update".into();
+        stale_user.role = "admin".into();
+        // Retain the old sender epoch to model work stamped before demotion.
+        // Election, lease release/acquisition, and the write fence stay real.
+        claim_a.store(old_epoch, Ordering::Release);
+        let stale_update = match hub_a.save_user(stale_user, "old-leader").await {
+            Ok(_) => panic!("a stale leader must not update a user"),
+            Err(error) => error,
+        };
+        let stale_issuance = match hub_a
+            .issue_credential("alice", "stale-leader", None, "old-leader")
+            .await
+        {
+            Ok(_) => panic!("a stale leader must not issue a credential"),
+            Err(error) => error,
+        };
+        for error in [stale_update, stale_issuance] {
+            assert!(
+                matches!(&error, HubError::StaleLeader { claimed, current }
+                    if *claimed == old_epoch && *current == new_epoch),
+                "expected the PostgreSQL write fence to reject the old epoch: {error:?}"
+            );
+        }
+        claim_a.store(0, Ordering::Release);
+        assert_eq!(claim_b.load(Ordering::Acquire), new_epoch);
+        assert_eq!(hub_b.list_users().await.unwrap(), users_before);
+        assert!(
+            hub_b.list_credentials("alice").await.unwrap() == credentials_before,
+            "stale writes changed the new leader's credential directory"
+        );
+
+        // A write using the actual new leader's epoch succeeds; authentication
+        // is healthy while the old credential remains revoked.
+        let (status, fresh) = identity_http_request(
+            &app_b,
+            "POST",
+            "/api/v1/users/alice/credentials",
+            "break-glass",
+            Some(serde_json::json!({"label": "after-failover"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, identity) = identity_http_request(
+            &app_b,
+            "GET",
+            "/api/v1/system",
+            fresh["token"].as_str().unwrap(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(identity["principal"]["id"], "alice");
+        let (status, _) = identity_http_request(&app_b, "GET", "/api/v1/system", token, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        hub_b.release_leadership().await;
+    }))
+    .catch_unwind()
+    .await;
+
+    let cleanup = tokio::time::timeout(Duration::from_secs(10), async {
+        for pool in pools {
+            pool.close().await;
+        }
+        let dropped = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+        dropped
+    })
+    .await;
+    if !matches!(&cleanup, Ok(Ok(_))) {
+        eprintln!("identity HA cleanup failed; remove isolated schema {schema}");
+    }
+    match outcome {
+        Ok(result) => result.expect("PostgreSQL identity HA scenario timed out"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+    cleanup
+        .expect("PostgreSQL identity HA cleanup timed out")
+        .expect("drop isolated identity HA schema");
+    eprintln!("PostgreSQL identity HA assertions completed; removed schema {schema}");
+}

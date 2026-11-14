@@ -9,6 +9,50 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added — Control plane
 
+- `arkflow-server` accepts `--config <FILE>`: a full startup configuration
+  file (YAML/JSON/TOML by extension) covering every `ServerConfig` field
+  (including fields no environment variable can set — `api_prefix`, health
+  paths, `cors_origins`, `session_ttl_ms`), a `hub.operator_token` section,
+  the `ha` block, and `logging`/`observability`. Secret references
+  (`${env:}`/`${file:}`/`${secret:}`) resolve at load; unknown top-level
+  keys fail startup naming the key; explicitly set environment variables
+  override the file, so env-only deployments (including the Helm chart)
+  behave exactly as before.
+- The Hub binary now initializes a tracing subscriber at startup: by
+  default it logs to the console at `info` (election, lease, session,
+  webhook, and HTTP `TraceLayer` output were previously invisible). When
+  `observability.tracing` is enabled, Hub spans export over OTLP/HTTP-JSON
+  (off by default; exporter build failures never block startup) and
+  buffered spans are flushed on graceful shutdown. New environment
+  variables: `ARKFLOW_LOG_LEVEL`, `ARKFLOW_OTEL_TRACING_ENABLED`,
+  `ARKFLOW_OTEL_ENDPOINT`, `ARKFLOW_OTEL_SERVICE_NAME`.
+- `RUST_LOG` (EnvFilter directives) is now honored by both the engine and
+  the Hub as an override on top of the configured log level, with the
+  precedence chain `RUST_LOG` > `ARKFLOW_LOG_LEVEL` > `logging.level` >
+  default. An unparsable value warns and falls back to the static level.
+  This makes the `RUST_LOG=info` usage documented in the Kubernetes guide
+  actually effective.
+
+### Changed — Control plane
+
+- **BREAKING (behavior fix)**: the `arkflow-server` serve path now rejects
+  unknown flags, stray positional arguments, and a missing `--config`
+  value with a usage message and exit code `2`; previously any unknown
+  first argument silently started the Hub. Unreadable/unparseable config
+  files also exit `2`. Invalid environment-variable spellings (booleans
+  outside `1/true/yes|0/false/no`, non-numeric limits) now warn on stderr
+  instead of being silently dropped; sub-floor TTL values (below 1000 ms)
+  do not apply and the underlying value stands.
+
+- Audit history now enforces the existing `ReadAudit` permission and `audit`
+  resource scope (admin/viewer allowed; operator returns `403`). Queries
+  support exact `actor`/`action` filters and inclusive `from_ms`/`to_ms`
+  bounds before pagination; inverted ranges return `400 invalid_audit_query`.
+- Job operation audits carry the authenticated principal for direct operator
+  dispatches, including dispatches deferred until a target reconnects;
+  operations with no originating request use `system`. Optional operation actor
+  metadata survives persistence and retry; historical operation JSON remains
+  readable.
 - Job-level pause/resume (`POST /api/v1/jobs/{id}/actions/pause` and
   `/resume`, plus `PUT /jobs/{id}/desired-state {"state":"paused"}`):
   pausing is a durable quiesce, not a bare stop. The Hub captures a recovery

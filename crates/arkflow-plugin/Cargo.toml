@@ -2,10 +2,10 @@
 name = "arkflow-plugin"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 license.workspace = true
 
 
@@ -47,7 +47,6 @@ tower = "0.5"
 tower-http = { version = "0.7.0", features = ["cors", "trace"] }
 base64 = "0.22"
 subtle = { workspace = true }
-colored = { workspace = true }
 flume = { workspace = true }
 dashmap = { workspace = true }
 tempfile = { workspace = true }
@@ -56,7 +55,6 @@ rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
 
 # Kafka
-aws-msk-iam-sasl-signer = "1.0.0"
 rdkafka = { version = "0.39", features = [
     "cmake-build",
     "tracing",
@@ -101,7 +99,7 @@ hdfs-native-object-store = "0.17"
 
 # Compression (WAL segment optimization)
 zstd = "0.13"
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 
 # python
 pyo3 = { version = "0.28", features = ["auto-initialize", "serde"] }
@@ -115,5 +113,5 @@ num_cpus = "1.17.0"
 [dev-dependencies]
 mockall = { workspace = true }
 serial_test = "4.0.1"
-testcontainers = "0.27.3"
+testcontainers = "0.28.0"
 wiremock = "0.6"

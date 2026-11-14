@@ -12,7 +12,7 @@
 - [x] 2.1 `crates/arkflow-server/src/hub/users.rs`（新模块）：用户 CRUD；id 文法校验、role 解析、scope 解析复用 `parse_resource_scope`（`hub/nodes.rs:234-243`）、`oidc_subject` 唯一冲突、分页列表
 - [x] 2.2 凭证：`ark_<credential_id>_<secret>` 生成（CSPRNG 32B）、`SHA-256(credential_id ‖ 0x00 ‖ secret)` 存储、常量时间比较、一次性明文返回、签发/轮换（原子）/吊销/过期校验、`last_used_at_ms` 惰性更新（>5min 才写，best-effort）
 - [x] 2.3 不变量：最后一个启用 Admin 保护（禁用/删除/降级前检查其他启用 Admin 或静态 `operator_token`，否则 `last_admin_required`）；用户/凭证数量上限；删除用户级联吊销凭证+会话；单测覆盖每个不变量正反例
-- [ ] 2.4 审计漏斗：`record_identity_audit(actor, action, resource, outcome, failure_code)`（复用 `record_audit_event`，`hub/observability.rs:281` 范本）；与 `add-job-pause-resume` 协调修复 `record_job_operation_audit` 的 actor 硬编码（`observability.rs:296`）——先落地者改签名，本任务只接线并断言
+- [x] 2.4 审计漏斗：`record_identity_audit(actor, action, resource, outcome, failure_code)`（复用 `record_audit_event`，`hub/observability.rs:281` 范本）；与 `add-job-pause-resume` 协调修复 `record_job_operation_audit` 的 actor 硬编码（`observability.rs:296`）——先落地者改签名，本任务只接线并断言
 
 ## 3. 认证解析（托管凭证）
 
@@ -89,13 +89,19 @@
 
 - [x] 10.1 `cargo test -p arkflow-server`、`cargo test -p arkflow-core`、clippy、fmt 全绿；PG 门控套件在真库上跑通
 - [x] 10.2 端到端：本地 SQLite Hub → 创建第二用户并签发凭证 → 该凭证按角色成功/被拒 → 吊销后立即 401 → 浏览器会话被吊销 → 重启 Hub 会话仍在 → backup/restore 后用户与凭证在、会话不在
-- [ ] 10.3 HA 一致性：同一 PG 上 leader 吊销后（模拟 standby 提升）新 leader 下旧凭证仍 401；stale epoch 写被拒
+- [x] 10.3 HA 一致性：同一 PG 上 leader 吊销后（模拟 standby 提升）新 leader 下旧凭证仍 401；stale epoch 写被拒
 - [x] 10.4 `openspec validate add-multi-user-credential-management --strict`；与 `add-job-pause-resume` 一并归档后 `openspec/changes/` 清空
 
 
 ## 归档说明（2026-11-01）
 
 - 完成情况：schema v5、用户目录、托管凭证、会话持久化、JWT 主体吊销、管理 API + `ManageUsers`、Console `/users` 面板 + 运行期 token、en/zh 文档与备份/边界测试全部落地；`cargo test -p arkflow-server --all-targets` 绿（509 lib + 全部集成套件），`pnpm -C console test` 106 绿，`pnpm -C docs docs:check` 145 页绿。
-- 10.3（HA 下吊销跨 leader 的 PG 端到端）未执行：需要真实 PostgreSQL 双实例环境；吊销状态与读路径均走共享存储（无缓存，语义上跨 leader 立即生效），以门控 PG 契约测试与持久化测试覆盖。
-- 已记录但未在本变更内修复的既有缺口：`ReadAudit` 从未强制、JSON `/audit` 过滤能力不足（见 proposal Non-goals）；身份审计的 operations-level actor（JobStart/Stop）参数化另立专项。
+- 归档当时 10.3（HA 下吊销跨 leader 的 PG 端到端）未执行；已于 2026-11-12 随 `close-control-plane-validation-and-audit` 补齐，见后续收尾记录。
+- 归档当时保留的既有缺口（`ReadAudit` 未强制、JSON `/audit` 过滤不足、JobStart/Stop operations-level actor 硬编码）已于 2026-11-12 随同一收尾 change 修复。
 - 环境说明：`cargo test --workspace --all-targets` 在 macOS 沙箱下因 `libduckdb-sys` C++ 编译错误（`FP_NAN` undeclared）失败，属环境/工具链问题；受影响 crate 的测试在 `arkflow-server`/`arkflow-core` 层面全部通过。
+
+## 后续收尾记录（2026-11-12）
+
+- 2.4 已完成：Job API 传递真实 principal，后台操作使用 `system`；actor 随 operation JSON 持久化、恢复和重试保留。`hub::operations::job_actor_tests` 6 项通过，覆盖接受、拒绝、历史 JSON、重试、checkpoint commit 和凭证脱敏。
+- 10.3 已完成：真实 PostgreSQL 16 下两个独立 Hub 获取/释放共享租约，任期由 1 切到 2；旧凭证在新 leader 下仍返回 401，旧 epoch 更新用户与签发凭证均被 WriteFence 拒绝，新 epoch 签发与认证成功。`hub::identity_tests::postgres_identity_revocation_survives_failover_and_fences_stale_writes` 实跑通过，隔离 schema 已删除。
+- 审计读取补齐 `ReadAudit` 和资源 scope；actor/action/时间范围在 SQL 中先过滤再取有界结果并分页。`api::audit_api_tests` 4 项分别在 SQLite 与真实 PostgreSQL 上通过，含超过 1024 条无关记录的回归。

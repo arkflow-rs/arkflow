@@ -163,13 +163,7 @@ impl BatchProcessor {
         }
         let last_batch_time = self.last_batch_time.lock().await;
         // 如果超过超时时间且批处理不为空，则刷新
-        if !held.is_empty()
-            && last_batch_time.elapsed().as_millis() >= self.config.timeout_ms as u128
-        {
-            return true;
-        }
-
-        false
+        !held.is_empty() && last_batch_time.elapsed().as_millis() >= self.config.timeout_ms as u128
     }
 
     /// Merge every buffered delivery into one output. The merge is
