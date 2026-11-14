@@ -207,6 +207,44 @@ async fn parked_job_observations_are_redelivered_by_the_next_session() {
     assert!(runtime.take_finished().await.is_empty());
 }
 
+/// A Hub-rejected observation rotates behind the reports it was blocking, so
+/// a later poll delivers the others first.
+#[tokio::test]
+async fn rejected_observation_rotates_behind_the_rest() {
+    let runtime = JobRuntime::default();
+    runtime
+        .requeue_undelivered(
+            vec![
+                ("orders".into(), 3, Err("rejected".into())),
+                ("billing".into(), 1, Ok(())),
+            ],
+            true,
+        )
+        .await;
+    let finished = runtime.take_finished().await;
+    assert_eq!(finished[0].0, "billing");
+    assert_eq!(finished[1].0, "orders");
+}
+
+/// A transport failure keeps the original delivery order for the reconnect
+/// replay.
+#[tokio::test]
+async fn transport_failure_keeps_the_observation_order() {
+    let runtime = JobRuntime::default();
+    runtime
+        .requeue_undelivered(
+            vec![
+                ("orders".into(), 3, Err("transport".into())),
+                ("billing".into(), 1, Ok(())),
+            ],
+            false,
+        )
+        .await;
+    let finished = runtime.take_finished().await;
+    assert_eq!(finished[0].0, "orders");
+    assert_eq!(finished[1].0, "billing");
+}
+
 /// Compile the generate→drop smoke spec for the replacement-path tests,
 /// mirroring `aborted_start_leaves_no_unregistered_running_kernel`.
 async fn replacement_test_plan(job_id: &str) -> (JobPlan, Vec<TaskAttempt>) {

@@ -1042,6 +1042,24 @@ impl JobRuntime {
         self.pending_observations.lock().await.push(observation);
     }
 
+    /// Requeue an undelivered observation batch after a delivery failure.
+    /// A Hub rejection (`hub_rejected`) rotates the rejected entry behind the
+    /// rest so it cannot block them, retrying it on a later poll; a transport
+    /// failure keeps the original delivery order for the reconnect replay.
+    pub(super) async fn requeue_undelivered(
+        &self,
+        mut observations: Vec<FinishedJob>,
+        hub_rejected: bool,
+    ) {
+        if hub_rejected && !observations.is_empty() {
+            let rejected = observations.remove(0);
+            self.park_observations(observations).await;
+            self.park_observation_after(rejected).await;
+        } else {
+            self.park_observations(observations).await;
+        }
+    }
+
     pub(super) async fn stop_all(&self) {
         let _start_guard = self.starts.lock().await;
         let tasks = {
