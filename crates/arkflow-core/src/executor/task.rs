@@ -40,6 +40,14 @@ const BARRIER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// progress; exceeding this bound reports the condition instead.
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Bound on submitted-but-not-yet-published pool deliveries. The bounded
+/// work/result channels do not cover deliveries that the collector has
+/// already moved into its reorder map: a slow earliest batch lets a fast
+/// worker keep completing later batches, each carrying a source
+/// acknowledgement and staged state. Capping the distance between
+/// `submitted` and `flushed` backpressures the chain loop instead.
+const MAX_UNPUBLISHED_DELIVERIES: u64 = 64;
+
 /// Upper bound on joining a pool's result collector during shutdown. The
 /// collector's final drain flushes downstream, which can block on a full edge
 /// whose consumer already stopped.
@@ -1524,10 +1532,12 @@ async fn run_interior_chain_loop(
                 }
             }
             Ok(None) => {
-                if aligner.is_aligning() {
-                    // Envelope retained inside the aligner; replay happens at
-                    // alignment completion above.
-                } else if let Some(envelope) = aligner.take_passthrough() {
+                // The aligner may have parked a pass-through envelope even
+                // while alignment is in progress: pre-barrier data from an
+                // input whose own barrier has not arrived must be processed
+                // before the snapshot. Post-barrier data is retained inside
+                // the aligner and `take_passthrough` returns None.
+                if let Some(envelope) = aligner.take_passthrough() {
                     if handle_envelope(
                         chain,
                         hook,
@@ -2084,7 +2094,7 @@ impl ProcessorWorkerPool {
                         Err(_) => {
                             // All workers exited: flush what is left.
                             while let Some(result) = pending.remove(&next_sequence) {
-                                if let Err(error) = flush_pool_result(
+                                if let Err(error) = flush_pool_result_bounded(
                                     &collector_shared,
                                     result,
                                     &error_targets,
@@ -2114,7 +2124,7 @@ impl ProcessorWorkerPool {
                 pending.insert(sequence, result);
                 while let Some(result) = pending.remove(&next_sequence) {
                     if let Err(error) =
-                        flush_pool_result(&collector_shared, result, &error_targets).await
+                        flush_pool_result_bounded(&collector_shared, result, &error_targets).await
                     {
                         collector_failed.store(true, std::sync::atomic::Ordering::Release);
                         let _ = collector_fail_tx.try_send(error);
@@ -2225,6 +2235,41 @@ impl ProcessorWorkerPool {
     /// Submit one data delivery; the bounded queue applies backpressure to
     /// the chain loop exactly like a bounded inter-chain channel.
     async fn submit(&self, delivery: PoolDelivery) -> Result<(), Error> {
+        // Bound everything submitted but not yet published downstream. The
+        // collector's reorder map is where out-of-order completions pile up;
+        // neither bounded channel limits that map once an early sequence is
+        // slow, so the submitter itself must stop feeding the pool.
+        loop {
+            let published = self.flushed.load(std::sync::atomic::Ordering::Acquire);
+            let submitted = self.submitted.load(std::sync::atomic::Ordering::Acquire);
+            if submitted.saturating_sub(published) < MAX_UNPUBLISHED_DELIVERIES {
+                break;
+            }
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Error::Process(
+                    "processor worker pool failed while backpressuring submissions".into(),
+                ));
+            }
+            // Register before re-checking: the collector signals with
+            // `notify_waiters`, which stores no permit.
+            let notified = self.progress.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let published = self.flushed.load(std::sync::atomic::Ordering::Acquire);
+            let submitted = self.submitted.load(std::sync::atomic::Ordering::Acquire);
+            if submitted.saturating_sub(published) < MAX_UNPUBLISHED_DELIVERIES {
+                break;
+            }
+            tokio::select! {
+                _ = self.cancellation.cancelled() => {
+                    return Err(Error::Process(
+                        "processor worker pool was cancelled while backpressuring submissions"
+                            .into(),
+                    ));
+                }
+                _ = &mut notified => {}
+            }
+        }
         // Sequence numbers are local to this pool. A process-global counter
         // makes a newly created pool wait forever for sequence zero after an
         // earlier pool has already consumed it.
@@ -2325,6 +2370,44 @@ async fn flush_pool_result(
                         "processor failed and error output routing failed: {failure_message}; route error: {route_error}"
                     ))
                 })
+        }
+    }
+}
+
+/// Flush one ordered result with a bounded downstream wait. Without this,
+/// a full downstream edge parks the collector forever while the workers
+/// block on the bounded result channel and `drain()` waits on the workers
+/// before it ever applies its collector timeout.
+async fn flush_pool_result_bounded(
+    chain: &Chain,
+    result: PoolResult,
+    error_targets: &BTreeMap<String, Vec<EdgeTarget>>,
+) -> Result<(), Error> {
+    // A dropped timeout future cannot run `flush_outputs`' own abort path;
+    // clone every acknowledgement first so the timed-out delivery is still
+    // settled exactly once.
+    let abort_on_timeout: Vec<Arc<dyn crate::input::Ack>> = match &result {
+        PoolResult::Outputs(outputs) => outputs.iter().map(|output| output.ack.clone()).collect(),
+        PoolResult::ProcessorFailure(failure) => {
+            let mut acks = Vec::with_capacity(failure.siblings.len() + 1);
+            acks.push(failure.ack.clone());
+            acks.extend(failure.siblings.iter().map(|sibling| sibling.ack.clone()));
+            acks
+        }
+    };
+    match tokio::time::timeout(
+        COLLECTOR_DRAIN_TIMEOUT,
+        flush_pool_result(chain, result, error_targets),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            let _ = abort_acknowledgements(abort_on_timeout).await;
+            Err(Error::Process(format!(
+                "processor result flush exceeded the {}s drain deadline",
+                COLLECTOR_DRAIN_TIMEOUT.as_secs()
+            )))
         }
     }
 }
@@ -5900,9 +5983,12 @@ mod task_loop_tests {
             },
             ..Default::default()
         };
-        // Input 1 aligns a barrier; input 0 floods enough data to exceed the
-        // 1024-envelope bound regardless of the reader interleaving.
-        senders[1].send_async(barrier("c-3", 3)).await.unwrap();
+        // Input 0 aligns a barrier, then floods its own post-barrier data to
+        // exceed the 1024-envelope bound regardless of the reader
+        // interleaving. (Input 0's data is buffered because its barrier has
+        // already arrived; data from a still-waiting input would be
+        // pre-barrier and must pass through instead.)
+        senders[0].send_async(barrier("c-3", 3)).await.unwrap();
         for value in 0..1_100 {
             senders[0]
                 .send_async(Envelope::Data(

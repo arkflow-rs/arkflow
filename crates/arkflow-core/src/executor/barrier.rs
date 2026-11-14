@@ -86,9 +86,10 @@ impl Aligner {
     }
 
     /// Feed one envelope from input `index`. Returns `Some(barrier)` when the
-    /// last missing barrier arrives (all inputs aligned); data envelopes are
-    /// buffered until then, or parked for `take_passthrough` when no
-    /// alignment is in progress.
+    /// last missing barrier arrives (all inputs aligned). Post-barrier data
+    /// (from an input whose own barrier already arrived) is buffered until
+    /// then; pre-barrier data from a still-waiting input is parked for
+    /// `take_passthrough` so it is processed before the snapshot is taken.
     pub fn observe(
         &mut self,
         index: usize,
@@ -194,6 +195,16 @@ impl Aligner {
             self.passthrough = Some(envelope);
             return Ok(None);
         }
+        if !self.aligned.contains(&index) {
+            // This input has not delivered its own barrier yet. The record
+            // precedes that input's barrier (channels are FIFO), so it
+            // belongs BEFORE the checkpoint cut and must be processed now.
+            // Buffering it until release would take the state snapshot
+            // without its effect while the source position has already
+            // advanced past it.
+            self.passthrough = Some(envelope);
+            return Ok(None);
+        }
         // Hold the envelope's acknowledgement while it sits in the alignment
         // buffer. Otherwise its source can never drain (the ack completes only
         // when this vertex processes the envelope, which waits for the
@@ -223,6 +234,7 @@ impl Aligner {
 
     /// Whether `index` is currently held back by alignment (its data must be
     /// buffered rather than processed).
+    #[cfg(test)]
     pub fn is_aligning(&self) -> bool {
         self.in_flight.is_some() || !self.aligned.is_empty() || !self.buffered.is_empty()
     }
@@ -469,21 +481,39 @@ mod tests {
     }
 
     #[test]
-    fn an_eos_is_buffered_when_alignment_already_drained_data() {
+    fn pre_barrier_data_from_a_waiting_input_is_processed_not_buffered() {
+        let mut aligner = Aligner::new(2, 10);
+        assert!(aligner.observe(0, barrier("cp-1", 1)).unwrap().is_none());
+        // Input 0 already delivered its barrier: later data from it is
+        // post-barrier and must be held out of the running state.
+        assert!(aligner.observe(0, data()).unwrap().is_none());
+        assert!(aligner.take_passthrough().is_none());
+        // Input 1 has not delivered its barrier yet: this record precedes
+        // the cut and must be processed before the snapshot.
+        assert!(aligner.observe(1, data()).unwrap().is_none());
+        assert!(
+            aligner.take_passthrough().is_some(),
+            "pre-barrier data from the waiting input must pass through"
+        );
+        assert!(aligner.observe(1, barrier("cp-1", 1)).unwrap().is_some());
+        // Only input 0's held post-barrier data is released.
+        assert_eq!(aligner.release().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_round_keeps_holding_post_barrier_data_until_release() {
         let mut aligner = Aligner::new(2, 10);
         aligner.observe(0, barrier("cp-1", 1)).unwrap();
+        // Post-barrier data from the aligned input is held.
+        aligner.observe(0, data()).unwrap();
+        // Pre-barrier data from the waiting input passes through.
         aligner.observe(1, data()).unwrap();
-        // A mismatched barrier fails the round and clears the in-flight state
-        // while leaving the buffered data in place.
+        assert!(aligner.take_passthrough().is_some());
+        // A mismatched barrier fails the round and clears the in-flight
+        // state while leaving the held data for `release`.
         assert!(aligner.observe(0, barrier("cp-2", 1)).is_err());
-        assert!(aligner
-            .observe(1, crate::executor::Envelope::Eos)
-            .unwrap()
-            .is_none());
-        // The EOS joined the buffer instead of passing through.
-        assert!(aligner.take_passthrough().is_none());
         let released = aligner.release();
-        assert_eq!(released.len(), 2);
+        assert_eq!(released.len(), 1);
     }
 
     #[test]

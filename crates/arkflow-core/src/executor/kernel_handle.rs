@@ -81,6 +81,11 @@ pub struct KernelJobHandle {
     /// only reports real notifications, never channel closure.
     chain_finished: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     _finished_keepalive: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Chains that have exited. Once observed, the exemption must survive
+    /// every later round: the one-shot `chain_finished` notification cannot
+    /// be re-read, and a later round would otherwise inject a barrier into a
+    /// closed channel and wait for a report that can never arrive.
+    ended_tasks: tokio::sync::Mutex<BTreeSet<String>>,
     checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
     /// Round deadline in milliseconds (see CHECKPOINT_ROUND_TIMEOUT);
     /// AtomicU64 so tests can shrink it without waiting 10 minutes.
@@ -222,9 +227,10 @@ impl KernelJobHandle {
         }
         // Chains whose event loop already exited can neither receive barriers
         // (their barrier receiver dropped with the hook) nor send reports.
-        // Exempt them from this round instead of parking the wait loop on a
-        // report that will never arrive.
-        let mut ended = BTreeSet::new();
+        // Exempt them from this and every later round instead of parking the
+        // wait loop on a report that will never arrive. The exit notification
+        // is one-shot, so the set must live in the handle, not in this call.
+        let mut ended = self.ended_tasks.lock().await;
         {
             let mut finished = self.chain_finished.lock().await;
             while let Ok(task_id) = finished.try_recv() {
@@ -290,6 +296,10 @@ impl KernelJobHandle {
                                 "kernel ended before checkpoint completed".into(),
                             ));
                         };
+                        // Persist the exemption for all future rounds before
+                        // any early return below: the notification will not
+                        // be delivered again.
+                        ended.insert(task_id.clone());
                         // A chain sends its report before its finished
                         // notification, so once the exit is observed the
                         // report is already queued (possibly behind reports
@@ -891,6 +901,7 @@ impl KernelJobRunner {
             checkpoint_errors,
             chain_finished,
             _finished_keepalive: chain_finished_tx,
+            ended_tasks: tokio::sync::Mutex::new(BTreeSet::new()),
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_round_timeout_ms: AtomicU64::new(CHECKPOINT_ROUND_TIMEOUT.as_millis() as u64),
             next_snapshot_id: AtomicU64::new(0),
@@ -953,6 +964,7 @@ mod tests {
             checkpoint_errors: Arc::new(tokio::sync::Mutex::new(error_rx)),
             chain_finished: Arc::new(tokio::sync::Mutex::new(finished_rx)),
             _finished_keepalive: finished_tx.clone(),
+            ended_tasks: tokio::sync::Mutex::new(BTreeSet::new()),
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_round_timeout_ms: AtomicU64::new(10 * 60 * 1000),
             next_snapshot_id: AtomicU64::new(0),
@@ -995,6 +1007,7 @@ mod tests {
                     tokio::sync::mpsc::unbounded_channel::<String>();
                 unrelated_tx
             },
+            ended_tasks: tokio::sync::Mutex::new(BTreeSet::new()),
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_round_timeout_ms: AtomicU64::new(10 * 60 * 1000),
             next_snapshot_id: AtomicU64::new(0),
@@ -1058,6 +1071,38 @@ mod tests {
             error.to_string().contains("kernel ended before checkpoint"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_ended_chain_stays_exempt_across_rounds() {
+        let (handle, channels) = synthetic_handle(&["a", "b"], CancellationToken::new());
+        // Round 1: b exits while the round is already waiting for reports.
+        // The round must fail (b never reported), but the exit must be
+        // remembered for every later round.
+        let (error, ()) = tokio::join!(handle.checkpoint_barrier("cp-1", 0), async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            channels
+                .report
+                .send(snapshot_report("a", "cp-1", 0))
+                .unwrap();
+            channels.finished.send("b".into()).unwrap();
+        });
+        let error = error.expect_err("a chain that ended without reporting fails the round");
+        assert!(
+            error.to_string().contains("without reporting a snapshot"),
+            "{error}"
+        );
+
+        // Round 2: only a is still running. It must not wait for b's
+        // one-shot exit notification again.
+        channels
+            .report
+            .send(snapshot_report("a", "cp-2", 1))
+            .unwrap();
+        handle
+            .checkpoint_barrier("cp-2", 1)
+            .await
+            .expect("the ended chain must stay exempt in later rounds");
     }
 
     #[tokio::test]

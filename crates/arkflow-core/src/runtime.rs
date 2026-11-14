@@ -2311,6 +2311,9 @@ mod coverage_tests {
             std::future::pending().await
         }
         async fn close(&self) -> Result<(), Error> {
+            // Give restart a real shutdown window so a concurrent stop can
+            // observe `Restarting` deterministically.
+            tokio::time::sleep(Duration::from_millis(200)).await;
             Ok(())
         }
     }
@@ -2725,16 +2728,6 @@ mod coverage_tests {
         manager.start("s").await.unwrap();
         assert_eq!(state_of(&manager, "s").await, StreamState::Running);
 
-        // Replace the live handle with a slow-to-join task so the Restarting
-        // window is observable; the real task is cancelled by the restart.
-        {
-            let entry = manager.get("s").await.unwrap();
-            let mut runtime = entry.lock().await;
-            runtime.handle = Some(tokio::spawn(async {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                Ok(())
-            }));
-        }
         let restarter = manager.clone();
         let restart = tokio::spawn(async move { restarter.restart("s").await });
         let mut saw_restarting = false;

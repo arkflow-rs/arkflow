@@ -171,6 +171,12 @@ struct JournalInner {
     /// (replaying a relative `Increment` would count its delta twice).
     /// Cleared when the transaction completes or is discarded.
     replay_applied: BTreeMap<u64, std::collections::BTreeSet<usize>>,
+    /// Transactions whose apply failed AND whose compensating restore also
+    /// failed partway. The backend is in an unknown mixed state; a retried
+    /// apply would execute relative mutations (Increment) a second time, so
+    /// the journal refuses to apply them again until the transaction is
+    /// discarded.
+    failed_compensation: std::collections::BTreeSet<u64>,
 }
 
 impl JournalInner {
@@ -627,6 +633,13 @@ impl StateJournal {
         let _commit_guard = self.commit_lock.lock().unwrap();
         let (mutations, staged_versions, replay_applied) = {
             let inner = self.inner.lock().unwrap();
+            if inner.failed_compensation.contains(&txn.id) {
+                return Err(Error::Process(
+                    "state journal transaction already failed to compensate; refusing to \
+                     re-apply mutations over an unknown backend state"
+                        .into(),
+                ));
+            }
             match inner.txns.get(&txn.id) {
                 Some(TxnState::Staged(mutations)) => {
                     // The fence records the key version each mutation observed
@@ -728,6 +741,11 @@ impl StateJournal {
                             &previous_versions,
                             &applied_versions,
                         ) {
+                            self.inner
+                                .lock()
+                                .unwrap()
+                                .failed_compensation
+                                .insert(txn.id);
                             return Err(Error::Process(format!(
                                 "state journal apply refused a stale mutation; rollback also \
                                  failed ({rollback_error})"
@@ -799,6 +817,11 @@ impl StateJournal {
                         &applied_versions,
                     );
                     if let Err(rollback_error) = ownership_skipped {
+                        self.inner
+                            .lock()
+                            .unwrap()
+                            .failed_compensation
+                            .insert(txn.id);
                         return Err(Error::Process(format!(
                             "state journal apply failed ({error}); rollback also failed ({rollback_error})"
                         )));
@@ -828,6 +851,7 @@ impl StateJournal {
         let mut inner = self.inner.lock().unwrap();
         inner.apply_fences.remove(&txn.id);
         inner.replay_applied.remove(&txn.id);
+        inner.failed_compensation.remove(&txn.id);
         if let Some(state) = inner.txns.remove(&txn.id) {
             match state {
                 TxnState::Staged(mutations) | TxnState::Applied { mutations, .. } => {
@@ -2431,6 +2455,13 @@ mod coverage_tests {
         assert!(
             error.contains("apply failed") && error.contains("rollback also failed"),
             "{error}"
+        );
+        // A retried apply must not re-execute the increment/put that is still
+        // in the backend while the compensating restore is incomplete.
+        let retry = journal.commit(txn).unwrap_err().to_string();
+        assert!(
+            retry.contains("already failed to compensate"),
+            "retry must be refused after a failed compensation: {retry}"
         );
     }
 
