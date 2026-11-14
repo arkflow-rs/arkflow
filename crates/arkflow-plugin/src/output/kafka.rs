@@ -421,6 +421,7 @@ impl KafkaOutput {
         } else {
             crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?
         };
+        crate::output::codec_helper::ensure_row_aligned(&payloads, msg.num_rows(), "kafka")?;
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
@@ -673,6 +674,7 @@ impl KafkaOutput {
         } else {
             crate::output::codec_helper::apply_codec_encode(&msg, &self.codec).await?
         };
+        crate::output::codec_helper::ensure_row_aligned(&payloads, msg.num_rows(), "kafka")?;
         if payloads.is_empty() {
             return Ok(());
         }

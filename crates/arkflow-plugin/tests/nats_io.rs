@@ -150,6 +150,8 @@ fn sweep_leftover_servers() {
             "ps",
             "-aq",
             "--filter",
+            "status=exited",
+            "--filter",
             "label=org.testcontainers.managed-by=testcontainers",
             "--filter",
             "ancestor=nats:2-alpine",

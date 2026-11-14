@@ -162,6 +162,8 @@ fn sweep_leftover_brokers() {
             "ps",
             "-aq",
             "--filter",
+            "status=exited",
+            "--filter",
             "label=org.testcontainers.managed-by=testcontainers",
             "--filter",
             "ancestor=apachepulsar/pulsar:3.3.3",

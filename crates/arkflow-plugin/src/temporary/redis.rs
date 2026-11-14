@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use redis::aio::ConnectionLike;
 use redis::{cmd, Pipeline};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -54,12 +53,16 @@ impl Temporary for RedisTemporary {
     }
 
     async fn get(&self, keys: &[String]) -> Result<Option<MessageBatch>, Error> {
-        let cli_lock = self.cli.read().await;
-        let Some(cli) = cli_lock.as_ref() else {
-            return Err(Error::Disconnection);
+        // Clone the connection inside a short read-lock scope: remote I/O and
+        // codec decoding below must not hold the lock that `close()` and
+        // reconnect need to take exclusively.
+        let mut connection = {
+            let cli_lock = self.cli.read().await;
+            let Some(cli) = cli_lock.as_ref() else {
+                return Err(Error::Disconnection);
+            };
+            cli.clone()
         };
-
-        let mut connection = cli.clone();
 
         // An empty key list (empty batch) must not reach Redis: MGET without
         // keys is a protocol error and an empty pipeline is meaningless.
@@ -69,8 +72,12 @@ impl Temporary for RedisTemporary {
 
         let data: Vec<Vec<String>> = match self.config.redis_type {
             RedisType::List => {
-                let mut pipeline = Pipeline::with_capacity(keys.len());
-                for x in keys {
+                // One lookup per DISTINCT key: duplicate input keys used to
+                // re-download and re-expand the same list, multiplying the
+                // temporary table that a dimension JOIN then amplifies.
+                let unique: std::collections::BTreeSet<&String> = keys.iter().collect();
+                let mut pipeline = Pipeline::with_capacity(unique.len());
+                for x in unique {
                     pipeline.lrange(x, 0, -1);
                 }
 
@@ -83,7 +90,7 @@ impl Temporary for RedisTemporary {
             }
             RedisType::String => {
                 let mut mget = cmd("mget");
-                let key = keys.iter().collect::<HashSet<_>>();
+                let key: std::collections::BTreeSet<&String> = keys.iter().collect();
                 for x in key {
                     mget.arg(x);
                 }
