@@ -21,12 +21,19 @@ pub(crate) mod window;
 use arkflow_core::Error;
 
 fn register_components() -> Result<(), Error> {
-    memory::init()?;
-    tumbling_window::init()?;
-    sliding_window::init()?;
-    session_window::init()?;
-    Ok(())
+    crate::init_steps(
+        &COMPLETED,
+        &[
+            memory::init,
+            tumbling_window::init,
+            sliding_window::init,
+            session_window::init,
+        ],
+    )
 }
+
+static COMPLETED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Component registration is process-global, so `init()` is idempotent:
 /// the first successful call registers every builder and later calls

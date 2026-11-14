@@ -34,21 +34,30 @@ pub mod sql;
 pub mod websocket;
 
 fn register_components() -> Result<(), Error> {
-    generate::init()?;
-    http::init()?;
-    kafka::init()?;
-    memory::init()?;
-    mqtt::init()?;
-    nats::init()?;
-    pulsar::init()?;
-    redis::init()?;
-    sql::init()?;
-    websocket::init()?;
-    multiple_inputs::init()?;
-    modbus::init()?;
-    file::init()?;
-    Ok(())
+    crate::init_steps(
+        &COMPLETED,
+        &[
+            generate::init,
+            http::init,
+            kafka::init,
+            memory::init,
+            mqtt::init,
+            nats::init,
+            pulsar::init,
+            redis::init,
+            sql::init,
+            websocket::init,
+            multiple_inputs::init,
+            modbus::init,
+            file::init,
+        ],
+    )
 }
+
+/// Per-component success markers so a retry after a later component failed
+/// does not re-register an earlier one.
+static COMPLETED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Component registration is process-global, so `init()` is idempotent:
 /// the first successful call registers every builder and later calls
