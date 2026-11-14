@@ -284,11 +284,36 @@ fn expr_folds_time(expr: &LogicalExpr) -> bool {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     let mut found = false;
     let _ = expr.apply(&mut |e: &LogicalExpr| {
-        if let LogicalExpr::ScalarFunction(func) = e {
-            if TIME_FOLDING_FUNCTIONS.contains(&func.name()) {
-                found = true;
-                return Ok(TreeNodeRecursion::Stop);
+        match e {
+            LogicalExpr::ScalarFunction(func) => {
+                if TIME_FOLDING_FUNCTIONS.contains(&func.name()) {
+                    found = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
             }
+            // A subquery's plan lives INSIDE the expression, not in the
+            // enclosing plan's inputs: `SELECT (SELECT now()) FROM flow`
+            // was classified as time-independent and its frozen timestamp
+            // was cached. Recurse into every subquery form.
+            LogicalExpr::ScalarSubquery(subquery)
+            | LogicalExpr::InSubquery(datafusion::logical_expr::expr::InSubquery {
+                subquery, ..
+            })
+            | LogicalExpr::Exists(datafusion::logical_expr::expr::Exists { subquery, .. }) => {
+                if plan_folds_time(&subquery.subquery) {
+                    found = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            LogicalExpr::SetComparison(datafusion::logical_expr::expr::SetComparison {
+                subquery, ..
+            }) => {
+                if plan_folds_time(&subquery.subquery) {
+                    found = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            _ => {}
         }
         Ok(TreeNodeRecursion::Continue)
     });

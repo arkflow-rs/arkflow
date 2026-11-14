@@ -66,6 +66,12 @@ pub struct HttpInput {
     server_handle: Arc<Mutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>>,
     sender: Arc<Sender<MessageBatch>>,
     receiver: Arc<Receiver<MessageBatch>>,
+    /// Set when the listener task ends (error or abort). The input itself
+    /// holds `sender`, so the channel NEVER disconnects by itself: without
+    /// this signal a dead listener left `read` waiting forever instead of
+    /// surfacing the disconnection the engine reconnects on.
+    server_down: Arc<std::sync::atomic::AtomicBool>,
+    server_down_notify: Arc<tokio::sync::Notify>,
     connected: AtomicBool,
     auth: Option<AuthType>,
     codec: Option<Arc<dyn Codec>>,
@@ -95,6 +101,8 @@ impl HttpInput {
             connected: AtomicBool::new(false),
             sender: Arc::new(sender),
             receiver: Arc::new(receiver),
+            server_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            server_down_notify: Arc::new(tokio::sync::Notify::new()),
             auth,
             codec,
         })
@@ -169,10 +177,20 @@ impl Input for HttpInput {
             .await
             .map_err(|e| Error::Connection(format!("HTTP input failed to bind {addr}: {e}")))?;
 
+        // A reconnect rebinds: clear the previous listener's down marker.
+        self.server_down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let server_down = Arc::clone(&self.server_down);
+        let server_down_notify = Arc::clone(&self.server_down_notify);
         let server_handle = tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service())
+            let result = axum::serve(listener, app.into_make_service())
                 .await
-                .map_err(|e| Error::Connection(format!("HTTP server error: {}", e)))
+                .map_err(|e| Error::Connection(format!("HTTP server error: {}", e)));
+            // Publish the listener's death (error OR abort): `read` selects
+            // on this flag instead of the never-closing channel.
+            server_down.store(true, std::sync::atomic::Ordering::SeqCst);
+            server_down_notify.notify_waiters();
+            result
         });
 
         let server_handle_arc = self.server_handle.clone();
@@ -187,16 +205,30 @@ impl Input for HttpInput {
         if !self.connected.load(Ordering::SeqCst) {
             return Err(Error::Connection("The input is not connected".to_string()));
         }
+        // A dead listener can never deliver again: report it up front (the
+        // channel itself stays open because this input holds the sender).
+        if self.server_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Disconnection);
+        }
 
-        if let Ok(mut msg) = self.receiver.recv_async().await {
-            msg.set_input_name(self.input_name.clone());
-            Ok((Arc::new(msg), Arc::new(NoopAck)))
-        } else {
-            // The channel disconnects only when the listener task (and every
-            // request handler) is gone — surface that as a disconnection so
-            // the engine's reconnect path re-binds instead of reading a
-            // misleading "empty queue" process error forever.
-            Err(Error::Disconnection)
+        // Register for the death notification BEFORE the receive so a
+        // listener exit between the check above and the wait is not missed.
+        let mut down = std::pin::pin!(self.server_down_notify.notified());
+        down.as_mut().enable();
+        tokio::select! {
+            result = self.receiver.recv_async() => {
+                if let Ok(mut msg) = result {
+                    msg.set_input_name(self.input_name.clone());
+                    Ok((Arc::new(msg), Arc::new(NoopAck)))
+                } else {
+                    // Only reachable once every sender is gone.
+                    Err(Error::Disconnection)
+                }
+            }
+            _ = &mut down => {
+                // The listener task ended (error or abort).
+                Err(Error::Disconnection)
+            }
         }
     }
 
