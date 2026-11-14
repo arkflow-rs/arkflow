@@ -245,6 +245,82 @@ async fn out_of_order_renewals_keep_the_newest_deadline() {
     let _ = hub_task.await;
 }
 
+/// End-to-end hold: the runtime entry lock blocks the restart, so the
+/// lifecycle operation stays in progress across the command's original
+/// deadline while the reporter renews the lease. The command must complete
+/// instead of timing out.
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_operation_held_across_its_original_deadline_completes() {
+    let _ = arkflow_plugin::initialize();
+    let (hub_url, hub_cancel, hub_task) =
+        json_stub_hub(serde_json::json!({"state": "running"})).await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let engine_config = engine_config_with_stream("orders-hold");
+    let cp = ControlPlane::new(engine_config.clone(), RuntimeManager::new());
+    cp.runtime_manager()
+        .replace_config(&engine_config)
+        .await
+        .expect("the stream registers");
+    let runtime = Arc::new(JobRuntime::default());
+    let entry = cp
+        .runtime_manager()
+        .get("orders-hold")
+        .await
+        .expect("runtime entry");
+
+    // Hold the entry so the lifecycle restart cannot take it.
+    let first_hold = entry.lock().await;
+    let original_deadline = now_ms().saturating_add(300);
+    let command = test_command("restart", "orders-hold", 1, None, original_deadline);
+    let task_cp = cp.clone();
+    let task_client = client.clone();
+    let task_config = config.clone();
+    let task_auth = auth.clone();
+    let task_runtime = runtime.clone();
+    let handle = tokio::spawn(async move {
+        execute_command(
+            &task_client,
+            &task_cp,
+            &task_config,
+            &task_auth,
+            &command,
+            &task_runtime,
+            2_000,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(first_hold);
+    // tokio's Mutex is FIFO: the stale check takes it next, then this request
+    // (queued before the lifecycle task's restart) takes it back and holds
+    // the operation in progress.
+    let hold = entry.lock().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        now_ms() > original_deadline.saturating_add(100),
+        "the operation must be held past its original deadline"
+    );
+    drop(hold);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("the command settles")
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        outcome.state,
+        HubOperationState::TimedOut,
+        "a held lifecycle operation must not time out while the lease renews: {:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.state, HubOperationState::Succeeded);
+    let _ = cp.runtime_manager().stop_all().await;
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+}
+
 /// Watcher + reporter together: the real reporter renews while the operation
 /// is still running, so a watcher decision taken AFTER the original deadline
 /// has passed still chooses Continue.
