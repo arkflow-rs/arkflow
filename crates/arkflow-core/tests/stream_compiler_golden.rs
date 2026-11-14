@@ -22,9 +22,11 @@ fn every_stream_example_compiles_to_job_specs() {
         {
             continue;
         }
-        let Ok(config) = EngineConfig::from_file(path.to_str().unwrap()) else {
-            continue;
-        };
+        // A broken YAML file must fail the group: skipping it silently let
+        // the whole sweep pass while one example was not even parseable.
+        let config = EngineConfig::from_file(path.to_str().unwrap()).unwrap_or_else(|error| {
+            panic!("{name}: example YAML does not parse as an engine config: {error}")
+        });
         if config.streams.is_empty() {
             continue;
         }
@@ -139,5 +141,11 @@ jobs:
     recovery: latest_checkpoint
 "#;
     let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
-    assert!(config.job_specs().is_err());
+    let error = config
+        .job_specs()
+        .expect_err("a duplicate Job id must be rejected");
+    assert!(
+        error.to_string().contains("Duplicate job id"),
+        "the error must name the duplicate id, got: {error}"
+    );
 }

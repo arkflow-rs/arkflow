@@ -28,40 +28,112 @@ fn config_from_yaml(yaml: &str) -> EngineConfig {
 
 #[test]
 fn logging_initializes_from_config_for_each_format_and_writer() {
-    // try_init keeps the first global subscriber; later calls exercise
-    // the branch construction without replacing it.
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("logs").join("engine.log");
-    let file_str = file.to_str().unwrap().to_string();
+    // A subscriber can be installed only once per process, so each
+    // format/writer/level case runs in its own child process and asserts on
+    // what that subscriber actually emitted. (The previous version called
+    // init four times in one process: only the first subscriber was ever
+    // installed, so three cases asserted nothing.)
+    if let Ok(case) = std::env::var("ARKFLOW_TEST_LOGGING_CHILD") {
+        let dir = std::env::var("ARKFLOW_TEST_LOGGING_DIR").unwrap();
+        let file = std::path::Path::new(&dir)
+            .join("logs")
+            .join("engine.log")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let (level, format, path) = match case.as_str() {
+            "plain-file" => ("debug", "plain", file),
+            "json-file" => ("trace", "json", file),
+            "json-console" => ("warn", "json", String::new()),
+            "bogus-level-console" => ("bogus-level-falls-back-to-info", "plain", String::new()),
+            other => panic!("unknown logging case {other}"),
+        };
+        let yaml = format!(
+            "logging:\n  level: {level}\n  format: {format}\n  file_path: {path}\nstreams: []\n"
+        );
+        init_logging(&config_from_yaml(&yaml));
+        tracing::debug!("ARKFLOW_CHILD_DEBUG_EVENT");
+        tracing::info!("ARKFLOW_CHILD_INFO_EVENT");
+        tracing::warn!("ARKFLOW_CHILD_WARN_EVENT");
+        return;
+    }
 
-    let base = "logging:\n  level: {level}\n  format: {format}\n  file_path: {file}\nstreams: []\n";
-    let mut yaml = base
-        .replace("{level}", "debug")
-        .replace("{format}", "plain")
-        .replace("{file}", &file_str);
-    let config = config_from_yaml(&yaml);
-    init_logging(&config);
+    let exe = std::env::current_exe().unwrap();
+    let run = |case: &str, dir: &std::path::Path| {
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "logging_initializes_from_config_for_each_format_and_writer",
+                "--nocapture",
+            ])
+            .env("ARKFLOW_TEST_LOGGING_CHILD", case)
+            .env("ARKFLOW_TEST_LOGGING_DIR", dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "case {case} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
 
-    yaml = base
-        .replace("{level}", "trace")
-        .replace("{format}", "json")
-        .replace("{file}", &file_str);
-    init_logging(&config_from_yaml(&yaml));
+    // File cases: each gets its own directory so both formats are checked.
+    let plain_dir = tempfile::tempdir().unwrap();
+    let plain_console = run("plain-file", plain_dir.path());
+    assert!(
+        !plain_console.contains("ARKFLOW_CHILD_INFO_EVENT"),
+        "a file-configured writer must not also log to the console: {plain_console}"
+    );
+    assert!(plain_dir.path().join("logs").exists());
+    let plain = std::fs::read_to_string(plain_dir.path().join("logs/engine.log")).unwrap();
+    assert!(
+        plain.contains("ARKFLOW_CHILD_DEBUG_EVENT")
+            && plain.contains("ARKFLOW_CHILD_INFO_EVENT")
+            && plain.contains("ARKFLOW_CHILD_WARN_EVENT"),
+        "plain file must receive every event admitted by level=debug: {plain}"
+    );
+    assert!(
+        !plain.lines().any(|line| line.trim_start().starts_with('{')),
+        "plain format must not emit JSON lines: {plain}"
+    );
 
-    yaml = base
-        .replace("{level}", "warn")
-        .replace("{format}", "json")
-        .replace("{file}", "");
-    init_logging(&config_from_yaml(&yaml));
+    let json_dir = tempfile::tempdir().unwrap();
+    run("json-file", json_dir.path());
+    let json = std::fs::read_to_string(json_dir.path().join("logs/engine.log")).unwrap();
+    assert!(
+        json.contains("\"ARKFLOW_CHILD_DEBUG_EVENT\"")
+            && json.contains("\"ARKFLOW_CHILD_INFO_EVENT\""),
+        "json file must receive trace/debug events: {json}"
+    );
+    assert!(
+        json.lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| line.trim_start().starts_with('{')),
+        "json format must emit one JSON object per line: {json}"
+    );
 
-    yaml = base
-        .replace("{level}", "bogus-level-falls-back-to-info")
-        .replace("{format}", "plain")
-        .replace("{file}", "");
-    init_logging(&config_from_yaml(&yaml));
+    // Console cases: no file writer path.
+    let console_dir = tempfile::tempdir().unwrap();
+    let json_console = run("json-console", console_dir.path());
+    assert!(
+        json_console.contains("\"ARKFLOW_CHILD_WARN_EVENT\""),
+        "console JSON must show the warn event: {json_console}"
+    );
+    assert!(
+        !json_console.contains("ARKFLOW_CHILD_INFO_EVENT"),
+        "level=warn must filter info events: {json_console}"
+    );
 
-    // The file writer created the parent directory.
-    assert!(dir.path().join("logs").exists());
+    let bogus = run("bogus-level-console", console_dir.path());
+    assert!(
+        bogus.contains("ARKFLOW_CHILD_INFO_EVENT") && bogus.contains("ARKFLOW_CHILD_WARN_EVENT"),
+        "an unknown level must fall back to info: {bogus}"
+    );
+    assert!(
+        !bogus.contains("ARKFLOW_CHILD_DEBUG_EVENT"),
+        "info fallback must not admit debug events: {bogus}"
+    );
 }
 
 /// RUST_LOG semantics, re-executed as a child process so the env var and the

@@ -1042,6 +1042,19 @@ impl Wal {
         self.call_store(|store| store.read_after_cursor()).await
     }
 
+    /// Read at most `limit` entries with sequence strictly greater than
+    /// `after`. Recovery pages through the backlog so a large on-disk
+    /// backlog does not have to be decoded into memory before the first
+    /// delivery.
+    pub async fn read_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
+        self.call_store(move |store| store.read_after(after, limit))
+            .await
+    }
+
     /// Flush staged appends before a record is exposed to downstream
     /// processing. This is the durability boundary for group-commit and
     /// periodic policies: a process crash after `read()` returns must leave

@@ -134,19 +134,37 @@ type PendingRetryQueue = Arc<
     >,
 >;
 
+/// Entries recovered from the WAL per page. Recovery used to decode the
+/// whole on-disk backlog before the first delivery; pages keep the peak at
+/// one page plus whatever `read` has not yet consumed, even when a
+/// checkpoint trims most of the backlog.
+const WAL_REPLAY_PAGE_SIZE: usize = 256;
+
+/// Paging state for the recovery replay queue. `after` is the highest WAL
+/// sequence paged so far; `next_expected` tracks the contiguous prefix the
+/// checkpoint already covers.
+struct ReplayPager {
+    after: u64,
+    next_expected: u64,
+    positions: Option<Vec<crate::checkpoint::SourcePosition>>,
+    done: bool,
+}
+
 /// Wrap an input with the adapter's WAL: replays unacknowledged entries
 /// before new reads (crash recovery), appends each batch, and gates the ack
 /// on the WAL commit — exactly like the legacy `Stream::do_input` path.
 pub(crate) struct WalInput {
     inner: Arc<dyn Input>,
     wal: Arc<Wal>,
-    /// Unacked-entry replay queue, initialized on the first read (the
-    /// component-builder trait is sync; WAL reads are async). A std mutex:
-    /// it is only ever held across a synchronous pop/push (no awaits), so
-    /// the cancellation guards below can re-queue entries from `drop`.
-    replay: tokio::sync::OnceCell<
-        std::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>,
-    >,
+    /// Unacked-entry replay queue, refilled one WAL page at a time. A std
+    /// mutex: it is only ever held across a synchronous pop/push (no
+    /// awaits), so the cancellation guards below can re-queue entries from
+    /// `drop`.
+    replay: std::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>,
+    /// Paging state for the replay queue; the first page is loaded on the
+    /// first read (the component-builder trait is sync; WAL reads are
+    /// async).
+    replay_pager: tokio::sync::Mutex<Option<ReplayPager>>,
     /// Checkpoint positions are installed before the first read.  WAL
     /// entries are durable independently of the connector cursor, so the
     /// replay queue must discard entries already covered by a checkpoint
@@ -164,7 +182,8 @@ impl WalInput {
         Self {
             inner,
             wal,
-            replay: tokio::sync::OnceCell::new(),
+            replay: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            replay_pager: tokio::sync::Mutex::new(None),
             checkpoint_positions: tokio::sync::RwLock::new(None),
             pending_retry: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }
@@ -244,50 +263,106 @@ impl WalInput {
         })
     }
 
-    /// Load the unacknowledged entries once (first read), then replay them
-    /// ahead of new input. The OnceCell guarantees recovery runs exactly one
-    /// time even with concurrent first reads.
-    async fn replay_queue(
-        &self,
-    ) -> Result<&std::sync::Mutex<std::collections::VecDeque<(u64, crate::MessageBatchRef)>>, Error>
-    {
-        self.replay
-            .get_or_try_init(|| async {
-                let entries = self.wal.read_after_cursor().await?;
-                let positions = self.checkpoint_positions.read().await.clone();
-                let replay = if let Some(positions) = positions.as_deref() {
-                    let mut next_seq = self.wal.cursor().await?.saturating_add(1);
-                    let mut covered = Vec::new();
-                    let mut replay = Vec::new();
-                    for (seq, batch) in entries {
-                        // Only discard the covered prefix that can be
-                        // reconciled contiguously. A covered entry after an
-                        // uncovered WAL sequence must remain replayable;
-                        // otherwise the cursor would never be able to cross
-                        // that missing sequence and a later acknowledgement
-                        // would wait forever on a filtered-out entry.
-                        if seq == next_seq
-                            && Self::batch_is_covered_by_checkpoint(seq, &batch, positions)
-                        {
-                            covered.push(seq);
-                            next_seq = next_seq.saturating_add(1);
-                        } else {
-                            replay.push((seq, batch));
-                        }
+    /// Fill the replay queue with the next WAL page, trimming the
+    /// checkpoint-covered prefix as it goes. Paging keeps recovery memory
+    /// bounded: the pre-paging version decoded the entire backlog before
+    /// the first delivery, even when a checkpoint later discarded most of
+    /// it.
+    async fn fill_replay_page(&self) -> Result<(), Error> {
+        let mut pager = self.replay_pager.lock().await;
+        if pager.is_none() {
+            let cursor = self.wal.cursor().await?;
+            *pager = Some(ReplayPager {
+                after: cursor,
+                next_expected: cursor.saturating_add(1),
+                positions: self.checkpoint_positions.read().await.clone(),
+                done: false,
+            });
+        }
+        let state = pager.as_mut().expect("replay pager initialized");
+        while !state.done {
+            let page = self
+                .wal
+                .read_after(state.after, WAL_REPLAY_PAGE_SIZE)
+                .await?;
+            if page.is_empty() {
+                state.done = true;
+                return Ok(());
+            }
+            let page_len = page.len();
+            // Stage the cursor advances locally: an await below (reconcile)
+            // can cancel this read future, and the page must then be read
+            // again rather than skipped.
+            let mut after = state.after;
+            let mut next_expected = state.next_expected;
+            let mut covered = Vec::new();
+            let mut retained = Vec::new();
+            for (seq, batch) in page {
+                after = after.max(seq);
+                // Only discard the covered prefix that can be reconciled
+                // contiguously. A covered entry after an uncovered WAL
+                // sequence must remain replayable; otherwise the cursor
+                // could never cross that missing sequence and a later
+                // acknowledgement would wait forever on a filtered-out
+                // entry.
+                match state.positions.as_deref() {
+                    Some(positions)
+                        if seq == next_expected
+                            && Self::batch_is_covered_by_checkpoint(seq, &batch, positions) =>
+                    {
+                        covered.push(seq);
+                        next_expected = next_expected.saturating_add(1);
                     }
-                    self.wal.reconcile_covered(&covered).await?;
-                    replay
-                } else {
-                    entries
-                };
-                if !replay.is_empty() {
-                    tracing::info!(count = replay.len(), "WAL recovery: replaying entries");
+                    _ => retained.push((seq, batch)),
                 }
-                Ok::<_, Error>(std::sync::Mutex::new(replay.into_iter().collect()))
-            })
-            .await?;
-        // SAFETY-free: OnceCell::get is Some after get_or_init resolves.
-        Ok(self.replay.get().expect("replay queue initialized"))
+            }
+            if !covered.is_empty() {
+                self.wal.reconcile_covered(&covered).await?;
+            }
+            if !retained.is_empty() {
+                let count = retained.len();
+                self.replay
+                    .lock()
+                    .expect("wal replay queue poisoned")
+                    .extend(retained);
+                state.after = after;
+                state.next_expected = next_expected;
+                tracing::info!(count, "WAL recovery: replaying entries");
+                return Ok(());
+            }
+            state.after = after;
+            state.next_expected = next_expected;
+            // A fully covered page: keep paging until there is something to
+            // replay or the backlog ends.
+            if page_len < WAL_REPLAY_PAGE_SIZE {
+                state.done = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pop the next replay entry, paging the WAL backlog in only as needed.
+    async fn next_replay_entry(&self) -> Result<Option<(u64, crate::MessageBatchRef)>, Error> {
+        loop {
+            if let Some(entry) = self
+                .replay
+                .lock()
+                .expect("wal replay queue poisoned")
+                .pop_front()
+            {
+                return Ok(Some(entry));
+            }
+            if self
+                .replay_pager
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|state| state.done)
+            {
+                return Ok(None);
+            }
+            self.fill_replay_page().await?;
+        }
     }
 }
 
@@ -367,31 +442,27 @@ impl Input for WalInput {
         // one read, never lost.
         //
         // Replay unacked WAL entries before reading new input (spec:
-        // recovery forwards pending entries before do_input starts).
-        {
-            let queue_mutex = self.replay_queue().await?;
-            // The guard is confined to this await-free scope; the lease keeps
-            // only the Mutex reference so the awaits below stay Send.
-            let popped = queue_mutex
-                .lock()
-                .expect("wal replay queue poisoned")
-                .pop_front();
-            if let Some((seq, msg)) = popped {
-                let mut lease = ReplayLease {
-                    queue: queue_mutex,
-                    entry: Some((seq, Arc::clone(&msg))),
-                };
-                // A replayed WAL record still represents the original source
-                // delivery. Rebuild its source-position acknowledgement when
-                // the connector supports it; using NoopAck here would leave
-                // Kafka's broker cursor behind and allow the same record to
-                // be delivered again after recovery.
-                let source_ack = self.replay_source_ack(&msg).await?;
-                let ack: Arc<dyn crate::input::Ack> =
-                    Arc::new(WalAck::new(self.wal.clone(), seq, source_ack));
-                lease.take();
-                return Ok((msg, ack));
-            }
+        // recovery forwards pending entries before do_input starts). Pages
+        // are loaded on demand so a large on-disk backlog is not decoded
+        // into memory before the first delivery.
+        if let Some((seq, msg)) = self.next_replay_entry().await? {
+            // The guard is confined to this await-free scope where possible;
+            // the lease keeps only the Mutex reference so the awaits below
+            // stay Send.
+            let mut lease = ReplayLease {
+                queue: &self.replay,
+                entry: Some((seq, Arc::clone(&msg))),
+            };
+            // A replayed WAL record still represents the original source
+            // delivery. Rebuild its source-position acknowledgement when
+            // the connector supports it; using NoopAck here would leave
+            // Kafka's broker cursor behind and allow the same record to
+            // be delivered again after recovery.
+            let source_ack = self.replay_source_ack(&msg).await?;
+            let ack: Arc<dyn crate::input::Ack> =
+                Arc::new(WalAck::new(self.wal.clone(), seq, source_ack));
+            lease.take();
+            return Ok((msg, ack));
         }
         // Admission control: while the WAL cannot confirm what it already
         // buffers (failed seals, deferred acknowledgements), stop claiming
@@ -1293,9 +1364,9 @@ mod tests {
             }])
             .await
             .unwrap();
-        let queue = input.replay_queue().await.unwrap();
+        input.fill_replay_page().await.unwrap();
         {
-            let entries = queue.lock().expect("wal replay queue poisoned");
+            let entries = input.replay.lock().expect("wal replay queue poisoned");
             assert_eq!(entries.len(), 1);
             assert_eq!(entries.front().unwrap().0, 2);
         }
@@ -1314,6 +1385,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wal.cursor().await.unwrap(), 3);
+
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_pages_the_wal_backlog() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = WalConfig::local(
+            true,
+            directory.path().to_string_lossy().to_string(),
+            crate::wal::SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&config).unwrap();
+        let total = WAL_REPLAY_PAGE_SIZE + 7;
+        for offset in 0..total {
+            wal.append(&metadata_batch(0, offset as u64, "orders"))
+                .await
+                .unwrap();
+        }
+        let input = WalInput::new(Arc::new(EmptyInput), wal.clone());
+
+        // Recovery loads one page at a time instead of decoding the whole
+        // backlog before the first delivery.
+        input.fill_replay_page().await.unwrap();
+        {
+            let entries = input.replay.lock().expect("wal replay queue poisoned");
+            assert_eq!(entries.len(), WAL_REPLAY_PAGE_SIZE);
+            assert_eq!(entries.front().unwrap().0, 1);
+            assert_eq!(entries.back().unwrap().0, WAL_REPLAY_PAGE_SIZE as u64);
+        }
+        input
+            .replay
+            .lock()
+            .expect("wal replay queue poisoned")
+            .clear();
+
+        input.fill_replay_page().await.unwrap();
+        {
+            let entries = input.replay.lock().expect("wal replay queue poisoned");
+            assert_eq!(entries.len(), 7);
+            assert_eq!(entries.front().unwrap().0, WAL_REPLAY_PAGE_SIZE as u64 + 1);
+            assert_eq!(entries.back().unwrap().0, total as u64);
+        }
 
         wal.close().await.unwrap();
     }
