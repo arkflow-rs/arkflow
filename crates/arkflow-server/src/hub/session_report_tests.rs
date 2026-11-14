@@ -346,8 +346,13 @@ async fn expired_session_mid_command_still_settles_one_terminal_result() {
         node_id: "agent-a".into(),
         session_token: reauth.session_token.clone(),
     };
-    // The command lease is still valid, so nothing is redelivered yet.
-    assert!(hub.commands(auth_b.clone()).await.unwrap().is_empty());
+    // A same-boot re-registration re-delivers the still-valid lease under
+    // its original id: the poll response sent under the expired session may
+    // never have reached the Agent. The Agent dedupes by command id, so a
+    // command it did receive is not executed twice.
+    let redelivered_after_reregister = hub.commands(auth_b.clone()).await.unwrap();
+    assert_eq!(redelivered_after_reregister.len(), 1);
+    assert_eq!(redelivered_after_reregister[0].id, command.id);
 
     // Let the command lease expire. Session B's own TTL also elapses
     // during the wait — with a hard TTL every long gap ends in another
@@ -789,6 +794,7 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
                 capabilities: vec![],
                 last_seen_at_ms: now,
                 lease_expires_at_ms: now + 1_000,
+                report_seq: 0,
                 streams_total: 0,
                 streams_running: 0,
                 streams_failed: 0,

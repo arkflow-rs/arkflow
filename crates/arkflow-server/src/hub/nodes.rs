@@ -347,6 +347,7 @@ impl Hub {
             capabilities: sanitize_capabilities(request.capabilities.clone()),
             last_seen_at_ms: now,
             lease_expires_at_ms: now + self.config.lease_ttl_ms,
+            report_seq: 0,
             streams_total: 0,
             streams_running: 0,
             streams_failed: 0,
@@ -382,6 +383,33 @@ impl Hub {
         let boot_changed = old
             .as_ref()
             .is_some_and(|record| record.boot_id.as_deref() != Some(registered_boot_id.as_str()));
+        // Commands queued for an old process belong to a runtime that no
+        // longer exists. Reconciliation below will enqueue the desired
+        // state for the new boot.
+        let (commands, leased_commands) = match old.as_ref() {
+            Some(record) if !boot_changed => {
+                let mut commands: VecDeque<AgentCommand> = VecDeque::new();
+                let mut leased = BTreeMap::new();
+                // A session refresh of the SAME process gets a new token; a
+                // poll response issued under the old one may never have
+                // reached the Agent. Re-deliver still-valid leases under
+                // their original command ids — the Agent dedupes by id
+                // (completed cache + in-flight set), so a command it did
+                // receive is never executed twice.
+                for (id, command) in &record.leased_commands {
+                    if command.expires_at_ms > now {
+                        commands.push_back(command.clone());
+                    } else {
+                        // Expired leases follow the expiry sweep, which
+                        // re-enqueues them as retries with a fresh operation.
+                        leased.insert(id.clone(), command.clone());
+                    }
+                }
+                commands.extend(record.commands.iter().cloned());
+                (commands, leased)
+            }
+            _ => (VecDeque::new(), BTreeMap::new()),
+        };
         nodes.insert(
             request.node_id.clone(),
             NodeRecord {
@@ -395,23 +423,8 @@ impl Hub {
                 // registrations: a reconnecting node re-earns its streak
                 // within a few report intervals (bounded rebalance delay).
                 pressure_streak: 0,
-                // Commands queued for an old process belong to a runtime that
-                // no longer exists. Reconciliation below will enqueue the
-                // desired state for the new boot.
-                commands: if boot_changed {
-                    VecDeque::new()
-                } else {
-                    old.as_ref()
-                        .map(|record| record.commands.clone())
-                        .unwrap_or_default()
-                },
-                leased_commands: if boot_changed {
-                    BTreeMap::new()
-                } else {
-                    old.as_ref()
-                        .map(|record| record.leased_commands.clone())
-                        .unwrap_or_default()
-                },
+                commands,
+                leased_commands,
                 streams: old
                     .as_ref()
                     .map(|record| record.streams.clone())
@@ -648,6 +661,9 @@ impl Hub {
         }
         let now = now_ms();
         node.resource.last_seen_at_ms = now;
+        // The node view reports which state report it reflects; heartbeats
+        // refresh last_seen but never this.
+        node.resource.report_seq = node.report_seq;
         node.resource.lease_expires_at_ms = now + self.config.lease_ttl_ms;
         node.resource.state = if report.state == "draining" {
             NodeConnectionState::Draining
