@@ -245,6 +245,71 @@ async fn out_of_order_renewals_keep_the_newest_deadline() {
     let _ = hub_task.await;
 }
 
+/// The real watcher loop, synchronized on the operation reaching Running and
+/// held across the command's original deadline while a real reporter renews
+/// the lease. Only then is the operation allowed to complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn watcher_holds_a_running_operation_across_the_original_deadline() {
+    use arkflow_core::control::OperationState;
+
+    let (hub_url, hub_cancel, hub_task) =
+        json_stub_hub(serde_json::json!({"state": "running"})).await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let cp = ControlPlane::new(
+        engine_config_with_stream("orders-watch"),
+        RuntimeManager::new(),
+    );
+    let store = cp.operation_store();
+    let record = store
+        .find_or_create("restart", "stream", "orders-watch", None)
+        .await;
+    store
+        .update(&record.id, OperationState::Running, 10, None)
+        .await
+        .expect("the operation is observable");
+
+    let original_deadline = super::now_ms().saturating_add(300);
+    let template = command_result_template(HubOperationState::Acknowledged);
+    let progress = super::commands::spawn_progress_reports(
+        &client,
+        &config,
+        &auth,
+        &template,
+        std::time::Duration::from_millis(100),
+        2_000,
+        original_deadline,
+    );
+    let command = test_command("restart", "orders-watch", 1, None, original_deadline);
+    let watching = super::commands::watch_lifecycle_operation(&cp, &command, &record.id, &progress);
+    // Hold the operation Running across the original deadline; only then let
+    // it complete.
+    let completing = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        store
+            .update(&record.id, OperationState::Succeeded, 100, None)
+            .await;
+    };
+    let (result, ()) = tokio::join!(watching, completing);
+    assert!(
+        super::now_ms() > original_deadline.saturating_add(100),
+        "the operation must complete after its original deadline"
+    );
+    assert_eq!(
+        result.state,
+        HubOperationState::Succeeded,
+        "the watcher must keep waiting while the operation runs"
+    );
+    assert!(
+        progress.deadline_ms() > original_deadline,
+        "the reporter must have renewed the lease during the hold"
+    );
+    drop(progress);
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+}
+
 /// End-to-end hold: the runtime entry lock blocks the restart, so the
 /// lifecycle operation stays in progress across the command's original
 /// deadline while the reporter renews the lease. The command must complete
