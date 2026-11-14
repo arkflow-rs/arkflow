@@ -57,6 +57,15 @@ impl ProgressReports {
     pub(super) fn deadline_ms(&self) -> u64 {
         self.deadline_ms.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// Advance the local deadline after a CONFIRMED renewal (a report the
+    /// Hub answered while still holding the operation as non-terminal).
+    pub(super) fn mark_renewed(&self, lease_ttl_ms: u64, interval: Duration) {
+        self.deadline_ms.store(
+            renewed_deadline_ms(lease_ttl_ms, interval, now_ms()),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
 }
 
 impl Drop for ProgressReports {
@@ -96,16 +105,20 @@ pub(super) fn spawn_progress_reports(
             tokio::select! {
                 _ = task_cancel.cancelled() => break,
                 _ = tick.tick() => {
-                    // A failed report is retried on the next tick; the Hub's
-                    // lease sweep remains the fallback for an unreachable Hub.
-                    if send_result(&client, &config, &auth, update.clone()).await.is_ok() {
+                    match send_progress_report(&client, &config, &auth, update.clone()).await {
                         // The Hub renewed its lease: advance the local copy
                         // so the lifecycle watcher does not time out a command
                         // the Hub still considers alive.
-                        task_deadline.store(
+                        Ok(true) => task_deadline.store(
                             renewed_deadline_ms(lease_ttl_ms, interval, now_ms()),
                             std::sync::atomic::Ordering::Release,
-                        );
+                        ),
+                        // The Hub already settled the command (its lease
+                        // sweep timed it out): stop reporting.
+                        Ok(false) => break,
+                        // Transport failure: retry on the next tick; the
+                        // Hub's lease sweep remains the fallback.
+                        Err(_) => {}
                     }
                 }
             }
@@ -213,18 +226,23 @@ pub(super) async fn execute_command(
         result.failure_class = Some("stale_generation".into());
         return deliver_result(client, config, auth, result).await;
     }
-    send_result(client, config, auth, result.clone()).await?;
     // Configuration/lifecycle execution can outlive the lease; report
     // progress until the terminal result is delivered.
+    let progress_interval = command_progress_interval(command.expires_at_ms, lease_ttl_ms);
     let progress = spawn_progress_reports(
         client,
         config,
         auth,
         &result,
-        command_progress_interval(command.expires_at_ms, lease_ttl_ms),
+        progress_interval,
         lease_ttl_ms,
         command.expires_at_ms,
     );
+    // The acknowledgement is itself a lease renewal: advance the local
+    // deadline when the Hub still holds the operation as non-terminal.
+    if send_progress_report(client, config, auth, result.clone()).await? {
+        progress.mark_renewed(lease_ttl_ms, progress_interval);
+    }
     match &command.operation {
         AgentOperation::ValidateConfiguration | AgentOperation::DiffConfiguration => {
             // Read-only reports dispatched by the Hub for console clients.
@@ -439,7 +457,7 @@ pub(super) async fn execute_command(
                     .await;
                 }
             };
-            send_result(
+            if send_progress_report(
                 client,
                 config,
                 auth,
@@ -465,7 +483,10 @@ pub(super) async fn execute_command(
                     result: None,
                 },
             )
-            .await?;
+            .await?
+            {
+                progress.mark_renewed(lease_ttl_ms, progress_interval);
+            }
             loop {
                 if let Some(current) = cp.operation(&operation.id).await {
                     if matches!(
@@ -833,6 +854,48 @@ pub(super) async fn send_result(
     .await?
     .error_for_status()?;
     Ok(())
+}
+
+/// POST an `acknowledged`/`running` report and return whether the Hub still
+/// holds the operation as NON-terminal. A 200 that carries a terminal record
+/// means the Hub already settled the command (its lease sweep timed it out):
+/// that is not a renewal and must not extend the local deadline. Transport
+/// errors stay errors so the session still tears down; an unrecognized body
+/// is treated as a renewal for older Hubs.
+async fn send_progress_report(
+    client: &Client,
+    config: &NodeAgentConfig,
+    auth: &AgentAuth,
+    result: CommandResult,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let query = agent_auth_query(&auth.node_id);
+    let response = bearer_auth(
+        client.post(format!(
+            "{}{}/agent/commands/{}/result?{}",
+            config.hub_url, config.api_prefix, result.command_id, query
+        )),
+        &auth.session_token,
+    )
+    .json(&result)
+    .send()
+    .await?
+    .error_for_status()?;
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    let terminal = body
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|state| {
+            matches!(
+                state,
+                "succeeded"
+                    | "failed"
+                    | "timed_out"
+                    | "node_unavailable"
+                    | "cancelled"
+                    | "superseded"
+            )
+        });
+    Ok(!terminal)
 }
 pub(super) async fn post_json<T: Serialize>(
     client: &Client,

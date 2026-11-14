@@ -257,27 +257,12 @@ fn renewals_advance_the_local_deadline() {
 /// original deadline must not be reported TimedOut while the Hub renews.
 #[tokio::test(flavor = "multi_thread")]
 async fn progress_reports_advance_the_local_deadline_past_the_original() {
-    let (hub_url, hub_cancel, hub_task) = stub_hub_server().await;
+    let (hub_url, hub_cancel, hub_task) =
+        json_stub_hub(serde_json::json!({"state": "running"})).await;
     let client = build_agent_client(&hub_url).unwrap();
     let config = test_node_config(&hub_url);
     let auth = test_auth();
-    let template = crate::hub::CommandResult {
-        command_id: "cmd-deadline".into(),
-        operation_id: "op-deadline".into(),
-        state: HubOperationState::Acknowledged,
-        progress: 5,
-        error: None,
-        correlation_id: None,
-        generation: 1,
-        observed_generation: None,
-        action_id: None,
-        failure_class: None,
-        config_version_id: None,
-        rollout_id: None,
-        observed_checkpoint_id: None,
-        checkpoint_manifest_uri: None,
-        result: None,
-    };
+    let template = command_result_template(HubOperationState::Acknowledged);
     // The command's original deadline has already passed; only the renewals
     // (every 50ms, lease 2s) keep it alive.
     let original_deadline = super::now_ms().saturating_sub(1_000);
@@ -296,6 +281,38 @@ async fn progress_reports_advance_the_local_deadline_past_the_original() {
         "renewals must extend the local deadline past the original one"
     );
     assert!(progress.deadline_ms() > original_deadline);
+    drop(progress);
+    hub_cancel.cancel();
+    let _ = hub_task.await;
+}
+
+/// A 200 response carrying a TERMINAL operation means the Hub already
+/// settled the command (its lease sweep timed it out): the reporter must not
+/// treat that as a renewal and the local deadline must stay put.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_hub_responses_do_not_renew_the_local_deadline() {
+    let (hub_url, hub_cancel, hub_task) =
+        json_stub_hub(serde_json::json!({"state": "timed_out"})).await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let template = command_result_template(HubOperationState::Acknowledged);
+    let original_deadline = super::now_ms().saturating_add(60_000);
+    let progress = super::commands::spawn_progress_reports(
+        &client,
+        &config,
+        &auth,
+        &template,
+        std::time::Duration::from_millis(50),
+        2_000,
+        original_deadline,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        progress.deadline_ms(),
+        original_deadline,
+        "a terminal Hub response is not a renewal"
+    );
     drop(progress);
     hub_cancel.cancel();
     let _ = hub_task.await;
@@ -3269,6 +3286,48 @@ async fn stub_hub_server() -> (String, CancellationToken, tokio::task::JoinHandl
     (format!("http://{address}"), cancellation, task)
 }
 
+/// A stub Hub that answers every request with the given JSON body.
+async fn json_stub_hub(
+    body: serde_json::Value,
+) -> (String, CancellationToken, tokio::task::JoinHandle<()>) {
+    let app = axum::Router::new().fallback(move || {
+        let body = body.clone();
+        async move { axum::Json(body) }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancellation = CancellationToken::new();
+    let shutdown = cancellation.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap();
+    });
+    (format!("http://{address}"), cancellation, task)
+}
+
+/// Progress-report template used by the lease-renewal tests.
+fn command_result_template(state: HubOperationState) -> crate::hub::CommandResult {
+    crate::hub::CommandResult {
+        command_id: "cmd-deadline".into(),
+        operation_id: "op-deadline".into(),
+        state,
+        progress: 5,
+        error: None,
+        correlation_id: None,
+        generation: 1,
+        observed_generation: None,
+        action_id: None,
+        failure_class: None,
+        config_version_id: None,
+        rollout_id: None,
+        observed_checkpoint_id: None,
+        checkpoint_manifest_uri: None,
+        result: None,
+    }
+}
+
 fn test_command(
     operation: &str,
     resource_id: &str,
@@ -5712,11 +5771,12 @@ async fn take_finished_reports_a_panicked_kernel_join() {
     assert!(runtime.tasks.lock().await.is_empty());
 }
 
-/// A stream command whose deadline expires while its lifecycle operation
-/// is still mid-flight settles as TimedOut through the watcher's expiry
-/// branch (rather than the pre-execution expiry).
+/// A lifecycle command whose ORIGINAL deadline passes mid-flight must not be
+/// reported TimedOut while the Hub keeps renewing the lease: the
+/// acknowledged/running reports advance the local deadline, and the restart
+/// completes through the local operation instead of the stale deadline.
 #[tokio::test(flavor = "multi_thread")]
-async fn stream_command_deadline_expires_mid_lifecycle() {
+async fn stream_command_survives_its_original_deadline_when_renewed() {
     let _ = arkflow_plugin::initialize();
     let (hub_url, hub_cancel, hub_task) = stub_hub_server().await;
     let client = build_agent_client(&hub_url).unwrap();
@@ -5732,9 +5792,10 @@ async fn stream_command_deadline_expires_mid_lifecycle() {
 
     // Each attempt uses a fresh command id and a deadline only a
     // millisecond out: the precheck passes, and the first watcher poll
-    // after the result round trip lands past the deadline while the
-    // lifecycle operation is still mid-flight.
-    let mut saw_deadline = false;
+    // lands past the original deadline while the lifecycle operation is
+    // still mid-flight. The acknowledgement/renewal reports must keep the
+    // command alive.
+    let mut verified = false;
     for attempt in 0..40 {
         let mut command = test_command(
             "restart",
@@ -5743,8 +5804,8 @@ async fn stream_command_deadline_expires_mid_lifecycle() {
             None,
             now_ms().saturating_add(1),
         );
-        command.id = format!("cmd-deadline-{attempt}");
-        command.operation_id = format!("op-deadline-{attempt}");
+        command.id = format!("cmd-renewed-{attempt}");
+        command.operation_id = format!("op-renewed-{attempt}");
         let outcome = tokio::time::timeout(
             Duration::from_secs(20),
             execute_command(&client, &cp, &config, &auth, &command, &runtime, 0),
@@ -5754,30 +5815,26 @@ async fn stream_command_deadline_expires_mid_lifecycle() {
         .unwrap();
         match outcome.state {
             HubOperationState::TimedOut
-                if outcome
-                    .error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("deadline")) =>
-            {
-                saw_deadline = true;
-                break;
-            }
-            // On a loaded runner the 1ms deadline can lapse before the
-            // precheck (`command_expired` guard) settles the attempt
-            // through the pre-execution expiry branch; that attempt is a
-            // retryable miss, not the branch under test.
-            HubOperationState::TimedOut
                 if outcome.error.as_deref() == Some("Command expired before execution") =>
             {
+                // The 1ms deadline lapsed before the precheck on a loaded
+                // runner; that attempt is a retryable miss.
                 continue;
             }
-            HubOperationState::Succeeded => continue,
+            HubOperationState::TimedOut => panic!(
+                "a renewed lifecycle command must not time out mid-flight: {:?}",
+                outcome.error
+            ),
+            HubOperationState::Succeeded => {
+                verified = true;
+                break;
+            }
             other => panic!("unexpected intermediate state {other:?}"),
         }
     }
     assert!(
-        saw_deadline,
-        "at least one attempt must settle through the deadline branch"
+        verified,
+        "at least one attempt must execute the lifecycle operation past its original deadline"
     );
     let _ = cp.runtime_manager().stop_all().await;
     hub_cancel.cancel();
