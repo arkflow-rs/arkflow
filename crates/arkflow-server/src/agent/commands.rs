@@ -60,9 +60,13 @@ impl ProgressReports {
 
     /// Advance the local deadline after a CONFIRMED renewal (a report the
     /// Hub answered while still holding the operation as non-terminal).
-    pub(super) fn mark_renewed(&self, lease_ttl_ms: u64, interval: Duration) {
+    /// `sent_at_ms` is when the report request STARTED: the Hub extends its
+    /// lease when it processes the report, which is never later than the
+    /// response arrival, so basing the local deadline on the send start keeps
+    /// it conservative (it can never outlive the Hub's lease).
+    pub(super) fn mark_renewed(&self, lease_ttl_ms: u64, interval: Duration, sent_at_ms: u64) {
         self.deadline_ms.store(
-            renewed_deadline_ms(lease_ttl_ms, interval, now_ms()),
+            renewed_deadline_ms(lease_ttl_ms, interval, sent_at_ms),
             std::sync::atomic::Ordering::Release,
         );
     }
@@ -105,12 +109,14 @@ pub(super) fn spawn_progress_reports(
             tokio::select! {
                 _ = task_cancel.cancelled() => break,
                 _ = tick.tick() => {
+                    let sent_at = now_ms();
                     match send_progress_report(&client, &config, &auth, update.clone()).await {
                         // The Hub renewed its lease: advance the local copy
                         // so the lifecycle watcher does not time out a command
-                        // the Hub still considers alive.
+                        // the Hub still considers alive. The base is the SEND
+                        // time, never the (later) response time.
                         Ok(true) => task_deadline.store(
-                            renewed_deadline_ms(lease_ttl_ms, interval, now_ms()),
+                            renewed_deadline_ms(lease_ttl_ms, interval, sent_at),
                             std::sync::atomic::Ordering::Release,
                         ),
                         // The Hub already settled the command (its lease
@@ -201,10 +207,23 @@ pub(super) async fn execute_command(
         // be running and this one must not start.
         let mut confirmation = result.clone();
         confirmation.state = HubOperationState::Running;
+        let confirmation_sent_at = now_ms();
+        let confirmation_interval = command_progress_interval(command.expires_at_ms, lease_ttl_ms);
         if !send_progress_report(client, config, auth, confirmation).await? {
             result.state = HubOperationState::TimedOut;
             result.progress = 100;
             result.error = Some("command was settled by the Hub before execution".into());
+            result.failure_class = Some("temporary_execution".into());
+            return deliver_result(client, config, auth, result).await;
+        }
+        if renewed_deadline_ms(lease_ttl_ms, confirmation_interval, confirmation_sent_at)
+            <= now_ms()
+        {
+            // The confirmation's lease already lapsed (delayed response): a
+            // replacement may be running, so the Job must not start.
+            result.state = HubOperationState::TimedOut;
+            result.progress = 100;
+            result.error = Some("command confirmation arrived after its lease expired".into());
             result.failure_class = Some("temporary_execution".into());
             return deliver_result(client, config, auth, result).await;
         }
@@ -255,6 +274,7 @@ pub(super) async fn execute_command(
     // terminal response means the Hub already settled this command (its
     // lease sweep timed it out and may have dispatched a replacement):
     // starting the operation now would run it twice.
+    let ack_sent_at = now_ms();
     if !send_progress_report(client, config, auth, result.clone()).await? {
         result.state = HubOperationState::TimedOut;
         result.progress = 100;
@@ -262,7 +282,17 @@ pub(super) async fn execute_command(
         result.failure_class = Some("temporary_execution".into());
         return deliver_result(client, config, auth, result).await;
     }
-    progress.mark_renewed(lease_ttl_ms, progress_interval);
+    // The Hub's lease was extended when IT handled the report, which may be
+    // much earlier than this response (a delayed response must not make the
+    // agent believe in a lease the Hub no longer holds).
+    if renewed_deadline_ms(lease_ttl_ms, progress_interval, ack_sent_at) <= now_ms() {
+        result.state = HubOperationState::TimedOut;
+        result.progress = 100;
+        result.error = Some("command confirmation arrived after its lease expired".into());
+        result.failure_class = Some("temporary_execution".into());
+        return deliver_result(client, config, auth, result).await;
+    }
+    progress.mark_renewed(lease_ttl_ms, progress_interval, ack_sent_at);
     match &command.operation {
         AgentOperation::ValidateConfiguration | AgentOperation::DiffConfiguration => {
             // Read-only reports dispatched by the Hub for console clients.
@@ -477,6 +507,7 @@ pub(super) async fn execute_command(
                     .await;
                 }
             };
+            let running_sent_at = now_ms();
             if !send_progress_report(
                 client,
                 config,
@@ -517,7 +548,14 @@ pub(super) async fn execute_command(
                 result.failure_class = Some("temporary_execution".into());
                 return deliver_result(client, config, auth, result).await;
             }
-            progress.mark_renewed(lease_ttl_ms, progress_interval);
+            if renewed_deadline_ms(lease_ttl_ms, progress_interval, running_sent_at) <= now_ms() {
+                result.state = HubOperationState::TimedOut;
+                result.progress = 100;
+                result.error = Some("command confirmation arrived after its lease expired".into());
+                result.failure_class = Some("temporary_execution".into());
+                return deliver_result(client, config, auth, result).await;
+            }
+            progress.mark_renewed(lease_ttl_ms, progress_interval, running_sent_at);
             loop {
                 let current = cp.operation(&operation.id).await;
                 match lifecycle_wait_decision(

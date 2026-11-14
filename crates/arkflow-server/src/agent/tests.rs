@@ -5880,6 +5880,93 @@ async fn stream_command_survives_its_original_deadline_when_renewed() {
     let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
 }
 
+/// A delayed response must not make the agent believe in a lease the Hub no
+/// longer holds: the local deadline is based on the SEND time, so a
+/// confirmation whose lease has already lapsed rejects execution.
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_confirmation_after_its_lease_is_rejected() {
+    let _ = arkflow_plugin::initialize();
+    let (hub_url, hub_cancel, hub_task) = delayed_json_stub_hub(
+        Duration::from_millis(400),
+        serde_json::json!({"state": "running"}),
+    )
+    .await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let engine_config = engine_config_with_stream("orders-lease");
+    let cp = ControlPlane::new(engine_config.clone(), RuntimeManager::new());
+    cp.runtime_manager()
+        .replace_config(&engine_config)
+        .await
+        .expect("the stream registers");
+    let runtime = Arc::new(JobRuntime::default());
+    let command = test_command(
+        "restart",
+        "orders-lease",
+        1,
+        None,
+        now_ms().saturating_add(60_000),
+    );
+    // Lease 100ms, response delayed 400ms: the lease renewed at send time has
+    // lapsed by the time the response arrives.
+    let outcome = execute_command(&client, &cp, &config, &auth, &command, &runtime, 100)
+        .await
+        .unwrap();
+    assert_eq!(outcome.state, HubOperationState::TimedOut);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("confirmation arrived after its lease expired")),
+        "unexpected error: {:?}",
+        outcome.error
+    );
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+}
+
+/// The Job path has the same guard: a delayed confirmation whose lease lapsed
+/// must not start the Job.
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_confirmation_prevents_job_execution() {
+    let (hub_url, hub_cancel, hub_task) = delayed_json_stub_hub(
+        Duration::from_millis(400),
+        serde_json::json!({"state": "running"}),
+    )
+    .await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let runtime = Arc::new(JobRuntime::default());
+    let cp = empty_control_plane();
+    let command = test_command(
+        "job_start",
+        "job-lapsed",
+        1,
+        None,
+        now_ms().saturating_add(60_000),
+    );
+    let outcome = execute_command(&client, &cp, &config, &auth, &command, &runtime, 100)
+        .await
+        .unwrap();
+    assert_eq!(outcome.state, HubOperationState::TimedOut);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("confirmation arrived after its lease expired")),
+        "unexpected error: {:?}",
+        outcome.error
+    );
+    assert!(
+        runtime.tasks.lock().await.is_empty(),
+        "the Job operation must not start after a lapsed confirmation lease"
+    );
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+}
+
 /// A terminal acknowledgement also stops JOB operations: they must not start
 /// next to a replacement the Hub may already have dispatched.
 #[tokio::test(flavor = "multi_thread")]
