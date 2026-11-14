@@ -38,7 +38,11 @@ impl StateSnapshot {
     }
 
     pub fn verify(&self) -> bool {
-        self.checksum == checksum_entries(&self.entries)
+        // New snapshots use the length-prefixed v2 encoding; checkpoints
+        // written before it remain valid under the legacy byte-concatenation
+        // checksum.
+        self.checksum == checksum_entries_v2(&self.entries)
+            || self.checksum == checksum_entries_legacy(&self.entries)
     }
 }
 
@@ -1327,6 +1331,43 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 fn checksum_entries(entries: &[StateEntry]) -> u64 {
+    checksum_entries_v2(entries)
+}
+
+/// Length-prefixed checksum: concatenating namespace/key/value bytes without
+/// boundaries made (`key=a`, `value=bc`) and (`key=ab`, `value=c`) collide,
+/// so two different snapshots could share an object key.
+fn checksum_entries_v2(entries: &[StateEntry]) -> u64 {
+    fn update(checksum: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *checksum ^= u64::from(*byte);
+            *checksum = checksum.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn update_field(checksum: &mut u64, bytes: &[u8]) {
+        update(checksum, &(bytes.len() as u64).to_le_bytes());
+        update(checksum, bytes);
+    }
+
+    let mut checksum = 0xcbf29ce484222325u64;
+    update(&mut checksum, b"arkflow-state-v2");
+    for entry in entries {
+        update_field(&mut checksum, entry.namespace.as_bytes());
+        update_field(&mut checksum, &entry.key);
+        update_field(&mut checksum, &entry.value);
+        match entry.expires_at_ms {
+            Some(expires) => {
+                update(&mut checksum, &[1]);
+                update(&mut checksum, &expires.to_le_bytes());
+            }
+            None => update(&mut checksum, &[0]),
+        }
+    }
+    checksum
+}
+
+/// Pre-v2 checksum, kept only to verify snapshots written by older builds.
+fn checksum_entries_legacy(entries: &[StateEntry]) -> u64 {
     let mut checksum = 0xcbf29ce484222325u64;
     for entry in entries {
         for byte in entry

@@ -11,6 +11,25 @@ use std::path::{Path, PathBuf};
 static CHECKPOINT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Encode a node id as one collision-free object-key component.
+///
+/// The old `replace('/', "_")` mapped `rack/a` and `rack_a` onto the same key,
+/// so two registered nodes could overwrite each other's intermediate
+/// manifests. Percent-encoding is reversible and keeps the safe ASCII set
+/// readable.
+pub fn encode_node_key(node_id: &str) -> String {
+    let mut encoded = String::with_capacity(node_id.len());
+    for byte in node_id.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePosition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -463,7 +482,7 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
                     format!(
                         "{prefix}/{}/manifests/{}.json",
                         manifest.checkpoint_id,
-                        attempt.node_id.replace('/', "_")
+                        encode_node_key(&attempt.node_id)
                     )
                 })
                 .collect::<BTreeSet<_>>();

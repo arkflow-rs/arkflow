@@ -238,14 +238,39 @@ impl KernelJobHandle {
             }
         }
         if inject_locally {
+            // Barrier injection must obey the same deadline and cancellation
+            // as report collection: a source whose bounded barrier queue is
+            // full used to park this call while holding the round lock, so
+            // every later checkpoint blocked behind it.
+            let injection_deadline = tokio::time::Instant::now() + self.round_timeout();
             for (task_id, sender) in &self.barrier_senders {
                 if ended.contains(task_id) {
                     continue;
                 }
-                sender
-                    .send_async(super::envelope::Envelope::Barrier(barrier.clone()))
-                    .await
-                    .map_err(|_| Error::Process("source barrier channel is closed".into()))?;
+                tokio::select! {
+                    _ = self.cancellation.cancelled() => {
+                        return Err(Error::Process(
+                            "kernel cancelled during checkpoint barrier injection".into(),
+                        ));
+                    }
+                    result = tokio::time::timeout_at(
+                        injection_deadline,
+                        sender.send_async(super::envelope::Envelope::Barrier(barrier.clone())),
+                    ) => match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            return Err(Error::Process(
+                                "source barrier channel is closed".into(),
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(Error::Process(format!(
+                                "checkpoint barrier injection timed out after {:?}",
+                                self.round_timeout()
+                            )));
+                        }
+                    }
+                }
             }
         }
         let mut remaining: BTreeSet<String> = self
