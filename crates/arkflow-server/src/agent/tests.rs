@@ -207,28 +207,98 @@ async fn parked_job_observations_are_redelivered_by_the_next_session() {
     assert!(runtime.take_finished().await.is_empty());
 }
 
-/// The lease-renewal interval is derived from the remaining lease: a short
-/// lease (the tests use two seconds) must be renewed before it expires, and
-/// the interval is clamped so reports are neither a busy loop nor too slow.
+/// The lease-renewal interval is derived from the Hub lease the agent
+/// receives in the registration response, so a short lease (the tests use two
+/// seconds) is renewed before it expires; the interval is clamped so reports
+/// are neither a busy loop nor too slow.
 #[test]
-fn progress_interval_derives_from_the_remaining_lease() {
-    let now = super::now_ms();
+fn progress_interval_derives_from_the_hub_lease() {
     assert_eq!(
-        super::commands::command_progress_interval(now + 2_000),
+        super::commands::command_progress_interval(0, 2_000),
         std::time::Duration::from_millis(1_000)
     );
     assert_eq!(
-        super::commands::command_progress_interval(now + 200),
+        super::commands::command_progress_interval(0, 200),
         std::time::Duration::from_millis(500)
     );
     assert_eq!(
-        super::commands::command_progress_interval(now + 600_000),
+        super::commands::command_progress_interval(0, 600_000),
         std::time::Duration::from_secs(30)
     );
-    assert_eq!(
-        super::commands::command_progress_interval(now.saturating_sub(1)),
-        std::time::Duration::from_millis(500)
+    // Older Hubs without a lease report: fall back to half of the remaining
+    // time, compared as a range (a second clock read may tick).
+    let now = super::now_ms();
+    let fallback = super::commands::command_progress_interval(now + 2_000, 0);
+    assert!(
+        fallback >= std::time::Duration::from_millis(900)
+            && fallback <= std::time::Duration::from_millis(1_000),
+        "unexpected fallback interval: {fallback:?}"
     );
+}
+
+/// Each successful renewal advances the local deadline: a lifecycle command
+/// still executing past its original `expires_at_ms` must not be reported
+/// TimedOut while the Hub keeps renewing its lease.
+#[test]
+fn renewals_advance_the_local_deadline() {
+    let now = super::now_ms();
+    assert_eq!(
+        super::commands::renewed_deadline_ms(2_000, std::time::Duration::from_secs(1), now),
+        now + 2_000
+    );
+    assert_eq!(
+        super::commands::renewed_deadline_ms(0, std::time::Duration::from_secs(1), now),
+        now + 2_000
+    );
+}
+
+/// A renewal report must advance the local deadline past the command's
+/// original `expires_at_ms`: a lifecycle operation still running after the
+/// original deadline must not be reported TimedOut while the Hub renews.
+#[tokio::test(flavor = "multi_thread")]
+async fn progress_reports_advance_the_local_deadline_past_the_original() {
+    let (hub_url, hub_cancel, hub_task) = stub_hub_server().await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let template = crate::hub::CommandResult {
+        command_id: "cmd-deadline".into(),
+        operation_id: "op-deadline".into(),
+        state: HubOperationState::Acknowledged,
+        progress: 5,
+        error: None,
+        correlation_id: None,
+        generation: 1,
+        observed_generation: None,
+        action_id: None,
+        failure_class: None,
+        config_version_id: None,
+        rollout_id: None,
+        observed_checkpoint_id: None,
+        checkpoint_manifest_uri: None,
+        result: None,
+    };
+    // The command's original deadline has already passed; only the renewals
+    // (every 50ms, lease 2s) keep it alive.
+    let original_deadline = super::now_ms().saturating_sub(1_000);
+    let progress = super::commands::spawn_progress_reports(
+        &client,
+        &config,
+        &auth,
+        &template,
+        std::time::Duration::from_millis(50),
+        2_000,
+        original_deadline,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        progress.deadline_ms() > super::now_ms(),
+        "renewals must extend the local deadline past the original one"
+    );
+    assert!(progress.deadline_ms() > original_deadline);
+    drop(progress);
+    hub_cancel.cancel();
+    let _ = hub_task.await;
 }
 
 /// A Hub-rejected observation rotates behind the reports it was blocking, so
@@ -3308,7 +3378,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
 
     // Expired before execution.
     let command = test_command("restart", "orders-stream", 1, None, now_ms() - 1_000);
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::TimedOut);
@@ -3318,7 +3388,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
     // A Job command behind the running generation is superseded.
     insert_exited_task(&runtime, "job-stale", 5, Ok(())).await;
     let command = test_command("job_stop", "job-stale", 3, None, live_deadline);
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Superseded);
@@ -3333,7 +3403,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         Some(serde_json::json!({"checkpoint_id": "cp-9"})),
         live_deadline,
     );
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Failed);
@@ -3348,7 +3418,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         "assignments": serde_json::to_value(&assignments).unwrap(),
     });
     let command = test_command("job_restart", "orders-cmd", 1, Some(payload), live_deadline);
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Succeeded);
@@ -3369,7 +3439,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         Some(serde_json::to_value(&candidate).unwrap()),
         live_deadline,
     );
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Succeeded);
@@ -3390,7 +3460,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         Some(serde_json::to_value(&invalid).unwrap()),
         live_deadline,
     );
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Succeeded);
@@ -3401,7 +3471,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
     );
 
     let command = test_command("validate_configuration", "config", 1, None, live_deadline);
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Failed);
@@ -3437,7 +3507,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         Some(serde_json::json!({"from": first.id, "to": second.id})),
         live_deadline,
     );
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Succeeded);
@@ -3457,7 +3527,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         Some(serde_json::json!({"to": second.id})),
         live_deadline,
     );
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Failed);
@@ -3473,7 +3543,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         Some(serde_json::json!({"from": "no-such-version", "to": second.id})),
         live_deadline,
     );
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Failed);
@@ -3481,7 +3551,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
 
     // Stream lifecycle: an unknown stream fails, a known one settles.
     let command = test_command("restart", "ghost-stream", 1, None, live_deadline);
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Failed);
@@ -3498,7 +3568,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
     let command = test_command("restart", "orders-stream", 1, None, live_deadline);
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        execute_command(&client, &cp, &config, &auth, &command, &runtime),
+        execute_command(&client, &cp, &config, &auth, &command, &runtime, 0),
     )
     .await
     .expect("the lifecycle watcher settles")
@@ -3538,7 +3608,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         live_deadline,
     );
     apply_command.config_version_id = Some("version-42".into());
-    let result = execute_command(&client, &cp, &config, &auth, &apply_command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &apply_command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -3553,7 +3623,7 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
     );
 
     let command = test_command("apply_configuration", "config", 1, None, live_deadline);
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Failed);
@@ -3569,13 +3639,13 @@ async fn execute_command_settles_every_command_shape_against_a_stub_hub() {
         Some(serde_json::json!({"id": first.id})),
         live_deadline,
     );
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Succeeded);
 
     let command = test_command("rollback_configuration", "config", 1, None, live_deadline);
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(result.state, HubOperationState::Failed);
@@ -3672,6 +3742,7 @@ async fn terminal_results_survive_delivery_failures() {
             &auth,
             &command,
             &JobRuntime::default(),
+            0,
         ),
     )
     .await
@@ -4324,7 +4395,7 @@ async fn job_checkpoint_commit_and_stop_commands_settle() {
         "node_data_ports": {}
     });
     let command = test_command("job_start", "orders-cmds", 1, Some(payload), live_deadline);
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -4342,7 +4413,7 @@ async fn job_checkpoint_commit_and_stop_commands_settle() {
         Some(serde_json::json!({"checkpoint_id": "cp-cmds"})),
         live_deadline,
     );
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -4371,7 +4442,7 @@ async fn job_checkpoint_commit_and_stop_commands_settle() {
         })),
         live_deadline,
     );
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -4398,7 +4469,7 @@ async fn job_checkpoint_commit_and_stop_commands_settle() {
             Some(payload),
             live_deadline,
         );
-        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+        let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
             .await
             .unwrap();
         assert_eq!(
@@ -4412,7 +4483,7 @@ async fn job_checkpoint_commit_and_stop_commands_settle() {
 
     // A stop on the running generation succeeds through the command path.
     let command = test_command("job_stop", "orders-cmds", 1, None, live_deadline);
-    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime)
+    let result = execute_command(&client, &cp, &config, &auth, &command, &runtime, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -4455,7 +4526,7 @@ async fn stream_commands_settle_stale_and_failed_lifecycle_outcomes() {
     let command = test_command("start", "orders-stream", 1, None, live_deadline);
     let result = tokio::time::timeout(
         Duration::from_secs(15),
-        execute_command(&client, &cp, &config, &auth, &command, &runtime),
+        execute_command(&client, &cp, &config, &auth, &command, &runtime, 0),
     )
     .await
     .expect("the lifecycle watcher settles")
@@ -5676,7 +5747,7 @@ async fn stream_command_deadline_expires_mid_lifecycle() {
         command.operation_id = format!("op-deadline-{attempt}");
         let outcome = tokio::time::timeout(
             Duration::from_secs(20),
-            execute_command(&client, &cp, &config, &auth, &command, &runtime),
+            execute_command(&client, &cp, &config, &auth, &command, &runtime, 0),
         )
         .await
         .expect("each attempt settles")

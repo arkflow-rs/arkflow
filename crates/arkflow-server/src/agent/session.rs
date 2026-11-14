@@ -379,6 +379,9 @@ pub(super) async fn run_session(
         node_id: config.node_id.clone(),
         session_token: session.session_token,
     };
+    // The Hub reports its command lease in the registration response; the
+    // progress reporter and the local lifecycle deadline both need it.
+    let lease_ttl_ms = session.lease_ttl_ms;
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     let mut report_tick = tokio::time::interval(config.report_interval);
     let mut poll = tokio::time::interval(config.poll_interval);
@@ -486,6 +489,7 @@ pub(super) async fn run_session(
                             &command_auth,
                             &command,
                             &command_runtime,
+                            lease_ttl_ms,
                         )
                         .await;
                         (command_id, result)

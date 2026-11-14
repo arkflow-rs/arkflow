@@ -14,12 +14,29 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::warn;
 
-/// How often to renew a command's execution lease: half of the lease time
-/// remaining at execution start, so even a short lease (the tests use two
-/// seconds) is renewed before it expires. Clamped to a sane floor/ceiling.
-pub(super) fn command_progress_interval(expires_at_ms: u64) -> Duration {
-    let remaining_ms = expires_at_ms.saturating_sub(now_ms());
-    Duration::from_millis((remaining_ms / 2).clamp(500, 30_000))
+/// How often to renew a command's execution lease: half of the Hub lease,
+/// so the lease is renewed before it can expire. Older Hubs that do not
+/// report `lease_ttl_ms` fall back to half of the time left on the command.
+/// Clamped to a sane floor/ceiling.
+pub(super) fn command_progress_interval(expires_at_ms: u64, lease_ttl_ms: u64) -> Duration {
+    let lease_ms = if lease_ttl_ms > 0 {
+        lease_ttl_ms
+    } else {
+        expires_at_ms.saturating_sub(now_ms())
+    };
+    Duration::from_millis((lease_ms / 2).clamp(500, 30_000))
+}
+
+/// The local deadline after a renewal: the Hub extends its lease by the full
+/// `lease_ttl_ms` from each report, so the agent's own copy must advance by
+/// the same amount (or, without a reported lease, by two report intervals).
+pub(super) fn renewed_deadline_ms(lease_ttl_ms: u64, interval: Duration, now_ms: u64) -> u64 {
+    let renewal_ms = if lease_ttl_ms > 0 {
+        lease_ttl_ms
+    } else {
+        2 * u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)
+    };
+    now_ms.saturating_add(renewal_ms)
 }
 
 /// Keeps a "running" progress report ticking while a command executes. The
@@ -27,9 +44,19 @@ pub(super) fn command_progress_interval(expires_at_ms: u64) -> Duration {
 /// operation that outlives `lease_ttl_ms` (a configuration apply, a Job
 /// start) is not swept as TimedOut and dispatched a second time. Dropping
 /// the guard stops the reports; every early-return path is covered.
-struct ProgressReports {
+pub(super) struct ProgressReports {
     cancel: tokio_util::sync::CancellationToken,
     handle: tokio::task::JoinHandle<()>,
+    /// The locally tracked command deadline, advanced on every successful
+    /// renewal report. The lifecycle watcher reads it instead of the
+    /// command's original (stale) `expires_at_ms`.
+    deadline_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ProgressReports {
+    pub(super) fn deadline_ms(&self) -> u64 {
+        self.deadline_ms.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl Drop for ProgressReports {
@@ -41,18 +68,22 @@ impl Drop for ProgressReports {
     }
 }
 
-fn spawn_progress_reports(
+pub(super) fn spawn_progress_reports(
     client: &Client,
     config: &NodeAgentConfig,
     auth: &AgentAuth,
     template: &CommandResult,
     interval: Duration,
+    lease_ttl_ms: u64,
+    expires_at_ms: u64,
 ) -> ProgressReports {
     let cancel = tokio_util::sync::CancellationToken::new();
     let task_cancel = cancel.clone();
     let client = client.clone();
     let config = config.clone();
     let auth = auth.clone();
+    let deadline_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(expires_at_ms));
+    let task_deadline = deadline_ms.clone();
     let mut update = template.clone();
     update.state = HubOperationState::Running;
     let handle = tokio::spawn(async move {
@@ -67,12 +98,24 @@ fn spawn_progress_reports(
                 _ = tick.tick() => {
                     // A failed report is retried on the next tick; the Hub's
                     // lease sweep remains the fallback for an unreachable Hub.
-                    let _ = send_result(&client, &config, &auth, update.clone()).await;
+                    if send_result(&client, &config, &auth, update.clone()).await.is_ok() {
+                        // The Hub renewed its lease: advance the local copy
+                        // so the lifecycle watcher does not time out a command
+                        // the Hub still considers alive.
+                        task_deadline.store(
+                            renewed_deadline_ms(lease_ttl_ms, interval, now_ms()),
+                            std::sync::atomic::Ordering::Release,
+                        );
+                    }
                 }
             }
         }
     });
-    ProgressReports { cancel, handle }
+    ProgressReports {
+        cancel,
+        handle,
+        deadline_ms,
+    }
 }
 
 pub(super) async fn execute_command(
@@ -82,6 +125,7 @@ pub(super) async fn execute_command(
     auth: &AgentAuth,
     command: &AgentCommand,
     job_runtime: &JobRuntime,
+    lease_ttl_ms: u64,
 ) -> Result<CommandResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut result = CommandResult {
         command_id: command.id.clone(),
@@ -135,7 +179,9 @@ pub(super) async fn execute_command(
             config,
             auth,
             &result,
-            command_progress_interval(command.expires_at_ms),
+            command_progress_interval(command.expires_at_ms, lease_ttl_ms),
+            lease_ttl_ms,
+            command.expires_at_ms,
         );
         let operation = execute_job_operation(command, config, job_runtime).await;
         if let Ok(Some(manifest_uri)) = &operation {
@@ -170,12 +216,14 @@ pub(super) async fn execute_command(
     send_result(client, config, auth, result.clone()).await?;
     // Configuration/lifecycle execution can outlive the lease; report
     // progress until the terminal result is delivered.
-    let _progress = spawn_progress_reports(
+    let progress = spawn_progress_reports(
         client,
         config,
         auth,
         &result,
-        command_progress_interval(command.expires_at_ms),
+        command_progress_interval(command.expires_at_ms, lease_ttl_ms),
+        lease_ttl_ms,
+        command.expires_at_ms,
     );
     match &command.operation {
         AgentOperation::ValidateConfiguration | AgentOperation::DiffConfiguration => {
@@ -501,7 +549,7 @@ pub(super) async fn execute_command(
                     )
                     .await;
                 }
-                if command_expired(command.expires_at_ms, now_ms()) {
+                if command_expired(progress.deadline_ms(), now_ms()) {
                     // The command deadline passed without a terminal observation; the
                     // Hub has already stopped waiting for this command.
                     return deliver_result(
