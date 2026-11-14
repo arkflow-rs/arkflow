@@ -156,6 +156,12 @@ impl Hub {
             now_ms(),
             actor,
         );
+        if let Some(artifact_id) = &artifact_id {
+            self.pause_dispatch_pending
+                .write()
+                .await
+                .insert(job_id.to_string(), artifact_id.clone());
+        }
         let job = storage
             .update_job_pause(job_id, update)
             .await
@@ -559,6 +565,22 @@ impl Hub {
                 if now_ms() >= deadline {
                     return self.abort_pause(job, "pause_savepoint_failed").await;
                 }
+                // The pause pointer is committed before the capture command
+                // is dispatched; a tick landing in that window must not
+                // re-dispatch (it would consume the bounded retry budget on
+                // work that is about to start). Exactly one tick per dispatch
+                // issued by THIS process is skipped — after a restart the map
+                // is empty and the reconciler re-issues immediately.
+                {
+                    let mut pending = self.pause_dispatch_pending.write().await;
+                    if pending
+                        .get(&job.job_id)
+                        .is_some_and(|pending_id| pending_id == &artifact_id)
+                    {
+                        pending.remove(&job.job_id);
+                        return Ok(false);
+                    }
+                }
                 if self.pause_capture_in_flight(job, &artifact_id).await {
                     return Ok(false);
                 }
@@ -586,6 +608,10 @@ impl Hub {
             retry_count: Some(job.pause_retry_count.saturating_add(1)),
             ..JobPauseUpdate::default()
         };
+        self.pause_dispatch_pending
+            .write()
+            .await
+            .insert(job.job_id.clone(), artifact_id.clone());
         let updated = storage
             .update_job_pause(&job.job_id, update)
             .await

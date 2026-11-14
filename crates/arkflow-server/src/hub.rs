@@ -170,6 +170,13 @@ pub struct Hub {
     /// request skips the status CAS, so two callers could otherwise both
     /// adopt-or-create a rollout for the same correlation.
     approval_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Artifact id whose capture command this process just dispatched, keyed
+    /// by Job. The durable pause pointer is written before the command
+    /// exists, so a reconcile tick can observe "pending artifact, nothing in
+    /// flight" and retry a round that is about to start. One tick per local
+    /// dispatch is skipped; after a restart the map is empty and recovery
+    /// re-dispatches immediately.
+    pause_dispatch_pending: Arc<RwLock<BTreeMap<String, String>>>,
     /// Command ids whose terminal result has completed its storage and
     /// aggregation side effects. A duplicate terminal result only short-
     /// circuits when this marker is present; otherwise it retries them.
@@ -324,6 +331,7 @@ impl Hub {
             #[cfg(test)]
             test_after_write_gate: Arc::new(RwLock::new(None)),
             approval_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pause_dispatch_pending: Arc::new(RwLock::new(BTreeMap::new())),
             settled_commands: Arc::new(RwLock::new(BTreeSet::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             plan_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
