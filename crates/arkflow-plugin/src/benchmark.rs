@@ -467,6 +467,13 @@ async fn run_each(count: usize) -> Result<Vec<ScenarioResult>, Error> {
     ])
 }
 
+/// Serializes whole suite runs. The stream scenarios count the rows the
+/// kernel actually processed through one process-wide counter; two suites
+/// running concurrently (the library tests do) would reset and read each
+/// other's counters and report zero workload.
+static SUITE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Runs the whole suite: `warmup` untimed passes followed by `runs` measured
 /// passes, reporting the best (minimum wall clock) per scenario.
 pub async fn run_suite(
@@ -475,6 +482,7 @@ pub async fn run_suite(
     runs: usize,
 ) -> Result<Vec<ScenarioResult>, Error> {
     assert!(runs >= 1, "at least one measured run is required");
+    let _suite = SUITE_LOCK.lock().await;
     setup_plugins();
     for _ in 0..warmup {
         run_each(count).await?;
