@@ -29,7 +29,6 @@ use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBu
 use arkflow_core::{Error, MessageBatchRef, ProcessResult, Resource};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use futures_util::TryStreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -139,15 +138,27 @@ impl Processor for VectorSearchProcessor {
 }
 
 impl VectorSearchProcessor {
-    /// One search per row; results are collected in row order while at
-    /// most `concurrency` requests are in flight. The first row failure
-    /// short-circuits: in-flight requests are dropped rather than awaited.
+    /// One search per row; at most `concurrency` requests are in flight.
+    /// The first failure surfaces as soon as its own request completes and
+    /// cancels the rest, so an early slow row cannot hide a later error;
+    /// successful results keep row order.
     async fn search_all(&self, vectors: &[Vec<f32>]) -> Result<Vec<String>, Error> {
-        let owned: Vec<Vec<f32>> = vectors.to_vec();
-        futures_util::stream::iter(owned.into_iter().map(|vector| self.search(vector)))
-            .buffered(self.config.concurrency)
-            .try_collect()
-            .await
+        let mut results: Vec<Option<String>> = (0..vectors.len()).map(|_| None).collect();
+        let mut pending = futures_util::stream::iter(
+            vectors
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, vector)| async move { (index, self.search(vector).await) }),
+        )
+        .buffer_unordered(self.config.concurrency);
+        while let Some((index, result)) = pending.next().await {
+            results[index] = Some(result?);
+        }
+        Ok(results
+            .into_iter()
+            .map(|result| result.expect("every row completed"))
+            .collect())
     }
 
     async fn search(&self, vector: Vec<f32>) -> Result<String, Error> {

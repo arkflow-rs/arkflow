@@ -66,6 +66,41 @@ fn minio_endpoint() -> Option<String> {
     std::env::var("MINIO_ENDPOINT").ok()
 }
 
+/// Object-store location for this test run. The prefix must be unique per
+/// RUN, not just per process: two test binaries (or a rerun) starting at
+/// SEQ 0 shared the same bucket location and their recovery scans saw each
+/// other's segments and manifests.
+fn unique_prefix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "arkflow/wal-test-{}-{nanos}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+/// Explicitly running `--ignored` without `MINIO_ENDPOINT` must fail: the
+/// point of that invocation is to exercise the integration, and silently
+/// returning success hides a misconfigured run.
+fn require_minio(case: &str) -> Option<String> {
+    match minio_endpoint() {
+        Some(endpoint) => Some(endpoint),
+        None => {
+            let explicitly_requested =
+                std::env::args().any(|arg| arg == "--ignored" || arg == "--include-ignored");
+            assert!(
+                !explicitly_requested,
+                "{case}: --ignored was requested but MINIO_ENDPOINT is not set"
+            );
+            eprintln!("MINIO_ENDPOINT not set; skipping {case}. Run MinIO locally to exercise it.");
+            None
+        }
+    }
+}
+
 fn s3_config() -> ObjectStoreS3Config {
     ObjectStoreS3Config {
         bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "arkflow-wal-test".into()),
@@ -85,7 +120,7 @@ fn osc(s3: ObjectStoreS3Config) -> ObjectStoreWalConfig {
     ObjectStoreWalConfig {
         node_id: "pod-a".into(),
         stream_id: "minio-integration".into(),
-        prefix: format!("arkflow/wal-test-{}", SEQ.fetch_add(1, Ordering::SeqCst)),
+        prefix: unique_prefix(),
         s3,
         segment: SegmentConfig {
             max_entries: 4,
@@ -106,8 +141,7 @@ fn osc(s3: ObjectStoreS3Config) -> ObjectStoreWalConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn round_trip_against_minio() {
-    if minio_endpoint().is_none() {
-        eprintln!("MINIO_ENDPOINT not set; skipping. Run MinIO locally to exercise this test.");
+    if require_minio("round trip against MinIO").is_none() {
         return;
     }
 
@@ -141,8 +175,7 @@ async fn round_trip_against_minio() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn high_qps_workload() {
-    if minio_endpoint().is_none() {
-        eprintln!("MINIO_ENDPOINT not set; skipping. Run MinIO locally to exercise this test.");
+    if require_minio("high qps workload").is_none() {
         return;
     }
 
@@ -183,4 +216,46 @@ async fn high_qps_workload() {
         write_duration,
         100.0 / write_duration.as_secs_f64()
     );
+}
+
+/// Recovery across a reopen: a fresh store handle over the same bucket
+/// location must rebuild the sealed segments and replay every unacknowledged
+/// entry. The round-trip test only read through the SAME open handle, so the
+/// manifest GET / LIST-union recovery path was never exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reopen_recovers_unacknowledged_segments() {
+    if require_minio("reopen recovery").is_none() {
+        return;
+    }
+    init().expect("plugin init");
+
+    let cfg = WalConfig {
+        enabled: true,
+        path: String::new(),
+        sync: SyncPolicy::GroupCommit,
+        backend: Some(arkflow_core::wal::WalBackend::ObjectStore(osc(s3_config()))),
+    };
+    cfg.validate().expect("config must validate");
+
+    let store = arkflow_core::wal::build_wal_store(&cfg).unwrap();
+    let payload = sample_payload();
+    // 4 entries → one full segment sealed; its manifest entry must survive
+    // close so the reopen can find it.
+    for i in 1u64..=4 {
+        store.append_batch(vec![(i, payload.clone())]).unwrap();
+    }
+    store.close().unwrap();
+
+    let reopened = arkflow_core::wal::build_wal_store(&cfg).unwrap();
+    let replayed = reopened.read_after_cursor().unwrap();
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "reopen must replay every unacknowledged entry"
+    );
+    reopened.close().unwrap();
 }

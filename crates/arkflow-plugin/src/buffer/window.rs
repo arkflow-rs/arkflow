@@ -46,6 +46,29 @@ impl BaseWindow {
         gap: time::Duration,
         resource: &Resource,
     ) -> Result<Self, Error> {
+        let join_operation = join_config
+            .map(|config| {
+                let codec = config.codec.build(resource)?;
+                let input_names = resource
+                    .input_names
+                    .borrow()
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<String>>();
+
+                JoinOperation::new(
+                    config.query,
+                    config.value_field,
+                    config.thread_num,
+                    codec,
+                    input_names,
+                )
+            })
+            .transpose()?;
+
+        // Only start the timer once construction can no longer fail: a
+        // failed build would otherwise leak a task that no close token
+        // ever reaches.
         let notify_clone = Arc::clone(&notify);
         let close_clone = close.clone();
         tokio::spawn(async move {
@@ -67,26 +90,6 @@ impl BaseWindow {
                 }
             }
         });
-
-        let join_operation = join_config
-            .map(|config| {
-                let codec = config.codec.build(resource)?;
-                let input_names = resource
-                    .input_names
-                    .borrow()
-                    .iter()
-                    .cloned()
-                    .collect::<HashSet<String>>();
-
-                JoinOperation::new(
-                    config.query,
-                    config.value_field,
-                    config.thread_num,
-                    codec,
-                    input_names,
-                )
-            })
-            .transpose()?;
 
         Ok(Self {
             join_operation,

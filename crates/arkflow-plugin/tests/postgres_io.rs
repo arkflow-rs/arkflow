@@ -80,16 +80,54 @@ fn unique_table(prefix: &str) -> String {
     )
 }
 
-/// Connect with a bounded timeout; `None` means "skip this test".
+/// Connection strings carry the password; skip notes must not echo it.
+fn redacted_uri(uri: &str) -> String {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return "<redacted connection string>".to_string();
+    };
+    match rest.split_once('@') {
+        Some((userinfo, host)) => {
+            let user = userinfo.split(':').next().unwrap_or_default();
+            format!("{scheme}://{user}:***@{host}")
+        }
+        None => uri.to_string(),
+    }
+}
+
+/// Connect with a bounded timeout; `None` means "skip this test". Set
+/// `ARKFLOW_REQUIRE_POSTGRES=1` where the database is expected to be
+/// reachable (a CI job with a Postgres service): an unavailable server then
+/// fails the test instead of reporting success without running any
+/// assertion.
 async fn try_connect(uri: &str, case: &str) -> Option<PgConnection> {
     match tokio::time::timeout(Duration::from_secs(5), PgConnection::connect(uri)).await {
         Ok(Ok(conn)) => Some(conn),
         Ok(Err(e)) => {
-            eprintln!("--- SKIPPED {case}: Postgres at {uri} refused a connection: {e} ---");
+            if std::env::var_os("ARKFLOW_REQUIRE_POSTGRES").is_some() {
+                panic!(
+                    "{case}: Postgres is required (ARKFLOW_REQUIRE_POSTGRES is set) but {} \
+                     refused a connection: {e}",
+                    redacted_uri(uri)
+                );
+            }
+            eprintln!(
+                "--- SKIPPED {case}: Postgres at {} refused a connection: {e} ---",
+                redacted_uri(uri)
+            );
             None
         }
         Err(_) => {
-            eprintln!("--- SKIPPED {case}: Postgres at {uri} did not answer within 5s ---");
+            if std::env::var_os("ARKFLOW_REQUIRE_POSTGRES").is_some() {
+                panic!(
+                    "{case}: Postgres is required (ARKFLOW_REQUIRE_POSTGRES is set) but {} did \
+                     not answer within 5s",
+                    redacted_uri(uri)
+                );
+            }
+            eprintln!(
+                "--- SKIPPED {case}: Postgres at {} did not answer within 5s ---",
+                redacted_uri(uri)
+            );
             None
         }
     }
@@ -413,7 +451,10 @@ async fn pgvector_output_roundtrip_and_upsert() {
         .await
         .is_err()
     {
-        eprintln!("--- SKIPPED {case}: cannot CREATE EXTENSION vector on {uri} ---");
+        eprintln!(
+            "--- SKIPPED {case}: cannot CREATE EXTENSION vector on {} ---",
+            redacted_uri(&uri)
+        );
         return;
     }
     let table = unique_table("arkflow_pgvec_out");
@@ -495,7 +536,10 @@ async fn pgvector_search_processor_returns_nearest_neighbors() {
         .await
         .is_err()
     {
-        eprintln!("--- SKIPPED {case}: cannot CREATE EXTENSION vector on {uri} ---");
+        eprintln!(
+            "--- SKIPPED {case}: cannot CREATE EXTENSION vector on {} ---",
+            redacted_uri(&uri)
+        );
         return;
     }
     let table = unique_table("arkflow_pgvec_search");

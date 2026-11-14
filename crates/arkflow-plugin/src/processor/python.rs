@@ -60,13 +60,17 @@ static INFLIGHT_UDFS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(INFLIGHT_UDF_LIMIT)));
 
 struct PythonProcessor {
-    func: Py<PyAny>, // Stores the Python function to be called
+    func: Arc<Py<PyAny>>, // Stores the Python function to be called
     timeout_ms: u64,
 }
 
 /// Run one UDF call on the blocking thread: convert the batch to PyArrow,
 /// invoke the function, convert the returned list back to RecordBatches.
-fn call_udf(func: Py<PyAny>, batch: MessageBatchRef) -> Result<Vec<RecordBatch>, Error> {
+///
+/// Attaching to the interpreter can wait for the GIL indefinitely while
+/// another UDF holds it. The attach therefore happens inside the timed
+/// blocking task, never on an async worker outside the timeout.
+fn call_udf(func: Arc<Py<PyAny>>, batch: MessageBatchRef) -> Result<Vec<RecordBatch>, Error> {
     Python::attach(|py| -> Result<Vec<RecordBatch>, Error> {
         // Convert MessageBatch to PyArrow
         let py_batch = batch.record_batch().to_pyarrow(py).map_err(|e| {
@@ -95,8 +99,6 @@ fn call_udf(func: Py<PyAny>, batch: MessageBatchRef) -> Result<Vec<RecordBatch>,
 #[async_trait]
 impl Processor for PythonProcessor {
     async fn process(&self, batch: MessageBatchRef) -> Result<ProcessResult, Error> {
-        let func_to_call = Python::attach(|py| self.func.clone_ref(py));
-
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
         // The WHOLE acquisition-plus-call waits inside the timeout: permits
         // held by permanently stuck calls must not turn every later call into
@@ -105,13 +107,13 @@ impl Processor for PythonProcessor {
         // forever). Timing out while queued abandons nothing that is running:
         // an already-started call keeps its blocking thread and its permit
         // until it returns.
-        let result = tokio::time::timeout(timeout, async {
+        let func = Arc::clone(&self.func);
+        let result = tokio::time::timeout(timeout, async move {
             let permit = INFLIGHT_UDFS
                 .clone()
                 .acquire_owned()
                 .await
                 .map_err(|e| Error::Process(format!("python UDF in-flight semaphore closed: {e}")))?;
-            let func = func_to_call;
             let handle = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 call_udf(func, batch)
@@ -165,7 +167,13 @@ impl PythonProcessor {
             if let Some(script) = &config.script {
                 let string = CString::new(script.as_str())
                     .map_err(|e| Error::Process(format!("Failed to create CString: {}", e)))?;
-                py.run(&string, None, None)
+                // Execute the inline script in the configured module's
+                // namespace (default `__main__`). Running it in the default
+                // globals made a `module: X` + `script: ...` configuration
+                // define the function somewhere `getattr` never looks, and
+                // leaked every top-level name into `__main__`.
+                let globals = py_module.dict();
+                py.run(&string, Some(&globals), None)
                     .map_err(|e| Error::Process(format!("Failed to run Python script: {}", e)))?;
             }
 
@@ -180,7 +188,7 @@ impl PythonProcessor {
             // Convert the bound function reference to a PyObject for storage.
             let func_obj: Py<PyAny> = func.into_any().unbind();
             Ok(PythonProcessor {
-                func: func_obj,
+                func: Arc::new(func_obj),
                 timeout_ms: config.timeout_ms,
             })
         })

@@ -51,6 +51,40 @@ fn docker_available() -> bool {
         .unwrap_or(false)
 }
 
+fn skip_without_docker(case: &str) {
+    if std::env::var_os("ARKFLOW_REQUIRE_DOCKER").is_some() {
+        panic!(
+            "{case}: Docker is required (ARKFLOW_REQUIRE_DOCKER is set) but no daemon is reachable"
+        );
+    }
+    eprintln!("--- SKIPPED {case}: Docker is unavailable ---");
+}
+
+/// Remove testcontainers `redis:7-alpine` containers leaked by crashed runs.
+fn sweep_leftover_cluster_containers() {
+    let Ok(listing) = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            "label=org.testcontainers.managed-by=testcontainers",
+            "--filter",
+            "ancestor=redis:7-alpine",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !listing.status.success() {
+        return;
+    }
+    for id in String::from_utf8_lossy(&listing.stdout).split_whitespace() {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
+    }
+}
+
 /// Minimal RESP client. Unlike the one in `redis_input.rs` it reads full
 /// bulk strings, because `CLUSTER INFO` (used as the readiness probe) is
 /// a multi-line bulk reply.
@@ -138,9 +172,14 @@ async fn cluster_lease() -> Option<ClusterLease> {
     let mut cluster = CLUSTER.lock().await;
     if cluster.is_none() {
         if !docker_available() {
-            eprintln!("skipping redis_cluster tests: Docker is unavailable");
+            skip_without_docker("redis cluster");
             return None;
         }
+        // The single-node lease publishes FIXED host ports: a container left
+        // alive by a crashed earlier run holds them, and the new node then
+        // fails to start. Sweep our own image's leftover containers first
+        // (the multi-node test publishes no ports and is unaffected).
+        sweep_leftover_cluster_containers();
         let container = GenericImage::new("redis", "7-alpine")
             .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
             .with_startup_timeout(Duration::from_secs(120))
@@ -298,6 +337,11 @@ async fn cluster_channels_subscription_delivers_published_payloads() {
 
     let batch = read_with_timeout(&input).await;
     assert_eq!(first_payload(&batch), b"hello-cluster");
+    let unexpected = tokio::time::timeout(Duration::from_millis(700), input.read()).await;
+    assert!(
+        unexpected.is_err(),
+        "a message published to another cluster channel must not be delivered"
+    );
     input.close().await.expect("close redis cluster input");
 }
 
@@ -324,5 +368,273 @@ async fn cluster_list_mode_pops_pushed_entries() {
 
     let batch = read_with_timeout(&input).await;
     assert_eq!(first_payload(&batch), b"hello-cluster-list");
+    input.close().await.expect("close redis cluster input");
+}
+
+// --- Real multi-node cluster -------------------------------------------------
+
+/// Three nodes, each owning a disjoint slot range. Kept alive for the test's
+/// duration; the containers are removed by testcontainers when dropped.
+struct MultiNodeCluster {
+    ips: Vec<String>,
+    _containers: Vec<ContainerAsync<GenericImage>>,
+    /// Removes the user-defined network after the containers are gone
+    /// (fields drop in declaration order).
+    _network: NetworkCleanup,
+}
+
+/// Best-effort `docker network rm` on drop.
+struct NetworkCleanup(String);
+
+impl Drop for NetworkCleanup {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["network", "rm", &self.0])
+            .output();
+    }
+}
+
+impl MultiNodeCluster {
+    fn addr(&self, index: usize) -> String {
+        format!("{}:6379", self.ips[index])
+    }
+
+    fn urls(&self) -> Vec<String> {
+        self.ips
+            .iter()
+            .map(|ip| format!("redis://{ip}:6379"))
+            .collect()
+    }
+
+    /// A key whose slot belongs to `node` (0-based). Uses `CLUSTER KEYSLOT`,
+    /// which every node computes locally.
+    async fn probe_key_owned_by_node(&self, node: usize) -> String {
+        let ranges = [(0u32, 5460u32), (5461, 10_922), (10_923, 16_383)];
+        let (low, high) = ranges[node];
+        let mut client = RespClient::connect(&self.addr(0)).await;
+        for index in 0..200 {
+            let key = format!("ark-redirect-{index}");
+            let reply = client
+                .cmd(&["CLUSTER".into(), "KEYSLOT".into(), key.clone()])
+                .await;
+            let slot: u32 = reply
+                .trim_start_matches(':')
+                .parse()
+                .unwrap_or_else(|_| panic!("CLUSTER KEYSLOT returned {reply}"));
+            if (low..=high).contains(&slot) {
+                return key;
+            }
+        }
+        panic!("no probe key landed in slots {low}..={high}");
+    }
+
+    /// LPUSH through a NON-owner node and follow the MOVED reply. The owner
+    /// address is returned so the test can prove the key really lives on the
+    /// other node (a single-node cluster never redirects).
+    async fn push_following_redirect(
+        &self,
+        client: &mut RespClient,
+        key: &str,
+        value: &str,
+    ) -> String {
+        let reply = client
+            .cmd(&["LPUSH".into(), key.into(), value.into()])
+            .await;
+        let Some(rest) = reply.strip_prefix("-MOVED ") else {
+            panic!("expected a MOVED redirect for a key owned by another node, got {reply}");
+        };
+        let owner_addr = rest
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("malformed MOVED reply: {reply}"))
+            .to_string();
+        let mut owner = RespClient::connect(&owner_addr).await;
+        let pushed = owner.cmd(&["LPUSH".into(), key.into(), value.into()]).await;
+        assert!(
+            pushed.starts_with(':'),
+            "LPUSH on the MOVED target failed: {pushed}"
+        );
+        owner_addr
+    }
+}
+
+/// Form three fresh `redis:7-alpine` containers into a cluster. Returns
+/// `None` when Docker is unavailable, or when the host cannot route to the
+/// container bridge network (Docker Desktop keeps it inside its VM): the
+/// Redis client under test runs on the host and must reach every node's
+/// announced address.
+async fn multi_node_cluster() -> Option<MultiNodeCluster> {
+    if !docker_available() {
+        skip_without_docker("redis multi-node cluster");
+        return None;
+    }
+    // A user-defined network is required: `get_bridge_ip_address` inspects
+    // the container's NetworkMode, and Docker Desktop reports `default` for
+    // the implicit bridge (no inspectable network of that name).
+    let network = format!("arkflow-redis-cluster-{}", std::process::id());
+    let created = std::process::Command::new("docker")
+        .args(["network", "create", &network])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !created {
+        eprintln!("skipping multi-node redis cluster: cannot create a Docker network");
+        return None;
+    }
+    let _network_cleanup = NetworkCleanup(network.clone());
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut containers = Vec::with_capacity(3);
+    for _ in 0..3 {
+        containers.push(
+            GenericImage::new("redis", "7-alpine")
+                .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+                .with_startup_timeout(Duration::from_secs(120))
+                .with_cmd([
+                    "--cluster-enabled",
+                    "yes",
+                    "--cluster-config-file",
+                    "nodes.conf",
+                ])
+                .with_network(network.clone())
+                .start()
+                .await
+                .expect("redis cluster node start"),
+        );
+    }
+    let mut ips = Vec::with_capacity(3);
+    for container in &containers {
+        ips.push(
+            container
+                .get_bridge_ip_address()
+                .await
+                .expect("redis cluster node bridge IP")
+                .to_string(),
+        );
+    }
+    if tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect((ips[0].as_str(), 6379)),
+    )
+    .await
+    .is_err()
+    {
+        eprintln!(
+            "skipping multi-node redis cluster: the container bridge network is not \
+             routable from the host"
+        );
+        return None;
+    }
+
+    // Assign epochs BEFORE meeting, then give each node a disjoint third of
+    // the hash slots.
+    let mut clients = Vec::with_capacity(3);
+    for (index, ip) in ips.iter().enumerate() {
+        let mut client = RespClient::connect(&format!("{ip}:6379")).await;
+        let reply = client
+            .cmd(&[
+                "CLUSTER".into(),
+                "SET-CONFIG-EPOCH".into(),
+                (index + 1).to_string(),
+            ])
+            .await;
+        assert!(reply.starts_with('+'), "SET-CONFIG-EPOCH failed: {reply}");
+        clients.push(client);
+    }
+    for (index, client) in clients.iter_mut().enumerate() {
+        let start = index * 5461;
+        let end = if index == 2 { 16_383 } else { start + 5460 };
+        let mut args = vec!["CLUSTER".to_string(), "ADDSLOTS".to_string()];
+        args.extend((start..=end).map(|slot| slot.to_string()));
+        let reply = client.cmd(&args).await;
+        assert!(
+            reply.starts_with('+'),
+            "ADDSLOTS failed on node {index}: {reply}"
+        );
+    }
+    for index in 1..3 {
+        let reply = clients[0]
+            .cmd(&[
+                "CLUSTER".into(),
+                "MEET".into(),
+                ips[index].clone(),
+                "6379".into(),
+            ])
+            .await;
+        assert!(reply.starts_with('+'), "CLUSTER MEET failed: {reply}");
+    }
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "multi-node redis cluster never converged"
+        );
+        let mut converged = true;
+        for client in clients.iter_mut() {
+            let info = client.cmd(&["CLUSTER".into(), "INFO".into()]).await;
+            if !info.contains("cluster_state:ok") || !info.contains("cluster_slots_assigned:16384")
+            {
+                converged = false;
+            }
+        }
+        if converged {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Some(MultiNodeCluster {
+        ips,
+        _containers: containers,
+        _network: _network_cleanup,
+    })
+}
+
+async fn build_cluster_input_with_urls(
+    urls: Vec<String>,
+    redis_type: serde_json::Value,
+) -> Arc<dyn Input> {
+    ensure_init();
+    InputConfig {
+        input_type: "redis".into(),
+        name: None,
+        codec: None,
+        config: Some(serde_json::json!({
+            "mode": {"type": "cluster", "urls": urls},
+            "redis_type": redis_type,
+        })),
+    }
+    .build(&resource())
+    .expect("build redis multi-node cluster input")
+}
+
+/// A key owned by a node the client did NOT connect to first must still be
+/// readable: the client follows the cluster's MOVED routing. The single-node
+/// suite (all 16384 slots on one node) can never exercise this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn cluster_routes_a_key_owned_by_another_node() {
+    let Some(cluster) = multi_node_cluster().await else {
+        return;
+    };
+    let key = cluster.probe_key_owned_by_node(2).await;
+    let mut entry = RespClient::connect(&cluster.addr(0)).await;
+    let owner = cluster
+        .push_following_redirect(&mut entry, &key, "hello-redirect")
+        .await;
+    assert_eq!(
+        owner,
+        cluster.addr(2),
+        "the probe key must live on the third node"
+    );
+
+    let input = build_cluster_input_with_urls(
+        cluster.urls(),
+        serde_json::json!({
+            "type": "list",
+            "list": [key],
+        }),
+    )
+    .await;
+    input.connect().await.expect("connect redis cluster input");
+    let batch = read_with_timeout(&input).await;
+    assert_eq!(first_payload(&batch), b"hello-redirect");
     input.close().await.expect("close redis cluster input");
 }

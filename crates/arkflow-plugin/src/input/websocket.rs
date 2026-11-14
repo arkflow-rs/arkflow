@@ -214,6 +214,26 @@ impl Input for WebSocketInput {
 }
 
 impl WebSocketInput {
+    /// Forward a delivery unless the input is closing first. The send can
+    /// block on a full bounded channel when the kernel has already stopped
+    /// consuming; without the cancellation arm this detached reader task
+    /// would linger (and retain the socket) until the send settles.
+    async fn forward(
+        sender: &Sender<Delivery>,
+        cancellation_token: &CancellationToken,
+        delivery: Delivery,
+    ) -> bool {
+        tokio::select! {
+            _ = cancellation_token.cancelled() => false,
+            result = sender.send_async(delivery) => {
+                if let Err(e) = result {
+                    error!("Failed to forward WebSocket message: {}", e);
+                }
+                true
+            }
+        }
+    }
+
     async fn handle_websocket_messages(
         mut reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
         sender: Sender<Delivery>,
@@ -236,36 +256,50 @@ impl WebSocketInput {
                                     continue;
                                 }
                                 Message::Close(_) => {
-                                    if let Err(e) = sender.send_async(Delivery::Err(Error::Disconnection)).await {
-                                        error!("Failed to send disconnection notification: {}", e);
-                                    }
+                                    let _ = Self::forward(
+                                        &sender,
+                                        &cancellation_token,
+                                        Delivery::Err(Error::Disconnection),
+                                    )
+                                    .await;
                                     break;
                                 }
                             };
-                            let delivery = crate::input::codec_helper::decode_delivery(
-                                &payload,
-                                &codec,
-                                input_name.clone(),
-                                Arc::new(NoopAck),
-                            )
-                            .await;
-                            if let Err(e) = sender.send_async(delivery).await {
-                                error!("Failed to forward WebSocket message: {}", e);
+                            // Decoding can await (schema fetch, JSON parse);
+                            // close must be able to interrupt it instead of
+                            // waiting for the decoder to settle.
+                            let delivery = tokio::select! {
+                                _ = cancellation_token.cancelled() => break,
+                                delivery = crate::input::codec_helper::decode_delivery(
+                                    &payload,
+                                    &codec,
+                                    input_name.clone(),
+                                    Arc::new(NoopAck),
+                                ) => delivery,
+                            };
+                            if !Self::forward(&sender, &cancellation_token, delivery).await {
+                                break;
                             }
                         },
                         Some(Err(e)) => {
                             // Log the error and notify about disconnection
                             error!("WebSocket read error: {}", e);
-                            if let Err(e) = sender.send_async(Delivery::Err(Error::Disconnection)).await {
-                                error!("Failed to send error notification: {}", e);
-                            }
+                            let _ = Self::forward(
+                                &sender,
+                                &cancellation_token,
+                                Delivery::Err(Error::Disconnection),
+                            )
+                            .await;
                             break;
                         },
                         None => {
                             // Connection closed
-                            if let Err(e) = sender.send_async(Delivery::Err(Error::Disconnection)).await {
-                                error!("Failed to send disconnection notification: {}", e);
-                            }
+                            let _ = Self::forward(
+                                &sender,
+                                &cancellation_token,
+                                Delivery::Err(Error::Disconnection),
+                            )
+                            .await;
                             break;
                         }
                     }
