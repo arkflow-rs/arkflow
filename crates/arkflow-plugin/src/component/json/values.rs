@@ -295,8 +295,17 @@ fn build_struct_array<'a, 'de>(
         })
         .collect::<Result<Vec<ArrayRef>, Error>>()?;
 
-    let array = StructArray::try_new(fields.clone(), children, nulls.finish())
-        .map_err(|e| Error::Process(format!("JSON decode failed for column `{}`: {}", path, e)))?;
+    // A struct type with ZERO child fields cannot derive its length from
+    // the children (`try_new` rejects empty children outright), so an
+    // `after: {}`-style empty object failed whenever rows were present.
+    // Pass the row count explicitly.
+    let array = StructArray::try_new_with_length(
+        fields.clone(),
+        children,
+        nulls.finish(),
+        values.len(),
+    )
+    .map_err(|e| Error::Process(format!("JSON decode failed for column `{}`: {}", path, e)))?;
     Ok(Arc::new(array))
 }
 

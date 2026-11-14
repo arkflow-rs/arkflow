@@ -120,13 +120,17 @@ fn insert_meta<'de>(
     value: CowValue<'de>,
     collisions: &mut Vec<String>,
 ) {
-    if row.contains_key(name) {
-        if !collisions.iter().any(|c| c == name) {
-            collisions.push(name.to_string());
-        }
-        row.insert(Cow::Owned(format!("__debezium_{name}")), value);
-    } else {
+    if !row.contains_key(name) {
         row.insert(Cow::Borrowed(name), value);
+        return;
+    }
+    // Double collision: the business payload already holds BOTH the primary
+    // name and the reserved fallback. Business data always wins — writing
+    // the fallback would silently REPLACE a business column with envelope
+    // metadata — so the envelope value is dropped and the collision recorded
+    // (the schema shift stays observable to the operator).
+    if !collisions.iter().any(|c| c == name) {
+        collisions.push(name.to_string());
     }
 }
 
