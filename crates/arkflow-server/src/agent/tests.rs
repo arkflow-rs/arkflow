@@ -207,6 +207,89 @@ async fn parked_job_observations_are_redelivered_by_the_next_session() {
     assert!(runtime.take_finished().await.is_empty());
 }
 
+/// Concurrent reports can complete out of order: an older response must not
+/// move the confirmed deadline backwards and cause a premature timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn out_of_order_renewals_keep_the_newest_deadline() {
+    let (hub_url, hub_cancel, hub_task) =
+        json_stub_hub(serde_json::json!({"state": "running"})).await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let template = command_result_template(HubOperationState::Acknowledged);
+    let progress = super::commands::spawn_progress_reports(
+        &client,
+        &config,
+        &auth,
+        &template,
+        std::time::Duration::from_millis(100),
+        2_000,
+        super::now_ms().saturating_add(60_000),
+    );
+    let now = super::now_ms();
+    progress.mark_renewed(2_000, std::time::Duration::from_millis(100), now);
+    let newest = progress.deadline_ms();
+    // The older response arrives last and confirms a deadline in the past.
+    progress.mark_renewed(
+        2_000,
+        std::time::Duration::from_millis(100),
+        now.saturating_sub(1_500),
+    );
+    assert_eq!(
+        progress.deadline_ms(),
+        newest,
+        "an older response must not move the confirmed deadline backwards"
+    );
+    drop(progress);
+    hub_cancel.cancel();
+    let _ = hub_task.await;
+}
+
+/// Watcher + reporter together: the real reporter renews while the operation
+/// is still running, so a watcher decision taken AFTER the original deadline
+/// has passed still chooses Continue.
+#[tokio::test(flavor = "multi_thread")]
+async fn running_operation_stays_alive_across_the_original_deadline() {
+    use super::commands::{lifecycle_wait_decision, LifecycleWait};
+    use arkflow_core::control::OperationState;
+
+    let (hub_url, hub_cancel, hub_task) =
+        json_stub_hub(serde_json::json!({"state": "running"})).await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let original_deadline = super::now_ms().saturating_add(300);
+    let template = command_result_template(HubOperationState::Acknowledged);
+    let progress = super::commands::spawn_progress_reports(
+        &client,
+        &config,
+        &auth,
+        &template,
+        std::time::Duration::from_millis(100),
+        2_000,
+        original_deadline,
+    );
+    // Hold the operation "in progress" past its original deadline.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let now = super::now_ms();
+    assert!(
+        now > original_deadline,
+        "the original deadline must have passed"
+    );
+    assert!(
+        progress.deadline_ms() > now,
+        "the reporter must have renewed the deadline past the original one"
+    );
+    assert_eq!(
+        lifecycle_wait_decision(Some(OperationState::Running), progress.deadline_ms(), now),
+        LifecycleWait::Continue,
+        "the watcher must keep waiting while the operation is still running"
+    );
+    drop(progress);
+    hub_cancel.cancel();
+    let _ = hub_task.await;
+}
+
 /// The watcher decision with a fixed clock: an operation that is still
 /// running when its ORIGINAL deadline passes stays alive while the renewed
 /// (Hub-leased) deadline is ahead; a terminal observation always wins.
