@@ -11,6 +11,7 @@
 use super::error::HubError;
 use super::{now_ms, Hub, HUB_SEQUENCE};
 use crate::storage::{AuditRecord, ConfigApprovalRequest, ConfigApprovalStatus};
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 /// Terminal requests are pruned after 30 days.
@@ -153,6 +154,10 @@ impl Hub {
         approver_id: String,
         note: Option<String>,
     ) -> Result<ConfigApprovalRequest, HubError> {
+        // A retry of a crashed approval re-enters at `approving` and skips
+        // the status CAS; serialize the whole adopt-or-create decision so
+        // two such callers cannot each create a rollout for one correlation.
+        let _decision = self.approval_lock.lock().await;
         let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
         let request = storage
             .get_config_approval_request(request_id)
@@ -378,6 +383,7 @@ impl Hub {
     ) -> Result<bool, HubError> {
         let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
         let rollouts = storage.list_rollouts().await.map_err(HubError::from)?;
+        let mut applied: BTreeSet<String> = BTreeSet::new();
         for rollout in &rollouts {
             if rollout.config_version_id != config_version_id {
                 continue;
@@ -386,14 +392,18 @@ impl Hub {
                 .list_rollout_targets(&rollout.rollout_id)
                 .await
                 .map_err(HubError::from)?;
-            if targets.iter().any(|target| {
-                node_ids.contains(&target.node_id)
+            for target in targets {
+                if node_ids.contains(&target.node_id)
                     && (target.observed_config_version.as_deref() == Some(config_version_id)
                         || matches!(target.state.as_str(), "applied" | "converged" | "succeeded"))
-            }) {
-                return Ok(true);
+                {
+                    applied.insert(target.node_id);
+                }
             }
         }
-        Ok(false)
+        // Every rollback target must have an application record: a version
+        // applied to only part of the fleet must not reach the remaining
+        // nodes through the rollback path around the approval gate.
+        Ok(node_ids.iter().all(|node_id| applied.contains(node_id)))
     }
 }

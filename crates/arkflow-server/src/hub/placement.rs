@@ -1339,6 +1339,33 @@ impl Hub {
             .await
             .map_err(HubError::from)?
         else {
+            // No claimable attempt. A terminal/superseded intent can never
+            // produce one again: settle the outbox row instead of leaving it
+            // at the head of the claim order forever.
+            let terminal = match outbox.intent_id.as_deref() {
+                Some(intent_id) => storage
+                    .get_intent(intent_id)
+                    .await
+                    .map_err(HubError::from)?
+                    .is_none_or(|intent| {
+                        matches!(
+                            intent.state.as_str(),
+                            "converged"
+                                | "blocked"
+                                | "superseded"
+                                | "failed"
+                                | "cancelled"
+                                | "timed_out"
+                        )
+                    }),
+                None => true,
+            };
+            if terminal {
+                storage
+                    .mark_outbox_processed(outbox.outbox_id, now_ms())
+                    .await
+                    .map_err(HubError::from)?;
+            }
             return Ok(None);
         };
         // Transient secret pre-resolution: `${secret:...}` references in

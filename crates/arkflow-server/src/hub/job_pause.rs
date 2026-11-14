@@ -383,6 +383,14 @@ impl Hub {
                 pinned.push(pointer);
             }
         }
+        // Aborting a pause restores `pause_prev_checkpoint_id`; retention
+        // must keep that artifact readable until the pause reaches a
+        // terminal phase (or the abort restores a now-missing pointer).
+        if let Some(previous) = job.pause_prev_checkpoint_id {
+            if !pinned.contains(&previous) {
+                pinned.push(previous);
+            }
+        }
         pinned
     }
 

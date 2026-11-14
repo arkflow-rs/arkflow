@@ -4300,6 +4300,70 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn outbox_claim_skips_an_offline_node_and_reaches_the_online_row() {
+        let store = ControlPlaneStore::contract(
+            "outbox_claim_skips_an_offline_node_and_reaches_the_online_row",
+        )
+        .await;
+        let now = now_ms();
+        // The oldest row belongs to a registered but expired node: it must
+        // not occupy the single claim slot ahead of live nodes.
+        store
+            .upsert_node(NodeMutation {
+                node_id: "node-offline".into(),
+                version: "v1".into(),
+                state: "stale".into(),
+                capabilities_json: "[]".into(),
+                boot_id: None,
+                report_seq: None,
+                last_seen_at_ms: now.saturating_sub(60_000),
+                lease_expires_at_ms: now.saturating_sub(30_000),
+                maintenance_state: None,
+                maintenance_updated_at_ms: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_desired(DesiredMutation {
+                node_id: "node-offline".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_node(NodeMutation {
+                node_id: "node-online".into(),
+                version: "v1".into(),
+                state: "online".into(),
+                capabilities_json: "[]".into(),
+                boot_id: None,
+                report_seq: None,
+                last_seen_at_ms: now,
+                lease_expires_at_ms: now.saturating_add(60_000),
+                maintenance_state: None,
+                maintenance_updated_at_ms: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_desired(DesiredMutation {
+                node_id: "node-online".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let claimed = store.claim_outbox("worker", now).await.unwrap().unwrap();
+        assert_eq!(claimed.node_id, "node-online");
+    }
+
     /// The outbox retention reclaims only processed rows: the unprocessed
     /// work queue (pending or claimed) survives every sweep, and the status
     /// counters — which only look at unprocessed rows — are unaffected.

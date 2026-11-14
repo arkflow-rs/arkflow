@@ -359,7 +359,24 @@ impl Hub {
         };
         let mut nodes = self.nodes.write().await;
         if nodes.len() >= MAX_NODES && !nodes.contains_key(&request.node_id) {
-            return Err(HubError::Capacity);
+            // Retired nodes used to occupy the fixed registry forever: the
+            // expiry sweep only changes their state, never removes the map
+            // entry. Reclaim one expired/offline slot instead of rejecting a
+            // live node for the whole process lifetime.
+            let reclaimable = nodes
+                .iter()
+                .find(|(id, record)| {
+                    id.as_str() != request.node_id
+                        && (record.resource.state != NodeConnectionState::Online
+                            || record.resource.lease_expires_at_ms <= now)
+                })
+                .map(|(id, _)| id.clone());
+            match reclaimable {
+                Some(id) => {
+                    nodes.remove(&id);
+                }
+                None => return Err(HubError::Capacity),
+            }
         }
         let old = nodes.remove(&request.node_id);
         let boot_changed = old

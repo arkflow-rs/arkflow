@@ -166,6 +166,10 @@ pub struct Hub {
     pub(crate) test_list_gate: Arc<RwLock<Option<Arc<TestGate>>>>,
     #[cfg(test)]
     pub(crate) test_after_write_gate: Arc<RwLock<Option<Arc<TestGate>>>>,
+    /// Serializes approval decisions: a retry that resumes an `approving`
+    /// request skips the status CAS, so two callers could otherwise both
+    /// adopt-or-create a rollout for the same correlation.
+    approval_lock: Arc<tokio::sync::Mutex<()>>,
     /// The node order each Job's placement was actually dispatched in, so a
     /// retained placement re-dispatches with the identical task→node mapping
     /// (split round-robin and multi-component co-location are order
@@ -315,6 +319,7 @@ impl Hub {
             test_list_gate: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             test_after_write_gate: Arc::new(RwLock::new(None)),
+            approval_lock: Arc::new(tokio::sync::Mutex::new(())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             plan_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),

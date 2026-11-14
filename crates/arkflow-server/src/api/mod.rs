@@ -894,13 +894,23 @@ struct HubTlsListener {
         tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
         std::net::SocketAddr,
     )>,
+    /// Owns the real TCP listener. Dropping the serve-side listener aborts
+    /// this task, which drops the socket and releases the bound port; a
+    /// detached accept loop used to keep the port after Axum exited.
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HubTlsListener {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
 }
 
 impl HubTlsListener {
     fn spawn(inner: TcpListener, acceptor: tokio_rustls::TlsAcceptor) -> std::io::Result<Self> {
         let local_addr = inner.local_addr()?;
         let (tx, ready) = tokio::sync::mpsc::channel(128);
-        tokio::spawn(async move {
+        let accept_task = tokio::spawn(async move {
             // Bound concurrent handshakes: decoupling admission from
             // consumption would otherwise let a connection flood multiply
             // in-flight handshake tasks without limit (each held for at
@@ -948,7 +958,11 @@ impl HubTlsListener {
                 }
             }
         });
-        Ok(Self { local_addr, ready })
+        Ok(Self {
+            local_addr,
+            ready,
+            accept_task,
+        })
     }
 }
 

@@ -573,7 +573,7 @@ impl StorageBackend for PostgresBackend {
             let candidate: Option<(i64, String, String, String, Option<String>, Option<String>)> =
                 transaction
                     .query_row(
-                        "SELECT outbox_id, event_key, event_type, node_id, stream_id, intent_id FROM cp_outbox WHERE processed_at_ms IS NULL AND available_at_ms <= ?1 AND (claimed_at_ms IS NULL OR claimed_at_ms < ?2) ORDER BY outbox_id LIMIT 1",
+                        "SELECT o.outbox_id, o.event_key, o.event_type, o.node_id, o.stream_id, o.intent_id FROM cp_outbox o LEFT JOIN cp_nodes n ON n.node_id = o.node_id WHERE o.processed_at_ms IS NULL AND o.available_at_ms <= $1 AND (o.claimed_at_ms IS NULL OR o.claimed_at_ms < $2) AND (n.node_id IS NULL OR (n.state = 'online' AND n.lease_expires_at_ms > $1)) ORDER BY o.outbox_id LIMIT 1",
                         binds![now_ms, now_ms.saturating_sub(CLAIM_LEASE_MS)],
                         |row| {
                             Ok((
