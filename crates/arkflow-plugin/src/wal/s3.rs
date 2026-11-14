@@ -1050,7 +1050,10 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
 
     // Retry parked (failed-PUT) segments first: a newer active segment may
     // only be sealed once everything before it is durable.
-    while let Some(batch) = store.pending_seal.lock().unwrap().pop_front() {
+    loop {
+        let Some(batch) = store.pending_seal.lock().unwrap().pop_front() else {
+            break;
+        };
         if let Err(e) = publish_sealed_segment(store, &batch).await {
             store.pending_seal.lock().unwrap().push_front(batch);
             return Err(e);

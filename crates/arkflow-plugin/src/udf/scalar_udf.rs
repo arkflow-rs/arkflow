@@ -50,7 +50,7 @@ pub fn register(udf: ScalarUDF) -> Result<(), Error> {
     let mut keys: Vec<&str> = vec![name];
     keys.extend(udf.aliases().iter().map(String::as_str));
     for (existing_name, existing_udf) in udfs.iter() {
-        let collides = keys.iter().any(|key| *key == existing_name.as_str())
+        let collides = keys.contains(&existing_name.as_str())
             || keys
                 .iter()
                 .any(|key| existing_udf.aliases().iter().any(|alias| alias == *key));

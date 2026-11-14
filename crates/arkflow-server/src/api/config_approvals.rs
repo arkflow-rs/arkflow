@@ -63,8 +63,14 @@ pub(super) async fn list_approvals(
     Query(query): Query<ApprovalListQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) =
-        require_operator_action(&hub, &headers, OperatorAction::Read, "approval", None).await
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "config_approval",
+        None,
+    )
+    .await
     {
         return response;
     }
@@ -95,7 +101,7 @@ pub(super) async fn get_approval(
         &hub,
         &headers,
         OperatorAction::Read,
-        "approval",
+        "config_approval",
         Some(id.clone()),
     )
     .await

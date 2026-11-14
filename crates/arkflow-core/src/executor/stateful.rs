@@ -122,18 +122,18 @@ impl StatefulOperator {
                 }
             };
         }
-        // Tags carry the trailing COLON the rescale parser strips
-        // (`routing_key_bytes` expects "<tag>:"); a bare prefix made every
-        // integer-keyed state fail rescale redistribution with
-        // "unrecognized key encoding".
-        encode_integer_keys!(Int8Array, "i8:");
-        encode_integer_keys!(Int16Array, "i16:");
-        encode_integer_keys!(Int32Array, "i32:");
-        encode_integer_keys!(Int64Array, "i64:");
-        encode_integer_keys!(UInt8Array, "u8:");
-        encode_integer_keys!(UInt16Array, "u16:");
-        encode_integer_keys!(UInt32Array, "u32:");
-        encode_integer_keys!(UInt64Array, "u64:");
+        // The bare tags are the PERSISTED encoding released versions wrote:
+        // state restored from a checkpoint must keep resolving under the
+        // same key bytes (and the null sentinels must hash like the routing
+        // path). The rescale parser accepts both this and the tagged form.
+        encode_integer_keys!(Int8Array, "i8");
+        encode_integer_keys!(Int16Array, "i16");
+        encode_integer_keys!(Int32Array, "i32");
+        encode_integer_keys!(Int64Array, "i64");
+        encode_integer_keys!(UInt8Array, "u8");
+        encode_integer_keys!(UInt16Array, "u16");
+        encode_integer_keys!(UInt32Array, "u32");
+        encode_integer_keys!(UInt64Array, "u64");
         Err(Error::Process(format!(
             "stateful operator key field '{}' has unsupported Arrow type {:?}",
             self.key_field,

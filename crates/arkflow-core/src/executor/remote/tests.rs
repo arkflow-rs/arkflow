@@ -2703,7 +2703,7 @@ async fn pump_register_rejection_with_failing_abort_combines_errors() {
     .unwrap();
     drop(tx);
     let result = pump_edge(
-        rx, writer, quad, pending, shutdown, config, None, false, None, false,
+        rx, writer, quad, pending, shutdown, config, None, false, None, false, false,
     )
     .await;
     let error = result.unwrap_err();
@@ -2822,6 +2822,11 @@ async fn run_receipt_harness(
             false,
             failures_tx,
             &shutdown,
+            // The fixture builds the ack from the nonce of the handshake it
+            // wrote itself (`auth.client_handshake()` in the test body).
+            // Suppress the pump's own handshake so it cannot overwrite that
+            // recorded nonce before the read half verifies the ack.
+            true,
             false,
         ),
     )
@@ -3811,7 +3816,7 @@ async fn pump_register_rejection_with_a_clean_abort_reports_the_limit() {
     .unwrap();
     drop(tx);
     let error = pump_edge(
-        rx, writer, quad, pending, shutdown, config, None, false, None, false,
+        rx, writer, quad, pending, shutdown, config, None, false, None, false, false,
     )
     .await
     .unwrap_err();
@@ -3850,6 +3855,7 @@ async fn pump_data_write_failures_fail_the_edge() {
         None,
         false,
         None,
+        false,
         false,
     )
     .await

@@ -64,23 +64,44 @@ pub(super) async fn hub_operations(
     .into_response()
 }
 
+/// Authorize one operator action on a Hub operation and return the resolved
+/// record. The operation id lives in its own namespace (`hop-42`), so a
+/// node-scoped principal authorizes through the operation's owning node while
+/// an explicit operation-ID scope still authorizes directly. `None` means the
+/// operation does not exist (the caller reports 404).
+#[allow(clippy::result_large_err)] // same ready-made Response idiom as require_operator_action
+async fn authorize_operation(
+    hub: &hub::Hub,
+    headers: &HeaderMap,
+    action: OperatorAction,
+    id: &str,
+) -> Result<Option<hub::HubOperation>, Response> {
+    let operation = hub.operation(id).await;
+    let supplied = super::bearer(headers);
+    let principal = hub.operator_principal(supplied.as_deref()).await;
+    let allowed = principal.as_ref().is_some_and(|principal| {
+        principal.can_scope(action, "operation", Some(id))
+            || operation.as_ref().is_some_and(|operation| {
+                principal.can_scope(action, "operation", Some(&operation.node_id))
+            })
+    });
+    if !allowed {
+        // Same audit + denial path as every other endpoint.
+        require_operator_action(hub, headers, action, "operation", Some(id.to_owned())).await?;
+    }
+    Ok(operation)
+}
+
 pub(super) async fn hub_operation(
     State(hub): State<hub::Hub>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_operator_action(
-        &hub,
-        &headers,
-        OperatorAction::Read,
-        "operation",
-        Some(id.clone()),
-    )
-    .await
-    {
-        return response;
-    }
-    match hub.operation(&id).await {
+    let operation = match authorize_operation(&hub, &headers, OperatorAction::Read, &id).await {
+        Ok(operation) => operation,
+        Err(response) => return response,
+    };
+    match operation {
         Some(operation) => Json(operation).into_response(),
         None => problem(
             StatusCode::NOT_FOUND,
@@ -95,19 +116,19 @@ pub(super) async fn hub_cancel_operation(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_operator_action(
-        &hub,
-        &headers,
-        OperatorAction::Operate,
-        "operation",
-        Some(id.clone()),
-    )
-    .await
-    {
-        return response;
-    }
-    match hub.cancel_operation(&id).await {
-        Some(operation) => Json(operation).into_response(),
+    let operation = match authorize_operation(&hub, &headers, OperatorAction::Operate, &id).await {
+        Ok(operation) => operation,
+        Err(response) => return response,
+    };
+    match operation {
+        Some(_) => match hub.cancel_operation(&id).await {
+            Some(operation) => Json(operation).into_response(),
+            None => problem(
+                StatusCode::NOT_FOUND,
+                "operation_not_found",
+                format!("Unknown operation: {id}"),
+            ),
+        },
         None => problem(
             StatusCode::NOT_FOUND,
             "operation_not_found",

@@ -561,6 +561,17 @@ impl ProtobufBatchConverter {
         if !self.started {
             for field in self.descriptor.fields() {
                 let field_name = field.name();
+                // Contract (module docs): oneof members and proto3 `optional`
+                // fields are not supported by the scalar column plan — the
+                // presence bit would be lost. Reject on the production path
+                // too, not only in the test-only per-message oracle.
+                if let Some(oneof) = field.containing_oneof() {
+                    return Err(Error::Process(format!(
+                        "Protobuf field '{}' is a member of oneof '{}': oneof and proto3 `optional` fields are not supported",
+                        field_name,
+                        oneof.name()
+                    )));
+                }
                 let (plan, mut builder) = proto_plan(field_name, field.number(), &field.kind())?;
                 proto_append_value(
                     field_name,
@@ -1386,6 +1397,24 @@ message Holder { Nested inner = 1; }
         let mut conv = ProtobufBatchConverter::new(descriptor.clone());
         let err = conv.push(&encoded).unwrap_err();
         assert!(err.to_string().contains("Unsupported field type"), "{err}");
+    }
+
+    #[test]
+    fn batch_converter_rejects_oneof_members_like_single_path() {
+        let schema = r#"syntax = "proto3";
+package t;
+message Choice { oneof pick { int32 a = 1; string b = 2; } }
+"#;
+        let descriptor = parse_proto_source(schema, "t.Choice").unwrap();
+        let encoded = DynamicMessage::new(descriptor.clone()).encode_to_vec();
+
+        // Both decode paths must reject the same descriptors: the production
+        // converter lost the presence bit just like the test oracle would.
+        let err = protobuf_to_arrow(&descriptor, &encoded).unwrap_err();
+        assert!(err.to_string().contains("oneof"), "{err}");
+        let mut conv = ProtobufBatchConverter::new(descriptor);
+        let err = conv.push(&encoded).unwrap_err();
+        assert!(err.to_string().contains("oneof"), "{err}");
     }
 
     /// Ad-hoc release timing (NOT run by CI): per-message batches +

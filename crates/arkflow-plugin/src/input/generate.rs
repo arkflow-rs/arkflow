@@ -307,7 +307,12 @@ mod tests {
         let (msg_batch, _) = input.read().await.unwrap();
         assert_eq!(msg_batch.len(), 2);
 
-        // Second read should return EOF because next batch would exceed count
+        // Second read returns the partial final batch: the remaining quota
+        // (1 row) is emitted instead of dropping it.
+        let (msg_batch, _) = input.read().await.unwrap();
+        assert_eq!(msg_batch.len(), 1);
+
+        // Third read reports EOF: the quota is spent.
         assert!(matches!(input.read().await, Err(Error::EOF)));
     }
 

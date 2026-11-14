@@ -760,34 +760,37 @@ impl LookupProcessor {
 
         let rows = batch.num_rows();
         let separator = '\u{1f}';
+        // Only a multi-column join can be made ambiguous by a value carrying
+        // the separator; a single-column key is the value itself.
+        let composite = per_column.len() > 1;
         let mut keys = Vec::with_capacity(rows);
         for row in 0..rows {
+            // A null component makes the composite key absent regardless of
+            // the other components, so separator validation applies only to
+            // rows that actually join multiple non-null values.
+            if per_column.iter().any(|values| values[row].is_none()) {
+                keys.push(None);
+                continue;
+            }
             let mut key = String::new();
-            let mut is_null = false;
             for (column_index, values) in per_column.iter().enumerate() {
                 if column_index > 0 {
                     key.push(separator);
                 }
-                match &values[row] {
-                    Some(value) => {
-                        // The composite key joins with \u{1f}; a value
-                        // carrying that separator makes distinct tuples
-                        // collide into one cache key (dedup would then serve
-                        // wrong rows). Reject loudly instead.
-                        if value.contains(separator) {
-                            return Err(Error::Process(format!(
-                                "lookup processor: key value in row {row} contains the composite-key separator U+001F; such values cannot be joined unambiguously"
-                            )));
-                        }
-                        key.push_str(value);
+                if let Some(value) = &values[row] {
+                    // The composite key joins with \u{1f}; a value carrying
+                    // that separator makes distinct tuples collide into one
+                    // cache key (dedup would then serve wrong rows). Reject
+                    // loudly instead.
+                    if composite && value.contains(separator) {
+                        return Err(Error::Process(format!(
+                            "lookup processor: key value in row {row} contains the composite-key separator U+001F; such values cannot be joined unambiguously"
+                        )));
                     }
-                    None => {
-                        is_null = true;
-                        break;
-                    }
+                    key.push_str(value);
                 }
             }
-            keys.push(if is_null { None } else { Some(key) });
+            keys.push(Some(key));
         }
         Ok(keys)
     }
@@ -1207,6 +1210,84 @@ mod tests {
         let path = &mock.requests()[0];
         // U+001F percent-encoded inside the key segment.
         assert!(path.contains("42%1F7"), "{path}");
+    }
+
+    #[tokio::test]
+    async fn single_column_key_may_contain_the_separator() {
+        // One column needs no join, so U+001F cannot create a tuple
+        // collision: the value is the key, percent-encoded as usual.
+        let mock = MockDimService::spawn(|_path| (200, record_body("x", 1)));
+        let mut config = base_config(mock.addr, serde_json::json!({}));
+        config["key_columns"] = serde_json::json!(["user_id"]);
+        let processor = build_processor(config);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a\u{1f}b"]))])
+                .unwrap(),
+        ));
+        process_single(&processor, batch).await;
+        assert!(
+            mock.requests()[0].contains("a%1Fb"),
+            "{:?}",
+            mock.requests()
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_key_with_a_null_component_is_absent_not_rejected() {
+        // A null component makes the composite key absent, so separator
+        // validation must not fire for the other components.
+        let mock = MockDimService::spawn(|_path| (200, record_body("x", 1)));
+        let mut config = base_config(mock.addr, serde_json::json!({}));
+        config["key_columns"] = serde_json::json!(["tenant_id", "user_id"]);
+        let processor = build_processor(config);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, true),
+            Field::new("user_id", DataType::Utf8, true),
+        ]));
+        let batch = Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a\u{1f}b")])),
+                    Arc::new(StringArray::from(vec![None::<&str>])),
+                ],
+            )
+            .unwrap(),
+        ));
+        process_single(&processor, batch).await;
+        assert!(
+            mock.requests().is_empty(),
+            "a null composite key must not be looked up"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_key_rejects_separator_values() {
+        let mock = MockDimService::spawn(|_path| (200, record_body("x", 1)));
+        let mut config = base_config(mock.addr, serde_json::json!({}));
+        config["key_columns"] = serde_json::json!(["tenant_id", "user_id"]);
+        let processor = build_processor(config);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, true),
+            Field::new("user_id", DataType::Utf8, true),
+        ]));
+        let batch = Arc::new(MessageBatch::new_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["a\u{1f}b"])),
+                    Arc::new(StringArray::from(vec!["c"])),
+                ],
+            )
+            .unwrap(),
+        ));
+        let err = processor.process(batch).await.unwrap_err().to_string();
+        assert!(err.contains("U+001F"), "{err}");
     }
 
     #[tokio::test]

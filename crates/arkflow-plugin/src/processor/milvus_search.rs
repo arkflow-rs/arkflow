@@ -409,7 +409,7 @@ mod tests {
     async fn searches_each_row_in_order_with_normalized_matches() {
         let mock = MockMilvus::spawn(|body| {
             let parsed: Value = serde_json::from_str(body).unwrap();
-            let first = parsed["data"][0]["vector"][0].as_f64().unwrap() as i64;
+            let first = parsed["data"][0][0].as_f64().unwrap() as i64;
             (200, hits_response(first))
         });
         let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
@@ -442,7 +442,7 @@ mod tests {
         let (head, body) = requests
             .iter()
             .find(|(_, body)| {
-                serde_json::from_str::<Value>(body).unwrap()["data"][0]["vector"]
+                serde_json::from_str::<Value>(body).unwrap()["data"][0]
                     == serde_json::json!([1.0, 0.0])
             })
             .expect("row 0's request carries the [1.0, 0.0] vector")
@@ -458,7 +458,8 @@ mod tests {
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["collectionName"], "docs");
         assert_eq!(parsed["data"].as_array().unwrap().len(), 1);
-        assert_eq!(parsed["data"][0]["vector"], serde_json::json!([1.0, 0.0]));
+        assert_eq!(parsed["data"][0], serde_json::json!([1.0, 0.0]));
+        assert_eq!(parsed["annsField"], json!("embedding"));
         assert_eq!(parsed["limit"], 5);
         assert_eq!(parsed["searchParams"]["metricType"], "COSINE");
         let fields = parsed["outputFields"].as_array().unwrap();

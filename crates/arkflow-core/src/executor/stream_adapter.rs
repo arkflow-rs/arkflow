@@ -107,6 +107,14 @@ fn decode_name(payload: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Live deliveries awaiting the next read's WAL hand-off (see
+/// [`LiveDeliveryLease`]): shared by the input and its cancellation guard.
+type PendingRetryQueue = Arc<
+    std::sync::Mutex<
+        std::collections::VecDeque<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>)>,
+    >,
+>;
+
 /// Wrap an input with the adapter's WAL: replays unacknowledged entries
 /// before new reads (crash recovery), appends each batch, and gates the ack
 /// on the WAL commit — exactly like the legacy `Stream::do_input` path.
@@ -129,11 +137,7 @@ pub(crate) struct WalInput {
     /// claim and the durable WAL hand-off: re-appended by the next read
     /// (at-least-once; a partially appended batch may replay as a duplicate,
     /// which is the contract floor, never a loss).
-    pending_retry: Arc<
-        std::sync::Mutex<
-            std::collections::VecDeque<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>)>,
-        >,
-    >,
+    pending_retry: PendingRetryQueue,
 }
 
 impl WalInput {
@@ -300,11 +304,7 @@ impl Drop for ReplayLease<'_> {
 /// delayed by one read, never lost (a partially appended batch replays as
 /// a duplicate, the at-least-once floor).
 struct LiveDeliveryLease {
-    retry: Arc<
-        std::sync::Mutex<
-            std::collections::VecDeque<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>)>,
-        >,
-    >,
+    retry: PendingRetryQueue,
     batch: crate::MessageBatchRef,
     source_ack: Arc<dyn crate::input::Ack>,
     disarmed: std::sync::atomic::AtomicBool,
@@ -1244,11 +1244,12 @@ mod tests {
             .await
             .unwrap();
         let queue = input.replay_queue().await.unwrap();
-        let entries = queue.lock().expect("wal replay queue poisoned");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries.front().unwrap().0, 2);
+        {
+            let entries = queue.lock().expect("wal replay queue poisoned");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries.front().unwrap().0, 2);
+        }
         assert_eq!(wal.cursor().await.unwrap(), 1);
-        drop(entries);
 
         // The covered prefix is now part of the local cursor. A replay of
         // sequence 2 can complete, and the first newly appended sequence 3

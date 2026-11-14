@@ -490,18 +490,22 @@ mod tests {
         let result = processor.process(binary_msg(&["test1"])).await.unwrap();
         assert!(result.is_empty());
 
-        // Wait for timeout
+        // Wait for timeout. The kernel drives idle chains through `on_tick`;
+        // an arrival resets the idle timer, so the timeout fires here rather
+        // than on the next message.
         sleep(Duration::from_millis(150)).await;
 
-        // Next message should trigger flush due to timeout
-        let result = processor.process(binary_msg(&["test2"])).await.unwrap();
-
+        let result = processor.on_tick().await.unwrap();
         match result {
             ProcessResult::Single(batch) => {
-                assert_eq!(batch.len(), 2); // 2 messages combined
+                assert_eq!(batch.len(), 1); // the single held message
             }
-            _ => panic!("Expected single result"),
+            other => panic!("Expected single result, got {other:?}"),
         }
+
+        // After the flush the next arrival starts a fresh batch.
+        let result = processor.process(binary_msg(&["test2"])).await.unwrap();
+        assert!(result.is_empty());
     }
 
     #[tokio::test]

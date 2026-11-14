@@ -133,7 +133,11 @@ pub struct StateSnapshotRef {
 
 impl CheckpointManifest {
     pub fn verify(&self) -> bool {
-        self.checksum == manifest_checksum(self)
+        // Manifests written before `source_positions_by_task` existed carry
+        // a checksum over the LEGACY tuple (without that field). Accept both
+        // encodings so an upgrade can still recover old checkpoints and
+        // savepoints; new seals always use the current encoding.
+        self.checksum == manifest_checksum(self) || self.checksum == legacy_manifest_checksum(self)
     }
 
     pub fn seal(&mut self) {
@@ -882,7 +886,15 @@ impl CheckpointCoordinator {
             ));
         }
         // A duplicate attempt ROW for one task would collapse in the set
-        // above and seal state against an ambiguous dispatch record.
+        // above and seal state against an ambiguous dispatch record. Two
+        // rows for the same task (even with distinct attempt ids) are just
+        // as ambiguous: the acknowledgement pairing below would pick
+        // whichever row happens to come first.
+        if task_attempts.len() != self.participants.len() {
+            return Err(Error::Process(
+                "checkpoint task attempts contain multiple rows for a participating task".into(),
+            ));
+        }
         let mut attempt_ids = BTreeSet::new();
         for attempt in &task_attempts {
             if !attempt_ids.insert(attempt.attempt_id.as_str()) {
@@ -992,6 +1004,31 @@ fn manifest_checksum(manifest: &CheckpointManifest) -> u64 {
         manifest.format_version,
     ))
     .unwrap_or_default();
+    hash_manifest_bytes(&encoded)
+}
+
+/// The checksum contract released versions used: the same tuple WITHOUT
+/// `source_positions_by_task`. Verification accepts it for upgrade
+/// compatibility; sealing never produces it.
+fn legacy_manifest_checksum(manifest: &CheckpointManifest) -> u64 {
+    let encoded = serde_json::to_vec(&(
+        &manifest.checkpoint_id,
+        &manifest.job_id,
+        manifest.job_version,
+        manifest.generation,
+        &manifest.task_attempts,
+        &manifest.source_positions,
+        &manifest.watermarks_ms,
+        &manifest.watermark_partitions,
+        &manifest.in_flight_barrier,
+        &manifest.state_snapshots,
+        manifest.format_version,
+    ))
+    .unwrap_or_default();
+    hash_manifest_bytes(&encoded)
+}
+
+fn hash_manifest_bytes(encoded: &[u8]) -> u64 {
     encoded.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
         hash.wrapping_mul(0x100000001b3) ^ u64::from(*byte)
     })
@@ -1078,6 +1115,18 @@ mod tests {
             )
             .unwrap();
         assert!(manifest.verify());
+        // Upgrade compatibility: a manifest sealed by a released version
+        // (checksum over the legacy tuple without source_positions_by_task)
+        // must still verify, while tampering with the new field still fails.
+        let mut legacy = manifest.clone();
+        legacy.checksum = legacy_manifest_checksum(&legacy);
+        assert!(legacy.verify());
+        // New seals cover the field, so tampering with it still fails.
+        let mut tampered = manifest.clone();
+        tampered
+            .source_positions_by_task
+            .insert("tampered".into(), Vec::new());
+        assert!(!tampered.verify());
         assert_eq!(manifest.watermarks_ms.len(), 2);
         assert_eq!(manifest.watermarks_ms.get("task-0"), Some(&100));
         assert_eq!(manifest.watermarks_ms.get("task-1"), Some(&100));
@@ -1789,6 +1838,15 @@ mod artifact_selection_tests {
                 node_id: "n".into(),
             })
             .collect::<Vec<_>>();
+        // Two dispatch rows for one task with distinct attempt ids pass the
+        // set-coverage check but make the ack→dispatch pairing ambiguous.
+        let mut conflicting = attempts.clone();
+        conflicting.push(TaskAttemptSnapshot {
+            task_id: "task-1".into(),
+            attempt_id: "task-1-other".into(),
+            node_id: "n".into(),
+        });
+        assert!(coordinator.complete(conflicting, vec![]).is_err());
         // Snapshot set has a duplicate task reference.
         let duplicate = vec![
             state_ref("checkpoints/ckpt-c/a.json", 1),

@@ -124,11 +124,17 @@ fn insert_meta<'de>(
         row.insert(Cow::Borrowed(name), value);
         return;
     }
-    // Double collision: the business payload already holds BOTH the primary
-    // name and the reserved fallback. Business data always wins — writing
-    // the fallback would silently REPLACE a business column with envelope
-    // metadata — so the envelope value is dropped and the collision recorded
-    // (the schema shift stays observable to the operator).
+    // The business payload owns the canonical column: relocate the envelope
+    // value to the reserved `__debezium_<name>` column when that is free.
+    // On a double collision (the payload also holds the fallback) business
+    // data always wins: writing the fallback would silently REPLACE a
+    // business column with envelope metadata, so the envelope value is
+    // dropped. Either way the collision is recorded, keeping the schema
+    // shift observable to the operator.
+    let fallback = format!("__debezium_{name}");
+    if !row.contains_key(fallback.as_str()) {
+        row.insert(Cow::Owned(fallback), value);
+    }
     if !collisions.iter().any(|c| c == name) {
         collisions.push(name.to_string());
     }
@@ -403,6 +409,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_double_collision_never_overwrites_business_data() {
+        // The payload owns both the canonical and the reserved fallback
+        // column: the envelope value is dropped, never written over business
+        // data.
+        let batch = decode_one(
+            r#"{"before":null,"after":{"id":1,"op":"custom","__debezium_op":"also-custom"},"op":"c","ts_ms":1,"source":{"db":"s","table":"t"}}"#,
+        )
+        .await;
+        assert_eq!(batch.len(), 1);
+        assert_eq!(str_col(&batch, "op", 0), "custom");
+        assert_eq!(str_col(&batch, "__debezium_op", 0), "also-custom");
+    }
+
+    #[tokio::test]
     async fn test_no_collision_keeps_canonical_names() {
         // Without a collision the metadata columns keep their canonical names.
         let batch = decode_one(
@@ -492,7 +512,10 @@ mod tests {
                     if !collisions.iter().any(|c| c == name) {
                         collisions.push(name.to_string());
                     }
-                    row.insert(format!("__debezium_{name}"), value);
+                    let fallback = format!("__debezium_{name}");
+                    if !row.contains_key(&fallback) {
+                        row.insert(fallback, value);
+                    }
                 } else {
                     row.insert(name.to_string(), value);
                 }

@@ -300,20 +300,18 @@ fn expr_folds_time(expr: &LogicalExpr) -> bool {
                 subquery,
                 ..
             })
-            | LogicalExpr::Exists(datafusion::logical_expr::expr::Exists { subquery, .. }) => {
-                if plan_folds_time(&subquery.subquery) {
-                    found = true;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
+            | LogicalExpr::Exists(datafusion::logical_expr::expr::Exists { subquery, .. })
+                if plan_folds_time(&subquery.subquery) =>
+            {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
             }
             LogicalExpr::SetComparison(datafusion::logical_expr::expr::SetComparison {
                 subquery,
                 ..
-            }) => {
-                if plan_folds_time(&subquery.subquery) {
-                    found = true;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
+            }) if plan_folds_time(&subquery.subquery) => {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
             }
             _ => {}
         }

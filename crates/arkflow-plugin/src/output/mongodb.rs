@@ -171,26 +171,40 @@ impl Output for MongoDBOutput {
     }
 }
 
-/// True when EVERY write error the driver reports is a duplicate-key
-/// (code 11000): all other documents landed, and the duplicates are the
-/// idempotent echo of an at-least-once replay with a stable `_id`. Any other
-/// error (or a mix) propagates.
+/// True when a write error is the duplicate of the document `_id` index:
+/// the idempotent echo of an at-least-once replay. A conflict on any OTHER
+/// unique index means this document was never written, so it must propagate
+/// instead of being reported as a successful replay.
+fn is_id_duplicate(code: i32, message: &str) -> bool {
+    code == 11000 && message.contains("index: _id_")
+}
+
+/// True when EVERY write error the driver reports is a duplicate of the
+/// document `_id` (code 11000): all other documents landed, and the
+/// duplicates are the idempotent echo of an at-least-once replay with a
+/// stable `_id`. A write concern error means the requested durability was
+/// not satisfied, so it always propagates. Any other error (or a mix)
+/// propagates too.
 fn mongo_error_is_duplicate_key(error: &mongodb::error::Error) -> bool {
     match error.kind.as_ref() {
         mongodb::error::ErrorKind::InsertMany(insert_many_error) => {
+            if insert_many_error.write_concern_error.is_some() {
+                return false;
+            }
             match &insert_many_error.write_errors {
                 Some(write_errors) if !write_errors.is_empty() => write_errors
                     .iter()
-                    .all(|write_error| write_error.code == 11000),
+                    .all(|write_error| is_id_duplicate(write_error.code, &write_error.message)),
                 _ => false,
             }
         }
         mongodb::error::ErrorKind::BulkWrite(bulk_write_error) => {
-            !bulk_write_error.write_errors.is_empty()
+            bulk_write_error.write_concern_errors.is_empty()
+                && !bulk_write_error.write_errors.is_empty()
                 && bulk_write_error
                     .write_errors
                     .values()
-                    .all(|write_error| write_error.code == 11000)
+                    .all(|write_error| is_id_duplicate(write_error.code, &write_error.message))
         }
         _ => false,
     }
@@ -383,6 +397,21 @@ mod tests {
     };
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn only_id_index_duplicates_count_as_idempotent_replay() {
+        assert!(is_id_duplicate(
+            11000,
+            "E11000 duplicate key error collection: db.c index: _id_ dup key: { _id: 1 }"
+        ));
+        // A conflict on a secondary unique index means the document was NOT
+        // written: reporting success would silently drop it.
+        assert!(!is_id_duplicate(
+            11000,
+            "E11000 duplicate key error collection: db.c index: email_1 dup key: { email: \"a\" }"
+        ));
+        assert!(!is_id_duplicate(121, "document validation failure"));
+    }
 
     fn batch(columns: Vec<(&str, ArrayRef)>) -> MessageBatch {
         let fields: Vec<Field> = columns

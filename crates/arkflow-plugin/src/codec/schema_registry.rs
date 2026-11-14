@@ -1644,9 +1644,9 @@ mod tests {
         let codec = build_codec(resolver);
         let batch = codec
             .decode(vec![
-                wire(1, &protobuf_payload(11)),
-                wire(1, &protobuf_payload(22)),
-                wire(1, &protobuf_payload(33)),
+                proto_wire(1, &protobuf_payload(11)),
+                proto_wire(1, &protobuf_payload(22)),
+                proto_wire(1, &protobuf_payload(33)),
             ])
             .await
             .unwrap();

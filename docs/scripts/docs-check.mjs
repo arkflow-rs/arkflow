@@ -116,7 +116,10 @@ for (const file of markdown) {
       resolved = file;
     } else {
       const base = path.resolve(path.dirname(file), target);
-      const candidates = [base, `${base}.md`, path.join(base, 'index.md')];
+      // Prefer a Markdown file over a same-named directory: links to
+      // `guide` resolve to `guide.md` (or `guide/index.md`) so the anchor
+      // check runs instead of silently skipping a directory match.
+      const candidates = [`${base}.md`, path.join(base, 'index.md'), base];
       resolved = candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
       const route = path
         .relative(docsRoot, base)
@@ -136,7 +139,16 @@ for (const file of markdown) {
     }
 
     if (anchor && resolved && /\.(md|mdx)$/.test(resolved)) {
-      if (!slugsFor(resolved).has(anchor)) {
+      // Links may percent-encode the anchor (e.g. #caf%C3%A9): compare the
+      // decoded text against the heading slug. Invalid encoding keeps the
+      // raw text so the broken anchor is still reported.
+      let expected = anchor;
+      try {
+        expected = decodeURIComponent(anchor);
+      } catch {
+        expected = anchor;
+      }
+      if (!slugsFor(resolved).has(expected)) {
         errors.push(`${path.relative(root, file)}: broken anchor #${anchor} in link to ${target || path.basename(file)}`);
       }
     }

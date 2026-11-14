@@ -221,7 +221,7 @@ segment_tuning:
 
 `parallel_put` 仍保留在配置模式中,但封段已串行化(见上文),因此工作线程数目前对吞吐没有影响。请保持默认值;配置多于一个工作线程时存储层会记录警告。
 
-**Manifest 写入安全**:当 `workers > 1` 时,多个工作线程可能同时完成一段的上传并封存它,各自重写 `manifest.json`。这些并发重写由基于 ETag 的乐观并发控制协调(读取 ETag → 条件 PUT → 不匹配则重试,最多 8 次尝试,覆盖工作线程数上限),因此任何工作线程的游标推进或已封存段条目都不会被静默覆盖——前提是后端支持条件 PUT。S3 与 S3 兼容存储都支持;不支持的后端(例如 `LocalFileSystem`)会退化为单写者无条件写入,因此那里请保持 `workers: 1`。在 `workers: 1`(默认)时这一切不可见:无竞争、无重试,行为不变。投递契约细节参见 `docs/docs/components/0-inputs/delivery-semantics.md`。
+**Manifest 写入安全**:封段已串行化,同一时刻至多只有一个工作线程重写 `manifest.json`,进程内不会出现并发重写。写入仍使用基于 ETag 的乐观并发控制(读取 ETag → 条件 PUT → 不匹配则重试),用于防范另一个进程或人工编辑同一前缀;不支持条件 PUT 的后端(例如 `LocalFileSystem`)会退化为单写者无条件写入,因此那里请保持 `workers: 1`。投递契约细节参见 `docs/docs/components/0-inputs/delivery-semantics.md`。
 
 ## 压缩
 

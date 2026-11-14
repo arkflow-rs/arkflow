@@ -392,6 +392,7 @@ pub(super) fn parse_generation_etag(value: &str) -> Option<u64> {
 /// turned the compare-and-set into an unconditional write, so a malformed
 /// (or hostile) conditional clobbered a newer generation instead of
 /// rejecting.
+#[allow(clippy::result_large_err)] // same ready-made Response idiom as require_operator_action
 pub(super) fn expected_generation_from_headers(
     headers: &HeaderMap,
 ) -> Result<Option<u64>, Response> {

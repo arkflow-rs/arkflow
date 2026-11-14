@@ -120,10 +120,7 @@ const MAX_BINDS_PER_INSERT: usize = 10_000;
 /// Split rows into per-statement chunks whose bind count (rows × columns)
 /// stays under the protocol limit. Chunks are executed inside the caller's
 /// transaction (or sequential statements on the non-transactional path).
-fn chunk_rows_for_insert<'a>(
-    columns: usize,
-    rows: &'a [Vec<SqlValue>],
-) -> Vec<&'a [Vec<SqlValue>]> {
+fn chunk_rows_for_insert(columns: usize, rows: &[Vec<SqlValue>]) -> Vec<&[Vec<SqlValue>]> {
     if columns == 0 {
         return vec![rows];
     }

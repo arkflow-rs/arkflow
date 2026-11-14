@@ -18,7 +18,7 @@
 
 use crate::input::codec_helper::Delivery;
 use crate::pulsar::{
-    PulsarAuth, PulsarClientUtils, PulsarConfigValidator, RetryConfig, RetryUtils, SubscriptionType,
+    PulsarAuth, PulsarClientUtils, PulsarConfigValidator, RetryConfig, SubscriptionType,
 };
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
@@ -228,7 +228,7 @@ impl Input for PulsarInput {
         // Start background task for message processing
         tokio::spawn(async move {
             let consumer = consumer_arc;
-            loop {
+            'receive: loop {
                 tokio::select! {
                     _ = cancellation_token_clone.cancelled() => {
                         break;
@@ -256,67 +256,94 @@ impl Input for PulsarInput {
                             Ok(Some(Err(e))) => {
                                 warn!("Failed to receive Pulsar message: {}", e);
                                 // Transient receive failures retry under the
-                                // configured policy (bounded lock waits do
-                                // not count against it) before declaring the
-                                // connection lost.
-                                let consumer_arc = consumer.clone();
-                                let retried = RetryUtils::retry_with_backoff(
-                                    move || {
-                                        let consumer_arc = consumer_arc.clone();
-                                        async move {
-                                            let mut consumer = consumer_arc.lock().await;
-                                            match tokio::time::timeout(
-                                                CONSUMER_LOCK_BOUND,
-                                                consumer.next(),
+                                // configured policy before declaring the
+                                // connection lost. A bounded lock wait that
+                                // observes no message is NOT a stream end:
+                                // keep polling without consuming an attempt.
+                                let mut attempts = 0u32;
+                                let mut delay = std::time::Duration::from_millis(
+                                    retry_config.initial_delay_ms,
+                                );
+                                loop {
+                                    if cancellation_token_clone.is_cancelled() {
+                                        break 'receive;
+                                    }
+                                    let mut consumer_guard = consumer.lock().await;
+                                    let probe = tokio::time::timeout(
+                                        CONSUMER_LOCK_BOUND,
+                                        consumer_guard.next(),
+                                    )
+                                    .await;
+                                    drop(consumer_guard);
+                                    match probe {
+                                        Ok(Some(Ok(message))) => {
+                                            forward_pulsar_message(
+                                                message,
+                                                consumer.clone(),
+                                                &codec_clone,
+                                                input_name_clone.clone(),
+                                                &sender_clone,
                                             )
-                                            .await
+                                            .await;
+                                            break;
+                                        }
+                                        Ok(None) => {
+                                            // The stream really ended.
+                                            if let Err(e) = sender_clone
+                                                .send_async(Delivery::Err(Error::EOF))
+                                                .await
                                             {
-                                                Ok(Some(Ok(message))) => Ok(Some(message)),
-                                                Ok(None) => Ok(None),
-                                                Ok(Some(Err(error))) => {
-                                                    Err(format!("receive failed: {error}"))
-                                                }
-                                                Err(_) => Ok(None),
+                                                error!(
+                                                    "Failed to send EOF to channel: {}",
+                                                    e
+                                                );
                                             }
+                                            break 'receive;
                                         }
-                                    },
-                                    &retry_config,
-                                    "receive Pulsar message",
-                                )
-                                .await;
-                                match retried {
-                                    Ok(Some(message)) => {
-                                        forward_pulsar_message(
-                                            message,
-                                            consumer.clone(),
-                                            &codec_clone,
-                                            input_name_clone.clone(),
-                                            &sender_clone,
-                                        )
-                                        .await;
-                                    }
-                                    Ok(None) => {
-                                        // Stream ended (or stayed idle through
-                                        // every retry): surface EOF for the
-                                        // engine's reconnect path.
-                                        if let Err(e) = sender_clone
-                                            .send_async(Delivery::Err(Error::EOF))
-                                            .await
-                                        {
-                                            error!("Failed to send EOF to channel: {}", e);
+                                        Ok(Some(Err(error))) => {
+                                            attempts += 1;
+                                            if attempts >= retry_config.max_attempts {
+                                                warn!(
+                                                    "Pulsar receive retries exhausted: {error}"
+                                                );
+                                                if let Err(e) = sender_clone
+                                                    .send_async(Delivery::Err(
+                                                        Error::Disconnection,
+                                                    ))
+                                                    .await
+                                                {
+                                                    error!(
+                                                        "Failed to send error to channel: {}",
+                                                        e
+                                                    );
+                                                }
+                                                // Break the loop to allow reconnection to
+                                                // create a new consumer task
+                                                break 'receive;
+                                            }
+                                            warn!(
+                                                "Attempt {} for receiving Pulsar message failed, retrying in {:?}: {}",
+                                                attempts, delay, error
+                                            );
+                                            tokio::select! {
+                                                _ = cancellation_token_clone.cancelled() => {
+                                                    break 'receive;
+                                                }
+                                                _ = tokio::time::sleep(delay) => {}
+                                            }
+                                            delay = std::time::Duration::from_millis(
+                                                (delay.as_millis() as f64
+                                                    * retry_config.backoff_multiplier)
+                                                    .min(retry_config.max_delay_ms as f64)
+                                                    as u64,
+                                            );
                                         }
-                                        break;
-                                    }
-                                    Err(last) => {
-                                        warn!("Pulsar receive retries exhausted: {last}");
-                                        if let Err(e) = sender_clone
-                                            .send_async(Delivery::Err(Error::Disconnection))
-                                            .await
-                                        {
-                                            error!("Failed to send error to channel: {}", e);
+                                        Err(_lock_budget_elapsed) => {
+                                            // Idle within the lock budget: keep
+                                            // polling and leave the retry budget
+                                            // untouched.
+                                            continue;
                                         }
-                                        // Break the loop to allow reconnection to create a new consumer task
-                                        break;
                                     }
                                 }
                             }

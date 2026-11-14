@@ -1232,10 +1232,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Batch size larger than one write so nothing flushes during write.
+        // `write` flushes before returning (the ack must imply durability),
+        // so stage a line directly in the buffer to exercise the close-time
+        // flush path.
         let output = InfluxDBOutput::new(typed_config(server.uri(), 1000)).unwrap();
         output.connect().await.unwrap();
-        output.write(Arc::new(typed_batch())).await.unwrap();
+        output
+            .batch_buffer
+            .lock()
+            .await
+            .push("staged measure field=1i".to_string());
         assert_eq!(output.batch_buffer.lock().await.len(), 1);
 
         output.close().await.unwrap();

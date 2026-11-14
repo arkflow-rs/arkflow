@@ -1371,9 +1371,12 @@ impl NetworkManager {
             let mut current = Some(stream);
             let mut final_error: Option<Error> = None;
             let mut clean_exit = false;
-            // The reconnect replay opens the session preamble itself; the
+            // The reconnect path writes the session preamble itself; the
             // pump must not send a second handshake on the same stream.
             let mut handshake_sent = false;
+            // Set after a reconnect: the pump replays every unacknowledged
+            // frame only once the peer's handshake ack verified.
+            let mut replay_pending = false;
             while let Some(stream) = current.take() {
                 let (pump_result, read_result) = run_edge_connection(
                     stream,
@@ -1386,6 +1389,7 @@ impl NetworkManager {
                     failures.clone(),
                     &manager.shutdown,
                     handshake_sent,
+                    replay_pending,
                 )
                 .await;
                 // Clean requires BOTH halves to end cleanly: the read loop
@@ -1427,20 +1431,14 @@ impl NetworkManager {
                         let redial = redial.clone().expect("retry implies redial");
                         match redial.connect(quad).await {
                             Ok(mut stream) => {
-                                if let Err(error) = replay_pending(
-                                    &mut stream,
-                                    quad,
-                                    &pending,
-                                    &auth,
-                                    &config,
-                                    /* send_handshake */ true,
-                                )
-                                .await
+                                if let Err(error) =
+                                    write_session_handshake(&mut stream, quad, &auth, &config).await
                                 {
                                     final_error = Some(error);
                                     break;
                                 }
                                 handshake_sent = true;
+                                replay_pending = true;
                                 current = Some(stream);
                             }
                             Err(error) => {
@@ -2072,17 +2070,6 @@ async fn wait_for_route(
     }
 }
 
-/// Drains one quad's edge channel onto its connection, stamping sequences and
-/// registering pending receipts. Exits when the channel closes (drained) or
-/// the connection fails; failures abort all pending branch acknowledgements.
-/// Runs one connection's receipt read loop and outbound pump to completion,
-/// returning both results. A failure on either half cancels the shared token,
-/// so the other half exits promptly; the caller decides whether to reconnect
-/// (replaying unacknowledged frames) or fail the edge closed. With
-/// `reconnectable`, the pump defers its failure-path branch aborts to the
-/// supervisor: the branches must stay registered so a reconnect can replay
-/// them, and the supervisor aborts them if recovery does not succeed.
-#[allow(clippy::too_many_arguments)]
 /// Deadline for one inbound TLS handshake: a peer that completes TCP but
 /// stalls the TLS negotiation must not hold its accept task (and semaphore
 /// permit) forever.
@@ -2142,6 +2129,17 @@ impl HandshakeGate {
     }
 }
 
+/// Drains one quad's edge channel onto its connection, stamping sequences and
+/// registering pending receipts. Exits when the channel closes (drained) or
+/// the connection fails; failures abort all pending branch acknowledgements.
+/// Runs one connection's receipt read loop and outbound pump to completion,
+/// returning both results. A failure on either half cancels the shared token,
+/// so the other half exits promptly; the caller decides whether to reconnect
+/// (replaying unacknowledged frames) or fail the edge closed. With
+/// `reconnectable`, the pump defers its failure-path branch aborts to the
+/// supervisor: the branches must stay registered so a reconnect can replay
+/// them, and the supervisor aborts them if recovery does not succeed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_edge_connection(
     stream: Box<dyn RemoteStream>,
     quad: Quad,
@@ -2153,9 +2151,12 @@ pub(crate) async fn run_edge_connection(
     failures: flume::Sender<Error>,
     shutdown: &tokio_util::sync::CancellationToken,
     // True when the stream's session preamble (the authenticated handshake)
-    // was already written by the reconnect replay — pump_edge must not send
+    // was already written by the reconnect path — pump_edge must not send
     // a second one (the peer's duplicate-handshake guard rejects it).
     handshake_sent: bool,
+    // True on a reconnected stream: replay every unacknowledged frame once
+    // the peer's handshake acknowledgement verified.
+    replay_pending: bool,
 ) -> (Result<(), Error>, Result<(), Error>) {
     let (reader, writer) = tokio::io::split(stream);
     let connection_cancel = shutdown.child_token();
@@ -2281,6 +2282,7 @@ pub(crate) async fn run_edge_connection(
             reconnectable,
             handshake_gate,
             handshake_sent,
+            replay_pending,
         )
         .await;
         match result {
@@ -2316,54 +2318,36 @@ pub(crate) async fn run_edge_connection(
     (pump_result, read_result)
 }
 
-/// Replays the session preamble on a freshly reconnected stream: the
-/// authenticated handshake plus every unacknowledged data frame in sequence
-/// order, reusing each frame's original sequence number so the receiver's
-/// delivery-level dedup can drop the ones it already routed.
-pub(crate) async fn replay_pending(
+/// Writes the session preamble on a freshly reconnected stream: the
+/// authenticated handshake ONLY. Pending data frames are replayed by
+/// [`pump_edge`] after the server's handshake acknowledgement verified, so a
+/// redirected peer that never proves the session key receives no batch bytes.
+pub(crate) async fn write_session_handshake(
     stream: &mut Box<dyn RemoteStream>,
     quad: Quad,
-    pending: &Arc<PendingReceipts>,
     auth: &Option<SessionAuth>,
     config: &NetworkManagerConfig,
-    // True when THIS replay must open the session preamble (the reconnect
-    // path): pump_edge on the same stream must then skip its own handshake.
-    send_handshake: bool,
 ) -> Result<(), Error> {
     use tokio::io::AsyncWriteExt;
+    let Some(auth) = auth else {
+        return Ok(());
+    };
     let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, &mut **stream);
-    if send_handshake {
-        if let Some(auth) = auth {
-            let handshake = auth.client_handshake()?;
-            let payload = serde_json::to_vec(&handshake).map_err(|error| {
-                Error::Process(format!("remote edge handshake encode failed: {error}"))
-            })?;
-            write_frame_with_limit(
-                &mut writer,
-                quad,
-                FrameKind::Handshake,
-                &payload,
-                config.max_frame_len,
-            )
-            .await?;
-        }
-    }
-    let mut encoder = DataEncoder::new();
-    for (seq, batch) in pending.replay_snapshot() {
-        let payload = encoder.encode(&batch, seq)?;
-        write_frame_with_limit(
-            &mut writer,
-            quad,
-            FrameKind::Data,
-            &payload,
-            config.max_frame_len,
-        )
-        .await?;
-    }
+    let handshake = auth.client_handshake()?;
+    let payload = serde_json::to_vec(&handshake)
+        .map_err(|error| Error::Process(format!("remote edge handshake encode failed: {error}")))?;
+    write_frame_with_limit(
+        &mut writer,
+        quad,
+        FrameKind::Handshake,
+        &payload,
+        config.max_frame_len,
+    )
+    .await?;
     writer
         .flush()
         .await
-        .map_err(|error| Error::Process(format!("remote edge replay flush failed: {error}")))?;
+        .map_err(|error| Error::Process(format!("remote edge handshake flush failed: {error}")))?;
     Ok(())
 }
 
@@ -2381,19 +2365,19 @@ pub(crate) async fn pump_edge(
     // data frames must not precede the client-side authentication check.
     handshake_gate: Option<Arc<HandshakeGate>>,
     // True when the session preamble was already written on this stream by
-    // the reconnect replay; a second handshake makes the peer reject.
+    // the reconnect path; a second handshake makes the peer reject.
     handshake_sent: bool,
+    // True on a reconnected stream: every unacknowledged frame is replayed in
+    // sequence order once the handshake gate above confirms the peer.
+    replay_pending: bool,
 ) -> Result<(), Error> {
     let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, writer);
     let mut encoder = DataEncoder::new();
     let mut flush_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    if auth.is_some() {
+    if let Some(auth) = auth.as_ref() {
         if !handshake_sent {
-            let handshake = auth
-                .as_ref()
-                .expect("auth checked above")
-                .client_handshake()?;
+            let handshake = auth.client_handshake()?;
             let payload = serde_json::to_vec(&handshake).map_err(|error| {
                 Error::Process(format!("remote edge handshake encode failed: {error}"))
             })?;
@@ -2417,6 +2401,28 @@ pub(crate) async fn pump_edge(
         }
     }
     drop(auth);
+    if replay_pending {
+        // Replay the unacknowledged frames with their ORIGINAL sequence
+        // numbers (the receiver dedups already-routed ones). This runs only
+        // after the gate above confirmed the peer's handshake — gating the
+        // live loop but replaying first would hand the pending batch bytes to
+        // a peer that never authenticated.
+        for (seq, batch) in pending.replay_snapshot() {
+            let payload = encoder.encode(&batch, seq)?;
+            write_frame_with_limit(
+                &mut writer,
+                quad,
+                FrameKind::Data,
+                &payload,
+                config.max_frame_len,
+            )
+            .await?;
+        }
+        writer
+            .flush()
+            .await
+            .map_err(|error| Error::Process(format!("remote edge replay flush failed: {error}")))?;
+    }
     let result: Result<(), Error>;
     // A drained channel (upstream dropped the sender) is the one clean exit
     // where the connection stays alive: the receipt read loop on the same

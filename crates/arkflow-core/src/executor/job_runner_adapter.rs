@@ -817,9 +817,11 @@ impl RescaleContext {
                 .ok_or_else(|| Error::Process("corrupt window state key during rescale".into()))?;
             return Ok(user_key.to_vec());
         }
-        // StatefulOperator state key = "<tag>:" + value encoding, where the
-        // post-tag bytes are exactly the routing hash input; the null
-        // sentinels ("null:<tag>") hash as-is.
+        // StatefulOperator state key = "<tag>:" + value encoding for
+        // string/binary keys, and the PERSISTED integer form is a BARE tag
+        // ("i64" + 8-byte BE) — released versions wrote that shape, so both
+        // forms parse here; the post-tag bytes are exactly the routing hash
+        // input and the null sentinels ("null:<tag>") hash as-is.
         if let Some(rest) = key.strip_prefix(b"utf8:") {
             return Ok(rest.to_vec());
         }
@@ -833,6 +835,22 @@ impl RescaleContext {
             b"u16:",
             b"u32:",
             b"u64:",
+        ] {
+            if let Some(rest) = key.strip_prefix(tag) {
+                return Ok(rest.to_vec());
+            }
+        }
+        // Legacy integer keys (bare tag, no colon). No tag is a prefix of
+        // another, so the match is unambiguous.
+        for tag in [
+            &b"i8"[..],
+            b"i16",
+            b"i32",
+            b"i64",
+            b"u8",
+            b"u16",
+            b"u32",
+            b"u64",
         ] {
             if let Some(rest) = key.strip_prefix(tag) {
                 return Ok(rest.to_vec());
@@ -1428,14 +1446,14 @@ mod validation_tests {
         }
     }
 
-    /// Regression (integer key encoding): stateful integer keys encode as
-    /// "<tag>:" + big-endian bytes — the bare "<tag>" prefix made every
-    /// integer-keyed entry fail rescale redistribution with "unrecognized
-    /// key encoding". The stripped post-tag bytes must be EXACTLY the
-    /// routing-hash input (the raw big-endian value, matching
-    /// `hash_column`).
+    /// Regression (integer key encoding): the rescale parser must accept
+    /// both the released BARE tag form ("i64" + big-endian bytes, still what
+    /// the stateful operator writes so restored checkpoints keep resolving)
+    /// and the tagged form written by intermediate builds. The stripped
+    /// post-tag bytes must be EXACTLY the routing-hash input (the raw
+    /// big-endian value, matching `hash_column`).
     #[test]
-    fn integer_state_keys_rescale_with_the_colon_tag() {
+    fn integer_state_keys_rescale_with_both_tag_forms() {
         let new_plan = JobPlan::compile(rescale_job_spec(4)).unwrap();
         let context = RescaleContext::from_plan(&new_plan).unwrap();
         let old_plan = JobPlan::compile(rescale_job_spec(1)).unwrap();
@@ -1447,14 +1465,6 @@ mod validation_tests {
         let old_namespace =
             crate::job::effective_state_namespace(&old_plan.spec.id, None, "agg", &old_task.id);
         let value: i64 = 0x0102030405060708;
-        let state_key = [b"i64:".as_slice(), value.to_be_bytes().as_slice()].concat();
-        let entry = crate::state::StateEntry {
-            namespace: old_namespace,
-            key: state_key.clone(),
-            value: b"1".to_vec(),
-            expires_at_ms: None,
-        };
-        let moved = context.redistribute(entry).unwrap();
         // The routing input is the bare big-endian value.
         let group = crate::job::key_group_for_key(&value.to_be_bytes(), 16).unwrap();
         let owner = new_plan
@@ -1470,8 +1480,20 @@ mod validation_tests {
             .unwrap();
         let expected =
             crate::job::effective_state_namespace(&new_plan.spec.id, None, "agg", &owner.id);
-        assert_eq!(moved.namespace, expected);
-        assert_eq!(moved.key, state_key);
+        for state_key in [
+            [b"i64".as_slice(), value.to_be_bytes().as_slice()].concat(),
+            [b"i64:".as_slice(), value.to_be_bytes().as_slice()].concat(),
+        ] {
+            let entry = crate::state::StateEntry {
+                namespace: old_namespace.clone(),
+                key: state_key.clone(),
+                value: b"1".to_vec(),
+                expires_at_ms: None,
+            };
+            let moved = context.redistribute(entry).unwrap();
+            assert_eq!(moved.namespace, expected);
+            assert_eq!(moved.key, state_key);
+        }
     }
 
     #[test]

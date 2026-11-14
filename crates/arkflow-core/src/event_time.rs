@@ -345,7 +345,7 @@ pub(crate) fn window_action(
     if event_time_ms >= window_end_ms {
         return WindowAction::Hold;
     }
-    let deadline = window_end_ms.saturating_add(allowed_lateness_ms as i64);
+    let deadline = window_end_ms.saturating_add(allowed_lateness_ms);
     if watermark_ms <= deadline {
         match policy {
             LateEventPolicy::Update => WindowAction::Update,

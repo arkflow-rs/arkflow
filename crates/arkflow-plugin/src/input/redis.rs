@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// Redis input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +76,9 @@ struct RedisInput {
     /// enqueues raw payloads here and a single pump decodes them in order
     /// (see `ClusterPushForwarder`).
     cluster_raw: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
+    /// The single cluster decode pump. A reconnect replaces it so two pumps
+    /// never interleave decodes (delivery order must match broker order).
+    cluster_pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
 }
@@ -138,16 +141,35 @@ impl redis::aio::AsyncPushSender for ClusterPushForwarder {
         if msg.data.len() <= payload_index {
             return Ok(());
         }
+        // `FromRedisValue` for a Nil value yields an EMPTY byte vector rather
+        // than an error, which would enqueue a bogus empty message; a Nil
+        // payload means the frame is malformed, so skip it explicitly.
+        let payload = msg.data.swap_remove(payload_index);
+        if matches!(payload, redis::Value::Nil) {
+            warn!("redis cluster push message has no payload; skipped");
+            return Ok(());
+        }
         // redis 1.x's FromRedisValue takes the Value by value.
-        let message: Vec<u8> = match Vec::from_redis_value(msg.data.swap_remove(payload_index)) {
+        let message: Vec<u8> = match Vec::from_redis_value(payload) {
             Ok(message) => message,
             Err(error) => {
                 error!("redis cluster push message failed to parse: {}", error);
                 return Ok(());
             }
         };
-        if let Err(error) = self.raw.send(message) {
-            error!("redis cluster raw queue closed: {}", error);
+        // The push callback runs synchronously on the redis connection task:
+        // blocking on a full queue would block that connection (and can
+        // deadlock subscription setup while later SUBSCRIBE responses are
+        // pending). Pub/Sub is fire-and-forget, so a full local queue drops
+        // the message loudly instead of stalling the connection.
+        match self.raw.try_send(message) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(_)) => {
+                error!("redis cluster raw queue is full; dropping a pub/sub message");
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                error!("redis cluster raw queue closed");
+            }
         }
         Ok(())
     }
@@ -185,6 +207,7 @@ impl RedisInput {
             sender,
             receiver,
             cluster_raw: (cluster_raw_tx, cluster_raw_rx),
+            cluster_pump: Mutex::new(None),
             cancellation_token,
             codec,
         })
@@ -221,6 +244,44 @@ impl RedisInput {
             .map_err(|e| Error::Connection(format!("Failed to connect to Redis cluster: {}", e)))?;
         match config_type {
             Type::Subscribe { subscribe } => {
+                // ONE pump decodes the bounded raw queue in order: the push
+                // callback only enqueues, so memory stays capped and delivery
+                // order matches broker order. Start it BEFORE the SUBSCRIBE
+                // round trips: the push callback must never block the redis
+                // connection, so the queue has to drain while later
+                // subscription responses are still pending. A reconnect
+                // replaces the previous pump so two pumps never interleave.
+                {
+                    let mut pump_slot = self.cluster_pump.lock().await;
+                    if let Some(previous) = pump_slot.take() {
+                        previous.abort();
+                    }
+                    let raw_receiver = self.cluster_raw.1.clone();
+                    let sender = Sender::clone(&self.sender);
+                    let codec = self.codec.clone();
+                    let input_name = self.input_name.clone();
+                    let token = cancellation_token.clone();
+                    *pump_slot = Some(tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = token.cancelled() => break,
+                                message = raw_receiver.recv_async() => {
+                                    let Ok(message) = message else { break };
+                                    let delivery = crate::input::codec_helper::decode_delivery(
+                                        &message,
+                                        &codec,
+                                        input_name.clone(),
+                                        Arc::new(NoopAck),
+                                    )
+                                    .await;
+                                    if sender.send_async(delivery).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }));
+                }
                 match subscribe {
                     Subscribe::Channels { channels } => {
                         // Subscribe to channels
@@ -255,35 +316,6 @@ impl RedisInput {
                         }
                     }
                 }
-                // ONE pump decodes the bounded raw queue in order: the push
-                // callback only enqueues (bounded, backpressuring redis), so
-                // memory stays capped and delivery order matches broker
-                // order — per-message spawned decode tasks did neither.
-                let raw_receiver = self.cluster_raw.1.clone();
-                let sender = Sender::clone(&self.sender);
-                let codec = self.codec.clone();
-                let input_name = self.input_name.clone();
-                let token = cancellation_token.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = token.cancelled() => break,
-                            message = raw_receiver.recv_async() => {
-                                let Ok(message) = message else { break };
-                                let delivery = crate::input::codec_helper::decode_delivery(
-                                    &message,
-                                    &codec,
-                                    input_name.clone(),
-                                    Arc::new(NoopAck),
-                                )
-                                .await;
-                                if sender.send_async(delivery).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
             }
             Type::List { list } => {
                 let sender_clone = Sender::clone(&self.sender);
@@ -515,6 +547,9 @@ impl Input for RedisInput {
 
     async fn close(&self) -> Result<(), Error> {
         self.cancellation_token.cancel();
+        if let Some(pump) = self.cluster_pump.lock().await.take() {
+            pump.abort();
+        }
         if let Some(cli) = self.client.lock().await.take() {
             match cli {
                 Cli::Single(mut c) => {
@@ -701,10 +736,6 @@ mod tests {
             },
             PushInfo {
                 kind: PushKind::Message,
-                data: vec![Value::Nil, Value::BulkString(b"payload".to_vec())],
-            },
-            PushInfo {
-                kind: PushKind::Message,
                 data: vec![Value::BulkString(b"events".to_vec()), Value::Nil],
             },
         ];
@@ -715,6 +746,16 @@ mod tests {
             );
         }
         assert!(raw_rx.try_recv().is_err(), "nothing is enqueued");
+
+        // The channel element is not consumed (the delivery carries only the
+        // payload): a frame whose channel is Nil still delivers its payload.
+        assert!(forwarder
+            .send(PushInfo {
+                kind: PushKind::Message,
+                data: vec![Value::Nil, Value::BulkString(b"payload".to_vec())],
+            })
+            .is_ok());
+        assert_eq!(raw_rx.try_recv().unwrap(), b"payload".to_vec());
     }
 
     #[test]

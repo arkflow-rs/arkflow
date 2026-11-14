@@ -241,21 +241,16 @@ segment_tuning:
 serialized (see above) so the worker count has no throughput effect today.
 Keep the default; the store logs a warning when more than one worker is
 configured.
-- Per-worker backpressure (16 segments each)
 
-**Watch for S3 rate limits**: 8 workers can hit per-prefix limits.
-
-**Manifest write safety**: With `workers > 1`, multiple workers can finish a
-segment upload and seal it concurrently, each rewriting `manifest.json`. These
-concurrent rewrites are coordinated with ETag-based optimistic concurrency
-(read ETag → conditional PUT → retry on mismatch, up to 8 attempts covering the
-worker ceiling), so no worker's cursor advancement or sealed-segment entry is
-silently overwritten — provided the backend supports conditional PUT. S3 and
-S3-compatible stores do; a backend that does not (e.g. `LocalFileSystem`)
-falls back to a single-writer unconditional write, so keep `workers: 1` there.
-This is invisible at `workers: 1` (the default): no contention, no retries,
-behavior unchanged. See `docs/docs/components/0-inputs/delivery-semantics.md`
-for the delivery-contract details.
+**Manifest write safety**: Seals are serialized, so at most one worker
+rewrites `manifest.json` at a time and concurrent rewrites cannot happen
+inside one process. The write still uses ETag-based optimistic concurrency
+(read ETag → conditional PUT → retry on mismatch) as a guard against another
+process or a manual edit touching the same prefix; a backend without
+conditional PUT (e.g. `LocalFileSystem`) falls back to a single-writer
+unconditional write, so keep `workers: 1` there. See
+`docs/docs/components/0-inputs/delivery-semantics.md` for the
+delivery-contract details.
 
 ## Compression
 
