@@ -196,6 +196,14 @@ pub trait WalStore: Send + Sync + 'static {
         self.cursor().saturating_add(1)
     }
 
+    /// Whether [`next_seq_hint`](Self::next_seq_hint) already accounts for
+    /// every persisted entry above the cursor. The default `false` makes
+    /// `Wal::open` scan the backlog once and raise the allocator above it;
+    /// backends with an exact hint override this to skip that scan.
+    fn next_seq_hint_is_exact(&self) -> bool {
+        false
+    }
+
     /// Highest sequence number guaranteed to be contained in a sealed (fully
     /// persisted) segment. The default `None` marks a backend that makes
     /// appends durable synchronously inside `append_batch` / the flush path
@@ -516,6 +524,10 @@ impl WalStore for RedbStore {
             .max(1)
     }
 
+    fn next_seq_hint_is_exact(&self) -> bool {
+        true
+    }
+
     fn close(&self) -> Result<(), Error> {
         // redb drops implicitly when the last `Arc<RedbStore>` is released,
         // releasing the fcntl flock. `close` is a no-op here.
@@ -594,6 +606,16 @@ mod tests {
         let rb_out: &RecordBatch = back.deref();
         assert_eq!(rb_in.schema(), rb_out.schema());
         assert_eq!(rb_in.num_rows(), rb_out.num_rows());
+        // Values and metadata are the actual payload; a schema/row-count
+        // comparison alone would accept corrupted data.
+        for index in 0..rb_in.num_columns() {
+            assert_eq!(
+                rb_in.column(index).to_data(),
+                rb_out.column(index).to_data(),
+                "column {} payload differs",
+                rb_in.schema().field(index).name()
+            );
+        }
     }
 
     #[test]

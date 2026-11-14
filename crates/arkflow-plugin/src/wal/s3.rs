@@ -960,6 +960,10 @@ impl WalStore for S3Store {
             .max(1)
     }
 
+    fn next_seq_hint_is_exact(&self) -> bool {
+        true
+    }
+
     fn sealed_seq(&self) -> Option<u64> {
         Some(self.sealed_seq.load(Ordering::Acquire))
     }

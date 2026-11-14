@@ -9,7 +9,7 @@ use crate::storage::{
     RolloutRecord, StorageActor, StorageError,
 };
 use arkflow_core::control::{ControlEvent, OperationRecord, StreamStatus};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -170,6 +170,10 @@ pub struct Hub {
     /// request skips the status CAS, so two callers could otherwise both
     /// adopt-or-create a rollout for the same correlation.
     approval_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Command ids whose terminal result has completed its storage and
+    /// aggregation side effects. A duplicate terminal result only short-
+    /// circuits when this marker is present; otherwise it retries them.
+    settled_commands: Arc<RwLock<BTreeSet<String>>>,
     /// The node order each Job's placement was actually dispatched in, so a
     /// retained placement re-dispatches with the identical task→node mapping
     /// (split round-robin and multi-component co-location are order
@@ -320,6 +324,7 @@ impl Hub {
             #[cfg(test)]
             test_after_write_gate: Arc::new(RwLock::new(None)),
             approval_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settled_commands: Arc::new(RwLock::new(BTreeSet::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             plan_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),

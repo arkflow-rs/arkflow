@@ -333,7 +333,18 @@ impl MessageBatch {
 
     pub fn new_binary_with_origin(&self, content: Vec<Bytes>) -> Result<Self, Error> {
         let schema = self.schema();
-        let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+        let mut fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields().len() + 1);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len() + 1);
+        for (index, field) in schema.fields().iter().enumerate() {
+            // A batch that already carries `__value__` must not end up with a
+            // second column of the same name: `to_binary` resolves the FIRST
+            // match, so downstream would keep reading the stale payload.
+            if field.name() == DEFAULT_BINARY_VALUE_FIELD {
+                continue;
+            }
+            fields.push(field.clone());
+            columns.push(self.column(index).clone());
+        }
 
         fields.push(Arc::new(Field::new(
             DEFAULT_BINARY_VALUE_FIELD,
@@ -341,11 +352,6 @@ impl MessageBatch {
             false,
         )));
         let new_schema = Arc::new(Schema::new(fields));
-
-        let mut columns: Vec<ArrayRef> = Vec::new();
-        for i in 0..schema.fields().len() {
-            columns.push(self.column(i).clone());
-        }
 
         let binary_data: Vec<&[u8]> = content.iter().map(|v| v.as_slice()).collect();
         columns.push(Arc::new(BinaryArray::from(binary_data)));
@@ -379,8 +385,16 @@ impl MessageBatch {
         }
 
         let new_schema: SchemaRef = SchemaRef::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(new_schema, new_columns)
-            .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
+        // Zero selected columns is a valid projection (e.g. a dynamic batch
+        // with none of the whitelisted fields): Arrow needs an explicit row
+        // count when there are no columns to infer it from.
+        let batch = RecordBatch::try_new_with_options(
+            new_schema,
+            new_columns,
+            &datafusion::arrow::record_batch::RecordBatchOptions::new()
+                .with_row_count(Some(self.num_rows())),
+        )
+        .map_err(|e| Error::Process(format!("Creating an Arrow record batch failed: {}", e)))?;
         // Preserve the origin: a column filter is a transformation of THIS
         // batch, and the input_name is the cross-component contract (the
         // join buffer registers data by it) — dropping it silently empties
