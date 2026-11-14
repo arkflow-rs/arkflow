@@ -169,6 +169,9 @@ impl Buffer for MemoryBuffer {
     /// * `Result<(), Error>` - Success or an error
     async fn write(&self, msg: MessageBatchRef, arc: Arc<dyn Ack>) -> Result<(), Error> {
         loop {
+            if self.close.is_cancelled() {
+                return Err(Error::Process("memory buffer is closed".to_string()));
+            }
             // Register for a capacity notification before checking the fill
             // level: a drain between the check and the wait must not be lost
             // (the periodic timer would only paper over it one timeout
@@ -213,6 +216,11 @@ impl Buffer for MemoryBuffer {
     ///   or None if the buffer is closed and empty
     async fn read(&self) -> Result<Option<(MessageBatchRef, Arc<dyn Ack>)>, Error> {
         loop {
+            // Register before checking: close can fire between the queue
+            // check and `notified().await`, and its `notify_waiters` would
+            // otherwise be lost, parking the reader forever.
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
             {
                 let queue_arc = Arc::clone(&self.queue);
                 let queue_lock = queue_arc.read().await;
@@ -225,9 +233,10 @@ impl Buffer for MemoryBuffer {
                     return Ok(None);
                 }
             }
-            // Wait for notification from timer, write operation, or close
-            let notify = Arc::clone(&self.notify);
-            notify.notified().await;
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = self.close.cancelled() => {}
+            }
         }
         // Process and return the accumulated messages
         self.process_messages().await

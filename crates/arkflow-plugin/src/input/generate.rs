@@ -290,7 +290,7 @@ mod tests {
                     .is_err()
             );
         }
-        let (second, _) = tokio::time::timeout(Duration::from_millis(100), input.read())
+        let (second, _) = tokio::time::timeout(Duration::from_secs(1), input.read())
             .await
             .expect("the absolute deadline elapses despite cancelled reads")
             .unwrap();

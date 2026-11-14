@@ -1027,7 +1027,7 @@ async fn dispatch_gate_outputs(
     forward_watermark: bool,
     current_ready_start: Option<usize>,
 ) -> Result<(), Error> {
-    record_watermark_lag(hook.metrics.as_deref(), watermark);
+    record_watermark_lag(hook.metrics.as_deref(), chain.entry_task_id(), watermark);
     record_late_event_rows(hook.metrics.as_deref(), late_rows);
 
     if ready.len() != ready_acks.len() || ready.len() != ready_invalid_timestamps.len() {
@@ -1233,15 +1233,16 @@ async fn shutdown_interior_chain(
     Ok(())
 }
 
-fn record_watermark_lag(metrics: Option<&crate::runtime::RuntimeMetrics>, watermark: Option<i64>) {
+fn record_watermark_lag(
+    metrics: Option<&crate::runtime::RuntimeMetrics>,
+    source: &str,
+    watermark: Option<i64>,
+) {
     let Some(watermark) = watermark else { return };
     let now = crate::state::now_ms() as i64;
     let lag = now.saturating_sub(watermark).max(0);
     if let Some(metrics) = metrics {
-        metrics
-            .kernel
-            .watermark_lag_ms
-            .fetch_max(lag, std::sync::atomic::Ordering::Relaxed);
+        metrics.kernel.record_watermark_lag(source, lag);
     }
 }
 

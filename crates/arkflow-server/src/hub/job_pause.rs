@@ -14,7 +14,7 @@
 use super::error::HubError;
 use super::wire::{AgentOperation, HubEvent, HubOperationState};
 use super::{now_ms, Hub};
-use crate::storage::{AuditRecord, JobCheckpointRecord, JobPauseUpdate, JobRecord, StorageError};
+use crate::storage::{AuditRecord, JobCheckpointRecord, JobPauseUpdate, JobRecord};
 use arkflow_core::control::ControlEvent;
 
 pub(crate) const PAUSE_CAPTURING: &str = "capturing";
@@ -735,24 +735,34 @@ impl Hub {
             )
             .await;
         // Observation writes clear `last_error`; the abort's stable failure
-        // code is the operator's only signal, so restore it afterwards under
-        // the abort's generation fence — a stale abort must not overwrite a
-        // newer job generation's error state.
-        let mut restore = updated.clone();
-        restore.last_error = Some(failure_code.into());
-        match storage
-            .update_job_with_expected_generation(restore, updated.generation)
-            .await
-        {
-            Ok(restored) => self.cache_job(&restored).await,
-            Err(StorageError::GenerationConflict { .. }) => {
-                tracing::warn!(
-                    job_id = %updated.job_id,
-                    generation = updated.generation,
-                    "pause abort error code not restored: a newer job generation won"
-                );
+        // code is the operator's only signal, so restore it afterwards only
+        // while the abort's generation is still current. (The plain
+        // `update_job` preserves the generation; the conditional variant
+        // would bump it.)
+        let current = self.job(&updated.job_id).await?.ok_or(HubError::NotFound)?;
+        if current.generation == updated.generation {
+            if let Some(restored) = storage
+                .update_job(
+                    &updated.job_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(failure_code.into()),
+                )
+                .await
+                .map_err(HubError::from)?
+            {
+                self.cache_job(&restored).await;
             }
-            Err(error) => return Err(HubError::from(error)),
+        } else {
+            tracing::warn!(
+                job_id = %updated.job_id,
+                generation = updated.generation,
+                current = current.generation,
+                "pause abort error code not restored: a newer job generation won"
+            );
         }
         Ok(true)
     }

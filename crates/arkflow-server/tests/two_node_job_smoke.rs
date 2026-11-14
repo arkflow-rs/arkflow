@@ -791,7 +791,11 @@ async fn wait_for_running_rows(
                     && job.convergence == "converged"
                     && job.pause_phase.is_none()
                     && tasks.keys().cloned().collect::<BTreeSet<_>>() == expected_tasks
-                    && tasks.values().map(String::as_str).collect::<BTreeSet<_>>()
+                    && tasks
+                        .values()
+                        .flatten()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>()
                         == BTreeSet::from(["node-a", "node-b"])
                     && fixture.settled(count)
             }

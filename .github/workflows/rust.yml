@@ -164,6 +164,11 @@ jobs:
       #   cargo test, which runs test binaries sequentially and keeps
       #   future suites of that shape working without workflow edits.
       - name: Run tests
+        env:
+          # CI runners provide Docker; make broker integration tests run
+          # their assertions instead of returning successfully when no
+          # daemon is reachable.
+          ARKFLOW_REQUIRE_DOCKER: "1"
         run: |
           cargo nextest run --workspace --all-targets -E 'not package(arkflow-plugin)'
           cargo test -p arkflow-plugin

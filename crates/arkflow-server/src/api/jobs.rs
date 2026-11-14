@@ -566,12 +566,16 @@ pub(super) async fn hub_job_detail(
                     .unwrap_or_default()
                     .to_owned();
                 match observed_tasks.get(&task_id) {
-                    Some(node_id) => {
+                    Some(node_ids) if !node_ids.is_empty() => {
                         object.insert("state".into(), serde_json::json!("running"));
                         object.insert("observed".into(), serde_json::json!(true));
-                        object.insert("observed_node_id".into(), serde_json::json!(node_id));
+                        object.insert(
+                            "observed_node_id".into(),
+                            serde_json::json!(node_ids.first()),
+                        );
+                        object.insert("observed_node_ids".into(), serde_json::json!(node_ids));
                     }
-                    None => {
+                    _ => {
                         object.insert("observed".into(), serde_json::json!(false));
                     }
                 }

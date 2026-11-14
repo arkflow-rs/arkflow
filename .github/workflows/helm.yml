@@ -12,15 +12,17 @@ on:
     paths:
       - "deploy/charts/**"
       - ".github/workflows/helm.yml"
-      - "crates/arkflow-core/src/config.rs"
-      - "crates/arkflow-core/src/secret.rs"
+      - "crates/arkflow-core/src/**"
+      - "crates/arkflow-plugin/src/**"
+      - "crates/arkflow/src/**"
   pull_request:
     branches: [ "main" ]
     paths:
       - "deploy/charts/**"
       - ".github/workflows/helm.yml"
-      - "crates/arkflow-core/src/config.rs"
-      - "crates/arkflow-core/src/secret.rs"
+      - "crates/arkflow-core/src/**"
+      - "crates/arkflow-plugin/src/**"
+      - "crates/arkflow/src/**"
   workflow_dispatch:
 
 env:

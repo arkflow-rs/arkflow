@@ -1480,6 +1480,23 @@ mod tests {
         Arc::new(MessageBatch::new_arrow(batch))
     }
 
+    /// Row values in a canonical order, for queries without ORDER BY.
+    fn sorted_rows(batch: &RecordBatch) -> Vec<Vec<String>> {
+        let mut rows = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let mut values = Vec::with_capacity(batch.num_columns());
+            for column in batch.columns() {
+                values.push(
+                    datafusion::arrow::util::display::array_value_to_string(column, row)
+                        .unwrap_or_default(),
+                );
+            }
+            rows.push(values);
+        }
+        rows.sort();
+        rows
+    }
+
     /// Spec "Physical planning happens once per schema": the build counter
     /// rises at most once per pooled context for a fixed schema and then
     /// stops, and a schema drift re-triggers exactly one rebuild per used
@@ -1674,9 +1691,12 @@ mod tests {
                     fresh_batch.record_batch().schema(),
                     "query {query} round {round} (ids {ids:?}): schema differs"
                 );
+                // A query without ORDER BY has no row-order contract; plan
+                // shape changes may legitimately reorder join output. Compare
+                // rows as a multiset.
                 assert_eq!(
-                    cached_batch.record_batch(),
-                    fresh_batch.record_batch(),
+                    sorted_rows(cached_batch.record_batch()),
+                    sorted_rows(fresh_batch.record_batch()),
                     "query {query} round {round} (ids {ids:?}): values differ"
                 );
             }

@@ -4360,7 +4360,11 @@ mod tests {
             .await
             .unwrap();
 
-        let claimed = store.claim_outbox("worker", now).await.unwrap().unwrap();
+        let claimed = store
+            .claim_outbox("worker", now_ms())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(claimed.node_id, "node-online");
     }
 
@@ -6162,7 +6166,17 @@ mod tests {
             "the pending age must be reported for queued work"
         );
         // Claiming the only row moves it into the claimed counter and gives
-        // the pending queue an age.
+        // the pending queue an age. The target node is offline, so the claim
+        // is skipped; bring it online first.
+        assert!(store
+            .claim_outbox("worker", now_ms())
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .upsert_node(node("node-a", "online", None))
+            .await
+            .unwrap();
         let outbox = store
             .claim_outbox("worker", now_ms())
             .await

@@ -1705,10 +1705,10 @@ mod tests {
             .expect("empty batch is a no-op");
     }
 
-    /// A codec producing more payloads than topic rows trips the
-    /// row-alignment guard (previously an index panic).
+    /// A codec producing more payloads than rows trips the row-alignment
+    /// guard before any topic routing can panic.
     #[tokio::test]
-    async fn write_fails_loudly_when_topics_run_short() {
+    async fn write_fails_loudly_when_payloads_do_not_match_rows() {
         let output = KafkaOutput::new(
             output_config(serde_json::json!({
                 "brokers": ["localhost:9092"],
@@ -1720,7 +1720,10 @@ mod tests {
         output.connect().await.unwrap();
         let batch = utf8_batch(&[("device_topic", vec![Some("a"), Some("b")])]);
         let err = output.write(batch).await.unwrap_err();
-        assert!(err.to_string().contains("has no topic"), "got: {err}");
+        assert!(
+            err.to_string().contains("payloads for 2 rows"),
+            "got: {err}"
+        );
     }
 
     /// write_batch's non-transactional path aggregates per-message failures

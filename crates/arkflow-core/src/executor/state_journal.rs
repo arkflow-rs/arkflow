@@ -853,11 +853,21 @@ impl StateJournal {
         inner.replay_applied.remove(&txn.id);
         inner.failed_compensation.remove(&txn.id);
         if let Some(state) = inner.txns.remove(&txn.id) {
-            match state {
-                TxnState::Staged(mutations) | TxnState::Applied { mutations, .. } => {
-                    inner.release_bytes(&mutations);
+            let mutations = match state {
+                TxnState::Staged(mutations) => mutations,
+                TxnState::Applied { mutations, .. } => mutations,
+            };
+            // A completed delete leaves no live value; retaining its version
+            // fence forever leaks one entry per deleted key.
+            for mutation in &mutations {
+                if matches!(mutation, StagedMutation::Delete { .. }) {
+                    let (namespace, key) = mutation.storage();
+                    inner
+                        .key_versions
+                        .remove(&(namespace.to_owned(), key.to_vec()));
                 }
             }
+            inner.release_bytes(&mutations);
         }
     }
 
@@ -1128,18 +1138,30 @@ impl Ack for CommitGroupOnAck {
         self.journal
             .with_finalize_scope(async {
                 let inner_result = self.inner.abort().await;
+                let mut compensation_error = None;
                 for txn in &self.txns {
                     if self.journal.transaction_is_registered(*txn) {
-                        let _ = self.journal.undo(*txn);
+                        if let Err(error) = self.journal.undo(*txn) {
+                            compensation_error.get_or_insert(error);
+                        }
                         self.journal.rollback(*txn);
                     }
                 }
                 if let Some(rollbacks) = self.completed_rollbacks.lock().unwrap().take() {
                     for rollback in rollbacks.iter().rev() {
-                        let _ = self.journal.undo_snapshot(rollback);
+                        if let Err(error) = self.journal.undo_snapshot(rollback) {
+                            compensation_error.get_or_insert(error);
+                        }
                     }
                 }
-                inner_result
+                match (inner_result, compensation_error) {
+                    (Ok(()), None) => Ok(()),
+                    (Ok(()), Some(error)) => Err(error),
+                    (Err(error), Some(compensation)) => Err(Error::Process(format!(
+                        "{error}; compensation also failed: {compensation}"
+                    ))),
+                    (Err(error), None) => Err(error),
+                }
             })
             .await
     }
@@ -1226,16 +1248,28 @@ impl Ack for CommitOnAck {
         self.journal
             .with_finalize_scope(async {
                 let inner_result = self.inner.abort().await;
+                let mut compensation_error = None;
                 if self.journal.transaction_is_registered(self.txn) {
-                    let _ = self.journal.undo(self.txn);
+                    if let Err(error) = self.journal.undo(self.txn) {
+                        compensation_error.get_or_insert(error);
+                    }
                     self.journal.rollback(self.txn);
                 } else {
                     let completed_rollback = { self.completed_rollback.lock().unwrap().take() };
                     if let Some(rollback) = completed_rollback {
-                        let _ = self.journal.undo_snapshot(&rollback);
+                        if let Err(error) = self.journal.undo_snapshot(&rollback) {
+                            compensation_error.get_or_insert(error);
+                        }
                     }
                 }
-                inner_result
+                match (inner_result, compensation_error) {
+                    (Ok(()), None) => Ok(()),
+                    (Ok(()), Some(error)) => Err(error),
+                    (Err(error), Some(compensation)) => Err(Error::Process(format!(
+                        "{error}; compensation also failed: {compensation}"
+                    ))),
+                    (Err(error), None) => Err(error),
+                }
             })
             .await
     }
