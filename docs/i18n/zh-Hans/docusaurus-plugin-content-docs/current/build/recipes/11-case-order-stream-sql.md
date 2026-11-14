@@ -49,7 +49,6 @@ streams:
         - type: json_to_arrow
         - type: sql
           query: "SELECT * FROM flow WHERE status = 'PAID'"
-        - type: arrow_to_json
 
     output:
       type: sql

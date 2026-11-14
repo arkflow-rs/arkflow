@@ -107,9 +107,11 @@ jobs:
           chart_version="$(grep -m1 '^version:' deploy/charts/arkflow/Chart.yaml | cut -d' ' -f2 | tr -d '"')"
           echo "Publishing chart version ${chart_version} (appVersion tracks the engine tag)"
           helm package deploy/charts/arkflow
-          helm push "arkflow-${chart_version}.tgz" oci://${{ github.repository_owner }}/charts
+          # An OCI reference needs the registry host; `oci://<owner>/charts`
+          # made Helm treat the owner name as the registry.
+          helm push "arkflow-${chart_version}.tgz" "oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts"
 
       - name: Verify published chart
         run: |
           chart_version="$(grep -m1 '^version:' deploy/charts/arkflow/Chart.yaml | cut -d' ' -f2 | tr -d '"')"
-          helm show chart oci://${{ github.repository_owner }}/charts/arkflow --version "${chart_version}"
+          helm show chart "oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/arkflow" --version "${chart_version}"
