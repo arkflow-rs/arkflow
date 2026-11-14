@@ -144,9 +144,15 @@ impl Input for PulsarInput {
             .await
             .map_err(|e| Error::Connection(format!("Failed to connect to Pulsar: {}", e)))?;
 
-        // Store client
-        let mut client_guard = self.client.write().await;
-        *client_guard = Some(client.clone());
+        // Store client — the write guard is released immediately: holding it
+        // across the consumer build below serialized every read() against a
+        // network call, and combined with close()'s reverse lock order
+        // (consumer, then client) formed an ABBA deadlock on reconnect-vs-
+        // close overlaps.
+        {
+            let mut client_guard = self.client.write().await;
+            *client_guard = Some(client.clone());
+        }
 
         // Configure consumer
         let subscription_type = self.config.subscription_type.clone().unwrap_or_default();
@@ -300,14 +306,16 @@ impl Input for PulsarInput {
         // Send cancellation signal
         self.cancellation_token.cancel();
 
-        // Close consumer if active
-        let mut consumer_guard = self.consumer.write().await;
-        *consumer_guard = None;
-
-        // Close Pulsar client
-        let mut client_guard = self.client.write().await;
-        if let Some(_client) = client_guard.take() {
-            // Client will be dropped automatically
+        // Lock in the SAME order as connect (client, then consumer): the
+        // previous consumer-first order deadlocked against a reconnect's
+        // connect holding client across the consumer build.
+        {
+            let mut client_guard = self.client.write().await;
+            let mut consumer_guard = self.consumer.write().await;
+            *consumer_guard = None;
+            if let Some(_client) = client_guard.take() {
+                // Client will be dropped automatically
+            }
         }
 
         Ok(())

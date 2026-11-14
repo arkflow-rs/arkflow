@@ -658,12 +658,10 @@ impl Hub {
         {
             return Err(HubError::Unauthorized);
         }
-        // A terminal result settles the command lease as well as the
-        // operation.  If the result is a duplicate, removing an already
-        // absent lease is intentionally idempotent.
-        if let Some(node) = nodes.get_mut(&auth.node_id) {
-            node.leased_commands.remove(&result.command_id);
-        }
+        // The command lease settles only with a terminal result: the initial
+        // acknowledgement and progress reports must leave it leased so the
+        // expiry sweep can still time out a command whose node acknowledged
+        // it and then died before executing.
         let mut operations = self.operations.write().await;
         let operation = operations
             .values_mut()
@@ -673,6 +671,17 @@ impl Hub {
             return Err(HubError::Unauthorized);
         }
         if operation.id != result.operation_id {
+            // The node is reporting under a command that maps to a different
+            // stored operation (a command-id collision or a stale replay).
+            // Do not apply the reported state, and do NOT settle the lease:
+            // the sweep must still be able to expire this command.
+            tracing::warn!(
+                node = %auth.node_id,
+                command_id = %result.command_id,
+                reported_operation_id = %result.operation_id,
+                stored_operation_id = %operation.id,
+                "command result carries a foreign operation id; state not applied"
+            );
             return Ok(operation.clone());
         }
         if operation.generation != result.generation {
@@ -691,6 +700,22 @@ impl Hub {
             // otherwise rewrite a terminal operation. Returning the stored
             // record keeps duplicate result delivery idempotent.
             return Ok(operation.clone());
+        }
+        if matches!(
+            result.state,
+            HubOperationState::Succeeded
+                | HubOperationState::Failed
+                | HubOperationState::TimedOut
+                | HubOperationState::NodeUnavailable
+                | HubOperationState::Cancelled
+                | HubOperationState::Superseded
+        ) {
+            // A terminal result settles the command lease. The check runs on
+            // the validated, applied result — an acknowledged/running report
+            // or a foreign-id replay never releases the lease.
+            if let Some(node) = nodes.get_mut(&auth.node_id) {
+                node.leased_commands.remove(&result.command_id);
+            }
         }
         operation.state = result.state;
         operation.progress = result.progress;

@@ -77,15 +77,17 @@ impl Input for GenerateInput {
             tokio::time::sleep(self.config.interval).await;
         }
 
+        let mut batch_size = self.batch_size;
         if let Some(count) = self.config.count {
             let current_count = self.count.load(Ordering::SeqCst);
             if current_count >= count as i64 {
                 return Err(Error::EOF);
             }
-            // Check if adding the current batch would exceed the total count limit
-            if current_count + self.batch_size as i64 > count as i64 {
-                return Err(Error::EOF);
-            }
+            // The FINAL batch may be a partial one: emitting only whole
+            // multiples silently dropped the remainder (count=10 with
+            // batch_size=4 produced 8 records and stopped at EOF).
+            batch_size =
+                batch_size.min((count as i64 - current_count.max(0)).max(0) as usize);
         }
 
         // One read's payloads are byte-identical copies of the template, so
@@ -107,12 +109,11 @@ impl Input for GenerateInput {
         )
         .await?;
 
-        if self.batch_size > 1 {
-            message_batch = replicate_rows(&message_batch, self.batch_size)?;
+        if batch_size > 1 {
+            message_batch = replicate_rows(&message_batch, batch_size)?;
         }
 
-        self.count
-            .fetch_add(self.batch_size as i64, Ordering::SeqCst);
+        self.count.fetch_add(batch_size as i64, Ordering::SeqCst);
 
         message_batch.set_input_name(self.input_name.clone());
         Ok((Arc::new(message_batch), Arc::new(NoopAck)))

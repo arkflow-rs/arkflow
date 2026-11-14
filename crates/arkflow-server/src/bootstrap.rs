@@ -7,7 +7,7 @@
 use crate::hub::{Hub, HubConfig, HubHaConfig};
 use crate::oidc::OidcFederation;
 use crate::storage::table_copier;
-use crate::storage::{ControlPlaneStore, StorageActor};
+use crate::storage::{ControlPlaneStore, StorageActor, StorageBackend};
 use crate::{serve_hub, ServerConfig};
 use std::error::Error;
 use tokio_util::sync::CancellationToken;
@@ -379,6 +379,24 @@ pub async fn serve_from_config(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut hub = if let Some(path) = config.hub_storage.as_deref() {
         let store = ControlPlaneStore::open(path).await?;
+        // Seed both id sequences above everything a previous process
+        // persisted, BEFORE the Hub mints its first id: a reused durable
+        // primary key either fails the insert or silently overwrites an
+        // older record.
+        match store.id_sequence_floor().await {
+            Ok(floor) => crate::hub::seed_control_plane_floor(floor),
+            Err(error) => tracing::warn!(
+                %error,
+                "could not read the control-plane id floor; new ids may collide with persisted rows"
+            ),
+        }
+        match store.intent_counter_floor().await {
+            Ok(floor) => crate::storage::seed_intent_counter(floor),
+            Err(error) => tracing::warn!(
+                %error,
+                "could not read the intent counter floor; new intents may collide with persisted rows"
+            ),
+        }
         Hub::with_storage(hub_config, StorageActor::start(store, 128)).with_ha(ha)
     } else {
         Hub::new(hub_config).with_ha(ha)

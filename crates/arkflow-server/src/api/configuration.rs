@@ -16,8 +16,14 @@ use serde::Serialize;
 pub(super) async fn hub_configuration(
     State(hub): State<hub::Hub>,
     Path(node_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "configuration", Some(node_id.clone()))
+            .await
+    {
+        return response;
+    }
     match hub.configuration(&node_id).await {
         Some(configuration) => Json(configuration).into_response(),
         None => problem(
@@ -31,8 +37,14 @@ pub(super) async fn hub_configuration(
 pub(super) async fn hub_configuration_versions(
     State(hub): State<hub::Hub>,
     Path(node_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "configuration", Some(node_id.clone()))
+            .await
+    {
+        return response;
+    }
     if hub.configuration(&node_id).await.is_none() {
         return problem(
             StatusCode::NOT_FOUND,

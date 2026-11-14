@@ -203,17 +203,22 @@ impl Output for NatsOutput {
     }
 
     async fn close(&self) -> Result<(), Error> {
-        // Close JetStream stream if active
+        // Take the locks in the SAME ORDER as `connect` (client, then
+        // js_stream): this close took js_stream first and held both while a
+        // reconnect's connect held client and waited for js_stream — a
+        // classic ABBA deadlock on overlapping public calls.
+        let mut client_guard = self.client.write().await;
         let mut js_stream_guard = self.js_stream.write().await;
         *js_stream_guard = None;
 
-        // Close NATS client
-        let mut client_guard = self.client.write().await;
+        // Close NATS client — a flush failure at close is a real delivery
+        // loss signal, not a log line: propagate it like the other outputs.
         if let Some(client) = client_guard.take() {
             // Client will be dropped automatically
-            if let Err(e) = client.flush().await {
-                error!("Error flushing NATS client: {}", e);
-            }
+            client
+                .flush()
+                .await
+                .map_err(|e| Error::Connection(format!("Failed to flush NATS client: {}", e)))?;
         }
 
         Ok(())

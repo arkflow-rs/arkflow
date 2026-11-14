@@ -264,6 +264,10 @@ impl Hub {
     /// exists.
     pub async fn save_user(&self, user: UserRecord, actor: &str) -> Result<UserRecord, HubError> {
         let storage = self.identity_storage()?.clone();
+        // Serialize the reachability check with the write: two concurrent
+        // demotions of the last two admins must not both observe "the other
+        // admin exists" between `list_users` and `upsert_user`.
+        let _write_guard = self.identity_write_lock.lock().await;
         let current = storage
             .get_user(&user.user_id)
             .await
@@ -335,6 +339,9 @@ impl Hub {
     /// enabled admin is protected by the same reachability invariant.
     pub async fn delete_user(&self, user_id: &str, actor: &str) -> Result<bool, HubError> {
         let storage = self.identity_storage()?.clone();
+        // Same serialization as `save_user`: the reachability check must not
+        // interleave with another admin mutation's write.
+        let _write_guard = self.identity_write_lock.lock().await;
         let current = storage
             .get_user(user_id)
             .await

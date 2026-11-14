@@ -98,27 +98,36 @@ impl Processor for PythonProcessor {
         let func_to_call = Python::attach(|py| self.func.clone_ref(py));
 
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
-        // The permit lives inside the blocking closure: an async timeout
-        // abandons the task but the stuck call keeps holding its permit,
-        // so new calls queue here instead of piling more threads.
-        let permit =
-            INFLIGHT_UDFS.clone().acquire_owned().await.map_err(|e| {
-                Error::Process(format!("python UDF in-flight semaphore closed: {e}"))
-            })?;
-        let handle = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            call_udf(func_to_call, batch)
-        });
-        let result = tokio::time::timeout(timeout, handle)
-            .await
-            .map_err(|_| {
-                Error::Process(format!(
-                    "Python function call timed out after {} ms (the UDF may still occupy its blocking thread and one of {} in-flight slots until it returns)",
-                    self.timeout_ms,
-                    INFLIGHT_UDF_LIMIT
-                ))
-            })?
-            .map_err(|e| Error::Process(format!("Failed to spawn blocking task: {}", e)))??;
+        // The WHOLE acquisition-plus-call waits inside the timeout: permits
+        // held by permanently stuck calls must not turn every later call into
+        // an unbounded wait on the semaphore (the acquisition previously sat
+        // outside the timeout, so 64 stuck UDFs meant every later call hung
+        // forever). Timing out while queued abandons nothing that is running:
+        // an already-started call keeps its blocking thread and its permit
+        // until it returns.
+        let result = tokio::time::timeout(timeout, async {
+            let permit = INFLIGHT_UDFS
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| Error::Process(format!("python UDF in-flight semaphore closed: {e}")))?;
+            let func = func_to_call;
+            let handle = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                call_udf(func, batch)
+            });
+            handle
+                .await
+                .map_err(|e| Error::Process(format!("Failed to spawn blocking task: {e}")))?
+        })
+        .await
+        .map_err(|_| {
+            Error::Process(format!(
+                "Python function call timed out after {} ms (a started UDF may still occupy its blocking thread and one of {} in-flight slots until it returns)",
+                self.timeout_ms,
+                INFLIGHT_UDF_LIMIT
+            ))
+        })??;
 
         let vec_mb = result
             .into_iter()

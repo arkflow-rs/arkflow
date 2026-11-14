@@ -881,6 +881,7 @@ fn agent_rescale_restore_partitions_entries_exactly_by_node() {
             node_id: "n1".into(),
         }],
         source_positions: Vec::new(),
+        source_positions_by_task: Default::default(),
         watermarks_ms: Default::default(),
         watermark_partitions: Default::default(),
         in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
@@ -1010,6 +1011,7 @@ fn agent_recovery_without_rescale_fails_closed_on_task_set_change() {
             node_id: "n1".into(),
         }],
         source_positions: Vec::new(),
+        source_positions_by_task: Default::default(),
         watermarks_ms: Default::default(),
         watermark_partitions: Default::default(),
         in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {
@@ -1433,6 +1435,7 @@ fn plan_manifest(
             })
             .collect(),
         source_positions: Vec::new(),
+        source_positions_by_task: Default::default(),
         watermarks_ms: Default::default(),
         watermark_partitions: Default::default(),
         in_flight_barrier: arkflow_core::checkpoint::CheckpointBarrier {

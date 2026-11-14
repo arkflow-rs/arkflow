@@ -122,14 +122,18 @@ impl StatefulOperator {
                 }
             };
         }
-        encode_integer_keys!(Int8Array, "i8");
-        encode_integer_keys!(Int16Array, "i16");
-        encode_integer_keys!(Int32Array, "i32");
-        encode_integer_keys!(Int64Array, "i64");
-        encode_integer_keys!(UInt8Array, "u8");
-        encode_integer_keys!(UInt16Array, "u16");
-        encode_integer_keys!(UInt32Array, "u32");
-        encode_integer_keys!(UInt64Array, "u64");
+        // Tags carry the trailing COLON the rescale parser strips
+        // (`routing_key_bytes` expects "<tag>:"); a bare prefix made every
+        // integer-keyed state fail rescale redistribution with
+        // "unrecognized key encoding".
+        encode_integer_keys!(Int8Array, "i8:");
+        encode_integer_keys!(Int16Array, "i16:");
+        encode_integer_keys!(Int32Array, "i32:");
+        encode_integer_keys!(Int64Array, "i64:");
+        encode_integer_keys!(UInt8Array, "u8:");
+        encode_integer_keys!(UInt16Array, "u16:");
+        encode_integer_keys!(UInt32Array, "u32:");
+        encode_integer_keys!(UInt64Array, "u64:");
         Err(Error::Process(format!(
             "stateful operator key field '{}' has unsupported Arrow type {:?}",
             self.key_field,
@@ -266,6 +270,22 @@ impl Processor for StatefulOperator {
 
     async fn close(&self) -> Result<(), Error> {
         self.inner.close().await
+    }
+
+    // Lifecycle forwarding: without these the stateful operator inherits the
+    // Processor trait's no-op defaults, so an inner processor driven by
+    // idle-tick flushes, watermarks, or EOF draining (the batch processor)
+    // never fires inside a stateful chain.
+    async fn finish(&self) -> Result<crate::ProcessResult, Error> {
+        self.inner.finish().await
+    }
+
+    async fn on_tick(&self) -> Result<crate::ProcessResult, Error> {
+        self.inner.on_tick().await
+    }
+
+    async fn on_watermark(&self, watermark_ms: i64) -> Result<crate::ProcessResult, Error> {
+        self.inner.on_watermark(watermark_ms).await
     }
 }
 

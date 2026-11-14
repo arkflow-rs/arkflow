@@ -94,6 +94,13 @@ pub struct CheckpointManifest {
     pub generation: u64,
     pub task_attempts: Vec<TaskAttemptSnapshot>,
     pub source_positions: Vec<SourcePosition>,
+    /// Source positions keyed by the source task that reported them. The
+    /// flattened `source_positions` list loses task identity, so two sources
+    /// with the same topic/partition would restore from each other's
+    /// offsets; recovery prefers this map and only falls back to the flat
+    /// list for manifests written before it existed.
+    #[serde(default)]
+    pub source_positions_by_task: BTreeMap<String, Vec<SourcePosition>>,
     /// Watermarks keyed by stable source task identity. Partition numbers are
     /// only unique within one source operator and cannot identify a Job-wide
     /// watermark when multiple sources are present.
@@ -520,6 +527,9 @@ impl CheckpointCatalog {
 pub struct RecoveryPlan {
     pub checkpoint_id: String,
     pub source_positions: Vec<SourcePosition>,
+    /// Per-task positions mirroring the manifest map; legacy manifests carry
+    /// an empty map and restore falls back to `source_positions`.
+    pub source_positions_by_task: BTreeMap<String, Vec<SourcePosition>>,
     pub watermarks_ms: BTreeMap<String, i64>,
     pub watermark_partitions: BTreeMap<String, Vec<WatermarkPosition>>,
     pub task_attempts: Vec<TaskAttemptSnapshot>,
@@ -753,6 +763,7 @@ impl RecoveryPlan {
         Ok(Self {
             checkpoint_id: manifest.checkpoint_id.clone(),
             source_positions: manifest.source_positions.clone(),
+            source_positions_by_task: manifest.source_positions_by_task.clone(),
             watermarks_ms: manifest.watermarks_ms.clone(),
             watermark_partitions: manifest.watermark_partitions.clone(),
             task_attempts: manifest.task_attempts.clone(),
@@ -877,10 +888,12 @@ impl CheckpointCoordinator {
             .clone()
             .ok_or_else(|| Error::Process("checkpoint barrier is missing".into()))?;
         let mut source_positions = Vec::new();
+        let mut source_positions_by_task = BTreeMap::new();
         let mut watermarks_ms = BTreeMap::new();
         let mut watermark_partitions = BTreeMap::new();
         for ack in self.acknowledgements.values() {
             source_positions.extend(ack.source_positions.clone());
+            source_positions_by_task.insert(ack.task_id.clone(), ack.source_positions.clone());
             if let Some(watermark) = ack.watermark_ms {
                 watermarks_ms.insert(ack.task_id.clone(), watermark);
             }
@@ -895,6 +908,7 @@ impl CheckpointCoordinator {
             generation: self.generation,
             task_attempts,
             source_positions,
+            source_positions_by_task,
             watermarks_ms,
             watermark_partitions,
             in_flight_barrier: barrier,
@@ -938,6 +952,7 @@ fn manifest_checksum(manifest: &CheckpointManifest) -> u64 {
         manifest.generation,
         &manifest.task_attempts,
         &manifest.source_positions,
+        &manifest.source_positions_by_task,
         &manifest.watermarks_ms,
         &manifest.watermark_partitions,
         &manifest.in_flight_barrier,
@@ -1109,6 +1124,7 @@ mod tests {
                 partition: 0,
                 offset: 10,
             }],
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: BTreeMap::new(),
             watermark_partitions: BTreeMap::new(),
             in_flight_barrier: CheckpointBarrier {
@@ -1213,6 +1229,7 @@ mod tests {
                 node_id: "node-a".into(),
             }],
             source_positions: vec![],
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: BTreeMap::new(),
             watermark_partitions: BTreeMap::new(),
             in_flight_barrier: CheckpointBarrier {
@@ -1259,6 +1276,7 @@ mod compatibility_tests {
                 })
                 .collect(),
             source_positions: vec![],
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: BTreeMap::new(),
             watermark_partitions: BTreeMap::new(),
             in_flight_barrier: CheckpointBarrier {

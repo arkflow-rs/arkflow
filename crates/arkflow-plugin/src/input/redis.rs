@@ -72,6 +72,10 @@ struct RedisInput {
     client: Arc<Mutex<Option<Cli>>>,
     sender: Sender<Delivery>,
     receiver: Receiver<Delivery>,
+    /// Bounded queue for cluster pub/sub pushes: the sync push callback
+    /// enqueues raw payloads here and a single pump decodes them in order
+    /// (see `ClusterPushForwarder`).
+    cluster_raw: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
     cancellation_token: CancellationToken,
     codec: Option<Arc<dyn Codec>>,
 }
@@ -107,71 +111,45 @@ fn is_temporary_redis_error<E: std::fmt::Display>(err: &E) -> bool {
     true
 }
 
-/// Forwards cluster pub/sub pushes into the input channel. redis 1.x takes
-/// push delivery through the `AsyncPushSender` trait instead of a closure;
-/// `SendError` carries no payload (it only signals connection loss), so a
-/// push message that fails to parse is logged and skipped rather than
-/// propagated.
+/// Forwards cluster pub/sub pushes into a bounded raw queue. The push
+/// callback is synchronous, so it cannot decode (an async codec call) — but
+/// spawning one decode task per message was unbounded under a slow consumer
+/// and let the spawned tasks race each other into reordering. The callback
+/// now blocks on the bounded queue instead: backpressure instead of
+/// unbounded memory, and the single pump decodes in sequence so delivery
+/// order matches broker order.
+///
+/// `PushKind::PMessage` frames carry `[pattern, channel, payload]`; plain
+/// `Message`/`SMessage` frames carry `[channel, payload]`.
 struct ClusterPushForwarder {
-    sender: Sender<Delivery>,
-    codec: Option<Arc<dyn Codec>>,
-    input_name: Option<String>,
+    raw: Sender<Vec<u8>>,
 }
 
 impl redis::aio::AsyncPushSender for ClusterPushForwarder {
-    fn send(&self, msg: PushInfo) -> Result<(), redis::aio::SendError> {
-        match msg.kind {
-            PushKind::Message | PushKind::PMessage | PushKind::SMessage => {
-                if msg.data.len() < 2 {
-                    return Ok(());
-                }
-                let mut iter = msg.data.into_iter();
-                let _channel = match iter.next() {
-                    Some(v) => match String::from_redis_value(v) {
-                        Ok(channel) => channel,
-                        Err(error) => {
-                            error!("redis cluster push channel failed to parse: {}", error);
-                            return Ok(());
-                        }
-                    },
-                    None => return Ok(()),
-                };
-                let message: Vec<u8> = match iter.next() {
-                    Some(v) => match Vec::from_redis_value(v) {
-                        Ok(message) => message,
-                        Err(error) => {
-                            error!("redis cluster push message failed to parse: {}", error);
-                            return Ok(());
-                        }
-                    },
-                    None => return Ok(()),
-                };
-
-                // The push callback is sync; decode off it so the
-                // delivery entering the channel is already
-                // finished (cancellation-safe read contract).
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => {
-                        let sender_cb = Sender::clone(&self.sender);
-                        let codec_cb = self.codec.clone();
-                        let input_name_cb = self.input_name.clone();
-                        handle.spawn(async move {
-                            let delivery = crate::input::codec_helper::decode_delivery(
-                                &message,
-                                &codec_cb,
-                                input_name_cb,
-                                Arc::new(NoopAck),
-                            )
-                            .await;
-                            if let Err(e) = sender_cb.send_async(delivery).await {
-                                error!("{}", e);
-                            }
-                        });
-                    }
-                    Err(e) => error!("no async runtime for redis push decode: {}", e),
-                }
+    fn send(&self, mut msg: PushInfo) -> Result<(), redis::aio::SendError> {
+        // The message byte payload sits at a kind-specific index; the
+        // channel/pattern elements are not consumed (the delivery carries
+        // only the decoded payload, as before).
+        let payload_index = match msg.kind {
+            PushKind::Message | PushKind::SMessage => 1usize,
+            PushKind::PMessage => 2usize,
+            _ => return Ok(()),
+        };
+        if msg.data.len() <= payload_index {
+            return Ok(());
+        }
+        // redis 1.x's FromRedisValue takes the Value by value.
+        let message: Vec<u8> = match Vec::from_redis_value(
+            msg.data.swap_remove(payload_index),
+        ) {
+            Ok(message) => message,
+            Err(error) => {
+                error!("redis cluster push message failed to parse: {}", error);
+                return Ok(());
             }
-            _ => {}
+        };
+        if let Err(error) = self.raw.send(message) {
+            error!("redis cluster raw queue closed: {}", error);
         }
         Ok(())
     }
@@ -185,6 +163,7 @@ impl RedisInput {
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let (sender, receiver) = flume::bounded::<Delivery>(1000);
+        let (cluster_raw_tx, cluster_raw_rx) = flume::bounded::<Vec<u8>>(1000);
         let cancellation_token = CancellationToken::new();
         match &config.mode {
             ModeConfig::Cluster { urls, .. } => {
@@ -207,6 +186,7 @@ impl RedisInput {
             client: Arc::new(Mutex::new(None)),
             sender,
             receiver,
+            cluster_raw: (cluster_raw_tx, cluster_raw_rx),
             cancellation_token,
             codec,
         })
@@ -229,9 +209,7 @@ impl RedisInput {
             Type::Subscribe { .. } => client_builder
                 .use_protocol(redis::ProtocolVersion::RESP3)
                 .push_sender(ClusterPushForwarder {
-                    sender: Sender::clone(&self.sender),
-                    codec: self.codec.clone(),
-                    input_name: self.input_name.clone(),
+                    raw: self.cluster_raw.0.clone(),
                 }),
             Type::List { .. } => client_builder,
         };
@@ -279,6 +257,35 @@ impl RedisInput {
                         }
                     }
                 }
+                // ONE pump decodes the bounded raw queue in order: the push
+                // callback only enqueues (bounded, backpressuring redis), so
+                // memory stays capped and delivery order matches broker
+                // order — per-message spawned decode tasks did neither.
+                let raw_receiver = self.cluster_raw.1.clone();
+                let sender = Sender::clone(&self.sender);
+                let codec = self.codec.clone();
+                let input_name = self.input_name.clone();
+                let token = cancellation_token.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = token.cancelled() => break,
+                            message = raw_receiver.recv_async() => {
+                                let Ok(message) = message else { break };
+                                let delivery = crate::input::codec_helper::decode_delivery(
+                                    &message,
+                                    &codec,
+                                    input_name.clone(),
+                                    Arc::new(NoopAck),
+                                )
+                                .await;
+                                if sender.send_async(delivery).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
             }
             Type::List { list } => {
                 let sender_clone = Sender::clone(&self.sender);
@@ -611,12 +618,8 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_push_forwarder_delivers_message_payload() {
-        let (sender, receiver) = flume::unbounded();
-        let forwarder = ClusterPushForwarder {
-            sender,
-            codec: None,
-            input_name: Some("redis-in".into()),
-        };
+        let (raw_tx, raw_rx) = flume::unbounded::<Vec<u8>>();
+        let forwarder = ClusterPushForwarder { raw: raw_tx };
 
         assert!(
             forwarder
@@ -631,35 +634,58 @@ mod tests {
             "push handling never signals connection loss"
         );
 
-        let delivery =
-            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv_async())
+        let payload =
+            tokio::time::timeout(std::time::Duration::from_secs(2), raw_rx.recv_async())
                 .await
-                .expect("delivery arrives")
+                .expect("payload arrives")
                 .expect("channel stays open");
-        let Delivery::Data(batch, _ack) = delivery else {
-            panic!("no-codec push decode cannot fail");
-        };
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch.get_input_name(), Some("redis-in".to_string()));
+        assert_eq!(payload, b"payload".to_vec());
+    }
+
+    /// PMessage frames carry `[pattern, channel, payload]`: the forwarder
+    /// must take the THIRD element as the message (the previous code emitted
+    /// the channel string as the message payload).
+    #[test]
+    fn cluster_push_forwarder_parses_pmessage_parts() {
+        let (raw_tx, raw_rx) = flume::unbounded::<Vec<u8>>();
+        let forwarder = ClusterPushForwarder { raw: raw_tx };
+
+        assert!(
+            forwarder
+                .send(PushInfo {
+                    kind: PushKind::PMessage,
+                    data: vec![
+                        Value::BulkString(b"events.*".to_vec()),
+                        Value::BulkString(b"events.a".to_vec()),
+                        Value::BulkString(b"real-payload".to_vec()),
+                    ],
+                })
+                .is_ok(),
+            "push handling never signals connection loss"
+        );
+        assert_eq!(raw_rx.try_recv().unwrap(), b"real-payload".to_vec());
     }
 
     #[test]
     fn cluster_push_forwarder_skips_malformed_push_data() {
-        // A push message with fewer than two parts, or parts that fail to
-        // parse (Nil is not string-convertible), is skipped without
+        // A push message missing its payload index, or a payload that fails
+        // to parse (Nil is not bytes-convertible), is skipped without
         // signalling connection loss: SendError must only mean "connection
         // gone", so a malformed push must never drop the cluster connection.
-        let (sender, receiver) = flume::unbounded();
-        let forwarder = ClusterPushForwarder {
-            sender,
-            codec: None,
-            input_name: None,
-        };
+        let (raw_tx, raw_rx) = flume::unbounded::<Vec<u8>>();
+        let forwarder = ClusterPushForwarder { raw: raw_tx };
 
         let malformed = [
             PushInfo {
                 kind: PushKind::Message,
                 data: vec![Value::BulkString(b"events".to_vec())],
+            },
+            PushInfo {
+                kind: PushKind::PMessage,
+                data: vec![
+                    Value::BulkString(b"events.*".to_vec()),
+                    Value::BulkString(b"events.a".to_vec()),
+                ],
             },
             PushInfo {
                 kind: PushKind::Message,
@@ -676,17 +702,13 @@ mod tests {
                 "malformed push is skipped, not a connection error"
             );
         }
-        assert!(receiver.try_recv().is_err(), "nothing is delivered");
+        assert!(raw_rx.try_recv().is_err(), "nothing is enqueued");
     }
 
     #[test]
     fn cluster_push_forwarder_ignores_non_message_kinds() {
-        let (sender, receiver) = flume::unbounded();
-        let forwarder = ClusterPushForwarder {
-            sender,
-            codec: None,
-            input_name: None,
-        };
+        let (raw_tx, raw_rx) = flume::unbounded::<Vec<u8>>();
+        let forwarder = ClusterPushForwarder { raw: raw_tx };
 
         for kind in [PushKind::PUnsubscribe, PushKind::SUnsubscribe] {
             assert!(
@@ -702,7 +724,7 @@ mod tests {
                 "non-message kinds are a no-op"
             );
         }
-        assert!(receiver.try_recv().is_err(), "nothing is delivered");
+        assert!(raw_rx.try_recv().is_err(), "nothing is delivered");
     }
 
     #[test]

@@ -12,9 +12,46 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-pub(super) async fn hub_jobs(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
+/// Redact secret-looking values inside a persisted spec/plan JSON string.
+/// The stored `spec_json`/`plan_json` carry the plaintext connector
+/// credentials the execution path needs — a viewer-facing response must
+/// never return them verbatim. An unparseable payload is fully masked
+/// (fail closed) instead of leaked.
+fn redact_spec_string(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map(|value| arkflow_core::configuration::redacted_value(&value).to_string())
+        .unwrap_or_else(|_| "******".into())
+}
+
+/// Redact the spec/plan string fields of one record-shaped JSON value.
+fn redact_record_fields(record: &mut serde_json::Value) {
+    if let Some(object) = record.as_object_mut() {
+        for key in ["spec_json", "plan_json", "target_spec_json"] {
+            if let Some(serde_json::Value::String(raw)) = object.get(key).cloned() {
+                object.insert(key.into(), serde_json::Value::String(redact_spec_string(&raw)));
+            }
+        }
+    }
+}
+
+pub(super) async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "job", None).await
+    {
+        return response;
+    }
     match hub.jobs().await {
-        Ok(jobs) => Json(jobs).into_response(),
+        Ok(jobs) => {
+            let items = jobs
+                .into_iter()
+                .map(|job| {
+                    let mut value = serde_json::to_value(&job).unwrap_or_default();
+                    redact_record_fields(&mut value);
+                    value
+                })
+                .collect::<Vec<_>>();
+            Json(items).into_response()
+        }
         Err(error) => hub_problem(error),
     }
 }
@@ -32,10 +69,20 @@ pub(crate) fn deep_validate_job(spec: &arkflow_core::job::JobSpec) -> Result<(),
 pub(super) async fn hub_job(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
+            .await
+    {
+        return response;
+    }
     match hub.job(&job_id).await {
-        Ok(Some(job)) => Json(job).into_response(),
+        Ok(Some(job)) => {
+            let mut value = serde_json::to_value(&job).unwrap_or_default();
+            redact_record_fields(&mut value);
+            Json(value).into_response()
+        }
         Ok(None) => problem(
             StatusCode::NOT_FOUND,
             "job_not_found",
@@ -48,8 +95,14 @@ pub(super) async fn hub_job(
 pub(super) async fn hub_job_plan(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
+            .await
+    {
+        return response;
+    }
     let Some(job) = (match hub.job(&job_id).await {
         Ok(job) => job,
         Err(error) => return hub_problem(error),
@@ -72,8 +125,15 @@ pub(super) async fn hub_job_plan(
     };
     match arkflow_core::job::JobPlan::compile(spec) {
         Ok(plan) => {
-            Json(serde_json::json!({ "job_id": job.job_id, "version": job.version, "plan": plan }))
-                .into_response()
+            // The compiled plan embeds every operator's configuration —
+            // redact it like the raw spec.
+            let plan_value = serde_json::to_value(&plan).unwrap_or_default();
+            Json(serde_json::json!({
+                "job_id": job.job_id,
+                "version": job.version,
+                "plan": arkflow_core::configuration::redacted_value(&plan_value)
+            }))
+            .into_response()
         }
         Err(error) => problem(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -235,8 +295,14 @@ pub(super) async fn hub_job_savepoint(
 pub(super) async fn hub_job_checkpoints(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
+            .await
+    {
+        return response;
+    }
     match hub.job_checkpoints(&job_id).await {
         Ok(records) => Json(records).into_response(),
         Err(error) => hub_problem(error),
@@ -327,8 +393,14 @@ pub(super) async fn hub_validate_job(
 pub(super) async fn hub_job_detail(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
+            .await
+    {
+        return response;
+    }
     let Some(job) = (match hub.job(&job_id).await {
         Ok(job) => job,
         Err(error) => return hub_problem(error),
@@ -425,7 +497,7 @@ pub(super) async fn hub_job_detail(
         })
         .collect::<Vec<_>>();
     let metrics = hub.job_detail_metrics(&job_id).await;
-    Json(serde_json::json!({
+    let mut payload = serde_json::json!({
         "job": job,
         "plan": plan,
         "tasks": tasks,
@@ -446,15 +518,32 @@ pub(super) async fn hub_job_detail(
                 })
             }),
         "metrics": metrics
-    }))
-    .into_response()
+    });
+    // Viewers must never receive the persisted plaintext credentials: the
+    // detail view embeds both the raw job record (spec_json) and the
+    // compiled plan (operator configurations).
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(job) = object.get_mut("job") {
+            redact_record_fields(job);
+        }
+        if let Some(plan) = object.get_mut("plan") {
+            *plan = arkflow_core::configuration::redacted_value(plan);
+        }
+    }
+    Json(payload).into_response()
 }
 
 pub(super) async fn hub_job_versions(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "job", Some(job_id.clone()))
+            .await
+    {
+        return response;
+    }
     if matches!(hub.job(&job_id).await, Ok(None)) {
         return problem(
             StatusCode::NOT_FOUND,
@@ -463,7 +552,17 @@ pub(super) async fn hub_job_versions(
         );
     }
     match hub.job_versions(&job_id).await {
-        Ok(versions) => Json(versions).into_response(),
+        Ok(versions) => {
+            let items = versions
+                .into_iter()
+                .map(|version| {
+                    let mut value = serde_json::to_value(&version).unwrap_or_default();
+                    redact_record_fields(&mut value);
+                    value
+                })
+                .collect::<Vec<_>>();
+            Json(items).into_response()
+        }
         Err(error) => hub_problem(error),
     }
 }

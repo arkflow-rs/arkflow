@@ -12,8 +12,19 @@ use axum::Json;
 pub(super) async fn hub_operations(
     State(hub): State<hub::Hub>,
     Query(query): Query<OperationQuery>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "operation",
+        query.node_id.clone(),
+    )
+    .await
+    {
+        return response;
+    }
     let mut items = hub.operations(query.node_id.as_deref()).await;
     if let Some(resource_id) = query.resource_id.as_deref() {
         items.retain(|item| item.resource_id == resource_id);
@@ -56,8 +67,14 @@ pub(super) async fn hub_operations(
 pub(super) async fn hub_operation(
     State(hub): State<hub::Hub>,
     Path(id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "operation", Some(id.clone()))
+            .await
+    {
+        return response;
+    }
     match hub.operation(&id).await {
         Some(operation) => Json(operation).into_response(),
         None => problem(

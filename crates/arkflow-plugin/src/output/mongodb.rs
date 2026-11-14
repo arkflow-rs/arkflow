@@ -132,16 +132,58 @@ impl Output for MongoDBOutput {
             return Ok(());
         }
 
-        collection
-            .insert_many(documents)
-            .await
-            .map_err(|e| map_mongodb_error("Failed to insert documents into MongoDB", &e))?;
-        Ok(())
+        // Unordered + duplicate-key tolerance: the driver's DEFAULT ordered
+        // insert stops at the first duplicate-key error with the PREFIX
+        // already committed — a replay then errors on that committed prefix
+        // before ever reaching the suffix, permanently blocking recovery on
+        // a stable _id. Unordered attempts EVERY document, and duplicate-key
+        // errors are idempotent no-ops for an at-least-once replay.
+        match collection.insert_many(documents).ordered(false).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if mongo_error_is_duplicate_key(&error) {
+                    tracing::warn!(
+                        "MongoDB insert hit duplicate keys (idempotent at-least-once replay); treating the batch as written"
+                    );
+                    Ok(())
+                } else {
+                    Err(map_mongodb_error(
+                        "Failed to insert documents into MongoDB",
+                        &error,
+                    ))
+                }
+            }
+        }
     }
 
     async fn close(&self) -> Result<(), Error> {
         *self.collection.lock().await = None;
         Ok(())
+    }
+}
+
+/// True when EVERY write error the driver reports is a duplicate-key
+/// (code 11000): all other documents landed, and the duplicates are the
+/// idempotent echo of an at-least-once replay with a stable `_id`. Any other
+/// error (or a mix) propagates.
+fn mongo_error_is_duplicate_key(error: &mongodb::error::Error) -> bool {
+    match error.kind.as_ref() {
+        mongodb::error::ErrorKind::InsertMany(insert_many_error) => {
+            match &insert_many_error.write_errors {
+                Some(write_errors) if !write_errors.is_empty() => write_errors
+                    .iter()
+                    .all(|write_error| write_error.code == 11000),
+                _ => false,
+            }
+        }
+        mongodb::error::ErrorKind::BulkWrite(bulk_write_error) => {
+            !bulk_write_error.write_errors.is_empty()
+                && bulk_write_error
+                    .write_errors
+                    .values()
+                    .all(|write_error| write_error.code == 11000)
+        }
+        _ => false,
     }
 }
 

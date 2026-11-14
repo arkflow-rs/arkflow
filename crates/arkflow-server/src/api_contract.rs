@@ -111,14 +111,26 @@ impl OperatorPrincipal {
                     let same_resource = scope.resource_type == resource_type
                         && (scope.resource_id.is_none()
                             || scope.resource_id.as_deref() == resource_id);
-                    let node_contains_stream = scope.resource_type == "node"
+                    // A node scope covers only resources that live in the
+                    // node's id namespace (its streams, its configuration,
+                    // its operations/events). Identity resources (`user`,
+                    // `credential`), `job`, `rollout`, `webhook`, … use
+                    // their own id namespaces: matching them by node-id
+                    // equality/prefix let a node-scoped credential act on an
+                    // identity whose id merely equaled the node id and
+                    // escalate past its scope (stored scopes [] are
+                    // unrestricted).
+                    let node_livespace_resource =
+                        matches!(resource_type, "stream" | "configuration" | "operation" | "event" | "checkpoint");
+                    let node_contains_resource = scope.resource_type == "node"
                         && resource_type != "node"
+                        && node_livespace_resource
                         && scope.resource_id.as_ref().is_some_and(|node_id| {
                             resource_id.is_some_and(|resource| {
                                 resource == node_id || resource.starts_with(&format!("{node_id}/"))
                             })
                         });
-                    same_resource || node_contains_stream
+                    same_resource || node_contains_resource
                 }))
     }
 

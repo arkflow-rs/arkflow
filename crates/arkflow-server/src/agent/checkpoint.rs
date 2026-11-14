@@ -188,6 +188,64 @@ pub(crate) fn delete_checkpoint_artifact(
         .map_err(|error| error.to_string())
 }
 
+/// A repository rooted at the artifact's OWN reported manifest URI — the
+/// Job's CURRENT checkpoint URI may have changed since the artifact was
+/// written, so retention must address the location the artifact actually
+/// lives at (deleting via the current spec would orphan the old objects).
+/// The agent reports `manifest_uri` as `{store_root}/{manifest_key}`.
+pub(crate) fn repository_for_manifest_uri(
+    manifest_uri: &str,
+    manifest_key: &str,
+) -> Result<CheckpointRepository<SharedCheckpointStore>, String> {
+    let root = manifest_uri
+        .strip_suffix(manifest_key)
+        .ok_or_else(|| "manifest uri does not match the recovery layout".to_string())?;
+    Ok(CheckpointRepository::new(SharedCheckpointStore::from_uri(root)?))
+}
+
+/// Delete one artifact at the location its record reports.
+pub(crate) fn delete_checkpoint_artifact_at(
+    manifest_uri: &str,
+    artifact: &RecoveryArtifact,
+) -> Result<(), String> {
+    repository_for_manifest_uri(manifest_uri, &artifact.manifest_key)?
+        .delete(artifact)
+        .map_err(|error| error.to_string())
+}
+
+/// Validate one persisted checkpoint record against its OWN store location:
+/// a readable manifest, a verified checksum, and a matching job version.
+/// Retention must not count a corrupt or incompatible artifact as
+/// recoverable.
+pub(crate) fn checkpoint_record_is_valid_at_own_uri(
+    record: &crate::storage::JobCheckpointRecord,
+) -> bool {
+    let kind = match record.kind.as_str() {
+        "checkpoint" => RecoveryArtifactKind::Checkpoint,
+        "savepoint" => RecoveryArtifactKind::Savepoint,
+        _ => return false,
+    };
+    let artifact = RecoveryArtifact {
+        id: record.checkpoint_id.clone(),
+        kind,
+        manifest_key: recovery_manifest_key(kind, &record.checkpoint_id),
+        job_version: arkflow_core::job::JobVersion(record.job_version),
+        format_version: record.format_version,
+        created_at_ms: record.created_at_ms,
+        status: CheckpointStatus::Completed,
+    };
+    let Some(uri) = record.manifest_uri.as_deref() else {
+        return false;
+    };
+    let Ok(repository) = repository_for_manifest_uri(uri, &artifact.manifest_key) else {
+        return false;
+    };
+    let Ok(manifest) = repository.read_manifest(&artifact) else {
+        return false;
+    };
+    manifest.verify() && manifest.job_version.0 == record.job_version
+}
+
 pub(super) fn recovery_artifact(
     plan: &JobPlan,
     checkpoint_id: &str,

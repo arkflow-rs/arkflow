@@ -158,7 +158,9 @@ impl OidcAuthenticator {
             return None;
         }
         let role = role_from_claims(&claims, &self.role_claim)?;
-        let scopes = scopes_from_claims(&claims, &self.scopes_claim);
+        // A malformed scopes claim fails the token (fail closed): empty
+        // scopes are unrestricted, so it must never widen.
+        let scopes = scopes_from_claims(&claims, &self.scopes_claim)?;
         let issued_at = claims.get("iat").and_then(Value::as_i64);
         Some((
             OperatorPrincipal {
@@ -718,12 +720,31 @@ fn role_from_claims(claims: &Value, role_claim: &str) -> Option<OperatorRole> {
     None
 }
 
-fn scopes_from_claims(claims: &Value, scopes_claim: &str) -> Vec<ResourceScope> {
-    claim_values(claims, scopes_claim)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|value| parse_scope(value))
-        .collect()
+/// Map the configured scopes claim to resource scopes. A MISSING claim maps
+/// to no scopes (the documented claim-only deployment contract); a claim
+/// that is present but carries an unparseable entry is `None` — an empty
+/// scope list means "unrestricted" in `OperatorPrincipal::can_scope`, so a
+/// malformed claim must DENY the token rather than silently widen it.
+/// String claims are comma-separated scope lists (as the wire contract
+/// documents); array claims carry one scope per element.
+fn scopes_from_claims(claims: &Value, scopes_claim: &str) -> Option<Vec<ResourceScope>> {
+    let raw: Vec<String> = match claims.get(scopes_claim) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::String(value)) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        // Null / number / object claims are malformed, not "no scopes".
+        Some(_) => return None,
+        None => Vec::new(),
+    };
+    raw.iter().map(|value| parse_scope(value)).collect()
 }
 
 /// Claim values as strings, accepting either a JSON array or a single
@@ -1525,8 +1546,32 @@ mod tests {
         });
         let role = role_from_claims(&claims, &auth.role_claim).unwrap();
         assert_eq!(role, OperatorRole::Viewer);
-        let scopes = scopes_from_claims(&claims, &auth.scopes_claim);
+        let scopes = scopes_from_claims(&claims, &auth.scopes_claim).expect("valid scopes");
         assert_eq!(scopes[0].resource_type, "node");
+    }
+
+    /// A malformed scopes claim must DENY (None), never degrade to the
+    /// unrestricted empty list; a comma-separated string claim splits into
+    /// one scope per entry, as the wire contract documents.
+    #[test]
+    fn malformed_scopes_claim_denies_and_string_claims_split() {
+        let malformed = json!({ "permissions": ["node=node-a", "not-a-scope"] });
+        assert!(scopes_from_claims(&malformed, "permissions").is_none());
+        let malformed_type = json!({ "permissions": 7 });
+        assert!(scopes_from_claims(&malformed_type, "permissions").is_none());
+        let comma_separated = json!({ "permissions": "node=node-a, stream=b" });
+        let scopes =
+            scopes_from_claims(&comma_separated, "permissions").expect("comma list parses");
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[0].resource_type, "node");
+        assert_eq!(scopes[0].resource_id.as_deref(), Some("node-a"));
+        assert_eq!(scopes[1].resource_type, "stream");
+        let absent = json!({ "other": 1 });
+        assert!(
+            scopes_from_claims(&absent, "permissions")
+                .expect("missing claim keeps the no-scopes contract")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

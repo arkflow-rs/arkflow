@@ -64,7 +64,12 @@ pub(super) async fn create_rollout(
     }
 }
 
-pub(super) async fn hub_rollouts(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
+pub(super) async fn hub_rollouts(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "rollout", None).await
+    {
+        return response;
+    }
     match hub.rollouts().await {
         Ok(rollouts) => Json(rollouts).into_response(),
         Err(error) => hub_problem(error),
@@ -74,8 +79,14 @@ pub(super) async fn hub_rollouts(State(hub): State<hub::Hub>, _headers: HeaderMa
 pub(super) async fn hub_rollout(
     State(hub): State<hub::Hub>,
     Path(id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "rollout", Some(id.clone()))
+            .await
+    {
+        return response;
+    }
     match hub.rollout(&id).await {
         Ok(Some((rollout, targets))) => Json(serde_json::json!({
             "rollout": rollout,

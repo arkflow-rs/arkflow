@@ -372,28 +372,6 @@ impl InfluxDBOutput {
             .unwrap_or(0)
     }
 
-    /// Check if buffer should be flushed
-    async fn should_flush(&self) -> bool {
-        let buffer = self.batch_buffer.lock().await;
-        let batch_size = self.config.batch_size.unwrap_or(1000);
-
-        // Flush if buffer size exceeds batch size
-        if buffer.len() >= batch_size {
-            return true;
-        }
-
-        // Flush if flush interval exceeded
-        if let Some(interval_secs) = self.config.flush_interval {
-            let last_flush = self.last_flush.lock().await;
-            let elapsed = last_flush.elapsed().as_secs();
-            if elapsed >= interval_secs {
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// Flush batch buffer to InfluxDB
     async fn flush(&self) -> Result<(), Error> {
         let mut buffer = self.batch_buffer.lock().await;
@@ -503,12 +481,14 @@ impl Output for InfluxDBOutput {
             buffer.extend(lines);
             drop(buffer);
 
-            // Check once per acknowledgement range so one write_batch call is
-            // not split into multiple requests merely because it has several
-            // MessageBatch values.
-            if self.should_flush().await {
-                self.flush().await?;
-            }
+            // The acknowledgement must imply durability: returning Ok with
+            // lines still buffered in memory let the kernel commit the source
+            // while the data existed only in this process — a crash silently
+            // lost it. Every write flushes before returning, so cross-call
+            // buffering and the `flush_interval` knob no longer apply on the
+            // ack path (`batch_size` still batches WITHIN one write_batch
+            // call through the buffer).
+            self.flush().await?;
         }
         Ok(())
     }
@@ -1119,27 +1099,31 @@ mod tests {
         assert_eq!(InfluxDBOutput::get_string_value(&null_utf8, 0), None);
     }
 
+    /// The acknowledgement must imply durability: every write flushes before
+    /// returning, even when the buffer stays below `batch_size` — the old
+    /// threshold-gated path returned Ok with lines still only in memory,
+    /// letting the kernel commit the source over data a crash would lose.
     #[tokio::test]
-    async fn test_should_flush_respects_size_and_interval() {
-        let mut config = flexible_config(Vec::new(), None, None);
+    async fn test_write_batch_flushes_below_batch_size_before_returning() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let mut config = typed_config(server.uri(), 1);
         config.batch_size = Some(10);
         let output = InfluxDBOutput::new(config).unwrap();
-        // Empty buffer, no interval configured.
-        assert!(!output.should_flush().await);
-        output.batch_buffer.lock().await.push("line".into());
-        assert!(!output.should_flush().await, "1 < 10 must not flush");
-
-        // Interval of zero seconds is always elapsed.
-        output.batch_buffer.lock().await.clear();
-        let mut config = flexible_config(Vec::new(), None, None);
-        config.flush_interval = Some(0);
-        let output = InfluxDBOutput::new(config).unwrap();
-        assert!(output.should_flush().await);
-
-        // Buffer reaching the batch size flushes regardless of interval.
-        let output = InfluxDBOutput::new(typed_config("http://127.0.0.1:1".into(), 1)).unwrap();
-        output.batch_buffer.lock().await.push("line".into());
-        assert!(output.should_flush().await);
+        output.connect().await.unwrap();
+        // One line, far below batch_size=10: the write must still reach the
+        // server before Ok is returned.
+        output.write(Arc::new(typed_batch())).await.unwrap();
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 1, "below-threshold writes still flush");
+        assert!(output.batch_buffer.lock().await.is_empty());
     }
 
     #[tokio::test]

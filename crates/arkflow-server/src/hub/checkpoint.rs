@@ -432,11 +432,47 @@ impl Hub {
         // collect it before resume converges (defensive for savepoints, which
         // retention never collects anyway).
         pinned.extend(self.pinned_job_pause_artifacts(&job.job_id).await);
-        for record in completed
-            .into_iter()
-            .skip(retention)
-            .filter(|record| !pinned.contains(&record.checkpoint_id))
-        {
+
+        // Retention keeps the newest `retention` artifacts that VALIDATE:
+        // a missing/corrupt/incompatible newer artifact does not consume the
+        // keep budget, so it can never crowd out the last recoverable older
+        // point. Rows that fail validation WITHIN the keep horizon stay
+        // (they would have been kept positionally before); beyond the
+        // horizon everything is collected as before. Validation and deletion
+        // address each record's OWN store location — the Job's checkpoint
+        // URI may have changed since older artifacts were written, and
+        // deleting via the current spec would orphan the old objects.
+        let mut valid_keep = 0usize;
+        let mut scanned = 0usize;
+        let mut delete_candidates: Vec<JobCheckpointRecord> = Vec::new();
+        for record in &completed {
+            if pinned.contains(&record.checkpoint_id) {
+                // Pinned artifacts survive retention and do not consume the
+                // keep budget (mirroring the previous skip-and-filter).
+                continue;
+            }
+            scanned += 1;
+            if valid_keep >= retention {
+                delete_candidates.push(record.clone());
+                continue;
+            }
+            let valid = tokio::task::spawn_blocking({
+                let record = record.clone();
+                move || crate::agent::checkpoint_record_is_valid_at_own_uri(&record)
+            })
+            .await
+            .map_err(|error| {
+                HubError::Invalid(format!("checkpoint retention task failed: {error}"))
+            })?;
+            if valid {
+                valid_keep += 1;
+            } else if scanned > retention {
+                // Positional debris: the previous sweep would have collected
+                // it by position regardless of readability.
+                delete_candidates.push(record.clone());
+            }
+        }
+        for record in delete_candidates {
             let artifact = arkflow_core::checkpoint::RecoveryArtifact {
                 id: record.checkpoint_id.clone(),
                 kind: arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,
@@ -444,22 +480,47 @@ impl Hub {
                     arkflow_core::checkpoint::RecoveryArtifactKind::Checkpoint,
                     &record.checkpoint_id,
                 ),
-                job_version: spec.version,
+                job_version: arkflow_core::job::JobVersion(record.job_version),
                 format_version: record.format_version,
                 created_at_ms: record.created_at_ms,
                 status: arkflow_core::checkpoint::CheckpointStatus::Completed,
             };
             // The artifact delete performs blocking object-store I/O; keep it
             // off the async runtime's worker threads (this runs inside
-            // reconciliation and request handling).
-            let spec_for_delete = spec.clone();
-            tokio::task::spawn_blocking(move || {
-                delete_checkpoint_artifact(&spec_for_delete, &artifact).map_err(HubError::Invalid)
-            })
-            .await
-            .map_err(|error| {
-                HubError::Invalid(format!("checkpoint retention task failed: {error}"))
-            })??;
+            // reconciliation and request handling). Deletion is BEST-EFFORT:
+            // an object that never materialized (or was already removed) is
+            // catalog debris, not a retention failure — the row removal below
+            // is what keeps the catalog consistent.
+            let deletion = match record.manifest_uri.clone() {
+                Some(manifest_uri) => {
+                    tokio::task::spawn_blocking(move || {
+                        crate::agent::delete_checkpoint_artifact_at(&manifest_uri, &artifact)
+                    })
+                    .await
+                    .map_err(|error| {
+                        HubError::Invalid(format!("checkpoint retention task failed: {error}"))
+                    })?
+                }
+                None => {
+                    // Legacy rows without a reported manifest location fall
+                    // back to the current spec.
+                    let spec_for_delete = spec.clone();
+                    tokio::task::spawn_blocking(move || {
+                        delete_checkpoint_artifact(&spec_for_delete, &artifact)
+                    })
+                    .await
+                    .map_err(|error| {
+                        HubError::Invalid(format!("checkpoint retention task failed: {error}"))
+                    })?
+                }
+            };
+            if let Err(error) = deletion {
+                tracing::warn!(
+                    checkpoint_id = %record.checkpoint_id,
+                    %error,
+                    "checkpoint artifact delete failed; removing the catalog row only"
+                );
+            }
             if let Some(storage) = &self.storage {
                 storage
                     .delete_job_checkpoint(&record.job_id, &record.checkpoint_id)

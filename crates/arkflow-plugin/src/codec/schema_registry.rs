@@ -323,26 +323,44 @@ impl Decoder for SchemaRegistryCodec {
         // Messages accumulate columnar per schema id (groups in
         // first-appearance order, rows in message order within a group);
         // protobuf groups accumulate columnar exactly like Avro groups, so
-        // relative order is stable across kinds.
+        // relative order is stable across kinds. `row_order` records, per
+        // staged message, the (group position, row within the group) the
+        // message decoded to — the map that reassembles the output in
+        // MESSAGE order after the columnar accumulation (downstream
+        // consumers bind per-row source metadata positionally).
         enum Group {
             Avro(Box<AvroArrowAccumulator>),
             Protobuf(ProtobufBatchConverter),
         }
         let mut groups: Vec<(u32, Group)> = Vec::new();
         let mut readers: HashMap<u32, AvroValueReader<'_>> = HashMap::new();
+        let mut row_order: Vec<(usize, usize)> = Vec::with_capacity(staged.len());
+        let mut group_rows: Vec<usize> = Vec::new();
         for (id, payload) in staged {
             let cached = cached_by_id.get(&id).expect("resolved during pass 1");
             match cached.as_ref() {
                 CachedSchema::Protobuf(descriptor) => {
-                    match groups.iter_mut().find(|(gid, _)| gid == &id) {
-                        Some((_, Group::Protobuf(converter))) => converter.push(payload)?,
-                        _ => {
+                    // Strip the mandatory Confluent message-index array
+                    // before prost sees the bytes (see the helper's doc).
+                    let payload = strip_protobuf_message_indexes(payload)?;
+                    let pos = match groups.iter().position(|(gid, _)| gid == &id) {
+                        Some(pos) => pos,
+                        None => {
                             // `MessageDescriptor` clones are cheap Arc bumps.
                             let mut converter = ProtobufBatchConverter::new(descriptor.clone());
                             converter.push(payload)?;
                             groups.push((id, Group::Protobuf(converter)));
+                            group_rows.push(1);
+                            row_order.push((groups.len() - 1, 0));
+                            continue;
                         }
+                    };
+                    match &mut groups[pos].1 {
+                        Group::Protobuf(converter) => converter.push(payload)?,
+                        Group::Avro(_) => unreachable!("group {pos} kind changed"),
                     }
+                    group_rows[pos] += 1;
+                    row_order.push((pos, group_rows[pos] - 1));
                 }
                 CachedSchema::Avro(schema) => {
                     let value = match readers.entry(id) {
@@ -356,14 +374,23 @@ impl Decoder for SchemaRegistryCodec {
                             value
                         }
                     };
-                    match groups.iter_mut().find(|(gid, _)| gid == &id) {
-                        Some((_, Group::Avro(accumulator))) => accumulator.push(&value)?,
-                        _ => {
+                    let pos = match groups.iter().position(|(gid, _)| gid == &id) {
+                        Some(pos) => pos,
+                        None => {
                             let mut accumulator = Box::new(AvroArrowAccumulator::new(schema)?);
                             accumulator.push(&value)?;
                             groups.push((id, Group::Avro(accumulator)));
+                            group_rows.push(1);
+                            row_order.push((groups.len() - 1, 0));
+                            continue;
                         }
+                    };
+                    match &mut groups[pos].1 {
+                        Group::Avro(accumulator) => accumulator.push(&value)?,
+                        Group::Protobuf(_) => unreachable!("group {pos} kind changed"),
                     }
+                    group_rows[pos] += 1;
+                    row_order.push((pos, group_rows[pos] - 1));
                 }
             }
         }
@@ -374,15 +401,48 @@ impl Decoder for SchemaRegistryCodec {
                 Group::Protobuf(converter) => batches.push(converter.finish()?),
             }
         }
+        // The accumulation is columnar per group; each finished group batch
+        // must carry exactly one row per message or the message-order
+        // reassembly below would silently misalign rows.
+        for (pos, expected) in group_rows.iter().enumerate() {
+            let produced = batches[pos].num_rows();
+            if produced != *expected {
+                return Err(Error::Process(format!(
+                    "schema registry decode: group {pos} produced {produced} rows for \
+                     {expected} messages; reassembling message order would misalign \
+                     per-row source metadata"
+                )));
+            }
+        }
         if batches.is_empty() {
             return Ok(MessageBatch::new_arrow(RecordBatch::new_empty(Arc::new(
                 Schema::empty(),
             ))));
         }
+        if batches.len() == 1 {
+            // A single group is already in message order.
+            return Ok(MessageBatch::new_arrow(batches.pop().expect("one group")));
+        }
         // Groups decoded under different schema versions may legitimately
-        // carry different schemas (real schema evolution); normalize to the
-        // field union instead of failing the concat.
-        let merged = crate::component::batch_merge::normalize_and_concat(&batches)?;
+        // carry different schemas (real schema evolution); project onto the
+        // field union, then reassemble the rows in MESSAGE order. Downstream
+        // consumers bind per-row source metadata (offset, key, timestamp)
+        // positionally to the decoded batch, so group-columnar output would
+        // corrupt that binding.
+        let (schema, projected) = crate::component::batch_merge::normalize_to_union(&batches)?;
+        let mut columns: Vec<datafusion::arrow::array::ArrayRef> =
+            Vec::with_capacity(schema.fields().len());
+        for field_idx in 0..schema.fields().len() {
+            let group_columns: Vec<&dyn datafusion::arrow::array::Array> = projected
+                .iter()
+                .map(|batch| batch.column(field_idx).as_ref())
+                .collect();
+            let interleaved = datafusion::arrow::compute::interleave(&group_columns, &row_order)
+                .map_err(|e| Error::Process(format!("schema registry decode reorder: {e}")))?;
+            columns.push(interleaved);
+        }
+        let merged = RecordBatch::try_new(schema, columns)
+            .map_err(|e| Error::Process(format!("schema registry decode reorder: {e}")))?;
         Ok(MessageBatch::new_arrow(merged))
     }
 }
@@ -402,6 +462,54 @@ fn parse_wire_format(msg: &[u8]) -> Result<(u32, &[u8]), Error> {
     }
     let id = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
     Ok((id, &msg[5..]))
+}
+
+/// Read one zigzag-encoded varint, advancing `offset`.
+fn read_zigzag_varint(payload: &[u8], offset: &mut usize) -> Result<u64, Error> {
+    let mut shift = 0u32;
+    let mut varint = 0u64;
+    loop {
+        let Some(&byte) = payload.get(*offset) else {
+            return Err(Error::Process(
+                "Confluent Protobuf payload truncated inside the message index array".into(),
+            ));
+        };
+        *offset += 1;
+        varint |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            // zigzag decode: (n >> 1) ^ -(n & 1)
+            return Ok((varint >> 1) ^ (0u64.wrapping_sub(varint & 1)));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(Error::Process(
+                "invalid zigzag varint in Confluent Protobuf message indexes".into(),
+            ));
+        }
+    }
+}
+
+/// Confluent Protobuf payloads carry a MANDATORY message-index array after
+/// the 5-byte wire prefix: a zigzag varint element count followed by that
+/// many zigzag varint indexes locating the message within the schema. The
+/// indexes must be stripped before the bytes reach prost — the leading
+/// `0x00` of the ubiquitous top-level `[0]` index is an invalid protobuf
+/// field tag and fails every real Confluent record. Nested selections (an
+/// array longer than one) are stripped but not navigated: decoding proceeds
+/// against the configured message type, which matches the standard
+/// single-message-per-subject layout.
+fn strip_protobuf_message_indexes(payload: &[u8]) -> Result<&[u8], Error> {
+    let mut offset = 0usize;
+    let count = read_zigzag_varint(payload, &mut offset)?;
+    if count > 8 {
+        return Err(Error::Process(format!(
+            "Confluent Protobuf message index array is implausibly long: {count}"
+        )));
+    }
+    for _ in 0..count {
+        read_zigzag_varint(payload, &mut offset)?;
+    }
+    Ok(&payload[offset..])
 }
 
 // ===== RestSchemaResolver (Confluent REST, reqwest async) =====
@@ -728,6 +836,14 @@ mod tests {
         m
     }
 
+    /// Confluent Protobuf frame with the mandatory message-index array;
+    /// `0x00` is the encoded `[0]` (top-level message).
+    fn proto_wire(id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut indexed = vec![0x00];
+        indexed.extend_from_slice(payload);
+        wire(id, &indexed)
+    }
+
     struct InMemorySchemaResolver {
         schemas: HashMap<u32, FetchedSchema>,
         subject_levels: std::sync::Mutex<HashMap<String, String>>,
@@ -836,7 +952,7 @@ mod tests {
         )])));
         let codec = build_codec(resolver.clone());
         let batch = codec
-            .decode(vec![wire(1, &protobuf_payload_id_42())])
+            .decode(vec![proto_wire(1, &protobuf_payload_id_42())])
             .await
             .unwrap();
         assert_eq!(batch.len(), 1);
@@ -885,7 +1001,7 @@ mod tests {
             .expect("avro id must decode without message_type");
         // ...while a protobuf id surfaces a clear error.
         let err = codec
-            .decode(vec![wire(2, &protobuf_payload_id_42())])
+            .decode(vec![proto_wire(2, &protobuf_payload_id_42())])
             .await
             .unwrap_err();
         assert!(
@@ -903,8 +1019,8 @@ mod tests {
         let codec = build_codec(resolver.clone());
         let batch = codec
             .decode(vec![
-                wire(1, &protobuf_payload_id_42()),
-                wire(1, &protobuf_payload_id_42()),
+                proto_wire(1, &protobuf_payload_id_42()),
+                proto_wire(1, &protobuf_payload_id_42()),
             ])
             .await
             .unwrap();
@@ -924,8 +1040,8 @@ mod tests {
         let codec = build_codec(resolver.clone());
         let batch = codec
             .decode(vec![
-                wire(1, &protobuf_payload_id_42()),
-                wire(2, &[0x08, 0x2A, 0x12, 0x02, b'o', b'k']), // id=42, name="ok"
+                proto_wire(1, &protobuf_payload_id_42()),
+                proto_wire(2, &[0x08, 0x2A, 0x12, 0x02, b'o', b'k']), // id=42, name="ok"
             ])
             .await
             .unwrap();
@@ -1008,10 +1124,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_avro_mixed_id_batch_groups_by_first_appearance() {
-        // Interleaved ids: rows come out grouped by schema id in
-        // first-appearance order (group order, message order within a
-        // group); the union schema puts the first group's columns first.
+    async fn test_avro_mixed_id_batch_preserves_message_order() {
+        // Interleaved ids: rows must come out in MESSAGE order even though
+        // accumulation is columnar per schema id — the Kafka input binds
+        // per-row source metadata (offset/key/timestamp) positionally, so a
+        // schema-id regrouping (10, 11, 20, 21) would corrupt that binding.
+        // The union schema still puts the first group's columns first.
         let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::from([
             (1u32, FetchedSchema::Avro(avro_schema())),
             (
@@ -1045,12 +1163,12 @@ mod tests {
         let ids = rb.column_by_name("id").unwrap().as_primitive::<Int64Type>();
         assert_eq!(
             (ids.value(0), ids.value(1), ids.value(2), ids.value(3)),
-            (10, 11, 20, 21),
-            "rows grouped by schema id, message order within a group"
+            (10, 20, 11, 21),
+            "rows stay in message order across interleaved schema ids"
         );
         let names = rb.column_by_name("name").unwrap().as_string::<i32>();
-        assert!(names.is_null(0) && names.is_null(1));
-        assert_eq!(names.value(2), "b");
+        assert!(names.is_null(0) && names.is_null(2));
+        assert_eq!(names.value(1), "b");
         assert_eq!(names.value(3), "c");
     }
 
@@ -1068,8 +1186,8 @@ mod tests {
         let codec = build_codec(resolver);
         let err = codec
             .decode(vec![
-                wire(1, &protobuf_payload_id_42()),
-                wire(2, &[0x0A, 0x01, b'x']), // string id = "x"
+                proto_wire(1, &protobuf_payload_id_42()),
+                proto_wire(2, &[0x0A, 0x01, b'x']), // string id = "x"
             ])
             .await
             .unwrap_err();
@@ -1085,7 +1203,7 @@ mod tests {
         let resolver = Arc::new(InMemorySchemaResolver::new(HashMap::new())); // empty -> all error
         let codec = build_codec(resolver);
         let result = codec
-            .decode(vec![wire(99, &protobuf_payload_id_42())])
+            .decode(vec![proto_wire(99, &protobuf_payload_id_42())])
             .await;
         assert!(result.is_err());
     }
@@ -1342,7 +1460,7 @@ mod tests {
         )])));
         let codec = build_codec(resolver);
         let err = codec
-            .decode(vec![wire(1, &protobuf_payload_id_42())])
+            .decode(vec![proto_wire(1, &protobuf_payload_id_42())])
             .await
             .unwrap_err();
         let msg = format!("{err}");

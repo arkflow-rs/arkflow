@@ -3551,7 +3551,20 @@ async fn hub_job_action_and_recovery_artifact_routes_validate_input() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(detail["nodes"].as_array().unwrap().len(), 1);
 
-    // Job observation from the executing node flips observed state.
+    // Job observation from the executing node flips observed state. The
+    // node may only observe a Job it was dispatched: seed the dispatch
+    // fingerprint the dispatch path records.
+    hub.start_dispatch_fingerprints
+        .write()
+        .await
+        .insert(
+            (
+                "acted-job".into(),
+                "node-a".into(),
+                detail["job"]["generation"].as_u64().unwrap_or(1),
+            ),
+            0,
+        );
     let (status, _) = post_json(
         &app,
         "/api/v1/agent/job-observations",
@@ -5075,7 +5088,7 @@ async fn hub_maintenance_routes_manage_node_lifecycle_state() {
 #[tokio::test]
 async fn agent_routes_reject_bad_credentials_and_accept_observations() {
     let hub = storage_hub();
-    let app = hub_router(hub, &ServerConfig::default());
+    let app = hub_router(hub.clone(), &ServerConfig::default());
     let session = register_hub_node(&app, "node-a").await;
 
     // Wrong shared registration token.
@@ -5119,6 +5132,26 @@ async fn agent_routes_reject_bad_credentials_and_accept_observations() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // An observation from a node that was never DISPATCHED the job is
+    // rejected: session authentication is not an assignment, and letting it
+    // through would let any agent falsify another node's Job convergence.
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/agent/job-observations",
+        &session.session_token,
+        serde_json::json!({
+            "node_id": "node-a", "session_token": session.session_token,
+            "job_id": "unknown-job", "generation": 1, "state": "running"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // A dispatched node may observe: seed the dispatch fingerprint the real
+    // dispatch path records, and the (still unknown) job settles to 204.
+    hub.start_dispatch_fingerprints
+        .write()
+        .await
+        .insert(("unknown-job".into(), "node-a".into(), 1), 0);
     let (status, _) = post_json(
         &app,
         "/api/v1/agent/job-observations",

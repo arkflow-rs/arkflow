@@ -736,7 +736,13 @@ impl JobRuntime {
                 task.checkpoint_store_uri.clone(),
             )
         };
-        let (snapshot, source_positions, task_watermarks, watermark_partitions) = kernel
+        let (
+            snapshot,
+            _flat_positions,
+            task_watermarks,
+            watermark_partitions,
+            positions_by_task,
+        ) = kernel
             .checkpoint_barrier_with_details(checkpoint_id, generation)
             .await
             .map_err(|error| error.to_string())?;
@@ -778,7 +784,7 @@ impl JobRuntime {
         let barrier = coordinator
             .start(checkpoint_id)
             .map_err(|error| error.to_string())?;
-        for (index, assignment) in assignments.iter().enumerate() {
+        for assignment in assignments.iter() {
             coordinator
                 .acknowledge(TaskCheckpointAck {
                     task_id: assignment.task_id.clone(),
@@ -790,11 +796,14 @@ impl JobRuntime {
                     checkpoint_id: barrier.checkpoint_id.clone(),
                     generation: barrier.generation,
                     state: snapshot.clone(),
-                    source_positions: if index == 0 {
-                        source_positions.clone()
-                    } else {
-                        Vec::new()
-                    },
+                    // Each source task carries ONLY its own chain's positions;
+                    // folding the flat list into the first task would let a
+                    // second source sharing topic/partition restore from the
+                    // first one's offsets.
+                    source_positions: positions_by_task
+                        .get(&assignment.task_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     watermark_ms: task_watermarks.get(&assignment.task_id).copied(),
                     watermark_partitions: watermark_partitions
                         .get(&assignment.task_id)
@@ -935,6 +944,13 @@ impl JobRuntime {
                     target.task_attempts.push(attempt);
                 }
                 target.source_positions.extend(manifest.source_positions);
+                for (task_id, positions) in manifest.source_positions_by_task {
+                    target
+                        .source_positions_by_task
+                        .entry(task_id)
+                        .or_default()
+                        .extend(positions);
+                }
                 target.watermarks_ms.extend(manifest.watermarks_ms);
                 for (task_id, partitions) in manifest.watermark_partitions {
                     target
@@ -1267,8 +1283,19 @@ async fn spawn_kernel_job(
                 }
             }
         }
-        for input in &inputs {
-            if let Err(error) = input.restore_positions(&recovery.source_positions).await {
+        for chain in &graph.chains {
+            let Some(input) = chain.source.as_ref() else {
+                continue;
+            };
+            // Per-task positions first (task identity preserved in the
+            // manifest); legacy manifests without the map fall back to the
+            // flat list.
+            let positions = recovery
+                .source_positions_by_task
+                .get(chain.entry_task_id())
+                .map(|positions| positions.as_slice())
+                .unwrap_or(recovery.source_positions.as_slice());
+            if let Err(error) = input.restore_positions(positions).await {
                 close_inputs(&inputs).await;
                 return Err(error.to_string());
             }

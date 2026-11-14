@@ -145,7 +145,11 @@ impl BatchProcessor {
     fn new(config: BatchProcessorConfig) -> Result<Self, Error> {
         Ok(Self {
             config: config.clone(),
-            held: Arc::new(RwLock::new(Vec::with_capacity(config.count))),
+            // NO capacity preallocation from `config.count`: it is a user
+            // row threshold, and an absurd value aborted the process right
+            // here (capacity overflow) or pinned gigabytes before the first
+            // row ever arrived. Vec growth amortizes.
+            held: Arc::new(RwLock::new(Vec::new())),
             last_batch_time: Arc::new(Mutex::new(std::time::Instant::now())),
         })
     }
@@ -243,6 +247,13 @@ impl BatchProcessor {
                 ack: ack.clone(),
                 rows,
             });
+        }
+        // The idle timer measures since the LATEST input, not since
+        // construction or the prior flush — otherwise a steady stream that
+        // never reaches the count threshold gets flushed mid-flow.
+        {
+            let mut last_batch_time = self.last_batch_time.lock().await;
+            *last_batch_time = std::time::Instant::now();
         }
 
         // Check if the batch should be refreshed

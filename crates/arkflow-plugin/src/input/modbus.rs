@@ -23,7 +23,6 @@ use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -73,7 +72,12 @@ struct Point {
 struct ModbusInput {
     config: ModbusInputConfig,
     name: Option<String>,
-    first_read: AtomicBool,
+    /// Absolute instant of the next scheduled poll. `read` sleeps only the
+    /// REMAINING time, and the kernel may cancel and re-create `read` at its
+    /// idle tick (100ms), so a sleep spanning the whole interval would never
+    /// complete. The due date survives cancellations and advances only after
+    /// a successful poll.
+    next_due: std::sync::Mutex<Option<std::time::Instant>>,
     client: Arc<Mutex<Option<tokio_modbus::client::Context>>>,
 }
 
@@ -81,7 +85,7 @@ impl ModbusInput {
     fn new(config: ModbusInputConfig, name: Option<String>) -> Self {
         Self {
             config,
-            first_read: AtomicBool::new(false),
+            next_due: std::sync::Mutex::new(None),
             client: Arc::new(Mutex::new(None)),
             name,
         }
@@ -110,11 +114,29 @@ impl Input for ModbusInput {
             return Err(Error::Disconnection);
         };
 
-        if self
-            .first_read
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        let due = {
+            let mut next_due = self
+                .next_due
+                .lock()
+                .expect("modbus next_due lock poisoned");
+            match *next_due {
+                Some(due) => due,
+                None => {
+                    // First poll fires immediately; the cadence starts only
+                    // after the first successful delivery.
+                    let due = std::time::Instant::now() + self.config.interval;
+                    *next_due = Some(due);
+                    due
+                }
+            }
+        };
         {
-            tokio::time::sleep(self.config.interval).await;
+            let now = std::time::Instant::now();
+            if due > now {
+                // Sleep only the REMAINING time: a previous attempt cancelled
+                // by the kernel's idle tick must not restart the full interval.
+                tokio::time::sleep(due - now).await;
+            }
         }
 
         let mut fields = Vec::with_capacity(self.config.points.len());
@@ -176,6 +198,11 @@ impl Input for ModbusInput {
             .map_err(|e| Error::Process(format!("Failed to create record batch:{}", e)))?;
         let mut msg: MessageBatch = batch.into();
         msg.set_input_name(self.name.clone());
+        // Advance the cadence only after a successful poll: a failed or
+        // cancelled attempt retries at the old due date instead of silently
+        // skipping a cycle.
+        *self.next_due.lock().expect("modbus next_due lock poisoned") =
+            Some(std::time::Instant::now() + self.config.interval);
         Ok((Arc::new(msg), Arc::new(NoopAck)))
     }
 

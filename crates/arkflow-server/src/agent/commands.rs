@@ -319,7 +319,11 @@ pub(super) async fn execute_command(
                 auth,
                 CommandResult {
                     command_id: command.id.clone(),
-                    operation_id: operation.id.clone(),
+                    // The Hub matches results against ITS operation id
+                    // (`hop-*` / intent ids); the local runtime operation id
+                    // (`op-*`) is agent-internal and would be silently
+                    // rejected, leaving the Hub operation non-terminal.
+                    operation_id: command.operation_id.clone(),
                     state: HubOperationState::Running,
                     progress: 10,
                     error: None,
@@ -362,7 +366,7 @@ pub(super) async fn execute_command(
                             auth,
                             CommandResult {
                                 command_id: command.id.clone(),
-                                operation_id: operation.id,
+                                operation_id: command.operation_id.clone(),
                                 state,
                                 progress: 100,
                                 error: current.error,
@@ -398,12 +402,12 @@ pub(super) async fn execute_command(
                         auth,
                         CommandResult {
                             command_id: command.id.clone(),
-                            operation_id: operation.id,
+                            operation_id: command.operation_id.clone(),
                             state: HubOperationState::Failed,
                             progress: 100,
                             error: Some(format!(
                                 "operation record {} is no longer observable on the agent",
-                                command.operation_id
+                                operation.id
                             )),
                             correlation_id: command.correlation_id.clone(),
                             generation: command.generation,
@@ -428,7 +432,7 @@ pub(super) async fn execute_command(
                 auth,
                 CommandResult {
                     command_id: command.id.clone(),
-                    operation_id: operation.id,
+                    operation_id: command.operation_id.clone(),
                     state: HubOperationState::TimedOut,
                     progress: 100,
                     error: Some(

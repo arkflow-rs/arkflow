@@ -317,6 +317,11 @@ async fn run_subscription_delivery_with(
 struct DeliveryTask {
     queue: Arc<PendingQueue>,
     handle: JoinHandle<()>,
+    /// The subscription snapshot the worker was spawned with. A refreshed
+    /// record that differs (URL, signing secret, filters) must REPLACE the
+    /// worker: the old one captured stale configuration forever, so edits
+    /// silently never took effect until the process restarted.
+    subscription: WebhookSubscription,
 }
 
 /// The forwarder: consumes the Hub event broadcast and fans matching events
@@ -410,12 +415,23 @@ async fn refresh_subscriptions(
         .filter(|subscription| subscription.enabled)
         .map(|subscription| subscription.id.clone())
         .collect();
-    let to_spawn: Vec<WebhookSubscription> = fresh
-        .iter()
-        .filter(|subscription| subscription.enabled && !tasks.contains_key(&subscription.id))
-        .cloned()
-        .collect();
-    for subscription in to_spawn {
+    // Spawn (or REPLACE) one worker per enabled subscription. A worker whose
+    // snapshot no longer matches the fresh record is aborted and respawned:
+    // URL/signing-key edits must take effect on the next refresh tick, not
+    // only after a restart.
+    for subscription in fresh.iter().filter(|subscription| subscription.enabled) {
+        let needs_replace = match tasks.get(&subscription.id) {
+            Some(task) => task.subscription != *subscription,
+            None => true,
+        };
+        if !needs_replace {
+            continue;
+        }
+        if let Some(existing) = tasks.remove(&subscription.id) {
+            existing.handle.abort();
+        }
+        let subscription = subscription.clone();
+        let snapshot = subscription.clone();
         let queue = PendingQueue::new();
         let task_queue = queue.clone();
         let task_hub = hub.clone();
@@ -431,7 +447,14 @@ async fn refresh_subscriptions(
             )
             .await;
         });
-        tasks.insert(id, DeliveryTask { queue, handle });
+        tasks.insert(
+            id,
+            DeliveryTask {
+                queue,
+                handle,
+                subscription: snapshot,
+            },
+        );
     }
     let stale: Vec<String> = tasks
         .keys()

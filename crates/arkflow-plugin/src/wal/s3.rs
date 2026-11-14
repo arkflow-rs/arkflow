@@ -280,6 +280,17 @@ pub(crate) struct S3Store {
     /// in the engine's `Wal::wait_for_sealed`.
     seal_notify: Notify,
     flusher: StdMutex<Option<FlusherHandle>>,
+    /// Serializes segment seals: concurrent seals (append-threshold trigger,
+    /// background flusher, close) must publish in sequence order — a later
+    /// segment finishing first would let `sealed_seq` advance the ack
+    /// frontier past an earlier, not-yet-durable segment.
+    seal_lock: tokio::sync::Mutex<()>,
+    /// Segments whose PUT failed, in seal order. The next seal re-uploads
+    /// them (in order) BEFORE sealing the active segment, so a newer
+    /// segment's publication never implies an earlier one's durability.
+    /// Keeping the failed batch out of `active` avoids clobbering entries
+    /// appended while the failed PUT was in flight.
+    pending_seal: StdMutex<std::collections::VecDeque<SealedBatch>>,
 }
 
 struct ActiveSegment {
@@ -293,6 +304,15 @@ struct ActiveSegment {
     bytes: Vec<u8>,
     /// Filename of the next segment to be sealed (D4: 8-digit zero-padded).
     next_index: u64,
+}
+
+/// A rotated-out segment awaiting (re-)upload after its segment PUT failed.
+struct SealedBatch {
+    bytes: Vec<u8>,
+    first_seq: u64,
+    last_seq: u64,
+    next_index: u64,
+    entries: usize,
 }
 
 /// Run one construction-path future on the private runtime, off the
@@ -493,6 +513,8 @@ impl S3Store {
             sealed_seq: AtomicU64::new(0),
             seal_notify: Notify::new(),
             flusher: StdMutex::new(None),
+            seal_lock: tokio::sync::Mutex::new(()),
+            pending_seal: StdMutex::new(std::collections::VecDeque::new()),
         });
 
         let manifest_cursor = block_on_init(store.rt(), recover(&store))??;
@@ -756,7 +778,14 @@ impl WalStore for S3Store {
         //    segment is *committed*; per-entry writes are not allowed on
         //    remote backends (D8).
         if seal_now {
-            self.rt().block_on(seal_active_segment(self))?;
+            // A failed seal parks the batch in `pending_seal` for the next
+            // seal attempt; it must NOT surface as an append error here or
+            // the core WAL would restore its retry batch and append the
+            // same sequences again. The flusher retries every
+            // `flush_interval`.
+            if let Err(e) = self.rt().block_on(seal_active_segment(self)) {
+                tracing::warn!("S3 WAL seal failed (retry on the next flush tick): {e}");
+            }
         }
         Ok(())
     }
@@ -984,7 +1013,37 @@ fn segment_index(name: &str) -> u64 {
 
 /// Seal the current active segment: write it to a fresh `NNNNNNNN.wal`
 /// filename, rotate the in-memory state, and update the manifest.
+///
+/// Seals are serialized (`seal_lock`) and a failed segment PUT parks the
+/// batch in `pending_seal` instead of writing it back into `active`:
+///
+/// - a concurrent seal finishing out of order must never let `sealed_seq`
+///   (the acknowledgement gate) advance past an earlier segment that is not
+///   durable yet;
+/// - `active` may have accumulated newer entries while the failed PUT was in
+///   flight — overwriting them would lose data, and returning the entries to
+///   the caller as an error would make the core WAL re-append the same
+///   sequences (duplicates).
+///
+/// The parked batch is re-uploaded by the next seal attempt (the flusher
+/// runs every `flush_interval`) before the active segment is sealed, so
+/// publication order keeps matching sequence order. Entries lost on a crash
+/// while parked were never acknowledged (the gate never advanced past them),
+/// so the source replays them.
 async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
+    // One seal at a time: the order of publication must match sequence
+    // order for the acknowledgement gate to stay sound.
+    let _seal_guard = store.seal_lock.lock().await;
+
+    // Retry parked (failed-PUT) segments first: a newer active segment may
+    // only be sealed once everything before it is durable.
+    while let Some(batch) = store.pending_seal.lock().unwrap().pop_front() {
+        if let Err(e) = publish_sealed_segment(store, &batch).await {
+            store.pending_seal.lock().unwrap().push_front(batch);
+            return Err(e);
+        }
+    }
+
     // Move the bytes out of the active lock so the encode + PUT doesn't
     // hold the lock across the network call.
     let (sealed_bytes, first_seq, last_seq, next_index, entry_count) = {
@@ -1004,35 +1063,50 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
         (bytes, first, last, idx, count)
     };
 
-    let name = format!("{:08}.wal", next_index);
-    let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, name).as_str());
-    // Clone for the PUT so the original bytes survive a failed upload and can be
-    // restored to the active segment below. Without this, a transient segment
-    // PUT failure would permanently lose the entries (they were already moved
-    // out of the active segment above).
-    if let Err(e) = store
-        .client
-        .put(&key, PutPayload::from(Bytes::from(sealed_bytes.clone())))
-        .await
-    {
-        let mut active = store.active.lock().unwrap();
-        active.bytes = sealed_bytes;
-        active.first_seq = first_seq;
-        active.last_seq = last_seq;
-        active.entries = entry_count;
-        active.next_index = next_index; // undo the pre-increment
-        return Err(Error::Process(format!("S3 PUT segment {}: {}", name, e)));
+    let batch = SealedBatch {
+        bytes: sealed_bytes,
+        first_seq,
+        last_seq,
+        next_index,
+        entries: entry_count,
+    };
+    if let Err(e) = publish_sealed_segment(store, &batch).await {
+        // Park for the next seal attempt (see the function doc). Appends
+        // that landed in `active` while the PUT was in flight stay untouched.
+        store.pending_seal.lock().unwrap().push_back(batch);
+        return Err(e);
     }
+    Ok(())
+}
+
+/// Upload one sealed segment and publish it: PUT the object, record the seal
+/// in the manifest under ETag coordination, then advance the sealed frontier
+/// (`sealed_seq`) and wake acknowledgement waiters. The frontier moves only
+/// after BOTH the segment object and the manifest hold the range (D2).
+async fn publish_sealed_segment(store: &S3Store, batch: &SealedBatch) -> Result<(), Error> {
+    let name = format!("{:08}.wal", batch.next_index);
+    let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, name).as_str());
+    // Clone for the PUT so the original bytes survive a failed upload in the
+    // caller's parked batch.
+    store
+        .client
+        .put(&key, PutPayload::from(Bytes::from(batch.bytes.clone())))
+        .await
+        .map_err(|e| {
+            Error::Process(format!(
+                "S3 PUT segment {} (seq {}..={}, {} entries): {}",
+                name, batch.first_seq, batch.last_seq, batch.entries, e
+            ))
+        })?;
 
     // Bump the manifest's `max_sealed_seq` and add the new segment to
     // `sealed_segments`. If we had an active segment before, demote it.
     // Use the ETag-coordinated writer so concurrent seal callbacks from
-    // parallel PUT workers don't lose each other's updates.
+    // parallel PUT workers don't lose each other's updates (`apply_seal`
+    // guards against out-of-order seals regressing the active pointer).
     let name_for_mutator = name.clone();
+    let last_seq = batch.last_seq;
     write_manifest_with_etag(store, move |m| {
-        // Record the sealed segment, keeping the chronologically-newest segment
-        // active (`apply_seal` guards against out-of-order seals regressing
-        // the active pointer), then bump the high-water mark.
         apply_seal(m, &name_for_mutator);
         if last_seq > m.max_sealed_seq {
             m.max_sealed_seq = last_seq;
@@ -1050,8 +1124,6 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
     // frontier monotonic across concurrent/out-of-order seals.
     store.sealed_seq.fetch_max(last_seq, Ordering::AcqRel);
     store.seal_notify.notify_waiters();
-
-    let _ = first_seq; // (we track via sealed_segments index; could go into manifest for diagnostics)
     Ok(())
 }
 
@@ -2448,12 +2520,13 @@ mod tests {
         });
     }
 
-    /// T7: a failed segment PUT must restore the in-memory active segment so the
-    /// entries are not lost. Guards the rollback added to `seal_active_segment`
-    /// (previously a PUT failure after `std::mem::take` permanently dropped the
-    /// data).
+    /// T7: a failed segment PUT must park the batch in `pending_seal` (not
+    /// restore it into `active`) so the entries are neither lost nor
+    /// duplicated. Guards the parked-retry path: the original code dropped
+    /// the data after `std::mem::take`, and the first rollback overwrote
+    /// entries appended while the PUT was in flight.
     #[test]
-    fn seal_put_failure_restores_active_segment() {
+    fn seal_put_failure_parks_batch_for_retry() {
         let store = build_failing_store();
         // Prime the in-memory active segment, as `append_batch` would.
         {
@@ -2479,14 +2552,26 @@ mod tests {
             "the sealed frontier must not advance on a failed seal"
         );
 
-        // The active segment must be fully restored (entries + next_index), so
-        // the next seal attempt re-uploads the same data.
+        // The batch is parked with its own segment index (5) and range; the
+        // active segment stays EMPTY (rotated), so entries appended while the
+        // PUT was in flight are never clobbered and the core WAL's retry
+        // path cannot duplicate the parked sequences.
+        {
+            let pending = store.pending_seal.lock().unwrap();
+            assert_eq!(pending.len(), 1, "the failed batch is parked for retry");
+            let batch = &pending[0];
+            assert_eq!(batch.next_index, 5, "the failed batch keeps its segment index");
+            assert_eq!(batch.first_seq, 1);
+            assert_eq!(batch.last_seq, 3);
+            assert_eq!(batch.entries, 3);
+            assert!(!batch.bytes.is_empty(), "bytes preserved");
+        }
         let active = store.active.lock().unwrap();
-        assert_eq!(active.entries, 3, "entries restored after PUT failure");
-        assert_eq!(active.first_seq, 1);
-        assert_eq!(active.last_seq, 3);
-        assert_eq!(active.next_index, 5, "next_index rolled back");
-        assert!(!active.bytes.is_empty(), "bytes restored");
+        assert_eq!(active.entries, 0, "active stays rotated; no restore clobber");
+        assert_eq!(
+            active.next_index, 6,
+            "active's next index moved past the parked batch"
+        );
     }
 
     /// Seal gating (`fix-object-store-wal-loss-window` task 1.2): the sealed

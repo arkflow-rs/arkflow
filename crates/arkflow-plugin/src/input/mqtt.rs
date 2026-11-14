@@ -111,6 +111,13 @@ impl Input for MqttInput {
 
         // Set the keep-alive time
         if let Some(keep_alive) = self.config.keep_alive {
+            // The MQTT CONNECT packet encodes keep-alive as a u16 SECONDS
+            // field; rumqttc narrows `Duration::as_secs() as u16` silently,
+            // so a larger configured value would make the broker enforce a
+            // wrapped (much shorter) interval than the local timer keeps.
+            // The protocol caps the field at 65535 — reject more at build.
+            u16::try_from(keep_alive)
+                .map_err(|_| Error::Config("mqtt keep_alive must be at most 65535 seconds".into()))?;
             mqtt_options.set_keep_alive(std::time::Duration::from_secs(keep_alive));
         }
 

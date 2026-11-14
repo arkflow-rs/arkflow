@@ -138,7 +138,31 @@ async fn serve_with_config(
     let cancellation = CancellationToken::new();
     let shutdown = cancellation.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        // Kubernetes sends SIGTERM for pod termination; a ctrl_c-only watcher
+        // exits the process without the Hub's graceful lease release and
+        // stalls HA takeover until the lease TTL expires.
+        #[cfg(unix)]
+        {
+            let sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+            match sigterm {
+                Ok(mut sigterm) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = sigterm.recv() => {}
+                    }
+                }
+                Err(error) => {
+                    eprintln!("failed to install SIGTERM handler: {error}");
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &shutdown;
+            let _ = tokio::signal::ctrl_c().await;
+        }
         shutdown.cancel();
     });
     bootstrap::serve_from_config(hub_config, config, ha, cancellation).await

@@ -197,8 +197,14 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(StringArray))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::from(value.to_owned());
+                    // NULL → VrlValue::Null (see the note on the integer
+                    // branches): `value(i)` on a null slot returns "".
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::from(value.to_owned())
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -210,8 +216,12 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(BinaryArray))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Bytes(value.to_vec().into());
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Bytes(value.to_vec().into())
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -223,8 +233,12 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(BooleanArray))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Boolean(value);
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Boolean(value)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -236,8 +250,12 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(Float64Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Float(value.try_into().unwrap_or_default());
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Float(value.try_into().unwrap_or_default())
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -249,8 +267,12 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(Float32Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Float((value as f64).try_into().unwrap_or_default());
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Float((value as f64).try_into().unwrap_or_default())
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -262,8 +284,12 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(Int64Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Integer(value);
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Integer(value)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -275,8 +301,15 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(Int32Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Integer(value as i64);
+                    // A NULL cell must become VrlValue::Null: the primitive
+                    // `value(i)` returns the slot's underlying default (0),
+                    // which the VRL program would see as real data.
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Integer(value as i64)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -288,8 +321,15 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(Int16Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Integer(value as i64);
+                    // A NULL cell must become VrlValue::Null: the primitive
+                    // `value(i)` returns the slot's underlying default (0),
+                    // which the VRL program would see as real data.
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Integer(value as i64)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -298,8 +338,15 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                     downcast_failure(name, column.data_type(), stringify!(Int8Array))
                 })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Integer(value as i64);
+                    // A NULL cell must become VrlValue::Null: the primitive
+                    // `value(i)` returns the slot's underlying default (0),
+                    // which the VRL program would see as real data.
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Integer(value as i64)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -311,15 +358,19 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(UInt64Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    // VRL integers are i64: values beyond i64::MAX must be a
-                    // loud error, never a silent negative wraparound.
-                    let vrl_value = VrlValue::Integer(i64::try_from(value).map_err(|_| {
-                        Error::Process(format!(
-                            "VRL processor: column `{}` has value {} which exceeds i64::MAX (VRL integers are i64); remove or cast the column first, e.g. with filter_columns or a SQL processor",
-                            name, value
-                        ))
-                    })?);
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        // VRL integers are i64: values beyond i64::MAX must be a
+                        // loud error, never a silent negative wraparound.
+                        VrlValue::Integer(i64::try_from(value).map_err(|_| {
+                            Error::Process(format!(
+                                "VRL processor: column `{}` has value {} which exceeds i64::MAX (VRL integers are i64); remove or cast the column first, e.g. with filter_columns or a SQL processor",
+                                name, value
+                            ))
+                        })?)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -331,8 +382,15 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(UInt32Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Integer(value as i64);
+                    // A NULL cell must become VrlValue::Null: the primitive
+                    // `value(i)` returns the slot's underlying default (0),
+                    // which the VRL program would see as real data.
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Integer(value as i64)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -344,8 +402,15 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(UInt16Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Integer(value as i64);
+                    // A NULL cell must become VrlValue::Null: the primitive
+                    // `value(i)` returns the slot's underlying default (0),
+                    // which the VRL program would see as real data.
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Integer(value as i64)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -357,8 +422,15 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(UInt8Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Integer(value as i64);
+                    // A NULL cell must become VrlValue::Null: the primitive
+                    // `value(i)` returns the slot's underlying default (0),
+                    // which the VRL program would see as real data.
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Integer(value as i64)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -370,8 +442,15 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(Date32Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Integer(value as i64);
+                    // A NULL cell must become VrlValue::Null: the primitive
+                    // `value(i)` returns the slot's underlying default (0),
+                    // which the VRL program would see as real data.
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Integer(value as i64)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }
@@ -383,8 +462,12 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         downcast_failure(name, column.data_type(), stringify!(Date64Array))
                     })?;
                 for i in 0..rows {
-                    let value = col.value(i);
-                    let vrl_value = VrlValue::Integer(value);
+                    let vrl_value = if col.is_null(i) {
+                        VrlValue::Null
+                    } else {
+                        let value = col.value(i);
+                        VrlValue::Integer(value)
+                    };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
             }

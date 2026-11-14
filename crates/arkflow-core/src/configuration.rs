@@ -414,6 +414,15 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Redact secret-looking values in an arbitrary JSON document: nested
+/// objects and arrays, secret-named keys, and URL userinfo passwords. Job
+/// specs and compiled plans carry the plaintext connector credentials the
+/// execution path needs, so every read API projects its persisted payloads
+/// through this before responding.
+pub fn redacted_value(value: &Value) -> Value {
+    redact_secrets(value)
+}
+
 /// Convert an engine configuration to a redacted JSON representation.
 pub fn redacted_config(config: &EngineConfig) -> Result<Value, Error> {
     let value = serde_json::to_value(config)?;

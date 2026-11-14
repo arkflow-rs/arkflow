@@ -17,8 +17,21 @@ use axum::Json;
 pub(super) async fn hub_streams(
     State(hub): State<hub::Hub>,
     Query(query): Query<PageQuery>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    // Reads enforce scopes like mutations: middleware only authenticates.
+    // A node filter doubles as the scope anchor for node-scoped credentials.
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "stream",
+        query.node_id.clone(),
+    )
+    .await
+    {
+        return response;
+    }
     let all = hub.streams(query.node_id.as_deref()).await;
     let total = all.len();
     let page = query.page.unwrap_or(1).max(1);
@@ -47,8 +60,19 @@ pub(super) async fn hub_streams(
 pub(super) async fn hub_stream(
     State(hub): State<hub::Hub>,
     Path((node_id, stream_id)): Path<(String, String)>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::Read,
+        "stream",
+        Some(format!("{node_id}/{stream_id}")),
+    )
+    .await
+    {
+        return response;
+    }
     match hub.stream_resource(&node_id, &stream_id).await {
         Ok(Some(resource)) => Json(resource).into_response(),
         Ok(None) => problem(
@@ -93,6 +117,10 @@ pub(super) async fn hub_targeted_command(
             "Unsupported node operation".into(),
         );
     }
+    let expected_generation = match expected_generation_from_headers(&headers) {
+        Ok(expected) => expected,
+        Err(response) => return response,
+    };
     let correlation_id = headers
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())
@@ -109,10 +137,7 @@ pub(super) async fn hub_targeted_command(
                 },
                 config_version_id: None,
                 action_id: None,
-                expected_generation: headers
-                    .get("if-match")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(parse_generation_etag),
+                expected_generation,
                 actor: Some(principal.id.clone()),
                 correlation_id,
                 idempotency_key: headers
@@ -173,10 +198,7 @@ pub(super) async fn hub_targeted_command(
                 node_id,
                 id,
                 action_id,
-                headers
-                    .get("if-match")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(parse_generation_etag),
+                expected_generation,
                 Some(principal.id.clone()),
                 correlation_id,
                 headers
@@ -297,10 +319,10 @@ pub(super) async fn hub_desired_state(
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let expected_generation = headers
-        .get("if-match")
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_generation_etag);
+    let expected_generation = match expected_generation_from_headers(&headers) {
+        Ok(expected) => expected,
+        Err(response) => return response,
+    };
     match hub
         .set_desired_state(DesiredMutation {
             node_id: node_id.clone(),
@@ -363,6 +385,27 @@ pub(super) fn parse_generation_etag(value: &str) -> Option<u64> {
         .trim_matches('"')
         .strip_prefix("generation-")
         .and_then(|value| value.parse().ok())
+}
+
+/// Extract the expected generation from an `If-Match` header. A present but
+/// unparseable header must FAIL the request: mapping it to `None` silently
+/// turned the compare-and-set into an unconditional write, so a malformed
+/// (or hostile) conditional clobbered a newer generation instead of
+/// rejecting.
+pub(super) fn expected_generation_from_headers(
+    headers: &HeaderMap,
+) -> Result<Option<u64>, Response> {
+    match headers.get("if-match") {
+        None => Ok(None),
+        Some(value) => match value.to_str().ok().and_then(parse_generation_etag) {
+            Some(generation) => Ok(Some(generation)),
+            None => Err(problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_if_match",
+                "The If-Match header must be \"generation-N\"".into(),
+            )),
+        },
+    }
 }
 
 pub(super) async fn streams(

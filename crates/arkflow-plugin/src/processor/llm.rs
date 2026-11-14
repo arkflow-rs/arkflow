@@ -299,6 +299,12 @@ fn assemble_sse(body: &str) -> Result<(String, Option<Value>), Error> {
         }
         let chunk: Value = serde_json::from_str(payload)
             .map_err(|e| Error::Process(format!("LLM stream chunk parse failed: {e}")))?;
+        // An explicit in-stream error object must FAIL the stream: the
+        // previous silent skip reported empty or partial content as success
+        // when the provider errored mid-stream.
+        if let Some(error) = chunk.get("error") {
+            return Err(Error::Process(format!("LLM stream error: {error}")));
+        }
         let Some(delta) = chunk
             .get("choices")
             .and_then(|choices| choices.get(0))

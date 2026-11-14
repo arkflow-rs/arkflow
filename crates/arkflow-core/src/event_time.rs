@@ -127,10 +127,24 @@ impl WatermarkTracker {
                 "watermark tracker requires a watermark specification".into(),
             ));
         };
+        // u64 config durations must not silently wrap through `as i64`:
+        // a value above i64::MAX would become NEGATIVE (negative allowed
+        // lateness / idle timeout), corrupting watermark firing. Fail the
+        // configuration loudly instead.
+        let out_of_orderness_ms = i64::try_from(watermark.out_of_orderness_ms).map_err(|_| {
+            Error::Config("watermark.out_of_orderness_ms exceeds i64::MAX".into())
+        })?;
+        let idle_timeout_ms = watermark
+            .idle_timeout_ms
+            .map(|value| {
+                i64::try_from(value)
+                    .map_err(|_| Error::Config("watermark.idle_timeout_ms exceeds i64::MAX".into()))
+            })
+            .transpose()?;
         Ok(Self {
             strategy: watermark.strategy,
-            out_of_orderness_ms: watermark.out_of_orderness_ms as i64,
-            idle_timeout_ms: watermark.idle_timeout_ms.map(|value| value as i64),
+            out_of_orderness_ms,
+            idle_timeout_ms,
             partitions: BTreeMap::new(),
             physical_partitions: BTreeMap::new(),
             watermark_ms: None,
@@ -295,6 +309,9 @@ pub(crate) fn window_action(
     allowed_lateness_ms: u64,
     policy: LateEventPolicy,
 ) -> WindowAction {
+    // Same wrap guard as the watermark spec: a u64 lateness above i64::MAX
+    // must not become a NEGATIVE allowance through `as i64`.
+    let allowed_lateness_ms = i64::try_from(allowed_lateness_ms).unwrap_or(i64::MAX);
     let Some(watermark_ms) = watermark_ms else {
         return WindowAction::Hold;
     };

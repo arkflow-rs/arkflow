@@ -169,8 +169,21 @@ pub(crate) async fn run_job_with_checkpoints_started<A: JobComponentAdapter>(
                 .map(|sender| sender.send(Err(error.to_string())));
             return Err(error);
         }
-        for input in &inputs {
-            if let Err(error) = input.restore_positions(&manifest.source_positions).await {
+        // Restore each source from the positions ITS task reported: the
+        // flattened manifest list loses task identity, so two sources with
+        // the same topic/partition would otherwise consume each other's
+        // offsets. Manifests written before per-task positions existed carry
+        // an empty map and fall back to the flat list.
+        for chain in &graph.chains {
+            let Some(input) = chain.source.as_ref() else {
+                continue;
+            };
+            let positions = manifest
+                .source_positions_by_task
+                .get(chain.entry_task_id())
+                .map(|positions| positions.as_slice())
+                .unwrap_or(manifest.source_positions.as_slice());
+            if let Err(error) = input.restore_positions(positions).await {
                 close_inputs(&inputs).await;
                 let _ = startup
                     .take()
@@ -1003,7 +1016,13 @@ async fn run_local_checkpoint_loop(
                 let checkpoint_id = format!("local-{}-{timestamp}-{sequence}", plan.spec.id);
                 sequence = sequence.saturating_add(1);
                 match handle.checkpoint_barrier_with_details(checkpoint_id.clone(), 0).await {
-                    Ok((snapshot, source_positions, watermarks_ms, watermark_partitions)) => {
+                    Ok((
+                        snapshot,
+                        _flat_source_positions,
+                        watermarks_ms,
+                        watermark_partitions,
+                        source_positions_by_task,
+                    )) => {
                         if let Err(error) = persist_local_checkpoint(
                             &store,
                             &mut catalog,
@@ -1011,7 +1030,7 @@ async fn run_local_checkpoint_loop(
                             &participants,
                             &checkpoint,
                             snapshot,
-                            source_positions,
+                            source_positions_by_task,
                             watermarks_ms,
                             watermark_partitions,
                             &checkpoint_id,
@@ -1036,7 +1055,7 @@ fn persist_local_checkpoint(
     participants: &[String],
     checkpoint: &crate::job::CheckpointSpec,
     snapshot: crate::state::StateSnapshot,
-    source_positions: Vec<crate::checkpoint::SourcePosition>,
+    source_positions_by_task: BTreeMap<String, Vec<crate::checkpoint::SourcePosition>>,
     watermarks_ms: BTreeMap<String, i64>,
     watermark_partitions: BTreeMap<String, Vec<crate::checkpoint::WatermarkPosition>>,
     checkpoint_id: &str,
@@ -1058,17 +1077,7 @@ fn persist_local_checkpoint(
         participants.iter().cloned(),
     );
     let barrier = coordinator.start(checkpoint_id.to_owned())?;
-    let mut positions_pending = Some(source_positions);
     for task_id in participants {
-        let is_source = plan
-            .task(task_id)
-            .and_then(|task| {
-                plan.spec
-                    .operators
-                    .iter()
-                    .find(|operator| operator.id == task.operator_id)
-            })
-            .is_some_and(|operator| operator.kind == crate::job::OperatorKind::Source);
         coordinator.acknowledge(crate::checkpoint::TaskCheckpointAck {
             task_id: task_id.clone(),
             attempt_id: format!("{task_id}:local:0"),
@@ -1080,11 +1089,13 @@ fn persist_local_checkpoint(
             checkpoint_id: barrier.checkpoint_id.clone(),
             generation: barrier.generation,
             state: snapshot.clone(),
-            source_positions: if is_source {
-                positions_pending.take().unwrap_or_default()
-            } else {
-                Vec::new()
-            },
+            // Each source task carries ONLY the positions its own chain
+            // reported: handing the whole flat list to the first source task
+            // would mis-restore every other source sharing topic/partition.
+            source_positions: source_positions_by_task
+                .get(task_id)
+                .cloned()
+                .unwrap_or_default(),
             watermark_ms: watermarks_ms.get(task_id).copied(),
             watermark_partitions: watermark_partitions
                 .get(task_id)
@@ -1266,6 +1277,7 @@ mod validation_tests {
                 },
             ],
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: Default::default(),
             watermark_partitions: Default::default(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {
@@ -1392,6 +1404,52 @@ mod validation_tests {
             assert_eq!(moved.key, state_key);
             assert_eq!(moved.value, b"42".to_vec());
         }
+    }
+
+    /// Regression (integer key encoding): stateful integer keys encode as
+    /// "<tag>:" + big-endian bytes — the bare "<tag>" prefix made every
+    /// integer-keyed entry fail rescale redistribution with "unrecognized
+    /// key encoding". The stripped post-tag bytes must be EXACTLY the
+    /// routing-hash input (the raw big-endian value, matching
+    /// `hash_column`).
+    #[test]
+    fn integer_state_keys_rescale_with_the_colon_tag() {
+        let new_plan = JobPlan::compile(rescale_job_spec(4)).unwrap();
+        let context = RescaleContext::from_plan(&new_plan).unwrap();
+        let old_plan = JobPlan::compile(rescale_job_spec(1)).unwrap();
+        let old_task = old_plan
+            .tasks
+            .iter()
+            .find(|task| task.operator_id == "agg")
+            .unwrap();
+        let old_namespace =
+            crate::job::effective_state_namespace(&old_plan.spec.id, None, "agg", &old_task.id);
+        let value: i64 = 0x0102030405060708;
+        let state_key = [b"i64:".as_slice(), value.to_be_bytes().as_slice()].concat();
+        let entry = crate::state::StateEntry {
+            namespace: old_namespace,
+            key: state_key.clone(),
+            value: b"1".to_vec(),
+            expires_at_ms: None,
+        };
+        let moved = context.redistribute(entry).unwrap();
+        // The routing input is the bare big-endian value.
+        let group = crate::job::key_group_for_key(&value.to_be_bytes(), 16).unwrap();
+        let owner = new_plan
+            .tasks
+            .iter()
+            .find(|task| {
+                task.operator_id == "agg"
+                    && task
+                        .partitions
+                        .iter()
+                        .any(|partition| partition.key_group.contains(group))
+            })
+            .unwrap();
+        let expected =
+            crate::job::effective_state_namespace(&new_plan.spec.id, None, "agg", &owner.id);
+        assert_eq!(moved.namespace, expected);
+        assert_eq!(moved.key, state_key);
     }
 
     #[test]
@@ -1756,6 +1814,7 @@ mod validation_tests {
             generation: 1,
             task_attempts: Vec::new(),
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: Default::default(),
             watermark_partitions: Default::default(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {
@@ -1814,6 +1873,7 @@ mod validation_tests {
             generation: 1,
             task_attempts: Vec::new(),
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: Default::default(),
             watermark_partitions: Default::default(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {
@@ -1874,6 +1934,7 @@ mod validation_tests {
             generation: 1,
             task_attempts: Vec::new(),
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: Default::default(),
             watermark_partitions: Default::default(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {
@@ -3702,6 +3763,7 @@ mod runner_tests {
             manifest.generation,
             &manifest.task_attempts,
             &manifest.source_positions,
+            &manifest.source_positions_by_task,
             &manifest.watermarks_ms,
             &manifest.watermark_partitions,
             &manifest.in_flight_barrier,
@@ -3731,6 +3793,7 @@ mod runner_tests {
                 })
                 .collect(),
             source_positions: Vec::new(),
+            source_positions_by_task: BTreeMap::new(),
             watermarks_ms: BTreeMap::new(),
             watermark_partitions: BTreeMap::new(),
             in_flight_barrier: crate::checkpoint::CheckpointBarrier {

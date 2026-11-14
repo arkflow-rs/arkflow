@@ -85,25 +85,51 @@ impl DatabaseConnection {
     ) -> Result<(), Error> {
         match self {
             DatabaseConnection::Mysql(conn) => {
-                build_mysql_insert(output_config, columns, rows)
-                    .build()
-                    .execute(conn)
-                    .await
-                    .map_err(|e| Error::Process(format!("Failed to execute MySQL query: {}", e)))?;
+                for chunk in chunk_rows_for_insert(columns.len(), rows) {
+                    build_mysql_insert(output_config, columns, chunk)
+                        .build()
+                        .execute(&mut *conn)
+                        .await.map_err(|e| {
+                            Error::Process(format!("Failed to execute MySQL query: {}", e))
+                        })?;
+                }
                 Ok(())
             }
             DatabaseConnection::Postgres(conn) => {
-                build_postgres_insert(output_config, columns, rows)
-                    .build()
-                    .execute(conn)
-                    .await
-                    .map_err(|e| {
-                        Error::Process(format!("Failed to execute PostgresSQL query: {}", e))
-                    })?;
+                for chunk in chunk_rows_for_insert(columns.len(), rows) {
+                    build_postgres_insert(output_config, columns, chunk)
+                        .build()
+                        .execute(&mut *conn)
+                        .await.map_err(|e| {
+                            Error::Process(format!("Failed to execute PostgresSQL query: {}", e))
+                        })?;
+                }
                 Ok(())
             }
         }
     }
+}
+
+/// Max BIND PARAMETERS per INSERT statement: PostgreSQL's protocol caps the
+/// bind count at 65535 (u16) and a 1024-row × 64-column batch is 65536 binds
+/// — the whole batch failed with a protocol error. Keep well below the cap.
+const MAX_BINDS_PER_INSERT: usize = 10_000;
+
+/// Split rows into per-statement chunks whose bind count (rows × columns)
+/// stays under the protocol limit. Chunks are executed inside the caller's
+/// transaction (or sequential statements on the non-transactional path).
+fn chunk_rows_for_insert<'a>(
+    columns: usize,
+    rows: &'a [Vec<SqlValue>],
+) -> Vec<&'a [Vec<SqlValue>]> {
+    if columns == 0 {
+        return vec![rows];
+    }
+    let rows_per_chunk = (MAX_BINDS_PER_INSERT / columns).max(1);
+    if rows.len() <= rows_per_chunk {
+        return vec![rows];
+    }
+    rows.chunks(rows_per_chunk).collect()
 }
 
 /// One `write_batch` call is one SQL transaction: every batch's insert runs
@@ -123,11 +149,14 @@ async fn execute_insert_transactional(
                 .await
                 .map_err(|e| Error::Process(format!("Failed to begin MySQL transaction: {}", e)))?;
             for (columns, rows) in batches {
-                build_mysql_insert(output_config, columns, rows)
-                    .build()
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|e| Error::Process(format!("Failed to execute MySQL query: {}", e)))?;
+                for chunk in chunk_rows_for_insert(columns.len(), rows) {
+                    build_mysql_insert(output_config, columns, chunk)
+                        .build()
+                        .execute(&mut *transaction)
+                        .await.map_err(|e| Error::Process(format!(
+                            "Failed to execute MySQL query: {}", e
+                        )))?;
+                }
             }
             transaction
                 .commit()
@@ -139,13 +168,14 @@ async fn execute_insert_transactional(
                 Error::Process(format!("Failed to begin Postgres transaction: {}", e))
             })?;
             for (columns, rows) in batches {
-                build_postgres_insert(output_config, columns, rows)
-                    .build()
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|e| {
-                        Error::Process(format!("Failed to execute PostgresSQL query: {}", e))
-                    })?;
+                for chunk in chunk_rows_for_insert(columns.len(), rows) {
+                    build_postgres_insert(output_config, columns, chunk)
+                        .build()
+                        .execute(&mut *transaction)
+                        .await.map_err(|e| Error::Process(format!(
+                            "Failed to execute PostgresSQL query: {}", e
+                        )))?;
+                }
             }
             transaction.commit().await.map_err(|e| {
                 Error::Process(format!("Failed to commit Postgres transaction: {}", e))
@@ -212,7 +242,10 @@ fn build_mysql_insert(
                 SqlValue::UInt64(u) => b.push_bind(*u),
                 SqlValue::Float64(f) => b.push_bind(*f),
                 SqlValue::Boolean(bool) => b.push_bind(*bool),
-                SqlValue::Null => b.push_bind(None::<String>),
+                // An untyped NULL lets the server infer the column type;
+                // binding Option::<String>::None forced TEXT semantics and
+                // mismatched non-text columns.
+                SqlValue::Null => b.push("NULL"),
             };
         }
     });
@@ -243,10 +276,23 @@ fn build_postgres_insert(
             match value {
                 SqlValue::String(s) => b.push_bind(s.as_str()),
                 SqlValue::Int64(i) => b.push_bind(*i),
-                SqlValue::UInt64(u) => b.push_bind(*u as i64),
+                SqlValue::UInt64(u) => {
+                    if *u <= i64::MAX as u64 {
+                        b.push_bind(*u as i64)
+                    } else {
+                        // Above i64::MAX: bind as a numeric literal. A BIGINT
+                        // column then fails the write at the server (the
+                        // value simply does not fit) instead of silently
+                        // wrapping to a negative number.
+                        b.push(format!("'{}'::numeric", u))
+                    }
+                }
                 SqlValue::Float64(f) => b.push_bind(*f),
                 SqlValue::Boolean(bool) => b.push_bind(*bool),
-                SqlValue::Null => b.push_bind(None::<String>),
+                // An untyped NULL lets the server infer the column type;
+                // binding Option::<String>::None forced TEXT semantics and
+                // mismatched non-text columns.
+                SqlValue::Null => b.push("NULL"),
             };
         }
     });

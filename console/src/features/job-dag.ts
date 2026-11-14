@@ -46,8 +46,10 @@ export function jobSpecToDag(spec: JobSpec): { nodes: DagNode[]; edges: Edge[] }
     id: edge.id ?? `${edge.from}-${edge.to}`,
     source: edge.from,
     target: edge.to,
-    data: { partitioned: edge.partitioned !== false },
-    label: edge.partitioned !== false ? 'partitioned' : undefined,
+    // The Rust EdgeSpec serde default is `false`: an omitted field must
+    // round-trip as false instead of silently becoming true.
+    data: { partitioned: edge.partitioned === true },
+    label: edge.partitioned === true ? 'partitioned' : undefined,
     animated: false,
   }))
   return { nodes, edges }
@@ -58,19 +60,29 @@ export function dagToJobSpec(nodes: DagNode[], edges: Edge[], base: JobSpec = {}
     sinks: any[] = []
   const operators = nodes.map((node) => {
     const data = node.data
-    if (data.kind === 'source')
+    // Start from the base spec's record and override only what the editor
+    // models: the stored SourceSpec/SinkSpec carries fields the editor does
+    // not render (codec, name, …) that must survive a round-trip instead of
+    // being dropped on every save.
+    if (data.kind === 'source') {
+      const baseSource = base.sources?.find((item: any) => item.operator_id === node.id)
       sources.push({
+        ...clone(baseSource ?? {}),
         operator_id: node.id,
         input_type: data.component,
         config: clone(data.config ?? {}),
-        time: clone(
-          base.sources?.find((item: any) => item.operator_id === node.id)?.time ?? {
-            mode: 'processing_time',
-          },
-        ),
+        time: clone(baseSource?.time ?? { mode: 'processing_time' }),
       })
-    if (data.kind === 'sink')
-      sinks.push({ operator_id: node.id, output_type: data.component, config: clone(data.config ?? {}) })
+    }
+    if (data.kind === 'sink') {
+      const baseSink = base.sinks?.find((item: any) => item.operator_id === node.id)
+      sinks.push({
+        ...clone(baseSink ?? {}),
+        operator_id: node.id,
+        output_type: data.component,
+        config: clone(data.config ?? {}),
+      })
+    }
     const config = clone(data.config ?? {})
     if (data.kind === 'processor' && !config.type) config.type = data.component
     return {
@@ -87,7 +99,7 @@ export function dagToJobSpec(nodes: DagNode[], edges: Edge[], base: JobSpec = {}
       id: edge.id,
       from: edge.source,
       to: edge.target,
-      partitioned: (edge.data as any)?.partitioned !== false,
+      partitioned: (edge.data as any)?.partitioned === true,
     })),
     sources,
     sinks,

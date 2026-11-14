@@ -314,6 +314,29 @@ impl StorageBackend for PostgresBackend {
                 .optional()
         }
     }
+    async fn id_sequence_floor(&self) -> Result<u64, StorageError> {
+        // Max numeric suffix over the shared hop-/cmd-/attempt- namespaces.
+        let floor: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(suffix::bigint), 0) FROM (\
+               SELECT regexp_replace(intent_id, '^[^-]*-', '') AS suffix FROM cp_intents WHERE intent_id LIKE 'hop-%' \
+               UNION ALL SELECT regexp_replace(attempt_id, '^[^-]*-', '') FROM cp_attempts WHERE attempt_id LIKE 'attempt-%' \
+               UNION ALL SELECT regexp_replace(command_id, '^[^-]*-', '') FROM cp_attempts WHERE command_id LIKE 'cmd-%'\
+             ) ids WHERE suffix ~ '^[0-9]+$'",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        Ok(floor.max(0) as u64)
+    }
+    async fn intent_counter_floor(&self) -> Result<u64, StorageError> {
+        // The {counter} segment of `intent-{generation}-{counter}` ids.
+        let floor: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX((regexp_split_to_array(intent_id, '-'))[3]::bigint), 0) \
+             FROM cp_intents WHERE intent_id ~ '^intent-[0-9]+-[0-9]+$'",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        Ok(floor.max(0) as u64)
+    }
 
     async fn replace_node_labels(
         &self,
@@ -952,9 +975,8 @@ impl StorageBackend for PostgresBackend {
             } else {
                 "stop"
             };
-            let suffix = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let attempt_id = format!("attempt-{suffix}");
-            let command_id = format!("cmd-{suffix}");
+            let attempt_id = crate::hub::next_control_plane_id("attempt");
+            let command_id = crate::hub::next_control_plane_id("cmd");
             let now = now_ms();
             transaction.execute(
                 "INSERT INTO cp_attempts (attempt_id, intent_id, command_id, node_id, stream_id, generation, operation, state, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8)",

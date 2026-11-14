@@ -205,7 +205,12 @@ impl MilvusSearchProcessor {
         let output_fields: Vec<String> = self.output_fields();
         let mut body = json!({
             "collectionName": self.config.collection,
-            "data": [{"vector": vector}],
+            // REST v2 search takes RAW query vectors in `data` (one vector
+            // per request) and names the target field via `annsField`. The
+            // previous `{"vector": [...]}` shape is the INSERT entity
+            // format — with no annsField every search failed.
+            "data": [vector],
+            "annsField": self.config.vector_field,
             "limit": self.config.top_k,
             "searchParams": {"metricType": self.config.metric.as_str(), "params": {}},
         });

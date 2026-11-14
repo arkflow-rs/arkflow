@@ -48,7 +48,12 @@ pub(super) async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) 
 /// Fleet-aggregated EngineStatus so console clients get one overview
 /// contract in local and Hub mode. Only a lease-holding Hub reaches this
 /// handler; standbys are rejected by the router's standby middleware.
-pub(super) async fn hub_status(State(hub): State<hub::Hub>, _headers: HeaderMap) -> Response {
+pub(super) async fn hub_status(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "node", None).await
+    {
+        return response;
+    }
     let nodes = hub.nodes().await;
     Json(arkflow_core::control::EngineStatus {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -65,8 +70,13 @@ pub(super) async fn hub_status(State(hub): State<hub::Hub>, _headers: HeaderMap)
 pub(super) async fn hub_nodes(
     State(hub): State<hub::Hub>,
     Query(query): Query<NodePageQuery>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) =
+        require_operator_action(&hub, &headers, OperatorAction::Read, "node", None).await
+    {
+        return response;
+    }
     let mut filters = Vec::new();
     if let Some(label) = &query.label {
         if !label.trim().is_empty() {

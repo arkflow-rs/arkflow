@@ -509,6 +509,11 @@ pub struct NetworkManager {
     accepted: AcceptedQueue,
     config: NetworkManagerConfig,
     active_connections: std::sync::atomic::AtomicUsize,
+    /// Bounds UNAUTHENTICATED work: TLS handshakes run off the accept loop,
+    /// and without a cap one attacker with idle TCP connections holds
+    /// unbounded tasks and sockets (the active_connections limit only counts
+    /// AUTHENTICATED streams). One permit per in-flight handshake.
+    handshake_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) shutdown: tokio_util::sync::CancellationToken,
 }
 
@@ -659,6 +664,7 @@ impl NetworkManager {
         config.validate()?;
         let (failure_sender, failure_receiver) = flume::bounded(config.max_failure_queue);
         let accepted = flume::bounded(config.max_connections);
+        let handshake_permits = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
         Ok(Arc::new(Self {
             inbound: std::sync::RwLock::new(BTreeMap::new()),
             outbound: std::sync::RwLock::new(BTreeMap::new()),
@@ -674,6 +680,7 @@ impl NetworkManager {
             session_registrations: std::sync::Mutex::new(BTreeMap::new()),
             accepted,
             active_connections: std::sync::atomic::AtomicUsize::new(0),
+            handshake_permits,
             config,
             shutdown: tokio_util::sync::CancellationToken::new(),
         }))
@@ -1027,15 +1034,40 @@ impl NetworkManager {
                             // connection-failure path — never a plaintext
                             // fallback.
                             Some(tls) => {
+                                // Bound unauthenticated work BEFORE the spawn:
+                                // the handshake runs off the accept loop, so
+                                // an attacker with idle TCP connections must
+                                // not hold unbounded tasks and sockets — the
+                                // active_connections limit only counts
+                                // AUTHENTICATED streams.
+                                let Ok(permit) =
+                                    manager.handshake_permits.clone().try_acquire_owned()
+                                else {
+                                    manager.report_failure(Error::Process(format!(
+                                        "remote edge TLS handshake limit {} reached",
+                                        manager.config.max_connections
+                                    )));
+                                    continue;
+                                };
                                 let handshake_manager = manager.clone();
                                 tokio::spawn(async move {
-                                    match tls.accept(stream).await {
-                                        Ok(tls_stream) => {
-                                            handshake_manager.accept_stream(Box::new(tls_stream));
+                                    let accepted = tokio::time::timeout(
+                                        TLS_HANDSHAKE_TIMEOUT,
+                                        tls.accept(stream),
+                                    )
+                                    .await;
+                                    // The authenticated stream is counted by
+                                    // active_connections from here on.
+                                    drop(permit);
+                                    match accepted {
+                                        Ok(Ok(tls_stream)) => {
+                                            handshake_manager
+                                                .accept_stream(Box::new(tls_stream));
                                         }
-                                        Err(error) => {
-                                            handshake_manager.report_failure(error);
-                                        }
+                                        Ok(Err(error)) => handshake_manager.report_failure(error),
+                                        Err(_) => handshake_manager.report_failure(Error::Process(
+                                            "remote edge TLS handshake timed out".into(),
+                                        )),
                                     }
                                 });
                             }
@@ -1269,11 +1301,23 @@ impl NetworkManager {
     }
 
     pub(crate) fn report_failure(&self, error: Error) {
-        // This path is synchronous because it is also used by the listener
-        // and Ack callbacks. A blocking send preserves the bounded queue's
-        // backpressure without silently losing the failure that must cancel
-        // the affected edge.
-        let _ = self.failures.send(error);
+        // This path is synchronous (listener, TLS-accept tasks, Ack
+        // callbacks) and feeds the GLOBAL channel — which production Jobs
+        // never consume (they hold per-job receivers, see
+        // `failure_receiver_for_job`). A blocking send here would stall the
+        // accept path forever once the unconsumed queue fills; the fatal
+        // per-edge signals use the per-job channels with real backpressure.
+        // Drop with a loud log when the global queue is full or closed.
+        if let Err(error) = self.failures.try_send(error) {
+            let payload = match error {
+                flume::TrySendError::Full(error) => error,
+                flume::TrySendError::Disconnected(error) => error,
+            };
+            tracing::warn!(
+                error = %payload,
+                "data-plane global failure channel unavailable; dropping the report"
+            );
+        }
     }
 
     /// Spawns the receipt read loop and outbound pump over an established
@@ -1328,6 +1372,9 @@ impl NetworkManager {
             let mut current = Some(stream);
             let mut final_error: Option<Error> = None;
             let mut clean_exit = false;
+            // The reconnect replay opens the session preamble itself; the
+            // pump must not send a second handshake on the same stream.
+            let mut handshake_sent = false;
             while let Some(stream) = current.take() {
                 let (pump_result, read_result) = run_edge_connection(
                     stream,
@@ -1339,6 +1386,7 @@ impl NetworkManager {
                     reconnectable,
                     failures.clone(),
                     &manager.shutdown,
+                    handshake_sent,
                 )
                 .await;
                 // Clean requires BOTH halves to end cleanly: the read loop
@@ -1380,13 +1428,20 @@ impl NetworkManager {
                         let redial = redial.clone().expect("retry implies redial");
                         match redial.connect(quad).await {
                             Ok(mut stream) => {
-                                if let Err(error) =
-                                    replay_pending(&mut stream, quad, &pending, &auth, &config)
-                                        .await
+                                if let Err(error) = replay_pending(
+                                    &mut stream,
+                                    quad,
+                                    &pending,
+                                    &auth,
+                                    &config,
+                                    /* send_handshake */ true,
+                                )
+                                .await
                                 {
                                     final_error = Some(error);
                                     break;
                                 }
+                                handshake_sent = true;
                                 current = Some(stream);
                             }
                             Err(error) => {
@@ -1429,11 +1484,21 @@ impl NetworkManager {
                 // different Job's global queue.
                 return;
             };
-            // A connection error is part of the Job's failure contract.  Do
-            // not use try_send here: a full bounded queue must apply
-            // backpressure rather than silently dropping the only signal that
-            // can cancel the affected Job.
-            let _ = sender.send_async(failure.error).await;
+            match failure.job.as_ref() {
+                Some(_) => {
+                    // A connection error is part of the Job's failure contract.
+                    // Do not use try_send here: a full bounded queue must apply
+                    // backpressure rather than silently dropping the only signal
+                    // that can cancel the affected Job.
+                    let _ = sender.send_async(failure.error).await;
+                }
+                None => {
+                    // The GLOBAL queue has no production consumer: parking the
+                    // connection teardown (and with it the active-connection
+                    // slot) on an unconsumed channel leaks the connection.
+                    let _ = sender.try_send(failure.error);
+                }
+            }
         }
     }
 
@@ -2019,6 +2084,65 @@ async fn wait_for_route(
 /// supervisor: the branches must stay registered so a reconnect can replay
 /// them, and the supervisor aborts them if recovery does not succeed.
 #[allow(clippy::too_many_arguments)]
+/// Deadline for one inbound TLS handshake: a peer that completes TCP but
+/// stalls the TLS negotiation must not hold its accept task (and semaphore
+/// permit) forever.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cross-task handshake-acknowledgement gate: the receipt half confirms the
+/// server ack (nonce-checked MAC) and the pump half must not put DATA on the
+/// wire before that confirmation — an unauthenticated peer (plaintext
+/// transport, hostile redirect) must never receive batch bytes ahead of the
+/// client-side authentication check.
+#[derive(Default)]
+pub(crate) struct HandshakeGate {
+    confirmed: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl HandshakeGate {
+    fn confirm(&self) {
+        self.confirmed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(
+        &self,
+        timeout: std::time::Duration,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), Error> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.confirmed.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            // Register for the release notification BEFORE re-checking so a
+            // confirm between the check and the wait is never lost.
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
+            if self.confirmed.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(Error::Process(
+                        "remote edge cancelled while waiting for the handshake acknowledgement"
+                            .into(),
+                    ));
+                }
+                waited = tokio::time::timeout_at(deadline, &mut notified) => {
+                    if waited.is_err() {
+                        return Err(Error::Process(
+                            "remote edge handshake acknowledgement not confirmed in time".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn run_edge_connection(
     stream: Box<dyn RemoteStream>,
     quad: Quad,
@@ -2029,10 +2153,23 @@ pub(crate) async fn run_edge_connection(
     reconnectable: bool,
     failures: flume::Sender<Error>,
     shutdown: &tokio_util::sync::CancellationToken,
+    // True when the stream's session preamble (the authenticated handshake)
+    // was already written by the reconnect replay — pump_edge must not send
+    // a second one (the peer's duplicate-handshake guard rejects it).
+    handshake_sent: bool,
 ) -> (Result<(), Error>, Result<(), Error>) {
     let (reader, writer) = tokio::io::split(stream);
     let connection_cancel = shutdown.child_token();
     let outbound_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The data half waits for this gate before its FIRST frame: the receipt
+    // half confirms the server's handshake ack (nonce-checked) first, so an
+    // unauthenticated peer never receives batch bytes ahead of the
+    // client-side authentication check.
+    let handshake_gate = if auth.is_some() {
+        Some(Arc::new(HandshakeGate::default()))
+    } else {
+        None
+    };
 
     // Receipt read loop: routes receipts to the pending map. Errors cancel
     // the connection; classification (clean EOF after drain, late-failure
@@ -2042,6 +2179,7 @@ pub(crate) async fn run_edge_connection(
     let receipt_outbound_closed = outbound_closed.clone();
     let receipt_failures = failures.clone();
     let receipt_auth = auth.clone();
+    let receipt_gate = handshake_gate.clone();
     let read_task = tokio::spawn(async move {
         let mut reader = reader;
         let cancelled = receipt_cancel.clone();
@@ -2081,6 +2219,10 @@ pub(crate) async fn run_edge_connection(
                             if let Err(error) = result {
                                 failure = Some(error);
                                 break;
+                            }
+                            // Authenticated: the data half may open the tap.
+                            if let Some(gate) = receipt_gate.as_ref() {
+                                gate.confirm();
                             }
                         } else if header.kind == FrameKind::Receipt {
                             first_frame = false;
@@ -2138,6 +2280,8 @@ pub(crate) async fn run_edge_connection(
             config,
             auth,
             reconnectable,
+            handshake_gate,
+            handshake_sent,
         )
         .await;
         match result {
@@ -2183,22 +2327,27 @@ pub(crate) async fn replay_pending(
     pending: &Arc<PendingReceipts>,
     auth: &Option<SessionAuth>,
     config: &NetworkManagerConfig,
+    // True when THIS replay must open the session preamble (the reconnect
+    // path): pump_edge on the same stream must then skip its own handshake.
+    send_handshake: bool,
 ) -> Result<(), Error> {
     use tokio::io::AsyncWriteExt;
     let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, &mut **stream);
-    if let Some(auth) = auth {
-        let handshake = auth.client_handshake()?;
-        let payload = serde_json::to_vec(&handshake).map_err(|error| {
-            Error::Process(format!("remote edge handshake encode failed: {error}"))
-        })?;
-        write_frame_with_limit(
-            &mut writer,
-            quad,
-            FrameKind::Handshake,
-            &payload,
-            config.max_frame_len,
-        )
-        .await?;
+    if send_handshake {
+        if let Some(auth) = auth {
+            let handshake = auth.client_handshake()?;
+            let payload = serde_json::to_vec(&handshake).map_err(|error| {
+                Error::Process(format!("remote edge handshake encode failed: {error}"))
+            })?;
+            write_frame_with_limit(
+                &mut writer,
+                quad,
+                FrameKind::Handshake,
+                &payload,
+                config.max_frame_len,
+            )
+            .await?;
+        }
     }
     let mut encoder = DataEncoder::new();
     for (seq, batch) in pending.replay_snapshot() {
@@ -2229,28 +2378,46 @@ pub(crate) async fn pump_edge(
     config: NetworkManagerConfig,
     auth: Option<SessionAuth>,
     reconnectable: bool,
+    // Confirmed by the receipt half once the server's handshake ack verified:
+    // data frames must not precede the client-side authentication check.
+    handshake_gate: Option<Arc<HandshakeGate>>,
+    // True when the session preamble was already written on this stream by
+    // the reconnect replay; a second handshake makes the peer reject.
+    handshake_sent: bool,
 ) -> Result<(), Error> {
     let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, writer);
     let mut encoder = DataEncoder::new();
     let mut flush_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    if let Some(auth) = auth {
-        let handshake = auth.client_handshake()?;
-        let payload = serde_json::to_vec(&handshake).map_err(|error| {
-            Error::Process(format!("remote edge handshake encode failed: {error}"))
-        })?;
-        write_frame_with_limit(
-            &mut writer,
-            quad,
-            FrameKind::Handshake,
-            &payload,
-            config.max_frame_len,
-        )
-        .await?;
-        writer.flush().await.map_err(|error| {
-            Error::Process(format!("remote edge handshake flush failed: {error}"))
-        })?;
+    if auth.is_some() {
+        if !handshake_sent {
+            let handshake = auth
+                .as_ref()
+                .expect("auth checked above")
+                .client_handshake()?;
+            let payload = serde_json::to_vec(&handshake).map_err(|error| {
+                Error::Process(format!("remote edge handshake encode failed: {error}"))
+            })?;
+            write_frame_with_limit(
+                &mut writer,
+                quad,
+                FrameKind::Handshake,
+                &payload,
+                config.max_frame_len,
+            )
+            .await?;
+            writer.flush().await.map_err(|error| {
+                Error::Process(format!("remote edge handshake flush failed: {error}"))
+            })?;
+        }
+        // No data frame may precede the client-side authentication check: an
+        // unauthenticated peer (plaintext, hostile redirect) must never
+        // receive batch bytes before the server ack verified.
+        if let Some(gate) = handshake_gate.as_ref() {
+            gate.wait(config.receipt_wait_timeout, &shutdown).await?;
+        }
     }
+    drop(auth);
     let result: Result<(), Error>;
     // A drained channel (upstream dropped the sender) is the one clean exit
     // where the connection stays alive: the receipt read loop on the same
