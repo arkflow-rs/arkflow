@@ -24,9 +24,7 @@ export function Rollouts({ onError, canMutate = true }: RolloutsProps) {
   // cancel / rollback actions targeting the previous rollout's id under the
   // new selection. Treat a mismatched identity as "still loading".
   const selected =
-    detailQuery.data && detailQuery.data.rollout.rollout_id === selectedId
-      ? detailQuery.data
-      : undefined
+    detailQuery.data && detailQuery.data.rollout.rollout_id === selectedId ? detailQuery.data : undefined
   const pollError = detailQuery.isError ? errorMessage(detailQuery.error) : ''
   const [version, setVersion] = useState('')
   const [targets, setTargets] = useState<string[]>([])

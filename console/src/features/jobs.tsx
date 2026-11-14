@@ -136,9 +136,7 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
   // selection loads; rendering it would expose stop/pause/savepoint/upgrade
   // actions against the previous job under the new selection.
   const selected =
-    detailQuery.data && detailQuery.data.job.job_id === selectedJobId
-      ? detailQuery.data
-      : undefined
+    detailQuery.data && detailQuery.data.job.job_id === selectedJobId ? detailQuery.data : undefined
   const pollError = detailQuery.isError ? errorMessage(detailQuery.error) : ''
   const [filter, setFilter] = useState('')
   const [state, setState] = useState('all')

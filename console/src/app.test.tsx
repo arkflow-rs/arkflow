@@ -59,7 +59,7 @@ describe('console application', () => {
     render(<App />)
     expect(await screen.findByText('Fleet health')).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining('/nodes?page=1&page_size=50'),
+      expect.stringContaining('/nodes?page=1&page_size=100'),
       expect.objectContaining({
         headers: expect.objectContaining({ 'X-Correlation-ID': expect.any(String) }),
       }),

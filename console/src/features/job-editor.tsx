@@ -360,7 +360,12 @@ export function JobEditor({
   // request left a validation result (and enabled submit) for a different
   // placement.
   const latestNodesJson = useRef<string>()
-  latestNodesJson.current = JSON.stringify([...nodeIds].sort())
+  // Sync the ref from an effect, not during render: refs are not render
+  // inputs, and effects flush before the next validate request can read it.
+  const nodeIdsJson = JSON.stringify([...nodeIds].sort())
+  useEffect(() => {
+    latestNodesJson.current = nodeIdsJson
+  }, [nodeIdsJson])
   const connect = (connection: Connection) => {
     const issue = edgeIssue(dagNodes, edges, connection)
     if (issue) {
@@ -424,8 +429,7 @@ export function JobEditor({
     latestSpecJson.current = validatedSpec
     try {
       const result = await api.validateJob(next, nodeIds)
-      if (latestSpecJson.current !== validatedSpec || latestNodesJson.current !== validatedNodes)
-        return
+      if (latestSpecJson.current !== validatedSpec || latestNodesJson.current !== validatedNodes) return
       setValidation(result)
       setIssues(result.valid ? [] : [t('editor.incompatibleGraph')])
     } catch (cause) {
