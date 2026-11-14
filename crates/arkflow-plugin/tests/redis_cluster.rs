@@ -236,9 +236,26 @@ async fn cluster_lease() -> Option<ClusterLease> {
 
 impl Drop for ClusterLease {
     fn drop(&mut self) {
-        ACTIVE.fetch_sub(1, Ordering::SeqCst);
-        // Shared across tests in this binary; removed at process teardown.
+        if ACTIVE.fetch_sub(1, Ordering::SeqCst) != 1 {
+            // Another test still holds the shared node.
+            return;
+        }
+        // Last lease: remove the shared container now. Leaving it to process
+        // teardown leaked containers that then held the fixed host ports for
+        // the next run (testcontainers' reaper is not always present).
+        if let Ok(mut cluster) = CLUSTER.try_lock() {
+            if let Some(container) = cluster.take() {
+                remove_container(&container);
+            }
+        }
     }
+}
+
+/// Remove a test container explicitly (best effort).
+fn remove_container(container: &ContainerAsync<GenericImage>) {
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", container.id()])
+        .output();
 }
 
 fn resource() -> Resource {
@@ -391,6 +408,14 @@ impl Drop for NetworkCleanup {
         let _ = std::process::Command::new("docker")
             .args(["network", "rm", &self.0])
             .output();
+    }
+}
+
+impl Drop for MultiNodeCluster {
+    fn drop(&mut self) {
+        for container in &self._containers {
+            remove_container(container);
+        }
     }
 }
 
