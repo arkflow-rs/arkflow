@@ -22,6 +22,11 @@ const markdown = walkFlat(docsRoot).filter(
 const routeFiles = new Set(
   markdown.map((file) => routeFor(docsRoot, file)),
 );
+// Route → source file, so a route-only link target (no file at the relative
+// path) still validates its #anchor against the page it actually lands on.
+const routeToFile = new Map(
+  markdown.map((file) => [routeFor(docsRoot, file), file]),
+);
 
 // ---------------------------------------------------------------------------
 // Headings and anchors. GitHub-style slugs (Docusaurus uses the same rules):
@@ -123,6 +128,11 @@ for (const file of markdown) {
         errors.push(`${path.relative(root, file)}: unresolved internal link ${target}`);
         continue;
       }
+      if (!resolved) {
+        // Route-only target: validate the anchor against the file behind the
+        // route instead of silently skipping it.
+        resolved = routeToFile.get(route) ?? null;
+      }
     }
 
     if (anchor && resolved && /\.(md|mdx)$/.test(resolved)) {
@@ -211,11 +221,15 @@ try {
   }
   const examplesDir = path.join(repoRoot, 'examples');
   if (fs.existsSync(examplesDir)) {
-    for (const entry of fs.readdirSync(examplesDir, {withFileTypes: true})) {
-      if (!entry.isFile() || !/\.(ya?ml)$/.test(entry.name)) continue;
-      const full = path.join(examplesDir, entry.name);
+    // Recursive: nested example trees (examples/python/…) were invisible to
+    // the old top-level-only scan, so an unregistered or invalid nested YAML
+    // passed the check.
+    for (const full of walkFlat(examplesDir)) {
+      if (!/\.(ya?ml)$/.test(path.basename(full))) continue;
       if (!declaredExamplePaths.has(full)) {
-        errors.push(`examples/${entry.name} is not registered in reference/example-manifest.json`);
+        errors.push(
+          `${path.relative(repoRoot, full)} is not registered in reference/example-manifest.json`,
+        );
       }
     }
   }
