@@ -207,6 +207,36 @@ async fn parked_job_observations_are_redelivered_by_the_next_session() {
     assert!(runtime.take_finished().await.is_empty());
 }
 
+/// The watcher decision with a fixed clock: an operation that is still
+/// running when its ORIGINAL deadline passes stays alive while the renewed
+/// (Hub-leased) deadline is ahead; a terminal observation always wins.
+#[test]
+fn renewed_deadline_keeps_a_running_lifecycle_operation_alive() {
+    use super::commands::{lifecycle_wait_decision, LifecycleWait};
+    use arkflow_core::control::OperationState;
+
+    // Original deadline 1000ms; the operation is still running at 1500ms.
+    assert_eq!(
+        lifecycle_wait_decision(Some(OperationState::Running), 1_000, 1_500),
+        LifecycleWait::DeadlinePassed
+    );
+    // A renewal moved the deadline to 2000ms: keep waiting.
+    assert_eq!(
+        lifecycle_wait_decision(Some(OperationState::Running), 2_000, 1_500),
+        LifecycleWait::Continue
+    );
+    // The operation completes after the original deadline: terminal wins.
+    assert_eq!(
+        lifecycle_wait_decision(Some(OperationState::Succeeded), 2_000, 2_500),
+        LifecycleWait::Terminal(OperationState::Succeeded)
+    );
+    // A vanished operation record is reported immediately.
+    assert_eq!(
+        lifecycle_wait_decision(None, 2_000, 1_500),
+        LifecycleWait::RecordGone
+    );
+}
+
 /// The lease-renewal interval is derived from the Hub lease the agent
 /// receives in the registration response, so a short lease (the tests use two
 /// seconds) is renewed before it expires; the interval is clamped so reports
@@ -5846,6 +5876,44 @@ async fn stream_command_survives_its_original_deadline_when_renewed() {
     );
     assert_eq!(outcome.state, HubOperationState::Succeeded);
     let _ = cp.runtime_manager().stop_all().await;
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+}
+
+/// A terminal acknowledgement also stops JOB operations: they must not start
+/// next to a replacement the Hub may already have dispatched.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_acknowledgement_prevents_job_execution() {
+    let (hub_url, hub_cancel, hub_task) =
+        json_stub_hub(serde_json::json!({"state": "timed_out"})).await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let runtime = Arc::new(JobRuntime::default());
+    let cp = empty_control_plane();
+    let command = test_command(
+        "job_start",
+        "job-settled",
+        1,
+        None,
+        now_ms().saturating_add(60_000),
+    );
+    let outcome = execute_command(&client, &cp, &config, &auth, &command, &runtime, 2_000)
+        .await
+        .unwrap();
+    assert_eq!(outcome.state, HubOperationState::TimedOut);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("settled by the Hub before execution")),
+        "unexpected error: {:?}",
+        outcome.error
+    );
+    assert!(
+        runtime.tasks.lock().await.is_empty(),
+        "the Job operation must not start after a terminal acknowledgement"
+    );
     hub_cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
 }

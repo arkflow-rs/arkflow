@@ -196,6 +196,18 @@ pub(super) async fn execute_command(
             lease_ttl_ms,
             command.expires_at_ms,
         );
+        // Confirm the Hub still holds the command before starting the Job
+        // operation: if its lease sweep already settled it, a replacement may
+        // be running and this one must not start.
+        let mut confirmation = result.clone();
+        confirmation.state = HubOperationState::Running;
+        if !send_progress_report(client, config, auth, confirmation).await? {
+            result.state = HubOperationState::TimedOut;
+            result.progress = 100;
+            result.error = Some("command was settled by the Hub before execution".into());
+            result.failure_class = Some("temporary_execution".into());
+            return deliver_result(client, config, auth, result).await;
+        }
         let operation = execute_job_operation(command, config, job_runtime).await;
         if let Ok(Some(manifest_uri)) = &operation {
             result.checkpoint_manifest_uri = Some(manifest_uri.clone());
@@ -507,20 +519,19 @@ pub(super) async fn execute_command(
             }
             progress.mark_renewed(lease_ttl_ms, progress_interval);
             loop {
-                if let Some(current) = cp.operation(&operation.id).await {
-                    if matches!(
-                        current.state,
-                        OperationState::Succeeded
-                            | OperationState::Failed
-                            | OperationState::Cancelled
-                            | OperationState::TimedOut
-                    ) {
+                let current = cp.operation(&operation.id).await;
+                match lifecycle_wait_decision(
+                    current.as_ref().map(|record| record.state),
+                    progress.deadline_ms(),
+                    now_ms(),
+                ) {
+                    LifecycleWait::Terminal(state) => {
                         if let Some(action_id) = command.action_id.clone() {
                             cp.runtime_manager()
                                 .set_last_completed_action(&command.resource_id, action_id)
                                 .await;
                         }
-                        let state = match current.state {
+                        let state = match state {
                             OperationState::Succeeded => HubOperationState::Succeeded,
                             OperationState::Cancelled => HubOperationState::Cancelled,
                             OperationState::TimedOut => HubOperationState::TimedOut,
@@ -535,7 +546,7 @@ pub(super) async fn execute_command(
                                 operation_id: command.operation_id.clone(),
                                 state,
                                 progress: 100,
-                                error: current.error,
+                                error: current.and_then(|record| record.error),
                                 correlation_id: command.correlation_id.clone(),
                                 generation: command.generation,
                                 observed_generation: None,
@@ -556,68 +567,71 @@ pub(super) async fn execute_command(
                         )
                         .await;
                     }
-                } else {
-                    // The local operation record is gone (e.g. evicted from the bounded
-                    // operation store), so its outcome can no longer be observed. The
-                    // execution itself keeps running; report an ambiguous temporary
-                    // failure so the Hub settles the command through its retry path
-                    // instead of this watcher spinning forever.
-                    return deliver_result(
-                        client,
-                        config,
-                        auth,
-                        CommandResult {
-                            command_id: command.id.clone(),
-                            operation_id: command.operation_id.clone(),
-                            state: HubOperationState::Failed,
-                            progress: 100,
-                            error: Some(format!(
-                                "operation record {} is no longer observable on the agent",
-                                operation.id
-                            )),
-                            correlation_id: command.correlation_id.clone(),
-                            generation: command.generation,
-                            observed_generation: None,
-                            action_id: command.action_id.clone(),
-                            failure_class: Some("temporary_execution".into()),
-                            config_version_id: command.config_version_id.clone(),
-                            rollout_id: command.rollout_id.clone(),
-                            observed_checkpoint_id: None,
-                            checkpoint_manifest_uri: None,
-                            result: None,
-                        },
-                    )
-                    .await;
-                }
-                if command_expired(progress.deadline_ms(), now_ms()) {
-                    // The command deadline passed without a terminal observation; the
-                    // Hub has already stopped waiting for this command.
-                    return deliver_result(
-                client,
-                config,
-                auth,
-                CommandResult {
-                    command_id: command.id.clone(),
-                    operation_id: command.operation_id.clone(),
-                    state: HubOperationState::TimedOut,
-                    progress: 100,
-                    error: Some(
-                        "operation did not reach a terminal state before the command deadline"
-                            .into(),
-                    ),
-                    correlation_id: command.correlation_id.clone(),
-                    generation: command.generation,
-                    observed_generation: None,
-                    action_id: command.action_id.clone(),
-                    failure_class: Some("temporary_execution".into()),
-                    config_version_id: command.config_version_id.clone(),
-                    rollout_id: command.rollout_id.clone(),
-                    observed_checkpoint_id: None,
-                    checkpoint_manifest_uri: None,
-                    result: None,
-                },
-            )
-            .await;
+                    LifecycleWait::RecordGone => {
+                        // The local operation record is gone (e.g. evicted from
+                        // the bounded operation store), so its outcome can no
+                        // longer be observed. The execution itself keeps
+                        // running; report an ambiguous temporary failure so the
+                        // Hub settles the command through its retry path
+                        // instead of this watcher spinning forever.
+                        return deliver_result(
+                            client,
+                            config,
+                            auth,
+                            CommandResult {
+                                command_id: command.id.clone(),
+                                operation_id: command.operation_id.clone(),
+                                state: HubOperationState::Failed,
+                                progress: 100,
+                                error: Some(format!(
+                                    "operation record {} is no longer observable on the agent",
+                                    operation.id
+                                )),
+                                correlation_id: command.correlation_id.clone(),
+                                generation: command.generation,
+                                observed_generation: None,
+                                action_id: command.action_id.clone(),
+                                failure_class: Some("temporary_execution".into()),
+                                config_version_id: command.config_version_id.clone(),
+                                rollout_id: command.rollout_id.clone(),
+                                observed_checkpoint_id: None,
+                                checkpoint_manifest_uri: None,
+                                result: None,
+                            },
+                        )
+                        .await;
+                    }
+                    LifecycleWait::DeadlinePassed => {
+                        // The (renewed) command deadline passed without a
+                        // terminal observation; the Hub has stopped waiting.
+                        return deliver_result(
+                            client,
+                            config,
+                            auth,
+                            CommandResult {
+                                command_id: command.id.clone(),
+                                operation_id: command.operation_id.clone(),
+                                state: HubOperationState::TimedOut,
+                                progress: 100,
+                                error: Some(
+                                    "operation did not reach a terminal state before the command deadline"
+                                        .into(),
+                                ),
+                                correlation_id: command.correlation_id.clone(),
+                                generation: command.generation,
+                                observed_generation: None,
+                                action_id: command.action_id.clone(),
+                                failure_class: Some("temporary_execution".into()),
+                                config_version_id: command.config_version_id.clone(),
+                                rollout_id: command.rollout_id.clone(),
+                                observed_checkpoint_id: None,
+                                checkpoint_manifest_uri: None,
+                                result: None,
+                            },
+                        )
+                        .await;
+                    }
+                    LifecycleWait::Continue => {}
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -633,6 +647,40 @@ pub(super) async fn execute_command(
         | AgentOperation::JobSavepoint
         | AgentOperation::JobCheckpointCommit
         | AgentOperation::JobSavepointCommit => unreachable!("job-plane commands dispatch above"),
+    }
+}
+
+/// One lifecycle-watcher iteration's decision, factored out so the "the
+/// operation is still running when the deadline passes" behavior can be
+/// unit-tested with a fixed clock.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LifecycleWait {
+    Terminal(OperationState),
+    RecordGone,
+    DeadlinePassed,
+    Continue,
+}
+
+pub(super) fn lifecycle_wait_decision(
+    current: Option<OperationState>,
+    deadline_ms: u64,
+    now_ms: u64,
+) -> LifecycleWait {
+    match current {
+        Some(state)
+            if matches!(
+                state,
+                OperationState::Succeeded
+                    | OperationState::Failed
+                    | OperationState::Cancelled
+                    | OperationState::TimedOut
+            ) =>
+        {
+            LifecycleWait::Terminal(state)
+        }
+        None => LifecycleWait::RecordGone,
+        Some(_) if command_expired(deadline_ms, now_ms) => LifecycleWait::DeadlinePassed,
+        Some(_) => LifecycleWait::Continue,
     }
 }
 
