@@ -1043,6 +1043,30 @@ fn segment_index(name: &str) -> u64 {
 /// publication order keeps matching sequence order. Entries lost on a crash
 /// while parked were never acknowledged (the gate never advanced past them),
 /// so the source replays them.
+/// Move the active segment's bytes into a sealed batch, resetting the active
+/// buffer. `None` when the segment holds no entries.
+///
+/// The normal seal path rotates this way before the PUT; the failed-retry
+/// path also rotates, so the active buffer keeps its configured threshold
+/// instead of growing for as long as the backend stays unavailable.
+fn take_active_segment(active: &mut ActiveSegment) -> Option<SealedBatch> {
+    if active.entries == 0 {
+        return None;
+    }
+    let batch = SealedBatch {
+        bytes: std::mem::take(&mut active.bytes),
+        first_seq: active.first_seq,
+        last_seq: active.last_seq,
+        next_index: active.next_index,
+        entries: active.entries,
+    };
+    active.first_seq = 0;
+    active.last_seq = 0;
+    active.entries = 0;
+    active.next_index += 1;
+    Some(batch)
+}
+
 async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
     // One seal at a time: the order of publication must match sequence
     // order for the acknowledgement gate to stay sound.
@@ -1056,35 +1080,30 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
         };
         if let Err(e) = publish_sealed_segment(store, &batch).await {
             store.pending_seal.lock().unwrap().push_front(batch);
+            // This attempt returns before the normal rotation. Park the
+            // active bytes behind the failed segment (push_back preserves
+            // publication order) so `append_batch` cannot grow the active
+            // buffer past the configured thresholds while the PUT keeps
+            // failing.
+            let rotated = {
+                let mut active = store.active.lock().unwrap();
+                take_active_segment(&mut active)
+            };
+            if let Some(rotated) = rotated {
+                store.pending_seal.lock().unwrap().push_back(rotated);
+            }
             return Err(e);
         }
     }
 
     // Move the bytes out of the active lock so the encode + PUT doesn't
     // hold the lock across the network call.
-    let (sealed_bytes, first_seq, last_seq, next_index, entry_count) = {
+    let batch = {
         let mut active = store.active.lock().unwrap();
-        if active.entries == 0 {
+        let Some(batch) = take_active_segment(&mut active) else {
             return Ok(());
-        }
-        let bytes = std::mem::take(&mut active.bytes);
-        let first = active.first_seq;
-        let last = active.last_seq;
-        let idx = active.next_index;
-        let count = active.entries;
-        active.first_seq = 0;
-        active.last_seq = 0;
-        active.entries = 0;
-        active.next_index += 1;
-        (bytes, first, last, idx, count)
-    };
-
-    let batch = SealedBatch {
-        bytes: sealed_bytes,
-        first_seq,
-        last_seq,
-        next_index,
-        entries: entry_count,
+        };
+        batch
     };
     if let Err(e) = publish_sealed_segment(store, &batch).await {
         // Park for the next seal attempt (see the function doc). Appends
@@ -2594,6 +2613,55 @@ mod tests {
             active.next_index, 6,
             "active's next index moved past the parked batch"
         );
+    }
+
+    /// A failed retry of an already-parked segment returns before the normal
+    /// rotation, so the active bytes must be parked behind it: otherwise
+    /// `append_batch` keeps growing the active buffer for as long as the
+    /// backend stays unavailable.
+    #[test]
+    fn failed_parked_retry_rotates_the_active_segment() {
+        let store = build_failing_store();
+        // One segment already parked by an earlier failed PUT.
+        store.pending_seal.lock().unwrap().push_back(SealedBatch {
+            bytes: vec![1, 2, 3],
+            first_seq: 1,
+            last_seq: 2,
+            next_index: 4,
+            entries: 2,
+        });
+        // Entries appended while the backend was down sit in `active`.
+        {
+            let mut active = store.active.lock().unwrap();
+            active.first_seq = 3;
+            active.last_seq = 3;
+            active.entries = 1;
+            active.bytes = vec![4, 5];
+            active.next_index = 5;
+        }
+        let inner = store.clone();
+        let result = store
+            .rt()
+            .block_on(async move { seal_active_segment(&inner).await });
+        assert!(result.is_err(), "the parked retry still fails");
+
+        let pending = store.pending_seal.lock().unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "the active segment is parked behind the failed one"
+        );
+        assert_eq!(pending[0].next_index, 4, "the failed segment keeps order");
+        assert_eq!(
+            pending[1].next_index, 5,
+            "the active bytes rotate into a new parked batch"
+        );
+        assert_eq!(pending[1].first_seq, 3);
+        drop(pending);
+
+        let active = store.active.lock().unwrap();
+        assert_eq!(active.entries, 0, "active is bounded, not left growing");
+        assert_eq!(active.next_index, 6);
     }
 
     /// Seal gating (`fix-object-store-wal-loss-window` task 1.2): the sealed
