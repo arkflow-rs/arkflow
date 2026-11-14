@@ -1,4 +1,3 @@
-import { useEffect } from 'react'
 import { useSearchParams } from 'react-router'
 import { errorMessage } from '../api'
 import { useT } from '../i18n'
@@ -29,16 +28,10 @@ export function Events() {
   const total = eventsQuery.data?.total
   const pages = Math.max(1, Math.ceil((total ?? 0) / pageSize))
   const hasFilter = Boolean(eventType || streamId || correlationId)
-
-  // A retained/old link may name a page beyond the result set; clamp it so
-  // the user is never stranded on an empty table.
-  useEffect(() => {
-    if (total !== undefined && page > pages) {
-      const next = new URLSearchParams(searchParams)
-      next.set('page', String(pages))
-      setSearchParams(next, { replace: true })
-    }
-  }, [page, pages, total, searchParams, setSearchParams])
+  // An old link may name a page beyond the result set. Do not navigate from
+  // an effect (it can unmount a control the user is about to click); render
+  // the effective last page instead.
+  const displayPage = Math.min(page, pages)
 
   const setParam = (key: string, value: string) => {
     const next = new URLSearchParams(searchParams)
@@ -118,7 +111,11 @@ export function Events() {
           )}
         </p>
       )}
-      <Pagination page={page} pages={pages} onChange={(next) => setParam('page', String(next))} />
+      <Pagination
+        page={displayPage}
+        pages={pages}
+        onChange={(next) => setParam('page', String(next))}
+      />
     </section>
   )
 }

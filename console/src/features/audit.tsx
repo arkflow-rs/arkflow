@@ -34,13 +34,9 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
     if (auditQuery.isError) onError(errorMessage(auditQuery.error))
   }, [auditQuery.isError, auditQuery.error, onError])
 
-  useEffect(() => {
-    if (total !== undefined && page > pages) {
-      const next = new URLSearchParams(searchParams)
-      next.set('page', String(pages))
-      setSearchParams(next, { replace: true })
-    }
-  }, [page, pages, total, searchParams, setSearchParams])
+  // Render the effective last page for an out-of-range link instead of
+  // navigating from an effect.
+  const displayPage = Math.min(page, pages)
 
   const setParam = (key: string, value: string) => {
     const next = new URLSearchParams(searchParams)
@@ -103,7 +99,11 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
           )}
         </p>
       )}
-      <Pagination page={page} pages={pages} onChange={(next) => setParam('page', String(next))} />
+      <Pagination
+        page={displayPage}
+        pages={pages}
+        onChange={(next) => setParam('page', String(next))}
+      />
     </section>
   )
 }
