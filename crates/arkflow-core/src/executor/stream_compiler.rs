@@ -61,6 +61,15 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         )
     });
     let requested_parallelism = stream.pipeline.thread_num.max(1);
+    // The worker pool allocates channel capacity, task handles, and spawned
+    // workers from this value; an absurd configuration must fail validation
+    // instead of exhausting memory at start.
+    if requested_parallelism > 1024 {
+        return Err(Error::Config(format!(
+            "stream '{stream_id}' pipeline.thread_num is {requested_parallelism}; the maximum \
+             supported processor parallelism is 1024"
+        )));
+    }
     let chain_parallelism = if window_buffered && requested_parallelism > 1 {
         if requested_parallelism == crate::pipeline::default_thread_num() {
             1

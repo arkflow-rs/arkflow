@@ -7200,9 +7200,9 @@ async fn a_panic_inside_a_close_path_fails_the_chain_task() {
         .unwrap();
     let result = run_graph(graph, CancellationToken::new()).await;
     let message = result.unwrap_err().to_string();
-    // The panic escaped the event loop's catch_unwind (it fired in the close
-    // path), so the join error surfaces as a chain task panic.
-    assert!(message.contains("chain task panicked"), "{message}");
+    // The close path is guarded: the panic fails the chain with the
+    // component/panic named, while the remaining close paths still run.
+    assert!(message.contains("processor close panicked"), "{message}");
 }
 
 #[tokio::test]

@@ -24,6 +24,33 @@ pub async fn migrate_sqlite_to_postgres(
     sqlite_path: impl AsRef<std::path::Path>,
     postgres_url: &str,
 ) -> Result<MigrationReport, StorageError> {
+    let path = sqlite_path.as_ref();
+    // Opening a missing SQLite path creates an empty database, and copying
+    // zero rows from it would report a successful migration. Verify the
+    // source (and its control-plane schema) before touching the target.
+    if !path.is_file() {
+        return Err(StorageError::Encoding(format!(
+            "migration source does not exist: {}",
+            path.display()
+        )));
+    }
+    {
+        let probe = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let has_schema: i64 = probe.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cp_nodes'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_schema == 0 {
+            return Err(StorageError::Encoding(format!(
+                "migration source is not an arkflow control-plane SQLite database: {}",
+                path.display()
+            )));
+        }
+    }
     let source = SqliteBackend::open(sqlite_path)?;
     let target = PostgresBackend::open(postgres_url).await?;
     copy_sqlite_to_postgres(&source, target.pool()).await

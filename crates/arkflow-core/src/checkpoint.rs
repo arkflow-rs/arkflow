@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// Distinguishes concurrent temp files for the same key inside one process.
+static CHECKPOINT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePosition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,7 +207,11 @@ impl CheckpointStore for FileCheckpointStore {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| Error::Config("invalid checkpoint store key".into()))?;
-        let temp_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+        let temp_path = path.with_file_name(format!(
+            ".{file_name}.tmp-{}-{}",
+            std::process::id(),
+            CHECKPOINT_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let write_atomic = || -> Result<(), Error> {
             use std::io::Write;
             let mut file = std::fs::File::create(&temp_path)
@@ -215,10 +223,18 @@ impl CheckpointStore for FileCheckpointStore {
             drop(file);
             std::fs::rename(&temp_path, &path)
                 .map_err(|error| Error::Process(format!("publish checkpoint object: {error}")))?;
-            if let Some(parent) = path.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
+            // Make the rename itself durable before retention is allowed to
+            // delete the predecessor (a non-durable rename loses both).
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                let dir = std::fs::File::open(parent).map_err(|error| {
+                    Error::Process(format!("open checkpoint directory for sync: {error}"))
+                })?;
+                dir.sync_all().map_err(|error| {
+                    Error::Process(format!("sync checkpoint directory: {error}"))
+                })?;
             }
             Ok(())
         };

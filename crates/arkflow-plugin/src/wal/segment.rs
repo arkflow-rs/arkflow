@@ -105,6 +105,7 @@ fn decode_raw(bytes: &[u8]) -> Result<DecodedSegment, Error> {
     let mut entries = Vec::new();
     let mut pos = 0usize;
     let mut last_good = 0usize;
+    let mut last_seq: Option<u64> = None;
 
     while pos < bytes.len() {
         // Header: 8 bytes seq + 4 bytes len = 12 bytes minimum.
@@ -115,6 +116,14 @@ fn decode_raw(bytes: &[u8]) -> Result<DecodedSegment, Error> {
         let mut seq_buf = [0u8; 8];
         seq_buf.copy_from_slice(&bytes[pos..pos + 8]);
         let seq = u64::from_be_bytes(seq_buf);
+        // Sequence numbers are not covered by the payload CRC but drive the
+        // replay cursor and next-sequence recovery. A decoded sequence must
+        // strictly increase; a regression/duplicate is treated as a torn tail
+        // rather than trusting corrupt metadata.
+        if last_seq.is_some_and(|previous| seq <= previous) {
+            break;
+        }
+        last_seq = Some(seq);
         let mut len_buf = [0u8; 4];
         len_buf.copy_from_slice(&bytes[pos + 8..pos + 12]);
         let len = u32::from_be_bytes(len_buf) as usize;

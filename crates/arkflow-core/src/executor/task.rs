@@ -53,6 +53,10 @@ const MAX_UNPUBLISHED_DELIVERIES: u64 = 64;
 /// whose consumer already stopped.
 const COLLECTOR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Upper bound on one component close. A hung connector must not prevent the
+/// remaining processor/sink/source close paths from running.
+const COMPONENT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Bound on one sink write: a hung external system fails the chain (and
 /// thereby unblocks shutdown) instead of parking the loop body forever.
 /// Generous for legitimately slow bulk uploads — this catches dead
@@ -329,8 +333,12 @@ async fn run_graph_inner_instrumented(
                 let watcher_token = token.clone();
                 let watcher = tokio::spawn(async move {
                     if let Ok(error) = edge_failures.recv_async().await {
-                        watcher_token.cancel();
+                        // Publish the cause BEFORE cancelling: a chain that
+                        // finishes its cleanup between the two steps would
+                        // otherwise observe an empty `failure_rx` and report
+                        // success, losing the remote-edge error.
                         let _ = failure_tx.send(error);
+                        watcher_token.cancel();
                     }
                 });
                 let result = run_chain(chain, hook, token).await;
@@ -414,26 +422,63 @@ async fn run_chain(
     // failure observable while still attempting every remaining component.
     let mut close_error = None;
     for processor in &chain.processors {
-        if let Err(error) = processor.close().await {
-            tracing::warn!(%error, task = chain.entry_task_id(), "failed to close chain processor");
+        if let Some(error) =
+            close_chain_component(chain.entry_task_id(), "processor", processor.close()).await
+        {
             close_error.get_or_insert(error);
         }
     }
     if let Some(sink) = &chain.sink {
-        if let Err(error) = sink.close().await {
-            tracing::warn!(%error, task = chain.entry_task_id(), "failed to close chain sink");
+        if let Some(error) =
+            close_chain_component(chain.entry_task_id(), "sink", sink.close()).await
+        {
             close_error.get_or_insert(error);
         }
     }
     if let Some(source) = &chain.source {
-        if let Err(error) = source.close().await {
-            tracing::warn!(%error, task = chain.entry_task_id(), "failed to close chain source");
+        if let Some(error) =
+            close_chain_component(chain.entry_task_id(), "source", source.close()).await
+        {
             close_error.get_or_insert(error);
         }
     }
     match result {
         Err(error) => Err(error),
         Ok(()) => close_error.map_or(Ok(()), Err),
+    }
+}
+
+/// Close one owned component with a panic and a hang boundary. A panicking
+/// or wedged close must not skip the other components' explicit close paths
+/// after the job-level resource guard has already handed them over.
+async fn close_chain_component<F>(chain_id: &str, what: &'static str, close: F) -> Option<Error>
+where
+    F: std::future::Future<Output = Result<(), Error>>,
+{
+    match tokio::time::timeout(
+        COMPONENT_CLOSE_TIMEOUT,
+        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(close)),
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, task = chain_id, what, "failed to close chain component");
+            Some(error)
+        }
+        Ok(Err(panic)) => {
+            let error = Error::Process(format!("{what} close panicked: {}", panic_payload(&panic)));
+            tracing::warn!(%error, task = chain_id, what, "chain component close panicked");
+            Some(error)
+        }
+        Err(_) => {
+            let error = Error::Process(format!(
+                "{what} close exceeded {}s",
+                COMPONENT_CLOSE_TIMEOUT.as_secs()
+            ));
+            tracing::warn!(%error, task = chain_id, what, "chain component close timed out");
+            Some(error)
+        }
     }
 }
 

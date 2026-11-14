@@ -203,9 +203,17 @@ impl EdgeTransport for TcpEdgeTransport {
         let max_attempts = self.max_attempts.max(1);
         let mut last_error = None;
         for attempt in 0..max_attempts {
-            let stream = match tokio::net::TcpStream::connect(self.addr).await {
-                Ok(stream) => stream,
-                Err(error) => {
+            // Bound one TCP establishment attempt: a peer that accepts the
+            // SYN but never completes the handshake must not hold an edge
+            // unready for the whole retry budget.
+            let stream = match tokio::time::timeout(
+                EDGE_CONNECT_TIMEOUT,
+                tokio::net::TcpStream::connect(self.addr),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
                     let backoff = connect_backoff(attempt);
                     tracing::warn!(
                         "remote edge connect to {} failed (attempt {}/{}): {error}; retrying in {backoff:?}",
@@ -217,24 +225,58 @@ impl EdgeTransport for TcpEdgeTransport {
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
+                Err(_) => {
+                    let backoff = connect_backoff(attempt);
+                    tracing::warn!(
+                        "remote edge connect to {} timed out after {:?} (attempt {}/{}); retrying in {backoff:?}",
+                        self.addr,
+                        EDGE_CONNECT_TIMEOUT,
+                        attempt + 1,
+                        max_attempts
+                    );
+                    last_error = Some(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "remote edge TCP connect timed out",
+                    ));
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
             };
             let _ = stream.set_nodelay(true);
             let stream = match &self.tls {
-                Some(tls) => match tls.connect(stream).await {
-                    Ok(tls_stream) => Box::new(tls_stream) as Box<dyn RemoteStream>,
-                    Err(error) => {
-                        let backoff = connect_backoff(attempt);
-                        tracing::warn!(
+                Some(tls) => {
+                    match tokio::time::timeout(EDGE_CONNECT_TIMEOUT, tls.connect(stream)).await {
+                        Ok(Ok(tls_stream)) => Box::new(tls_stream) as Box<dyn RemoteStream>,
+                        Ok(Err(error)) => {
+                            let backoff = connect_backoff(attempt);
+                            tracing::warn!(
                             "remote edge TLS connect to {} failed (attempt {}/{}): {error}; retrying in {backoff:?}",
                             self.addr,
                             attempt + 1,
                             max_attempts
                         );
-                        last_error = Some(std::io::Error::other(error.to_string()));
-                        tokio::time::sleep(backoff).await;
-                        continue;
+                            last_error = Some(std::io::Error::other(error.to_string()));
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            let backoff = connect_backoff(attempt);
+                            tracing::warn!(
+                            "remote edge TLS handshake to {} timed out after {:?} (attempt {}/{}); retrying in {backoff:?}",
+                            self.addr,
+                            EDGE_CONNECT_TIMEOUT,
+                            attempt + 1,
+                            max_attempts
+                        );
+                            last_error = Some(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "remote edge TLS handshake timed out",
+                            ));
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
                     }
-                },
+                }
                 None => Box::new(stream) as Box<dyn RemoteStream>,
             };
             return Ok(stream);
@@ -261,6 +303,11 @@ impl TcpEdgeTransport {
         }
     }
 }
+
+/// Bound on one TCP connect / TLS handshake attempt. `max_attempts` counts
+/// retries, so without this a peer that accepts the socket but stalls the
+/// handshake could hold an edge unready indefinitely.
+const EDGE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) fn connect_backoff(attempt: usize) -> std::time::Duration {
     // Grows with the attempt count, capped well below a checkpoint timeout so

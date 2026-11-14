@@ -744,6 +744,33 @@ impl StateBackend for RedbStateBackend {
                 .map(|value| decode_value(value.value()))
                 .transpose()?;
             let (bytes, had_live) = Self::previous_row(&previous, now_ms());
+            // A compensating restore must obey the same byte budget as a
+            // normal write; otherwise an undo can push the state past the
+            // configured maximum and later writes reject every increase.
+            if had_live {
+                if let Some(max_bytes) = self.max_bytes {
+                    let projected = self
+                        .bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(bytes)
+                        .saturating_add(entry.value.len() as u64);
+                    if projected > max_bytes {
+                        return Err(Error::Process(format!(
+                            "state restore exceeds the configured byte budget ({projected} > {max_bytes})"
+                        )));
+                    }
+                }
+            } else if let Some(max_bytes) = self.max_bytes {
+                let projected = self
+                    .bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(entry.value.len() as u64);
+                if projected > max_bytes {
+                    return Err(Error::Process(format!(
+                        "state restore exceeds the configured byte budget ({projected} > {max_bytes})"
+                    )));
+                }
+            }
             table
                 .insert(storage_key.as_str(), encoded.as_slice())
                 .map_err(|error| Error::Process(format!("state restore: {error}")))?;

@@ -154,7 +154,14 @@ impl CheckpointStore for SharedCheckpointStore {
     fn delete(&self, key: &str) -> Result<(), arkflow_core::Error> {
         let path = self.path_for(key)?;
         let client = self.client.clone();
-        self.block_on(async move { client.delete(&path).await })
+        self.block_on(async move {
+            match client.delete(&path).await {
+                // Deleting a key that is already gone is success: a retry
+                // after a partial delete must be able to finish the rest.
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(error) => Err(error),
+            }
+        })
     }
 }
 

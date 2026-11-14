@@ -101,7 +101,7 @@ impl AggregateBuffer {
         let self_updated = self.updated_since_emit;
         let other_emitted = other.emitted;
         self.count += other.count;
-        self.sum_i64 = self.sum_i64.wrapping_add(other.sum_i64);
+        self.sum_i64 = self.sum_i64.saturating_add(other.sum_i64);
         self.sum_float += other.sum_float;
         // Combine each representation only over the sides that actually
         // observed values: an all-float buffer's untouched integer min/max
@@ -166,7 +166,9 @@ impl AggregateBuffer {
             self.min_i64 = self.min_i64.min(value);
             self.max_i64 = self.max_i64.max(value);
         }
-        self.sum_i64 = self.sum_i64.wrapping_add(value);
+        // Int64 SUM saturates rather than wrapping: a negative sum is never
+        // a correct answer for an overflowing positive aggregate.
+        self.sum_i64 = self.sum_i64.saturating_add(value);
         self.int_observations = self.int_observations.saturating_add(1);
         self.count += 1;
         self.updated_since_emit = self.emitted;
@@ -181,6 +183,12 @@ impl AggregateBuffer {
     /// Float32 aggregates. Float min/max seed from the first FLOAT value —
     /// integer observations share neither representation nor sentinel.
     pub fn observe_float(&mut self, value: f64, kind: NumericKind) {
+        // JSON persistence cannot represent NaN/Infinity; a non-finite value
+        // used to serialize as null and poison the restored aggregate. It is
+        // not a meaningful sum/min/max input, so it is ignored.
+        if !value.is_finite() {
+            return;
+        }
         if self.float_observations == 0 {
             self.min_float = value;
             self.max_float = value;
@@ -455,7 +463,7 @@ pub(crate) fn decode_buffer_unchecked(bytes: &[u8]) -> Result<AggregateBuffer, E
     // Pre-IPC kernel state: one-row Arrow stream with the legacy columns.
     if let Ok(mut reader) = StreamReader::try_new(Cursor::new(bytes), None) {
         if let Some(Ok(batch)) = reader.next() {
-            if batch.num_rows() == 1 {
+            if batch.num_rows() == 1 && batch.num_columns() >= 5 {
                 let value = |index: usize| batch.column(index).clone();
                 let count = value(0)
                     .as_any()
