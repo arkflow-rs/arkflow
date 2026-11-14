@@ -234,8 +234,10 @@ impl Output for PulsarOutput {
         // lock is released before any wait. The producer uses blocking
         // admission (`block_queue_if_full`), so enqueueing past its pending
         // queue waits for the sender task instead of failing the batch with
-        // `SlowDown`; both phases share the same bounded window.
-        let receipts = tokio::time::timeout(WRITE_RECEIPT_TIMEOUT, async {
+        // `SlowDown`. ONE deadline covers both phases: a separate full window
+        // for each would let one write consume ~2× the budget.
+        let deadline = tokio::time::Instant::now() + WRITE_RECEIPT_TIMEOUT;
+        let receipts = tokio::time::timeout_at(deadline, async {
             let mut receipts = Vec::with_capacity(owned_payloads.len());
             for (index, payload) in owned_payloads.into_iter().enumerate() {
                 let topic = match &topics {
@@ -271,7 +273,7 @@ impl Output for PulsarOutput {
                     ))
                 })
             }));
-        tokio::time::timeout(WRITE_RECEIPT_TIMEOUT, waits)
+        tokio::time::timeout_at(deadline, waits)
             .await
             .map_err(|_| {
                 Error::Connection("Timed out waiting for Pulsar receipts for the batch".to_string())
