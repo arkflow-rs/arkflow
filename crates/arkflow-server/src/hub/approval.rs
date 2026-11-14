@@ -56,19 +56,20 @@ impl Hub {
         {
             return Err(HubError::Invalid("configuration version not found".into()));
         }
-        let registered = self.nodes().await;
-        let known: std::collections::BTreeSet<String> =
-            registered.into_iter().map(|node| node.id).collect();
-        let unknown: Vec<String> = node_ids
-            .iter()
-            .filter(|id| !known.contains(*id))
-            .cloned()
-            .collect();
-        if !unknown.is_empty() {
-            return Err(HubError::Invalid(format!(
-                "approval request targets unknown node(s): {}",
-                unknown.join(", ")
-            )));
+        // Match direct rollout creation: reject empty/duplicate target lists
+        // but do not require the node to be re-registered in this process.
+        // Label resolution reads durable labels, so a Hub restart legitimately
+        // produces targets that have not re-registered yet.
+        if node_ids.is_empty() {
+            return Err(HubError::Invalid(
+                "approval request requires at least one target node".into(),
+            ));
+        }
+        let unique: std::collections::BTreeSet<&String> = node_ids.iter().collect();
+        if unique.len() != node_ids.len() {
+            return Err(HubError::Invalid(
+                "approval request targets contain duplicate node ids".into(),
+            ));
         }
         let now = now_ms();
         let request = ConfigApprovalRequest {
@@ -262,24 +263,36 @@ impl Hub {
                 {
                     Ok(rollout) => rollout,
                     Err(error) => {
-                        // Roll the reservation back: the request stays
-                        // decidable, the failure reason is recorded.
-                        let _ = storage
-                            .reset_config_approval_request(
-                                request_id,
-                                &format!("rollout creation failed: {error}"),
-                                now_ms(),
+                        // Rollout creation can fail AFTER the rollout and its
+                        // targets were persisted (e.g. the audit write). Do
+                        // not reset the approval to pending in that case:
+                        // periodic recovery only adopts `approving` rows, so
+                        // the already-created rollout would never be linked.
+                        if let Ok(Some(existing)) = storage
+                            .find_rollout_by_correlation(&request.correlation_id)
+                            .await
+                        {
+                            existing
+                        } else {
+                            // Roll the reservation back: the request stays
+                            // decidable, the failure reason is recorded.
+                            let _ = storage
+                                .reset_config_approval_request(
+                                    request_id,
+                                    &format!("rollout creation failed: {error}"),
+                                    now_ms(),
+                                )
+                                .await;
+                            self.record_approval_audit(
+                                "config_approval.approve",
+                                &request,
+                                &approver_id,
+                                note.as_deref(),
+                                "failed",
                             )
-                            .await;
-                        self.record_approval_audit(
-                            "config_approval.approve",
-                            &request,
-                            &approver_id,
-                            note.as_deref(),
-                            "failed",
-                        )
-                        .await?;
-                        return Err(error);
+                            .await?;
+                            return Err(error);
+                        }
                     }
                 }
             }

@@ -1084,11 +1084,11 @@ pub async fn serve_hub(
     let listener = TcpListener::bind(address).await?;
     // Lease election loop: leaders renew at ttl/3, standbys probe for
     // takeover. Failover is bounded by the lease TTL plus one probe.
-    if hub.ha_config().enabled {
+    let election_task = if hub.ha_config().enabled {
         let election_hub = hub.clone();
         let election_cancel = cancellation.clone();
         let probe_ms = (hub.ha_config().lease_ttl_ms / 3).max(1_000);
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(probe_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -1097,8 +1097,10 @@ pub async fn serve_hub(
                     _ = election_cancel.cancelled() => break,
                 }
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
     let sweep_hub = hub.clone();
     let sweep_cancel = cancellation.clone();
     let sweep_task = tokio::spawn(async move {
@@ -1225,25 +1227,30 @@ pub async fn serve_hub(
         webhook_hub.run_webhook_forwarder(webhook_cancel).await;
     });
     let _ = &webhook_task;
+    // Stop the election loop BEFORE releasing the lease: an in-flight tick
+    // could otherwise re-acquire the lease after the release and leave a
+    // shutting-down Hub as leader.
+    let mut election_task = election_task;
+    let shutdown_hub = hub.clone();
+    let shutdown_cancel = cancellation.clone();
+    let shutdown = async move {
+        shutdown_cancel.cancelled().await;
+        if let Some(task) = election_task.take() {
+            let _ = task.await;
+        }
+        shutdown_hub.release_leadership().await;
+    };
     let router = hub_router(hub.clone(), &config).into_make_service();
     let result = match tls_acceptor {
         Some(acceptor) => {
             let tls_listener = HubTlsListener::spawn(listener, acceptor)?;
             axum::serve(tls_listener, router)
-                .with_graceful_shutdown(async move {
-                    cancellation.cancelled().await;
-                    hub.release_leadership().await;
-                })
+                .with_graceful_shutdown(shutdown)
                 .await
         }
         None => {
             axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    cancellation.cancelled().await;
-                    // Release the lease before the listener drains so a standby can
-                    // take over immediately instead of waiting out the TTL.
-                    hub.release_leadership().await;
-                })
+                .with_graceful_shutdown(shutdown)
                 .await
         }
     };

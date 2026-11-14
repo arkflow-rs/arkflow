@@ -619,11 +619,19 @@ pub async fn backup_postgres_to_sqlite(
             }
             Ok(())
         })?;
+        // Verify the SNAPSHOT's row count, not the source's: comparing two
+        // reads of the same PostgreSQL transaction cannot detect a target
+        // insert that was skipped.
+        let snapshot_count = snapshot.with_connection(|connection| {
+            connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })?;
         verify_count(
             &mut report,
             table,
             rows.len(),
-            pg_count(&mut *tx, table).await?,
+            usize::try_from(snapshot_count).unwrap_or_default(),
         )?;
     }
     drop(tx);
@@ -660,6 +668,9 @@ pub async fn restore_sqlite_target(
         if !non_empty.is_empty() {
             return Err(StorageError::NonEmptyTarget { tables: non_empty });
         }
+        // cp_sessions is deliberately excluded from the business-table empty
+        // check; a leftover session row would be resurrected by the restore.
+        connection.execute("DELETE FROM cp_sessions", [])?;
         let mut report = CopyReport::default();
         for (table, columns, rows) in &tables {
             for chunk in rows.chunks(CHUNK) {
@@ -705,6 +716,11 @@ pub async fn restore_postgres_target(
     if !non_empty.is_empty() {
         return Err(StorageError::NonEmptyTarget { tables: non_empty });
     }
+    // Sessions are outside TABLE_ORDER; clear any leftover rows so a restore
+    // cannot resurrect pre-restore browser sessions.
+    sqlx::query("DELETE FROM cp_sessions")
+        .execute(&mut *tx)
+        .await?;
     let mut report = CopyReport::default();
     for table in TABLE_ORDER {
         let (columns, rows) = read_sqlite_table_ordered(source, table)?;

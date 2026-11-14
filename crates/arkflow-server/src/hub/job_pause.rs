@@ -581,6 +581,7 @@ impl Hub {
         let update = JobPauseUpdate {
             expected_generation: job.generation,
             expected_phase: Some(PAUSE_CAPTURING.into()),
+            expected_retry_count: Some(job.pause_retry_count),
             artifact_id: Some(artifact_id.clone()),
             retry_count: Some(job.pause_retry_count.saturating_add(1)),
             ..JobPauseUpdate::default()

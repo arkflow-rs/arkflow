@@ -2684,7 +2684,8 @@ impl SqliteBackend {
                     last_error = COALESCE(?13, last_error), \
                     requested_by = COALESCE(?17, requested_by), \
                     updated_at_ms = ?14 \
-                 WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS ?16",
+                 WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS ?16 \
+                   AND (?18 IS NULL OR pause_retry_count = ?18)",
                 rusqlite::params![
                     job_id,
                     update.desired_state,
@@ -2703,6 +2704,7 @@ impl SqliteBackend {
                     update.expected_generation,
                     update.expected_phase,
                     update.requested_by,
+                    update.expected_retry_count,
                 ],
             )?;
             if changed == 0 {
@@ -3491,6 +3493,16 @@ impl SqliteBackend {
         revoked_at_ms: u64,
     ) -> Result<bool, StorageError> {
         self.immediate_transaction(|connection| {
+            // Revoke the previous credential conditionally FIRST. The old
+            // read-then-insert let two concurrent rotations both see an
+            // active credential and issue two valid replacements.
+            let changed = connection.execute(
+                "UPDATE cp_credentials SET revoked_at_ms = ?2 WHERE credential_id = ?1 AND revoked_at_ms IS NULL",
+                rusqlite::params![previous_credential_id, revoked_at_ms],
+            )?;
+            if changed != 1 {
+                return Ok(false);
+            }
             connection.execute(
                 "INSERT INTO cp_credentials (credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
@@ -3504,11 +3516,7 @@ impl SqliteBackend {
                     record.revoked_at_ms,
                 ],
             )?;
-            let changed = connection.execute(
-                "UPDATE cp_credentials SET revoked_at_ms = COALESCE(revoked_at_ms, ?2) WHERE credential_id = ?1",
-                rusqlite::params![previous_credential_id, revoked_at_ms],
-            )?;
-            Ok(changed > 0)
+            Ok(true)
         })
     }
 

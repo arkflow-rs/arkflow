@@ -1056,8 +1056,7 @@ impl StorageBackend for PostgresBackend {
             // Duplicate terminal reports must not repeat the accounting.
             if attempt_updated == 0 {
                 return Ok(());
-            }
-            if terminal {
+            }            if terminal {
                 match failure_class {
                     Some("temporary_execution") | Some("transport") | Some("node_unavailable") => {
                         let retry_at = now_ms() + 1_000;
@@ -2627,7 +2626,8 @@ impl StorageBackend for PostgresBackend {
                     last_error = COALESCE(?13, last_error), \
                     requested_by = COALESCE(?17, requested_by), \
                     updated_at_ms = ?14 \
-                 WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS NOT DISTINCT FROM ?16",
+                 WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS NOT DISTINCT FROM ?16 \
+                   AND (?18 IS NULL OR pause_retry_count = ?18)",
                 binds![
                     job_id,
                     update.desired_state,
@@ -2646,6 +2646,7 @@ impl StorageBackend for PostgresBackend {
                     update.expected_generation,
                     update.expected_phase,
                     update.requested_by,
+                    update.expected_retry_count,
                 ],
             ).await?;
             if changed == 0 {
@@ -2884,6 +2885,17 @@ impl StorageBackend for PostgresBackend {
     ) -> Result<bool, StorageError> {
         let mut transaction = self.begin().await?;
         let __ret = async {
+            // Conditional revoke first: concurrent rotations must not both
+            // issue a valid replacement for one active credential.
+            let changed = transaction
+                .execute(
+                    &q("UPDATE cp_credentials SET revoked_at_ms = ?2 WHERE credential_id = ?1 AND revoked_at_ms IS NULL"),
+                    binds![previous_credential_id, revoked_at_ms],
+                )
+                .await?;
+            if changed != 1 {
+                return Ok(false);
+            }
             transaction
                 .execute(
                     &q("INSERT INTO cp_credentials (credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
@@ -2899,14 +2911,12 @@ impl StorageBackend for PostgresBackend {
                     ],
                 )
                 .await?;
-            let changed = transaction
-                .execute(
-                    &q("UPDATE cp_credentials SET revoked_at_ms = COALESCE(revoked_at_ms, ?2) WHERE credential_id = ?1"),
-                    binds![previous_credential_id, revoked_at_ms],
-                )
-                .await?;
-            Ok(changed > 0)
+            Ok(true)
         }.await;
+        if __ret.is_err() {
+            drop(transaction);
+            return __ret;
+        }
         transaction.commit().await?;
         __ret
     }

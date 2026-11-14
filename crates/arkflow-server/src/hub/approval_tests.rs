@@ -61,8 +61,10 @@ async fn submission_validates_without_side_effects() {
         .unwrap_err();
     assert!(err.to_string().contains("version not found"), "got: {err}");
 
-    // Unknown node is rejected naming the node.
-    let err = hub
+    // Targets are not required to be registered in this process: durable
+    // label resolution can legitimately return nodes that have not
+    // re-registered after a Hub restart (direct creation behaves the same).
+    let accepted = hub
         .submit_config_approval(
             "cfg-seed".into(),
             vec!["node-ghost".into()],
@@ -70,8 +72,8 @@ async fn submission_validates_without_side_effects() {
             "alice".into(),
         )
         .await
-        .unwrap_err();
-    assert!(err.to_string().contains("node-ghost"), "got: {err}");
+        .expect("an unregistered target is accepted like direct creation");
+    assert_eq!(accepted.targets, vec!["node-ghost"]);
 
     // Duplicate nodes are rejected.
     let err = hub

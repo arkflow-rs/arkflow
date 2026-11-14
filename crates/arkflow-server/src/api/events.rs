@@ -101,7 +101,12 @@ pub(super) async fn hub_event_stream(
     // deduplicated by event id below — only for replaying clients, since a
     // live-only client never receives the snapshot.
     let receiver = hub.subscribe();
-    let mut existing = hub.events(query.node_id.as_deref()).await;
+    let all_events = hub.events(query.node_id.as_deref()).await;
+    // Retention boundary comes from the UNFILTERED window: a cursor older
+    // than the oldest retained event is expired even when the subscription
+    // filter happens to match nothing.
+    let retention_oldest_id = all_events.iter().filter_map(|event| event.event_id).min();
+    let mut existing = all_events;
     existing.retain(|event| event_matches(event, &query));
     let seen_through = existing.iter().filter_map(|event| event.event_id).max();
     // Hub events reported by Agents are in-memory only (no persisted id).
@@ -116,9 +121,9 @@ pub(super) async fn hub_event_stream(
     let mut replay = VecDeque::new();
     if let Some(last_event_id) = last_event_id {
         let last_event_id = last_event_id.min(i64::MAX as u64) as i64;
-        let oldest_id = existing.iter().filter_map(|event| event.event_id).min();
         if has_live_only
-            || oldest_id.is_some_and(|event_id| last_event_id < event_id.saturating_sub(1))
+            || retention_oldest_id
+                .is_some_and(|event_id| last_event_id < event_id.saturating_sub(1))
         {
             replay.push_back(None);
         }

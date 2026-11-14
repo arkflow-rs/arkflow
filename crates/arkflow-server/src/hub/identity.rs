@@ -519,10 +519,15 @@ impl Hub {
             last_used_at_ms: None,
             revoked_at_ms: None,
         };
-        storage
+        let rotated = storage
             .rotate_credential(record.clone(), credential_id, now_ms())
             .await
             .map_err(HubError::from)?;
+        if !rotated {
+            return Err(HubError::Invalid(
+                "credential was revoked concurrently; rotation aborted".into(),
+            ));
+        }
         self.record_identity_audit(
             "credential.rotate",
             actor,
