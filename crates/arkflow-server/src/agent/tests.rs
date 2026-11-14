@@ -3307,6 +3307,33 @@ async fn json_stub_hub(
     (format!("http://{address}"), cancellation, task)
 }
 
+/// A stub Hub that delays every response by `delay` before returning the
+/// given JSON body. Used to force a command's original deadline to lapse
+/// while its acknowledgement is in flight.
+async fn delayed_json_stub_hub(
+    delay: std::time::Duration,
+    body: serde_json::Value,
+) -> (String, CancellationToken, tokio::task::JoinHandle<()>) {
+    let app = axum::Router::new().fallback(move || {
+        let body = body.clone();
+        async move {
+            tokio::time::sleep(delay).await;
+            axum::Json(body)
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancellation = CancellationToken::new();
+    let shutdown = cancellation.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap();
+    });
+    (format!("http://{address}"), cancellation, task)
+}
+
 /// Progress-report template used by the lease-renewal tests.
 fn command_result_template(state: HubOperationState) -> crate::hub::CommandResult {
     crate::hub::CommandResult {
@@ -5772,13 +5799,18 @@ async fn take_finished_reports_a_panicked_kernel_join() {
 }
 
 /// A lifecycle command whose ORIGINAL deadline passes mid-flight must not be
-/// reported TimedOut while the Hub keeps renewing the lease: the
-/// acknowledged/running reports advance the local deadline, and the restart
-/// completes through the local operation instead of the stale deadline.
+/// reported TimedOut while the Hub keeps renewing the lease. The stub delays
+/// every response past the original deadline, so the timing condition is
+/// deterministic: the acknowledgement (and therefore the local deadline
+/// extension) always arrives after `expires_at_ms`.
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_command_survives_its_original_deadline_when_renewed() {
     let _ = arkflow_plugin::initialize();
-    let (hub_url, hub_cancel, hub_task) = stub_hub_server().await;
+    let (hub_url, hub_cancel, hub_task) = delayed_json_stub_hub(
+        Duration::from_millis(800),
+        serde_json::json!({"state": "running"}),
+    )
+    .await;
     let client = build_agent_client(&hub_url).unwrap();
     let config = test_node_config(&hub_url);
     let auth = test_auth();
@@ -5790,53 +5822,71 @@ async fn stream_command_survives_its_original_deadline_when_renewed() {
         .expect("the stream registers");
     let runtime = Arc::new(JobRuntime::default());
 
-    // Each attempt uses a fresh command id and a deadline only a
-    // millisecond out: the precheck passes, and the first watcher poll
-    // lands past the original deadline while the lifecycle operation is
-    // still mid-flight. The acknowledgement/renewal reports must keep the
-    // command alive.
-    let mut verified = false;
-    for attempt in 0..40 {
-        let mut command = test_command(
-            "restart",
-            "orders-deadline",
-            1,
-            None,
-            now_ms().saturating_add(1),
-        );
-        command.id = format!("cmd-renewed-{attempt}");
-        command.operation_id = format!("op-renewed-{attempt}");
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(20),
-            execute_command(&client, &cp, &config, &auth, &command, &runtime, 0),
-        )
-        .await
-        .expect("each attempt settles")
-        .unwrap();
-        match outcome.state {
-            HubOperationState::TimedOut
-                if outcome.error.as_deref() == Some("Command expired before execution") =>
-            {
-                // The 1ms deadline lapsed before the precheck on a loaded
-                // runner; that attempt is a retryable miss.
-                continue;
-            }
-            HubOperationState::TimedOut => panic!(
-                "a renewed lifecycle command must not time out mid-flight: {:?}",
-                outcome.error
-            ),
-            HubOperationState::Succeeded => {
-                verified = true;
-                break;
-            }
-            other => panic!("unexpected intermediate state {other:?}"),
-        }
-    }
+    // 500ms out: the precheck passes immediately, and the delayed
+    // acknowledgement (800ms) lands after the original deadline.
+    let original_deadline = now_ms().saturating_add(500);
+    let command = test_command("restart", "orders-deadline", 1, None, original_deadline);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        execute_command(&client, &cp, &config, &auth, &command, &runtime, 2_000),
+    )
+    .await
+    .expect("the command settles")
+    .unwrap();
+    let completed_at = now_ms();
     assert!(
-        verified,
-        "at least one attempt must execute the lifecycle operation past its original deadline"
+        completed_at > original_deadline,
+        "the command must settle after its original deadline ({completed_at} vs {original_deadline})"
     );
+    assert_ne!(
+        outcome.state,
+        HubOperationState::TimedOut,
+        "a renewed lifecycle command must not time out mid-flight: {:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.state, HubOperationState::Succeeded);
     let _ = cp.runtime_manager().stop_all().await;
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+}
+
+/// A terminal response to the acknowledgement means the Hub already swept
+/// the command: `execute_command` must not start the operation (a replacement
+/// may already be running).
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_acknowledgement_prevents_execution() {
+    let _ = arkflow_plugin::initialize();
+    let (hub_url, hub_cancel, hub_task) =
+        json_stub_hub(serde_json::json!({"state": "timed_out"})).await;
+    let client = build_agent_client(&hub_url).unwrap();
+    let config = test_node_config(&hub_url);
+    let auth = test_auth();
+    let engine_config = engine_config_with_stream("orders-settled");
+    let cp = ControlPlane::new(engine_config.clone(), RuntimeManager::new());
+    cp.runtime_manager()
+        .replace_config(&engine_config)
+        .await
+        .expect("the stream registers");
+    let runtime = Arc::new(JobRuntime::default());
+    let command = test_command(
+        "restart",
+        "orders-settled",
+        1,
+        None,
+        now_ms().saturating_add(60_000),
+    );
+    let outcome = execute_command(&client, &cp, &config, &auth, &command, &runtime, 2_000)
+        .await
+        .unwrap();
+    assert_eq!(outcome.state, HubOperationState::TimedOut);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("settled by the Hub before execution")),
+        "unexpected error: {:?}",
+        outcome.error
+    );
     hub_cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
 }

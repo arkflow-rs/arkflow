@@ -239,10 +239,18 @@ pub(super) async fn execute_command(
         command.expires_at_ms,
     );
     // The acknowledgement is itself a lease renewal: advance the local
-    // deadline when the Hub still holds the operation as non-terminal.
-    if send_progress_report(client, config, auth, result.clone()).await? {
-        progress.mark_renewed(lease_ttl_ms, progress_interval);
+    // deadline when the Hub still holds the operation as non-terminal. A
+    // terminal response means the Hub already settled this command (its
+    // lease sweep timed it out and may have dispatched a replacement):
+    // starting the operation now would run it twice.
+    if !send_progress_report(client, config, auth, result.clone()).await? {
+        result.state = HubOperationState::TimedOut;
+        result.progress = 100;
+        result.error = Some("command was settled by the Hub before execution".into());
+        result.failure_class = Some("temporary_execution".into());
+        return deliver_result(client, config, auth, result).await;
     }
+    progress.mark_renewed(lease_ttl_ms, progress_interval);
     match &command.operation {
         AgentOperation::ValidateConfiguration | AgentOperation::DiffConfiguration => {
             // Read-only reports dispatched by the Hub for console clients.
@@ -457,7 +465,7 @@ pub(super) async fn execute_command(
                     .await;
                 }
             };
-            if send_progress_report(
+            if !send_progress_report(
                 client,
                 config,
                 auth,
@@ -485,8 +493,19 @@ pub(super) async fn execute_command(
             )
             .await?
             {
-                progress.mark_renewed(lease_ttl_ms, progress_interval);
+                // The Hub already settled the command: stop watching and let
+                // its reconciler own the replacement instead of reporting a
+                // result the Hub ignores.
+                result.state = HubOperationState::TimedOut;
+                result.progress = 100;
+                result.error = Some(
+                    "command was settled by the Hub before its lifecycle operation completed"
+                        .into(),
+                );
+                result.failure_class = Some("temporary_execution".into());
+                return deliver_result(client, config, auth, result).await;
             }
+            progress.mark_renewed(lease_ttl_ms, progress_interval);
             loop {
                 if let Some(current) = cp.operation(&operation.id).await {
                     if matches!(
