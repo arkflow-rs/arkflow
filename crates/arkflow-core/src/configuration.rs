@@ -451,6 +451,12 @@ fn is_secret_key(key: &str) -> bool {
         "secret",
         "credential",
         "api_key",
+        // Connector credential fields that do not contain "secret"/"token":
+        // AWS-style access keys, GCS service-account JSON (which embeds a
+        // private key), Azure storage account keys, and raw PEM keys.
+        "access_key",
+        "private_key",
+        "account_key",
     ]
     .iter()
     .any(|part| key.contains(part))
@@ -602,6 +608,30 @@ mod tests {
             .unwrap_err()
             .path
             .starts_with("line 1, column"));
+    }
+
+    #[test]
+    fn redaction_masks_file_connector_credential_fields() {
+        let value = serde_json::json!({
+            "object_store": {
+                "type": "gcs",
+                "service_account_key": "{\"private_key\":\"-----BEGIN PRIVATE KEY-----\"}",
+                "access_key": "azure-account-key",
+                "access_key_id": "aws-access-id",
+                "secret_access_key": "aws-secret",
+                "private_key": "-----BEGIN PRIVATE KEY-----",
+                "service_account_path": "/var/run/secrets/gcp.json"
+            }
+        });
+        let redacted = redact_secrets(&value);
+        let store = &redacted["object_store"];
+        assert_eq!(store["service_account_key"], "******");
+        assert_eq!(store["access_key"], "******");
+        assert_eq!(store["access_key_id"], "******");
+        assert_eq!(store["secret_access_key"], "******");
+        assert_eq!(store["private_key"], "******");
+        // A path is not itself a secret and must stay readable.
+        assert_eq!(store["service_account_path"], "/var/run/secrets/gcp.json");
     }
 
     #[test]

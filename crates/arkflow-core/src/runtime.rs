@@ -7,7 +7,7 @@ use crate::control::{
 };
 use crate::stream::StreamConfig;
 use crate::Error;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -293,6 +293,11 @@ pub struct RuntimeEntry {
     pub next_retry_at_ms: Option<u64>,
     pub node_id: String,
     pub recent_errors: VecDeque<RuntimeErrorEvent>,
+    /// A restart cycle is between its initial stop and its final start. A
+    /// `stop()` arriving in that window records `stop_requested` instead of
+    /// reporting success and letting the restart resurrect the stream.
+    pub restart_in_progress: bool,
+    pub stop_requested: bool,
 }
 
 impl RuntimeEntry {
@@ -320,6 +325,8 @@ impl RuntimeEntry {
             next_retry_at_ms: None,
             node_id: "local-node".to_string(),
             recent_errors: VecDeque::with_capacity(MAX_RECENT_ERRORS),
+            restart_in_progress: false,
+            stop_requested: false,
         }
     }
 
@@ -652,6 +659,7 @@ impl RuntimeManager {
         }
 
         let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let startup_cancel = cancellation.clone();
         let handle = self.spawn_supervised(entry.clone(), async move {
             // Adapter construction builds the WAL — the object-store
             // backend's recovery GETs every segment — so keep it off the
@@ -708,8 +716,8 @@ impl RuntimeManager {
             entry.lock().await.handle = Some(handle);
         }
 
-        match startup_rx.await {
-            Ok(Ok(())) => {
+        match timeout(SHUTDOWN_TIMEOUT, startup_rx).await {
+            Ok(Ok(Ok(()))) => {
                 let mut runtime = entry.lock().await;
                 if runtime.state != StreamState::Starting {
                     let state = runtime.state;
@@ -736,7 +744,7 @@ impl RuntimeManager {
                     .await;
                 Ok(())
             }
-            Ok(Err(message)) => {
+            Ok(Ok(Err(message))) => {
                 let startup_error = Error::Process(format!(
                     "stream '{}' resource startup failed: {message}",
                     id
@@ -757,7 +765,7 @@ impl RuntimeManager {
                     Err(wait_result.expect_err("startup task result was checked"))
                 }
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 let startup_error = Error::Process(format!(
                     "stream '{}' stopped before reporting startup readiness",
                     id
@@ -777,6 +785,35 @@ impl RuntimeManager {
                 } else {
                     Err(wait_result.expect_err("startup task result was checked"))
                 }
+            }
+            Err(_elapsed) => {
+                // The startup handshake never arrived. Bounded cleanup keeps
+                // `start()` from hanging forever when a component neither
+                // connects nor reports failure; the control plane can then
+                // reconcile the stream instead of dropping the future.
+                let mut runtime = entry.lock().await;
+                let task_handle = runtime.handle.take();
+                runtime.state = StreamState::Failed;
+                runtime.record_error("startup", "startup handshake timed out");
+                drop(runtime);
+                if let Some(mut task_handle) = task_handle {
+                    startup_cancel.cancel();
+                    if timeout(Duration::from_secs(1), &mut task_handle)
+                        .await
+                        .is_err()
+                    {
+                        task_handle.abort();
+                        let _ = timeout(Duration::from_secs(1), task_handle).await;
+                    }
+                }
+                self.record_event(
+                    "stream_start",
+                    Some(id.to_string()),
+                    "timed_out",
+                    Some("startup handshake timed out".into()),
+                )
+                .await;
+                Err(Error::Timeout)
             }
         }
     }
@@ -896,21 +933,71 @@ impl RuntimeManager {
         snapshot
     }
 
+    /// Reconcile the registry back to a previous snapshot without touching
+    /// streams whose configuration is unchanged. The old implementation
+    /// stopped and rebuilt every stream, so a failed apply also restarted
+    /// streams that never participated in it; a second failure then left the
+    /// remaining streams removed.
     async fn restore_snapshot(
         &self,
         snapshot: &[(String, StreamConfig, StreamState)],
     ) -> Result<(), Error> {
-        let _ = self.stop_all().await;
+        let snapshot_ids: BTreeSet<&str> = snapshot.iter().map(|(id, _, _)| id.as_str()).collect();
+        let mut first_error: Option<Error> = None;
+
+        // Drop runtimes that the failed reconciliation introduced.
         for id in self.ids().await {
-            self.remove(&id).await;
-        }
-        for (id, config, state) in snapshot {
-            self.register(id.clone(), config.clone()).await?;
-            if is_active(*state) {
-                self.start(id).await?;
+            if !snapshot_ids.contains(id.as_str()) {
+                if let Err(error) = self.stop(&id).await {
+                    first_error.get_or_insert(error);
+                }
+                self.remove(&id).await;
             }
         }
-        Ok(())
+
+        for (id, config, state) in snapshot {
+            let rebuild = match self.get(id).await {
+                None => true,
+                Some(entry) => {
+                    let runtime = entry.lock().await;
+                    serde_json::to_value(&runtime.config).ok() != serde_json::to_value(config).ok()
+                }
+            };
+            if rebuild {
+                if let Err(error) = self.stop(id).await {
+                    first_error.get_or_insert(error);
+                }
+                self.remove(id).await;
+                if let Err(error) = self.register(id.clone(), config.clone()).await {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+                if is_active(*state) {
+                    if let Err(error) = self.start(id).await {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            } else if is_active(*state) {
+                // Unchanged configuration: keep the live instance. Only
+                // restart it if the failed apply left it stopped.
+                let needs_start = match self.get(id).await {
+                    Some(entry) => {
+                        let runtime = entry.lock().await;
+                        matches!(
+                            runtime.state,
+                            StreamState::Created | StreamState::Stopped | StreamState::Failed
+                        )
+                    }
+                    None => true,
+                };
+                if needs_start {
+                    if let Err(error) = self.start(id).await {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Stop one Stream and await its task after releasing the entry lock.
@@ -923,12 +1010,24 @@ impl RuntimeManager {
         let handle = {
             let mut runtime = entry.lock().await;
             match runtime.state {
-                StreamState::Created | StreamState::Stopped => return Ok(()),
+                StreamState::Created | StreamState::Stopped => {
+                    // A restart that has finished its stop phase but has not
+                    // called start() yet leaves the entry in Stopped with
+                    // restart_in_progress set. Record the stop intent so the
+                    // restart's final start is suppressed.
+                    if runtime.restart_in_progress {
+                        runtime.stop_requested = true;
+                    }
+                    return Ok(());
+                }
                 // A restart in progress already cancelled the token and took
                 // the handle (atomically, above); its internal stop phase
-                // fulfils the stop intent. Early-return: intercepting here
-                // would race the restart's start() into a resurrection.
-                StreamState::Restarting => return Ok(()),
+                // fulfils the stop intent. Record the intent: the restart
+                // checks it before (and after) starting the replacement.
+                StreamState::Restarting => {
+                    runtime.stop_requested = true;
+                    return Ok(());
+                }
                 StreamState::Stopping => {
                     return Err(Error::Config(format!(
                         "Stream runtime '{}' is already stopping",
@@ -987,6 +1086,14 @@ impl RuntimeManager {
             let mut runtime = entry.lock().await;
             match runtime.state {
                 StreamState::Running | StreamState::Failed | StreamState::Stopped => {
+                    if runtime.restart_in_progress {
+                        return Err(Error::Config(format!(
+                            "Stream runtime '{}' is already restarting",
+                            id
+                        )));
+                    }
+                    runtime.restart_in_progress = true;
+                    runtime.stop_requested = false;
                     runtime.state = StreamState::Restarting;
                     runtime.cancellation.cancel();
                     runtime.handle.take()
@@ -1003,7 +1110,7 @@ impl RuntimeManager {
             Some(handle) => await_task(handle).await,
             None => Ok(()),
         };
-        {
+        let stop_before_start = {
             let mut runtime = entry.lock().await;
             match &wait_result {
                 Ok(()) => runtime.state = StreamState::Stopped,
@@ -1013,11 +1120,51 @@ impl RuntimeManager {
                 }
             }
             runtime.metrics.restarts.fetch_add(1, Ordering::Relaxed);
-        }
+            if wait_result.is_err() {
+                runtime.restart_in_progress = false;
+                runtime.stop_requested = false;
+                false
+            } else if runtime.stop_requested {
+                // A stop arrived while the old task was shutting down (or
+                // during the Stopped window): last intent wins, do not start.
+                runtime.restart_in_progress = false;
+                runtime.stop_requested = false;
+                runtime.state = StreamState::Stopped;
+                true
+            } else {
+                false
+            }
+        };
         wait_result?;
+        if stop_before_start {
+            self.record_event(
+                "stream_restart",
+                Some(id.to_string()),
+                "cancelled",
+                Some("stop requested during restart".into()),
+            )
+            .await;
+            return Ok(());
+        }
         self.record_event("stream_restart", Some(id.to_string()), "requested", None)
             .await;
-        self.start(id).await
+        let start_result = self.start(id).await;
+        // A stop can also arrive after the pre-start check but before (or
+        // during) start(). Once the replacement has settled, honour it.
+        let stop_after_start = {
+            let mut runtime = entry.lock().await;
+            runtime.restart_in_progress = false;
+            let requested = runtime.stop_requested;
+            runtime.stop_requested = false;
+            requested
+        };
+        if stop_after_start {
+            if start_result.is_ok() {
+                self.stop(id).await?;
+            }
+            return Ok(());
+        }
+        start_result
     }
 
     /// Await all currently owned tasks. Natural EOF completion and explicit
@@ -2149,6 +2296,39 @@ mod coverage_tests {
         }
     }
 
+    /// An input that stays open after startup: used to observe lifecycle
+    /// races without the stream settling to EOF on its own.
+    struct PendingInput;
+
+    #[async_trait::async_trait]
+    impl Input for PendingInput {
+        async fn connect(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn read(
+            &self,
+        ) -> Result<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>), Error> {
+            std::future::pending().await
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct PendingInputBuilder;
+
+    impl InputBuilder for PendingInputBuilder {
+        fn build(
+            &self,
+            _name: Option<&str>,
+            _config: &Option<serde_json::Value>,
+            _codec: Option<Arc<dyn crate::codec::Codec>>,
+            _resource: &crate::Resource,
+        ) -> Result<Arc<dyn Input>, Error> {
+            Ok(Arc::new(PendingInput))
+        }
+    }
+
     /// An output that discards every batch and records the settlements.
     struct DevNullOutput {
         wrote: Arc<AtomicBool>,
@@ -2479,6 +2659,100 @@ mod coverage_tests {
             error.contains("Configuration apply failed")
                 && error.contains("restoration also failed"),
             "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_replace_keeps_unchanged_streams_registered() {
+        let _ = crate::input::register_input_builder(
+            "runtime-cov-eof-input",
+            Arc::new(EofInputBuilder),
+        );
+        let _ = crate::output::register_output_builder(
+            "runtime-cov-devnull-output",
+            Arc::new(DevNullOutputBuilder),
+        );
+        let manager = RuntimeManager::new();
+        manager
+            .register("stable".into(), eof_stream_config("stable"))
+            .await
+            .unwrap();
+        force_state(&manager, "stable", StreamState::Running).await;
+        let stable_before = manager.get("stable").await.unwrap();
+
+        let mut broken = stream_config();
+        broken.id = Some("broken".into());
+        broken.input.input_type = "missing-input-old".into();
+        manager.register("broken".into(), broken).await.unwrap();
+        force_state(&manager, "broken", StreamState::Running).await;
+
+        let mut changed = stream_config();
+        changed.id = Some("broken".into());
+        changed.input.input_type = "missing-input-new".into();
+        let error = manager
+            .replace_config(&engine_config(vec![eof_stream_config("stable"), changed]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("restoration also failed"), "{error}");
+
+        let stable_after = manager.get("stable").await.unwrap();
+        assert!(
+            Arc::ptr_eq(&stable_before, &stable_after),
+            "a failed apply must not stop/re-register streams it never changed"
+        );
+        assert_eq!(state_of(&manager, "stable").await, StreamState::Running);
+    }
+
+    /// Spec "last initiated intent wins": a stop that arrives while the
+    /// restart's old task is shutting down must suppress the replacement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_during_restart_suppresses_the_replacement_start() {
+        let _ = crate::input::register_input_builder(
+            "runtime-cov-pending-input",
+            Arc::new(PendingInputBuilder),
+        );
+        let _ = crate::output::register_output_builder(
+            "runtime-cov-devnull-output",
+            Arc::new(DevNullOutputBuilder),
+        );
+        let manager = RuntimeManager::new();
+        let mut config = stream_config();
+        config.id = Some("s".into());
+        config.input.input_type = "runtime-cov-pending-input".into();
+        config.output.output_type = "runtime-cov-devnull-output".into();
+        manager.register("s".into(), config).await.unwrap();
+        manager.start("s").await.unwrap();
+        assert_eq!(state_of(&manager, "s").await, StreamState::Running);
+
+        // Replace the live handle with a slow-to-join task so the Restarting
+        // window is observable; the real task is cancelled by the restart.
+        {
+            let entry = manager.get("s").await.unwrap();
+            let mut runtime = entry.lock().await;
+            runtime.handle = Some(tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(())
+            }));
+        }
+        let restarter = manager.clone();
+        let restart = tokio::spawn(async move { restarter.restart("s").await });
+        let mut saw_restarting = false;
+        for _ in 0..200 {
+            if state_of(&manager, "s").await == StreamState::Restarting {
+                saw_restarting = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(saw_restarting, "restart never entered Restarting");
+
+        manager.stop("s").await.unwrap();
+        restart.await.unwrap().unwrap();
+        assert_eq!(
+            state_of(&manager, "s").await,
+            StreamState::Stopped,
+            "the stop intent must win; the restart must not start the replacement"
         );
     }
 

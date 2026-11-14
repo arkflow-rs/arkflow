@@ -19,10 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
-use tokio::time::{timeout, Duration};
-
-const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Default)]
 pub struct ControlHealth {
@@ -60,6 +57,12 @@ pub struct ControlPlane {
     node_id: Arc<str>,
     api_token: Option<String>,
     draft: Arc<RwLock<Option<ConfigCandidate>>>,
+    /// Serializes configuration mutations (apply and rollback). Version
+    /// selection, runtime reconciliation, and publication of the exposed
+    /// configuration must be one critical section; otherwise two callers can
+    /// each publish a candidate derived from the same old snapshot, leaving
+    /// the running state and the API-visible config divergent.
+    config_operation: Arc<Mutex<()>>,
 }
 
 impl ControlPlane {
@@ -93,6 +96,7 @@ impl ControlPlane {
             node_id: Arc::from("local-node"),
             api_token,
             draft: Arc::new(RwLock::new(None)),
+            config_operation: Arc::new(Mutex::new(())),
         }
     }
 
@@ -278,17 +282,19 @@ impl ControlPlane {
             store
                 .update(&operation_id, OperationState::Running, 10, None)
                 .await;
-            let result = timeout(LIFECYCLE_TIMEOUT, async {
-                match operation_name.as_str() {
-                    "start" => manager.start(&stream_id).await,
-                    "stop" => manager.stop(&stream_id).await,
-                    "restart" => manager.restart(&stream_id).await,
-                    _ => Err(Error::Config(format!(
-                        "Unknown lifecycle operation: {operation_name}"
-                    ))),
-                }
-            })
-            .await;
+            // No outer request timeout here: `RuntimeManager::stop`/
+            // `restart` extract the task handle and settle the entry state,
+            // so dropping this future on a deadline would detach the task
+            // and leave the stream in `Stopping`/`Restarting` forever. The
+            // manager bounds its own startup handshake and task join.
+            let result = match operation_name.as_str() {
+                "start" => manager.start(&stream_id).await,
+                "stop" => manager.stop(&stream_id).await,
+                "restart" => manager.restart(&stream_id).await,
+                _ => Err(Error::Config(format!(
+                    "Unknown lifecycle operation: {operation_name}"
+                ))),
+            };
             let observed_state = manager
                 .snapshots()
                 .await
@@ -304,7 +310,7 @@ impl ControlPlane {
                 .is_some_and(|record| record.state == OperationState::Cancelled);
             store.set_result(&operation_id, reconciliation).await;
             let (_state, outcome, message) = match result {
-                Ok(Ok(())) => {
+                Ok(()) => {
                     store
                         .update(&operation_id, OperationState::Succeeded, 100, None)
                         .await;
@@ -321,29 +327,7 @@ impl ControlPlane {
                         (OperationState::Succeeded, "succeeded", None)
                     }
                 }
-                Ok(Err(error)) => {
-                    store
-                        .update(
-                            &operation_id,
-                            OperationState::Failed,
-                            100,
-                            Some(error.to_string()),
-                        )
-                        .await;
-                    if cancelled {
-                        (
-                            OperationState::Cancelled,
-                            "cancelled_reconciled",
-                            Some(format!(
-                                "Cancellation requested; lifecycle ended with error: {}",
-                                error
-                            )),
-                        )
-                    } else {
-                        (OperationState::Failed, "failed", Some(error.to_string()))
-                    }
-                }
-                Err(_elapsed) => {
+                Err(Error::Timeout) => {
                     store
                         .update(
                             &operation_id,
@@ -364,6 +348,28 @@ impl ControlPlane {
                             "timed_out",
                             Some("Lifecycle operation timed out".into()),
                         )
+                    }
+                }
+                Err(error) => {
+                    store
+                        .update(
+                            &operation_id,
+                            OperationState::Failed,
+                            100,
+                            Some(error.to_string()),
+                        )
+                        .await;
+                    if cancelled {
+                        (
+                            OperationState::Cancelled,
+                            "cancelled_reconciled",
+                            Some(format!(
+                                "Cancellation requested; lifecycle ended with error: {}",
+                                error
+                            )),
+                        )
+                    } else {
+                        (OperationState::Failed, "failed", Some(error.to_string()))
                     }
                 }
             };
@@ -407,6 +413,9 @@ impl ControlPlane {
         &self,
         candidate: &ConfigCandidate,
     ) -> Result<serde_json::Value, Error> {
+        // Serialize version selection, runtime reconciliation, and the
+        // publication of the exposed configuration as one critical section.
+        let _operation = self.config_operation.lock().await;
         let config = candidate
             .parse()
             .map_err(|issue| Error::Config(issue.message))?;
@@ -445,6 +454,9 @@ impl ControlPlane {
     }
 
     pub async fn rollback_configuration(&self, id: &str) -> Result<serde_json::Value, Error> {
+        // Same critical section as apply: a rollback derived from a snapshot
+        // that a concurrent apply is replacing must not publish stale state.
+        let _operation = self.config_operation.lock().await;
         let candidate = self
             .version_store
             .load(id)
