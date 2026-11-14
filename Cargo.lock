@@ -331,7 +331,7 @@ dependencies = [
  "humantime",
  "indexmap 2.14.2",
  "lazy_static",
- "lz4_flex 0.11.6",
+ "lz4_flex",
  "mockall",
  "mongodb",
  "num_cpus",
@@ -606,7 +606,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
- "lz4_flex 0.13.1",
+ "lz4_flex",
  "zstd",
 ]
 
@@ -5663,15 +5663,6 @@ dependencies = [
 
 [[package]]
 name = "lz4_flex"
-version = "0.11.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
-name = "lz4_flex"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
@@ -6826,7 +6817,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.17.1",
- "lz4_flex 0.13.1",
+ "lz4_flex",
  "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
@@ -10693,7 +10684,7 @@ dependencies = [
  "jsonschema",
  "lalrpop",
  "lalrpop-util",
- "lz4_flex 0.13.1",
+ "lz4_flex",
  "md-5 0.11.0",
  "nom 8.0.0",
  "nom-language",

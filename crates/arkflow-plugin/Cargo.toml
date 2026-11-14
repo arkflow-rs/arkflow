@@ -99,7 +99,7 @@ hdfs-native-object-store = "0.16"
 
 # Compression (WAL segment optimization)
 zstd = "0.13"
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 
 # python
 pyo3 = { version = "0.28", features = ["auto-initialize", "serde"] }
