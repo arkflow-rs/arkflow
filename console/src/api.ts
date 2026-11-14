@@ -679,8 +679,14 @@ export const api = {
     request<ControlNode>(`/nodes/${encodeURIComponent(id)}/maintenance`, { method: 'POST' }),
   resumeNode: (id: string) =>
     request<ControlNode>(`/nodes/${encodeURIComponent(id)}/maintenance`, { method: 'DELETE' }),
-  streams: (nodeId?: string) =>
-    request<Page<StreamStatus>>(`/streams${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
+  streams: (nodeId?: string, page?: number, pageSize?: number) =>
+    request<Page<StreamStatus>>(
+      withQuery('/streams', {
+        ...(nodeId ? { node_id: nodeId } : {}),
+        ...(page ? { page } : {}),
+        ...(pageSize ? { page_size: pageSize } : {}),
+      }),
+    ),
   events: (query: EventListQuery = {}) => request<Page<ControlEvent>>(withQuery('/events', query)),
   operations: (query: OperationListQuery = {}) => request<Page<Operation>>(withQuery('/operations', query)),
   operation: (id: string) => request<Operation>(`/operations/${encodeURIComponent(id)}`),
@@ -950,6 +956,10 @@ export function streamEvents(
             emit()
           }
         }
+        // A clean server close (EOF without abort) also ends the live
+        // stream: report the gap before the backoff reconnects, or the UI
+        // keeps showing "Live" through the whole outage window.
+        if (!controller.signal.aborted) onState?.('disconnected')
       } catch {
         // Covers both real failures and the connect-deadline abort; outer
         // cleanup (controller aborted) reports nothing and exits the loop.

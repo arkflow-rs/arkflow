@@ -132,7 +132,11 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
   const nodes = useNodes().data?.items ?? []
   const [selectedJobId, setSelectedJobId] = useState<string>()
   const detailQuery = useJobDetail(selectedJobId)
-  const selected = detailQuery.data
+  // The detail query keeps the PREVIOUS job as placeholder while a new
+  // selection loads; rendering it would expose stop/pause/savepoint/upgrade
+  // actions against the previous job under the new selection.
+  const selected =
+    detailQuery.data && detailQuery.data.job.job_id === selectedJobId ? detailQuery.data : undefined
   const pollError = detailQuery.isError ? errorMessage(detailQuery.error) : ''
   const [filter, setFilter] = useState('')
   const [state, setState] = useState('all')

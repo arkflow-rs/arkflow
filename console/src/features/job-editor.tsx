@@ -354,6 +354,18 @@ export function JobEditor({
   // response can compare against the CURRENT graph rather than the stale
   // closure captured when the request was issued.
   const latestSpecJson = useRef<string>()
+  // The target node selection needs the same treatment: the async
+  // continuation's `nodeIds` is the closure captured at request time, so
+  // comparing it with itself was always equal — a node-set change during the
+  // request left a validation result (and enabled submit) for a different
+  // placement.
+  const latestNodesJson = useRef<string>()
+  // Sync the ref from an effect, not during render: refs are not render
+  // inputs, and effects flush before the next validate request can read it.
+  const nodeIdsJson = JSON.stringify([...nodeIds].sort())
+  useEffect(() => {
+    latestNodesJson.current = nodeIdsJson
+  }, [nodeIdsJson])
   const connect = (connection: Connection) => {
     const issue = edgeIssue(dagNodes, edges, connection)
     if (issue) {
@@ -417,8 +429,7 @@ export function JobEditor({
     latestSpecJson.current = validatedSpec
     try {
       const result = await api.validateJob(next, nodeIds)
-      if (latestSpecJson.current !== validatedSpec || JSON.stringify([...nodeIds].sort()) !== validatedNodes)
-        return
+      if (latestSpecJson.current !== validatedSpec || latestNodesJson.current !== validatedNodes) return
       setValidation(result)
       setIssues(result.valid ? [] : [t('editor.incompatibleGraph')])
     } catch (cause) {

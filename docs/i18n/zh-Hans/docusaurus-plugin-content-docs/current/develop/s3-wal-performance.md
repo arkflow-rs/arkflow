@@ -41,14 +41,13 @@ Input → append_batch (μs, memory) → segment buffer → channel → PUT work
 | 因素 | 典型范围 | 瓶颈 |
 |--------|---------------|------------|
 | S3 PUT(单工作线程) | 50-150 MB/s | 网络带宽 |
-| S3 PUT(并行,4-8 个工作线程) | 200-450 MB/s | 网络带宽 |
 | S3 LIST 恢复 | 20-100 MB/s | API 速率限制 |
 | 本地编码 | 500+ MB/s | CPU(CRC32 + 可选压缩) |
 | 通道背压 | 16 段/工作线程 | 可配置的有界通道 |
 
-**实际吞吐**:默认 1 个工作线程时为 100-200 MB/s;`parallel_put.workers: 8` 时最高 450 MB/s。
+**实际吞吐**:默认 1 个工作线程时为 100-200 MB/s。
 
-**并行 PUT 的收益**:多个工作线程在相互独立的有界通道上运行并轮流分配段,在不改变 at-least-once 契约的前提下,为高 QPS 工作负载带来最高 2-3 倍的吞吐提升。使用 8 个工作线程时请注意 S3 的每前缀速率限制。
+**封段已串行化**:段封存逐次执行,确保可确认前沿绝不会越过更早的未封存段(上传失败也会按序重试)。因此单次封段的吞吐受限于一次 PUT;`parallel_put.workers` 为兼容配置而保留,当前不产生任何效果(设置大于 1 时存储层会记录警告)。
 
 ### 重放窗口
 
@@ -220,22 +219,9 @@ segment_tuning:
 
 ## 并行 PUT 工作线程
 
-配置多个 PUT 工作线程可获得 2-3 倍的吞吐提升。
+`parallel_put` 仍保留在配置模式中,但封段已串行化(见上文),因此工作线程数目前对吞吐没有影响。请保持默认值;配置多于一个工作线程时存储层会记录警告。
 
-```yaml validate=foreign reason="WAL tuning option fragment"
-parallel_put:
-  workers: 4              # 1-8, default 1
-  shutdown_timeout: "30s" # how long to wait for in-flight uploads
-```
-
-**收益:**
-- 各工作线程通过独立通道并行运行
-- 轮流分配(最旧的段优先)
-- 每个工作线程独立的背压(各 16 段)
-
-**注意 S3 速率限制**:8 个工作线程可能触及每前缀限制。
-
-**Manifest 写入安全**:当 `workers > 1` 时,多个工作线程可能同时完成一段的上传并封存它,各自重写 `manifest.json`。这些并发重写由基于 ETag 的乐观并发控制协调(读取 ETag → 条件 PUT → 不匹配则重试,最多 8 次尝试,覆盖工作线程数上限),因此任何工作线程的游标推进或已封存段条目都不会被静默覆盖——前提是后端支持条件 PUT。S3 与 S3 兼容存储都支持;不支持的后端(例如 `LocalFileSystem`)会退化为单写者无条件写入,因此那里请保持 `workers: 1`。在 `workers: 1`(默认)时这一切不可见:无竞争、无重试,行为不变。投递契约细节参见 `docs/docs/components/0-inputs/delivery-semantics.md`。
+**Manifest 写入安全**:封段已串行化,同一时刻至多只有一个工作线程重写 `manifest.json`,进程内不会出现并发重写。写入仍使用基于 ETag 的乐观并发控制(读取 ETag → 条件 PUT → 不匹配则重试),用于防范另一个进程或人工编辑同一前缀;不支持条件 PUT 的后端(例如 `LocalFileSystem`)会退化为单写者无条件写入,因此那里请保持 `workers: 1`。投递契约细节参见 `docs/docs/components/0-inputs/delivery-semantics.md`。
 
 ## 压缩
 

@@ -872,12 +872,13 @@ impl Input for KafkaInput {
         // before the decode and assembly work.
         drop(consumer_guard);
 
-        let record_batch = self.decode_and_attach(&records).await?;
-
-        // Anchor each segment's frontier at its first delivery: an
-        // out-of-order FIRST acknowledgement (fan-out completing a later
-        // branch first) cannot then claim the earlier records of this
-        // delivery were acknowledged.
+        // Anchor each segment's frontier BEFORE the decode: decoding awaits
+        // the codec (a Schema Registry fetch is a network round trip), and
+        // the kernel cancels a slow `read` at its idle tick — dropping the
+        // already-claimed records. Anchoring first pins the frontier below
+        // the claimed first offsets even on cancellation, so no later
+        // acknowledgement can pass them; the replay re-claims and re-anchors
+        // the same records.
         let segments = Self::group_ack_segments(&records);
         for segment in &segments {
             self.frontier.anchor_delivery(&SourcePosition {
@@ -886,6 +887,8 @@ impl Input for KafkaInput {
                 offset: segment.first as u64,
             });
         }
+
+        let record_batch = self.decode_and_attach(&records).await?;
 
         let mut msg_batch = MessageBatch::new_arrow(record_batch);
         msg_batch.set_input_name(self.input_name.clone());
@@ -2762,7 +2765,8 @@ mod tests {
         value["consumer_group"] = serde_json::json!(format!("undo-txn-{}", std::process::id()));
         value["transactional_offsets"] = serde_json::json!(true);
         let input = input_with(value);
-        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group);
+        let committer_claim = std::sync::Arc::new(());
+        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group, &committer_claim);
         // The acknowledged frontier stands at the ack's next offset.
         input.frontier.seed(&[SourcePosition {
             topic: Some("orders".into()),
@@ -2807,7 +2811,8 @@ mod tests {
         value["consumer_group"] = serde_json::json!(format!("frontier-reg-{}", std::process::id()));
         value["transactional_offsets"] = serde_json::json!(true);
         let input = input_with(value);
-        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group);
+        let committer_claim = std::sync::Arc::new(());
+        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group, &committer_claim);
         let registered = crate::kafka_txn::group_frontier(&input.config.consumer_group)
             .expect("transactional input registers its frontier");
         assert!(
@@ -3277,7 +3282,8 @@ mod tests {
         value["consumer_group"] = serde_json::json!(format!("segment-undo-{}", std::process::id()));
         value["transactional_offsets"] = serde_json::json!(true);
         let input = input_with(value);
-        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group);
+        let committer_claim = std::sync::Arc::new(());
+        crate::kafka_txn::declare_offset_committer(&input.config.consumer_group, &committer_claim);
         // The acknowledged frontier stands at the segment's next offset (8).
         input.frontier.seed(&[SourcePosition {
             topic: Some("orders".into()),

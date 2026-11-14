@@ -28,7 +28,7 @@ is persisted locally first.
 | **MQTT** | Yes (QoS ≥ 1) | manual ack (`set_manual_acks(true)`); default QoS 1 |
 | **NATS (JetStream)** | Yes | `message.ack()` on ack only |
 | **Pulsar** | Yes | `consumer.ack()` on ack only |
-| **Redis (Streams)** | Yes (with consumer groups) | depends on configuration |
+| **Redis (List / Pub/Sub)** | **No** (Lists are consumed destructively; Pub/Sub is fire-and-forget; Streams consumer groups are not implemented) | none |
 | **SQL** | Partial (incremental query) | via incremental cursor |
 | **HTTP (server)** | **No** (webhook) | none — fire-and-forget |
 | **HTTP (client poll)** | **No** | none |
@@ -95,22 +95,23 @@ source (e.g. Kafka).
 
 ## S3 WAL manifest write coordination
 
-When the durable WAL uses the object-store (S3-compatible) backend with
-`parallel_put.workers > 1`, multiple PUT workers can finish a segment upload
-and seal it concurrently. Each seal rewrites the small `manifest.json` that
-records the ack cursor and the sealed-segment list. To keep those concurrent
-rewrites from silently overwriting each other — which would regress the cursor
-and cause duplicate replay on recovery — manifest writes are coordinated with
-ETag-based optimistic concurrency: each PUT carries the ETag it read, and on a
-mismatch the writer re-reads, re-applies its change, and retries (up to 8
-attempts, covering the configured worker ceiling).
+Note: segment seals are now serialized in the S3 WAL store, so the
+`parallel_put.workers > 1` contention described below no longer occurs in
+this codebase (the knob is accepted but has no effect and the store warns
+when it is set). The ETag coordination remains in place as defense in depth
+for any writer that ever runs concurrently.
+
+Each seal rewrites the small `manifest.json` that
+records the ack cursor and the sealed-segment list. Concurrent rewrites are
+coordinated with ETag-based optimistic concurrency: each PUT carries the ETag
+it read, and on a mismatch the writer re-reads, re-applies its change, and
+retries (up to 8 attempts).
 
 This coordination requires the object-store backend to support conditional
 PUT (`If-Match` / if-none-exists). S3 and S3-compatible stores (and the
 in-memory test backend) support it. A backend that does not support
 conditional PUT falls back to an unconditional write, which is safe only with
-a single writer — so `parallel_put.workers > 1` must not be configured
-against such a backend.
+a single writer.
 
 This is invisible to single-writer setups (`parallel_put.workers = 1`, the
 default): there is no contention, the first PUT succeeds, and no retries

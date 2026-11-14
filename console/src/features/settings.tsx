@@ -69,6 +69,11 @@ function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['webhooks'] }),
     onError: (cause) => reportMutationFailure(undefined, cause),
   })
+  // The replace API is a FULL-SET replacement built from the cached list, so
+  // a second mutation issued while one is in flight (two rapid toggles) would
+  // send the stale list and drop the first change. Block every mutating
+  // control until the in-flight replacement settles.
+  const canMutateNow = canMutate && !replace.isPending
 
   const runTest = useMutation({
     mutationFn: (id: string) => api.testWebhook(id),
@@ -120,7 +125,7 @@ function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
               <WebhookRow
                 key={subscription.id}
                 subscription={subscription}
-                canMutate={canMutate}
+                canMutate={canMutateNow}
                 onEdit={() =>
                   setForm({
                     id: subscription.id,
@@ -166,7 +171,7 @@ function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
       <div className="toolbar">
         <button
           type="button"
-          disabled={!canMutate}
+          disabled={!canMutateNow}
           title={!canMutate ? t('perm.requires', { action: 'manage_webhooks' }) : undefined}
           onClick={() => setForm({ ...EMPTY_FORM })}
         >
@@ -181,7 +186,7 @@ function WebhooksPanel({ canMutate = true }: { canMutate?: boolean }) {
       {form ? (
         <WebhookForm
           form={form}
-          canMutate={canMutate}
+          canMutate={canMutateNow}
           hasSecret={subscriptions.some((entry) => entry.id === form.id && entry.has_secret)}
           onChange={setForm}
           onCancel={() => setForm(null)}

@@ -23,6 +23,11 @@ const markdown = walkFlat(docsRoot).filter(
 const routeFiles = new Set(
   markdown.map((file) => routeFor(docsRoot, file)),
 );
+// Route → source file, so a route-only link target (no file at the relative
+// path) still validates its #anchor against the page it actually lands on.
+const routeToFile = new Map(
+  markdown.map((file) => [routeFor(docsRoot, file), file]),
+);
 
 // ---------------------------------------------------------------------------
 // Headings and anchors. GitHub-style slugs (Docusaurus uses the same rules):
@@ -112,7 +117,10 @@ for (const file of markdown) {
       resolved = file;
     } else {
       const base = path.resolve(path.dirname(file), target);
-      const candidates = [base, `${base}.md`, path.join(base, 'index.md')];
+      // Prefer a Markdown file over a same-named directory: links to
+      // `guide` resolve to `guide.md` (or `guide/index.md`) so the anchor
+      // check runs instead of silently skipping a directory match.
+      const candidates = [`${base}.md`, path.join(base, 'index.md'), base];
       resolved = candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
       const route = path
         .relative(docsRoot, base)
@@ -124,10 +132,24 @@ for (const file of markdown) {
         errors.push(`${path.relative(root, file)}: unresolved internal link ${target}`);
         continue;
       }
+      if (!resolved) {
+        // Route-only target: validate the anchor against the file behind the
+        // route instead of silently skipping it.
+        resolved = routeToFile.get(route) ?? null;
+      }
     }
 
     if (anchor && resolved && /\.(md|mdx)$/.test(resolved)) {
-      if (!slugsFor(resolved).has(anchor)) {
+      // Links may percent-encode the anchor (e.g. #caf%C3%A9): compare the
+      // decoded text against the heading slug. Invalid encoding keeps the
+      // raw text so the broken anchor is still reported.
+      let expected = anchor;
+      try {
+        expected = decodeURIComponent(anchor);
+      } catch {
+        expected = anchor;
+      }
+      if (!slugsFor(resolved).has(expected)) {
         errors.push(`${path.relative(root, file)}: broken anchor #${anchor} in link to ${target || path.basename(file)}`);
       }
     }
@@ -212,11 +234,15 @@ try {
   }
   const examplesDir = path.join(repoRoot, 'examples');
   if (fs.existsSync(examplesDir)) {
-    for (const entry of fs.readdirSync(examplesDir, {withFileTypes: true})) {
-      if (!entry.isFile() || !/\.(ya?ml)$/.test(entry.name)) continue;
-      const full = path.join(examplesDir, entry.name);
+    // Recursive: nested example trees (examples/python/…) were invisible to
+    // the old top-level-only scan, so an unregistered or invalid nested YAML
+    // passed the check.
+    for (const full of walkFlat(examplesDir)) {
+      if (!/\.(ya?ml)$/.test(path.basename(full))) continue;
       if (!declaredExamplePaths.has(full)) {
-        errors.push(`examples/${entry.name} is not registered in reference/example-manifest.json`);
+        errors.push(
+          `${path.relative(repoRoot, full)} is not registered in reference/example-manifest.json`,
+        );
       }
     }
   }

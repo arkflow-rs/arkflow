@@ -585,6 +585,62 @@ impl RedbStateBackend {
         };
         Ok((namespace, hex_decode(key)?))
     }
+
+    /// Expired-entry cleanup for read paths. Unlike `delete`, the removal is
+    /// conditional on the stored entry still being the exact one we observed:
+    /// the previous pattern (drop the read transaction, then delete in a
+    /// separate write transaction) deleted whatever a concurrent `put` had
+    /// replaced in between — silently losing the fresh value.
+    fn delete_if_unchanged(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        expected: &StoredStateValue,
+    ) -> Result<(), Error> {
+        let _write_guard = self.write_lock.lock().unwrap();
+        let storage_key = Self::storage_key(namespace, key);
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|error| Error::Process(format!("state write: {error}")))?;
+        let freed = {
+            let mut table = tx
+                .open_table(STATE_TABLE)
+                .map_err(|error| Error::Process(format!("state table: {error}")))?;
+            let removed = table
+                .remove(storage_key.as_str())
+                .map_err(|error| Error::Process(format!("state delete: {error}")))?
+                .map(|value| decode_value(value.value()))
+                .transpose()?;
+            match removed {
+                // Same expired entry: the deletion stands.
+                Some(current)
+                    if current.value == expected.value
+                        && current.expires_at_ms == expected.expires_at_ms =>
+                {
+                    Some((1u64, current.value.len() as u64))
+                }
+                // A concurrent put replaced it between the read and this
+                // transaction: restore it (remove+insert in one transaction
+                // is a net no-op for the table).
+                Some(current) => {
+                    let encoded = encode_value(&current.value, current.expires_at_ms)?;
+                    table
+                        .insert(storage_key.as_str(), encoded.as_slice())
+                        .map_err(|error| Error::Process(format!("state put: {error}")))?;
+                    None
+                }
+                None => None,
+            }
+        };
+        tx.commit()
+            .map_err(|error| Error::Process(format!("state commit: {error}")))?;
+        if let Some((keys, bytes)) = freed {
+            Self::release_keys(&self.keys, keys);
+            Self::release_bytes(&self.bytes, bytes);
+        }
+        Ok(())
+    }
 }
 
 impl StateBackend for RedbStateBackend {
@@ -612,7 +668,7 @@ impl StateBackend for RedbStateBackend {
             {
                 drop(table);
                 drop(tx);
-                self.delete(namespace, key)?;
+                self.delete_if_unchanged(namespace, key, &value)?;
                 return Ok(None);
             }
             Ok(Some(value.value))
@@ -643,7 +699,7 @@ impl StateBackend for RedbStateBackend {
         {
             drop(table);
             drop(tx);
-            self.delete(namespace, key)?;
+            self.delete_if_unchanged(namespace, key, &value)?;
             return Ok(None);
         }
         Ok(Some(StateEntry {

@@ -136,13 +136,16 @@ impl KernelJobHandle {
     > {
         self.checkpoint_barrier_with_details(checkpoint_id, generation)
             .await
-            .map(|(snapshot, positions, watermarks, _)| (snapshot, positions, watermarks))
+            .map(|(snapshot, positions, watermarks, _, _)| (snapshot, positions, watermarks))
     }
 
     /// Detailed checkpoint variant retaining every physical event-time
     /// watermark. The three-value method above remains compatible with older
     /// callers; Agent/local recovery uses this method for multi-topic and
-    /// multi-partition restore.
+    /// multi-partition restore. The fifth value maps each source task id to
+    /// the positions its OWN chain reported — the per-task attribution
+    /// restore needs so two sources sharing topic/partition never consume
+    /// each other's offsets.
     pub async fn checkpoint_barrier_with_details(
         &self,
         checkpoint_id: impl Into<String>,
@@ -153,6 +156,7 @@ impl KernelJobHandle {
             Vec<crate::checkpoint::SourcePosition>,
             BTreeMap<String, i64>,
             BTreeMap<String, Vec<crate::checkpoint::WatermarkPosition>>,
+            BTreeMap<String, Vec<crate::checkpoint::SourcePosition>>,
         ),
         Error,
     > {
@@ -196,6 +200,7 @@ impl KernelJobHandle {
             Vec<crate::checkpoint::SourcePosition>,
             BTreeMap<String, i64>,
             BTreeMap<String, Vec<crate::checkpoint::WatermarkPosition>>,
+            BTreeMap<String, Vec<crate::checkpoint::SourcePosition>>,
         ),
         Error,
     > {
@@ -398,6 +403,7 @@ impl KernelJobHandle {
         let format_version = self.state_format;
         let mut state_entries = BTreeMap::<(String, Vec<u8>), StateEntry>::new();
         let mut positions = Vec::new();
+        let mut positions_by_task = BTreeMap::new();
         let mut watermarks = BTreeMap::new();
         let mut watermark_partitions = BTreeMap::new();
         for report in snapshots.values() {
@@ -419,6 +425,7 @@ impl KernelJobHandle {
                 state_entries.insert((entry.namespace.clone(), entry.key.clone()), entry.clone());
             }
             positions.extend(report.source_positions.clone());
+            positions_by_task.insert(report.task_id.clone(), report.source_positions.clone());
             if let Some(watermark) = report.watermark_ms {
                 watermarks.insert(report.task_id.clone(), watermark);
             }
@@ -432,6 +439,7 @@ impl KernelJobHandle {
             positions,
             watermarks,
             watermark_partitions,
+            positions_by_task,
         ))
     }
 

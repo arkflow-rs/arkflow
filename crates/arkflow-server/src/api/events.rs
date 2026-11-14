@@ -17,8 +17,19 @@ use std::convert::Infallible;
 pub(super) async fn hub_events(
     State(hub): State<hub::Hub>,
     Query(query): Query<EventQuery>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ReadAudit,
+        "event",
+        query.node_id.clone(),
+    )
+    .await
+    {
+        return response;
+    }
     let mut items = hub.events(query.node_id.as_deref()).await;
     if let Some(event_type) = query.event_type.as_deref() {
         items.retain(|item| item.event.event_type == event_type);
@@ -50,13 +61,40 @@ pub(super) async fn hub_event_stream(
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
 ) -> Response {
+    // The SSE stream carries the same event/audit data as `hub_events`; the
+    // router-level operator check authenticates any operator credential but
+    // does not scope it, so a viewer must be denied here.
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ReadAudit,
+        "event",
+        query.node_id.clone(),
+    )
+    .await
+    {
+        return response;
+    }
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    let mut replay = VecDeque::new();
+    // Subscribe BEFORE the snapshot so an event produced in between can
+    // never fall into the gap between the replayed snapshot and the live
+    // stream (it would reach neither and the client would only learn of it
+    // via a manual resync). The [subscribe, snapshot] overlap window is
+    // deduplicated by event id below — only for replaying clients, since a
+    // live-only client never receives the snapshot.
+    let receiver = hub.subscribe();
     let mut existing = hub.events(query.node_id.as_deref()).await;
     existing.retain(|event| event_matches(event, &query));
+    let seen_through = existing.iter().filter_map(|event| event.event_id).max();
+    let dedup_through = if last_event_id.is_some() {
+        seen_through
+    } else {
+        None
+    };
+    let mut replay = VecDeque::new();
     if let Some(last_event_id) = last_event_id {
         let last_event_id = last_event_id.min(i64::MAX as u64) as i64;
         let oldest_id = existing.iter().filter_map(|event| event.event_id).min();
@@ -74,10 +112,9 @@ pub(super) async fn hub_event_stream(
         pending.sort_by_key(|event| event.event_id);
         replay.extend(pending.into_iter().map(Some));
     }
-    let receiver = hub.subscribe();
     let stream = futures_util::stream::unfold(
-        (replay, receiver, query),
-        |(mut replay, mut receiver, query)| async move {
+        (replay, receiver, query, dedup_through),
+        |(mut replay, mut receiver, query, dedup_through)| async move {
             if let Some(update) = replay.pop_front() {
                 let event = update
                     .map(|update| {
@@ -91,11 +128,19 @@ pub(super) async fn hub_event_stream(
                             .unwrap_or_else(|_| SseEvent::default().event("resync").data("{}"))
                     })
                     .unwrap_or_else(|| SseEvent::default().event("resync").data("{}"));
-                return Some((Ok::<_, Infallible>(event), (replay, receiver, query)));
+                return Some((
+                    Ok::<_, Infallible>(event),
+                    (replay, receiver, query, dedup_through),
+                ));
             }
             loop {
                 match receiver.recv().await {
-                    Ok(update) if event_matches(&update, &query) => {
+                    Ok(update)
+                        if event_matches(&update, &query)
+                            && !update
+                                .event_id
+                                .is_some_and(|id| dedup_through.is_some_and(|seen| id <= seen)) =>
+                    {
                         let event = SseEvent::default()
                             .id(update
                                 .event_id
@@ -104,12 +149,18 @@ pub(super) async fn hub_event_stream(
                             .event(update.event.event_type.clone())
                             .json_data(update)
                             .unwrap_or_else(|_| SseEvent::default().event("resync").data("{}"));
-                        break Some((Ok::<_, Infallible>(event), (replay, receiver, query)));
+                        break Some((
+                            Ok::<_, Infallible>(event),
+                            (replay, receiver, query, dedup_through),
+                        ));
                     }
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let event = SseEvent::default().event("resync").data("{}");
-                        break Some((Ok::<_, Infallible>(event), (replay, receiver, query)));
+                        break Some((
+                            Ok::<_, Infallible>(event),
+                            (replay, receiver, query, dedup_through),
+                        ));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break None,
                 }

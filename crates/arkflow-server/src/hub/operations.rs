@@ -539,17 +539,7 @@ impl Hub {
             // is not oldest, and evicting an in-flight operation would make
             // the Agent's eventual command result miss with a 404 — which the
             // Agent treats as a fatal session error.
-            let terminal = |operation: &HubOperation| {
-                matches!(
-                    operation.state,
-                    HubOperationState::Succeeded
-                        | HubOperationState::Failed
-                        | HubOperationState::TimedOut
-                        | HubOperationState::NodeUnavailable
-                        | HubOperationState::Cancelled
-                        | HubOperationState::Superseded
-                )
-            };
+            let terminal = |operation: &HubOperation| operation.state.is_terminal();
             let eviction = operations
                 .values()
                 .filter(|operation| terminal(operation))
@@ -658,12 +648,10 @@ impl Hub {
         {
             return Err(HubError::Unauthorized);
         }
-        // A terminal result settles the command lease as well as the
-        // operation.  If the result is a duplicate, removing an already
-        // absent lease is intentionally idempotent.
-        if let Some(node) = nodes.get_mut(&auth.node_id) {
-            node.leased_commands.remove(&result.command_id);
-        }
+        // The command lease settles only with a terminal result: the initial
+        // acknowledgement and progress reports must leave it leased so the
+        // expiry sweep can still time out a command whose node acknowledged
+        // it and then died before executing.
         let mut operations = self.operations.write().await;
         let operation = operations
             .values_mut()
@@ -673,24 +661,35 @@ impl Hub {
             return Err(HubError::Unauthorized);
         }
         if operation.id != result.operation_id {
+            // The node is reporting under a command that maps to a different
+            // stored operation (a command-id collision or a stale replay).
+            // Do not apply the reported state, and do NOT settle the lease:
+            // the sweep must still be able to expire this command.
+            tracing::warn!(
+                node = %auth.node_id,
+                command_id = %result.command_id,
+                reported_operation_id = %result.operation_id,
+                stored_operation_id = %operation.id,
+                "command result carries a foreign operation id; state not applied"
+            );
             return Ok(operation.clone());
         }
         if operation.generation != result.generation {
             return Ok(operation.clone());
         }
-        if matches!(
-            operation.state,
-            HubOperationState::Succeeded
-                | HubOperationState::Failed
-                | HubOperationState::TimedOut
-                | HubOperationState::NodeUnavailable
-                | HubOperationState::Cancelled
-                | HubOperationState::Superseded
-        ) {
+        if operation.state.is_terminal() {
             // A late result from an in-flight Agent must not resurrect or
             // otherwise rewrite a terminal operation. Returning the stored
             // record keeps duplicate result delivery idempotent.
             return Ok(operation.clone());
+        }
+        if result.state.is_terminal() {
+            // A terminal result settles the command lease. The check runs on
+            // the validated, applied result — an acknowledged/running report
+            // or a foreign-id replay never releases the lease.
+            if let Some(node) = nodes.get_mut(&auth.node_id) {
+                node.leased_commands.remove(&result.command_id);
+            }
         }
         operation.state = result.state;
         operation.progress = result.progress;
@@ -701,18 +700,11 @@ impl Hub {
         if result.result.is_some() {
             operation.result = result.result.clone();
         }
-        if matches!(
-            result.state,
-            HubOperationState::Succeeded
-                | HubOperationState::Failed
-                | HubOperationState::TimedOut
-                | HubOperationState::NodeUnavailable
-                | HubOperationState::Cancelled
-                | HubOperationState::Superseded
-        ) {
+        if result.state.is_terminal() {
             operation.finished_at_ms = Some(now_ms());
         }
         if matches!(result.state, HubOperationState::Acknowledged) {
+            operation.progress = result.progress;
             let now = now_ms();
             operation.acknowledged_at_ms = Some(now);
             // Enqueue-to-acknowledgement latency, the metric the spec
@@ -723,6 +715,22 @@ impl Hub {
             );
             self.command_metrics
                 .record_outcome(operation.operation.as_str(), "acknowledged");
+        }
+        if matches!(
+            result.state,
+            HubOperationState::Acknowledged | HubOperationState::Running
+        ) {
+            // A progress report renews the command lease. The expiry is
+            // stamped at enqueue, so without this a JobStart that outlives
+            // lease_ttl (connect + checkpoint restore) would be swept as
+            // expired, marked TimedOut and dispatched a second time while the
+            // agent still runs it. A silent agent stops renewing and still
+            // expires, so liveness detection is preserved.
+            if let Some(node) = nodes.get_mut(&auth.node_id) {
+                if let Some(command) = node.leased_commands.get_mut(&result.command_id) {
+                    command.expires_at_ms = now_ms() + self.config.lease_ttl_ms;
+                }
+            }
         }
         if let Some(outcome) = CommandMetrics::outcome_label(result.state) {
             self.command_metrics
@@ -841,7 +849,8 @@ impl Hub {
                         )
                         .await?;
                     }
-                } else if result.state != HubOperationState::Succeeded {
+                } else if result.state.is_terminal() && result.state != HubOperationState::Succeeded
+                {
                     self.complete_job_checkpoint(
                         &updated.resource_id,
                         checkpoint_id.unwrap_or("unknown"),
@@ -854,7 +863,10 @@ impl Hub {
                 updated.operation.as_str(),
                 "job_checkpoint_commit" | "job_savepoint_commit"
             ) && result.observed_checkpoint_id.is_some()
+                && result.state.is_terminal()
             {
+                // In-flight `running` progress reports must not settle the
+                // checkpoint as failed; only the terminal result decides.
                 self.complete_job_checkpoint(
                     &updated.resource_id,
                     result
@@ -967,15 +979,7 @@ impl Hub {
     pub async fn cancel_operation(&self, id: &str) -> Option<HubOperation> {
         let mut operations = self.operations.write().await;
         let operation = operations.get_mut(id)?;
-        if matches!(
-            operation.state,
-            HubOperationState::Succeeded
-                | HubOperationState::Failed
-                | HubOperationState::TimedOut
-                | HubOperationState::NodeUnavailable
-                | HubOperationState::Cancelled
-                | HubOperationState::Superseded
-        ) {
+        if operation.state.is_terminal() {
             return Some(operation.clone());
         }
         operation.state = HubOperationState::Cancelled;

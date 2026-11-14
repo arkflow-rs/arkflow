@@ -314,6 +314,37 @@ impl StorageBackend for PostgresBackend {
                 .optional()
         }
     }
+    async fn id_sequence_floor(&self) -> Result<u64, StorageError> {
+        // Max numeric suffix over every namespace the shared counter mints:
+        // hop- operation ids live in cp_operations (not cp_intents), and
+        // rollout-/approval-/job-upgrade- ids are persisted in their own
+        // tables. An unseeded counter would re-mint a durable PRIMARY KEY
+        // after a restart.
+        let floor: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(suffix::bigint), 0) FROM (\
+               SELECT regexp_replace(intent_id, '^[^-]*-', '') AS suffix FROM cp_intents WHERE intent_id LIKE 'hop-%' \
+               UNION ALL SELECT regexp_replace(attempt_id, '^[^-]*-', '') FROM cp_attempts WHERE attempt_id LIKE 'attempt-%' \
+               UNION ALL SELECT regexp_replace(command_id, '^[^-]*-', '') FROM cp_attempts WHERE command_id LIKE 'cmd-%' \
+               UNION ALL SELECT regexp_replace(operation_id, '^hop-', '') FROM cp_operations WHERE operation_id LIKE 'hop-%' \
+               UNION ALL SELECT regexp_replace(rollout_id, '^rollout-', '') FROM cp_rollouts WHERE rollout_id LIKE 'rollout-%' \
+               UNION ALL SELECT regexp_replace(request_id, '^approval-', '') FROM cp_config_approval_requests WHERE request_id LIKE 'approval-%' \
+               UNION ALL SELECT regexp_replace(upgrade_id, '^job-upgrade-', '') FROM cp_job_upgrades WHERE upgrade_id LIKE 'job-upgrade-%'\
+             ) ids WHERE suffix ~ '^[0-9]+$'",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        Ok(floor.max(0) as u64)
+    }
+    async fn intent_counter_floor(&self) -> Result<u64, StorageError> {
+        // The {counter} segment of `intent-{generation}-{counter}` ids.
+        let floor: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX((regexp_split_to_array(intent_id, '-'))[3]::bigint), 0) \
+             FROM cp_intents WHERE intent_id ~ '^intent-[0-9]+-[0-9]+$'",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        Ok(floor.max(0) as u64)
+    }
 
     async fn replace_node_labels(
         &self,
@@ -952,9 +983,8 @@ impl StorageBackend for PostgresBackend {
             } else {
                 "stop"
             };
-            let suffix = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let attempt_id = format!("attempt-{suffix}");
-            let command_id = format!("cmd-{suffix}");
+            let attempt_id = crate::hub::next_control_plane_id("attempt");
+            let command_id = crate::hub::next_control_plane_id("cmd");
             let now = now_ms();
             transaction.execute(
                 "INSERT INTO cp_attempts (attempt_id, intent_id, command_id, node_id, stream_id, generation, operation, state, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8)",

@@ -43,6 +43,25 @@ use tracing::{error, warn};
 /// bound only affects the idle case.
 const CONSUMER_LOCK_BOUND: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Decode one received Pulsar message and forward it to the input channel.
+/// The acknowledgement is paired BEFORE a channel slot is claimed, so a
+/// dropped/dropped-close delivery cannot lose the message unacked.
+async fn forward_pulsar_message(
+    mut message: pulsar::consumer::Message<Vec<u8>>,
+    consumer: Arc<Mutex<pulsar::Consumer<Vec<u8>, TokioExecutor>>>,
+    codec: &Option<Arc<dyn Codec>>,
+    input_name: Option<String>,
+    sender: &Sender<Delivery>,
+) {
+    let payload = std::mem::take(&mut message.payload.data);
+    let ack: Arc<dyn Ack> = Arc::new(PulsarAck::new(message, consumer));
+    let delivery =
+        crate::input::codec_helper::decode_delivery(&payload, codec, input_name, ack).await;
+    if let Err(e) = sender.send_async(delivery).await {
+        error!("Failed to send message to channel: {}", e);
+    }
+}
+
 /// Pulsar input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulsarInputConfig {
@@ -144,9 +163,15 @@ impl Input for PulsarInput {
             .await
             .map_err(|e| Error::Connection(format!("Failed to connect to Pulsar: {}", e)))?;
 
-        // Store client
-        let mut client_guard = self.client.write().await;
-        *client_guard = Some(client.clone());
+        // Store client — the write guard is released immediately: holding it
+        // across the consumer build below serialized every read() against a
+        // network call, and combined with close()'s reverse lock order
+        // (consumer, then client) formed an ABBA deadlock on reconnect-vs-
+        // close overlaps.
+        {
+            let mut client_guard = self.client.write().await;
+            *client_guard = Some(client.clone());
+        }
 
         // Configure consumer
         let subscription_type = self.config.subscription_type.clone().unwrap_or_default();
@@ -195,11 +220,15 @@ impl Input for PulsarInput {
         let cancellation_token_clone = self.cancellation_token.clone();
         let codec_clone = self.codec.clone();
         let input_name_clone = self.input_name.clone();
+        // The configured retry policy governs transient receive failures
+        // before the connection is declared lost (the policy was validated
+        // and then never applied).
+        let retry_config = self.config.retry_config.clone().unwrap_or_default();
 
         // Start background task for message processing
         tokio::spawn(async move {
             let consumer = consumer_arc;
-            loop {
+            'receive: loop {
                 tokio::select! {
                     _ = cancellation_token_clone.cancelled() => {
                         break;
@@ -214,34 +243,109 @@ impl Input for PulsarInput {
                         tokio::time::timeout(CONSUMER_LOCK_BOUND, consumer.next()).await
                     } => {
                         match result {
-                            Ok(Some(Ok(mut message))) => {
-                                // Decode and pair the ack before claiming a
-                                // slot: the message is taken apart here, and
-                                // the ack carries the consumer so `read()`
-                                // never awaits the consumer lock.
-                                let payload = std::mem::take(&mut message.payload.data);
-                                let ack: Arc<dyn Ack> = Arc::new(PulsarAck::new(
+                            Ok(Some(Ok(message))) => {
+                                forward_pulsar_message(
                                     message,
                                     consumer.clone(),
-                                ));
-                                let delivery = crate::input::codec_helper::decode_delivery(
-                                    &payload,
                                     &codec_clone,
                                     input_name_clone.clone(),
-                                    ack,
+                                    &sender_clone,
                                 )
                                 .await;
-                                if let Err(e) = sender_clone.send_async(delivery).await {
-                                    error!("Failed to send message to channel: {}", e);
-                                }
                             }
                             Ok(Some(Err(e))) => {
                                 warn!("Failed to receive Pulsar message: {}", e);
-                                if let Err(e) = sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
-                                    error!("Failed to send error to channel: {}", e);
+                                // Transient receive failures retry under the
+                                // configured policy before declaring the
+                                // connection lost. A bounded lock wait that
+                                // observes no message is NOT a stream end:
+                                // keep polling without consuming an attempt.
+                                let mut attempts = 0u32;
+                                let mut delay = std::time::Duration::from_millis(
+                                    retry_config.initial_delay_ms,
+                                );
+                                loop {
+                                    if cancellation_token_clone.is_cancelled() {
+                                        break 'receive;
+                                    }
+                                    let mut consumer_guard = consumer.lock().await;
+                                    let probe = tokio::time::timeout(
+                                        CONSUMER_LOCK_BOUND,
+                                        consumer_guard.next(),
+                                    )
+                                    .await;
+                                    drop(consumer_guard);
+                                    match probe {
+                                        Ok(Some(Ok(message))) => {
+                                            forward_pulsar_message(
+                                                message,
+                                                consumer.clone(),
+                                                &codec_clone,
+                                                input_name_clone.clone(),
+                                                &sender_clone,
+                                            )
+                                            .await;
+                                            break;
+                                        }
+                                        Ok(None) => {
+                                            // The stream really ended.
+                                            if let Err(e) = sender_clone
+                                                .send_async(Delivery::Err(Error::EOF))
+                                                .await
+                                            {
+                                                error!(
+                                                    "Failed to send EOF to channel: {}",
+                                                    e
+                                                );
+                                            }
+                                            break 'receive;
+                                        }
+                                        Ok(Some(Err(error))) => {
+                                            attempts += 1;
+                                            if attempts >= retry_config.max_attempts {
+                                                warn!(
+                                                    "Pulsar receive retries exhausted: {error}"
+                                                );
+                                                if let Err(e) = sender_clone
+                                                    .send_async(Delivery::Err(
+                                                        Error::Disconnection,
+                                                    ))
+                                                    .await
+                                                {
+                                                    error!(
+                                                        "Failed to send error to channel: {}",
+                                                        e
+                                                    );
+                                                }
+                                                // Break the loop to allow reconnection to
+                                                // create a new consumer task
+                                                break 'receive;
+                                            }
+                                            warn!(
+                                                "Attempt {} for receiving Pulsar message failed, retrying in {:?}: {}",
+                                                attempts, delay, error
+                                            );
+                                            tokio::select! {
+                                                _ = cancellation_token_clone.cancelled() => {
+                                                    break 'receive;
+                                                }
+                                                _ = tokio::time::sleep(delay) => {}
+                                            }
+                                            delay = std::time::Duration::from_millis(
+                                                (delay.as_millis() as f64
+                                                    * retry_config.backoff_multiplier)
+                                                    .min(retry_config.max_delay_ms as f64)
+                                                    as u64,
+                                            );
+                                        }
+                                        Err(_lock_budget_elapsed) => {
+                                            // Idle within the lock budget: keep
+                                            // polling and leave the retry budget
+                                            // untouched.
+                                            continue;
+                                        }
+                                    }
                                 }
-                                // Break the loop to allow reconnection to create a new consumer task
-                                break;
                             }
                             Ok(None) => {
                                 // Stream ended
@@ -300,14 +404,16 @@ impl Input for PulsarInput {
         // Send cancellation signal
         self.cancellation_token.cancel();
 
-        // Close consumer if active
-        let mut consumer_guard = self.consumer.write().await;
-        *consumer_guard = None;
-
-        // Close Pulsar client
-        let mut client_guard = self.client.write().await;
-        if let Some(_client) = client_guard.take() {
-            // Client will be dropped automatically
+        // Lock in the SAME order as connect (client, then consumer): the
+        // previous consumer-first order deadlocked against a reconnect's
+        // connect holding client across the consumer build.
+        {
+            let mut client_guard = self.client.write().await;
+            let mut consumer_guard = self.consumer.write().await;
+            *consumer_guard = None;
+            if let Some(_client) = client_guard.take() {
+                // Client will be dropped automatically
+            }
         }
 
         Ok(())

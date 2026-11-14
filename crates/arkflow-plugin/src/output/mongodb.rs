@@ -91,6 +91,15 @@ impl MongoDBOutput {
         for (column_index, field) in msg.schema().fields().iter().enumerate() {
             let column = msg.column(column_index);
             let value = array_value_to_bson(column.as_ref(), row, field.name())?;
+            // A BSON document cannot carry duplicate keys: inserting the
+            // second column of the same name silently REPLACED the first
+            // (stale/incorrect data written). Fail loudly instead.
+            if document.contains_key(field.name().as_str()) {
+                return Err(Error::Process(format!(
+                    "MongoDB output: duplicate column '{}' cannot be represented in a BSON document",
+                    field.name()
+                )));
+            }
             document.insert(field.name().clone(), value);
         }
         Ok(document)
@@ -132,16 +141,78 @@ impl Output for MongoDBOutput {
             return Ok(());
         }
 
-        collection
-            .insert_many(documents)
-            .await
-            .map_err(|e| map_mongodb_error("Failed to insert documents into MongoDB", &e))?;
-        Ok(())
+        // Unordered + duplicate-key tolerance: the driver's DEFAULT ordered
+        // insert stops at the first duplicate-key error with the PREFIX
+        // already committed — a replay then errors on that committed prefix
+        // before ever reaching the suffix, permanently blocking recovery on
+        // a stable _id. Unordered attempts EVERY document, and duplicate-key
+        // errors are idempotent no-ops for an at-least-once replay.
+        match collection.insert_many(documents).ordered(false).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if mongo_error_is_duplicate_key(&error) {
+                    tracing::warn!(
+                        "MongoDB insert hit duplicate keys (idempotent at-least-once replay); treating the batch as written"
+                    );
+                    Ok(())
+                } else {
+                    Err(map_mongodb_error(
+                        "Failed to insert documents into MongoDB",
+                        &error,
+                    ))
+                }
+            }
+        }
     }
 
     async fn close(&self) -> Result<(), Error> {
         *self.collection.lock().await = None;
         Ok(())
+    }
+}
+
+/// True when a write error is the duplicate of the document `_id` index:
+/// the idempotent echo of an at-least-once replay. A conflict on any OTHER
+/// unique index means this document was never written, so it must propagate
+/// instead of being reported as a successful replay. The index name is
+/// compared as a whole: a prefix match would also accept a custom index
+/// named `_id_email` and drop an uninserted document.
+fn is_id_duplicate(code: i32, message: &str) -> bool {
+    code == 11000
+        && message
+            .split_once("index: ")
+            .and_then(|(_, rest)| rest.split_once(" dup key"))
+            .is_some_and(|(index, _)| index == "_id_")
+}
+
+/// True when EVERY write error the driver reports is a duplicate of the
+/// document `_id` (code 11000): all other documents landed, and the
+/// duplicates are the idempotent echo of an at-least-once replay with a
+/// stable `_id`. A write concern error means the requested durability was
+/// not satisfied, so it always propagates. Any other error (or a mix)
+/// propagates too.
+fn mongo_error_is_duplicate_key(error: &mongodb::error::Error) -> bool {
+    match error.kind.as_ref() {
+        mongodb::error::ErrorKind::InsertMany(insert_many_error) => {
+            if insert_many_error.write_concern_error.is_some() {
+                return false;
+            }
+            match &insert_many_error.write_errors {
+                Some(write_errors) if !write_errors.is_empty() => write_errors
+                    .iter()
+                    .all(|write_error| is_id_duplicate(write_error.code, &write_error.message)),
+                _ => false,
+            }
+        }
+        mongodb::error::ErrorKind::BulkWrite(bulk_write_error) => {
+            bulk_write_error.write_concern_errors.is_empty()
+                && !bulk_write_error.write_errors.is_empty()
+                && bulk_write_error
+                    .write_errors
+                    .values()
+                    .all(|write_error| is_id_duplicate(write_error.code, &write_error.message))
+        }
+        _ => false,
     }
 }
 
@@ -332,6 +403,28 @@ mod tests {
     };
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn only_id_index_duplicates_count_as_idempotent_replay() {
+        assert!(is_id_duplicate(
+            11000,
+            "E11000 duplicate key error collection: db.c index: _id_ dup key: { _id: 1 }"
+        ));
+        // A conflict on a secondary unique index means the document was NOT
+        // written: reporting success would silently drop it.
+        assert!(!is_id_duplicate(
+            11000,
+            "E11000 duplicate key error collection: db.c index: email_1 dup key: { email: \"a\" }"
+        ));
+        // A custom index whose name merely starts with `_id_` is a secondary
+        // index: the same prefix check would report success for a document
+        // that was never inserted.
+        assert!(!is_id_duplicate(
+            11000,
+            "E11000 duplicate key error collection: db.c index: _id_email dup key: { _id_email: 1 }"
+        ));
+        assert!(!is_id_duplicate(121, "document validation failure"));
+    }
 
     fn batch(columns: Vec<(&str, ArrayRef)>) -> MessageBatch {
         let fields: Vec<Field> = columns

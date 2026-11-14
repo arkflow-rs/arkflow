@@ -42,6 +42,25 @@ pub fn register(udf: ScalarUDF) -> Result<(), Error> {
             name
         )));
     };
+    // Aliases share the lookup namespace: DataFusion's SessionState
+    // registers a UDF under its name AND every alias, silently overwriting
+    // any collision. Two UDFs whose name/alias sets intersect would both
+    // build here and then resolve nondeterministically (HashMap order) at
+    // `init` — reject the overlap at registration.
+    let mut keys: Vec<&str> = vec![name];
+    keys.extend(udf.aliases().iter().map(String::as_str));
+    for (existing_name, existing_udf) in udfs.iter() {
+        let collides = keys.contains(&existing_name.as_str())
+            || keys
+                .iter()
+                .any(|key| existing_udf.aliases().iter().any(|alias| alias == *key));
+        if collides {
+            return Err(Error::Config(format!(
+                "Scalar UDF '{}' collides with the name or alias of an existing UDF '{}'",
+                name, existing_name
+            )));
+        }
+    }
     udfs.insert(name.to_string(), Arc::new(udf));
     Ok(())
 }
