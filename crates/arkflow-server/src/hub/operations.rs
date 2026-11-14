@@ -539,17 +539,7 @@ impl Hub {
             // is not oldest, and evicting an in-flight operation would make
             // the Agent's eventual command result miss with a 404 — which the
             // Agent treats as a fatal session error.
-            let terminal = |operation: &HubOperation| {
-                matches!(
-                    operation.state,
-                    HubOperationState::Succeeded
-                        | HubOperationState::Failed
-                        | HubOperationState::TimedOut
-                        | HubOperationState::NodeUnavailable
-                        | HubOperationState::Cancelled
-                        | HubOperationState::Superseded
-                )
-            };
+            let terminal = |operation: &HubOperation| operation.state.is_terminal();
             let eviction = operations
                 .values()
                 .filter(|operation| terminal(operation))
@@ -687,29 +677,13 @@ impl Hub {
         if operation.generation != result.generation {
             return Ok(operation.clone());
         }
-        if matches!(
-            operation.state,
-            HubOperationState::Succeeded
-                | HubOperationState::Failed
-                | HubOperationState::TimedOut
-                | HubOperationState::NodeUnavailable
-                | HubOperationState::Cancelled
-                | HubOperationState::Superseded
-        ) {
+        if operation.state.is_terminal() {
             // A late result from an in-flight Agent must not resurrect or
             // otherwise rewrite a terminal operation. Returning the stored
             // record keeps duplicate result delivery idempotent.
             return Ok(operation.clone());
         }
-        if matches!(
-            result.state,
-            HubOperationState::Succeeded
-                | HubOperationState::Failed
-                | HubOperationState::TimedOut
-                | HubOperationState::NodeUnavailable
-                | HubOperationState::Cancelled
-                | HubOperationState::Superseded
-        ) {
+        if result.state.is_terminal() {
             // A terminal result settles the command lease. The check runs on
             // the validated, applied result — an acknowledged/running report
             // or a foreign-id replay never releases the lease.
@@ -726,15 +700,7 @@ impl Hub {
         if result.result.is_some() {
             operation.result = result.result.clone();
         }
-        if matches!(
-            result.state,
-            HubOperationState::Succeeded
-                | HubOperationState::Failed
-                | HubOperationState::TimedOut
-                | HubOperationState::NodeUnavailable
-                | HubOperationState::Cancelled
-                | HubOperationState::Superseded
-        ) {
+        if result.state.is_terminal() {
             operation.finished_at_ms = Some(now_ms());
         }
         if matches!(result.state, HubOperationState::Acknowledged) {
@@ -1009,15 +975,7 @@ impl Hub {
     pub async fn cancel_operation(&self, id: &str) -> Option<HubOperation> {
         let mut operations = self.operations.write().await;
         let operation = operations.get_mut(id)?;
-        if matches!(
-            operation.state,
-            HubOperationState::Succeeded
-                | HubOperationState::Failed
-                | HubOperationState::TimedOut
-                | HubOperationState::NodeUnavailable
-                | HubOperationState::Cancelled
-                | HubOperationState::Superseded
-        ) {
+        if operation.state.is_terminal() {
             return Some(operation.clone());
         }
         operation.state = HubOperationState::Cancelled;
