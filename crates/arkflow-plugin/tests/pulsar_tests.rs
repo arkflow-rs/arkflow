@@ -369,7 +369,7 @@ mod pulsar_tests {
     fn test_pulsar_output_builder_with_invalid_config() {
         let config_json = serde_json::json!({
             "service_url": "invalid-url",
-            "topic": "test-topic"
+            "topic": {"type": "value", "value": "test-topic"}
         });
 
         let builder = arkflow_plugin::output::pulsar::PulsarOutputBuilder;

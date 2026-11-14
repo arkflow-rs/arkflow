@@ -336,7 +336,16 @@ pub fn init() -> Result<(), Error> {
             "additionalProperties": false,
             "properties": {
                 "service_url": {"type": "string", "description": "Pulsar service URL."},
-                "topic": {"type": "string", "description": "Destination topic (supports {field} placeholders)."},
+                "topic": {
+                    "type": "object",
+                    "description": "Destination topic expression: {\"type\":\"value\",\"value\":\"...\"} for a static topic or {\"type\":\"expr\",\"expr\":\"...\"} per message.",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["value", "expr"]},
+                        "value": {"type": "string"},
+                        "expr": {"type": "string"}
+                    },
+                    "required": ["type"]
+                },
                 "auth": {"type": "object", "description": "Pulsar authentication configuration."},
                 "value_field": {"type": "string", "description": "Record field used as the payload."}
             },
@@ -344,7 +353,7 @@ pub fn init() -> Result<(), Error> {
         }),
     ).with_example(serde_json::json!({
         "service_url": "pulsar://localhost:6650",
-        "topic": "persistent://public/default/events"
+        "topic": {"type": "value", "value": "persistent://public/default/events"}
     })))
 }
 

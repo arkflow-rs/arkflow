@@ -1738,8 +1738,26 @@
             "description": "Pulsar service URL."
           },
           "topic": {
-            "type": "string",
-            "description": "Destination topic (supports {field} placeholders)."
+            "type": "object",
+            "description": "Destination topic expression: {\"type\":\"value\",\"value\":\"...\"} for a static topic or {\"type\":\"expr\",\"expr\":\"...\"} per message.",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "value",
+                  "expr"
+                ]
+              },
+              "value": {
+                "type": "string"
+              },
+              "expr": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ]
           },
           "auth": {
             "type": "object",
@@ -1757,7 +1775,10 @@
       },
       "config_example": {
         "service_url": "pulsar://localhost:6650",
-        "topic": "persistent://public/default/events"
+        "topic": {
+          "type": "value",
+          "value": "persistent://public/default/events"
+        }
       }
     },
     {
