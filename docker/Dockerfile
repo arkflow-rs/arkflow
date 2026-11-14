@@ -33,7 +33,11 @@ WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsqlite3-0 python3 python3-dev \
+    libsqlite3-0 python3 python3-dev ca-certificates \
+# ca-certificates: the runtime image is debian slim (no CA bundle by
+# default); without it every engine-side TLS connection (Kafka SASL_SSL,
+# https outputs, schema registry) fails certificate verification. The
+# server image already carries it.
  && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled binary from builder stage

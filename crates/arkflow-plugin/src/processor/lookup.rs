@@ -484,23 +484,47 @@ impl LookupBackend for HttpBackend {
         let response = request.send().await.map_err(|e| {
             Error::Process(format!("lookup processor: request for key failed: {e}"))
         })?;
+        let mut response = response;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::Process(format!("lookup processor: response read failed: {e}")))?;
+        // 404 is the conventional "no record" signal for a dimension lookup;
+        // it participates in negative caching. The body is never needed — do
+        // not read it (a hostile backend must not stream unbounded bytes into
+        // memory for a discarded 404).
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !status.is_success() {
-            // 404 is the conventional "no record" signal for a dimension
-            // lookup; it participates in negative caching. Any other
-            // non-2xx is a backend error.
-            if status == reqwest::StatusCode::NOT_FOUND {
-                return Ok(None);
-            }
+            // Any other non-2xx is a backend error. Bound the captured body:
+            // it only reaches the log line below (truncate_body).
+            const MAX_ERROR_BODY: usize = 16 * 1024;
+            let body = {
+                let mut raw = Vec::new();
+                let mut truncated = false;
+                while raw.len() < MAX_ERROR_BODY {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => {
+                            let take = chunk.len().min(MAX_ERROR_BODY - raw.len());
+                            raw.extend_from_slice(&chunk[..take]);
+                            truncated |= take < chunk.len();
+                        }
+                        _ => break, // end of body or read failure: best-effort capture
+                    }
+                }
+                let mut body = String::from_utf8_lossy(&raw).to_string();
+                if truncated {
+                    body.push_str("…(truncated)");
+                }
+                body
+            };
             return Err(Error::Process(format!(
                 "lookup processor: backend returned {status} for key: {}",
                 truncate_body(&body)
             )));
         }
+        let body = response
+            .text()
+            .await
+            .map_err(|e| Error::Process(format!("lookup processor: response read failed: {e}")))?;
         match serde_json::from_str::<Value>(&body) {
             Ok(record @ Value::Object(_)) => Ok(Some(record)),
             Ok(Value::Null) => Ok(None),
@@ -745,7 +769,18 @@ impl LookupProcessor {
                     key.push(separator);
                 }
                 match &values[row] {
-                    Some(value) => key.push_str(value),
+                    Some(value) => {
+                        // The composite key joins with \u{1f}; a value
+                        // carrying that separator makes distinct tuples
+                        // collide into one cache key (dedup would then serve
+                        // wrong rows). Reject loudly instead.
+                        if value.contains(separator) {
+                            return Err(Error::Process(format!(
+                                "lookup processor: key value in row {row} contains the composite-key separator U+001F; such values cannot be joined unambiguously"
+                            )));
+                        }
+                        key.push_str(value);
+                    }
                     None => {
                         is_null = true;
                         break;
