@@ -61,6 +61,20 @@ pub(super) async fn hub_event_stream(
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
 ) -> Response {
+    // The SSE stream carries the same event/audit data as `hub_events`; the
+    // router-level operator check authenticates any operator credential but
+    // does not scope it, so a viewer must be denied here.
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ReadAudit,
+        "event",
+        query.node_id.clone(),
+    )
+    .await
+    {
+        return response;
+    }
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())

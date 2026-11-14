@@ -1181,6 +1181,21 @@ async fn hub_routes_distinguish_viewer_from_operator_actions() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // A viewer holds ReadAudit, so the stream is readable; the router
+    // middleware alone would let any operator credential through, the
+    // handler must enforce the action scope (covered by the scoped test
+    // below).
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/api/v1/events/stream")
+                .header("authorization", "Bearer viewer-secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     let response = app
         .oneshot(
             axum::http::Request::get("/api/v1/events/stream")
@@ -1190,6 +1205,47 @@ async fn hub_routes_distinguish_viewer_from_operator_actions() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn event_stream_enforces_read_audit_scope() {
+    let hub = hub::Hub::new(hub::HubConfig {
+        operator_token: Some("scoped-viewer|viewer|scoped-secret|node=node-a".into()),
+        node_token: None,
+        insecure_local: false,
+        lease_ttl_ms: 10_000,
+        poll_interval_ms: 100,
+        session_ttl_ms: default_session_ttl_ms(),
+        approval_required: false,
+        approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
+    });
+    let app = hub_router(hub, &ServerConfig::default());
+    for uri in [
+        "/api/v1/events/stream?node_id=node-b",
+        "/api/v1/events/stream",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(uri)
+                    .header("authorization", "Bearer scoped-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/api/v1/events/stream?node_id=node-a")
+                .header("authorization", "Bearer scoped-secret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

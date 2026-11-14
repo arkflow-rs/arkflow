@@ -386,10 +386,12 @@ fn redact_url_password(text: &str) -> Option<String> {
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     // The userinfo is everything before the LAST '@' of the authority (the
-    // password itself may contain '@'); its password follows the last ':'.
+    // password itself may contain '@'); its password follows the FIRST ':'
+    // (the username cannot contain an unencoded ':', so masking from the
+    // first colon hides the whole password even when it contains colons).
     let at = authority.rfind('@')?;
     let userinfo = &authority[..at];
-    let colon = userinfo.rfind(':')?;
+    let colon = userinfo.find(':')?;
     if colon == userinfo.len() - 1 {
         // Empty password segment: nothing to redact.
         return None;
@@ -507,6 +509,7 @@ mod tests {
             "nested": {
                 "url": "mysql://root:s3cret@localhost/app"
             },
+            "multi_colon_url": "postgres://u:pa:ss:word@db.internal/app",
             "name": "not a url"
         });
         let redacted = redact_secrets(&value);
@@ -522,6 +525,12 @@ mod tests {
         assert_eq!(
             redacted["nested"]["url"],
             "mysql://root:******@localhost/app"
+        );
+        // A password containing colons must be masked whole: splitting at
+        // the last colon left its leading segments in the response.
+        assert_eq!(
+            redacted["multi_colon_url"],
+            "postgres://u:******@db.internal/app"
         );
         assert_eq!(redacted["name"], "not a url");
     }
