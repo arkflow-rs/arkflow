@@ -3557,6 +3557,42 @@ async fn running_job_is_dispatched_to_compatible_agent() {
             .as_deref(),
         Some("checkpoint-7")
     );
+    // An in-flight `running` progress report must not settle the checkpoint
+    // as failed: only the terminal result decides.
+    hub.command_result(
+        AgentAuth {
+            node_id: "compute-1".into(),
+            session_token: registration.session_token.clone(),
+        },
+        CommandResult {
+            command_id: checkpoint_command.id.clone(),
+            operation_id: checkpoint_command.operation_id.clone(),
+            state: HubOperationState::Running,
+            progress: 40,
+            error: None,
+            correlation_id: checkpoint_command.correlation_id.clone(),
+            generation: checkpoint_command.generation,
+            observed_generation: Some(checkpoint_command.generation),
+            action_id: None,
+            failure_class: None,
+            config_version_id: None,
+            rollout_id: None,
+            observed_checkpoint_id: Some("checkpoint-7".into()),
+            checkpoint_manifest_uri: None,
+            result: None,
+        },
+    )
+    .await
+    .unwrap();
+    let records = hub.job_checkpoints("orders").await.unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record.checkpoint_id == "checkpoint-7")
+            .map(|record| record.status.as_str()),
+        Some("pending"),
+        "a running progress report must not fail the checkpoint"
+    );
     hub.command_result(
         AgentAuth {
             node_id: "compute-1".into(),

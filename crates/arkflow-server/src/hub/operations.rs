@@ -849,7 +849,8 @@ impl Hub {
                         )
                         .await?;
                     }
-                } else if result.state != HubOperationState::Succeeded {
+                } else if result.state.is_terminal() && result.state != HubOperationState::Succeeded
+                {
                     self.complete_job_checkpoint(
                         &updated.resource_id,
                         checkpoint_id.unwrap_or("unknown"),
@@ -862,7 +863,10 @@ impl Hub {
                 updated.operation.as_str(),
                 "job_checkpoint_commit" | "job_savepoint_commit"
             ) && result.observed_checkpoint_id.is_some()
+                && result.state.is_terminal()
             {
+                // In-flight `running` progress reports must not settle the
+                // checkpoint as failed; only the terminal result decides.
                 self.complete_job_checkpoint(
                     &updated.resource_id,
                     result

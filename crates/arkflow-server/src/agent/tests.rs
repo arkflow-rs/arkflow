@@ -207,6 +207,30 @@ async fn parked_job_observations_are_redelivered_by_the_next_session() {
     assert!(runtime.take_finished().await.is_empty());
 }
 
+/// The lease-renewal interval is derived from the remaining lease: a short
+/// lease (the tests use two seconds) must be renewed before it expires, and
+/// the interval is clamped so reports are neither a busy loop nor too slow.
+#[test]
+fn progress_interval_derives_from_the_remaining_lease() {
+    let now = super::now_ms();
+    assert_eq!(
+        super::commands::command_progress_interval(now + 2_000),
+        std::time::Duration::from_millis(1_000)
+    );
+    assert_eq!(
+        super::commands::command_progress_interval(now + 200),
+        std::time::Duration::from_millis(500)
+    );
+    assert_eq!(
+        super::commands::command_progress_interval(now + 600_000),
+        std::time::Duration::from_secs(30)
+    );
+    assert_eq!(
+        super::commands::command_progress_interval(now.saturating_sub(1)),
+        std::time::Duration::from_millis(500)
+    );
+}
+
 /// A Hub-rejected observation rotates behind the reports it was blocking, so
 /// a later poll delivers the others first.
 #[tokio::test]

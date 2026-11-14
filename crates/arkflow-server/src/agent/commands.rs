@@ -14,8 +14,13 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::warn;
 
-/// Interval between "running" progress reports for an executing command.
-const COMMAND_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+/// How often to renew a command's execution lease: half of the lease time
+/// remaining at execution start, so even a short lease (the tests use two
+/// seconds) is renewed before it expires. Clamped to a sane floor/ceiling.
+pub(super) fn command_progress_interval(expires_at_ms: u64) -> Duration {
+    let remaining_ms = expires_at_ms.saturating_sub(now_ms());
+    Duration::from_millis((remaining_ms / 2).clamp(500, 30_000))
+}
 
 /// Keeps a "running" progress report ticking while a command executes. The
 /// Hub renews the command lease on Acknowledged/Running results, so an
@@ -41,6 +46,7 @@ fn spawn_progress_reports(
     config: &NodeAgentConfig,
     auth: &AgentAuth,
     template: &CommandResult,
+    interval: Duration,
 ) -> ProgressReports {
     let cancel = tokio_util::sync::CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -50,11 +56,11 @@ fn spawn_progress_reports(
     let mut update = template.clone();
     update.state = HubOperationState::Running;
     let handle = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(COMMAND_PROGRESS_INTERVAL);
+        let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick fires immediately; the caller just sent the
-        // Acknowledged report, so skip it.
-        tick.tick().await;
+        // The first tick fires immediately: renew the lease up front so a
+        // lease shorter than the interval cannot expire before the first
+        // report.
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => break,
@@ -124,7 +130,13 @@ pub(super) async fn execute_command(
                 .map(str::to_owned);
         }
         // Long Job operations keep the command lease alive while they run.
-        let _progress = spawn_progress_reports(client, config, auth, &result);
+        let _progress = spawn_progress_reports(
+            client,
+            config,
+            auth,
+            &result,
+            command_progress_interval(command.expires_at_ms),
+        );
         let operation = execute_job_operation(command, config, job_runtime).await;
         if let Ok(Some(manifest_uri)) = &operation {
             result.checkpoint_manifest_uri = Some(manifest_uri.clone());
@@ -158,7 +170,13 @@ pub(super) async fn execute_command(
     send_result(client, config, auth, result.clone()).await?;
     // Configuration/lifecycle execution can outlive the lease; report
     // progress until the terminal result is delivered.
-    let _progress = spawn_progress_reports(client, config, auth, &result);
+    let _progress = spawn_progress_reports(
+        client,
+        config,
+        auth,
+        &result,
+        command_progress_interval(command.expires_at_ms),
+    );
     match &command.operation {
         AgentOperation::ValidateConfiguration | AgentOperation::DiffConfiguration => {
             // Read-only reports dispatched by the Hub for console clients.
