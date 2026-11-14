@@ -323,6 +323,7 @@ fn infer_nested_array_type(array: &[CowValue]) -> Result<InferredType, Error> {
 
     for v in array {
         match v {
+            CowValue::Null => {}
             CowValue::Array(inner_array) => {
                 inner_ele_type.merge(infer_array_element_type(inner_array)?)?;
             }
@@ -342,6 +343,7 @@ fn infer_struct_array_type(array: &[CowValue]) -> Result<InferredType, Error> {
 
     for v in array {
         match v {
+            CowValue::Null => {}
             CowValue::Object(map) => collect_field_types_from_object(&mut field_types, map)?,
             _ => {
                 return Err(Error::Process(format!(
@@ -355,8 +357,11 @@ fn infer_struct_array_type(array: &[CowValue]) -> Result<InferredType, Error> {
 }
 
 fn infer_array_element_type(array: &[CowValue]) -> Result<InferredType, Error> {
-    match array.first() {
-        None => Ok(InferredType::Any), // empty array, return any type that can be updated later
+    // The first element may be null while later elements carry the shape;
+    // infer from the first NON-null element. An all-null array stays `Any`
+    // (representable as a nullable column) instead of being rejected.
+    match array.iter().find(|value| !matches!(value, CowValue::Null)) {
+        None => Ok(InferredType::Any),
         Some(a) => match a {
             CowValue::Array(_) => infer_nested_array_type(array),
             CowValue::Object(_) => infer_struct_array_type(array),

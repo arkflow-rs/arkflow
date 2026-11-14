@@ -70,7 +70,7 @@ impl Temporary for RedisTemporary {
             return Ok(None);
         }
 
-        let data: Vec<Vec<String>> = match self.config.redis_type {
+        let data: Vec<Vec<Vec<u8>>> = match self.config.redis_type {
             RedisType::List => {
                 // One lookup per DISTINCT key: duplicate input keys used to
                 // re-download and re-expand the same list, multiplying the
@@ -81,8 +81,11 @@ impl Temporary for RedisTemporary {
                     pipeline.lrange(x, 0, -1);
                 }
 
+                // Keep raw bytes: a Protobuf/binary codec is a supported
+                // configuration, and UTF-8 conversion here rejected valid
+                // encoded values before the codec ever saw them.
                 pipeline
-                    .query_async::<Vec<Vec<String>>>(&mut connection)
+                    .query_async::<Vec<Vec<Vec<u8>>>>(&mut connection)
                     .await
                     .map_err(|e| {
                         Error::Process(format!("Error in getting data from Redis: {}", e))
@@ -106,13 +109,12 @@ impl Temporary for RedisTemporary {
                 let array = array
                     .into_iter()
                     .map(|v| match v {
-                        redis::Value::SimpleString(s) => Ok(s),
-                        redis::Value::BulkString(v) => String::from_utf8(v)
-                            .map_err(|_| Error::Process("unexpected data".to_string())),
+                        redis::Value::SimpleString(s) => Ok(s.into_bytes()),
+                        redis::Value::BulkString(v) => Ok(v),
                         // An absent key is a normal lookup miss — the List
                         // path's lrange returns an empty vector for one too —
                         // not a batch failure.
-                        redis::Value::Nil => Ok(String::new()),
+                        redis::Value::Nil => Ok(Vec::new()),
                         _ => Err(Error::Process("unexpected type".to_string())),
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
@@ -120,11 +122,7 @@ impl Temporary for RedisTemporary {
                 vec![array]
             }
         };
-        let data = data
-            .iter()
-            .flatten()
-            .map(|s| s.as_bytes().to_vec())
-            .collect::<Vec<_>>();
+        let data = data.into_iter().flatten().collect::<Vec<_>>();
         let result = self.codec.decode(data).await?;
         Ok(Some(result))
     }

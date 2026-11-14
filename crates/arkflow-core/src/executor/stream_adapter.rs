@@ -63,6 +63,15 @@ impl StreamJobAdapter {
         };
         if let Some(temporary_configs) = &self.temporary {
             for temporary_config in temporary_configs {
+                // Two configurations with the same name would silently
+                // overwrite each other; a SQL temporary_list referring to the
+                // name could then read from the wrong backing store.
+                if resource.temporary.contains_key(&temporary_config.name) {
+                    return Err(Error::Config(format!(
+                        "duplicate temporary resource name '{}'",
+                        temporary_config.name
+                    )));
+                }
                 resource.temporary.insert(
                     temporary_config.name.clone(),
                     temporary_config.build(&resource)?,
