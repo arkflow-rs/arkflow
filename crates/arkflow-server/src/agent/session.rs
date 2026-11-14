@@ -442,6 +442,20 @@ pub(super) async fn run_session(
                         let mut undelivered = finished[index..].to_vec();
                         undelivered[0] = (job_id.clone(), *generation, outcome.clone());
                         job_runtime.park_observations(undelivered).await;
+                        // A Hub that ANSWERS with a client error (e.g. 401 for
+                        // an observation whose in-memory dispatch fingerprint
+                        // was lost in a Hub restart) rejects the same report on
+                        // every retry: re-registering cannot fix it and only
+                        // churns sessions. Keep it parked for the reconciler
+                        // and stay in the session; transport failures still
+                        // tear the session down so the agent re-registers.
+                        let hub_rejected = delivery
+                            .downcast_ref::<reqwest::Error>()
+                            .and_then(reqwest::Error::status)
+                            .is_some_and(|status| status.is_client_error());
+                        if hub_rejected {
+                            break;
+                        }
                         return Err(delivery);
                     }
                 }

@@ -23,6 +23,38 @@ fn redact_spec_string(raw: &str) -> String {
         .unwrap_or_else(|_| "******".into())
 }
 
+/// Restore secret values that the read API masked and the console echoed
+/// back: the spec editor round-trips `spec_json`, so a masked value must
+/// resolve to the persisted secret instead of being written verbatim.
+fn restore_masked_secrets(submitted: &mut serde_json::Value, stored: &serde_json::Value) {
+    match (submitted, stored) {
+        (serde_json::Value::Object(submitted), serde_json::Value::Object(stored)) => {
+            for (key, value) in submitted.iter_mut() {
+                if let Some(stored_value) = stored.get(key) {
+                    restore_masked_secrets(value, stored_value);
+                }
+            }
+        }
+        (serde_json::Value::Array(submitted), serde_json::Value::Array(stored))
+            if submitted.len() == stored.len() =>
+        {
+            for (value, stored_value) in submitted.iter_mut().zip(stored) {
+                restore_masked_secrets(value, stored_value);
+            }
+        }
+        (submitted @ serde_json::Value::String(_), stored) => {
+            let masked = arkflow_core::configuration::redacted_value(stored);
+            if submitted
+                .as_str()
+                .is_some_and(|value| value == "******" || Some(value) == masked.as_str())
+            {
+                *submitted = stored.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Redact the spec/plan string fields of one record-shaped JSON value.
 fn redact_record_fields(record: &mut serde_json::Value) {
     if let Some(object) = record.as_object_mut() {
@@ -599,7 +631,7 @@ pub(super) async fn hub_job_upgrade(
     State(hub): State<hub::Hub>,
     Path(job_id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<JobUpgradeRequest>,
+    Json(mut request): Json<JobUpgradeRequest>,
 ) -> Response {
     let principal = match require_operator_action(
         &hub,
@@ -623,6 +655,12 @@ pub(super) async fn hub_job_upgrade(
             format!("Unknown Job {job_id}"),
         );
     };
+    // The console prepares the upgrade from the REDACTED spec_json it read
+    // back, so any secret field it did not edit still carries the mask.
+    // Resolve those from the persisted spec before parsing the request.
+    if let Ok(stored) = serde_json::from_str::<serde_json::Value>(&current.spec_json) {
+        restore_masked_secrets(&mut request.spec, &stored);
+    }
     if current.generation != request.expected_generation {
         return problem_with_details(
             StatusCode::CONFLICT,
@@ -1025,7 +1063,14 @@ pub(super) async fn hub_job_upgrade_status(
         return response;
     }
     match hub.job_upgrade(&upgrade_id).await {
-        Ok(Some(record)) if record.job_id == job_id => Json(record).into_response(),
+        Ok(Some(record)) if record.job_id == job_id => {
+            // The target spec carries the same plaintext connector
+            // credentials as the Job spec; a Read-scoped caller must not
+            // receive them (the detail view removes the field entirely).
+            let mut value = serde_json::to_value(&record).unwrap_or_default();
+            redact_record_fields(&mut value);
+            Json(value).into_response()
+        }
         Ok(Some(_)) | Ok(None) => problem(
             StatusCode::NOT_FOUND,
             "job_upgrade_not_found",
@@ -1358,4 +1403,45 @@ pub(super) async fn reject_if_job_upgrade_active(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restore_masked_secrets;
+
+    /// The console prepares an upgrade from the REDACTED spec it read back:
+    /// masked values must resolve to the persisted secret instead of being
+    /// written verbatim as the connector credential.
+    #[test]
+    fn masked_secrets_are_restored_from_the_stored_spec() {
+        let stored = serde_json::json!({
+            "output": {
+                "url": "postgres://user:secret@db/app",
+                "password": "s3cret",
+            },
+            "source": {"max_tokens": 512},
+        });
+        let mut submitted = serde_json::json!({
+            "output": {
+                "url": "postgres://user:******@db/app",
+                "password": "******",
+            },
+            "source": {"max_tokens": 512},
+        });
+        restore_masked_secrets(&mut submitted, &stored);
+        assert_eq!(submitted, stored);
+    }
+
+    /// Values the caller actually edited (not the mask) must be kept.
+    #[test]
+    fn edited_values_are_not_overwritten() {
+        let stored = serde_json::json!({"output": {"url": "postgres://user:secret@db/app"}});
+        let mut submitted =
+            serde_json::json!({"output": {"url": "postgres://user:newpass@db/other"}});
+        restore_masked_secrets(&mut submitted, &stored);
+        assert_eq!(
+            submitted["output"]["url"],
+            "postgres://user:newpass@db/other"
+        );
+    }
 }

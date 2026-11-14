@@ -315,12 +315,20 @@ impl StorageBackend for PostgresBackend {
         }
     }
     async fn id_sequence_floor(&self) -> Result<u64, StorageError> {
-        // Max numeric suffix over the shared hop-/cmd-/attempt- namespaces.
+        // Max numeric suffix over every namespace the shared counter mints:
+        // hop- operation ids live in cp_operations (not cp_intents), and
+        // rollout-/approval-/job-upgrade- ids are persisted in their own
+        // tables. An unseeded counter would re-mint a durable PRIMARY KEY
+        // after a restart.
         let floor: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(suffix::bigint), 0) FROM (\
                SELECT regexp_replace(intent_id, '^[^-]*-', '') AS suffix FROM cp_intents WHERE intent_id LIKE 'hop-%' \
                UNION ALL SELECT regexp_replace(attempt_id, '^[^-]*-', '') FROM cp_attempts WHERE attempt_id LIKE 'attempt-%' \
-               UNION ALL SELECT regexp_replace(command_id, '^[^-]*-', '') FROM cp_attempts WHERE command_id LIKE 'cmd-%'\
+               UNION ALL SELECT regexp_replace(command_id, '^[^-]*-', '') FROM cp_attempts WHERE command_id LIKE 'cmd-%' \
+               UNION ALL SELECT regexp_replace(operation_id, '^hop-', '') FROM cp_operations WHERE operation_id LIKE 'hop-%' \
+               UNION ALL SELECT regexp_replace(rollout_id, '^rollout-', '') FROM cp_rollouts WHERE rollout_id LIKE 'rollout-%' \
+               UNION ALL SELECT regexp_replace(request_id, '^approval-', '') FROM cp_config_approval_requests WHERE request_id LIKE 'approval-%' \
+               UNION ALL SELECT regexp_replace(upgrade_id, '^job-upgrade-', '') FROM cp_job_upgrades WHERE upgrade_id LIKE 'job-upgrade-%'\
              ) ids WHERE suffix ~ '^[0-9]+$'",
         )
         .fetch_one(self.pool())

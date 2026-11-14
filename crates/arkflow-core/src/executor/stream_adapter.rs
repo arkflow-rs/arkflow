@@ -111,7 +111,11 @@ fn decode_name(payload: &serde_json::Value) -> Option<String> {
 /// [`LiveDeliveryLease`]): shared by the input and its cancellation guard.
 type PendingRetryQueue = Arc<
     std::sync::Mutex<
-        std::collections::VecDeque<(crate::MessageBatchRef, Arc<dyn crate::input::Ack>)>,
+        std::collections::VecDeque<(
+            crate::MessageBatchRef,
+            Arc<dyn crate::input::Ack>,
+            Option<u64>,
+        )>,
     >,
 >;
 
@@ -300,17 +304,24 @@ impl Drop for ReplayLease<'_> {
 
 /// Cancellation guard for a live delivery claimed from the wrapped input:
 /// if the read future is dropped between the claim and the durable WAL
-/// hand-off, the delivery is re-queued and the next read re-appends it —
-/// delayed by one read, never lost (a partially appended batch replays as
-/// a duplicate, the at-least-once floor).
+/// hand-off, the delivery is re-queued and the next read completes the
+/// hand-off — delayed by one read, never lost. The WAL sequence is recorded
+/// as soon as `append` returns: re-appending would mint a NEW sequence and
+/// leave the first one as a permanent unacknowledged hole (the ack frontier
+/// only advances through contiguous sequences).
 struct LiveDeliveryLease {
     retry: PendingRetryQueue,
     batch: crate::MessageBatchRef,
     source_ack: Arc<dyn crate::input::Ack>,
+    appended_seq: std::sync::Mutex<Option<u64>>,
     disarmed: std::sync::atomic::AtomicBool,
 }
 
 impl LiveDeliveryLease {
+    fn record_appended(&self, seq: u64) {
+        *self.appended_seq.lock().expect("wal retry seq poisoned") = Some(seq);
+    }
+
     fn disarm(&self) {
         self.disarmed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -320,8 +331,9 @@ impl LiveDeliveryLease {
 impl Drop for LiveDeliveryLease {
     fn drop(&mut self) {
         if !self.disarmed.load(std::sync::atomic::Ordering::Acquire) {
+            let seq = *self.appended_seq.lock().expect("wal retry seq poisoned");
             if let Ok(mut queue) = self.retry.lock() {
-                queue.push_back((self.batch.clone(), self.source_ack.clone()));
+                queue.push_back((self.batch.clone(), self.source_ack.clone(), seq));
             }
         }
     }
@@ -374,14 +386,26 @@ impl Input for WalInput {
                 .lock()
                 .expect("wal retry queue poisoned")
                 .pop_front();
-            if let Some((batch, source_ack)) = popped {
+            if let Some((batch, source_ack, appended_seq)) = popped {
                 let lease = LiveDeliveryLease {
                     retry: Arc::clone(&self.pending_retry),
                     batch: Arc::clone(&batch),
                     source_ack: Arc::clone(&source_ack),
+                    appended_seq: std::sync::Mutex::new(appended_seq),
                     disarmed: std::sync::atomic::AtomicBool::new(false),
                 };
-                let seq = self.wal.append(&batch).await?;
+                // The cancelled read may already have appended this batch to
+                // the WAL: reuse that sequence. Appending again would mint a
+                // new sequence and leave the first one permanently unacked,
+                // parking every later acknowledgement behind the gap.
+                let seq = match appended_seq {
+                    Some(seq) => seq,
+                    None => {
+                        let seq = self.wal.append(&batch).await?;
+                        lease.record_appended(seq);
+                        seq
+                    }
+                };
                 self.wal.flush().await?;
                 lease.disarm();
                 return Ok((
@@ -395,9 +419,13 @@ impl Input for WalInput {
             retry: Arc::clone(&self.pending_retry),
             batch: Arc::clone(&batch),
             source_ack: Arc::clone(&ack),
+            appended_seq: std::sync::Mutex::new(None),
             disarmed: std::sync::atomic::AtomicBool::new(false),
         };
         let seq = self.wal.append(&batch).await?;
+        // Record the assigned sequence before the flush await: a cancelled
+        // flush must retry the flush, not append the batch a second time.
+        lease.record_appended(seq);
         // Group-commit and periodic WALs stage appends asynchronously. The
         // record is now being published to downstream processing, so force the
         // durable hand-off before returning it from read().

@@ -301,8 +301,9 @@ fn assemble_sse(body: &str) -> Result<(String, Option<Value>), Error> {
             .map_err(|e| Error::Process(format!("LLM stream chunk parse failed: {e}")))?;
         // An explicit in-stream error object must FAIL the stream: the
         // previous silent skip reported empty or partial content as success
-        // when the provider errored mid-stream.
-        if let Some(error) = chunk.get("error") {
+        // when the provider errored mid-stream. `"error": null` is the
+        // OpenAI-compatible way of saying "no error" and must be ignored.
+        if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
             return Err(Error::Process(format!("LLM stream error: {error}")));
         }
         let Some(delta) = chunk

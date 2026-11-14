@@ -729,11 +729,17 @@ fn role_from_claims(claims: &Value, role_claim: &str) -> Option<OperatorRole> {
 /// documents); array claims carry one scope per element.
 fn scopes_from_claims(claims: &Value, scopes_claim: &str) -> Option<Vec<ResourceScope>> {
     let raw: Vec<String> = match claims.get(scopes_claim) {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
+        Some(Value::Array(items)) => {
+            // Every element must be a string: silently dropping non-strings
+            // turned an all-non-string claim into an EMPTY scope list, and
+            // empty scopes mean "unrestricted" in `can_scope`. Malformed
+            // entries must deny the token instead.
+            let mut raw = Vec::with_capacity(items.len());
+            for item in items {
+                raw.push(item.as_str()?.to_owned());
+            }
+            raw
+        }
         Some(Value::String(value)) => value
             .split(',')
             .map(str::trim)
@@ -1559,6 +1565,12 @@ mod tests {
         assert!(scopes_from_claims(&malformed, "permissions").is_none());
         let malformed_type = json!({ "permissions": 7 });
         assert!(scopes_from_claims(&malformed_type, "permissions").is_none());
+        // Non-string array entries are malformed: silently dropping them
+        // used to turn [42] into an EMPTY scope list (= unrestricted).
+        let non_string = json!({ "permissions": [42] });
+        assert!(scopes_from_claims(&non_string, "permissions").is_none());
+        let mixed = json!({ "permissions": ["node=node-a", 42] });
+        assert!(scopes_from_claims(&mixed, "permissions").is_none());
         let comma_separated = json!({ "permissions": "node=node-a, stream=b" });
         let scopes =
             scopes_from_claims(&comma_separated, "permissions").expect("comma list parses");

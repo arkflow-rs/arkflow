@@ -1193,6 +1193,24 @@ async fn spawn_kernel_job(
     // installed for the task's REAL partition, never a synthesized
     // partition 0.
     let mut gate_partitions: BTreeMap<String, u32> = BTreeMap::new();
+    // Chains sharing one watermark group must track their physical
+    // partitions under a per-chain namespace: otherwise one chain's observed
+    // event time advances the shared minimum and closes windows the other
+    // chain still holds. Mirrors the local runner's gate builder.
+    let mut group_sizes: BTreeMap<String, usize> = BTreeMap::new();
+    for chain in &graph.chains {
+        if chain
+            .source_time
+            .as_ref()
+            .is_some_and(|time| time.mode == arkflow_core::job::TimeMode::EventTime)
+        {
+            let group = chain
+                .watermark_group
+                .clone()
+                .unwrap_or_else(|| chain.entry_task_id().to_owned());
+            *group_sizes.entry(group).or_insert(0) += 1;
+        }
+    }
     for chain in &graph.chains {
         if let Some(source_time) = chain
             .source_time
@@ -1203,6 +1221,7 @@ async fn spawn_kernel_job(
                 .watermark_group
                 .clone()
                 .unwrap_or_else(|| chain.entry_task_id().to_owned());
+            let gate_shared = group_sizes.get(group.as_str()).copied().unwrap_or(0) > 1;
             let tracker = match shared_trackers.entry(group) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1214,13 +1233,16 @@ async fn spawn_kernel_job(
                     tracker
                 }
             };
-            let gate =
+            let mut gate =
                 arkflow_core::executor::event_time_gate::EventTimeGate::new_with_shared_tracker(
                     source_time,
                     chain.window_timings.clone(),
                     tracker,
                 )
                 .map_err(|error| error.to_string())?;
+            if gate_shared {
+                gate = gate.with_namespace(chain.entry_task_id());
+            }
             if let Some(partition) = chain.source_partition {
                 gate_partitions.insert(chain.entry_task_id().to_owned(), partition);
             }

@@ -3629,6 +3629,32 @@ impl StorageBackend for SqliteBackend {
             "SELECT command_id FROM cp_attempts WHERE command_id LIKE 'cmd-%'",
             "cmd-",
         )?);
+        // HUB_SEQUENCE also mints hop- operation ids (persisted in
+        // cp_operations, not cp_intents), rollout-, approval- and
+        // job-upgrade- ids. Leaving them out re-enters the counter at 1
+        // after a restart: the new id collides with a durable PRIMARY KEY,
+        // and upsert_operation's ON CONFLICT DO UPDATE overwrites the old
+        // record.
+        for (sql, prefix) in [
+            (
+                "SELECT operation_id FROM cp_operations WHERE operation_id LIKE 'hop-%'",
+                "hop-",
+            ),
+            (
+                "SELECT rollout_id FROM cp_rollouts WHERE rollout_id LIKE 'rollout-%'",
+                "rollout-",
+            ),
+            (
+                "SELECT request_id FROM cp_config_approval_requests WHERE request_id LIKE 'approval-%'",
+                "approval-",
+            ),
+            (
+                "SELECT upgrade_id FROM cp_job_upgrades WHERE upgrade_id LIKE 'job-upgrade-%'",
+                "job-upgrade-",
+            ),
+        ] {
+            floor = floor.max(sqlite_suffix_max(&connection, sql, prefix)?);
+        }
         Ok(floor)
     }
     async fn intent_counter_floor(&self) -> Result<u64, StorageError> {

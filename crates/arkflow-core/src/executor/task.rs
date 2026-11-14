@@ -3128,7 +3128,7 @@ fn partition_batch_by_key_hash(
     // previous dense `vec![no_owner; max_parallelism]` turned a huge
     // configured max_parallelism (accepted up to u32::MAX) into a
     // multi-gigabyte allocation even for two physical subtasks.
-    let ranges: Vec<(usize, &crate::job::KeyGroupRange)> = key_group_ranges
+    let mut ranges: Vec<(usize, &crate::job::KeyGroupRange)> = key_group_ranges
         .iter()
         .take(subtasks)
         .enumerate()
@@ -3137,6 +3137,11 @@ fn partition_batch_by_key_hash(
         // ordering; they own nothing and are dropped.
         .filter(|(_, range)| range.start <= range.end)
         .collect();
+    // Split placement concatenates the local runs and the remote tasks, so
+    // the ranges are NOT ordered by key group; sort them and keep each
+    // entry's ORIGINAL subtask index (the post-filter position is not the
+    // subtask id, and a binary search needs group order to work at all).
+    ranges.sort_by_key(|(_, range)| range.start);
     let mut buckets: Vec<Vec<u32>> = (0..subtasks).map(|_| Vec::new()).collect();
     for (row, group) in key_groups.iter().enumerate() {
         let Some(group) = group else {
@@ -3152,7 +3157,7 @@ fn partition_batch_by_key_hash(
                     std::cmp::Ordering::Equal
                 }
             })
-            .map(|index| index as u32)
+            .map(|index| ranges[index].0 as u32)
             .unwrap_or(no_owner);
         if owner != no_owner {
             buckets[owner as usize].push(row as u32);

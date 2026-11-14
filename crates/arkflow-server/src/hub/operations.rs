@@ -738,6 +738,7 @@ impl Hub {
             operation.finished_at_ms = Some(now_ms());
         }
         if matches!(result.state, HubOperationState::Acknowledged) {
+            operation.progress = result.progress;
             let now = now_ms();
             operation.acknowledged_at_ms = Some(now);
             // Enqueue-to-acknowledgement latency, the metric the spec
@@ -748,6 +749,22 @@ impl Hub {
             );
             self.command_metrics
                 .record_outcome(operation.operation.as_str(), "acknowledged");
+        }
+        if matches!(
+            result.state,
+            HubOperationState::Acknowledged | HubOperationState::Running
+        ) {
+            // A progress report renews the command lease. The expiry is
+            // stamped at enqueue, so without this a JobStart that outlives
+            // lease_ttl (connect + checkpoint restore) would be swept as
+            // expired, marked TimedOut and dispatched a second time while the
+            // agent still runs it. A silent agent stops renewing and still
+            // expires, so liveness detection is preserved.
+            if let Some(node) = nodes.get_mut(&auth.node_id) {
+                if let Some(command) = node.leased_commands.get_mut(&result.command_id) {
+                    command.expires_at_ms = now_ms() + self.config.lease_ttl_ms;
+                }
+            }
         }
         if let Some(outcome) = CommandMetrics::outcome_label(result.state) {
             self.command_metrics

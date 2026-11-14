@@ -90,7 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // with the token still live is abnormal (standalone startup
                 // guard refusal, bind failure).
                 if cancellation.is_cancelled() {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    // The handle's output was just consumed: polling it again
+                    // panics ("JoinHandle polled after completion"), and
+                    // re-looping would spin. Disarm the branch so the loop
+                    // simply waits for the engine to finish draining.
+                    server_task = None;
                     continue;
                 }
                 let result = result
@@ -110,7 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             result = async { agent_task.as_mut().unwrap().await }, if agent_task.is_some() => {
                 if cancellation.is_cancelled() {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    // Same completed-handle hazard as the server branch.
+                    agent_task = None;
                     continue;
                 }
                 // The Agent owns registration and its own reconnect loop, so

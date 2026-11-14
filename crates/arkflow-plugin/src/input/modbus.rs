@@ -115,15 +115,14 @@ impl Input for ModbusInput {
         };
 
         let due = {
-            let mut next_due = self.next_due.lock().expect("modbus next_due lock poisoned");
+            let next_due = self.next_due.lock().expect("modbus next_due lock poisoned");
             match *next_due {
                 Some(due) => due,
                 None => {
-                    // First poll fires immediately; the cadence starts only
-                    // after the first successful delivery.
-                    let due = std::time::Instant::now() + self.config.interval;
-                    *next_due = Some(due);
-                    due
+                    // First poll fires immediately; the cadence is armed only
+                    // after the first successful delivery (the update below),
+                    // so a cancelled first attempt still polls right away.
+                    std::time::Instant::now()
                 }
             }
         };
