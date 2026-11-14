@@ -183,7 +183,7 @@ export function Runtime({
                           title: t('runtime.confirmAction', { action: t(`common.${action}`), id: stream.id }),
                           confirmLabel: t(`common.${action}`),
                         }).then((accepted) => {
-                          if (accepted) void command(stream.id, action)
+                          if (accepted) void command(stream.id, action, stream.node_id)
                         })
                       }}
                     >

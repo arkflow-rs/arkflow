@@ -40,6 +40,21 @@ pub fn register(udf: WindowUDF) -> Result<(), Error> {
             name
         )));
     };
+    // Alias namespace check — see scalar_udf::register.
+    let mut keys: Vec<&str> = vec![name];
+    keys.extend(udf.aliases().iter().map(String::as_str));
+    for (existing_name, existing_udf) in udfs.iter() {
+        let collides = keys.iter().any(|key| *key == existing_name.as_str())
+            || keys
+                .iter()
+                .any(|key| existing_udf.aliases().iter().any(|alias| alias == *key));
+        if collides {
+            return Err(Error::Config(format!(
+                "Window UDF '{}' collides with the name or alias of an existing UDF '{}'",
+                name, existing_name
+            )));
+        }
+    }
     udfs.insert(name.to_string(), Arc::new(udf));
     Ok(())
 }

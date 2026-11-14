@@ -950,6 +950,10 @@ export function streamEvents(
             emit()
           }
         }
+        // A clean server close (EOF without abort) also ends the live
+        // stream: report the gap before the backoff reconnects, or the UI
+        // keeps showing "Live" through the whole outage window.
+        if (!controller.signal.aborted) onState?.('disconnected')
       } catch {
         // Covers both real failures and the connect-deadline abort; outer
         // cleanup (controller aborted) reports nothing and exits the loop.

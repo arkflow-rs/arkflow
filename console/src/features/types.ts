@@ -20,4 +20,8 @@ export type Snapshot = {
   metrics?: MetricsResponse
   totals?: { nodes: number; streams: number; operations: number; events: number }
 }
-export type Command = (id: string, action: 'start' | 'stop' | 'restart') => Promise<void>
+export type Command = (
+  id: string,
+  action: 'start' | 'stop' | 'restart',
+  nodeId?: string,
+) => Promise<void>
