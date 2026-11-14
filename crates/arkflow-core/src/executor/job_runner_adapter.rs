@@ -916,13 +916,40 @@ impl RescaleContext {
             .find(marker)
             .ok_or_else(|| Error::Process("state namespace lacks a task segment".into()))?
             + marker.len();
-        Ok(namespace[start..]
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .replace("%3A", ":")
-            .replace("%25", "%"))
+        Ok(percent_decode(
+            namespace[start..].split(':').next().unwrap_or_default(),
+        )?)
     }
+}
+
+/// Decode the percent-encoding used by `encode_state_component` for every
+/// escaped byte, not just `%3A`/`%25`: operator/task ids may contain `/`,
+/// spaces, or non-ASCII characters and must round-trip to the plan's id.
+fn percent_decode(value: &str) -> Result<String, Error> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = value.get(index + 1..index + 3).ok_or_else(|| {
+                Error::Process(format!(
+                    "state namespace has a truncated percent escape: {value}"
+                ))
+            })?;
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+                Error::Process(format!(
+                    "state namespace has an invalid percent escape: {value}"
+                ))
+            })?;
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| Error::Process(format!("state namespace is not valid UTF-8: {value}")))
 }
 
 /// Extract the operator-id segment from a state namespace built by
@@ -936,7 +963,7 @@ fn namespace_operator(namespace: &str) -> Result<String, Error> {
         + marker.len();
     let rest = &namespace[start..];
     let end = rest.find(":task:").unwrap_or(rest.len());
-    Ok(rest[..end].replace("%3A", ":").replace("%25", "%"))
+    percent_decode(&rest[..end])
 }
 
 fn restore_local_snapshot<S: crate::checkpoint::CheckpointStore>(

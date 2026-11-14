@@ -83,10 +83,13 @@ impl SessionContextPool {
     }
 
     fn push_available(&self, index: usize) {
-        self.available
-            .lock()
-            .expect("context pool lock")
-            .push(index);
+        let mut available = self.available.lock().expect("context pool lock");
+        // A public release is not tied to a lease; a cloned Arc released
+        // twice must not make one slot available twice and hand the same
+        // DataFusion context to two callers.
+        if !available.contains(&index) {
+            available.push(index);
+        }
     }
 
     /// Wait for a free slot until the acquisition deadline. An exhausted

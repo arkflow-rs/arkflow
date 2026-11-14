@@ -24,7 +24,6 @@ use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufWriter, Write};
-use std::string::String;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -77,12 +76,11 @@ impl Output for StdoutOutput {
         // lines and the flush below is the single per-batch write.
         let mut writer_std = self.writer.lock().await;
         for payload in payloads {
-            let s = String::from_utf8_lossy(&payload);
-
+            // Write bytes verbatim: a binary codec's payload must survive
+            // redirection unchanged, not turn invalid UTF-8 into U+FFFD.
+            writer_std.write_all(&payload).map_err(Error::Io)?;
             if self.config.append_newline.unwrap_or(true) {
-                writeln!(writer_std, "{}", s).map_err(Error::Io)?
-            } else {
-                write!(writer_std, "{}", s).map_err(Error::Io)?
+                writer_std.write_all(b"\n").map_err(Error::Io)?;
             }
         }
 

@@ -106,8 +106,20 @@ pub(super) fn checkpoint_worker() -> &'static flume::Sender<CheckpointJob> {
                     }
                 };
                 runtime.block_on(async move {
+                    // Bound in-flight object-store work. The channel only
+                    // bounds queued jobs; once spawned, a slow request still
+                    // owns a snapshot and a blocked caller.
+                    let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
                     while let Ok(job) = receiver.recv_async().await {
-                        let handle = tokio::spawn(job.future);
+                        let permit = in_flight
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("checkpoint worker semaphore is never closed");
+                        let handle = tokio::spawn(async move {
+                            let _permit = permit;
+                            job.future.await;
+                        });
                         tokio::spawn(async move {
                             if handle.await.is_err() {
                                 tracing::error!("checkpoint object store command panicked");

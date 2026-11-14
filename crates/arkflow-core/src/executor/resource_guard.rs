@@ -246,7 +246,7 @@ async fn connect_guarded(connected: &mut Vec<Guarded>, resource: Guarded) -> Res
         // A connector may allocate a WAL/consumer before discovering a
         // startup error. It is not in `connected` yet, so close this failed
         // resource explicitly before the caller cleans up earlier resources.
-        if let Err(close_error) = resource.close().await {
+        if let Some(close_error) = close_resource_bounded(&resource).await {
             tracing::warn!(
                 %close_error,
                 resource = %resource.label(),
@@ -262,7 +262,7 @@ async fn connect_guarded(connected: &mut Vec<Guarded>, resource: Guarded) -> Res
 async fn reverse_close(connected: &mut Vec<Guarded>) -> Result<(), Error> {
     let mut first_error = None;
     while let Some(resource) = connected.pop() {
-        if let Err(error) = resource.close().await {
+        if let Some(error) = close_resource_bounded(&resource).await {
             tracing::warn!(%error, resource = %resource.label(), "failed to close job resource");
             if first_error.is_none() {
                 first_error = Some(error);
@@ -270,6 +270,31 @@ async fn reverse_close(connected: &mut Vec<Guarded>) -> Result<(), Error> {
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Close one resource with a hang/panic bound. A wedged connector close must
+/// not prevent the remaining resources (or the caller's startup error) from
+/// being handled.
+async fn close_resource_bounded(resource: &Guarded) -> Option<Error> {
+    const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    match tokio::time::timeout(
+        CLOSE_TIMEOUT,
+        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(resource.close())),
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(error))) => Some(error),
+        Ok(Err(_panic)) => Some(Error::Process(format!(
+            "resource '{}' close panicked",
+            resource.label()
+        ))),
+        Err(_) => Some(Error::Process(format!(
+            "resource '{}' close exceeded {}s",
+            resource.label(),
+            CLOSE_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 #[cfg(test)]

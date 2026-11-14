@@ -195,11 +195,13 @@ impl Input for MultipleInputs {
                 generation.tracker.wait().await;
             }
         }
+        let mut first_error = None;
         for input in &self.inputs {
-            input.close().await?;
+            if let Err(error) = input.close().await {
+                first_error.get_or_insert(error);
+            }
         }
-
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -217,24 +219,36 @@ impl MultipleInputs {
             ));
         }
         let (sender, receiver) = flume::bounded(CHANNEL_CAPACITY);
-        let mut inputs = Vec::with_capacity(config.inputs.len());
-        let mut input_names_mut = resource.input_names.borrow_mut();
-        for x in config.inputs {
-            if let Some(name) = &x.name {
+        let mut declared_names = Vec::with_capacity(config.inputs.len());
+        for child in &config.inputs {
+            if let Some(name) = &child.name {
                 if name.is_empty() {
                     return Err(Error::Config(
                         "Multiple-inputs input configuration has empty input name".to_string(),
                     ));
                 }
-                input_names_mut.push(name.clone());
+                declared_names.push(name.clone());
             }
-            inputs.push(x.build(resource)?);
         }
-        let input_names_hash_set = input_names_mut.iter().cloned().collect::<HashSet<String>>();
-        if input_names_hash_set.len() != input_names_mut.len() {
-            return Err(Error::Config(
-                "Multiple-inputs input configuration has duplicate input names".to_string(),
-            ));
+        // Record this level's names in their own borrow scope. Holding the
+        // RefCell borrow across `build()` panicked when a child was itself a
+        // multiple-inputs input (its constructor borrows the same RefCell).
+        {
+            let mut input_names = resource.input_names.borrow_mut();
+            input_names.extend(declared_names);
+        }
+        let mut inputs = Vec::with_capacity(config.inputs.len());
+        for child in config.inputs {
+            inputs.push(child.build(resource)?);
+        }
+        {
+            let input_names = resource.input_names.borrow();
+            let input_names_hash_set = input_names.iter().cloned().collect::<HashSet<String>>();
+            if input_names_hash_set.len() != input_names.len() {
+                return Err(Error::Config(
+                    "Multiple-inputs input configuration has duplicate input names".to_string(),
+                ));
+            }
         };
 
         Ok(Self {

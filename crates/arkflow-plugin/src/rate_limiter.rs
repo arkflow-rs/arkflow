@@ -31,6 +31,10 @@ pub struct SimpleRateLimiter {
 struct RateLimiterState {
     tokens: AtomicU32,
     last_update: AtomicU64, // Stores nanoseconds since epoch
+    /// Serializes refill accounting: reading/writing the clock and the token
+    /// balance as separate atomics let two callers consume the same refill
+    /// interval or overwrite a token another caller had just deducted.
+    refill_lock: std::sync::Mutex<()>,
 }
 
 impl SimpleRateLimiter {
@@ -47,6 +51,7 @@ impl SimpleRateLimiter {
             state: Arc::new(RateLimiterState {
                 tokens: AtomicU32::new(burst_size),
                 last_update: AtomicU64::new(Self::now_nanos()),
+                refill_lock: std::sync::Mutex::new(()),
             }),
         }
     }
@@ -84,6 +89,7 @@ impl SimpleRateLimiter {
     }
 
     fn refill_tokens(&self) {
+        let _guard = self.state.refill_lock.lock().expect("rate limiter lock");
         let now = Self::now_nanos();
         let last_update = self.state.last_update.load(Ordering::Relaxed);
 
