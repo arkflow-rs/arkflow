@@ -44,7 +44,8 @@ export function routeFor(docsRoot, file) {
  * the page's directory; a `kind/name` entry states the kind explicitly.
  */
 export function parseComponentOwnership(docsRoot, file, text) {
-  const frontMatter = /^---\n([\s\S]*?)\n---/.exec(text);
+  const normalizedText = text.replace(/\r\n/g, '\n');
+  const frontMatter = /^---\n([\s\S]*?)\n---/.exec(normalizedText);
   if (!frontMatter) {
     throw new Error(`${path.relative(docsRoot, file)}: missing front matter`);
   }
