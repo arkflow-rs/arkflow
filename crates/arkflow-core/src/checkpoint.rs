@@ -881,6 +881,38 @@ impl CheckpointCoordinator {
                 "checkpoint task attempts do not cover all participating tasks".into(),
             ));
         }
+        // A duplicate attempt ROW for one task would collapse in the set
+        // above and seal state against an ambiguous dispatch record.
+        let mut attempt_ids = BTreeSet::new();
+        for attempt in &task_attempts {
+            if !attempt_ids.insert(attempt.attempt_id.as_str()) {
+                return Err(Error::Process(format!(
+                    "checkpoint task attempts contain a duplicate attempt '{}'",
+                    attempt.attempt_id
+                )));
+            }
+        }
+        // Every acknowledgement must come from the attempt row DISPATCHED
+        // for its task: an ack from a stale attempt (a previous dispatch of
+        // the same generation) would otherwise seal state from a node that
+        // is no longer executing the task.
+        for ack in self.acknowledgements.values() {
+            let attempt = task_attempts
+                .iter()
+                .find(|attempt| attempt.task_id == ack.task_id)
+                .ok_or_else(|| {
+                    Error::Process(format!(
+                        "checkpoint acknowledgement from unknown task '{}'",
+                        ack.task_id
+                    ))
+                })?;
+            if attempt.attempt_id != ack.attempt_id {
+                return Err(Error::Process(format!(
+                    "checkpoint acknowledgement from task '{}' came from attempt '{}' but the dispatched attempt is '{}'",
+                    ack.task_id, ack.attempt_id, attempt.attempt_id
+                )));
+            }
+        }
         validate_state_snapshot_task_set(&state_snapshots, &self.participants)
             .map_err(Error::Process)?;
         let barrier = self

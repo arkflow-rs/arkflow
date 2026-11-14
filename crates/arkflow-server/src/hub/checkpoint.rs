@@ -589,7 +589,15 @@ impl Hub {
             if nodes.is_empty() {
                 fallback_nodes.iter().cloned().collect::<Vec<_>>()
             } else {
-                nodes.into_iter().collect::<Vec<_>>()
+                // Re-derive in DISPATCH order (the remembered placement
+                // order, set members not remembered appended): split
+                // placement round-robins by node-list POSITION, so a lexical
+                // re-ordering would assign tasks to different nodes than the
+                // dispatch that actually ran them — the expected participant
+                // set would diverge from the executing one and the
+                // aggregation would spuriously mismatch.
+                self.retained_targets_in_dispatch_order(&operation.resource_id, &nodes)
+                    .await
             }
         } else {
             job.node_ids.clone()

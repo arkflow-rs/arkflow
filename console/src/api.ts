@@ -679,8 +679,14 @@ export const api = {
     request<ControlNode>(`/nodes/${encodeURIComponent(id)}/maintenance`, { method: 'POST' }),
   resumeNode: (id: string) =>
     request<ControlNode>(`/nodes/${encodeURIComponent(id)}/maintenance`, { method: 'DELETE' }),
-  streams: (nodeId?: string) =>
-    request<Page<StreamStatus>>(`/streams${nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''}`),
+  streams: (nodeId?: string, page?: number, pageSize?: number) =>
+    request<Page<StreamStatus>>(
+      withQuery('/streams', {
+        ...(nodeId ? { node_id: nodeId } : {}),
+        ...(page ? { page } : {}),
+        ...(pageSize ? { page_size: pageSize } : {}),
+      }),
+    ),
   events: (query: EventListQuery = {}) => request<Page<ControlEvent>>(withQuery('/events', query)),
   operations: (query: OperationListQuery = {}) => request<Page<Operation>>(withQuery('/operations', query)),
   operation: (id: string) => request<Operation>(`/operations/${encodeURIComponent(id)}`),

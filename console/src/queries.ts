@@ -5,8 +5,11 @@ import {
   errorMessage,
   isPermissionError,
   type AuditListQuery,
+  type ControlNode,
   type EventListQuery,
   type OperationListQuery,
+  type Page,
+  type StreamStatus,
   JOB_DETAIL_INTERVAL_MS,
   ROLLOUT_DETAIL_INTERVAL_MS,
   SNAPSHOT_INTERVAL_MS,
@@ -76,7 +79,23 @@ export function useStatus() {
   return useQuery({ queryKey: ['live', 'status'], queryFn: api.status, ...live })
 }
 
-const DEFAULT_PREVIEW_SIZE = 256
+// The server clamps page_size to 100; fleet-wide views page at the cap.
+const FLEET_PAGE_SIZE = 100
+
+/// Fetch every page of a list endpoint. Fleet-wide counts (overview
+/// failures/health) must not be derived from the FIRST page: a failure
+/// beyond it would read as "no failures" while the denominator shows the
+/// server's total. The assembled `Page` keeps the consumers' shape.
+async function fetchAllPages<T>(fetchPage: (page: number) => Promise<Page<T>>): Promise<Page<T>> {
+  const first = await fetchPage(1)
+  const items = [...first.items]
+  const pageSize = Math.max(1, first.page_size)
+  const pages = Math.min(1000, Math.ceil(first.total / pageSize))
+  for (let page = 2; page <= pages; page += 1) {
+    items.push(...(await fetchPage(page)).items)
+  }
+  return { items, page: 1, page_size: items.length || pageSize, total: first.total }
+}
 
 // Webhook subscriptions change only through this page's own mutations —
 // not 'live': refreshed by invalidation, not on the snapshot cadence.
@@ -101,17 +120,17 @@ export function useUserCredentials(userId: string | undefined) {
 }
 
 export function useNodes(label?: string) {
-  return useQuery({
+  return useQuery<Page<ControlNode>>({
     queryKey: ['live', 'nodes', label ?? null],
-    queryFn: () => (label ? api.nodes(1, DEFAULT_PREVIEW_SIZE, label) : api.nodes()),
+    queryFn: () => fetchAllPages<ControlNode>((page) => api.nodes(page, FLEET_PAGE_SIZE, label)),
     ...live,
   })
 }
 
 export function useStreams(nodeId?: string) {
-  return useQuery({
+  return useQuery<Page<StreamStatus>>({
     queryKey: ['live', 'streams', nodeId ?? null],
-    queryFn: () => api.streams(nodeId),
+    queryFn: () => fetchAllPages<StreamStatus>((page) => api.streams(nodeId, page, FLEET_PAGE_SIZE)),
     ...live,
   })
 }
