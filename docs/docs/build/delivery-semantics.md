@@ -28,7 +28,7 @@ is persisted locally first.
 | **MQTT** | Yes (QoS ≥ 1) | manual ack (`set_manual_acks(true)`); default QoS 1 |
 | **NATS (JetStream)** | Yes | `message.ack()` on ack only |
 | **Pulsar** | Yes | `consumer.ack()` on ack only |
-| **Redis (Streams)** | Yes (with consumer groups) | depends on configuration |
+| **Redis (List / Pub/Sub)** | **No** (Lists are consumed destructively; Pub/Sub is fire-and-forget; Streams consumer groups are not implemented) | none |
 | **SQL** | Partial (incremental query) | via incremental cursor |
 | **HTTP (server)** | **No** (webhook) | none — fire-and-forget |
 | **HTTP (client poll)** | **No** | none |

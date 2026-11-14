@@ -20,7 +20,7 @@ ArkFlow 在崩溃后如何处理消息,取决于输入能否**重新投递**尚�
 | **MQTT** | 是(QoS ≥ 1) | 手动 ack(`set_manual_acks(true)`);默认 QoS 1 |
 | **NATS (JetStream)** | 是 | 仅在 ack 时 `message.ack()` |
 | **Pulsar** | 是 | 仅在 ack 时 `consumer.ack()` |
-| **Redis (Streams)** | 是(使用消费者组时) | 取决于配置 |
+| **Redis (List / Pub/Sub)** | **否**(List 为破坏性消费;Pub/Sub 即发即忘;未实现 Streams 消费者组) | 无 |
 | **SQL** | 部分(增量查询) | 通过增量游标 |
 | **HTTP(服务端)** | **否**(webhook) | 无——即发即忘 |
 | **HTTP(客户端轮询)** | **否** | 无 |
