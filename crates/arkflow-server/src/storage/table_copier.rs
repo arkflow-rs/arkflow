@@ -726,6 +726,15 @@ pub fn finalize_sqlite_snapshot(
 ) -> Result<CopyReport, StorageError> {
     let snapshot = rusqlite::Connection::open(snapshot_path)?;
     snapshot.execute("DELETE FROM cp_hub_lease", [])?;
+    // Browser sessions are live bearer secrets: the dedicated restore path
+    // already excludes `cp_sessions` (see TABLE_ORDER), but VACUUM INTO
+    // copies them, so a snapshot used DIRECTLY as a database would
+    // reactivate every unexpired session. Purge them from the snapshot like
+    // the lease row.
+    snapshot.execute("DELETE FROM cp_sessions", [])?;
+    // SQLite does not shrink on DELETE; leave the file as-is — the rows are
+    // gone from the restored database either way.
+    snapshot.execute("VACUUM", [])?;
     let mut report = CopyReport::default();
     for (table, expected_rows) in expected {
         let actual = sqlite_count_rows_conn(&snapshot, &table)?;
@@ -780,6 +789,46 @@ mod tests {
         assert!(position("i2") < position("i3"));
         // The dangling reference emits without blocking.
         assert!(position("i4") < ordered.len());
+    }
+
+    /// Regression: a SQLite snapshot used DIRECTLY as a database must not
+    /// resurrect browser sessions. VACUUM INTO copies `cp_sessions` even
+    /// though the dedicated restore path excludes it, so the snapshot
+    /// finalizer purges the table alongside the lease row.
+    #[test]
+    fn finalize_sqlite_snapshot_purges_sessions_and_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cp_hub_lease (id INTEGER PRIMARY KEY);
+                 INSERT INTO cp_hub_lease (id) VALUES (1);
+                 CREATE TABLE cp_sessions (session_hash TEXT PRIMARY KEY, user_id TEXT);
+                 INSERT INTO cp_sessions (session_hash, user_id) VALUES ('h1', 'u1');
+                 CREATE TABLE cp_users (user_id TEXT PRIMARY KEY);
+                 INSERT INTO cp_users (user_id) VALUES ('u1');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let report = finalize_sqlite_snapshot(
+            path.to_str().unwrap(),
+            vec![("cp_users".to_string(), 1)],
+        )
+        .unwrap();
+        assert_eq!(report.rows_per_table, vec![("cp_users".to_string(), 1)]);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let sessions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM cp_sessions", [], |row| row.get(0))
+            .unwrap();
+        let leases: i64 = connection
+            .query_row("SELECT COUNT(*) FROM cp_hub_lease", [], |row| row.get(0))
+            .unwrap();
+        let users: i64 = connection
+            .query_row("SELECT COUNT(*) FROM cp_users", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((sessions, leases, users), (0, 0, 1));
     }
 
     #[test]

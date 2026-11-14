@@ -41,7 +41,7 @@ sidebar_label: File
 |-------|------|----------|-------------|
 | type | string | yes | `"gs"` |
 | bucket_name | string | yes | GCS 存储桶名称 |
-| url | string | no | 自定义端点 |
+| url | string | no | 自定义端点:`gs://bucket`(须与 bucket_name 同名)或指向模拟器的 `http(s)://` 端点(桶仍由 bucket_name 决定) |
 | service_account_path | string | no | 服务账号 JSON 密钥文件的路径 |
 | service_account_key | string | no | 服务账号 JSON 原始内容 |
 
@@ -61,7 +61,7 @@ sidebar_label: File
 | Field | Type | Required | 描述 |
 |-------|------|----------|-------------|
 | type | string | yes | `"http"` |
-| url | string | yes | HTTP 端点 URL |
+| url | string | yes | 存储源点(`scheme://host[:port]`);路径前缀应写入数据 `path`(如 `path: http://host/prefix/file.parquet`) |
 
 #### HDFS
 

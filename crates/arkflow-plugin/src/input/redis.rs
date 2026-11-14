@@ -397,7 +397,22 @@ impl RedisInput {
 
                     loop {
                         tokio::select! {
-                            Some(msg_result) = msg_stream.next() => {
+                            next_message = msg_stream.next() => {
+                                let Some(msg_result) = next_message else {
+                                    // The push stream ended (connection
+                                    // dropped): surface the loss so the
+                                    // engine reconnects. The previous
+                                    // `Some(..) =` pattern form silently
+                                    // disabled this branch and the task
+                                    // waited on cancellation forever.
+                                    if let Err(e) = sender_clone
+                                        .send_async(Delivery::Err(Error::Disconnection))
+                                        .await
+                                    {
+                                        error!("{}", e);
+                                    }
+                                    break;
+                                };
                                 let _channel: String = msg_result.get_channel_name().to_string();
                                 let Ok(payload) = msg_result.get_payload::<Vec<u8>>() else {
                                        continue;

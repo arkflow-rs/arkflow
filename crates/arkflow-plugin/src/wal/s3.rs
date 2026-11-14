@@ -487,16 +487,29 @@ impl S3Store {
             manifest_key,
             segment_cfg: resolved_segment,
             cursor_cfg: osc.cursor,
-            put_workers: Some(ParallelPutWorkers::spawn(
-                osc.parallel_put.workers,
-                client.clone(),
-                ns.clone(),
-                |_seq| {
-                    // Completion callback: in single-worker mode, the
-                    // completion is handled by the flusher. Multi-worker
-                    // mode updates are tracked separately. Placeholder.
-                },
-            )),
+            // Honest status of the knob: seals are SERIALIZED (seal_lock) so
+            // the acknowledged frontier can never advance past an earlier
+            // unsealed segment, and each seal uploads exactly one object —
+            // the worker pool therefore has no production call site.
+            put_workers: {
+                if osc.parallel_put.workers > 1 {
+                    tracing::warn!(
+                        workers = osc.parallel_put.workers,
+                        "S3 WAL: segment seals are serialized for acknowledgement ordering; \
+                         parallel_put.workers has no effect"
+                    );
+                }
+                Some(ParallelPutWorkers::spawn(
+                    osc.parallel_put.workers,
+                    client.clone(),
+                    ns.clone(),
+                    |_seq| {
+                        // Completion callback: in single-worker mode, the
+                        // completion is handled by the flusher. Multi-worker
+                        // mode updates are tracked separately. Placeholder.
+                    },
+                ))
+            },
             active: StdMutex::new(ActiveSegment {
                 first_seq: 0,
                 last_seq: 0,
