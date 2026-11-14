@@ -432,7 +432,9 @@ pub(crate) async fn hub_oidc_callback(
 pub(crate) async fn hub_oidc_logout(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
     if let Some(token) = bearer(&headers) {
         if let Some(session_id) = token.strip_prefix("session:") {
-            hub.remove_session(session_id).await;
+            if let Err(error) = hub.remove_session(session_id).await {
+                return hub_problem(error);
+            }
         }
     }
     Response::builder()

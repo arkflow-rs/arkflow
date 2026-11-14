@@ -1,7 +1,9 @@
+import { useEffect } from 'react'
 import { useSearchParams } from 'react-router'
+import { errorMessage } from '../api'
 import { useT } from '../i18n'
 import { useEvents } from '../queries'
-import { EventRow, PAGE_SIZES, Pagination, SkeletonRows, pageSizeParam } from './shared'
+import { EventRow, PAGE_SIZES, Pagination, SkeletonRows, pageParam, pageSizeParam } from './shared'
 
 export function Events() {
   const t = useT()
@@ -12,7 +14,7 @@ export function Events() {
   const eventType = searchParams.get('event_type') ?? undefined
   const streamId = searchParams.get('stream_id') ?? undefined
   const correlationId = searchParams.get('correlation_id') ?? undefined
-  const page = Math.max(1, Number(searchParams.get('page') ?? '1') || 1)
+  const page = pageParam(searchParams)
   const pageSize = pageSizeParam(searchParams)
 
   const eventsQuery = useEvents({
@@ -27,6 +29,16 @@ export function Events() {
   const total = eventsQuery.data?.total
   const pages = Math.max(1, Math.ceil((total ?? 0) / pageSize))
   const hasFilter = Boolean(eventType || streamId || correlationId)
+
+  // A retained/old link may name a page beyond the result set; clamp it so
+  // the user is never stranded on an empty table.
+  useEffect(() => {
+    if (total !== undefined && page > pages) {
+      const next = new URLSearchParams(searchParams)
+      next.set('page', String(pages))
+      setSearchParams(next, { replace: true })
+    }
+  }, [page, pages, total, searchParams, setSearchParams])
 
   const setParam = (key: string, value: string) => {
     const next = new URLSearchParams(searchParams)
@@ -79,6 +91,8 @@ export function Events() {
           render skeleton rows instead of flashing the empty state. */}
       {eventsQuery.isPending || eventsQuery.isPlaceholderData ? (
         <SkeletonRows rows={5} />
+      ) : eventsQuery.isError ? (
+        <p className="empty">{errorMessage(eventsQuery.error)}</p>
       ) : events.length ? (
         events.map((event, index) => (
           <EventRow event={event} key={`${event.occurred_at_ms}-${event.event_type}-${index}`} />

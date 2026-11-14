@@ -13,6 +13,7 @@ import {
   SkeletonRows,
   active,
   number,
+  pageParam,
   pageSizeParam,
 } from './shared'
 import type { Command } from './types'
@@ -39,7 +40,7 @@ export function Runtime({
   const operationName = searchParams.get('operation') ?? undefined
   const operationState = searchParams.get('state') ?? undefined
   const correlationId = searchParams.get('correlation_id') ?? undefined
-  const operationPage = Math.max(1, Number(searchParams.get('page') ?? '1') || 1)
+  const operationPage = pageParam(searchParams)
   const operationPageSize = pageSizeParam(searchParams)
   const streamsQuery = useStreams(nodeId)
   const operationsQuery = useOperations({

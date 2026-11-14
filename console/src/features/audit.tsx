@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router'
 import { type AuditRecord, errorMessage, formatTime } from '../api'
 import { useAudit } from '../queries'
 import { useT } from '../i18n'
-import { PAGE_SIZES, Pagination, SkeletonRows, pageSizeParam } from './shared'
+import { PAGE_SIZES, Pagination, SkeletonRows, pageParam, pageSizeParam } from './shared'
 
 export function Audit({ onError }: { onError: (message: string) => void }) {
   const t = useT()
@@ -11,9 +11,21 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
   // view state, replacing the old fetch-once + client text filter.
   const [searchParams, setSearchParams] = useSearchParams()
   const resourceId = searchParams.get('resource_id') ?? undefined
-  const page = Math.max(1, Number(searchParams.get('page') ?? '1') || 1)
+  const actor = searchParams.get('actor') ?? undefined
+  const action = searchParams.get('action') ?? undefined
+  const fromMs = Number(searchParams.get('from_ms')) || undefined
+  const toMs = Number(searchParams.get('to_ms')) || undefined
+  const page = pageParam(searchParams)
   const pageSize = pageSizeParam(searchParams)
-  const auditQuery = useAudit({ resource_id: resourceId, page, page_size: pageSize })
+  const auditQuery = useAudit({
+    resource_id: resourceId,
+    actor,
+    action,
+    from_ms: fromMs,
+    to_ms: toMs,
+    page,
+    page_size: pageSize,
+  })
   const records = auditQuery.data?.items ?? []
   const total = auditQuery.data?.total
   const pages = Math.max(1, Math.ceil((total ?? 0) / pageSize))
@@ -21,6 +33,14 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
   useEffect(() => {
     if (auditQuery.isError) onError(errorMessage(auditQuery.error))
   }, [auditQuery.isError, auditQuery.error, onError])
+
+  useEffect(() => {
+    if (total !== undefined && page > pages) {
+      const next = new URLSearchParams(searchParams)
+      next.set('page', String(pages))
+      setSearchParams(next, { replace: true })
+    }
+  }, [page, pages, total, searchParams, setSearchParams])
 
   const setParam = (key: string, value: string) => {
     const next = new URLSearchParams(searchParams)
@@ -42,6 +62,18 @@ export function Audit({ onError }: { onError: (message: string) => void }) {
             placeholder={t('list.filterResourceId')}
             value={resourceId ?? ''}
             onChange={(event) => setParam('resource_id', event.target.value.trim())}
+          />
+          <input
+            aria-label="actor"
+            placeholder="actor"
+            value={actor ?? ''}
+            onChange={(event) => setParam('actor', event.target.value.trim())}
+          />
+          <input
+            aria-label="action"
+            placeholder="action"
+            value={action ?? ''}
+            onChange={(event) => setParam('action', event.target.value.trim())}
           />
           <select
             aria-label={t('list.pageSize')}

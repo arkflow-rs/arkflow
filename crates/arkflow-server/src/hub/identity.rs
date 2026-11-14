@@ -642,13 +642,20 @@ impl Hub {
         self.oidc.as_ref()?.resolve_session(session_id)
     }
 
-    pub async fn remove_session(&self, session_id: &str) {
+    pub async fn remove_session(&self, session_id: &str) -> Result<(), HubError> {
         if let Some(storage) = self.storage.as_ref() {
-            let _ = storage.delete_session(&session_hash(session_id)).await;
+            // Propagate the failure: reporting logout success while the
+            // durable session row still authenticates is a security bug
+            // (the credential survives storage recovery).
+            storage
+                .delete_session(&session_hash(session_id))
+                .await
+                .map_err(HubError::from)?;
         }
         if let Some(federation) = self.oidc.as_ref() {
             federation.remove_session(session_id);
         }
+        Ok(())
     }
 
     /// Apply the managed user directory to a validated federated principal:

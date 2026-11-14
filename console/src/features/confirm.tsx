@@ -1,5 +1,5 @@
 import * as AlertDialog from '@radix-ui/react-alert-dialog'
-import { createContext, useContext, useState, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useT } from '../i18n'
 
 type ConfirmOptions = {
@@ -34,24 +34,50 @@ const ConfirmContext = createContext<ConfirmApi>({
 
 export function ConfirmProvider({ children }: { children: ReactNode }) {
   const t = useT()
-  const [pending, setPending] = useState<PendingDialog>()
+  // Queue instead of a single slot: two confirmations issued in one render
+  // commit (or a second one arriving while the first is open) used to
+  // overwrite the earlier resolver, leaving its caller pending forever.
+  const [queue, setQueue] = useState<PendingDialog[]>([])
+  const pending = queue[0]
   const [inputValue, setInputValue] = useState('')
+  const queueRef = useRef(queue)
+  queueRef.current = queue
+
+  // Settle every outstanding caller when the provider unmounts.
+  useEffect(
+    () => () => {
+      queueRef.current.forEach((dialog) => {
+        if (dialog.kind === 'confirm') dialog.resolve(false)
+        else dialog.resolve(null)
+      })
+    },
+    [],
+  )
+
+  // Load the prompt's initial value when it becomes the head of the queue.
+  useEffect(() => {
+    if (pending?.kind === 'prompt') {
+      setInputValue(pending.options.initialValue ?? '')
+    }
+  }, [pending])
 
   const api: ConfirmApi = {
     confirm: (options) =>
       new Promise((resolve) => {
-        setPending({ kind: 'confirm', options, resolve })
+        setQueue((current) => [...current, { kind: 'confirm', options, resolve }])
       }),
     prompt: (options) =>
       new Promise((resolve) => {
-        setInputValue(options.initialValue ?? '')
-        setPending({ kind: 'prompt', options, resolve })
+        setQueue((current) => [...current, { kind: 'prompt', options, resolve }])
       }),
   }
 
   const close = (value: boolean | string | null) => {
-    pending?.resolve(value as never)
-    setPending(undefined)
+    setQueue((current) => {
+      const [head, ...rest] = current
+      head?.resolve(value as never)
+      return rest
+    })
   }
 
   const settle = (accepted: boolean) => {
