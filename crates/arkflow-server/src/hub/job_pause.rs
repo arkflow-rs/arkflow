@@ -26,6 +26,12 @@ pub(crate) const PAUSE_RESUMING: &str = "resuming";
 pub(crate) const PAUSE_CAPTURE_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
 /// Bounded capture re-dispatch budget (Hub restart / timeout recovery).
 pub(crate) const MAX_PAUSE_CAPTURE_RETRIES: u32 = 3;
+/// How long a completed capture phase still counts as round progress while
+/// the Hub enqueues its commit. The commit is created right after the last
+/// capture result; a reconcile tick landing in between used to see no
+/// in-flight operation, replace the artifact, and burn the retry budget
+/// (each fresh capture then completed and was superseded ~130ms later).
+const PAUSE_COMMIT_GRACE_MS: u64 = 5_000;
 
 impl Hub {
     fn require_durable_storage(&self) -> Result<&crate::storage::StorageActor, HubError> {
@@ -408,28 +414,41 @@ impl Hub {
         // commit round still has to make the artifact usable. Counting only
         // JobCheckpoint/JobSavepoint would retry during that window, replace
         // the artifact id, and exhaust the budget while commits keep landing.
+        let now = now_ms();
         let operations = self.operations.read().await;
         operations.values().any(|operation| {
-            operation.resource_id == job.job_id
-                && operation.generation == job.generation
-                && matches!(
-                    operation.operation,
-                    AgentOperation::JobCheckpoint
-                        | AgentOperation::JobSavepoint
-                        | AgentOperation::JobCheckpointCommit
-                        | AgentOperation::JobSavepointCommit
-                )
-                && matches!(
-                    operation.state,
-                    HubOperationState::Queued
-                        | HubOperationState::Dispatched
-                        | HubOperationState::Acknowledged
-                        | HubOperationState::Running
-                )
-                && operation
+            if operation.resource_id != job.job_id
+                || operation.generation != job.generation
+                || operation
                     .checkpoint_id
                     .as_deref()
-                    .is_none_or(|id| id == artifact_id)
+                    .is_some_and(|id| id != artifact_id)
+            {
+                return false;
+            }
+            let active = matches!(
+                operation.state,
+                HubOperationState::Queued
+                    | HubOperationState::Dispatched
+                    | HubOperationState::Acknowledged
+                    | HubOperationState::Running
+            );
+            match operation.operation {
+                // The capture phase completing is progress too: the Hub
+                // enqueues the commit immediately after the last capture
+                // result. Only a RECENT success counts, so a round abandoned
+                // by a Hub restart (or whose commit timed out) still reaches
+                // the retry path.
+                AgentOperation::JobCheckpoint | AgentOperation::JobSavepoint => {
+                    active
+                        || (operation.state == HubOperationState::Succeeded
+                            && operation.finished_at_ms.is_some_and(|finished| {
+                                now.saturating_sub(finished) < PAUSE_COMMIT_GRACE_MS
+                            }))
+                }
+                AgentOperation::JobCheckpointCommit | AgentOperation::JobSavepointCommit => active,
+                _ => false,
+            }
         })
     }
 
