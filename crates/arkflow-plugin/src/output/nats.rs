@@ -91,6 +91,26 @@ impl NatsOutput {
     }
 }
 
+/// Per-row destination alignment guard: a per-row subject vector shorter
+/// than the payload list would silently drop the unmatched payloads (the
+/// MQTT sibling's failure mode — payload.rs:15-21 forbids it). Scalar
+/// subjects apply to every row and never misalign.
+fn check_subject_alignment(
+    subject: &crate::expr::EvaluateResult<String>,
+    payload_count: usize,
+) -> Result<(), Error> {
+    match subject {
+        crate::expr::EvaluateResult::Scalar(_) => Ok(()),
+        crate::expr::EvaluateResult::Vec(subjects) if subjects.len() >= payload_count => Ok(()),
+        crate::expr::EvaluateResult::Vec(subjects) => Err(Error::Process(format!(
+            "nats output: per-row subject count ({}) is fewer than the payload count ({}); \
+             publishing would silently drop the unmatched rows",
+            subjects.len(),
+            payload_count
+        ))),
+    }
+}
+
 #[async_trait]
 impl Output for NatsOutput {
     async fn connect(&self) -> Result<(), Error> {
@@ -161,10 +181,20 @@ impl Output for NatsOutput {
             }
         };
 
+        // Per-row destination alignment: a shorter per-row subject vector
+        // would silently drop the unmatched payloads (the MQTT sibling's
+        // failure mode). Fail loudly before the first publish instead.
+        check_subject_alignment(&subject, owned_payloads.len())?;
+
         // Publish messages
         for (i, payload) in owned_payloads.into_iter().enumerate() {
             let Some(subject_str) = subject.get(i) else {
-                continue;
+                // Unreachable under the alignment guard above; a silent
+                // skip here would be the exact data-loss shape the guard
+                // exists to prevent.
+                return Err(Error::Process(format!(
+                    "nats output: per-row subject {i} is missing (subject vector shorter than payload count)"
+                )));
             };
 
             match &self.config.mode {
@@ -387,5 +417,28 @@ mod tests {
 
         let output = NatsOutput::new(config, None);
         assert!(output.is_ok());
+    }
+
+    /// Spec: connector-recovery-contract — 输出连接器按行目的地错位 SHALL
+    /// 失败而不静默丢行。A per-row subject vector shorter than the payload
+    /// count fails with both counts named.
+    #[test]
+    fn subject_alignment_rejects_a_short_per_row_vector() {
+        let subjects = crate::expr::EvaluateResult::Vec(vec!["a".to_string(), "b".to_string()]);
+        let error = check_subject_alignment(&subjects, 3).unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("subject count (2)"), "{message}");
+        assert!(message.contains("payload count (3)"), "{message}");
+        assert!(message.contains("silently drop"), "{message}");
+    }
+
+    /// Aligned per-row vectors and scalar subjects pass the guard.
+    #[test]
+    fn subject_alignment_accepts_aligned_vectors_and_scalars() {
+        let subjects = crate::expr::EvaluateResult::Vec(vec!["a".to_string(), "b".to_string()]);
+        check_subject_alignment(&subjects, 2).expect("aligned vector passes");
+        check_subject_alignment(&subjects, 1).expect("longer vector passes");
+        let scalar = crate::expr::EvaluateResult::Scalar("t".to_string());
+        check_subject_alignment(&scalar, 7).expect("scalar applies to every row");
     }
 }

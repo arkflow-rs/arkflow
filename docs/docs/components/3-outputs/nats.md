@@ -36,6 +36,8 @@ The NATS output publishes messages to a NATS server, either to a regular subject
 
 An expression must yield a non-null string for every row: a NULL result for any row fails the batch with the expression and the row named (wrap it in `COALESCE(expr, 'fallback')` or filter such rows upstream).
 
+A per-row destination result must carry one destination per payload row: a shorter result fails the batch with both counts named instead of silently dropping the unmatched rows.
+
 ### auth
 
 | Field | Type | Required | Default | Description |

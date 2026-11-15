@@ -192,9 +192,22 @@ impl Input for NatsInput {
                                                 }
                                             },
                                             None => {
-                                                // Subscription ended
-                                                if let Err(e) = sender.send_async(Delivery::Err(Error::EOF)).await {
-                                                    error!("Failed to send EOF to channel: {}", e);
+                                                // A NATS subscription ending under a
+                                                // live source is an abnormal
+                                                // termination (server shutdown,
+                                                // unsubscribe), not a bounded
+                                                // source's exhaustion: classify as
+                                                // Disconnection so the engine
+                                                // reconnects instead of ending the
+                                                // job as if the data had ended.
+                                                if let Err(e) = sender
+                                                    .send_async(Delivery::Err(Error::Disconnection))
+                                                    .await
+                                                {
+                                                    error!(
+                                                        "Failed to send disconnection to channel: {}",
+                                                        e
+                                                    );
                                                 }
                                                 break;
                                             }
@@ -301,7 +314,15 @@ impl Input for NatsInput {
                             _ = cancellation.cancelled() => {
                                 break;
                             }
-                            result = consumer.fetch().messages()  => {
+                            // A bounded `expires` makes the server hold the
+                            // pull request (long-poll) instead of replying
+                            // instantly on an empty subject: the default
+                            // no-wait fetch would busy-spin a full core with
+                            // thousands of pull requests per second.
+                            result = consumer
+                                .fetch()
+                                .expires(std::time::Duration::from_millis(500))
+                                .messages()  => {
                                 match result {
                                 Ok(mut messages) => {
                                     while let Some(message_result) = messages.next().await {
@@ -698,5 +719,71 @@ mod tests {
             NatsInputBuilder.build(None, &bad, None, &create_test_resource()),
             Err(Error::Config(_))
         ));
+    }
+
+    /// Spec: connector-recovery-contract — NATS JetStream 空闲拉取 SHALL
+    /// 有界等待。Structural pin (the established include_str! pattern, cf.
+    /// input/kafka.rs's drain-engine guard): the JetStream loop's fetch
+    /// must carry `expires(...)` — the server-side long-poll that keeps an
+    /// idle subject from being re-fetched thousands of times a second.
+    #[test]
+    fn jetstream_fetch_loop_pins_a_bounded_expires() {
+        let source = include_str!("nats.rs");
+        // PRODUCTION code only: the test module's own literals must not be
+        // able to satisfy these assertions.
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code precedes the test module");
+        let marker = ".fetch()";
+        // Pin the LAST fetch call chain in production (the spawned
+        // JetStream loop; the earlier one is connect()'s one-shot warm-up).
+        // Comment-independent: the recurring fetch itself must carry
+        // `expires`, and an unrelated `.expires(` elsewhere must not
+        // satisfy the pin.
+        let fetch_start = production
+            .rfind(marker)
+            .expect("a fetch call site must exist in production code");
+        let fetch_tail = &production[fetch_start..];
+        let fetch_end = fetch_tail
+            .find(".messages()")
+            .expect("the fetch builder chain must drain via .messages()");
+        let fetch_call = &fetch_tail[..fetch_end];
+        assert!(
+            fetch_call.contains(".expires("),
+            "the JetStream fetch call must set a bounded expires (long-poll) on its \
+             own builder chain; a bare no-wait fetch busy-spins a full core on an \
+             idle subject"
+        );
+    }
+
+    /// Spec: connector-recovery-contract — 无界源的异常终止 SHALL 归类为
+    /// Disconnection 而非 EOF。Structural pin: the regular-mode
+    /// subscription-end branch must send Disconnection (not EOF) to the
+    /// delivery channel. Production code only, bounded to the branch.
+    #[test]
+    fn regular_subscription_end_sends_disconnection_not_eof() {
+        let source = include_str!("nats.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code precedes the test module");
+        let marker = "live source is an abnormal";
+        let branch_start = production
+            .find(marker)
+            .expect("subscription-end branch comment present");
+        let branch = &production[branch_start..];
+        // Bound to the branch: everything up to its loop break.
+        let branch_end = branch.find("break;").expect("loop break present");
+        let branch = &branch[..branch_end];
+        assert!(
+            branch.contains("Error::Disconnection"),
+            "an ended NATS subscription must be classified as Disconnection \
+             (EOF would end the whole job as if the data had legitimately ended)"
+        );
+        assert!(
+            !branch.contains("Error::EOF"),
+            "the subscription-end branch must not send EOF"
+        );
     }
 }

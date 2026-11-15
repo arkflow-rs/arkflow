@@ -17,6 +17,98 @@
 use arkflow_core::codec::Codec;
 use arkflow_core::{Bytes, Error, MessageBatch, MessageBatchRef};
 use std::sync::Arc;
+use tracing::warn;
+
+/// Classify a record-batch stream failure of a snapshot-style source
+/// (file/sql inputs).
+///
+/// Transient retrieval failures (IO, object store, connector transport)
+/// map to [`Error::Disconnection`] so the engine reconnects. Deterministic
+/// failures (decode/format corruption, schema errors, query execution
+/// errors) map to a terminal [`Error::Process`]: reconnecting would
+/// rebuild the same scan, replay the intact prefix, and hit the same
+/// corruption again — an endless restart loop, not a recovery.
+pub(crate) fn classify_stream_error(error: datafusion::common::DataFusionError) -> Error {
+    use datafusion::common::DataFusionError as Dfe;
+    match error {
+        Dfe::IoError(io) => {
+            warn!("record batch stream IO failure; reconnecting: {io}");
+            Error::Disconnection
+        }
+        Dfe::ObjectStore(store) => match *store {
+            // Access-control failures are deterministic: reconnecting
+            // replays the same prefix into the same denial.
+            object_store::Error::PermissionDenied { .. }
+            | object_store::Error::Unauthenticated { .. } => Error::Process(format!(
+                "record batch stream object-store access failure (deterministic): {store}"
+            )),
+            other => {
+                warn!("record batch stream object-store failure; reconnecting: {other}");
+                Error::Disconnection
+            }
+        },
+        // Table-provider connectors (sqlite/duckdb/postgres) surface
+        // dropped connections and transport errors through `External`.
+        Dfe::External(source) => {
+            warn!("record batch stream connector failure; reconnecting: {source}");
+            Error::Disconnection
+        }
+        // The postgres table provider buffers rows in 4,000-row chunks and
+        // wraps transport AND database failures after the first chunk as
+        // `Execution("Failed to fetch batch: {inner}")`
+        // (datafusion-table-providers-postgres 0.13.1 conn.rs:485). The
+        // inner Display distinguishes three classes:
+        // * `PostgresError::ConversionError` renders "Failed to convert
+        //   query result to Arrow." — deterministic, terminal;
+        // * `PostgresError::QueryError` renders "Query execution failed."
+        //   followed by the server error; the provider's
+        //   `format_postgres_query_error` appends "SQLSTATE: <code>" for
+        //   server-generated errors — the CODE decides: shutdown
+        //   (57P01/57P02/57P03) and connection-exception (08xxx) classes
+        //   are transient (the server told us to go away / the connection
+        //   broke), everything else (division by zero, constraint
+        //   violations) is deterministic and terminal. A message without
+        //   SQLSTATE is a dropped connection (transient).
+        // Unknown inner shapes stay terminal: reconnecting into an
+        // unrecognized failure would replay the prefix into the same error
+        // forever.
+        Dfe::Execution(message)
+            if message.starts_with("Failed to fetch batch:")
+                && message.contains("Query execution failed.")
+                && sqlstate_is_retryable(&message) =>
+        {
+            warn!("postgres record batch stream connection failure; reconnecting: {message}");
+            Error::Disconnection
+        }
+        Dfe::Context(context, source) => {
+            warn!("record batch stream failure ({context}); reclassifying cause");
+            classify_stream_error(*source)
+        }
+        other => Error::Process(format!(
+            "record batch stream failed deterministically (reconnect would replay the \
+             same prefix into the same failure): {other}"
+        )),
+    }
+}
+
+/// Whether a postgres `Failed to fetch batch:` message is retryable.
+///
+/// A message without SQLSTATE is a dropped connection (the server never
+/// produced a response — transport). A SQLSTATE is retryable only for the
+/// shutdown classes (`57P01` admin_shutdown, `57P02` crash_shutdown,
+/// `57P03` cannot_connect_now) and the connection-exception class
+/// (`08xxx`) — the server told the client to go away or the connection
+/// broke. Every other SQLSTATE (division by zero, constraint violations,
+/// data errors) is deterministic given the data and stays terminal.
+fn sqlstate_is_retryable(message: &str) -> bool {
+    match message.rsplit_once("SQLSTATE: ") {
+        None => true,
+        Some((_, rest)) => {
+            let code = rest.get(..5).unwrap_or(rest);
+            matches!(code, "57P01" | "57P02" | "57P03") || code.starts_with("08")
+        }
+    }
+}
 
 /// Apply codec to payload bytes
 ///

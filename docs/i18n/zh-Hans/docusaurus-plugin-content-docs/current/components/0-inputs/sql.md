@@ -75,3 +75,7 @@ input:
     type: "sqlite"
     path: "/path/to/data.db"
 ```
+
+## 读取错误
+
+已读出行之后的读取失败按原因分类:暂态检索失败(数据库连接断开、传输错误)返回 `Disconnection`,引擎重连并从头重跑查询;确定性失败以 `Error::Process` 终止运行,不会循环重连。读到结果集末尾仍是干净的 `EOF`。

@@ -147,3 +147,7 @@ input:
       container_name: "my-container"
       access_key: "${AZURE_STORAGE_ACCESS_KEY}"
 ```
+
+## Read errors
+
+A read failure after rows have flowed is classified by cause: transient retrieval failures (IO errors, object-store outages) return `Disconnection` and the engine reconnects, re-reading the snapshot from its start; deterministic failures (a corrupt file, a schema error) fail the run with `Error::Process` instead of looping. Reaching the end of the data remains a clean `EOF`.

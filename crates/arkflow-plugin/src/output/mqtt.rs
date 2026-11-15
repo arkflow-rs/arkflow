@@ -212,6 +212,10 @@ impl<T: MqttClient> MqttOutput<T> {
 }
 
 /// Publish every payload; the first error aborts the loop.
+///
+/// A missing per-row topic is a loud failure, never a silent skip: the
+/// caller (`write`) validates alignment before the first publish, so this
+/// arm only fires if a future caller bypasses that guard.
 async fn publish_all<T: MqttClient>(
     client: &T,
     topic: &crate::expr::EvaluateResult<String>,
@@ -220,11 +224,14 @@ async fn publish_all<T: MqttClient>(
     retain: bool,
 ) -> Result<(), ClientError> {
     for (i, payload) in payloads.iter().enumerate() {
-        if let Some(topic_str) = topic.get(i) {
-            client
-                .publish(topic_str.clone(), qos_level, retain, payload.clone())
-                .await?;
-        }
+        let Some(topic_str) = topic.get(i) else {
+            return Err(ClientError::Request(rumqttc::Request::Publish(
+                rumqttc::Publish::new("mqtt-output-misaligned-topic", qos_level, vec![]),
+            )));
+        };
+        client
+            .publish(topic_str.clone(), qos_level, retain, payload.clone())
+            .await?;
     }
     Ok(())
 }
@@ -266,6 +273,22 @@ impl<T: MqttClient> Output for MqttOutput<T> {
         crate::output::codec_helper::ensure_row_aligned(&payloads, msg.num_rows(), "mqtt")?;
 
         let topic = self.config.topic.evaluate_expr(&msg).await?;
+
+        // Per-row destination alignment: a shorter per-row topic vector would
+        // publish each surviving row under a previous row's topic and
+        // silently drop the tail. The Kafka sibling turns the same condition
+        // into a named error; failing before the first publish keeps the
+        // broker free of partially-routed batches.
+        if let crate::expr::EvaluateResult::Vec(topics) = &topic {
+            if topics.len() < payloads.len() {
+                return Err(Error::Process(format!(
+                    "mqtt output: per-row topic count ({}) is fewer than the payload count ({}); \
+                     publishing would silently drop the unmatched rows",
+                    topics.len(),
+                    payloads.len()
+                )));
+            }
+        }
 
         // Determine the QoS level
         let qos_level = match self.config.qos {
@@ -847,5 +870,61 @@ mod tests {
             !output.connected.load(Ordering::SeqCst),
             "connected must stay false after a failed handshake"
         );
+    }
+
+    /// Spec: connector-recovery-contract — 输出连接器按行目的地错位 SHALL
+    /// 失败而不静默丢行。publish_all is the innermost layer: it fails
+    /// loudly at the first missing topic instead of silently skipping it
+    /// (the write path's own guard runs BEFORE any publish, so the broker
+    /// never sees a partially-routed batch; this test pins the inner
+    /// defense where a caller bypassed it — rows up to the gap went out,
+    /// everything at/after the gap did not, and the error surfaces).
+    #[tokio::test]
+    async fn publish_all_rejects_a_short_per_row_topic_vector() {
+        let _guard = TEST_LOCK.lock().await;
+        reset_injections();
+        let output = MqttOutput::<MockMqttClient>::new(test_config(), None).unwrap();
+        output.connect().await.unwrap();
+        let client_guard = output.client.lock().await;
+        let client = client_guard.as_ref().unwrap();
+
+        let payloads: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        let short_topics =
+            crate::expr::EvaluateResult::Vec(vec!["t/0".to_string(), "t/1".to_string()]);
+
+        let result = publish_all(client, &short_topics, &payloads, QoS::AtLeastOnce, false).await;
+        assert!(result.is_err(), "a short topic vector must fail loudly");
+
+        let messages = client.published_messages.lock().await;
+        assert_eq!(
+            messages.len(),
+            2,
+            "rows with topics publish; the unmatched tail must NOT silently publish: {messages:?}"
+        );
+        assert_eq!(messages[1].0, "t/1");
+    }
+
+    /// Spec: connector-recovery-contract — 数量一致时每个 payload 按 topic
+    /// 逐行发布(守卫不得误伤正常路径)。
+    #[tokio::test]
+    async fn publish_all_publishes_every_row_when_topics_align() {
+        let _guard = TEST_LOCK.lock().await;
+        reset_injections();
+        let output = MqttOutput::<MockMqttClient>::new(test_config(), None).unwrap();
+        output.connect().await.unwrap();
+        let client_guard = output.client.lock().await;
+        let client = client_guard.as_ref().unwrap();
+
+        let payloads: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
+        let topics = crate::expr::EvaluateResult::Vec(vec!["t/0".to_string(), "t/1".to_string()]);
+
+        publish_all(client, &topics, &payloads, QoS::AtLeastOnce, false)
+            .await
+            .expect("aligned topics must publish");
+
+        let messages = client.published_messages.lock().await;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].0, "t/0");
+        assert_eq!(messages[1].0, "t/1");
     }
 }
