@@ -696,7 +696,6 @@ fn pg_dsn() -> String {
 }
 
 async fn build_pg_input(
-    uri: &str,
     select_sql: &str,
     app_name: &str,
 ) -> Result<Arc<dyn arkflow_core::input::Input>, arkflow_core::Error> {
@@ -758,7 +757,6 @@ async fn sql_input_pg_midstream_server_error_is_process() {
     .await;
 
     let input = build_pg_input(
-        &uri,
         &format!(
             "SELECT i, 1 / CASE WHEN i <= 4000 THEN 1 ELSE 0 END AS d FROM flow.public.{table}"
         ),
@@ -825,7 +823,6 @@ async fn sql_input_pg_midstream_connection_loss_is_disconnection() {
     .await;
 
     let input = build_pg_input(
-        &uri,
         &format!("SELECT i FROM flow.public.{table}"),
         "arkflow_midstream_connection_loss",
     )
