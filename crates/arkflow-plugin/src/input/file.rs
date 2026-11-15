@@ -966,6 +966,15 @@ mod tests {
         }))
     }
 
+    fn permanent_object_store_error() -> datafusion::common::DataFusionError {
+        datafusion::common::DataFusionError::ObjectStore(Box::new(
+            object_store::Error::PermissionDenied {
+                path: "secret/warehouse.parquet".into(),
+                source: Box::new(std::io::Error::other("injected denial")),
+            },
+        ))
+    }
+
     fn deterministic_decode_error() -> datafusion::common::DataFusionError {
         datafusion::common::DataFusionError::ArrowError(
             Box::new(datafusion::arrow::error::ArrowError::ExternalError(
@@ -1036,6 +1045,34 @@ mod tests {
         match input.read().await {
             Err(Error::Disconnection) => {}
             Err(other) => panic!("transient failure must be Disconnection, got: {other:?}"),
+            Ok(_) => panic!("a failed stream must not yield data"),
+        }
+        input.close().await?;
+        Ok(())
+    }
+
+    /// Regression (review round 5): an object-store access denial is
+    /// deterministic — reconnecting replays the same prefix into the same
+    /// denial. It must terminate instead of returning Disconnection.
+    #[tokio::test]
+    async fn object_store_permission_denied_is_terminal() -> Result<(), Error> {
+        let dir = tempfile::tempdir().unwrap();
+        let input = json_input_for_test(&dir)?;
+        input.connect().await?;
+        install_failing_stream(&input, permanent_object_store_error()).await?;
+
+        let (_, _) = input.read().await?;
+        match input.read().await {
+            Err(Error::Process(message)) => {
+                assert!(
+                    message.contains("deterministic"),
+                    "an access denial must terminate with the cause named: {message}"
+                );
+            }
+            Err(Error::Disconnection) => {
+                panic!("a permission-denied object store must not trigger endless reconnects")
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
             Ok(_) => panic!("a failed stream must not yield data"),
         }
         input.close().await?;

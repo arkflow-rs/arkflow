@@ -35,10 +35,18 @@ pub(crate) fn classify_stream_error(error: datafusion::common::DataFusionError) 
             warn!("record batch stream IO failure; reconnecting: {io}");
             Error::Disconnection
         }
-        Dfe::ObjectStore(store) => {
-            warn!("record batch stream object-store failure; reconnecting: {store}");
-            Error::Disconnection
-        }
+        Dfe::ObjectStore(store) => match *store {
+            // Access-control failures are deterministic: reconnecting
+            // replays the same prefix into the same denial.
+            object_store::Error::PermissionDenied { .. }
+            | object_store::Error::Unauthenticated { .. } => Error::Process(format!(
+                "record batch stream object-store access failure (deterministic): {store}"
+            )),
+            other => {
+                warn!("record batch stream object-store failure; reconnecting: {other}");
+                Error::Disconnection
+            }
+        },
         // Table-provider connectors (sqlite/duckdb/postgres) surface
         // dropped connections and transport errors through `External`.
         Dfe::External(source) => {

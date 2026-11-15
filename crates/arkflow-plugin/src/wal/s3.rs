@@ -793,8 +793,9 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
             }
             Err(object_store::Error::NotFound { .. }) => {
                 // Manifest referenced a segment that was truncated between
-                // write and recovery (D7). Skip, but observably: the dropped
-                // bytes hold unacked replay data.
+                // write and recovery (D7). Skip, but observably: the missing
+                // range may include acknowledged entries at or below the
+                // cursor; only entries above it are replay data.
                 warn_missing_segment(seg_name);
             }
             Err(e) => {
@@ -1232,10 +1233,11 @@ fn decode_segment_object(bytes: &[u8]) -> Result<segment::DecodedSegment, Error>
     segment::decode_with_kind(payload, kind)
 }
 
-/// Log a segment decode's truncation, if any. Dropped bytes on the replay
-/// path hold only unacknowledged (replayable) data — acknowledged records
-/// are past the manifest cursor and never re-read — but the loss must be
-/// observable, not silent (spec: fix-silent-data-loss).
+/// Log a segment decode's truncation, if any. A sealed segment can hold
+/// acknowledged entries at or below the cursor alongside unacked replay
+/// data, so the dropped range may cover both; only the entries above the
+/// cursor are replay data. The loss must be observable, not silent (spec:
+/// fix-silent-data-loss).
 fn warn_segment_truncation(segment: &str, decoded: &segment::DecodedSegment) {
     if let Some(t) = &decoded.truncation {
         tracing::warn!(
@@ -1249,8 +1251,9 @@ fn warn_segment_truncation(segment: &str, decoded: &segment::DecodedSegment) {
 }
 
 /// A manifest-referenced sealed segment is gone from the object store. Same
-/// replay-only scope as `warn_segment_truncation`, but nothing at all of the
-/// segment could be read.
+/// scope as `warn_segment_truncation` — the segment may include acknowledged
+/// entries alongside unacked replay data — but nothing at all of it could be
+/// read.
 fn warn_missing_segment(segment: &str) {
     tracing::warn!(
         segment,
