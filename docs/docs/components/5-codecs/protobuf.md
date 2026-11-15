@@ -47,4 +47,4 @@ codec:
 
 - Only proto3 scalar fields are supported: `bool`, `int32`/`sint32`/`sfixed32`, `int64`/`sint64`/`sfixed64`, `uint32`/`fixed32`, `uint64`/`fixed64`, `float`, `double`, `string`, `bytes`, and `enum` (mapped to Arrow `Int32`).
 - Nested messages, `repeated`, `map`, `oneof`, and proto3 `optional` fields are **not** supported; encountering them returns an error during encoding/decoding.
-- When decoding multiple messages, the batch is merged (`concat_batches`) using the schema of the first message; fields across messages must be compatible.
+- Decoding uses the descriptor's full field set against a single accumulated batch: every decoded field is nullable, and a message that omits a field simply yields `null` for that column (there is no per-message schema merge or cross-message compatibility check).

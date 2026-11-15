@@ -84,8 +84,9 @@ Job/stream series are exported only for Agents with a live lease — an Agent
 that stops reporting (expired lease or deregistration) drops out of the
 exposition; the raw `arkflow_node_metric` series keep their last reported
 values. When an operator token is configured the endpoint requires it
-(`Authorization: Bearer <operator token>`); with no token configured the
-endpoint is served without authentication, like the rest of the Hub API.
+(`Authorization: Bearer <operator token>`); a token-less Hub exists only in
+the `ARKFLOW_HUB_INSECURE_LOCAL` loopback development mode — a production
+Hub always has credentials and always authenticates this endpoint.
 
 Hub-side metric families:
 

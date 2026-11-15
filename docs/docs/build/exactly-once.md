@@ -21,8 +21,8 @@ A Kafka output configured for exactly-once uses a **transactional producer**:
   transaction commits successfully.
 
 The unit of work is **one ack range = one `write_batch` call = one Kafka
-transaction**. If a buffer (memory, a tumbling/sliding/session window, or a
-join) aggregates several input messages into one output batch, that whole batch
+transaction**. If a buffer (memory, a tumbling/session window) aggregates
+several input messages into one output batch, that whole batch
 is one atomic transaction unit. Downstream consumers reading with
 `isolation.level=read_committed` observe each batch atomically — **all messages
 or none**.

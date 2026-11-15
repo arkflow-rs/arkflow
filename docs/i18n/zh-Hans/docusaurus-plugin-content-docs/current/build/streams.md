@@ -47,7 +47,7 @@ streams:
 
 `processors` 是在融合算子链内执行的有序链条。记录是列式的 `MessageBatch`(Arrow `RecordBatch`);需要字节的处理器在边界处借助[编解码器](/zh-Hans/docs/components/codecs/json)。典型的链条是:解码、用 [SQL](/zh-Hans/docs/components/processors/sql) 或 [VRL](/zh-Hans/docs/components/processors/vrl) 变换、再重新编码。`thread_num` 控制并行处理批次的链条数;顺序保证见[背压与有序投递](/zh-Hans/docs/build/backpressure)。
 
-窗口(滚动、滑动、会话)以缓冲形式挂载——参见[缓冲组件](/zh-Hans/docs/components/buffers/tumbling_window)与[窗口聚合配方](/zh-Hans/docs/build/recipes/windowed-aggregation)。窗口缓冲是有状态的:旧式流在可接受状态丢失时应声明 `state.durability: ephemeral`;若窗口必须在重启后恢复,则使用带检查点策略的 `jobs` 条目。
+窗口(滚动、会话)以缓冲形式挂载——参见[缓冲组件](/zh-Hans/docs/components/buffers/tumbling_window)与[窗口聚合配方](/zh-Hans/docs/build/recipes/windowed-aggregation)。(旧式 `sliding_window` 缓冲会被流编译器拒绝;滑动窗口在 Job DAG 的 `window` 算子上可用。)窗口缓冲是有状态的:旧式流在可接受状态丢失时应声明 `state.durability: ephemeral`;若窗口必须在重启后恢复,则使用带检查点策略的 `jobs` 条目。
 
 ### 输出
 

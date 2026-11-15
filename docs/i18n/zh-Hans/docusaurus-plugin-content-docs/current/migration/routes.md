@@ -42,4 +42,4 @@ description: 文档路由迁移映射。
 
 组件页面(`/docs/components/...`)与 SQL 语言页面(`/docs/sql/...`)保留了原有 URL,并新增了正式的索引页(`/docs/components`、`/docs/sql`)。
 
-在 `lastVersion: 'current'` 设置下,持续维护的文档树由 `/docs/` 提供,已发布的快照则位于 `/docs/0.5.x`、`/docs/0.3.x` 和 `/docs/0.2.x`;版本下拉菜单可在它们之间切换。
+在 `lastVersion: 'current'` 设置下,持续维护的文档树由 `/docs/` 提供,已发布的快照则位于 `/docs/0.6.x`、`/docs/0.5.x`、`/docs/0.3.x` 和 `/docs/0.2.x`;版本下拉菜单可在它们之间切换。

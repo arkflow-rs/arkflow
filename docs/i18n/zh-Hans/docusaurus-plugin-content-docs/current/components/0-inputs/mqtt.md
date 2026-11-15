@@ -18,7 +18,7 @@ MQTT 输入(Input)连接到 MQTT broker,订阅一个或多个主题(Topic),并�
 | topics | array&lt;string&gt; | yes | — | 要订阅的主题列表(支持通配符) |
 | username | string | no | — | 认证用户名 |
 | password | string | no | — | 认证密码 |
-| qos | integer | no | — | QoS 等级(0、1、2) |
+| qos | integer | no | `1` | QoS 等级(0、1、2);未设置与任何越界值都回退为 QoS 1 |
 | clean_session | boolean | no | — | 是否使用干净会话(clean session) |
 | keep_alive | integer | no | — | 保活间隔(秒) |
 

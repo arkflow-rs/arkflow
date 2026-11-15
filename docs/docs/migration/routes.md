@@ -49,5 +49,5 @@ kept their URLs and gained proper index pages (`/docs/components`,
 `/docs/sql`).
 
 With `lastVersion: 'current'`, the maintained tree is served at `/docs/` and
-released snapshots live at `/docs/0.5.x`, `/docs/0.3.x`, and `/docs/0.2.x`;
+released snapshots live at `/docs/0.6.x`, `/docs/0.5.x`, `/docs/0.3.x`, and `/docs/0.2.x`;
 the version dropdown switches between them.

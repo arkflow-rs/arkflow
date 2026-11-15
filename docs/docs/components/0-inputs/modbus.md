@@ -12,7 +12,7 @@ The Modbus input polls a Modbus TCP device at a fixed interval and supports four
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | Constant value `"modbus"` |
-| addr | string | yes | — | Modbus TCP server address in `host:port` format |
+| addr | string | yes | — | Modbus TCP server address in `ip:port` format — parsed as a socket address, so **DNS hostnames are not accepted** (e.g. `192.168.1.10:502`, not `mydevice.local:502`) |
 | slave_id | integer | yes | — | Modbus slave ID |
 | points | array&lt;object&gt; | yes | — | List of points read each poll, see table below |
 | interval | duration | yes | — | Polling interval, e.g. `1s`, `500ms` |

@@ -18,6 +18,7 @@ Pulsar 输入(Input)订阅 Apache Pulsar 主题(Topic),支持四种订阅(Subscr
 | subscription_type | string | no | `"exclusive"` | 订阅类型: `exclusive` / `shared` / `failover` / `key_shared` |
 | auth | object | no | — | 认证配置,见下表(带标签的枚举) |
 | retry_config | object | no | — | 重试配置,见下表 |
+| tls | object | no | — | TLS 配置,见下表 |
 
 ### auth
 
@@ -39,6 +40,14 @@ Pulsar 输入(Input)订阅 Apache Pulsar 主题(Topic),支持四种订阅(Subscr
 | initial_delay_ms | integer | yes | — | 初始退避延迟(毫秒) |
 | max_delay_ms | integer | yes | — | 最大退避延迟(毫秒) |
 | backoff_multiplier | number | yes | — | 指数退避乘数 |
+
+### tls
+
+| Field | Type | Required | Default | 描述 |
+|-------|------|----------|---------|-------------|
+| certificate_chain_file | string | no | — | 客户端证书链路径(PEM),用于 mTLS。 |
+| hostname_verification | boolean | no | `true` | 是否校验 broker 证书主机名。 |
+| ca_file | string | no | — | 为 schema 兼容而接受,但当前**不会生效**——底层驱动没有自定义根证书 API,无论是否设置都使用系统信任库。不要把它当作私有信任锚。 |
 
 ## 示例
 
@@ -85,5 +94,5 @@ input:
 
 ## 说明
 
-- 元数据:`__meta_topic`、`__meta_message_id`、`__meta_publish_time`、`__meta_ingest_time`。
+- 当前不附加任何元数据列:Pulsar 输入只转发解码后的负载,不添加 `__meta_*` 列。
 - 订阅类型:`exclusive`(单消费者,有序)、`shared`(轮询分发,无序)、`failover`(主备,有序)、`key_shared`(按键路由,同一键内有序)。

@@ -18,7 +18,7 @@ The MQTT input connects to an MQTT broker, subscribes to one or more topics, and
 | topics | array&lt;string&gt; | yes | — | List of topics to subscribe to (wildcards supported) |
 | username | string | no | — | Authentication username |
 | password | string | no | — | Authentication password |
-| qos | integer | no | — | QoS level (0, 1, 2) |
+| qos | integer | no | `1` | QoS level (0, 1, 2); unset and any out-of-range value both fall back to QoS 1 |
 | clean_session | boolean | no | — | Whether to use a clean session |
 | keep_alive | integer | no | — | Keep-alive interval (seconds) |
 

@@ -18,6 +18,7 @@ The Pulsar input subscribes to an Apache Pulsar topic and supports four subscrip
 | subscription_type | string | no | `"exclusive"` | Subscription type: `exclusive` / `shared` / `failover` / `key_shared` |
 | auth | object | no | — | Authentication configuration, see table below (tagged enum) |
 | retry_config | object | no | — | Retry configuration, see table below |
+| tls | object | no | — | TLS configuration, see table below |
 
 ### auth
 
@@ -39,6 +40,14 @@ The Pulsar input subscribes to an Apache Pulsar topic and supports four subscrip
 | initial_delay_ms | integer | yes | — | Initial backoff delay (ms) |
 | max_delay_ms | integer | yes | — | Maximum backoff delay (ms) |
 | backoff_multiplier | number | yes | — | Exponential backoff multiplier |
+
+### tls
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| certificate_chain_file | string | no | — | Path to the client certificate chain (PEM) for mTLS. |
+| hostname_verification | boolean | no | `true` | Verify the broker certificate hostname. |
+| ca_file | string | no | — | Accepted for schema compatibility but **not applied today** — the underlying driver offers no custom-root API, so the system trust store is used regardless. Do not rely on it as a private trust anchor. |
 
 ## Examples
 
@@ -85,5 +94,5 @@ input:
 
 ## Notes
 
-- Metadata: `__meta_topic`, `__meta_message_id`, `__meta_publish_time`, `__meta_ingest_time`.
+- No metadata columns are attached today: the Pulsar input forwards decoded payloads without adding `__meta_*` columns.
 - Subscription types: `exclusive` (single consumer, ordered), `shared` (round-robin, unordered), `failover` (primary/standby, ordered), `key_shared` (routed by key, ordered within the same key).

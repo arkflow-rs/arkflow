@@ -16,7 +16,7 @@ The Kafka input consumes messages from one or more Apache Kafka topics using a c
 | topics | array&lt;string&gt; | yes | — | List of topics to subscribe to |
 | consumer_group | string | yes | — | Consumer group ID, used for offset coordination and load balancing |
 | client_id | string | no | — | Client ID, used for monitoring and logging |
-| start_from_latest | boolean | no | `false` | When `true`, ignores committed offsets and starts consuming from the latest messages |
+| start_from_latest | boolean | yes | — | Sets `auto.offset.reset=latest` for the group. Only meaningful for a group with **no committed offsets** (first run): the consumer then starts from the newest messages instead of the earliest. Existing committed group offsets always win, so a restart of an existing group resumes where it left off regardless of this flag. The field is required in the config (no serde default), even though the component JSON schema records a nominal `false` default. |
 | fetch_min_bytes | integer | no | — | Minimum bytes required for the broker to respond to a fetch request. The default (`1`) is latency-friendly: the broker answers as soon as any data is available. Larger values make the broker wait for more data (up to `fetch_wait_max_ms`) — a throughput lever that adds first-message latency in quiet periods. |
 | fetch_max_bytes | integer | no | — | Maximum bytes returned by a single fetch request |
 | fetch_max_partition_bytes | integer | no | — | Maximum bytes returned per partition in a single fetch |

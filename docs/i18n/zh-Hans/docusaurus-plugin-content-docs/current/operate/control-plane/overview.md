@@ -60,7 +60,8 @@ subject 绑定、JWT 吊销与会话持久化——见
 ## API 端点
 
 资源端点包括 `/api/v1/system`、`/nodes`、分页的 `/streams`、`/operations`、`/events`、
-`/configuration`、`/components` 与 `/schema`。`/metrics` 暴露 Prometheus 文本格式指标。
+`/components`、`/schema` 以及节点级的 `/nodes/{node_id}/configuration`(机群级 `/configuration`
+端点只存在于独立节点平面)。`/api/v1/metrics` 暴露 Prometheus 文本格式指标。
 作业端点包括作业 CRUD、检查点与保存点、版本历史与升级——升级端点的原子模式把
 "保存点 → 版本提交 → 恢复启动"编排为一次调用（见
 [原子作业升级](./job-upgrades.md)）。

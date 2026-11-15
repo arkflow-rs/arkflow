@@ -15,7 +15,8 @@ description: 节点 API 与 Hub 操作员/Agent API(/api/v1)的完整路由参�
 | Hub Agent API | `/api/v1/agent/*` | 计算节点(Agent):注册、心跳、报告、命令拉取。 |
 
 健康、就绪与存活探针(路径可配置)以及 `GET
-/metrics`(Prometheus 文本格式)同时在节点与 Hub 服务上提供。
+/metrics`(Prometheus 文本格式)在节点服务上提供。Hub 上 `/metrics` 只存在于版本化前缀之下
+(`GET /api/v1/metrics`)且要求 operator 认证——Hub 外层路由仅提供健康探针。
 
 Hub 操作员 API 是一个**期望状态(desired-state)API**:一次成功的 HTTP 变更只意味着 Intent 被持久化接受——并不代表某个节点已经执行了该命令,也不代表流已收敛(convergence)。请轮询资源或订阅事件来观察收敛。
 
@@ -220,7 +221,8 @@ PUT /api/v1/jobs/{job_id}/desired-state
 
 拒绝会入审计(`job.pause` / `job.resume`,结果 `rejected`,携带上述失败码)并计入
 `arkflow_job_pause_total{outcome="rejected"}`;相位转移会在 `GET /events/stream` 上发出
-`job.pause_requested`、`job.paused`、`job.resume_requested`、`job.resumed` 与
+`job.pause_requested`、`job.paused`、`job.resume_requested`、`job.resumed`、
+`job.pause_retrying` 与
 `job.pause_failed`。落工件失败或超时会中止暂停、还原暂停前的恢复指针,并在作业的
 `last_error` 中记录 `pause_savepoint_failed` / `pause_savepoint_timeout`。
 
@@ -276,8 +278,9 @@ PUT /api/v1/jobs/{job_id}/desired-state
 两个路由(以及 `POST /webhooks/{id}/test`)都要求 `ManageWebhooks` 动作
 ——admin 与 operator 角色——每次接受的替换或拒绝均入审计
 (`webhook.replace`)。每个条目包含 `id`、`url`(仅 `http`/`https`)、
-`event_types`(前缀过滤)、`enabled` 与可选的只写 `secret`:响应永不回显
-secret;省略时保留该 id 已存的密钥,显式空字符串则清除。
+`event_types`(前缀过滤)、`enabled`、`created_by`、`created_at_ms` 与可选的只写 `secret`
+(响应中只以布尔 `has_secret` 体现):响应永不回显
+secret 本身;省略时保留该 id 已存的密钥,显式空字符串则清除。
 
 投递为 best-effort(仅 leader 转发、有界丢最旧队列、3 次退避重试、连续
 5 次失败后自动暂停并发布 `webhook.paused`/`webhook.resumed` 生命周期事
@@ -409,7 +412,7 @@ subject 的联邦令牌若 `iat` 更早(60 秒时钟偏斜容差)会被拒绝。
 | `GET` | `/auth/oidc/callback` | 用 code 换取 id_token 并创建服务端会话。 |
 | `GET` | `/auth/oidc/logout` | 删除服务端会话并清除 cookie。 |
 
-具备持久化存储时会话落盘(`cp_sessions`,schema v5):跨 Hub 重启存活,并在登出、
+具备持久化存储时会话落盘(`cp_sessions`,schema v6):跨 Hub 重启存活,并在登出、
 禁用/删除用户或调用 `POST /users/{id}/revoke-tokens` 时失效。备份与恢复有意排除
 `cp_sessions`,因此恢复后的 Hub 绝不会复活登录态。易失 Hub 上会话保存在内存,
 重启即登出所有人。
@@ -423,7 +426,7 @@ subject 的联邦令牌若 `iat` 更早(60 秒时钟偏斜容差)会被拒绝。
 | `GET` | `/schema` | 引擎配置 JSON Schema。 |
 | `GET` | `/metrics` | 默认 Prometheus 文本格式;`?format=json`(或带 `Accept: application/json` 的请求)返回 `{"items": ..., "aggregate": ...}`——各节点指标加机群聚合,可用 `?node_id=` 收窄。 |
 
-除就绪度、对账、outbox 与集群状态仪表之外,命令派发还暴露 `arkflow_command_duration_bucket{command,le}`(从入队到确认的延迟,附带 `_count`/`_sum`)与 `arkflow_command_total{command,outcome}`。标签来自固定词表——命令类型(`job_start`、`job_stop`、`job_checkpoint`、`job_savepoint`、流操作)与结果类别(`enqueued`、`acknowledged`、`succeeded`、`failed`、`timed_out`、`node_unavailable`、`capacity`、`rejected`);未知命令名会折叠为 `other`,资源 ID、关联 ID 与错误文本绝不会成为标签。计数器在 Hub 重启时重置。
+除就绪度、对账、outbox 与集群状态仪表之外,命令派发还暴露 `arkflow_command_duration_bucket{command,le}`(从入队到确认的延迟,附带 `_count`/`_sum`)与 `arkflow_command_total{command,outcome}`。标签来自固定词表——命令类型(`job_start`、`job_stop`、`job_checkpoint`、`job_savepoint`、流操作)与结果类别(`enqueued`、`acknowledged`、`succeeded`、`failed`、`cancelled`、`superseded`、`timed_out`、`node_unavailable`、`capacity`、`rejected`);未知命令名会折叠为 `other`,资源 ID、关联 ID 与错误文本绝不会成为标签。计数器在 Hub 重启时重置。
 
 ## Hub Agent API(`/api/v1/agent/*`)
 

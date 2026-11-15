@@ -16,6 +16,7 @@ The Pulsar output publishes messages to an Apache Pulsar topic. It supports toke
 | topic | object | yes | — | Destination topic (expression; see below). |
 | auth | object | no | — | Authentication configuration (see below). |
 | value_field | string | no | — | Record field used as the message payload (binary or string column; takes precedence over `codec` when set). |
+| tls | object | no | — | TLS configuration (see below). |
 
 ### topic
 
@@ -48,6 +49,14 @@ An expression must yield a non-null string for every row: a NULL result for any 
 | issuer_url | string | yes | OAuth2 issuer URL. |
 | credentials_url | string | yes | URL to the client credentials file. |
 | audience | string | yes | OAuth2 audience. |
+
+### tls
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| certificate_chain_file | string | no | — | Path to the client certificate chain (PEM) for mTLS. |
+| hostname_verification | boolean | no | `true` | Verify the broker certificate hostname. |
+| ca_file | string | no | — | Accepted for schema compatibility but **not applied today** — the underlying driver offers no custom-root API, so the system trust store is used regardless. Do not rely on it as a private trust anchor. |
 
 ## Examples
 

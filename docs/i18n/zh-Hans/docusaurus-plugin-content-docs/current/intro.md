@@ -6,14 +6,14 @@ sidebar_position: 1
 
 > **规范入口:** 当前文档采用按领域划分的导航,请从[文档主页](./index.md)开始。本页作为稳定的兼容性入口保留,以便既有链接继续可用。
 
-![ArkFlow logo](pathname:///docs/logo.svg)
+![ArkFlow logo](./logo.svg)
 
 ArkFlow 是一个用 Rust 编写、运行在 Tokio 异步运行时之上的高性能流处理引擎。它从多种数据源(Kafka、MQTT、HTTP、文件、SQL、Pulsar、NATS、Redis、Modbus、WebSocket……)摄取数据,使用 SQL、VRL、Python UDF、JSON/Protobuf 编解码器与窗口连接进行变换,再写入一个或多个下游——全部由单个 YAML 文件驱动。
 
 ## 核心特性
 
 - **高性能** —— Rust + Tokio,列式 [Apache Arrow](https://arrow.apache.org/) 数据,多线程流水线。
-- **可靠投递** —— 默认通过每条流的 WAL 持久化保证至少一次(at-least-once);事务型下游可选择精确一次(exactly-once)。参见[投递语义](/zh-Hans/docs/build/delivery-semantics)。
+- **可靠投递** —— 可选的每条流 WAL 持久化保证至少一次(at-least-once)投递;事务型下游可选择精确一次(exactly-once)。参见[投递语义](/zh-Hans/docs/build/delivery-semantics)。
 - **丰富的数据源与下游** —— Kafka、MQTT、HTTP、文件(支持 S3/GCS/Azure/HDFS)、Pulsar、NATS、Redis、SQL、Modbus、WebSocket、InfluxDB 等。
 - **强大的处理能力** —— SQL(DataFusion)、VRL、Python UDF、JSON、Protobuf、批处理、窗口化,以及多源连接。
 - **流式编解码器** —— JSON、Protobuf、Debezium CDC 信封,以及 Confluent Schema Registry 传输格式(wire format)。

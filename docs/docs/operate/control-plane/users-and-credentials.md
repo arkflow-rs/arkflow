@@ -207,7 +207,7 @@ before: restarting the Hub signs everyone out.
   `cp_sessions` is intentionally excluded (see above). Snapshot files contain
   no credential plaintext (only hashes) but do contain user metadata and audit
   history — handle them with the same care as the database.
-- **Schema**: managed identity is storage schema **v5**. Opening an older
+- **Schema**: managed identity is storage schema **v6**. Opening an older
   store creates the identity tables and stamps the new version automatically;
   a database stamped by a newer binary is refused at startup.
 

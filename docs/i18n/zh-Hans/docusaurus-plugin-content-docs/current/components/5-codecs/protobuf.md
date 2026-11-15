@@ -47,4 +47,4 @@ codec:
 
 - 仅支持 proto3 标量字段:`bool`、`int32`/`sint32`/`sfixed32`、`int64`/`sint64`/`sfixed64`、`uint32`/`fixed32`、`uint64`/`fixed64`、`float`、`double`、`string`、`bytes` 以及 `enum`(映射为 Arrow `Int32`)。
 - 不支持嵌套消息、`repeated`、`map`、`oneof` 以及 proto3 的 `optional` 字段;在编码/解码时遇到它们会返回错误。
-- 解码多条消息时,批次会以第一条消息的 schema 进行合并(`concat_batches`);各消息之间的字段必须兼容。
+- 解码使用 descriptor 的完整字段集对单个累积批次进行:每个解码出的字段都是 nullable,消息缺省某字段时该列直接取 `null`(不存在按消息的 schema 合并,也没有跨消息兼容性检查)。

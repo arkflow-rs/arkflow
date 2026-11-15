@@ -12,7 +12,7 @@ Modbus 输入(Input)以固定的时间间隔轮询 Modbus TCP 设备,支持四�
 | Field | Type | Required | Default | 描述 |
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | 常量值 `"modbus"` |
-| addr | string | yes | — | Modbus TCP 服务器地址,格式为 `host:port` |
+| addr | string | yes | — | Modbus TCP 服务器地址,格式为 `ip:port`——按套接字地址解析,**不接受 DNS 主机名**(如 `192.168.1.10:502`,而非 `mydevice.local:502`) |
 | slave_id | integer | yes | — | Modbus 从站 ID |
 | points | array&lt;object&gt; | yes | — | 每次轮询读取的数据点列表,见下表 |
 | interval | duration | yes | — | 轮询间隔,如 `1s`、`500ms` |

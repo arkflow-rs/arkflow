@@ -605,7 +605,7 @@ Semantics and boundaries:
   side, oldest dropped) and flush once the schema arrives. Processing-time
   sources without watermarks never emit unmatched rows — prefer event-time
   sources for outer joins.
-- State is bounded: rows are evicted once the watermark passes
+- State is bounded per key and per side: rows are evicted once the watermark passes
   `timestamp + window_ms + ttl_ms`, and each key holds at most `max_per_key`
   rows per side (oldest first). Under an outer `join_type`, capacity
   eviction also emits the evicted row as unmatched — without a watermark

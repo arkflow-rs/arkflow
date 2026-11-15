@@ -1,6 +1,6 @@
 ---
 sidebar_position: 3
-description: 将消息分批到滚动、滑动或会话窗口中,并用 SQL 聚合。
+description: 将消息分批到滚动或会话窗口中,并用 SQL 聚合。
 ---
 
 # 实战:在窗口中聚合
@@ -17,8 +17,9 @@ description: 将消息分批到滚动、滑动或会话窗口中,并用 SQL 聚�
 | 缓冲(Buffer)类型 | 行为 | 典型用途 |
 |-------------|----------|-------------|
 | `tumbling_window` | 固定、不重叠的时间区间 | 周期性报表、批量写入 |
-| `sliding_window` | 相互重叠、滑动的窗口 | 滚动指标 |
 | `session_window` | 只要间隔不超过超时时间,窗口就保持打开 | 用户会话 |
+
+重叠/滑动窗口请使用 Job DAG 的 `window` 算子(`kind: sliding`,事件时间)——参见[事件时间语义](/zh-Hans/docs/build/distributed-jobs#事件时间语义)。旧式 `sliding_window` **缓冲**会被流编译器拒绝:其按行数的窗口无法映射到事件时间窗口算子。
 
 ## 配置
 
@@ -59,7 +60,7 @@ streams:
       type: stdout
 ```
 
-整个流程是:消息在**缓冲**(即窗口)中累积,每隔一个 `interval`,整个窗口作为一个批次释放进流水线,由 SQL 计算聚合。切换为 `sliding_window` 或 `session_window` 只需改动 `buffer` 块(二者分别接受 `interval`/`timeout`)。
+整个流程是:消息在**缓冲**(即窗口)中累积,每隔一个 `interval`,整个窗口作为一个批次释放进流水线,由 SQL 计算聚合。切换为 `session_window` 只需改动 `buffer` 块(`session_window` 接受 `timeout`)。
 
 ## 运行与验证
 
@@ -73,4 +74,4 @@ streams:
 
 - **没有任何输出** —— 窗口缓冲只在时间间隔走完后才释放;请等满一个完整间隔。
 - **对字符串 JSON 字段做聚合失败** —— 确认 `json_to_arrow` 已先行解码负载,且查询引用的是解码后的列名。
-- 窗口释放时跨数据源的 SQL join 可通过缓冲的 `join` 配置实现——参见[滚动窗口参考](/zh-Hans/docs/components/buffers/tumbling_window)。
+- **需要 join 两个数据源** —— 带旧式 `join` 字段的窗口缓冲会在编译时失败。流-流 join 是 Job DAG 的能力:运行一个带 `join` 算子(恰好两条入边)的 job——参见[双流 join](/zh-Hans/docs/build/distributed-jobs#双流-join)。

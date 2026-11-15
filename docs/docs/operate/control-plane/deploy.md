@@ -364,7 +364,7 @@ authenticated sessions. `VITE_API_TOKEN` deployments keep working unchanged —
 with a static token configured the console never redirects — and the console
 can also accept a bearer token at runtime instead of at build time. Sessions
 are persisted in the control-plane database when the Hub has durable storage
-(`cp_sessions`, schema v5): they survive Hub restarts, are deleted on logout,
+(`cp_sessions`, schema v6): they survive Hub restarts, are deleted on logout,
 and are invalidated immediately when the user is disabled, deleted, or
 `POST /api/v1/users/{id}/revoke-tokens` is called. A volatile Hub keeps the
 old in-memory behavior and signs everyone out on restart. Backup and restore
@@ -409,7 +409,9 @@ prefer OIDC authentication in production (leave the token unset).
 
 The old UI treated the backend as a health and aggregate-stream monitor. The
 resource-oriented console uses `/api/v1/system`, `/nodes`, `/streams`,
-`/operations`, `/events`, `/configuration`, and `/components`. Lifecycle
+`/operations`, `/events`, `/components`, and node-scoped
+`/nodes/{node_id}/configuration` (a fleet-level `/api/v1/configuration`
+endpoint exists only on the standalone node plane, not on the Hub). Lifecycle
 requests are asynchronous and must be polled by operation ID. Existing
 `/health`, `/readiness`, `/liveness`, `/metrics`, `/status`, and `/config*`
 routes remain as compatibility aliases, but new integrations should use the

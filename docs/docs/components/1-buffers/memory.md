@@ -1,11 +1,11 @@
 ---
 components: [buffer/memory]
-description: ArkFlow documentation page.
+description: In-memory buffer that releases a merged batch when a row-count capacity or timeout is reached.
 ---
 
 # Memory
 
-The Memory buffer is an in-memory message queue that accumulates incoming message batches and releases them as a single merged batch when either a capacity threshold or a timeout is reached. It smooths out traffic spikes and provides backpressure when downstream processing cannot keep up: once the buffer holds `capacity` messages, further writes wait until the reader drains accumulated messages, so the slowdown propagates upstream instead of growing the buffer without bound.
+The Memory buffer is an in-memory message queue that accumulates incoming message batches and releases them as a single merged batch when either a capacity threshold or a timeout is reached. It smooths out traffic spikes and provides backpressure when downstream processing cannot keep up: capacity is counted in **rows** (one message = one row of the merged batch), so once the buffer holds `capacity` rows in total, further writes wait until the reader drains accumulated messages, so the slowdown propagates upstream instead of growing the buffer without bound.
 
 Failed merges never drop retained messages: if accumulated batches cannot be merged (for example, incompatible schemas), the queue keeps them and the read fails with an error, leaving a retry possible. On close, the reader still drains whatever is pending before the stream ends, and a `flush` only wakes the reader — the timeout-based release keeps working afterwards.
 
@@ -16,7 +16,7 @@ Failed merges never drop retained messages: if accumulated batches cannot be mer
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | `memory` |
-| capacity | integer | yes | — | Maximum number of messages to accumulate. Once this many messages are held, writes wait (backpressure) until the reader releases them. Must be at least 1 — a capacity of `0` is rejected at build time. |
+| capacity | integer | yes | — | Maximum number of rows to accumulate (one message = one row). Once this many rows are held in total, writes wait (backpressure) until the reader releases them. Must be at least 1 — a capacity of `0` is rejected at build time. |
 | timeout | duration | yes | — | Maximum time to wait before flushing accumulated batches, even if `capacity` has not been reached. Examples: `1ms`, `1s`, `1m`, `1h`. |
 
 ## Examples

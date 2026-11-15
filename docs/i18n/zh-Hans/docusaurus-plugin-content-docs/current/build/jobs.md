@@ -80,7 +80,7 @@ jobs:
 
 - `parallelism`(默认 `1`)设置任务并行度;`max_parallelism`(默认 `128`)限定 `partitioned` 边所使用的键组空间。
 - `partitioned: true` 按键组归属路由,因此同一个 key 总会到达同一个下游任务,无论它来自哪个源分区或上游子任务。
-- 算子 `kind` 是 `source`、`map`、`filter`、`aggregate`、`window`、`sink` 或 `udf` 之一。`join` 在公开结构中保留,但在专门的分布式多输入运行时出现之前会被拒绝。
+- 算子 `kind` 是 `source`、`map`、`filter`、`aggregate`、`window`、`join`、`sink` 或 `udf` 之一。`join` 算子要求恰好两条入边,作为完整的 DAG join 算子运行——参见[双流 join](/zh-Hans/docs/build/distributed-jobs#双流-join)。
 - 事件时间源需声明 `mode`、`timestamp_field`、水位线参数与迟到事件策略(`drop`、`route` 或 `update`)。
 - 多输入顶点跨输入聚合水位线:超过 5 分钟未发出水位线的输入被视为空闲并从聚合中排除——静默输入(例如混入事件时间扇入的处理时间源)不会再永久冻结窗口触发与状态清理。空闲输入恢复上报且水位落后时会被钳制到单调递增的下游前沿;其间迟到行按所配置的迟到策略处置。
 - 汇聚到同一个窗口的各条源链按链**独立跟踪**水位线,即使两条链读取同一个 topic/partition(例如同一 Kafka topic 由两个消费组喂入同一个窗口)。窗口在所有链的最小值上触发,因此快链无法提前关闭慢链仍有事件的窗口。检查点按原始 `(topic, partition)` 形态持久化各分区水位,后续重新分组的图仍能把已保存进度恢复到每个 gate。

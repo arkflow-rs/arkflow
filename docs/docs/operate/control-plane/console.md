@@ -93,7 +93,7 @@ While a node is not `active`, its overview card shows the current state
 ## Navigation and URLs
 
 Every view has its own URL path (`/`, `/runtime`, `/jobs`, `/configuration`,
-`/rollouts`, `/components`, `/events`, `/audit`, `/users`, `/settings`), so views can be
+`/rollouts`, `/approvals`, `/components`, `/events`, `/audit`, `/users`, `/settings`), so views can be
 bookmarked, shared, and reached with the browser's back and forward buttons.
 The selected compute node is stored as a `node_id` query parameter on the
 current path and carries over when you switch views. Legacy links that used

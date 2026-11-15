@@ -1,6 +1,6 @@
 ---
 sidebar_position: 3
-description: Batch messages into tumbling, sliding, or session windows and aggregate with SQL.
+description: Batch messages into tumbling or session windows and aggregate with SQL.
 ---
 
 # How to: aggregate in windows
@@ -18,8 +18,14 @@ Batch messages into time windows and compute per-window aggregates with SQL.
 | Buffer type | Behavior | Typical use |
 |-------------|----------|-------------|
 | `tumbling_window` | Fixed, non-overlapping intervals | Periodic reports, batched writes |
-| `sliding_window` | Overlapping windows that slide | Rolling metrics |
 | `session_window` | Windows kept open while gaps stay under a timeout | User sessions |
+
+For overlapping/sliding windows use the Job DAG `window` operator with
+`kind: sliding` (event-time) — see
+[Event-time semantics](../distributed-jobs.md#event-time-semantics).
+The legacy `sliding_window` **buffer** is rejected by the stream compiler:
+its row-count windows cannot be represented by the event-time window
+operator.
 
 ## Configuration
 
@@ -63,9 +69,8 @@ streams:
 
 The flow is: messages accumulate in the **buffer** (the window), and every
 `interval` the whole window is released into the pipeline as one batch,
-where SQL computes the aggregate. Switching to `sliding_window` or
-`session_window` only changes the `buffer` block (`sliding_window` and
-`session_window` take `interval`/`timeout` respectively).
+where SQL computes the aggregate. Switching to `session_window` only
+changes the `buffer` block (`session_window` takes `timeout`).
 
 ## Run and verify
 
@@ -84,6 +89,7 @@ window.
 - **Aggregate over string JSON fields fails** — make sure `json_to_arrow`
   decoded the payload first and the query references the decoded column
   names.
-- SQL joins across sources at window emission time are supported via the
-  buffer's `join` configuration — see
-  [tumbling window reference](/docs/components/buffers/tumbling_window).
+- **Joining two sources** — a window buffer with a legacy `join` field fails
+  compilation. Stream-stream joins are a Job DAG feature: run a job with a
+  `join` operator (exactly two inbound edges) — see
+  [Stream-stream join](../distributed-jobs.md#stream-stream-join).

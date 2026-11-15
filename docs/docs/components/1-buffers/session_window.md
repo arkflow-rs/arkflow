@@ -19,8 +19,9 @@ The Session Window buffer groups messages into sessions defined by activity gaps
 
 Declaring `join` on a `session_window` buffer fails compilation with
 `legacy window buffers with 'join' cannot compile`. Stream-stream join is not
-supported in Stream configs; use the SQL processor's per-batch joins against
-temporary tables instead.
+supported in Stream configs; run a Job with the DAG `join` operator instead
+(see [Stream-stream join](../../build/distributed-jobs.md#stream-stream-join)),
+or use the SQL processor's per-batch joins against temporary tables.
 
 :::
 
@@ -31,7 +32,7 @@ temporary tables instead.
 | query | string | yes | — | SQL query joining batch data from different input sources. |
 | value_field | string | no | — | Name of the binary field holding the message payload. Defaults to the engine default binary value field. |
 | codec | object | yes | — | Codec used to decode message batches before joining. |
-| thread_num | integer | no | — | Number of worker threads used for parallel decoding during the join. |
+| thread_num | integer | no | — | Number of partitions each decoded batch is split into before the join (decode concurrency itself is fixed at the CPU count, not this value). |
 
 The `codec` field is a `CodecConfig` object: a `type` string selecting the codec plus any codec-specific fields.
 

@@ -1,5 +1,5 @@
 ---
-description: ArkFlow documentation page.
+description: Data types available in ArkFlow SQL and how they map to Arrow.
 ---
 
 # Data Types

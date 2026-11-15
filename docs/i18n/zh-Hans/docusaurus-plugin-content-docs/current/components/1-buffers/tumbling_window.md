@@ -19,7 +19,8 @@ description: ArkFlow 文档页。
 
 在 `tumbling_window` 缓冲上声明 `join` 会在编译时报错
 `legacy window buffers with 'join' cannot compile`。Stream 配置不支持流-流
-连接;请改用 SQL 处理器针对临时表的逐批次连接。
+连接;请改用带 DAG `join` 算子的 Job(参见[双流 join](/zh-Hans/docs/build/distributed-jobs#双流-join)),
+或使用 SQL 处理器针对临时表的逐批次连接。
 
 :::
 
@@ -30,7 +31,7 @@ description: ArkFlow 文档页。
 | query | string | yes | — | 对来自不同输入源的批次数据执行连接的 SQL 查询。 |
 | value_field | string | no | — | 保存消息载荷的二进制字段的名称。默认为引擎默认的二进制值字段。 |
 | codec | object | yes | — | 在连接前用于解码消息批次的编解码器(Codec)。 |
-| thread_num | integer | no | — | 连接期间用于并行解码的工作线程数。 |
+| thread_num | integer | no | — | 连接前把每个解码批次拆分成的分区数(解码并发本身固定为 CPU 核数,与此值无关)。 |
 
 `codec` 字段是一个 `CodecConfig` 对象:一个选择编解码器的 `type` 字符串,外加编解码器专属的其他字段。
 

@@ -74,3 +74,12 @@ input:
       - "tasks"
       - "notifications"
 ```
+
+## Durability
+
+Both modes use a no-op acknowledgement, which caps delivery at **at-most-once**:
+
+- **List** mode consumes destructively (`BLPOP`): once an element is popped it is gone from Redis. If the pipeline fails or crashes after delivery, the message is lost — it cannot be re-read.
+- **Subscribe** mode is fire-and-forget by Redis semantics: messages published while the consumer is down or reconnecting are never delivered.
+
+The cancellation-safety guarantee above only protects an already-decoded message from being lost by a *drop of the pending read* — it does not make the source replayable. For durable consumption, front Redis with a replayable source (e.g. Kafka), or enable stream-level WAL durability with a source that supports replay.

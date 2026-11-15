@@ -92,8 +92,9 @@ Key points:
   reaches the same downstream task regardless of which source partition or
   upstream subtask delivered it.
 - Operator `kind` is one of `source`, `map`, `filter`, `aggregate`,
-  `window`, `sink`, or `udf`. `join` is reserved in the public shape but is
-  rejected until a dedicated distributed multi-input runtime exists.
+  `window`, `join`, `sink`, or `udf`. A `join` operator requires exactly
+  two inbound edges and runs as a full DAG join operator — see
+  [Stream-stream join](./distributed-jobs.md#stream-stream-join).
 - Event-time sources declare `mode`, a `timestamp_field`, watermark
   parameters, and a late-event policy (`drop`, `route`, or `update`).
 - Multi-input vertices aggregate watermarks across their inputs: an input

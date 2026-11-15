@@ -42,18 +42,32 @@ the exact `JobSpec` the Hub will distribute.
 ## 2. Start the Hub and register agents
 
 The Hub is the standalone `arkflow-server` binary, configured through
-environment variables — `ARKFLOW_NODE_TOKEN` must match the agents' shared
-`node_token` (see [deployment](./control-plane/deploy.md)).
+environment variables — secure startup refuses to bind without durable
+storage (`ARKFLOW_HUB_STORAGE`) plus both operator and node credentials
+(`ARKFLOW_OPERATOR_TOKEN`, `ARKFLOW_NODE_TOKEN`); `ARKFLOW_NODE_TOKEN` must
+match the agents' shared `node_token` (see
+[deployment](./control-plane/deploy.md)).
 `examples/control_plane_node.yaml` shows an agent-side deployment
 configuration:
 
 ```bash
-# terminal 1 — the Hub
+# terminal 1 — the Hub (secure startup: durable storage + operator/node credentials)
+ARKFLOW_HUB_STORAGE=sqlite:/tmp/arkflow-hub.sqlite \
+ARKFLOW_OPERATOR_TOKEN=replace-with-operator-token \
 ARKFLOW_NODE_TOKEN=replace-with-node-token ./target/release/arkflow-server
 
 # terminal 2+ — one Agent per compute node
 ./target/release/arkflow --config examples/control_plane_node.yaml
 ```
+
+:::tip
+
+For a purely local dev loop, `ARKFLOW_HUB_INSECURE_LOCAL=1` (with the Hub
+bound to loopback) relaxes the guard to allow volatile state and omitted
+credentials — see
+[Hub startup safety](../reference/configuration.md#standalone-hub-startup-safety).
+
+:::
 
 Expected result: each agent appears as a leased node in the Hub's fleet API
 (`/api/v1`). A node that goes silent keeps appearing in the fleet but stops

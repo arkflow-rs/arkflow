@@ -17,7 +17,7 @@ or more sinks — all driven by a single YAML file.
 ## Core features
 
 - **High performance** — Rust + Tokio, columnar [Apache Arrow](https://arrow.apache.org/) data, multi-threaded pipelines.
-- **Durable delivery** — at-least-once by default via per-stream WAL durability; opt-in exactly-once for transactional sinks. See [Delivery semantics](/docs/build/delivery-semantics).
+- **Durable delivery** — opt-in per-stream WAL durability for at-least-once delivery; opt-in exactly-once for transactional sinks. See [Delivery semantics](/docs/build/delivery-semantics).
 - **Many sources & sinks** — Kafka, MQTT, HTTP, files (with S3/GCS/Azure/HDFS), Pulsar, NATS, Redis, SQL, Modbus, WebSocket, InfluxDB, and more.
 - **Powerful processing** — SQL (DataFusion), VRL, Python UDFs, JSON, Protobuf, batching, windowing, and multi-source joins.
 - **Streaming codecs** — JSON, Protobuf, Debezium CDC envelopes, and Confluent Schema Registry wire-format.

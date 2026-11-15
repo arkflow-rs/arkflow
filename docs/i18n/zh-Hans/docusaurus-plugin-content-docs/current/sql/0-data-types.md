@@ -1,5 +1,5 @@
 ---
-description: ArkFlow 文档页面。
+description: ArkFlow SQL 中可用的数据类型及其与 Arrow 的映射。
 ---
 
 # 数据类型(Data Types)

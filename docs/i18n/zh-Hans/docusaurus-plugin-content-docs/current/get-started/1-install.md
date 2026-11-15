@@ -7,15 +7,8 @@ sidebar_position: 1
 ## 前置条件
 
 - **Rust ≥ 1.97**(工具链,用于从源码构建)
-- **Protobuf 编译器**(`protoc`)——构建 protobuf 编解码器时必需
 
-```bash
-# macOS
-brew install protobuf
-# Debian/Ubuntu
-sudo apt-get install protobuf-compiler
-export PROTOC=$(which protoc)
-```
+无需安装 protobuf 编译器:Protobuf 编解码器的 `.proto` 文件由内置的纯 Rust `protox` 编译器在**运行时**编译,构建过程也不调用 `protoc`(仓库没有 `build.rs`)。
 
 ## 从源码构建
 

@@ -68,7 +68,8 @@ Job 位于 `arkflow_job_*`。所有序列都携带 `# HELP`/`# TYPE` 元数据;�
 Hub 会在自己的 `/metrics` 端点上重新导出其 Agent 上报的数据平面指标,并附加一个 `node`
 标签以区分上报者。Job/Stream 序列只为持有有效租约的 Agent 导出——停止上报的 Agent(租约过期或已注销)会从暴露中消失;
 原始的 `arkflow_node_metric` 序列则保留最后一次上报的值。配置了运维令牌时,该端点要求携带它
-(`Authorization: Bearer <operator token>`);未配置令牌时,该端点与 Hub API 的其余部分一样无需认证即可访问。
+(`Authorization: Bearer <operator token>`);无令牌的 Hub 只存在于 `ARKFLOW_HUB_INSECURE_LOCAL`
+环回开发模式——生产 Hub 必有凭据,该端点始终要求认证。
 
 Hub 侧的指标族:
 

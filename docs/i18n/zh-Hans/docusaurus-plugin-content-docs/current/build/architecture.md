@@ -37,6 +37,6 @@ Input → Buffer → [Processor → Processor → …] → Output
 - 若干**处理器工作者**(通过 `pipeline.thread_num` 配置),
 - 一个**输出工作者**按有序投递写到下游。
 
-它们通过 `flume` 通道通信,并通过 `CancellationToken` 一同关闭。关闭时由 `TaskTracker` 等待所有任务结束。
+它们通过有界 `flume` 通道(容量 1024)通信,并通过 `CancellationToken` 一同关闭。编译后的流运行在统一执行内核上,关闭时由内核 join 处理者与收集者工作者(`TaskTracker` 额外跟踪 `multiple_inputs` 的扇入读取任务)。
 
 继续阅读[背压与有序投递](/zh-Hans/docs/build/backpressure)。

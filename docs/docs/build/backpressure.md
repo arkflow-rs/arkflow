@@ -22,7 +22,7 @@ Effectively:
 - replayable sources simply pause their fetch, so no data is lost (the broker
   retains it).
 
-For windowing buffers (tumbling / sliding / session), the buffer itself holds
+For windowing buffers (tumbling / session), the buffer itself holds
 batches until the window closes, so the threshold interacts with the window's
 size and flush interval — size the window so it does not stall the input.
 
