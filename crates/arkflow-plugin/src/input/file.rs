@@ -153,7 +153,7 @@ struct FileInput {
     input_name: Option<String>,
     config: FileInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
-    cancellation_token: CancellationToken,
+    cancellation_token: Arc<Mutex<CancellationToken>>,
 }
 
 impl FileInput {
@@ -163,7 +163,7 @@ impl FileInput {
             input_name: name.map(str::to_string),
             config,
             stream: Arc::new(Mutex::new(None)),
-            cancellation_token,
+            cancellation_token: Arc::new(Mutex::new(cancellation_token)),
         })
     }
 
@@ -449,6 +449,7 @@ impl FileInput {
 #[async_trait]
 impl Input for FileInput {
     async fn connect(&self) -> Result<(), Error> {
+        *self.cancellation_token.lock().await = CancellationToken::new();
         let stream_arc = self.stream.clone();
         let mut stream_lock = stream_arc.lock().await;
 
@@ -466,10 +467,14 @@ impl Input for FileInput {
         let stream_arc = self.stream.clone();
         let mut stream_lock = stream_arc.lock().await;
         if stream_lock.is_none() {
+            // A closed input reports EOF; an unconnected one is a usage error.
+            if self.cancellation_token.lock().await.is_cancelled() {
+                return Err(Error::EOF);
+            }
             return Err(Error::Process("Stream is None".to_string()));
         }
 
-        let cancellation_token = self.cancellation_token.clone();
+        let cancellation_token = self.cancellation_token.lock().await.clone();
 
         let stream_lock = stream_lock.as_mut().unwrap();
         let mut stream_pin = stream_lock.as_mut();
@@ -495,7 +500,11 @@ impl Input for FileInput {
     }
 
     async fn close(&self) -> Result<(), Error> {
-        self.cancellation_token.clone().cancel();
+        self.cancellation_token.lock().await.cancel();
+        // Drop the installed plan/stream; otherwise the query
+        // keeps its resources alive while the input instance is retained,
+        // and a concurrent connect could install a new stream after close.
+        *self.stream.lock().await = None;
         Ok(())
     }
 }

@@ -119,6 +119,12 @@ pub struct HubNode {
     pub capabilities: Vec<String>,
     pub last_seen_at_ms: u64,
     pub lease_expires_at_ms: u64,
+    /// Sequence of the last state REPORT this node view reflects. Heartbeats
+    /// refresh `last_seen_at_ms` but never advance this, so observers that
+    /// need "a new report arrived" (rather than "the node is alive") can wait
+    /// on it.
+    #[serde(default)]
+    pub report_seq: u64,
     pub streams_total: usize,
     pub streams_running: usize,
     pub streams_failed: usize,

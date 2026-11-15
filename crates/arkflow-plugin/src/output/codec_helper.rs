@@ -43,6 +43,23 @@ pub async fn apply_codec_encode(
     }
 }
 
+/// Reject a payload list that is shorter than the batch. `to_binary` skips
+/// NULL cells, so a batch with any NULL `__value__` produces fewer payloads
+/// than rows. Outputs that route each payload by its row position (topics,
+/// keys, Redis fields) must fail instead of binding later rows to earlier
+/// routing values.
+pub fn ensure_row_aligned(payloads: &[Bytes], rows: usize, output: &str) -> Result<(), Error> {
+    if payloads.len() != rows {
+        return Err(Error::Process(format!(
+            "{output} output: default binary encoding produced {} payloads for {rows} rows; a \
+             NULL `{DEFAULT_BINARY_VALUE_FIELD}` cannot be routed by position — set `value_field` \
+             or ensure every row has a payload",
+            payloads.len()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

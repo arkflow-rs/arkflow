@@ -292,25 +292,52 @@ mod pulsar_tests {
 
     #[test]
     fn test_pulsar_input_builder_with_invalid_config() {
-        let config_json = serde_json::json!({
-            "service_url": "invalid-url",
-            "topic": "",
-            "subscription_name": "test-subscription"
-        });
-
+        let resource = arkflow_core::Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        };
         let builder = arkflow_plugin::input::pulsar::PulsarInputBuilder;
-        let result = builder.build(
-            Some("test-input"),
-            &Some(config_json),
-            None,
-            &arkflow_core::Resource {
-                temporary: std::collections::HashMap::new(),
-                input_names: std::cell::RefCell::new(Vec::new()),
-            },
+
+        // One invalid field per case: a mixed-invalid case passed as long as
+        // ANY field was rejected, so a regression in the other checks stayed
+        // invisible.
+        let invalid_url = builder
+            .build(
+                Some("test-input"),
+                &Some(serde_json::json!({
+                    "service_url": "invalid-url",
+                    "topic": "test-topic",
+                    "subscription_name": "test-subscription"
+                })),
+                None,
+                &resource,
+            )
+            .err()
+            .expect("an invalid service URL must be rejected")
+            .to_string();
+        assert!(
+            invalid_url.contains("service URL"),
+            "the error must name the service URL: {invalid_url}"
         );
 
-        // Should fail with invalid configuration
-        assert!(result.is_err());
+        let empty_topic = builder
+            .build(
+                Some("test-input"),
+                &Some(serde_json::json!({
+                    "service_url": "pulsar://localhost:6650",
+                    "topic": "",
+                    "subscription_name": "test-subscription"
+                })),
+                None,
+                &resource,
+            )
+            .err()
+            .expect("an empty topic must be rejected")
+            .to_string();
+        assert!(
+            empty_topic.contains("Topic name cannot be empty"),
+            "the error must name the topic: {empty_topic}"
+        );
     }
 
     #[test]
@@ -342,7 +369,7 @@ mod pulsar_tests {
     fn test_pulsar_output_builder_with_invalid_config() {
         let config_json = serde_json::json!({
             "service_url": "invalid-url",
-            "topic": "test-topic"
+            "topic": {"type": "value", "value": "test-topic"}
         });
 
         let builder = arkflow_plugin::output::pulsar::PulsarOutputBuilder;
@@ -357,6 +384,13 @@ mod pulsar_tests {
         );
 
         // Should fail with invalid configuration
-        assert!(result.is_err());
+        let error = result
+            .err()
+            .expect("an invalid service URL must be rejected")
+            .to_string();
+        assert!(
+            error.contains("service URL"),
+            "the error must name the service URL: {error}"
+        );
     }
 }

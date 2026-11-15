@@ -152,9 +152,16 @@ impl SlidingWindow {
 
         let new_ack = Arc::new(VecAck(acks));
 
-        // Remove slide_size messages from the front of the queue
-        // This slides the window forward by the configured amount
-        for _ in 0..self.config.slide_size {
+        // A forced flush emitted the WHOLE queue; removing only slide_size
+        // left the rest and repeated the same overlapping output on the next
+        // read. Remove exactly what was emitted; normal slides advance by
+        // slide_size for the overlapping-window contract.
+        let remove = if force {
+            size
+        } else {
+            (self.config.slide_size as usize).min(size)
+        };
+        for _ in 0..remove {
             if queue_lock.pop_front().is_none() {
                 break;
             }

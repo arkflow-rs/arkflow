@@ -16,14 +16,37 @@ use serde::de::Unexpected;
 use serde::{de, Deserialize, Deserializer};
 use std::time::Duration;
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DurationRepr {
+    Text(String),
+    Object {
+        secs: u64,
+        #[serde(default)]
+        nanos: u32,
+    },
+}
+
 pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let s: String = Deserialize::deserialize(deserializer)?;
-    humantime::parse_duration(&s).map_err(|_| {
-        de::Error::invalid_value(Unexpected::Str(&s), &"a duration like '10ms' or '1s'")
-    })
+    match DurationRepr::deserialize(deserializer)? {
+        DurationRepr::Text(text) => humantime::parse_duration(&text).map_err(|_| {
+            de::Error::invalid_value(Unexpected::Str(&text), &"a duration like '10ms' or '1s'")
+        }),
+        // Derived `Serialize` emits `{secs, nanos}`; accept it so typed
+        // configs can round-trip through the same decoder.
+        DurationRepr::Object { secs, nanos } => {
+            if nanos >= 1_000_000_000 {
+                return Err(de::Error::invalid_value(
+                    Unexpected::Unsigned(nanos as u64),
+                    &"nanoseconds below 1,000,000,000",
+                ));
+            }
+            Ok(Duration::new(secs, nanos))
+        }
+    }
 }
 
 #[cfg(test)]

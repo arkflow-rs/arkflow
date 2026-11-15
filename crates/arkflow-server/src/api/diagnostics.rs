@@ -120,13 +120,19 @@ pub(super) async fn hub_metrics(
     ));
     // Data-plane series reported by Agents: the kernel Job vocabulary with an
     // extra `node` label. Expired-lease nodes are excluded by the Hub.
+    // Encode every Job's families in ONE call so a family shared by several
+    // jobs/node reports is merged instead of repeating its HELP/TYPE header.
+    let mut data_plane = Vec::new();
     for (node_id, jobs) in hub.job_metrics().await {
         for (job_id, snapshot) in &jobs {
-            body.push_str(&crate::metrics::encode_families(
-                crate::metrics::kernel_job_families(job_id, snapshot, &[("node", node_id.clone())]),
+            data_plane.extend(crate::metrics::kernel_job_families(
+                job_id,
+                snapshot,
+                &[("node", node_id.clone())],
             ));
         }
     }
+    body.push_str(&crate::metrics::encode_families(data_plane));
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
@@ -426,7 +432,9 @@ pub(crate) async fn hub_oidc_callback(
 pub(crate) async fn hub_oidc_logout(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
     if let Some(token) = bearer(&headers) {
         if let Some(session_id) = token.strip_prefix("session:") {
-            hub.remove_session(session_id).await;
+            if let Err(error) = hub.remove_session(session_id).await {
+                return hub_problem(error);
+            }
         }
     }
     Response::builder()

@@ -38,7 +38,11 @@ impl StateSnapshot {
     }
 
     pub fn verify(&self) -> bool {
-        self.checksum == checksum_entries(&self.entries)
+        // New snapshots use the length-prefixed v2 encoding; checkpoints
+        // written before it remain valid under the legacy byte-concatenation
+        // checksum.
+        self.checksum == checksum_entries_v2(&self.entries)
+            || self.checksum == checksum_entries_legacy(&self.entries)
     }
 }
 
@@ -744,6 +748,33 @@ impl StateBackend for RedbStateBackend {
                 .map(|value| decode_value(value.value()))
                 .transpose()?;
             let (bytes, had_live) = Self::previous_row(&previous, now_ms());
+            // A compensating restore must obey the same byte budget as a
+            // normal write; otherwise an undo can push the state past the
+            // configured maximum and later writes reject every increase.
+            if had_live {
+                if let Some(max_bytes) = self.max_bytes {
+                    let projected = self
+                        .bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(bytes)
+                        .saturating_add(entry.value.len() as u64);
+                    if projected > max_bytes {
+                        return Err(Error::Process(format!(
+                            "state restore exceeds the configured byte budget ({projected} > {max_bytes})"
+                        )));
+                    }
+                }
+            } else if let Some(max_bytes) = self.max_bytes {
+                let projected = self
+                    .bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(entry.value.len() as u64);
+                if projected > max_bytes {
+                    return Err(Error::Process(format!(
+                        "state restore exceeds the configured byte budget ({projected} > {max_bytes})"
+                    )));
+                }
+            }
             table
                 .insert(storage_key.as_str(), encoded.as_slice())
                 .map_err(|error| Error::Process(format!("state restore: {error}")))?;
@@ -785,15 +816,20 @@ impl StateBackend for RedbStateBackend {
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
             let mut freed_bytes = 0_u64;
             let mut freed_keys = 0_u64;
-            // A configured byte budget must reclaim expired bytes before the
-            // check (the exact contract of the budget tests); without a
-            // budget the purge is amortized space reclamation.
-            if self.max_bytes.is_some()
-                || self
-                    .writes
-                    .fetch_add(1, Ordering::Relaxed)
-                    .is_multiple_of(PURGE_INTERVAL_WRITES)
-            {
+            let write_index = self.writes.fetch_add(1, Ordering::Relaxed);
+            // A byte budget used to force a full-table expired purge AND a
+            // second full-table byte scan on EVERY write (quadratic over a
+            // workload). Track live bytes incrementally; only pay for an
+            // exact scan when the tracked budget is under pressure, and
+            // reclaim expired rows periodically otherwise.
+            let budget_pressure = self.max_bytes.is_some_and(|max_bytes| {
+                self.bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(value.len() as u64)
+                    > max_bytes
+            });
+            let periodic = write_index.is_multiple_of(PURGE_INTERVAL_WRITES);
+            if budget_pressure || periodic {
                 let (bytes, keys) = Self::remove_expired_in_table(&mut table, now_ms)?;
                 freed_bytes += bytes;
                 freed_keys += keys;
@@ -821,7 +857,7 @@ impl StateBackend for RedbStateBackend {
             // drifted would reject every future write. `max_bytes` is the one
             // configuration that needs an exact answer, so it pays for the
             // scan and reconciles the counter to the measurement afterwards.
-            let budget_delta = if self.max_bytes.is_some() {
+            let budget_delta = if self.max_bytes.is_some() && (budget_pressure || periodic) {
                 let mut live_bytes = 0_u64;
                 let mut live_keys = 0_u64;
                 for item in table
@@ -914,15 +950,14 @@ impl StateBackend for RedbStateBackend {
                 .map_err(|error| Error::Process(format!("state table: {error}")))?;
             let mut freed_bytes = 0_u64;
             let mut freed_keys = 0_u64;
-            // A configured byte budget must reclaim expired bytes before the
-            // check; without a budget the purge is amortized space
-            // reclamation (reads hide expired values either way).
-            if self.max_bytes.is_some()
-                || self
-                    .writes
-                    .fetch_add(1, Ordering::Relaxed)
-                    .is_multiple_of(PURGE_INTERVAL_WRITES)
-            {
+            let write_index = self.writes.fetch_add(1, Ordering::Relaxed);
+            // Same amortization as `put_with_ttl`: no full-table scan on every
+            // write; scan only under budget pressure or periodically.
+            let budget_pressure = self.max_bytes.is_some_and(|max_bytes| {
+                self.bytes.load(Ordering::Relaxed).saturating_add(8) > max_bytes
+            });
+            let periodic = write_index.is_multiple_of(PURGE_INTERVAL_WRITES);
+            if budget_pressure || periodic {
                 let (bytes, keys) = Self::remove_expired_in_table(&mut table, current_time_ms)?;
                 freed_bytes += bytes;
                 freed_keys += keys;
@@ -955,7 +990,7 @@ impl StateBackend for RedbStateBackend {
             // The budget is measured inside the write transaction for the same
             // reason as `put_with_ttl`: the tracked counters are observability
             // only, and a drifted counter must not reject a legal write.
-            let budget_delta = if self.max_bytes.is_some() {
+            let budget_delta = if self.max_bytes.is_some() && (budget_pressure || periodic) {
                 let mut live_bytes = 0_u64;
                 let mut live_keys = 0_u64;
                 for item in table
@@ -1300,6 +1335,43 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 fn checksum_entries(entries: &[StateEntry]) -> u64 {
+    checksum_entries_v2(entries)
+}
+
+/// Length-prefixed checksum: concatenating namespace/key/value bytes without
+/// boundaries made (`key=a`, `value=bc`) and (`key=ab`, `value=c`) collide,
+/// so two different snapshots could share an object key.
+fn checksum_entries_v2(entries: &[StateEntry]) -> u64 {
+    fn update(checksum: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *checksum ^= u64::from(*byte);
+            *checksum = checksum.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn update_field(checksum: &mut u64, bytes: &[u8]) {
+        update(checksum, &(bytes.len() as u64).to_le_bytes());
+        update(checksum, bytes);
+    }
+
+    let mut checksum = 0xcbf29ce484222325u64;
+    update(&mut checksum, b"arkflow-state-v2");
+    for entry in entries {
+        update_field(&mut checksum, entry.namespace.as_bytes());
+        update_field(&mut checksum, &entry.key);
+        update_field(&mut checksum, &entry.value);
+        match entry.expires_at_ms {
+            Some(expires) => {
+                update(&mut checksum, &[1]);
+                update(&mut checksum, &expires.to_le_bytes());
+            }
+            None => update(&mut checksum, &[0]),
+        }
+    }
+    checksum
+}
+
+/// Pre-v2 checksum, kept only to verify snapshots written by older builds.
+fn checksum_entries_legacy(entries: &[StateEntry]) -> u64 {
     let mut checksum = 0xcbf29ce484222325u64;
     for entry in entries {
         for byte in entry

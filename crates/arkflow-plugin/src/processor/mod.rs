@@ -32,20 +32,27 @@ pub mod vector_search;
 pub mod vrl;
 
 fn register_components() -> Result<(), Error> {
-    batch::init()?;
-    json::init()?;
-    llm::init()?;
-    lookup::init()?;
-    pgvector_search::init()?;
-    protobuf::init()?;
-    sql::init()?;
-    vrl::init()?;
-    python::init()?;
-    embedding::init()?;
-    vector_search::init()?;
-    milvus_search::init()?;
-    Ok(())
+    crate::init_steps(
+        &COMPLETED,
+        &[
+            batch::init,
+            json::init,
+            llm::init,
+            lookup::init,
+            pgvector_search::init,
+            protobuf::init,
+            sql::init,
+            vrl::init,
+            python::init,
+            embedding::init,
+            vector_search::init,
+            milvus_search::init,
+        ],
+    )
 }
+
+static COMPLETED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Component registration is process-global, so `init()` is idempotent:
 /// the first successful call registers every builder and later calls

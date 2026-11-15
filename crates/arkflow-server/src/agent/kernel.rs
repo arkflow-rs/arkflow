@@ -830,7 +830,7 @@ impl JobRuntime {
         };
         let manifest_key = format!(
             "{prefix}/{checkpoint_id}/manifests/{}.json",
-            node_id.replace('/', "_")
+            arkflow_core::checkpoint::encode_node_key(node_id)
         );
         let manifest_key_owned = manifest_key.clone();
         let store_uri_for_manifest = store_uri.to_owned();
@@ -897,7 +897,14 @@ impl JobRuntime {
         for node_id in manifest_nodes {
             let key = format!(
                 "{prefix}/{checkpoint_id}/manifests/{}.json",
-                node_id.replace('/', "_")
+                arkflow_core::checkpoint::encode_node_key(node_id)
+            );
+            // Intermediate manifests written before the percent-encoding
+            // change live under the `/`→`_` spelling; fall back to it so an
+            // upgrade can still aggregate an in-flight checkpoint.
+            let legacy_key = format!(
+                "{prefix}/{checkpoint_id}/manifests/{}.json",
+                arkflow_core::checkpoint::legacy_encode_node_key(node_id)
             );
             let artifact = RecoveryArtifact {
                 id: checkpoint_id.to_owned(),
@@ -910,14 +917,29 @@ impl JobRuntime {
             };
             let store_uri_for_read = store_uri.to_owned();
             let artifact_for_read = artifact.clone();
+            let legacy_artifact = RecoveryArtifact {
+                manifest_key: legacy_key,
+                ..artifact.clone()
+            };
             // Blocking object-store reads run on the blocking pool.
             let manifest = tokio::task::spawn_blocking(move || -> Result<_, String> {
                 let repository = CheckpointRepository::new(SharedCheckpointStore::from_uri(
                     &store_uri_for_read,
                 )?);
-                repository
-                    .read_manifest(&artifact_for_read)
-                    .map_err(|error| error.to_string())
+                match repository.read_manifest(&artifact_for_read) {
+                    Ok(manifest) => Ok(manifest),
+                    Err(current_error)
+                        if legacy_artifact.manifest_key != artifact_for_read.manifest_key =>
+                    {
+                        repository.read_manifest(&legacy_artifact).map_err(|_| {
+                            format!(
+                                "checkpoint manifest read failed for both encodings                                  ({} and {}): {current_error}",
+                                artifact_for_read.manifest_key, legacy_artifact.manifest_key
+                            )
+                        })
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
             })
             .await
             .map_err(|error| format!("checkpoint manifest read task failed: {error}"))??;

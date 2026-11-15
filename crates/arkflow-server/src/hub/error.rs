@@ -61,6 +61,7 @@ impl HubError {
         match self {
             Self::Unauthorized => "authorization",
             Self::NodeUnavailable => "node_unavailable",
+            Self::Capacity => "capacity",
             Self::StorageUnavailable | Self::Storage(_) => "repository",
             Self::StaleLeader { .. } => "stale_leader",
             Self::NotFound => "not_found",
@@ -134,8 +135,9 @@ mod tests {
             HubError::OrchestrationPhaseConflict.failure_class(),
             "orchestration_conflict"
         );
-        // Everything else funnels into the shared invalid-request bucket.
-        assert_eq!(HubError::Capacity.failure_class(), "invalid");
+        // Registry exhaustion has its own admission class; everything else
+        // funnels into the shared invalid-request bucket.
+        assert_eq!(HubError::Capacity.failure_class(), "capacity");
         assert_eq!(
             HubError::Invalid("bad input".into()).failure_class(),
             "invalid"

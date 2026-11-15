@@ -116,6 +116,10 @@ fn sweep_leftover_brokers() {
         .args([
             "ps",
             "-aq",
+            // Only exited/created leftovers: a running container may belong
+            // to another checkout or project using the same image.
+            "--filter",
+            "status=exited",
             "--filter",
             "label=org.testcontainers.managed-by=testcontainers",
             "--filter",

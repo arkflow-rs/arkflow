@@ -61,6 +61,15 @@ pub fn compile_stream(stream: &StreamConfig, index: usize) -> Result<JobSpec, Er
         )
     });
     let requested_parallelism = stream.pipeline.thread_num.max(1);
+    // The worker pool allocates channel capacity, task handles, and spawned
+    // workers from this value; an absurd configuration must fail validation
+    // instead of exhausting memory at start.
+    if requested_parallelism > 1024 {
+        return Err(Error::Config(format!(
+            "stream '{stream_id}' pipeline.thread_num is {requested_parallelism}; the maximum \
+             supported processor parallelism is 1024"
+        )));
+    }
     let chain_parallelism = if window_buffered && requested_parallelism > 1 {
         if requested_parallelism == crate::pipeline::default_thread_num() {
             1
@@ -465,7 +474,14 @@ fn parse_duration_ms(raw: &str) -> Option<i64> {
         "h" | "hour" | "hours" => 3_600_000.0,
         _ => return None,
     };
-    Some((value * multiplier) as i64)
+    let millis = value * multiplier;
+    // The humantime branch rejects overflow; the float fallback must use the
+    // same rule instead of saturating to i64::MAX (a 1e30s window became a
+    // gigantic but valid-looking duration).
+    if !millis.is_finite() || millis < i64::MIN as f64 || millis > i64::MAX as f64 {
+        return None;
+    }
+    Some(millis as i64)
 }
 
 #[cfg(test)]

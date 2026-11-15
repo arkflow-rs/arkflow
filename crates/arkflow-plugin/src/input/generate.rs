@@ -19,9 +19,9 @@ use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, Noop
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GenerateInputConfig {
@@ -37,7 +37,11 @@ struct GenerateInput {
     config: GenerateInputConfig,
     count: AtomicI64,
     batch_size: usize,
-    first: AtomicBool,
+    /// Absolute deadline of the next read. It must survive cancelled reads:
+    /// the kernel's 100 ms idle tick drops `read()` futures, and rebuilding a
+    /// relative sleep on every call meant an interval above that tick never
+    /// elapsed. It is advanced only after a read actually delivers.
+    next_due: tokio::sync::Mutex<Option<Instant>>,
     codec: Option<Arc<dyn Codec>>,
 }
 impl GenerateInput {
@@ -55,12 +59,25 @@ impl GenerateInput {
                 "generate input 'batch_size' must be at least 1".to_string(),
             ));
         }
+        // The counters are i64 and every read replicates the template
+        // `batch_size` times; reject values that cannot be represented or
+        // would require an unbounded preallocation.
+        if batch_size > i64::MAX as usize || batch_size > 1_000_000 {
+            return Err(Error::Config(format!(
+                "generate input 'batch_size' {batch_size} is outside the supported range 1..=1000000"
+            )));
+        }
+        if config.count.is_some_and(|count| count > i64::MAX as usize) {
+            return Err(Error::Config(
+                "generate input 'count' exceeds the supported i64 range".to_string(),
+            ));
+        }
         Ok(Self {
             input_name: name.map(str::to_string),
             config,
             count: AtomicI64::new(0),
             batch_size,
-            first: AtomicBool::new(true),
+            next_due: tokio::sync::Mutex::new(None),
             codec,
         })
     }
@@ -73,8 +90,13 @@ impl Input for GenerateInput {
     }
 
     async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
-        if !self.first.swap(false, Ordering::SeqCst) {
-            tokio::time::sleep(self.config.interval).await;
+        let now = Instant::now();
+        let due = {
+            let next = self.next_due.lock().await;
+            next.unwrap_or(now)
+        };
+        if due > now {
+            tokio::time::sleep(due - now).await;
         }
 
         let mut batch_size = self.batch_size;
@@ -113,6 +135,9 @@ impl Input for GenerateInput {
         }
 
         self.count.fetch_add(batch_size as i64, Ordering::SeqCst);
+        // Advance the cadence only after a delivery; a read cancelled during
+        // the sleep or the decode leaves the same deadline in place.
+        *self.next_due.lock().await = Some(due + self.config.interval);
 
         message_batch.set_input_name(self.input_name.clone());
         Ok((Arc::new(message_batch), Arc::new(NoopAck)))
@@ -250,6 +275,39 @@ mod tests {
 
         // Test close
         assert!(input.close().await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interval_deadline_survives_cancelled_reads() {
+        let input = GenerateInput::new(
+            None,
+            GenerateInputConfig {
+                context: "v:1".into(),
+                interval: Duration::from_secs(1),
+                count: None,
+                batch_size: Some(1),
+            },
+            None,
+        )
+        .unwrap();
+        let (first, _) = input.read().await.unwrap();
+        assert_eq!(first.len(), 1);
+
+        // The kernel's idle tick cancels the read every 100 ms. Ten
+        // cancellations cover one interval; rebuilding a relative sleep on
+        // every call would restart it forever and never deliver.
+        for _ in 0..10 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), input.read())
+                    .await
+                    .is_err()
+            );
+        }
+        let (second, _) = tokio::time::timeout(Duration::from_secs(1), input.read())
+            .await
+            .expect("the absolute deadline elapses despite cancelled reads")
+            .unwrap();
+        assert_eq!(second.len(), 1);
     }
 
     #[tokio::test]

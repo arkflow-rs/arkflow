@@ -2168,6 +2168,7 @@ impl ColumnarWindowOperator {
             inner,
             rollback: self.rollback_state(before, after),
             operation_guard: Mutex::new(Some(operation_guard)),
+            completed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

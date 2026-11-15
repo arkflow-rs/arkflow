@@ -27,14 +27,9 @@ use arkflow_core::component::{list_components_by_kind, ComponentKind};
 /// leg is skipped for them (the schema leg still runs). Keeping this list
 /// short is the point — new offline-buildable components get no exemption.
 fn build_exemptions() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        // Creates a Pulsar producer eagerly; needs a broker.
-        (
-            "output",
-            "pulsar",
-            "builds a Pulsar producer (needs broker)",
-        ),
-    ]
+    // No exemptions: every current builder is offline-safe. The Pulsar
+    // output builds its client in `connect()`, not in `build()`.
+    Vec::new()
 }
 
 /// Minimal JSON-Schema validation covering the subset our metadata uses:
@@ -66,6 +61,27 @@ fn validate(value: &serde_json::Value, schema: &serde_json::Value, path: &str) -
     if let Some(allowed) = obj.get("enum").and_then(|e| e.as_array()) {
         if !allowed.contains(value) {
             errors.push(format!("{path}: {value} not in enum {allowed:?}"));
+        }
+    }
+
+    if let Some(expected) = obj.get("const") {
+        if value != expected {
+            errors.push(format!("{path}: {value} must equal const {expected}"));
+        }
+    }
+
+    if let Some(minimum) = obj.get("minimum").and_then(serde_json::Value::as_f64) {
+        if let Some(number) = value.as_f64() {
+            if number < minimum {
+                errors.push(format!("{path}: {number} is below minimum {minimum}"));
+            }
+        }
+    }
+    if let Some(maximum) = obj.get("maximum").and_then(serde_json::Value::as_f64) {
+        if let Some(number) = value.as_f64() {
+            if number > maximum {
+                errors.push(format!("{path}: {number} is above maximum {maximum}"));
+            }
         }
     }
 

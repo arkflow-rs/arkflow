@@ -63,15 +63,22 @@ pub(crate) fn resolve_candidate_payload(payload: String) -> Result<Option<String
             )))
         }
     };
+    // Keep the unresolved references for the verbatim copy: the node stores
+    // that text as its config version, so no plaintext is persisted. It must
+    // use the SAME format as `content` (JSON after this rewrite), otherwise
+    // a rollback reloads YAML text with a JSON parser and fails.
+    let verbatim = value.clone();
     secret::resolve_secret_references(&mut value)?;
 
     candidate["content"] = json!(serde_json::to_string(&value).map_err(|e| {
         Error::Config(format!("candidate content serialization failed: {}", e))
     })?);
-    // Carry the verbatim (pre-resolution) content alongside the resolved one:
-    // the node persists THIS text as its config version, keeping the dispatch
-    // path free of plaintext at rest. `serde` adds the field only when set.
-    candidate["content_verbatim"] = json!(content);
+    candidate["content_verbatim"] = json!(serde_json::to_string(&verbatim).map_err(|e| {
+        Error::Config(format!(
+            "candidate verbatim content serialization failed: {}",
+            e
+        ))
+    })?);
     candidate["format"] = json!("json");
     let serialized = serde_json::to_string(&candidate)
         .map_err(|e| Error::Config(format!("candidate payload serialization failed: {}", e)))?;
@@ -215,10 +222,20 @@ mod tests {
                 .contains("${secret:VERBATIM_PROBE}"),
             "dispatched content must be resolved"
         );
+        let verbatim = envelope["content_verbatim"].as_str().unwrap();
+        let verbatim_value: serde_json::Value = serde_json::from_str(verbatim)
+            .expect("verbatim content must use the same JSON format as content");
         assert_eq!(
-            envelope["content_verbatim"].as_str().unwrap(),
-            "health_check:\n  api_token: ${secret:VERBATIM_PROBE}\n",
+            verbatim_value["health_check"]["api_token"], "${secret:VERBATIM_PROBE}",
             "verbatim content must keep the reference"
         );
+        // A rollback reloads exactly this text with the recorded (JSON)
+        // format; it must parse instead of feeding YAML to a JSON parser.
+        let candidate = arkflow_core::configuration::ConfigCandidate {
+            format: arkflow_core::configuration::ConfigFormat::Json,
+            content: verbatim.to_string(),
+            content_verbatim: None,
+        };
+        assert!(candidate.parse().is_ok(), "verbatim must round-trip");
     }
 }

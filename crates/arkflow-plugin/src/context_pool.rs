@@ -37,6 +37,10 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct SessionContextPool {
     contexts: Vec<Arc<SessionContext>>,
     available: std::sync::Mutex<Vec<usize>>,
+    /// Wakes one waiter when a context returns to the pool. Without it an
+    /// exhausted pool would wake every waiter on a fixed interval just to
+    /// re-check the same lock.
+    released: tokio::sync::Notify,
 }
 
 impl SessionContextPool {
@@ -75,6 +79,7 @@ impl SessionContextPool {
         Ok(Self {
             contexts,
             available: std::sync::Mutex::new(available),
+            released: tokio::sync::Notify::new(),
         })
     }
 
@@ -83,10 +88,15 @@ impl SessionContextPool {
     }
 
     fn push_available(&self, index: usize) {
-        self.available
-            .lock()
-            .expect("context pool lock")
-            .push(index);
+        let mut available = self.available.lock().expect("context pool lock");
+        // A public release is not tied to a lease; a cloned Arc released
+        // twice must not make one slot available twice and hand the same
+        // DataFusion context to two callers.
+        if !available.contains(&index) {
+            available.push(index);
+            drop(available);
+            self.released.notify_one();
+        }
     }
 
     /// Wait for a free slot until the acquisition deadline. An exhausted
@@ -98,20 +108,40 @@ impl SessionContextPool {
             if let Some(index) = self.pop_available() {
                 return Ok(index);
             }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    pool_size = self.contexts.len(),
-                    waited = ?ACQUIRE_TIMEOUT,
-                    "session context pool exhausted: contexts are being leaked on error paths or the pool is undersized"
-                );
-                return Err(Error::Process(format!(
-                    "timed out after {ACQUIRE_TIMEOUT:?} waiting for a pooled SQL session \
-                     context (pool size {}): repeated processing errors must not exhaust the pool",
-                    self.contexts.len()
-                )));
+            // Register for the next release BEFORE re-checking, so a push
+            // that lands in between cannot leave this waiter asleep.
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if let Some(index) = self.pop_available() {
+                return Ok(index);
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(self.exhausted_error());
+            }
+            if tokio::time::timeout(remaining, released).await.is_err() {
+                // The deadline and a release can race: take a slot that
+                // arrived alongside the timeout before declaring failure.
+                if let Some(index) = self.pop_available() {
+                    return Ok(index);
+                }
+                return Err(self.exhausted_error());
+            }
         }
+    }
+
+    fn exhausted_error(&self) -> Error {
+        tracing::warn!(
+            pool_size = self.contexts.len(),
+            waited = ?ACQUIRE_TIMEOUT,
+            "session context pool exhausted: contexts are being leaked on error paths or the pool is undersized"
+        );
+        Error::Process(format!(
+            "timed out after {ACQUIRE_TIMEOUT:?} waiting for a pooled SQL session \
+             context (pool size {}): repeated processing errors must not exhaust the pool",
+            self.contexts.len()
+        ))
     }
 
     /// Acquire a SessionContext from the pool, bounded by the acquisition

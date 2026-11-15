@@ -1,7 +1,8 @@
 //! L3 placement affinity with the real Kafka builders: the affinity key is
-//! derived from configuration only (no broker), split placement pins the
-//! transactional pair onto one node while the middle operator stays spread,
-//! and a hand-split task map is rejected fail-closed.
+//! derived from configuration only (no broker), a parallel transactional
+//! sink is rejected before placement (every instance would share one
+//! transactional.id and fence its siblings), and a hand-split task map for
+//! the single-instance shape is rejected fail-closed.
 
 use arkflow_core::job::{JobPlan, JobSpec};
 use arkflow_core::Error;
@@ -48,26 +49,21 @@ fn l3_job() -> JobSpec {
     .expect("valid L3 job spec")
 }
 
-fn node_of<'a>(assignments: &'a [arkflow_core::job::TaskAttempt], task_id: &str) -> &'a str {
-    &assignments
-        .iter()
-        .find(|attempt| attempt.task_id == task_id)
-        .unwrap_or_else(|| panic!("no assignment for {task_id}"))
-        .node_id
-}
-
 #[test]
-fn kafka_builders_pin_the_l3_pair_under_split_placement() {
+fn kafka_builders_derive_the_l3_pair_group_and_reject_parallel_transactional_sinks() {
     arkflow_plugin::initialize().expect("plugin registry");
-    let plan = JobPlan::compile(l3_job()).expect("compiles");
-
-    // The affinity derivation reads configuration only and never connects.
+    // One transactional sink instance is the supported shape; the pair's
+    // affinity key is derived from configuration only (no broker).
+    let mut job = l3_job();
+    job.parallelism = 1;
+    let plan = JobPlan::compile(job).expect("compiles");
     let groups = plan.spec.affinity_groups().expect("affinity groups");
     assert_eq!(groups.len(), 1, "groups: {groups:?}");
     assert_eq!(groups[0].key, "kafka-txn:g1");
 
     // Without the pairing flags no group forms (the plain-job case).
     let mut plain = l3_job();
+    plain.parallelism = 1;
     plain.sources[0]
         .config
         .as_object_mut()
@@ -81,33 +77,29 @@ fn kafka_builders_pin_the_l3_pair_under_split_placement() {
     let plain = JobPlan::compile(plain).expect("compiles");
     assert!(plain.spec.affinity_groups().unwrap().is_empty());
 
-    // Split round-robin would spread source-0..sink-1 as a/b/a/b/a/b; the
-    // pin puts every pair member on the source's node while the map operator
-    // keeps its two-subtask spread across both nodes.
-    let nodes = vec!["a".to_string(), "b".to_string()];
-    let assignments = plan.assignments_for_nodes(&nodes, 1).expect("placement");
-    for task_id in ["source-0", "source-1", "sink-0", "sink-1"] {
-        assert_eq!(node_of(&assignments, task_id), "a", "task {task_id}");
-    }
-    let sql_nodes: std::collections::BTreeSet<String> = assignments
-        .iter()
-        .filter(|attempt| attempt.task_id.starts_with("sql"))
-        .map(|attempt| attempt.node_id.clone())
-        .collect();
-    assert_eq!(sql_nodes.len(), 2, "middle operator stays spread");
+    // Every parallel sink instance builds its own producer with the SAME
+    // transactional.id, and Kafka fences the older producer. Until
+    // per-subtask ids exist the multi-instance shape is rejected at compile
+    // time instead of silently fencing the siblings at runtime.
+    let error = JobPlan::compile(l3_job())
+        .expect_err("parallelism 2 with one transactional_id must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("exactly_once") && message.contains("parallelism 1"),
+        "explains the transactional fencing: {message}"
+    );
 }
 
 #[test]
 fn a_hand_split_l3_pair_is_rejected_fail_closed() {
     arkflow_plugin::initialize().expect("plugin registry");
-    let plan = JobPlan::compile(l3_job()).expect("compiles");
+    let mut job = l3_job();
+    job.parallelism = 1;
+    let plan = JobPlan::compile(job).expect("compiles");
     let split = std::collections::BTreeMap::from([
         ("source-0".to_string(), "a".to_string()),
-        ("source-1".to_string(), "a".to_string()),
         ("sql-0".to_string(), "a".to_string()),
-        ("sql-1".to_string(), "b".to_string()),
         ("sink-0".to_string(), "b".to_string()),
-        ("sink-1".to_string(), "b".to_string()),
     ]);
     let error = plan
         .validate_affinity_nodes(&split)
@@ -118,8 +110,8 @@ fn a_hand_split_l3_pair_is_rejected_fail_closed() {
         message.contains("kafka-txn:g1"),
         "names the group: {message}"
     );
-    assert!(message.contains("source-"), "names the tasks: {message}");
-    assert!(message.contains("sink-"), "names the tasks: {message}");
+    assert!(message.contains("source-0"), "names both tasks: {message}");
+    assert!(message.contains("sink-0"), "names both tasks: {message}");
 }
 
 #[test]

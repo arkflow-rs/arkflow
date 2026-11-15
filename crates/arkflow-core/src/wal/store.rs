@@ -182,6 +182,22 @@ pub trait WalStore: Send + Sync + 'static {
     /// cursor, in ascending order. Used by recovery replay.
     fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error>;
 
+    /// Read at most `limit` entries with sequence strictly greater than
+    /// `after`, in ascending order. Recovery pages through the backlog with
+    /// this so peak memory stays bounded by one page instead of the whole
+    /// on-disk backlog. The default implementation filters
+    /// [`read_after_cursor`](Self::read_after_cursor); backends with a range
+    /// scan should override it to avoid decoding entries past the page.
+    fn read_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut entries = self.read_after_cursor()?;
+        entries.retain(|(seq, _)| *seq > after);
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
     /// Current committed watermark (highest acked sequence, 0 if none).
     fn cursor(&self) -> u64;
 
@@ -194,6 +210,14 @@ pub trait WalStore: Send + Sync + 'static {
     /// exist on disk.
     fn next_seq_hint(&self) -> u64 {
         self.cursor().saturating_add(1)
+    }
+
+    /// Whether [`next_seq_hint`](Self::next_seq_hint) already accounts for
+    /// every persisted entry above the cursor. The default `false` makes
+    /// `Wal::open` scan the backlog once and raise the allocator above it;
+    /// backends with an exact hint override this to skip that scan.
+    fn next_seq_hint_is_exact(&self) -> bool {
+        false
     }
 
     /// Highest sequence number guaranteed to be contained in a sealed (fully
@@ -457,43 +481,12 @@ impl WalStore for RedbStore {
     }
 
     fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
-        let tx = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Process(format!("WAL read failed: {}", e)))?;
-        // Distinguish "table not created yet" (an empty WAL) from every
-        // other open failure: swallowing corruption/IO errors here made
-        // recovery see an EMPTY WAL and start from scratch, silently
-        // skipping everything a damaged store still held.
-        let cursor = match tx.open_table(META) {
-            Ok(table) => table
-                .get(CURSOR_KEY)
-                .map_err(|e| Error::Process(format!("WAL cursor read failed: {}", e)))?
-                .map(|guard| guard.value())
-                .unwrap_or(0),
-            Err(redb::TableError::TableDoesNotExist(_)) => 0,
-            Err(e) => return Err(Error::Process(format!("WAL table open failed: {}", e))),
-        };
-        let entries = match tx.open_table(ENTRIES) {
-            Ok(entries) => entries,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(Error::Process(format!("WAL table open failed: {}", e))),
-        };
+        self.read_entries_after(self.cursor_from_disk()?, usize::MAX)
+    }
 
-        let mut out = Vec::new();
-        let range = entries
-            .iter()
-            .map_err(|e| Error::Process(format!("WAL iter failed: {}", e)))?;
-        for item in range {
-            let (k, v) = item.map_err(|e| Error::Process(format!("WAL iter failed: {}", e)))?;
-            let seq = k.value();
-            if seq <= cursor {
-                continue;
-            }
-            let msg = Arc::new(deserialize(v.value())?);
-            out.push((seq, msg));
-        }
-        Ok(out)
+    fn read_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
+        let cursor = self.cursor_from_disk()?;
+        self.read_entries_after(cursor.max(after), limit)
     }
 
     fn cursor(&self) -> u64 {
@@ -516,10 +509,69 @@ impl WalStore for RedbStore {
             .max(1)
     }
 
+    fn next_seq_hint_is_exact(&self) -> bool {
+        true
+    }
+
     fn close(&self) -> Result<(), Error> {
         // redb drops implicitly when the last `Arc<RedbStore>` is released,
         // releasing the fcntl flock. `close` is a no-op here.
         Ok(())
+    }
+}
+
+impl RedbStore {
+    /// Committed cursor read in its own transaction (the paged recovery
+    /// path must not nest a second read transaction).
+    fn cursor_from_disk(&self) -> Result<u64, Error> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Process(format!("WAL read failed: {}", e)))?;
+        // Distinguish "table not created yet" (an empty WAL) from every
+        // other open failure: swallowing corruption/IO errors here made
+        // recovery see an EMPTY WAL and start from scratch, silently
+        // skipping everything a damaged store still held.
+        match tx.open_table(META) {
+            Ok(table) => table
+                .get(CURSOR_KEY)
+                .map_err(|e| Error::Process(format!("WAL cursor read failed: {}", e)))
+                .map(|guard| guard.map(|guard| guard.value()).unwrap_or(0)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(e) => Err(Error::Process(format!("WAL table open failed: {}", e))),
+        }
+    }
+
+    fn read_entries_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Process(format!("WAL read failed: {}", e)))?;
+        let entries = match tx.open_table(ENTRIES) {
+            Ok(entries) => entries,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(Error::Process(format!("WAL table open failed: {}", e))),
+        };
+
+        let mut out = Vec::new();
+        let range = entries
+            .range(after.saturating_add(1)..)
+            .map_err(|e| Error::Process(format!("WAL iter failed: {}", e)))?;
+        for item in range {
+            let (k, v) = item.map_err(|e| Error::Process(format!("WAL iter failed: {}", e)))?;
+            out.push((k.value(), Arc::new(deserialize(v.value())?)));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -594,6 +646,16 @@ mod tests {
         let rb_out: &RecordBatch = back.deref();
         assert_eq!(rb_in.schema(), rb_out.schema());
         assert_eq!(rb_in.num_rows(), rb_out.num_rows());
+        // Values and metadata are the actual payload; a schema/row-count
+        // comparison alone would accept corrupted data.
+        for index in 0..rb_in.num_columns() {
+            assert_eq!(
+                rb_in.column(index).to_data(),
+                rb_out.column(index).to_data(),
+                "column {} payload differs",
+                rb_in.schema().field(index).name()
+            );
+        }
     }
 
     #[test]

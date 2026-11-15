@@ -151,6 +151,9 @@ impl Output for NatsOutput {
         if owned_payloads.is_empty() {
             return Ok(());
         }
+        // Per-row subjects are indexed by payload, so a skipped NULL row
+        // would shift every later payload onto an earlier subject.
+        crate::output::codec_helper::ensure_row_aligned(&owned_payloads, msg.num_rows(), "nats")?;
         // Get subject
         let subject = match &self.config.mode {
             Mode::Regular { subject } | Mode::JetStream { subject } => {

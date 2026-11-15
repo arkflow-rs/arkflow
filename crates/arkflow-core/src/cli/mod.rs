@@ -452,9 +452,9 @@ fn build_subscriber(
             (None, crate::config::LogFormat::PLAIN) => fmt::layer().pretty().boxed(),
         };
 
-    let otel_layer = build_otel_layer(tracing_config);
+    let (otel_layer, otel_provider) = build_otel_layer(tracing_config);
 
-    let _ = match filter {
+    let installed = match filter {
         // The filter goes last: both concrete filter types implement
         // `Layer<S>` for any subscriber, so they wrap the assembled stack
         // globally.
@@ -469,20 +469,37 @@ fn build_subscriber(
             .with(level)
             .try_init(),
     };
+    // Install the OTel provider only when the subscriber carrying its layer
+    // is the one that was actually installed. A repeated initialization
+    // (tests, embedded restarts) fails `try_init`; exposing its provider
+    // globally would leave the global registry and the shutdown handle
+    // pointing at different providers, so buffered spans would never flush.
+    if installed.is_ok() {
+        if let Some(provider) = otel_provider {
+            opentelemetry::global::set_tracer_provider(provider.clone());
+            let _ = OTEL_PROVIDER.set(provider);
+        }
+    }
 }
 
 /// Builds the OTel span-export layer when tracing is enabled. Any build
 /// failure is isolated: a warning is printed and `None` is returned so the
 /// data plane is never affected by the export pipeline.
+/// Builds the OTel layer and its provider WITHOUT installing either: the
+/// caller installs the provider only after the subscriber that carries the
+/// layer is the one actually installed (see [`build_subscriber`]).
 fn build_otel_layer<S>(
     config: &crate::config::TracingConfig,
-) -> Option<Box<dyn tracing_subscriber::Layer<S> + Send + Sync>>
+) -> (
+    Option<Box<dyn tracing_subscriber::Layer<S> + Send + Sync>>,
+    Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+)
 where
     S: tracing::Subscriber + Send + Sync,
     S: for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     if !config.enabled {
-        return None;
+        return (None, None);
     }
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::WithExportConfig;
@@ -498,7 +515,7 @@ where
                 "Failed to build the OTLP span exporter (tracing disabled): {}",
                 error
             );
-            return None;
+            return (None, None);
         }
     };
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
@@ -510,12 +527,10 @@ where
         )
         .build();
     let tracer = provider.tracer("arkflow");
-    // otel 0.33: set_tracer_provider returns () (first setter wins silently).
-    opentelemetry::global::set_tracer_provider(provider.clone());
-    // Keep a handle so graceful shutdown can flush buffered spans (see
-    // [`shutdown_otel_tracing`]); the global provider itself holds a clone.
-    let _ = OTEL_PROVIDER.set(provider);
-    Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed())
+    (
+        Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed()),
+        Some(provider),
+    )
 }
 
 /// Handle to the process-global OTel tracer provider, kept so buffered spans
@@ -772,8 +787,9 @@ mod tests {
     #[test]
     fn otel_layer_is_absent_when_tracing_is_disabled() {
         let config = crate::config::TracingConfig::default();
-        let layer = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
+        let (layer, provider) = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
         assert!(layer.is_none());
+        assert!(provider.is_none());
     }
 
     #[test]
@@ -934,8 +950,9 @@ mod tests {
             endpoint: "not a valid url".to_string(),
             service_name: "arkflow-coverage".to_string(),
         };
-        let layer = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
+        let (layer, provider) = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
         assert!(layer.is_none());
+        assert!(provider.is_none());
         shutdown_otel_tracing();
     }
 
@@ -949,8 +966,9 @@ mod tests {
             endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
             service_name: "arkflow-coverage".to_string(),
         };
-        let layer = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
+        let (layer, provider) = build_otel_layer::<tracing_subscriber::registry::Registry>(&config);
         assert!(layer.is_some(), "valid config must yield the otel layer");
-        shutdown_otel_tracing();
+        let provider = provider.expect("valid config must yield the tracer provider");
+        provider.shutdown().unwrap();
     }
 }

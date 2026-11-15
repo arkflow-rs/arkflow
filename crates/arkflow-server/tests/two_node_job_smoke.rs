@@ -31,6 +31,17 @@ use pause_resume::{start_agents, HubHarness, ReplayFixture};
 static ONE_AT_A_TIME: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// An OS-assigned loopback port. Binding and dropping the listener is the
+/// usual best-effort reservation: fixed ports collide with another checkout
+/// running the same binary.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("ephemeral listener address")
+        .port()
+}
+
 fn empty_control_plane() -> ControlPlane {
     ControlPlane::new(
         EngineConfig {
@@ -403,6 +414,21 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         .unwrap()
         .unwrap();
 
+    // Baseline BEFORE the replacement starts: an operation recorded after
+    // this snapshot can only come from the restarted Agent, and the wait
+    // below additionally restricts the match to node-a.
+    let initial_start_ids = hub
+        .operations(Some("node-a"))
+        .await
+        .into_iter()
+        .filter(|operation| {
+            operation.resource_id == job_id
+                && operation.operation.as_str() == "job_start"
+                && operation.state == HubOperationState::Succeeded
+        })
+        .map(|operation| operation.id)
+        .collect::<Vec<_>>();
+
     let cancel_a_restart = CancellationToken::new();
     let mut restarted_a = tokio::spawn(agent::run(
         empty_control_plane(),
@@ -422,17 +448,6 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
         cancel_a_restart.clone(),
     ));
 
-    let initial_start_ids = hub
-        .operations(None)
-        .await
-        .into_iter()
-        .filter(|operation| {
-            operation.resource_id == job_id
-                && operation.operation.as_str() == "job_start"
-                && operation.state == HubOperationState::Succeeded
-        })
-        .map(|operation| operation.id)
-        .collect::<Vec<_>>();
     // The replacement round trip (kill → re-register → fence → recovery
     // dispatch → kernel restart → success report) is the longest chain in
     // the suite; give it triple the default budget instead of letting a
@@ -443,12 +458,15 @@ async fn two_node_hub_agent_checkpoint_and_restart_recover() {
             let job_id = job_id.clone();
             let initial_start_ids = initial_start_ids.clone();
             async move {
-                hub.operations(None).await.iter().any(|operation| {
-                    operation.resource_id == job_id
-                        && operation.operation.as_str() == "job_start"
-                        && operation.state == HubOperationState::Succeeded
-                        && !initial_start_ids.contains(&operation.id)
-                })
+                hub.operations(Some("node-a"))
+                    .await
+                    .iter()
+                    .any(|operation| {
+                        operation.resource_id == job_id
+                            && operation.operation.as_str() == "job_start"
+                            && operation.state == HubOperationState::Succeeded
+                            && !initial_start_ids.contains(&operation.id)
+                    })
             }
         },
         Duration::from_secs(180),
@@ -544,10 +562,14 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     // The TCP shuffle plane is authenticated independently of the in-process
     // Hub test mode. Both Agents use the same explicit test secret so this
     // exercises the production handshake instead of the unauthenticated
-    // in-memory transport used by core unit tests.
+    // in-memory transport used by core unit tests. Ports are allocated from
+    // the OS: fixed numbers collide with another checkout (or a leftover
+    // process) running the same test binary.
     let data_plane_secret = "split-data-plane-secret".to_string();
     let cancel_a = CancellationToken::new();
     let cancel_b = CancellationToken::new();
+    let port_a = free_port();
+    let port_b = free_port();
     let mut agent_a = tokio::spawn(agent::run(
         empty_control_plane(),
         NodeAgentConfig {
@@ -560,7 +582,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
             heartbeat_interval: Duration::from_millis(50),
             report_interval: Duration::from_millis(50),
             poll_interval: Duration::from_millis(20),
-            data_port: Some(29_601),
+            data_port: Some(port_a),
             data_host: Some("127.0.0.1".into()),
         },
         cancel_a.clone(),
@@ -577,7 +599,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
             heartbeat_interval: Duration::from_millis(50),
             report_interval: Duration::from_millis(50),
             poll_interval: Duration::from_millis(20),
-            data_port: Some(29_602),
+            data_port: Some(port_b),
             data_host: Some("127.0.0.1".into()),
         },
         cancel_b.clone(),
@@ -791,7 +813,11 @@ async fn wait_for_running_rows(
                     && job.convergence == "converged"
                     && job.pause_phase.is_none()
                     && tasks.keys().cloned().collect::<BTreeSet<_>>() == expected_tasks
-                    && tasks.values().map(String::as_str).collect::<BTreeSet<_>>()
+                    && tasks
+                        .values()
+                        .flatten()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>()
                         == BTreeSet::from(["node-a", "node-b"])
                     && fixture.settled(count)
             }
@@ -1072,17 +1098,19 @@ async fn exercise_two_node_pause_resume(recovery: RecoveryPolicy) {
             .await;
         }
 
-        // Publish a backlog while paused and wait for fresh reports from both
-        // Agents: a stopped Job must neither consume it nor dispatch starts.
+        // Publish a backlog while paused and wait for fresh REPORTS from
+        // both Agents: a stopped Job must neither consume it nor dispatch
+        // starts. The per-node report sequence is the signal — heartbeats
+        // also refresh last_seen_at_ms, so waiting on that proved nothing
+        // about the paused state having been observed by a report.
         let command_count = commands.lock().unwrap().len();
-        let last_seen = server
+        let last_report_seq: std::collections::BTreeMap<String, u64> = server
             .hub
             .nodes()
             .await
             .iter()
-            .map(|node| node.last_seen_at_ms)
-            .max()
-            .unwrap();
+            .map(|node| (node.id.clone(), node.report_seq))
+            .collect();
         fixture.publish_through(cut + 8);
         for _ in 0..3 {
             assert_eq!(server.hub.reconcile_jobs().await.unwrap(), 0);
@@ -1090,9 +1118,15 @@ async fn exercise_two_node_pause_resume(recovery: RecoveryPolicy) {
         }
         wait_until(|| {
             let hub = server.hub.clone();
+            let last_report_seq = last_report_seq.clone();
             async move {
                 let nodes = hub.nodes().await;
-                nodes.len() == 2 && nodes.iter().all(|node| node.last_seen_at_ms > last_seen)
+                nodes.len() == 2
+                    && nodes.iter().all(|node| {
+                        last_report_seq
+                            .get(&node.id)
+                            .is_some_and(|sequence| node.report_seq > *sequence)
+                    })
             }
         })
         .await;

@@ -45,6 +45,10 @@ struct ReaderGeneration {
     tracker: TaskTracker,
 }
 
+/// One child's pending delivery: a batch read from the source but not yet
+/// enqueued, carried across a reader-generation switch.
+type DeliveryHandoff = Arc<Mutex<Option<(MessageBatchRef, Arc<dyn Ack>)>>>;
+
 struct MultipleInputs {
     #[allow(unused)]
     input_name: Option<String>,
@@ -60,6 +64,12 @@ struct MultipleInputs {
     /// pending read; a `connect()` after close gets a born-cancelled token.
     closed: CancellationToken,
     generation: Mutex<Option<ReaderGeneration>>,
+    /// One slot per child: a delivery the previous generation had already
+    /// read from its source but had not yet enqueued when it was cancelled.
+    /// The next generation re-queues it before reading again — the source
+    /// has already removed it (e.g. a Redis BLPOP), so dropping it here
+    /// would lose data on every reconnect.
+    handoffs: Vec<DeliveryHandoff>,
 }
 
 enum Msg {
@@ -104,32 +114,25 @@ impl Input for MultipleInputs {
         let token = self.closed.child_token();
         let tracker = TaskTracker::new();
         let open_children = Arc::clone(&self.open_children);
-        for input in &self.inputs {
+        for (index, input) in self.inputs.iter().enumerate() {
             let input = Arc::clone(input);
             let sender = self.sender.clone();
             let cancellation_token = token.clone();
             let open_children = Arc::clone(&open_children);
+            let handoff = Arc::clone(&self.handoffs[index]);
             tracker.spawn(async move {
                 loop {
-                    tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            return;
-                        }
-                        result = input.read() => {
+                    // A delivery handed over by the previous generation goes
+                    // first: the child already removed it from its source.
+                    let (batch, ack) = match handoff.lock().await.take() {
+                        Some(pending) => pending,
+                        None => {
+                            let result = tokio::select! {
+                                _ = cancellation_token.cancelled() => return,
+                                result = input.read() => result,
+                            };
                             match result {
-                                Ok((batch, ack)) => {
-                                    // The send itself stays cancellation-aware:
-                                    // a full channel must not hold the task
-                                    // past close().
-                                    tokio::select! {
-                                        _ = cancellation_token.cancelled() => return,
-                                        sent = sender.send_async(Msg::Message(batch, ack)) => {
-                                            if sent.is_err() {
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
+                                Ok((batch, ack)) => (batch, ack),
                                 Err(e) => {
                                     // A child reaching its natural end just
                                     // exits: forwarding its EOF would end the
@@ -156,6 +159,22 @@ impl Input for MultipleInputs {
                                         _ = sender.send_async(Msg::Err(e)) => return,
                                     }
                                 }
+                            }
+                        }
+                    };
+                    // The send itself stays cancellation-aware: a full
+                    // channel must not hold the task past close(). A
+                    // cancelled send hands the delivery to the next
+                    // generation instead of dropping it.
+                    let message = Msg::Message(Arc::clone(&batch), Arc::clone(&ack));
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            *handoff.lock().await = Some((batch, ack));
+                            return;
+                        }
+                        sent = sender.send_async(message) => {
+                            if sent.is_err() {
+                                return;
                             }
                         }
                     }
@@ -195,11 +214,18 @@ impl Input for MultipleInputs {
                 generation.tracker.wait().await;
             }
         }
-        for input in &self.inputs {
-            input.close().await?;
+        // Close is terminal: a delivery still waiting for its generation to
+        // reconnect has no consumer left, so release it with its ack.
+        for handoff in &self.handoffs {
+            handoff.lock().await.take();
         }
-
-        Ok(())
+        let mut first_error = None;
+        for input in &self.inputs {
+            if let Err(error) = input.close().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -217,25 +243,39 @@ impl MultipleInputs {
             ));
         }
         let (sender, receiver) = flume::bounded(CHANNEL_CAPACITY);
-        let mut inputs = Vec::with_capacity(config.inputs.len());
-        let mut input_names_mut = resource.input_names.borrow_mut();
-        for x in config.inputs {
-            if let Some(name) = &x.name {
+        let mut declared_names = Vec::with_capacity(config.inputs.len());
+        for child in &config.inputs {
+            if let Some(name) = &child.name {
                 if name.is_empty() {
                     return Err(Error::Config(
                         "Multiple-inputs input configuration has empty input name".to_string(),
                     ));
                 }
-                input_names_mut.push(name.clone());
+                declared_names.push(name.clone());
             }
-            inputs.push(x.build(resource)?);
         }
-        let input_names_hash_set = input_names_mut.iter().cloned().collect::<HashSet<String>>();
-        if input_names_hash_set.len() != input_names_mut.len() {
-            return Err(Error::Config(
-                "Multiple-inputs input configuration has duplicate input names".to_string(),
-            ));
+        // Record this level's names in their own borrow scope. Holding the
+        // RefCell borrow across `build()` panicked when a child was itself a
+        // multiple-inputs input (its constructor borrows the same RefCell).
+        {
+            let mut input_names = resource.input_names.borrow_mut();
+            input_names.extend(declared_names);
+        }
+        let mut inputs = Vec::with_capacity(config.inputs.len());
+        for child in config.inputs {
+            inputs.push(child.build(resource)?);
+        }
+        {
+            let input_names = resource.input_names.borrow();
+            let input_names_hash_set = input_names.iter().cloned().collect::<HashSet<String>>();
+            if input_names_hash_set.len() != input_names.len() {
+                return Err(Error::Config(
+                    "Multiple-inputs input configuration has duplicate input names".to_string(),
+                ));
+            }
         };
+
+        let child_count = inputs.len();
 
         Ok(Self {
             input_name: name.map(str::to_string),
@@ -245,6 +285,9 @@ impl MultipleInputs {
             open_children: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             closed: CancellationToken::new(),
             generation: Mutex::new(None),
+            handoffs: (0..child_count)
+                .map(|_| Arc::new(Mutex::new(None)))
+                .collect(),
         })
     }
 }
@@ -378,6 +421,9 @@ mod tests {
 
     fn multiple_inputs_with(inputs: Vec<Arc<dyn Input>>) -> Arc<MultipleInputs> {
         let (sender, receiver) = flume::bounded(CHANNEL_CAPACITY);
+        let handoffs = (0..inputs.len())
+            .map(|_| Arc::new(Mutex::new(None)))
+            .collect();
         Arc::new(MultipleInputs {
             input_name: None,
             inputs,
@@ -386,6 +432,7 @@ mod tests {
             open_children: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             closed: CancellationToken::new(),
             generation: Mutex::new(None),
+            handoffs,
         })
     }
 
@@ -496,6 +543,36 @@ mod tests {
         // close() releases the blocked send and completes promptly.
         let closed = tokio::time::timeout(Duration::from_secs(2), input.close()).await;
         assert!(closed.is_ok(), "close must not hang on a full channel");
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_keeps_delivery_pending_in_old_generation() {
+        // One delivery beyond the channel capacity: the reader stalls in the
+        // send holding a batch it has already read from its source.
+        let messages: Vec<Msg> = (0..CHANNEL_CAPACITY + 1)
+            .map(|i| binary_msg(&format!("m{i}")))
+            .collect();
+        let (script, mock) = MockInput::scripted(messages);
+        let total_reads = Arc::clone(&mock.total_reads);
+        let input = multiple_inputs_with(vec![Arc::new(mock)]);
+
+        input.connect().await.unwrap();
+        wait_reads(&total_reads, CHANNEL_CAPACITY + 1).await;
+        // Let the next generation's read end at a natural EOF.
+        drop(script);
+
+        input.connect().await.unwrap();
+
+        // Every message survives exactly once, in order — including the one
+        // the cancelled generation had read but not enqueued.
+        for i in 0..CHANNEL_CAPACITY + 1 {
+            let (batch, _ack) = tokio::time::timeout(Duration::from_secs(2), input.read())
+                .await
+                .expect("the handed-over delivery must be re-queued on reconnect")
+                .expect("read failed");
+            let bodies = batch.to_binary("__value__").unwrap();
+            assert_eq!(bodies[0], format!("m{i}").as_bytes());
+        }
     }
 
     #[tokio::test]

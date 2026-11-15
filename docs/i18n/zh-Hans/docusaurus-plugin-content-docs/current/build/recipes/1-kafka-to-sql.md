@@ -38,7 +38,6 @@ streams:
         - type: json_to_arrow
         - type: sql
           query: "SELECT * FROM flow"
-        - type: arrow_to_json
 
     output:
       type: sql
@@ -51,7 +50,7 @@ streams:
       type: stdout
 ```
 
-处理链永远是同样的三步:把 JSON 负载**解码**(decode)为 Arrow(`json_to_arrow`),按需用 SQL **变换**(transform),再为下游**重新编码**(`arrow_to_json`)。`error_output` 会捕获格式错误的消息,这样一条坏记录不会让整条流停下来。
+处理链是:把 JSON 负载**解码**(decode)为 Arrow(`json_to_arrow`),按需用 SQL **变换**(transform)。SQL 输出按列名绑定 Arrow 列,因此不需要重新编码;仅当目标是消费原始负载的输出(Kafka、HTTP)时才追加 `arrow_to_json`。`error_output` 会捕获格式错误的消息,这样一条坏记录不会让整条流停下来。
 
 ## 运行与验证
 

@@ -826,7 +826,33 @@ impl PostgresBackend {
             .connect(url)
             .await?;
         sqlx::query("SELECT 1").execute(&pool).await?;
-        sqlx::raw_sql(PG_DDL).execute(&pool).await?;
+        // Read the version stamp BEFORE running any DDL: an old binary
+        // pointed at a newer database must be refused without first taking
+        // table locks or modifying the schema.
+        let version_table: bool =
+            sqlx::query_scalar("SELECT to_regclass('cp_schema_meta') IS NOT NULL")
+                .fetch_one(&pool)
+                .await?;
+        let stored: Option<i64> = if version_table {
+            sqlx::query_scalar("SELECT value FROM cp_schema_meta WHERE key = 'schema_version'")
+                .fetch_optional(&pool)
+                .await?
+        } else {
+            None
+        };
+        if let Some(stored) = stored {
+            if stored > SCHEMA_VERSION as i64 {
+                return Err(StorageError::SchemaTooNew {
+                    database: stored as u32,
+                    binary: SCHEMA_VERSION,
+                });
+            }
+        }
+        // A database already stamped at this version has the full schema;
+        // re-running the idempotent DDL would only take locks.
+        if stored != Some(SCHEMA_VERSION as i64) {
+            sqlx::raw_sql(PG_DDL).execute(&pool).await?;
+        }
         Self::ensure_schema_version(&pool).await?;
         Ok(Self {
             pool,

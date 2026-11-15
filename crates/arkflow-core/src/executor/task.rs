@@ -40,10 +40,22 @@ const BARRIER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// progress; exceeding this bound reports the condition instead.
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Bound on submitted-but-not-yet-published pool deliveries. The bounded
+/// work/result channels do not cover deliveries that the collector has
+/// already moved into its reorder map: a slow earliest batch lets a fast
+/// worker keep completing later batches, each carrying a source
+/// acknowledgement and staged state. Capping the distance between
+/// `submitted` and `flushed` backpressures the chain loop instead.
+const MAX_UNPUBLISHED_DELIVERIES: u64 = 64;
+
 /// Upper bound on joining a pool's result collector during shutdown. The
 /// collector's final drain flushes downstream, which can block on a full edge
 /// whose consumer already stopped.
 const COLLECTOR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Upper bound on one component close. A hung connector must not prevent the
+/// remaining processor/sink/source close paths from running.
+const COMPONENT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Bound on one sink write: a hung external system fails the chain (and
 /// thereby unblocks shutdown) instead of parking the loop body forever.
@@ -87,7 +99,9 @@ pub(crate) struct CheckpointHook {
     /// Report a checkpoint-local snapshot failure without terminating the
     /// data-plane chain. A failed checkpoint must leave normal processing
     /// running so the next barrier can retry.
-    pub failure_reporter: Option<tokio::sync::mpsc::UnboundedSender<Error>>,
+    pub failure_reporter: Option<
+        tokio::sync::mpsc::UnboundedSender<(Option<crate::checkpoint::CheckpointBarrier>, Error)>,
+    >,
     /// Barrier reception point for source chains (injected by a coordinator).
     pub barrier_rx: Option<Arc<tokio::sync::Mutex<flume::Receiver<super::envelope::Envelope>>>>,
     /// State backend to snapshot when a barrier passes this chain.
@@ -321,8 +335,12 @@ async fn run_graph_inner_instrumented(
                 let watcher_token = token.clone();
                 let watcher = tokio::spawn(async move {
                     if let Ok(error) = edge_failures.recv_async().await {
-                        watcher_token.cancel();
+                        // Publish the cause BEFORE cancelling: a chain that
+                        // finishes its cleanup between the two steps would
+                        // otherwise observe an empty `failure_rx` and report
+                        // success, losing the remote-edge error.
                         let _ = failure_tx.send(error);
+                        watcher_token.cancel();
                     }
                 });
                 let result = run_chain(chain, hook, token).await;
@@ -406,26 +424,63 @@ async fn run_chain(
     // failure observable while still attempting every remaining component.
     let mut close_error = None;
     for processor in &chain.processors {
-        if let Err(error) = processor.close().await {
-            tracing::warn!(%error, task = chain.entry_task_id(), "failed to close chain processor");
+        if let Some(error) =
+            close_chain_component(chain.entry_task_id(), "processor", processor.close()).await
+        {
             close_error.get_or_insert(error);
         }
     }
     if let Some(sink) = &chain.sink {
-        if let Err(error) = sink.close().await {
-            tracing::warn!(%error, task = chain.entry_task_id(), "failed to close chain sink");
+        if let Some(error) =
+            close_chain_component(chain.entry_task_id(), "sink", sink.close()).await
+        {
             close_error.get_or_insert(error);
         }
     }
     if let Some(source) = &chain.source {
-        if let Err(error) = source.close().await {
-            tracing::warn!(%error, task = chain.entry_task_id(), "failed to close chain source");
+        if let Some(error) =
+            close_chain_component(chain.entry_task_id(), "source", source.close()).await
+        {
             close_error.get_or_insert(error);
         }
     }
     match result {
         Err(error) => Err(error),
         Ok(()) => close_error.map_or(Ok(()), Err),
+    }
+}
+
+/// Close one owned component with a panic and a hang boundary. A panicking
+/// or wedged close must not skip the other components' explicit close paths
+/// after the job-level resource guard has already handed them over.
+async fn close_chain_component<F>(chain_id: &str, what: &'static str, close: F) -> Option<Error>
+where
+    F: std::future::Future<Output = Result<(), Error>>,
+{
+    match tokio::time::timeout(
+        COMPONENT_CLOSE_TIMEOUT,
+        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(close)),
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, task = chain_id, what, "failed to close chain component");
+            Some(error)
+        }
+        Ok(Err(panic)) => {
+            let error = Error::Process(format!("{what} close panicked: {}", panic_payload(&panic)));
+            tracing::warn!(%error, task = chain_id, what, "chain component close panicked");
+            Some(error)
+        }
+        Err(_) => {
+            let error = Error::Process(format!(
+                "{what} close exceeded {}s",
+                COMPONENT_CLOSE_TIMEOUT.as_secs()
+            ));
+            tracing::warn!(%error, task = chain_id, what, "chain component close timed out");
+            Some(error)
+        }
     }
 }
 
@@ -534,10 +589,13 @@ async fn run_source_chain(
                         _ = drain => {}
                         _ = tokio::time::sleep(BARRIER_DRAIN_TIMEOUT) => {
                             if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                                let _ = reporter.send(Error::Process(format!(
-                                    "checkpoint barrier drain timed out with {} acknowledgements still in flight",
-                                    tracker.blocking()
-                                )));
+                                let _ = reporter.send((
+                                    Some(barrier.clone()),
+                                    Error::Process(format!(
+                                        "checkpoint barrier drain timed out with {} acknowledgements still in flight",
+                                        tracker.blocking()
+                                    )),
+                                ));
                             }
                             // Abort the round: the barrier is consumed but not
                             // sealed and not forwarded, so no cut can persist
@@ -564,7 +622,7 @@ async fn run_source_chain(
                             // timeout, so no cut can persist positions this chain
                             // cannot vouch for.
                             if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                                let _ = reporter.send(error);
+                                let _ = reporter.send((Some(barrier.clone()), error));
                             }
                             continue;
                         }
@@ -632,7 +690,7 @@ async fn run_source_chain(
                     }
                     Err(error) => {
                         if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                            let _ = reporter.send(error);
+                            let _ = reporter.send((Some(barrier.clone()), error));
                         }
                         tokio::select! {
                             _ = cancellation.cancelled() => {
@@ -974,7 +1032,7 @@ async fn dispatch_gate_outputs(
     forward_watermark: bool,
     current_ready_start: Option<usize>,
 ) -> Result<(), Error> {
-    record_watermark_lag(hook.metrics.as_deref(), watermark);
+    record_watermark_lag(hook.metrics.as_deref(), chain.entry_task_id(), watermark);
     record_late_event_rows(hook.metrics.as_deref(), late_rows);
 
     if ready.len() != ready_acks.len() || ready.len() != ready_invalid_timestamps.len() {
@@ -1180,15 +1238,16 @@ async fn shutdown_interior_chain(
     Ok(())
 }
 
-fn record_watermark_lag(metrics: Option<&crate::runtime::RuntimeMetrics>, watermark: Option<i64>) {
+fn record_watermark_lag(
+    metrics: Option<&crate::runtime::RuntimeMetrics>,
+    source: &str,
+    watermark: Option<i64>,
+) {
     let Some(watermark) = watermark else { return };
     let now = crate::state::now_ms() as i64;
     let lag = now.saturating_sub(watermark).max(0);
     if let Some(metrics) = metrics {
-        metrics
-            .kernel
-            .watermark_lag_ms
-            .fetch_max(lag, std::sync::atomic::Ordering::Relaxed);
+        metrics.kernel.record_watermark_lag(source, lag);
     }
 }
 
@@ -1390,7 +1449,18 @@ async fn run_interior_chain_loop(
                 // Upstream chains also observe cancellation and close their
                 // senders. Drain all queued envelopes before forwarding EOS so
                 // no receiver task is left behind and bounded producers can
-                // finish their shutdown path.
+                // finish their shutdown path. Deliveries parked in the
+                // alignment buffer (or the passthrough slot) are explicit
+                // aborts: they were removed from the input channel, so the
+                // channel drain below cannot reach their acknowledgements.
+                for (_, envelope) in aligner.release() {
+                    if let Envelope::Data(_, ack) = envelope {
+                        let _ = ack.abort().await;
+                    }
+                }
+                if let Some(Envelope::Data(_, ack)) = aligner.take_passthrough() {
+                    let _ = ack.abort().await;
+                }
                 let pool = pool.take();
                 return shutdown_interior_chain(chain, pool).await;
             }
@@ -1524,10 +1594,12 @@ async fn run_interior_chain_loop(
                 }
             }
             Ok(None) => {
-                if aligner.is_aligning() {
-                    // Envelope retained inside the aligner; replay happens at
-                    // alignment completion above.
-                } else if let Some(envelope) = aligner.take_passthrough() {
+                // The aligner may have parked a pass-through envelope even
+                // while alignment is in progress: pre-barrier data from an
+                // input whose own barrier has not arrived must be processed
+                // before the snapshot. Post-barrier data is retained inside
+                // the aligner and `take_passthrough` returns None.
+                if let Some(envelope) = aligner.take_passthrough() {
                     if handle_envelope(
                         chain,
                         hook,
@@ -1553,7 +1625,8 @@ async fn run_interior_chain_loop(
                 // Alignment overflow: release what was buffered and keep the
                 // data flowing; the barrier round fails upstream.
                 if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                    let _ = reporter.send(Error::Process(error.to_string()));
+                    let _ = reporter
+                        .send((aligner.failed_barrier(), Error::Process(error.to_string())));
                 }
                 if let Some(pool) = pool.as_ref() {
                     pool.flush().await?;
@@ -1705,7 +1778,7 @@ async fn handle_completed_barrier_inner(
         }
         Err(error) => {
             if let Some(reporter) = &hook.checkpoint.failure_reporter {
-                let _ = reporter.send(error);
+                let _ = reporter.send((Some(barrier.clone()), error));
             }
             send_downstream(chain, Envelope::Barrier(barrier.clone())).await?;
         }
@@ -2084,7 +2157,7 @@ impl ProcessorWorkerPool {
                         Err(_) => {
                             // All workers exited: flush what is left.
                             while let Some(result) = pending.remove(&next_sequence) {
-                                if let Err(error) = flush_pool_result(
+                                if let Err(error) = flush_pool_result_bounded(
                                     &collector_shared,
                                     result,
                                     &error_targets,
@@ -2114,7 +2187,7 @@ impl ProcessorWorkerPool {
                 pending.insert(sequence, result);
                 while let Some(result) = pending.remove(&next_sequence) {
                     if let Err(error) =
-                        flush_pool_result(&collector_shared, result, &error_targets).await
+                        flush_pool_result_bounded(&collector_shared, result, &error_targets).await
                     {
                         collector_failed.store(true, std::sync::atomic::Ordering::Release);
                         let _ = collector_fail_tx.try_send(error);
@@ -2225,6 +2298,41 @@ impl ProcessorWorkerPool {
     /// Submit one data delivery; the bounded queue applies backpressure to
     /// the chain loop exactly like a bounded inter-chain channel.
     async fn submit(&self, delivery: PoolDelivery) -> Result<(), Error> {
+        // Bound everything submitted but not yet published downstream. The
+        // collector's reorder map is where out-of-order completions pile up;
+        // neither bounded channel limits that map once an early sequence is
+        // slow, so the submitter itself must stop feeding the pool.
+        loop {
+            let published = self.flushed.load(std::sync::atomic::Ordering::Acquire);
+            let submitted = self.submitted.load(std::sync::atomic::Ordering::Acquire);
+            if submitted.saturating_sub(published) < MAX_UNPUBLISHED_DELIVERIES {
+                break;
+            }
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Error::Process(
+                    "processor worker pool failed while backpressuring submissions".into(),
+                ));
+            }
+            // Register before re-checking: the collector signals with
+            // `notify_waiters`, which stores no permit.
+            let notified = self.progress.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let published = self.flushed.load(std::sync::atomic::Ordering::Acquire);
+            let submitted = self.submitted.load(std::sync::atomic::Ordering::Acquire);
+            if submitted.saturating_sub(published) < MAX_UNPUBLISHED_DELIVERIES {
+                break;
+            }
+            tokio::select! {
+                _ = self.cancellation.cancelled() => {
+                    return Err(Error::Process(
+                        "processor worker pool was cancelled while backpressuring submissions"
+                            .into(),
+                    ));
+                }
+                _ = &mut notified => {}
+            }
+        }
         // Sequence numbers are local to this pool. A process-global counter
         // makes a newly created pool wait forever for sequence zero after an
         // earlier pool has already consumed it.
@@ -2325,6 +2433,44 @@ async fn flush_pool_result(
                         "processor failed and error output routing failed: {failure_message}; route error: {route_error}"
                     ))
                 })
+        }
+    }
+}
+
+/// Flush one ordered result with a bounded downstream wait. Without this,
+/// a full downstream edge parks the collector forever while the workers
+/// block on the bounded result channel and `drain()` waits on the workers
+/// before it ever applies its collector timeout.
+async fn flush_pool_result_bounded(
+    chain: &Chain,
+    result: PoolResult,
+    error_targets: &BTreeMap<String, Vec<EdgeTarget>>,
+) -> Result<(), Error> {
+    // A dropped timeout future cannot run `flush_outputs`' own abort path;
+    // clone every acknowledgement first so the timed-out delivery is still
+    // settled exactly once.
+    let abort_on_timeout: Vec<Arc<dyn crate::input::Ack>> = match &result {
+        PoolResult::Outputs(outputs) => outputs.iter().map(|output| output.ack.clone()).collect(),
+        PoolResult::ProcessorFailure(failure) => {
+            let mut acks = Vec::with_capacity(failure.siblings.len() + 1);
+            acks.push(failure.ack.clone());
+            acks.extend(failure.siblings.iter().map(|sibling| sibling.ack.clone()));
+            acks
+        }
+    };
+    match tokio::time::timeout(
+        COLLECTOR_DRAIN_TIMEOUT,
+        flush_pool_result(chain, result, error_targets),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            let _ = abort_acknowledgements(abort_on_timeout).await;
+            Err(Error::Process(format!(
+                "processor result flush exceeded the {}s drain deadline",
+                COLLECTOR_DRAIN_TIMEOUT.as_secs()
+            )))
         }
     }
 }
@@ -5273,7 +5419,7 @@ mod task_loop_tests {
             .send_async(barrier("c-1", 1))
             .await
             .expect("barrier queued");
-        let report = tokio::time::timeout(4 * BUDGET, fail_rx.recv())
+        let (_, report) = tokio::time::timeout(4 * BUDGET, fail_rx.recv())
             .await
             .expect("the drain timeout reports a checkpoint failure")
             .expect("reporter alive");
@@ -5900,9 +6046,12 @@ mod task_loop_tests {
             },
             ..Default::default()
         };
-        // Input 1 aligns a barrier; input 0 floods enough data to exceed the
-        // 1024-envelope bound regardless of the reader interleaving.
-        senders[1].send_async(barrier("c-3", 3)).await.unwrap();
+        // Input 0 aligns a barrier, then floods its own post-barrier data to
+        // exceed the 1024-envelope bound regardless of the reader
+        // interleaving. (Input 0's data is buffered because its barrier has
+        // already arrived; data from a still-waiting input would be
+        // pre-barrier and must pass through instead.)
+        senders[0].send_async(barrier("c-3", 3)).await.unwrap();
         for value in 0..1_100 {
             senders[0]
                 .send_async(Envelope::Data(
@@ -5913,7 +6062,7 @@ mod task_loop_tests {
                 .unwrap();
         }
         let task = tokio::spawn(run_chain(chain, hook, CancellationToken::new()));
-        let report = tokio::time::timeout(BUDGET, fail_rx.recv())
+        let (_, report) = tokio::time::timeout(BUDGET, fail_rx.recv())
             .await
             .expect("the overflow reports a checkpoint failure")
             .expect("reporter alive");

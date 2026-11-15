@@ -237,8 +237,18 @@ pub(crate) struct S3Store {
     manifest_key: String,
     segment_cfg: SegmentConfig,
     cursor_cfg: CursorFlushConfig,
+    /// Cached first/last sequence of each sealed segment object (its
+    /// `{:08}.wal` index → range). `recover` fills it once; paged reads use
+    /// it to skip segments wholly below the page cursor instead of
+    /// re-downloading the whole backlog on every page.
+    segment_ranges: StdMutex<std::collections::BTreeMap<u64, (u64, u64)>>,
     /// Parallel PUT workers pool (task 3.3).
     put_workers: Option<ParallelPutWorkers>,
+    /// Segment compression selected by configuration. Applied on every
+    /// append; a per-segment magic tag lets recovery decode files written
+    /// under a different setting (including legacy untagged segments).
+    compression_kind: &'static str,
+    compression_level: i32,
 
     /// In-memory active segment (bytes + parsed entry records so the cursor
     /// can flush without re-reading).
@@ -344,7 +354,76 @@ where
     })
 }
 
+/// Numeric index of a segment object filename (`00000007.wal` → 7).
+fn segment_index_of(name: &str) -> Option<u64> {
+    name.strip_suffix(".wal")?.parse::<u64>().ok()
+}
+
 impl S3Store {
+    /// GET and decode the manifest; a missing manifest is a fresh WAL.
+    fn read_manifest(&self) -> Result<Manifest, Error> {
+        match self.rt().block_on(
+            self.client
+                .get(&ObjectPath::from(self.manifest_key.as_str())),
+        ) {
+            Ok(r) => {
+                let bytes = self
+                    .rt()
+                    .block_on(r.bytes())
+                    .map_err(|e| Error::Process(format!("S3 GET manifest body: {}", e)))?;
+                Manifest::from_json(&bytes)
+                    .map_err(|e| Error::Process(format!("manifest JSON: {}", e)))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(Manifest::fresh(
+                store_ns_node_id(self),
+                store_ns_stream_id(self),
+            )),
+            Err(e) => Err(Error::Process(format!("S3 GET manifest: {}", e))),
+        }
+    }
+
+    /// Every segment object name: the manifest's index unioned with a LIST
+    /// of the prefix, ordered by segment index (the serialized seal order,
+    /// which is also sequence order). Unparseable names sort last.
+    fn all_segment_names(&self, manifest: &Manifest) -> Result<Vec<String>, Error> {
+        let mut segs: HashSet<String> = manifest.sealed_segments.iter().cloned().collect();
+        if let Some(active) = &manifest.active_segment {
+            segs.insert(active.clone());
+        }
+        let prefix = ObjectPath::from(self.segments_prefix.as_str());
+        let listed = self.rt().block_on(async {
+            let mut out = Vec::new();
+            let mut stream = std::pin::pin!(self.client.list(Some(&prefix)));
+            while let Some(item) = stream.next().await {
+                out.push(item);
+            }
+            out
+        });
+        for item in listed {
+            let meta = item.map_err(|e| Error::Process(format!("S3 list: {}", e)))?;
+            let name = meta.location.filename().unwrap_or("").to_string();
+            if name.ends_with(".wal") {
+                segs.insert(name);
+            }
+        }
+        let mut names: Vec<String> = segs.into_iter().collect();
+        names.sort_by_key(|name| segment_index_of(name).unwrap_or(u64::MAX));
+        Ok(names)
+    }
+
+    /// Remember a decoded segment's sequence range for later page skips.
+    fn remember_segment_range(&self, name: &str, entries: &[(u64, MessageBatchRef)]) {
+        let Some(index) = segment_index_of(name) else {
+            return;
+        };
+        if let (Some((first, _)), Some((last, _))) = (entries.first(), entries.last()) {
+            self.segment_ranges
+                .lock()
+                .expect("segment range cache")
+                .insert(index, (*first, *last));
+        }
+    }
+
     /// The private runtime (present until Drop shuts it down).
     fn rt(&self) -> &Runtime {
         self.runtime.as_ref().expect("S3 store runtime alive")
@@ -473,6 +552,8 @@ impl S3Store {
         );
         let segments_prefix = format!("{}/segments", ns);
         let manifest_key = format!("{}/manifest.json", ns);
+        let (compression_kind, compression_level) =
+            crate::wal::compression::kind_from_config(&osc.compression);
 
         let runtime = runtime_slot.as_ref().expect("construction runtime present");
         let first_index = block_on_init(runtime, async {
@@ -487,6 +568,7 @@ impl S3Store {
             manifest_key,
             segment_cfg: resolved_segment,
             cursor_cfg: osc.cursor,
+            segment_ranges: StdMutex::new(std::collections::BTreeMap::new()),
             // Honest status of the knob: seals are SERIALIZED (seal_lock) so
             // the acknowledged frontier can never advance past an earlier
             // unsealed segment, and each seal uploads exactly one object —
@@ -510,6 +592,8 @@ impl S3Store {
                     },
                 ))
             },
+            compression_kind,
+            compression_level,
             active: StdMutex::new(ActiveSegment {
                 first_seq: 0,
                 last_seq: 0,
@@ -694,7 +778,8 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
                     .bytes()
                     .await
                     .map_err(|e| Error::Process(format!("S3 GET segment body: {}", e)))?;
-                let decoded = segment::decode(&bytes)?;
+                let decoded = decode_segment_object(&bytes)?;
+                store.remember_segment_range(seg_name, &decoded.entries);
                 if let Some((last, _)) = decoded.entries.last() {
                     if *last > max_seq_seen {
                         max_seq_seen = *last;
@@ -856,53 +941,9 @@ impl WalStore for S3Store {
     }
 
     fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
-        // Re-decode every segment (LIST union) and return entries strictly
-        // greater than the manifest's cursor. The active segment is included.
-        // LIST-fallback segments (not in the manifest) are read here too
-        // because they're in the same `list_segments()` set.
-        let manifest = match self.rt().block_on(
-            self.client
-                .get(&ObjectPath::from(self.manifest_key.as_str())),
-        ) {
-            Ok(r) => {
-                let bytes = self
-                    .rt()
-                    .block_on(r.bytes())
-                    .map_err(|e| Error::Process(format!("S3 GET manifest: {}", e)))?;
-                Manifest::from_json(&bytes)
-                    .map_err(|e| Error::Process(format!("manifest JSON: {}", e)))?
-            }
-            Err(object_store::Error::NotFound { .. }) => {
-                Manifest::fresh(store_ns_node_id(self), store_ns_stream_id(self))
-            }
-            Err(e) => return Err(Error::Process(format!("S3 GET manifest: {}", e))),
-        };
-
-        let mut segs: HashSet<String> = manifest.sealed_segments.iter().cloned().collect();
-        if let Some(a) = &manifest.active_segment {
-            segs.insert(a.clone());
-        }
-        let prefix = ObjectPath::from(self.segments_prefix.as_str());
-        let mut stream = self.rt().block_on(async {
-            let s = self.client.list(Some(&prefix));
-            // Drive the stream inside the runtime.
-            let mut out = Vec::new();
-            let mut s = std::pin::pin!(s);
-            while let Some(item) = s.next().await {
-                out.push(item);
-            }
-            out
-        });
-        for item in stream.drain(..) {
-            let meta = item.map_err(|e| Error::Process(format!("S3 list: {}", e)))?;
-            let name = meta.location.filename().unwrap_or("").to_string();
-            if name.ends_with(".wal") {
-                segs.insert(name);
-            }
-        }
-
+        let manifest = self.read_manifest()?;
         let mut out: Vec<(u64, MessageBatchRef)> = Vec::new();
-        for seg_name in segs {
+        for seg_name in self.all_segment_names(&manifest)? {
             let key = ObjectPath::from(format!("{}/{}", self.segments_prefix, seg_name).as_str());
             let bytes = match self.rt().block_on(self.client.get(&key)) {
                 Ok(r) => match self.rt().block_on(r.bytes()) {
@@ -912,7 +953,8 @@ impl WalStore for S3Store {
                 Err(object_store::Error::NotFound { .. }) => continue,
                 Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
             };
-            let decoded = segment::decode(&bytes)?;
+            let decoded = decode_segment_object(&bytes)?;
+            self.remember_segment_range(&seg_name, &decoded.entries);
             for (seq, mb) in decoded.entries {
                 if seq > manifest.cursor {
                     out.push((seq, mb));
@@ -920,6 +962,58 @@ impl WalStore for S3Store {
             }
         }
         out.sort_by_key(|(s, _)| *s);
+        Ok(out)
+    }
+
+    fn read_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let manifest = self.read_manifest()?;
+        let after = after.max(manifest.cursor);
+        let mut out: Vec<(u64, MessageBatchRef)> = Vec::new();
+        for seg_name in self.all_segment_names(&manifest)? {
+            // A segment whose cached range ends at or below the cursor cannot
+            // contain a page entry: skip its GET entirely. Segments decoded
+            // earlier in this recovery are cached here, so page N does not
+            // re-download the backlog pages 1..N-1 already consumed.
+            if let Some(index) = segment_index_of(&seg_name) {
+                if let Some(&(_, last)) = self
+                    .segment_ranges
+                    .lock()
+                    .expect("segment range cache")
+                    .get(&index)
+                {
+                    if last <= after {
+                        continue;
+                    }
+                }
+            }
+            let key = ObjectPath::from(format!("{}/{}", self.segments_prefix, seg_name).as_str());
+            let bytes = match self.rt().block_on(self.client.get(&key)) {
+                Ok(r) => match self.rt().block_on(r.bytes()) {
+                    Ok(b) => b,
+                    Err(e) => return Err(Error::Process(format!("S3 GET segment body: {}", e))),
+                },
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
+            };
+            let decoded = decode_segment_object(&bytes)?;
+            self.remember_segment_range(&seg_name, &decoded.entries);
+            for (seq, mb) in decoded.entries {
+                if seq > after {
+                    out.push((seq, mb));
+                }
+            }
+            // Seals are serialized and segment indices increase with the
+            // sequence order, so once the page is full no later segment can
+            // hold an entry that sorts before the collected ones.
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out.sort_by_key(|(s, _)| *s);
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -949,6 +1043,10 @@ impl WalStore for S3Store {
             .load(Ordering::Acquire)
             .saturating_add(1)
             .max(1)
+    }
+
+    fn next_seq_hint_is_exact(&self) -> bool {
+        true
     }
 
     fn sealed_seq(&self) -> Option<u64> {
@@ -1057,6 +1155,72 @@ fn segment_index(name: &str) -> u64 {
 /// publication order keeps matching sequence order. Entries lost on a crash
 /// while parked were never acknowledged (the gate never advanced past them),
 /// so the source replays them.
+/// Magic prefix identifying a segment object written by this build. Legacy
+/// objects start directly with the entry header (a sequence number), so an
+/// object without the prefix stays decodable as uncompressed.
+const SEGMENT_OBJECT_MAGIC: &[u8; 6] = b"AKWAL1";
+
+fn compression_tag(kind: &str) -> Option<u8> {
+    match kind {
+        "none" => Some(0),
+        "zstd" => Some(1),
+        "lz4" => Some(2),
+        _ => None,
+    }
+}
+
+fn compression_kind_from_tag(tag: u8) -> Option<&'static str> {
+    match tag {
+        0 => Some("none"),
+        1 => Some("zstd"),
+        2 => Some("lz4"),
+        _ => None,
+    }
+}
+
+fn segment_compression_for(kind: &str) -> crate::wal::manifest::SegmentCompression {
+    match kind {
+        "zstd" => crate::wal::manifest::SegmentCompression::Zstd,
+        "lz4" => crate::wal::manifest::SegmentCompression::Lz4,
+        _ => crate::wal::manifest::SegmentCompression::None,
+    }
+}
+
+/// Compress one complete raw segment and add the magic+algorithm tag.
+fn encode_segment_object(store: &S3Store, raw: &[u8]) -> Result<Vec<u8>, Error> {
+    let tag = compression_tag(store.compression_kind).ok_or_else(|| {
+        Error::Config(format!(
+            "unknown WAL compression kind '{}'",
+            store.compression_kind
+        ))
+    })?;
+    let compressed =
+        crate::wal::compression::compress(store.compression_kind, store.compression_level, raw)?;
+    let mut out = Vec::with_capacity(SEGMENT_OBJECT_MAGIC.len() + 1 + compressed.len());
+    out.extend_from_slice(SEGMENT_OBJECT_MAGIC);
+    out.push(tag);
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+fn decode_segment_object(bytes: &[u8]) -> Result<segment::DecodedSegment, Error> {
+    let Some(rest) = bytes.strip_prefix(SEGMENT_OBJECT_MAGIC) else {
+        // Pre-tag objects were written uncompressed.
+        return segment::decode(bytes);
+    };
+    let Some((&tag, payload)) = rest.split_first() else {
+        return Err(Error::Process(
+            "WAL segment object has a magic prefix but no compression tag".into(),
+        ));
+    };
+    let kind = compression_kind_from_tag(tag).ok_or_else(|| {
+        Error::Process(format!(
+            "WAL segment object has unknown compression tag {tag}"
+        ))
+    })?;
+    segment::decode_with_kind(payload, kind)
+}
+
 /// Move the active segment's bytes into a sealed batch, resetting the active
 /// buffer. `None` when the segment holds no entries.
 ///
@@ -1135,11 +1299,17 @@ async fn seal_active_segment(store: &S3Store) -> Result<(), Error> {
 async fn publish_sealed_segment(store: &S3Store, batch: &SealedBatch) -> Result<(), Error> {
     let name = format!("{:08}.wal", batch.next_index);
     let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, name).as_str());
+    // Compress at publication, not append: the active buffer accumulates
+    // raw entry bytes across many appends, so only the complete segment can
+    // be compressed as one block. The magic+tag prefix lets recovery decode
+    // this object even if the configured algorithm changed since (and keeps
+    // legacy untagged objects readable).
+    let object_bytes = encode_segment_object(store, &batch.bytes)?;
     // Clone for the PUT so the original bytes survive a failed upload in the
     // caller's parked batch.
     store
         .client
-        .put(&key, PutPayload::from(Bytes::from(batch.bytes.clone())))
+        .put(&key, PutPayload::from(Bytes::from(object_bytes)))
         .await
         .map_err(|e| {
             Error::Process(format!(
@@ -1155,11 +1325,13 @@ async fn publish_sealed_segment(store: &S3Store, batch: &SealedBatch) -> Result<
     // guards against out-of-order seals regressing the active pointer).
     let name_for_mutator = name.clone();
     let last_seq = batch.last_seq;
+    let active_compression = segment_compression_for(store.compression_kind);
     write_manifest_with_etag(store, move |m| {
         apply_seal(m, &name_for_mutator);
         if last_seq > m.max_sealed_seq {
             m.max_sealed_seq = last_seq;
         }
+        m.active_segment_compression = Some(active_compression);
     })
     .await?;
 
@@ -3970,5 +4142,40 @@ mod tests {
             }
             assert_eq!(m.sealed_segments.len(), 7);
         });
+    }
+
+    #[test]
+    fn read_after_pages_the_backlog_and_reuses_cached_segment_ranges() {
+        let dir = tempdir();
+        let (store, _) = build_local_store_in(&dir);
+        let payload = sample_payload(None);
+        // max_entries = 4: eight appends seal two segments, so every entry is
+        // on the object store (the active buffer is in memory only).
+        for seq in 1..=8u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+
+        let page = |after: u64, limit: usize| -> Vec<u64> {
+            store
+                .read_after(after, limit)
+                .unwrap()
+                .into_iter()
+                .map(|(seq, _)| seq)
+                .collect()
+        };
+        assert_eq!(page(0, 3), vec![1, 2, 3]);
+        assert_eq!(page(3, 3), vec![4, 5, 6]);
+        assert_eq!(page(6, 10), vec![7, 8]);
+        assert!(page(8, 3).is_empty());
+        // The ranges cached while paging cover every sealed segment.
+        let cached = store
+            .segment_ranges
+            .lock()
+            .expect("segment range cache")
+            .len();
+        assert!(
+            cached >= 2,
+            "sealed segments were decoded and their ranges cached, got {cached}"
+        );
     }
 }

@@ -141,8 +141,11 @@ async fn agent_resource_gauges_reach_the_hub_metrics_export() {
                 "node_memory_available_bytes",
             ]
             .map(|key| {
+                // The trailing newline makes the match exact: without it,
+                // an expected "…} 123" is also a substring of "…} 1234",
+                // so a mangled value could still pass.
                 format!(
-                    "arkflow_node_metric{{node_id=\"node-a\",metric=\"{key}\"}} {}",
+                    "arkflow_node_metric{{node_id=\"node-a\",metric=\"{key}\"}} {}\n",
                     view.metrics[key]
                 )
             });

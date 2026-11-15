@@ -124,11 +124,21 @@ impl Processor for ProtobufProcessor {
                 Arc::new((*msg).new_binary_with_origin(proto_data)?)
             }
             ToType::ProtobufToArrow(ref c) => {
+                let rows = msg.num_rows();
                 let payloads = (*msg).to_binary(
                     c.value_field
                         .as_deref()
                         .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
                 )?;
+                // NULL cells are skipped by `to_binary`; reject the batch
+                // rather than silently dropping those rows.
+                if payloads.len() != rows {
+                    return Err(Error::Process(format!(
+                        "Protobuf processor: {} payloads for {rows} rows; NULL payload rows \
+                         cannot be decoded silently",
+                        payloads.len()
+                    )));
+                }
                 // All payloads share the processor's single descriptor, so one
                 // columnar converter accumulates the whole batch without
                 // per-message schema construction or a concat pass.

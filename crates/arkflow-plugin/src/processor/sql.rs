@@ -27,7 +27,6 @@ use datafusion::arrow::array::AsArray;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::stats::Precision;
 use datafusion::common::{DataFusionError, Statistics};
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::datasource::TableType;
@@ -244,15 +243,12 @@ impl DataSource for SwapBatchSource {
         &self,
         _partition: Option<usize>,
     ) -> Result<Arc<Statistics>, DataFusionError> {
-        // Exact row count from the planning-time batch: the physical planner
-        // consumes statistics when the cached plan is first built, and this
-        // keeps that plan-shape input identical to the eager MemorySource it
-        // replaces. Only called at planning time, so no per-batch cost.
-        let num_rows = self.slot.read().unwrap().num_rows();
-        Ok(Arc::new(Statistics {
-            num_rows: Precision::Exact(num_rows),
-            ..Statistics::new_unknown(&self.projected_schema)
-        }))
+        // The slot's contents change on every batch, while the optimized
+        // physical plan (and its folded statistics) is cached per schema.
+        // Reporting the planning-time row count as Exact lets DataFusion's
+        // AggregateStatistics fold COUNT(*) into a literal, so later batches
+        // would keep returning the first batch's count. Report unknown.
+        Ok(Arc::new(Statistics::new_unknown(&self.projected_schema)))
     }
 
     fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -472,7 +468,19 @@ impl SqlProcessor {
                             temporary.name
                         )));
                     };
-                    temporary_map.insert(temporary.name.clone(), (t.clone(), temporary.clone()));
+                    // Key by the SQL table alias, not the backing resource
+                    // name: the same Redis/source may be referenced under
+                    // several table names with different keys, and keying by
+                    // name silently kept only the last configuration.
+                    if temporary_map
+                        .insert(temporary.table_name.clone(), (t.clone(), temporary.clone()))
+                        .is_some()
+                    {
+                        return Err(Error::Config(format!(
+                            "Duplicate temporary table_name '{}' in temporary_list",
+                            temporary.table_name
+                        )));
+                    }
                 }
 
                 Some(temporary_map)
@@ -1472,6 +1480,23 @@ mod tests {
         Arc::new(MessageBatch::new_arrow(batch))
     }
 
+    /// Row values in a canonical order, for queries without ORDER BY.
+    fn sorted_rows(batch: &RecordBatch) -> Vec<Vec<String>> {
+        let mut rows = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let mut values = Vec::with_capacity(batch.num_columns());
+            for column in batch.columns() {
+                values.push(
+                    datafusion::arrow::util::display::array_value_to_string(column, row)
+                        .unwrap_or_default(),
+                );
+            }
+            rows.push(values);
+        }
+        rows.sort();
+        rows
+    }
+
     /// Spec "Physical planning happens once per schema": the build counter
     /// rises at most once per pooled context for a fixed schema and then
     /// stops, and a schema drift re-triggers exactly one rebuild per used
@@ -1666,9 +1691,12 @@ mod tests {
                     fresh_batch.record_batch().schema(),
                     "query {query} round {round} (ids {ids:?}): schema differs"
                 );
+                // A query without ORDER BY has no row-order contract; plan
+                // shape changes may legitimately reorder join output. Compare
+                // rows as a multiset.
                 assert_eq!(
-                    cached_batch.record_batch(),
-                    fresh_batch.record_batch(),
+                    sorted_rows(cached_batch.record_batch()),
+                    sorted_rows(fresh_batch.record_batch()),
                     "query {query} round {round} (ids {ids:?}): values differ"
                 );
             }

@@ -43,16 +43,24 @@ impl Hub {
         // A checkpoint produced by a different Job deployment (version) must
         // never repoint the live record's recovery pointer: the artifact row
         // is kept for audit, but recovery keeps its current selection.
-        let version_matches = self
-            .job(&record.job_id)
-            .await
-            .map(|job| job.is_some_and(|job| job.version == record.job_version))?;
+        let current_job = self.job(&record.job_id).await?;
+        let version_matches = current_job
+            .as_ref()
+            .is_some_and(|job| job.version == record.job_version);
+        // While a pause is in progress, only its own capture artifact may
+        // move the recovery pointer. An operator checkpoint/savepoint issued
+        // during the pause must not replace the artifact that abort/resume
+        // will restore, especially when the pause capture later fails.
+        let pause_protects_pointer = current_job.as_ref().is_some_and(|job| {
+            job.pause_phase.is_some()
+                && job.pause_artifact_id.as_deref() != Some(record.checkpoint_id.as_str())
+        });
         if let Some(storage) = &self.storage {
             storage
                 .upsert_job_checkpoint(record.clone())
                 .await
                 .map_err(HubError::from)?;
-            let job = if version_matches {
+            let job = if version_matches && !pause_protects_pointer {
                 storage
                     .update_job(
                         &record.job_id,
@@ -66,7 +74,7 @@ impl Hub {
                     .await
                     .map_err(HubError::from)?
             } else {
-                self.job(&record.job_id).await?
+                current_job.clone()
             };
             if let Some(job) = &job {
                 self.jobs

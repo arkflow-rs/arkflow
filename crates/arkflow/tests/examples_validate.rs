@@ -35,6 +35,39 @@ fn docs_root() -> PathBuf {
     repo_root().join("docs")
 }
 
+/// Mirror the repository into a temp dir (top-level symlinks, everything
+/// except `data/`) so validation resolves auxiliary file references such as
+/// `examples/…` while any state directory a relative Redb path creates stays
+/// inside the sandbox. Running from the real root litters `data/` into the
+/// working tree and races a concurrently running test binary for the redb
+/// lock.
+#[cfg(unix)]
+fn sandboxed_repo_root() -> PathBuf {
+    use std::os::unix::fs::symlink;
+
+    let root = repo_root();
+    let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+    for entry in std::fs::read_dir(&root).expect("repository root is readable") {
+        let entry = entry.expect("directory entry is readable");
+        if entry.file_name() == "data" {
+            continue;
+        }
+        symlink(entry.path(), sandbox.path().join(entry.file_name()))
+            .unwrap_or_else(|error| panic!("cannot mirror {}: {error}", entry.path().display()));
+    }
+    // The process runs from the sandbox for its whole lifetime; nothing else
+    // needs the handle, so hand the path over without deleting it.
+    sandbox.keep()
+}
+
+/// Directory symlinks need elevated privileges on Windows; keep running from
+/// the real repository root there (test binaries execute sequentially under
+/// cargo test on the supported platforms).
+#[cfg(not(unix))]
+fn sandboxed_repo_root() -> PathBuf {
+    repo_root()
+}
+
 fn manifest_entries() -> Vec<(String, PathBuf, Option<bool>, Option<String>)> {
     let manifest_path = docs_root().join("reference/example-manifest.json");
     let raw = std::fs::read_to_string(&manifest_path)
@@ -98,8 +131,10 @@ async fn registered_examples_validate_offline() {
     arkflow_plugin::initialize().expect("component catalogue registers");
 
     // Examples reference auxiliary files (e.g. .proto descriptors) relative to
-    // the repository root, matching how users run the binary from there.
-    std::env::set_current_dir(repo_root()).expect("chdir to repository root");
+    // the repository root, matching how users run the binary from there. The
+    // sandbox mirror keeps those references resolvable while relative state
+    // paths stay out of the working tree.
+    std::env::set_current_dir(sandboxed_repo_root()).expect("chdir to sandboxed repository root");
 
     let mut failures = Vec::new();
     for (name, path, validate, reason) in manifest_entries() {

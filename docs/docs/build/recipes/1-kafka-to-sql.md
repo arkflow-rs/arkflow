@@ -42,7 +42,6 @@ streams:
         - type: json_to_arrow
         - type: sql
           query: "SELECT * FROM flow"
-        - type: arrow_to_json
 
     output:
       type: sql
@@ -55,10 +54,12 @@ streams:
       type: stdout
 ```
 
-The processing chain is always the same three steps: **decode** the JSON
-payload into Arrow (`json_to_arrow`), optionally **transform** with SQL, and
-**re-encode** (`arrow_to_json`) for the sink. The `error_output` catches
-malformed messages so one bad record does not stop the stream.
+The processing chain is: **decode** the JSON payload into Arrow
+(`json_to_arrow`), then optionally **transform** it with SQL. The SQL sink
+binds Arrow columns by name, so it needs no re-encoding step; add
+`arrow_to_json` only for sinks that consume raw payloads (Kafka, HTTP).
+The `error_output` catches malformed messages so one bad record does not
+stop the stream.
 
 ## Run and verify
 

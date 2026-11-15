@@ -92,8 +92,18 @@ fn sandboxed_repo_root() -> PathBuf {
     repo_root()
 }
 
-fn docs_root() -> PathBuf {
-    repo_root().join("docs/docs")
+/// Every documentation tree that ships YAML snippets: the English source and
+/// the Chinese translation. The translation is often edited independently, so
+/// validating only the English tree lets a translated snippet drift out of the
+/// schema unnoticed.
+fn docs_roots() -> Vec<PathBuf> {
+    let root = repo_root();
+    let zh = root.join("docs/i18n/zh-Hans/docusaurus-plugin-content-docs/current");
+    let mut roots = vec![root.join("docs/docs")];
+    if zh.is_dir() {
+        roots.push(zh);
+    }
+    roots
 }
 
 fn walk_markdown(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -374,7 +384,9 @@ async fn docs_yaml_snippets_validate() {
     std::env::set_current_dir(sandboxed_repo_root()).expect("chdir to sandboxed repository root");
 
     let mut files = Vec::new();
-    walk_markdown(&docs_root(), &mut files);
+    for root in docs_roots() {
+        walk_markdown(&root, &mut files);
+    }
     files.sort();
 
     let mut failures = Vec::new();
@@ -397,7 +409,25 @@ async fn docs_yaml_snippets_validate() {
             };
             checked += 1;
             let result = match classification.kind.as_str() {
-                "full" => validate_engine_config(&block.body, &label).map(|_| ()),
+                "full" => validate_engine_config(&block.body, &label).and_then(|config| {
+                    // A complete configuration gets the same containment
+                    // guard as a fragment: a field the current schema does
+                    // not know would otherwise be silently ignored and the
+                    // remaining config still validates.
+                    let serialized = serde_yaml::to_string(&config)
+                        .map_err(|e| format!("{label}: cannot re-serialize config: {e}"))?;
+                    let parsed: Value = serde_yaml::from_str(&serialized)
+                        .map_err(|e| format!("{label}: cannot re-parse config: {e}"))?;
+                    let declared: Value = serde_yaml::from_str(&block.body)
+                        .map_err(|e| format!("{label}: snippet is not valid YAML: {e}"))?;
+                    if !contains(&parsed, &declared) {
+                        return Err(format!(
+                            "{label}: the configuration dropped part of the snippet — a field is \
+                             not part of the current schema or does not survive parsing"
+                        ));
+                    }
+                    Ok(())
+                }),
                 "fragment" => {
                     let wrap = classification.wrap.as_deref().expect("wrap is set");
                     let fragment: Value = match serde_yaml::from_str(&block.body) {

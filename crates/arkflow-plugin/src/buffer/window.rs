@@ -24,6 +24,13 @@ use tokio::sync::Notify;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+/// Window queue shared by the buffer's inputs, each batch paired with its
+/// source acknowledgement.
+type WindowQueue = DashMap<String, VecDeque<(MessageBatchRef, Arc<dyn Ack>)>>;
+
+/// Batches (with acks) drained from the queue, restorable on cancellation.
+type PendingWindow = (Vec<MessageBatchRef>, Vec<Arc<dyn Ack>>);
+
 pub(crate) struct BaseWindow {
     /// Thread-safe queue to store message batches and their acknowledgments
     /// Using DashMap instead of nested RwLock for better performance
@@ -46,6 +53,29 @@ impl BaseWindow {
         gap: time::Duration,
         resource: &Resource,
     ) -> Result<Self, Error> {
+        let join_operation = join_config
+            .map(|config| {
+                let codec = config.codec.build(resource)?;
+                let input_names = resource
+                    .input_names
+                    .borrow()
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<String>>();
+
+                JoinOperation::new(
+                    config.query,
+                    config.value_field,
+                    config.thread_num,
+                    codec,
+                    input_names,
+                )
+            })
+            .transpose()?;
+
+        // Only start the timer once construction can no longer fail: a
+        // failed build would otherwise leak a task that no close token
+        // ever reaches.
         let notify_clone = Arc::clone(&notify);
         let close_clone = close.clone();
         tokio::spawn(async move {
@@ -67,26 +97,6 @@ impl BaseWindow {
                 }
             }
         });
-
-        let join_operation = join_config
-            .map(|config| {
-                let codec = config.codec.build(resource)?;
-                let input_names = resource
-                    .input_names
-                    .borrow()
-                    .iter()
-                    .cloned()
-                    .collect::<HashSet<String>>();
-
-                JoinOperation::new(
-                    config.query,
-                    config.value_field,
-                    config.thread_num,
-                    codec,
-                    input_names,
-                )
-            })
-            .transpose()?;
 
         Ok(Self {
             join_operation,
@@ -139,13 +149,18 @@ impl BaseWindow {
                 {
                     Ok(b) => b,
                     Err(e) => {
-                        self.queue
-                            .entry(input_name)
-                            .or_default()
-                            .extend(messages.into_iter().zip(acks));
-                        for (msg, ack) in all_messages.into_iter().zip(all_acks) {
+                        // Restore drained items ahead of any newer writes:
+                        // `write` appends at the back, so pushing these to
+                        // the front in reverse preserves the original order.
+                        for (msg, ack) in messages.into_iter().zip(acks).rev() {
+                            self.queue
+                                .entry(input_name.clone())
+                                .or_default()
+                                .push_front((msg, ack));
+                        }
+                        for (msg, ack) in all_messages.into_iter().zip(all_acks).rev() {
                             let name = msg.get_input_name().unwrap_or_default();
-                            self.queue.entry(name).or_default().push_back((msg, ack));
+                            self.queue.entry(name).or_default().push_front((msg, ack));
                         }
                         return Err(e);
                     }
@@ -164,38 +179,59 @@ impl BaseWindow {
 
         let new_ack = Arc::new(VecAck(all_acks.clone()));
 
+        // A cancellation while the join future is awaited (or a context
+        // construction error) must return the drained batches to their
+        // queues; a synchronous drop guard restores them because Drop cannot
+        // await.
+        struct RestorePending<'a> {
+            queue: &'a WindowQueue,
+            pending: Option<PendingWindow>,
+        }
+        impl Drop for RestorePending<'_> {
+            fn drop(&mut self) {
+                if let Some((messages, acks)) = self.pending.take() {
+                    for (msg, ack) in messages.into_iter().zip(acks).rev() {
+                        let name = msg.get_input_name().unwrap_or_default();
+                        self.queue.entry(name).or_default().push_front((msg, ack));
+                    }
+                }
+            }
+        }
+        let mut restore = RestorePending {
+            queue: &self.queue,
+            pending: Some((all_messages, all_acks)),
+        };
+        let (messages_ref, _) = restore
+            .pending
+            .as_ref()
+            .expect("pending restore was just installed");
         let merged = match &self.join_operation {
             None => {
-                let batches: Vec<RecordBatch> = all_messages
+                let batches: Vec<RecordBatch> = messages_ref
                     .iter()
                     .map(|batch| (**batch).clone().into())
                     .collect();
-                // Cross-input merge: heterogeneous input schemas are
-                // null-filled on the union; a genuine type conflict errors.
                 crate::component::batch_merge::normalize_and_concat(&batches)
             }
             Some(join) => {
                 let ctx = component::sql::create_session_context()?;
-                let messages: Vec<_> = all_messages.iter().map(|m| (**m).clone()).collect();
+                let messages: Vec<_> = messages_ref.iter().map(|m| (**m).clone()).collect();
                 join.join_operation(&ctx, messages).await
             }
         };
 
         match merged {
-            Ok(new_batch) => Ok(Some((
-                Arc::new(MessageBatch::new_arrow(new_batch)),
-                new_ack,
-            ))),
+            Ok(new_batch) => {
+                // Disarm the guard: the merged batch now owns the acks.
+                restore.pending.take();
+                Ok(Some((
+                    Arc::new(MessageBatch::new_arrow(new_batch)),
+                    new_ack,
+                )))
+            }
             Err(e) => {
-                // Cross-input failure (type conflict or join error): the
-                // per-input merged batches and their acks go back to their
-                // queues — content-equivalent to the original messages — so
-                // nothing is dropped and a later read can retry. Appended to
-                // the back: `write` pushes newer items to the front.
-                for (msg, ack) in all_messages.into_iter().zip(all_acks) {
-                    let name = msg.get_input_name().unwrap_or_default();
-                    self.queue.entry(name).or_default().push_back((msg, ack));
-                }
+                // The guard restores the per-input batches when this
+                // function returns; no message or ack is dropped.
                 Err(e)
             }
         }
@@ -209,7 +245,7 @@ impl BaseWindow {
         self.queue
             .entry(input_name)
             .or_default()
-            .push_front((msg, ack));
+            .push_back((msg, ack));
 
         Ok(())
     }

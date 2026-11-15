@@ -402,6 +402,7 @@ impl KafkaInput {
         // Fallback: per-payload decode for an exact row↔payload mapping.
         let mut batches: Vec<datafusion::arrow::record_batch::RecordBatch> = Vec::new();
         let mut row_records: Vec<&ClaimedRecord> = Vec::new();
+        let mut first_error = None;
         for record in records {
             match crate::input::codec_helper::apply_codec_to_payload(&record.payload, &self.codec)
                 .await
@@ -416,10 +417,26 @@ impl KafkaInput {
                     row_records.extend(std::iter::repeat_n(record, rows));
                     batches.push(batch.into());
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // A skip codec reports an error when the WHOLE
+                    // one-element batch was bad. One poisoned record must not
+                    // discard the good records decoded around it; fail only
+                    // when no record survives.
+                    tracing::warn!(
+                        topic = %record.topic,
+                        partition = record.partition,
+                        offset = record.offset,
+                        %error,
+                        "kafka record decode failed; skipping it"
+                    );
+                    first_error.get_or_insert(error);
+                }
             }
         }
         let merged = if batches.is_empty() {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
             // Every payload was skipped: an empty batch carrying the fast
             // path's schema (there are no rows to align metadata with).
             let schema = decoded_batch.schema();

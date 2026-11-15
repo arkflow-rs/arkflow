@@ -19,10 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
-use tokio::time::{timeout, Duration};
-
-const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Default)]
 pub struct ControlHealth {
@@ -60,6 +57,12 @@ pub struct ControlPlane {
     node_id: Arc<str>,
     api_token: Option<String>,
     draft: Arc<RwLock<Option<ConfigCandidate>>>,
+    /// Serializes configuration mutations (apply and rollback). Version
+    /// selection, runtime reconciliation, and publication of the exposed
+    /// configuration must be one critical section; otherwise two callers can
+    /// each publish a candidate derived from the same old snapshot, leaving
+    /// the running state and the API-visible config divergent.
+    config_operation: Arc<Mutex<()>>,
 }
 
 impl ControlPlane {
@@ -93,6 +96,7 @@ impl ControlPlane {
             node_id: Arc::from("local-node"),
             api_token,
             draft: Arc::new(RwLock::new(None)),
+            config_operation: Arc::new(Mutex::new(())),
         }
     }
 
@@ -264,6 +268,11 @@ impl ControlPlane {
         if !matches!(record.state, OperationState::Queued) {
             return Ok(record);
         }
+        // Two concurrent requests can both observe the same Queued record;
+        // only the atomic claim winner may spawn the lifecycle task.
+        if !self.operations.claim_for_dispatch(&record.id).await {
+            return Ok(self.operations.get(&record.id).await.unwrap_or(record));
+        }
         let store = self.operations.clone();
         let manager = self.runtime_manager.clone();
         let events = self.events.clone();
@@ -278,17 +287,19 @@ impl ControlPlane {
             store
                 .update(&operation_id, OperationState::Running, 10, None)
                 .await;
-            let result = timeout(LIFECYCLE_TIMEOUT, async {
-                match operation_name.as_str() {
-                    "start" => manager.start(&stream_id).await,
-                    "stop" => manager.stop(&stream_id).await,
-                    "restart" => manager.restart(&stream_id).await,
-                    _ => Err(Error::Config(format!(
-                        "Unknown lifecycle operation: {operation_name}"
-                    ))),
-                }
-            })
-            .await;
+            // No outer request timeout here: `RuntimeManager::stop`/
+            // `restart` extract the task handle and settle the entry state,
+            // so dropping this future on a deadline would detach the task
+            // and leave the stream in `Stopping`/`Restarting` forever. The
+            // manager bounds its own startup handshake and task join.
+            let result = match operation_name.as_str() {
+                "start" => manager.start(&stream_id).await,
+                "stop" => manager.stop(&stream_id).await,
+                "restart" => manager.restart(&stream_id).await,
+                _ => Err(Error::Config(format!(
+                    "Unknown lifecycle operation: {operation_name}"
+                ))),
+            };
             let observed_state = manager
                 .snapshots()
                 .await
@@ -304,7 +315,7 @@ impl ControlPlane {
                 .is_some_and(|record| record.state == OperationState::Cancelled);
             store.set_result(&operation_id, reconciliation).await;
             let (_state, outcome, message) = match result {
-                Ok(Ok(())) => {
+                Ok(()) => {
                     store
                         .update(&operation_id, OperationState::Succeeded, 100, None)
                         .await;
@@ -321,29 +332,7 @@ impl ControlPlane {
                         (OperationState::Succeeded, "succeeded", None)
                     }
                 }
-                Ok(Err(error)) => {
-                    store
-                        .update(
-                            &operation_id,
-                            OperationState::Failed,
-                            100,
-                            Some(error.to_string()),
-                        )
-                        .await;
-                    if cancelled {
-                        (
-                            OperationState::Cancelled,
-                            "cancelled_reconciled",
-                            Some(format!(
-                                "Cancellation requested; lifecycle ended with error: {}",
-                                error
-                            )),
-                        )
-                    } else {
-                        (OperationState::Failed, "failed", Some(error.to_string()))
-                    }
-                }
-                Err(_elapsed) => {
+                Err(Error::Timeout) => {
                     store
                         .update(
                             &operation_id,
@@ -364,6 +353,28 @@ impl ControlPlane {
                             "timed_out",
                             Some("Lifecycle operation timed out".into()),
                         )
+                    }
+                }
+                Err(error) => {
+                    store
+                        .update(
+                            &operation_id,
+                            OperationState::Failed,
+                            100,
+                            Some(error.to_string()),
+                        )
+                        .await;
+                    if cancelled {
+                        (
+                            OperationState::Cancelled,
+                            "cancelled_reconciled",
+                            Some(format!(
+                                "Cancellation requested; lifecycle ended with error: {}",
+                                error
+                            )),
+                        )
+                    } else {
+                        (OperationState::Failed, "failed", Some(error.to_string()))
                     }
                 }
             };
@@ -407,12 +418,27 @@ impl ControlPlane {
         &self,
         candidate: &ConfigCandidate,
     ) -> Result<serde_json::Value, Error> {
+        // Serialize version selection, runtime reconciliation, and the
+        // publication of the exposed configuration as one critical section.
+        let _operation = self.config_operation.lock().await;
         let config = candidate
             .parse()
             .map_err(|issue| Error::Config(issue.message))?;
         let report = validate_config(&config);
         if !report.valid {
             return Err(Error::Config("Configuration validation failed".into()));
+        }
+        // Hot reconciliation covers streams only. Accepting a jobs change but
+        // publishing it while the old local Jobs keep running would make the
+        // version history disagree with the runtime; reject it explicitly.
+        {
+            let current = self.configuration.read().await;
+            if serde_json::to_value(&config.jobs).ok() != serde_json::to_value(&current.jobs).ok() {
+                return Err(Error::Config(
+                    "jobs cannot be hot-applied; restart the engine with the new configuration"
+                        .into(),
+                ));
+            }
         }
         let parent = self
             .version_store
@@ -445,6 +471,9 @@ impl ControlPlane {
     }
 
     pub async fn rollback_configuration(&self, id: &str) -> Result<serde_json::Value, Error> {
+        // Same critical section as apply: a rollback derived from a snapshot
+        // that a concurrent apply is replacing must not publish stale state.
+        let _operation = self.config_operation.lock().await;
         let candidate = self
             .version_store
             .load(id)
@@ -455,6 +484,16 @@ impl ControlPlane {
         let report = validate_config(&config);
         if !report.valid {
             return Err(Error::Config("Configuration validation failed".into()));
+        }
+        {
+            let current = self.configuration.read().await;
+            if serde_json::to_value(&config.jobs).ok() != serde_json::to_value(&current.jobs).ok() {
+                return Err(Error::Config(
+                    "jobs cannot be hot-applied by rollback; restart the engine with the target \
+                     configuration"
+                        .into(),
+                ));
+            }
         }
         let version = self
             .version_store

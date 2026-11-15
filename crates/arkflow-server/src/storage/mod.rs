@@ -393,6 +393,9 @@ pub struct JobRecord {
 pub struct JobPauseUpdate {
     pub expected_generation: u64,
     pub expected_phase: Option<String>,
+    /// Optional CAS on the capture retry counter: two callers holding the
+    /// same snapshot must not each dispatch a capture round.
+    pub expected_retry_count: Option<u32>,
     pub desired_state: Option<String>,
     pub phase: Option<String>,
     pub artifact_id: Option<String>,
@@ -4300,6 +4303,74 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn outbox_claim_skips_an_offline_node_and_reaches_the_online_row() {
+        let store = ControlPlaneStore::contract(
+            "outbox_claim_skips_an_offline_node_and_reaches_the_online_row",
+        )
+        .await;
+        let now = now_ms();
+        // The oldest row belongs to a registered but expired node: it must
+        // not occupy the single claim slot ahead of live nodes.
+        store
+            .upsert_node(NodeMutation {
+                node_id: "node-offline".into(),
+                version: "v1".into(),
+                state: "stale".into(),
+                capabilities_json: "[]".into(),
+                boot_id: None,
+                report_seq: None,
+                last_seen_at_ms: now.saturating_sub(60_000),
+                lease_expires_at_ms: now.saturating_sub(30_000),
+                maintenance_state: None,
+                maintenance_updated_at_ms: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_desired(DesiredMutation {
+                node_id: "node-offline".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_node(NodeMutation {
+                node_id: "node-online".into(),
+                version: "v1".into(),
+                state: "online".into(),
+                capabilities_json: "[]".into(),
+                boot_id: None,
+                report_seq: None,
+                last_seen_at_ms: now,
+                lease_expires_at_ms: now.saturating_add(60_000),
+                maintenance_state: None,
+                maintenance_updated_at_ms: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_desired(DesiredMutation {
+                node_id: "node-online".into(),
+                stream_id: "orders".into(),
+                desired_state: "running".into(),
+                expected_generation: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let claimed = store
+            .claim_outbox("worker", now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.node_id, "node-online");
+    }
+
     /// The outbox retention reclaims only processed rows: the unprocessed
     /// work queue (pending or claimed) survives every sweep, and the status
     /// counters — which only look at unprocessed rows — are unaffected.
@@ -6098,7 +6169,17 @@ mod tests {
             "the pending age must be reported for queued work"
         );
         // Claiming the only row moves it into the claimed counter and gives
-        // the pending queue an age.
+        // the pending queue an age. The target node is offline, so the claim
+        // is skipped; bring it online first.
+        assert!(store
+            .claim_outbox("worker", now_ms())
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .upsert_node(node("node-a", "online", None))
+            .await
+            .unwrap();
         let outbox = store
             .claim_outbox("worker", now_ms())
             .await
@@ -7750,16 +7831,6 @@ mod job_storage_tests {
             Some(first.clone())
         );
         assert_eq!(store.list_credentials("alice").await.unwrap().len(), 1);
-        assert!(store.revoke_credential("cred-1", 20).await.unwrap());
-        assert_eq!(
-            store
-                .get_credential("cred-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .revoked_at_ms,
-            Some(20)
-        );
         let second = CredentialRecord {
             credential_id: "cred-2".into(),
             created_at_ms: 21,
@@ -7771,6 +7842,21 @@ mod job_storage_tests {
             .await
             .unwrap());
         assert_eq!(store.get_credential("cred-2").await.unwrap(), Some(second));
+        // The previous credential was revoked by the rotation; rotating it
+        // again must fail (it can no longer spawn a second replacement).
+        assert!(!store
+            .rotate_credential(
+                CredentialRecord {
+                    credential_id: "cred-3".into(),
+                    created_at_ms: 23,
+                    secret_hash: "hash-3".into(),
+                    ..first.clone()
+                },
+                "cred-1",
+                24,
+            )
+            .await
+            .unwrap());
         // A second revocation keeps the first timestamp (idempotent).
         assert!(store.revoke_credential("cred-1", 99).await.unwrap());
         assert_eq!(
@@ -7780,7 +7866,7 @@ mod job_storage_tests {
                 .unwrap()
                 .unwrap()
                 .revoked_at_ms,
-            Some(20)
+            Some(22)
         );
 
         // Sessions are revocable per user and pruned when expired.

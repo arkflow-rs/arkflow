@@ -125,18 +125,6 @@ pub(super) async fn decide_approval(
     headers: HeaderMap,
     Json(request): Json<ApprovalDecisionRequest>,
 ) -> Response {
-    let principal = match require_operator_action(
-        &hub,
-        &headers,
-        OperatorAction::ApproveRollouts,
-        "config_approval",
-        Some(id.clone()),
-    )
-    .await
-    {
-        Ok(principal) => principal,
-        Err(response) => return response,
-    };
     let decision = request.decision.as_str();
     let approve = match decision {
         "approve" | "reject" => decision == "approve",
@@ -148,6 +136,43 @@ pub(super) async fn decide_approval(
             )
         }
     };
+    let principal = match require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ManageRollouts,
+        "config_approval",
+        Some(id.clone()),
+    )
+    .await
+    {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    // Approving always needs the second-principal right. Rejecting your own
+    // pending request is a withdrawal and must stay available to the
+    // submitting operator; rejecting someone else's request still needs the
+    // approval right.
+    let needs_approval_right = if approve {
+        true
+    } else {
+        match hub.config_approval(&id).await {
+            Ok(Some(approval)) => approval.requester_id != principal.id,
+            _ => true,
+        }
+    };
+    if needs_approval_right {
+        if let Err(response) = require_operator_action(
+            &hub,
+            &headers,
+            OperatorAction::ApproveRollouts,
+            "config_approval",
+            Some(id.clone()),
+        )
+        .await
+        {
+            return response;
+        }
+    }
     match hub
         .decide_config_approval(&id, approve, principal.id, request.note)
         .await

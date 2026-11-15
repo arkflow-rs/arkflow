@@ -20,12 +20,19 @@ pub mod protobuf;
 pub mod schema_registry;
 
 fn register_components() -> Result<(), Error> {
-    json::init()?;
-    protobuf::init()?;
-    debezium::init()?;
-    schema_registry::init()?;
-    Ok(())
+    crate::init_steps(
+        &COMPLETED,
+        &[
+            json::init,
+            protobuf::init,
+            debezium::init,
+            schema_registry::init,
+        ],
+    )
 }
+
+static COMPLETED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Component registration is process-global, so `init()` is idempotent:
 /// the first successful call registers every builder and later calls

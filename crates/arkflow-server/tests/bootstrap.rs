@@ -24,6 +24,31 @@ fn args(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
+/// Swap the database name in a PostgreSQL URL while preserving query
+/// parameters (TLS options such as `sslmode`).
+fn url_for_database(base: &str, database: &str) -> String {
+    let (path_part, query) = match base.split_once('?') {
+        Some((head, query)) => (head, Some(query)),
+        None => (base, None),
+    };
+    let (scheme, rest) = path_part.split_once("://").expect("url with scheme");
+    let authority = rest.split('/').next().expect("authority");
+    match query {
+        Some(query) => format!("{scheme}://{authority}/{database}?{query}"),
+        None => format!("{scheme}://{authority}/{database}"),
+    }
+}
+
+/// Per-process, per-run suffix for a dedicated migration database: a fixed
+/// name let two workspaces on one server FORCE-drop each other's database.
+fn run_scoped_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!("{}_{nanos}", std::process::id())
+}
+
 #[tokio::test]
 async fn migrate_rejects_each_malformed_invocation() {
     let mut sink = |_message: String| {};
@@ -61,24 +86,38 @@ async fn migrate_rejects_each_malformed_invocation() {
 
 #[tokio::test]
 async fn migrate_reports_a_missing_source_database_loudly() {
-    // A well-formed invocation against a nonexistent sqlite file surfaces
-    // the migration error through the sink and the Err return.
+    // A misspelled source must fail for that reason, not for an unreachable
+    // target, and must never be created as an empty database. An isolated
+    // non-existent path under a fresh temp dir proves both.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing-source.sqlite");
+    assert!(!missing.exists(), "fixture path must not exist");
     let mut messages = Vec::new();
     let mut sink = |message: String| messages.push(message);
     let result = bootstrap::run_migrate(
         &args(&[
             "--from",
-            "sqlite:/nonexistent/arkflow/none.db",
+            &format!("sqlite:{}", missing.display()),
             "--to",
             "postgres://127.0.0.1:1/db",
         ]),
         &mut sink,
     )
     .await;
-    assert!(result.is_err(), "a missing source must fail");
+    let error = result.expect_err("a missing source must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("migration source does not exist"),
+        "the failure must name the missing source: {error}"
+    );
     assert!(
         messages.iter().any(|m| m.contains("migration failed")),
         "{messages:?}"
+    );
+    assert!(
+        !missing.exists(),
+        "the migration must not create the source database"
     );
 }
 
@@ -125,25 +164,27 @@ async fn migrate_end_to_end_against_live_postgres_when_available() {
     // Replace (not append to) the base URL's path: rsplit on the last slash
     // breaks for a base URL that already names a database (".../postgres"
     // would produce the malformed database name "postgres/ct_bootstrap_migrate").
-    let (scheme, authority) = {
-        let (scheme, rest) = url.split_once("://").expect("postgres URL with scheme");
-        (scheme, rest.split('/').next().expect("authority"))
-    };
-    let target = format!("{scheme}://{authority}/ct_bootstrap_migrate");
+    // Query parameters (TLS options) are preserved.
+    let migration_db = format!("ct_bootstrap_migrate_{}", run_scoped_suffix());
+    let target = url_for_database(&url, &migration_db);
     let mut messages = Vec::new();
     let mut sink = |message: String| messages.push(message);
     // The target database may not exist; create it through the admin URL.
     {
         use sqlx::Connection as _;
         if let Ok(mut admin) =
-            sqlx::PgConnection::connect(&format!("{scheme}://{authority}/postgres")).await
+            sqlx::PgConnection::connect(&url_for_database(&url, "postgres")).await
         {
-            let _ = sqlx::query("DROP DATABASE IF EXISTS ct_bootstrap_migrate WITH (FORCE)")
-                .execute(&mut admin)
-                .await;
-            let _ = sqlx::query("CREATE DATABASE ct_bootstrap_migrate")
-                .execute(&mut admin)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS {migration_db} WITH (FORCE)"
+            )))
+            .execute(&mut admin)
+            .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE DATABASE {migration_db}"
+            )))
+            .execute(&mut admin)
+            .await;
         }
     }
     let code = bootstrap::run_migrate(

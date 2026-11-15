@@ -317,7 +317,31 @@ pub fn rate_limit_families() -> Vec<MetricFamily> {
 }
 
 /// Encode families as Prometheus text format 0.0.4 (HELP/TYPE included).
+/// Merge families that share a metric name. The exporter builds one family
+/// per Stream/Job, so a scrape spanning several of them would otherwise
+/// repeat that family's HELP/TYPE header and split its samples across
+/// declarations — which stricter collectors reject.
+fn merge_families(families: Vec<MetricFamily>) -> Vec<MetricFamily> {
+    let mut merged: Vec<MetricFamily> = Vec::with_capacity(families.len());
+    let mut index_by_name: BTreeMap<String, usize> = BTreeMap::new();
+    for family in families {
+        let name = family.name().to_string();
+        match index_by_name.get(&name).copied() {
+            Some(index) => {
+                let samples = family.metric.to_vec();
+                merged[index].mut_metric().extend(samples);
+            }
+            None => {
+                index_by_name.insert(name, merged.len());
+                merged.push(family);
+            }
+        }
+    }
+    merged
+}
+
 pub fn encode_families(families: Vec<MetricFamily>) -> String {
+    let families = merge_families(families);
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();
     encoder
@@ -384,6 +408,28 @@ mod tests {
                 "missing HELP for {name}"
             );
         }
+    }
+
+    #[test]
+    fn multi_job_exposition_declares_each_family_once() {
+        let mut jobs = BTreeMap::new();
+        jobs.insert("job-a".to_string(), job_snapshot());
+        jobs.insert("job-b".to_string(), job_snapshot());
+        let text = data_plane_exposition(&[], &jobs);
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("# HELP arkflow_job_chain_batches_in_total "))
+                .count(),
+            1,
+            "one HELP header per metric family:\n{text}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("arkflow_job_chain_batches_in_total{"))
+                .count(),
+            4,
+            "samples from both jobs stay in the same family:\n{text}"
+        );
     }
 
     #[test]

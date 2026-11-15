@@ -1783,13 +1783,14 @@ fn data_envelope(value: i64) -> Envelope {
 }
 
 #[test]
-fn aligner_buffers_until_all_inputs_barrier() {
+fn aligner_buffers_post_barrier_data_until_all_inputs_barrier() {
     let mut aligner = Aligner::new(2, 100);
     assert!(!aligner.is_aligning());
-    // Input 0 barrier arrives; input 1 data must buffer.
+    // Input 0 barrier arrives; its own subsequent data is post-barrier and
+    // must buffer.
     assert!(aligner.observe(0, barrier("cp-1")).unwrap().is_none());
     assert!(aligner.is_aligning());
-    assert!(aligner.observe(1, data_envelope(5)).unwrap().is_none());
+    assert!(aligner.observe(0, data_envelope(5)).unwrap().is_none());
     // Input 1's barrier completes the alignment.
     let aligned = aligner.observe(1, barrier("cp-1")).unwrap().unwrap();
     assert_eq!(aligned.checkpoint_id, "cp-1");
@@ -1802,9 +1803,9 @@ fn aligner_buffers_until_all_inputs_barrier() {
 fn aligner_fails_when_buffer_bound_exceeded() {
     let mut aligner = Aligner::new(2, 2);
     aligner.observe(0, barrier("cp-1")).unwrap();
-    aligner.observe(1, data_envelope(1)).unwrap();
-    aligner.observe(1, data_envelope(2)).unwrap();
-    assert!(aligner.observe(1, data_envelope(3)).is_err());
+    aligner.observe(0, data_envelope(1)).unwrap();
+    aligner.observe(0, data_envelope(2)).unwrap();
+    assert!(aligner.observe(0, data_envelope(3)).is_err());
     // Release still drains what was buffered.
     assert_eq!(aligner.release().len(), 3);
     assert!(!aligner.is_aligning());
@@ -1830,9 +1831,9 @@ fn aligner_holds_buffered_acknowledgements_until_release() {
     let tracker = Arc::new(AckTracker::new());
     let mut aligner = Aligner::new(2, 100);
     assert!(aligner.observe(0, barrier("cp-1")).unwrap().is_none());
-    // The second input's data arrives while alignment is in flight: the
-    // aligner buffers it and its acknowledgement must be excluded from the
-    // drain (`blocking() == 0`).
+    // The first input's post-barrier data arrives while alignment is in
+    // flight: the aligner buffers it and its acknowledgement must be
+    // excluded from the drain (`blocking() == 0`).
     let inner: Arc<dyn Ack> = Arc::new(NoopAck);
     let ack = Arc::new(TrackingAck::new(tracker.clone(), inner));
     assert_eq!(tracker.blocking(), 1);
@@ -1840,7 +1841,7 @@ fn aligner_holds_buffered_acknowledgements_until_release() {
         vec![(1, "a".into())],
     )));
     assert!(aligner
-        .observe(1, Envelope::Data(batch, ack.clone()))
+        .observe(0, Envelope::Data(batch, ack.clone()))
         .unwrap()
         .is_none());
     assert_eq!(tracker.blocking(), 0);
@@ -7199,9 +7200,9 @@ async fn a_panic_inside_a_close_path_fails_the_chain_task() {
         .unwrap();
     let result = run_graph(graph, CancellationToken::new()).await;
     let message = result.unwrap_err().to_string();
-    // The panic escaped the event loop's catch_unwind (it fired in the close
-    // path), so the join error surfaces as a chain task panic.
-    assert!(message.contains("chain task panicked"), "{message}");
+    // The close path is guarded: the panic fails the chain with the
+    // component/panic named, while the remaining close paths still run.
+    assert!(message.contains("processor close panicked"), "{message}");
 }
 
 #[tokio::test]
@@ -7329,7 +7330,9 @@ fn barrier_hooked_graph(
 fn source_hook(
     barrier_rx: flume::Receiver<Envelope>,
     state: Option<Arc<dyn crate::state::StateBackend>>,
-    failure_tx: Option<tokio::sync::mpsc::UnboundedSender<Error>>,
+    failure_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<(Option<crate::checkpoint::CheckpointBarrier>, Error)>,
+    >,
 ) -> BTreeMap<String, crate::executor::task::ChainHooks> {
     BTreeMap::from([(
         "source-0".to_string(),
@@ -7465,7 +7468,7 @@ async fn source_barrier_snapshot_failure_reports_and_forwards_the_barrier() {
             trace_context: None,
         }))
         .await;
-    let failure = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
+    let (_, failure) = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
         .await
         .expect("the snapshot failure must be reported")
         .expect("the failure channel stays open");
@@ -8597,8 +8600,11 @@ async fn barrier_alignment_overflow_releases_the_buffered_data() {
         .unwrap();
     let (barrier_tx, barrier_rx) = flume::bounded::<Envelope>(4);
     let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (source_report_tx, mut source_report_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ChainSnapshot>();
     let mut left_hook = barrier_hook_for("left-source-0");
     left_hook.checkpoint.barrier_rx = Some(Arc::new(tokio::sync::Mutex::new(barrier_rx)));
+    left_hook.checkpoint.reporter = Some(source_report_tx);
     let mut merge_hook = barrier_hook_for("merge-0");
     merge_hook.checkpoint.failure_reporter = Some(failure_tx);
     let hooks = BTreeMap::from([
@@ -8623,25 +8629,37 @@ async fn barrier_alignment_overflow_releases_the_buffered_data() {
             trace_context: None,
         }))
         .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Wait until the source chain has forwarded the barrier downstream (it
+    // reports only after `send_downstream`). The flood below is then queued
+    // behind the barrier on the merge edge, so the merge chain observes the
+    // barrier first and buffers the rows as post-barrier data.
+    tokio::time::timeout(Duration::from_secs(5), source_report_rx.recv())
+        .await
+        .expect("the source chain forwards the barrier")
+        .expect("the source reporter stays alive");
     // Overrun the alignment bound: the merge chain releases everything it
-    // buffered and keeps processing instead of blocking.
+    // buffered and keeps processing instead of blocking. The left input's
+    // barrier already arrived, so its own further rows are post-barrier and
+    // are the ones the aligner holds.
     for value in 0..1030 {
-        right.push_rows(vec![(value, "right".into())]);
+        left.push_rows(vec![(value, "left".into())]);
     }
+    // Keep the right input open: finishing it would turn its EOS into the
+    // implicit second barrier and complete the round before the flood can
+    // overflow the alignment buffer.
     left.finish();
-    right.finish();
     let failure = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
         .await
         .expect("the overflow must be reported");
     assert!(
         failure
             .as_ref()
-            .map(|error| error.to_string())
+            .map(|(_, error)| error.to_string())
             .unwrap_or_default()
             .contains("exceeded"),
         "the overflow error names the bound: {failure:?}"
     );
+    right.finish();
     tokio::time::timeout(Duration::from_secs(10), runner)
         .await
         .expect("the overflowed chain must keep flowing")
@@ -8706,7 +8724,7 @@ async fn interior_barrier_snapshot_failure_reports_and_forwards() {
             trace_context: None,
         }))
         .await;
-    let failure = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
+    let (_, failure) = tokio::time::timeout(Duration::from_secs(5), failure_rx.recv())
         .await
         .expect("the interior snapshot failure must be reported")
         .expect("the failure channel stays open");

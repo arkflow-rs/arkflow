@@ -78,17 +78,19 @@ impl Hub {
             .into_values()
             .map(|(_, _, id)| id)
             .collect::<BTreeSet<_>>();
-        let stale: Vec<String> = operations
+        let stale: Vec<(String, String)> = operations
             .iter()
             .filter(|(_, record)| {
                 terminal(&record.state)
                     && !protected_ids.contains(&record.id)
                     && ((record.finished_at_ms.unwrap_or(record.created_at_ms)) as i64) < cutoff
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, record)| (id.clone(), record.command_id.clone()))
             .collect();
-        for id in stale {
+        let mut evicted_commands = Vec::with_capacity(stale.len());
+        for (id, command_id) in stale {
             operations.remove(&id);
+            evicted_commands.push(command_id);
         }
         let mut terminal_ids: Vec<(i64, String)> = operations
             .iter()
@@ -103,7 +105,17 @@ impl Hub {
         terminal_ids.sort();
         let excess = terminal_ids.len().saturating_sub(RETENTION_MAX as usize);
         for (_, id) in terminal_ids.into_iter().take(excess) {
-            operations.remove(&id);
+            if let Some(record) = operations.remove(&id) {
+                evicted_commands.push(record.command_id);
+            }
+        }
+        if !evicted_commands.is_empty() {
+            // Keep the settled-command markers bounded with the operations
+            // they describe.
+            let mut settled = self.settled_commands.write().await;
+            for command_id in evicted_commands {
+                settled.remove(&command_id);
+            }
         }
         Ok(())
     }
@@ -326,14 +338,30 @@ impl Hub {
     }
 
     pub async fn metrics(&self, node_id: Option<&str>) -> BTreeMap<String, f64> {
+        let now = now_ms();
         let nodes = self.nodes.read().await;
         let mut aggregate = BTreeMap::new();
-        for node in nodes
-            .values()
-            .filter(|node| node_id.is_none_or(|id| node.resource.id == id))
-        {
+        for node in nodes.values().filter(|node| {
+            node_id.is_none_or(|id| node.resource.id == id)
+                // Expired-lease nodes keep their last counters; exporting
+                // them as current is misleading.
+                && node.resource.lease_expires_at_ms > now
+        }) {
             for (key, value) in &node.metrics {
-                *aggregate.entry(key.clone()).or_insert(0.0) += value;
+                // Agent-reported watermark lag, checkpoint duration and mean
+                // latency are already node-local maxima; adding them across
+                // nodes over-reports (two 1 s lags became 2 s). Counters
+                // still sum.
+                let is_max_gauge = matches!(
+                    key.as_str(),
+                    "watermark_lag_ms" | "checkpoint_duration_ms" | "mean_latency_us"
+                );
+                let entry = aggregate.entry(key.clone()).or_insert(0.0);
+                if is_max_gauge {
+                    *entry = f64::max(*entry, *value);
+                } else {
+                    *entry += value;
+                }
             }
         }
         aggregate
@@ -361,11 +389,15 @@ impl Hub {
     }
 
     pub async fn metrics_by_node(&self, node_id: Option<&str>) -> Vec<HubNodeMetrics> {
+        let now = now_ms();
         self.nodes
             .read()
             .await
             .values()
-            .filter(|node| node_id.is_none_or(|id| node.resource.id == id))
+            .filter(|node| {
+                node_id.is_none_or(|id| node.resource.id == id)
+                    && node.resource.lease_expires_at_ms > now
+            })
             .map(|node| HubNodeMetrics {
                 node_id: node.resource.id.clone(),
                 metrics: node.metrics.clone(),
@@ -425,9 +457,9 @@ impl Hub {
     /// Task ids any node currently reports executing for the Job, mapped to
     /// the executing node id. This is the observed runtime state the detail
     /// view merges over the desired placement.
-    pub async fn observed_job_tasks(&self, job_id: &str) -> BTreeMap<String, String> {
+    pub async fn observed_job_tasks(&self, job_id: &str) -> BTreeMap<String, Vec<String>> {
         let now = now_ms();
-        let mut observed = BTreeMap::new();
+        let mut observed: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for node in self
             .nodes
             .read()
@@ -441,7 +473,13 @@ impl Hub {
                 .map(Vec::as_slice)
                 .unwrap_or_default()
             {
-                observed.insert(task_id.clone(), node.resource.id.clone());
+                // Keep every reporting node: during a placement switch the
+                // same task can briefly be reported by both, and last-writer
+                // would hide one executor.
+                let nodes = observed.entry(task_id.clone()).or_default();
+                if !nodes.contains(&node.resource.id) {
+                    nodes.push(node.resource.id.clone());
+                }
             }
         }
         observed

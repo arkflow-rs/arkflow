@@ -57,7 +57,15 @@ export type OperationListQuery = {
   page?: number
   page_size?: number
 }
-export type AuditListQuery = { resource_id?: string; page?: number; page_size?: number }
+export type AuditListQuery = {
+  resource_id?: string
+  actor?: string
+  action?: string
+  from_ms?: number
+  to_ms?: number
+  page?: number
+  page_size?: number
+}
 
 function withQuery(path: string, query: Record<string, string | number | undefined>): string {
   const params = new URLSearchParams()
@@ -507,6 +515,11 @@ export function setRuntimeBearerToken(value: string | null): void {
     else sessionStorage.removeItem(RUNTIME_TOKEN_STORAGE_KEY)
   } catch {
     // Storage unavailable: the token still works for this page lifetime.
+  }
+  // Live subscriptions read the token when they connect; tell them to
+  // rebuild rather than keep streaming with the previous credential.
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('arkflow-credential-changed'))
   }
 }
 
@@ -1074,11 +1087,18 @@ export function resetOidcStatusCacheForTests(): void {
 /** Probes (once) whether the Hub offers the OIDC browser login flow and
  * whether the current session cookie is still valid. */
 export function oidcStatus(): Promise<OidcStatus> {
-  oidcProbe ??= fetch(`${base}/auth/oidc/status`)
-    .then((response) =>
-      response.ok ? response.json() : { login_enabled: false, authenticated: false, principal: null },
-    )
-    .catch(() => ({ login_enabled: false, authenticated: false, principal: null })) as Promise<OidcStatus>
+  if (oidcProbe) return oidcProbe
+  const probe = fetch(`${base}/auth/oidc/status`).then((response) => {
+    if (!response.ok) throw new Error(`OIDC status HTTP ${response.status}`)
+    return response.json() as Promise<OidcStatus>
+  })
+  // Cache only a meaningful answer: a failed probe (network down, Hub not
+  // ready, 5xx) must be retryable instead of pinning login_enabled=false for
+  // the rest of the tab's lifetime.
+  oidcProbe = probe.catch(() => {
+    oidcProbe = null
+    return { login_enabled: false, authenticated: false, principal: null }
+  })
   return oidcProbe
 }
 
@@ -1097,11 +1117,15 @@ export async function redirectToOidcLogin(): Promise<void> {
   window.location.assign(`${base}/auth/oidc/login`)
 }
 
-/** Ends the browser session server-side and reloads the console. */
-export async function oidcLogout(): Promise<void> {
-  await fetch(`${base}/auth/oidc/logout`)
+/** Ends the browser session server-side and reloads the console. Returns
+ *  false when the server did not confirm the revocation; the caller keeps
+ *  the signed-in state so the user can retry. */
+export async function oidcLogout(): Promise<boolean> {
+  const response = await fetch(`${base}/auth/oidc/logout`)
+  if (!response.ok) return false
   sessionStorage.removeItem('arkflow_oidc_redirected_at')
   window.location.reload()
+  return true
 }
 
 /** 401 recovery: the Hub's OIDC login flow keeps its redirect behaviour, but

@@ -346,7 +346,10 @@ async fn expired_session_mid_command_still_settles_one_terminal_result() {
         node_id: "agent-a".into(),
         session_token: reauth.session_token.clone(),
     };
-    // The command lease is still valid, so nothing is redelivered yet.
+    // The command lease is still valid, so nothing is redelivered yet: a
+    // same-boot session refresh keeps leases leased. Early re-delivery could
+    // re-execute a non-idempotent checkpoint command whose result post raced
+    // the session expiry; the expiry sweep and a fresh capture id recover it.
     assert!(hub.commands(auth_b.clone()).await.unwrap().is_empty());
 
     // Let the command lease expire. Session B's own TTL also elapses
@@ -789,6 +792,7 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
                 capabilities: vec![],
                 last_seen_at_ms: now,
                 lease_expires_at_ms: now + 1_000,
+                report_seq: 0,
                 streams_total: 0,
                 streams_running: 0,
                 streams_failed: 0,

@@ -26,6 +26,12 @@ pub(crate) const PAUSE_RESUMING: &str = "resuming";
 pub(crate) const PAUSE_CAPTURE_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
 /// Bounded capture re-dispatch budget (Hub restart / timeout recovery).
 pub(crate) const MAX_PAUSE_CAPTURE_RETRIES: u32 = 3;
+/// How long a completed capture phase still counts as round progress while
+/// the Hub enqueues its commit. The commit is created right after the last
+/// capture result; a reconcile tick landing in between used to see no
+/// in-flight operation, replace the artifact, and burn the retry budget
+/// (each fresh capture then completed and was superseded ~130ms later).
+const PAUSE_COMMIT_GRACE_MS: u64 = 5_000;
 
 impl Hub {
     fn require_durable_storage(&self) -> Result<&crate::storage::StorageActor, HubError> {
@@ -82,7 +88,9 @@ impl Hub {
                 resource_id: Some(job_id.to_owned()),
                 node_id: None,
                 stream_id: None,
-                correlation_id: None,
+                // The pause's stable operation correlation: the audit trail
+                // must be joinable with the pause/resume lifecycle.
+                correlation_id: Some(format!("job-pause:{job_id}")),
                 outcome: outcome.to_owned(),
                 failure_code: failure_code.map(str::to_owned),
                 message: Some(message),
@@ -154,6 +162,12 @@ impl Hub {
             now_ms(),
             actor,
         );
+        if let Some(artifact_id) = &artifact_id {
+            self.pause_dispatch_pending
+                .write()
+                .await
+                .insert(job_id.to_string(), artifact_id.clone());
+        }
         let job = storage
             .update_job_pause(job_id, update)
             .await
@@ -383,6 +397,14 @@ impl Hub {
                 pinned.push(pointer);
             }
         }
+        // Aborting a pause restores `pause_prev_checkpoint_id`; retention
+        // must keep that artifact readable until the pause reaches a
+        // terminal phase (or the abort restores a now-missing pointer).
+        if let Some(previous) = job.pause_prev_checkpoint_id {
+            if !pinned.contains(&previous) {
+                pinned.push(previous);
+            }
+        }
         pinned
     }
 
@@ -392,28 +414,41 @@ impl Hub {
         // commit round still has to make the artifact usable. Counting only
         // JobCheckpoint/JobSavepoint would retry during that window, replace
         // the artifact id, and exhaust the budget while commits keep landing.
+        let now = now_ms();
         let operations = self.operations.read().await;
         operations.values().any(|operation| {
-            operation.resource_id == job.job_id
-                && operation.generation == job.generation
-                && matches!(
-                    operation.operation,
-                    AgentOperation::JobCheckpoint
-                        | AgentOperation::JobSavepoint
-                        | AgentOperation::JobCheckpointCommit
-                        | AgentOperation::JobSavepointCommit
-                )
-                && matches!(
-                    operation.state,
-                    HubOperationState::Queued
-                        | HubOperationState::Dispatched
-                        | HubOperationState::Acknowledged
-                        | HubOperationState::Running
-                )
-                && operation
+            if operation.resource_id != job.job_id
+                || operation.generation != job.generation
+                || operation
                     .checkpoint_id
                     .as_deref()
-                    .is_none_or(|id| id == artifact_id)
+                    .is_some_and(|id| id != artifact_id)
+            {
+                return false;
+            }
+            let active = matches!(
+                operation.state,
+                HubOperationState::Queued
+                    | HubOperationState::Dispatched
+                    | HubOperationState::Acknowledged
+                    | HubOperationState::Running
+            );
+            match operation.operation {
+                // The capture phase completing is progress too: the Hub
+                // enqueues the commit immediately after the last capture
+                // result. Only a RECENT success counts, so a round abandoned
+                // by a Hub restart (or whose commit timed out) still reaches
+                // the retry path.
+                AgentOperation::JobCheckpoint | AgentOperation::JobSavepoint => {
+                    active
+                        || (operation.state == HubOperationState::Succeeded
+                            && operation.finished_at_ms.is_some_and(|finished| {
+                                now.saturating_sub(finished) < PAUSE_COMMIT_GRACE_MS
+                            }))
+                }
+                AgentOperation::JobCheckpointCommit | AgentOperation::JobSavepointCommit => active,
+                _ => false,
+            }
         })
     }
 
@@ -547,7 +582,23 @@ impl Hub {
                     .map(|start| start.saturating_add(PAUSE_CAPTURE_TIMEOUT_MS))
                     .unwrap_or_else(|| now_ms().saturating_add(PAUSE_CAPTURE_TIMEOUT_MS));
                 if now_ms() >= deadline {
-                    return self.abort_pause(job, "pause_savepoint_timeout").await;
+                    return self.abort_pause(job, "pause_savepoint_failed").await;
+                }
+                // The pause pointer is committed before the capture command
+                // is dispatched; a tick landing in that window must not
+                // re-dispatch (it would consume the bounded retry budget on
+                // work that is about to start). Exactly one tick per dispatch
+                // issued by THIS process is skipped — after a restart the map
+                // is empty and the reconciler re-issues immediately.
+                {
+                    let mut pending = self.pause_dispatch_pending.write().await;
+                    if pending
+                        .get(&job.job_id)
+                        .is_some_and(|pending_id| pending_id == &artifact_id)
+                    {
+                        pending.remove(&job.job_id);
+                        return Ok(false);
+                    }
                 }
                 if self.pause_capture_in_flight(job, &artifact_id).await {
                     return Ok(false);
@@ -571,10 +622,15 @@ impl Hub {
         let update = JobPauseUpdate {
             expected_generation: job.generation,
             expected_phase: Some(PAUSE_CAPTURING.into()),
+            expected_retry_count: Some(job.pause_retry_count),
             artifact_id: Some(artifact_id.clone()),
             retry_count: Some(job.pause_retry_count.saturating_add(1)),
             ..JobPauseUpdate::default()
         };
+        self.pause_dispatch_pending
+            .write()
+            .await
+            .insert(job.job_id.clone(), artifact_id.clone());
         let updated = storage
             .update_job_pause(&job.job_id, update)
             .await
@@ -725,21 +781,34 @@ impl Hub {
             )
             .await;
         // Observation writes clear `last_error`; the abort's stable failure
-        // code is the operator's only signal, so restore it afterwards.
-        if let Some(restored) = storage
-            .update_job(
-                &updated.job_id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(failure_code.into()),
-            )
-            .await
-            .map_err(HubError::from)?
-        {
-            self.cache_job(&restored).await;
+        // code is the operator's only signal, so restore it afterwards only
+        // while the abort's generation is still current. (The plain
+        // `update_job` preserves the generation; the conditional variant
+        // would bump it.)
+        let current = self.job(&updated.job_id).await?.ok_or(HubError::NotFound)?;
+        if current.generation == updated.generation {
+            if let Some(restored) = storage
+                .update_job(
+                    &updated.job_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(failure_code.into()),
+                )
+                .await
+                .map_err(HubError::from)?
+            {
+                self.cache_job(&restored).await;
+            }
+        } else {
+            tracing::warn!(
+                job_id = %updated.job_id,
+                generation = updated.generation,
+                current = current.generation,
+                "pause abort error code not restored: a newer job generation won"
+            );
         }
         Ok(true)
     }

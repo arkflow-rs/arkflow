@@ -351,6 +351,14 @@ pub(super) async fn register(
                 let leader_url = problem["details"]["leader_url"].as_str().map(str::to_owned);
                 return Err(RegisterFailure::Standby { leader_url });
             }
+            // Keep the hub's capacity/standby reason visible: a bare
+            // "registration rejected" made registry exhaustion
+            // indistinguishable from a malformed credential.
+            let code = problem["code"].as_str().unwrap_or("service_unavailable");
+            let title = problem["title"].as_str().unwrap_or("registration rejected");
+            return Err(RegisterFailure::Transport(format!(
+                "HTTP {status}: {title} ({code})"
+            )));
         }
         return Err(RegisterFailure::Transport(format!(
             "HTTP {status}: registration rejected"
