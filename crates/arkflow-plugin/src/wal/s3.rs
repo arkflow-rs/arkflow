@@ -779,6 +779,7 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
                     .await
                     .map_err(|e| Error::Process(format!("S3 GET segment body: {}", e)))?;
                 let decoded = decode_segment_object(&bytes)?;
+                warn_segment_truncation(seg_name, &decoded);
                 store.remember_segment_range(seg_name, &decoded.entries);
                 if let Some((last, _)) = decoded.entries.last() {
                     if *last > max_seq_seen {
@@ -792,7 +793,9 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
             }
             Err(object_store::Error::NotFound { .. }) => {
                 // Manifest referenced a segment that was truncated between
-                // write and recovery (D7). Skip silently.
+                // write and recovery (D7). Skip, but observably: the dropped
+                // bytes hold unacked replay data.
+                warn_missing_segment(seg_name);
             }
             Err(e) => {
                 return Err(Error::Process(format!(
@@ -950,10 +953,14 @@ impl WalStore for S3Store {
                     Ok(b) => b,
                     Err(e) => return Err(Error::Process(format!("S3 GET segment body: {}", e))),
                 },
-                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(object_store::Error::NotFound { .. }) => {
+                    warn_missing_segment(&seg_name);
+                    continue;
+                }
                 Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
             };
             let decoded = decode_segment_object(&bytes)?;
+            warn_segment_truncation(&seg_name, &decoded);
             self.remember_segment_range(&seg_name, &decoded.entries);
             for (seq, mb) in decoded.entries {
                 if seq > manifest.cursor {
@@ -995,10 +1002,14 @@ impl WalStore for S3Store {
                     Ok(b) => b,
                     Err(e) => return Err(Error::Process(format!("S3 GET segment body: {}", e))),
                 },
-                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(object_store::Error::NotFound { .. }) => {
+                    warn_missing_segment(&seg_name);
+                    continue;
+                }
                 Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
             };
             let decoded = decode_segment_object(&bytes)?;
+            warn_segment_truncation(&seg_name, &decoded);
             self.remember_segment_range(&seg_name, &decoded.entries);
             for (seq, mb) in decoded.entries {
                 if seq > after {
@@ -1219,6 +1230,33 @@ fn decode_segment_object(bytes: &[u8]) -> Result<segment::DecodedSegment, Error>
         ))
     })?;
     segment::decode_with_kind(payload, kind)
+}
+
+/// Log a segment decode's truncation, if any. Dropped bytes on the replay
+/// path hold only unacknowledged (replayable) data — acknowledged records
+/// are past the manifest cursor and never re-read — but the loss must be
+/// observable, not silent (spec: fix-silent-data-loss).
+fn warn_segment_truncation(segment: &str, decoded: &segment::DecodedSegment) {
+    if let Some(t) = &decoded.truncation {
+        tracing::warn!(
+            segment,
+            truncated_at = t.truncated_at,
+            dropped_bytes = t.dropped_bytes,
+            kind = ?t.kind,
+            "sealed WAL segment decoded with dropped bytes; unacked replay data in it is skipped"
+        );
+    }
+}
+
+/// A manifest-referenced sealed segment is gone from the object store. Same
+/// replay-only scope as `warn_segment_truncation`, but nothing at all of the
+/// segment could be read.
+fn warn_missing_segment(segment: &str) {
+    tracing::warn!(
+        segment,
+        "manifest-referenced sealed WAL segment is missing from the object store; \
+         unacked replay data in it is skipped"
+    );
 }
 
 /// Move the active segment's bytes into a sealed batch, resetting the active

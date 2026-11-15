@@ -44,6 +44,31 @@ use super::crc;
 pub(crate) struct DecodedSegment {
     pub entries: Vec<(u64, MessageBatchRef)>,
     pub bytes_consumed: usize,
+    /// Present when decoding dropped part of the segment (torn tail or a
+    /// corrupt entry): the recovery path logs it so silent data loss on the
+    /// replay path becomes observable. `None` when the whole buffer decoded.
+    pub truncation: Option<SegmentTruncation>,
+}
+
+/// What a segment decode dropped, and from where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmentTruncation {
+    /// Offset of the first dropped byte (the intact prefix length).
+    pub truncated_at: usize,
+    /// Bytes dropped from `truncated_at` to the end of the segment.
+    pub dropped_bytes: usize,
+    /// Whether the drop was a trailing torn tail (mid-PUT crash) or a
+    /// corrupt entry (CRC mismatch / sequence regression).
+    pub kind: SegmentDropKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentDropKind {
+    /// Trailing bytes did not form a complete entry (mid-PUT crash).
+    TornTail,
+    /// An entry failed its integrity check (CRC mismatch, length overflow,
+    /// or a sequence regression in corrupt metadata).
+    CorruptEntry,
 }
 
 /// Encode a batch of `(seq, payload)` entries into a single segment byte
@@ -106,11 +131,20 @@ fn decode_raw(bytes: &[u8]) -> Result<DecodedSegment, Error> {
     let mut pos = 0usize;
     let mut last_good = 0usize;
     let mut last_seq: Option<u64> = None;
+    // `None` until a break records why decoding stopped early. Every break
+    // drops everything from the failure point to the end of the segment —
+    // that drop is reported, never silent.
+    let mut truncation: Option<SegmentTruncation> = None;
 
     while pos < bytes.len() {
         // Header: 8 bytes seq + 4 bytes len = 12 bytes minimum.
         if bytes.len() - pos < 12 {
             // Trailing partial header — torn tail.
+            truncation = Some(SegmentTruncation {
+                truncated_at: pos,
+                dropped_bytes: bytes.len() - pos,
+                kind: SegmentDropKind::TornTail,
+            });
             break;
         }
         let mut seq_buf = [0u8; 8];
@@ -121,6 +155,11 @@ fn decode_raw(bytes: &[u8]) -> Result<DecodedSegment, Error> {
         // strictly increase; a regression/duplicate is treated as a torn tail
         // rather than trusting corrupt metadata.
         if last_seq.is_some_and(|previous| seq <= previous) {
+            truncation = Some(SegmentTruncation {
+                truncated_at: pos,
+                dropped_bytes: bytes.len() - pos,
+                kind: SegmentDropKind::CorruptEntry,
+            });
             break;
         }
         last_seq = Some(seq);
@@ -139,6 +178,11 @@ fn decode_raw(bytes: &[u8]) -> Result<DecodedSegment, Error> {
         if crc_end > bytes.len() {
             // Trailing entry was truncated mid-PUT. Drop it; everything up
             // to `last_good` is intact.
+            truncation = Some(SegmentTruncation {
+                truncated_at: pos,
+                dropped_bytes: bytes.len() - pos,
+                kind: SegmentDropKind::TornTail,
+            });
             break;
         }
 
@@ -149,6 +193,11 @@ fn decode_raw(bytes: &[u8]) -> Result<DecodedSegment, Error> {
         let got = crc::crc32(payload);
         if want != got {
             // Mid-record corruption — same disposition as torn tail.
+            truncation = Some(SegmentTruncation {
+                truncated_at: pos,
+                dropped_bytes: bytes.len() - pos,
+                kind: SegmentDropKind::CorruptEntry,
+            });
             break;
         }
 
@@ -161,6 +210,7 @@ fn decode_raw(bytes: &[u8]) -> Result<DecodedSegment, Error> {
     Ok(DecodedSegment {
         entries,
         bytes_consumed: last_good,
+        truncation,
     })
 }
 
@@ -306,5 +356,67 @@ mod tests {
         let mut b = Vec::new();
         encode_compressed(&entries, &mut b, "none", 0).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Spec: s3-wal-pipeline / Failure handling and recovery — a torn tail
+    /// (trailing bytes that do not form a complete entry) drops the tail
+    /// AND reports the drop: offset, byte count, and TornTail kind.
+    #[test]
+    fn torn_tail_is_reported_with_offset_and_byte_count() {
+        let entries = vec![(1u64, make_payload()), (2u64, make_payload())];
+        let mut bytes = Vec::new();
+        encode(&entries, &mut bytes).unwrap();
+        let intact_len = bytes.len();
+        // Append a partial third entry (header + partial payload, no CRC).
+        bytes.extend_from_slice(&3u64.to_be_bytes());
+        bytes.extend_from_slice(&64u32.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 10]);
+
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.entries.len(), 2, "the intact prefix decodes");
+        let t = decoded
+            .truncation
+            .expect("a torn tail must be reported, not silent");
+        assert_eq!(t.truncated_at, intact_len);
+        assert_eq!(t.dropped_bytes, bytes.len() - intact_len);
+        assert_eq!(t.kind, SegmentDropKind::TornTail);
+    }
+
+    /// Spec: s3-wal-pipeline / Failure handling and recovery — a mid-record
+    /// CRC mismatch drops everything from the corrupt entry onward and is
+    /// reported as CorruptEntry; the intact prefix decodes normally.
+    #[test]
+    fn mid_record_crc_corruption_is_reported_as_corrupt_entry() {
+        let entries = vec![(1u64, make_payload()), (2u64, make_payload())];
+        let mut bytes = Vec::new();
+        encode(&entries, &mut bytes).unwrap();
+        // Corrupt the payload of the second entry: flip one payload byte.
+        // Entry layout is [seq(8)|len(4)|payload|crc(4)]; entry 2 starts at
+        // 12 + entry1_total(12+L+4), and its payload 12 bytes after that.
+        let payload_len = make_payload().len();
+        let entry2_start = 12 + payload_len + 4;
+        let second_payload_start = entry2_start + 12;
+        bytes[second_payload_start] ^= 0xFF;
+
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.entries.len(), 1, "only the intact prefix decodes");
+        let t = decoded
+            .truncation
+            .expect("mid-record corruption must be reported, not silent");
+        assert_eq!(t.truncated_at, entry2_start);
+        assert_eq!(t.kind, SegmentDropKind::CorruptEntry);
+        assert!(t.dropped_bytes > 0);
+        assert_eq!(t.kind, SegmentDropKind::CorruptEntry);
+    }
+
+    /// A fully intact segment reports no truncation.
+    #[test]
+    fn intact_segment_reports_no_truncation() {
+        let entries = vec![(1u64, make_payload()), (2u64, make_payload())];
+        let mut bytes = Vec::new();
+        encode(&entries, &mut bytes).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.entries.len(), 2);
+        assert!(decoded.truncation.is_none());
     }
 }

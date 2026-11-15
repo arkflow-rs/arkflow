@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::warn;
 
 const DEFAULT_NAME: &str = "flow";
 
@@ -193,9 +193,13 @@ impl Input for SqlInput {
                 Err(Error::EOF)
             }
             result = stream_pin.try_next() => {
+                 // A mid-stream failure is a disconnect, not a clean
+                 // end-of-stream: mapping it to `EOF` would broadcast EOS
+                 // downstream and acknowledge a truncated result set as
+                 // complete. `EOF` is reserved for `Ok(None)` below.
                  let value = result.map_err(|e| {
-                    error!("Failed to read: {}:",e);
-                    Error::EOF
+                    warn!("sql input stream failed before exhaustion; reconnecting: {}", e);
+                    Error::Disconnection
                 })?;
                 let Some(x) = value else {
                     return Err(Error::EOF);
@@ -455,5 +459,92 @@ mod tests {
             panic!("malformed config must be rejected");
         };
         assert!(err.to_string().contains("Sql input"), "{err}");
+    }
+
+    /// A RecordBatchStream double that yields one good batch and then a
+    /// mid-stream error — the shape a failing DB connection or query
+    /// produces after some rows have already flowed.
+    struct MidStreamFailure {
+        schema: datafusion::arrow::datatypes::SchemaRef,
+        emitted: std::sync::atomic::AtomicBool,
+    }
+
+    impl datafusion::physical_plan::RecordBatchStream for MidStreamFailure {
+        fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+            self.schema.clone()
+        }
+    }
+
+    impl futures_util::Stream for MidStreamFailure {
+        type Item = Result<
+            datafusion::arrow::record_batch::RecordBatch,
+            datafusion::common::DataFusionError,
+        >;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if !self.emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let schema = self.schema.clone();
+                let batch = datafusion::arrow::record_batch::RecordBatch::new_empty(schema);
+                return std::task::Poll::Ready(Some(Ok(batch)));
+            }
+            std::task::Poll::Ready(Some(Err(datafusion::common::DataFusionError::Execution(
+                "injected mid-stream failure".into(),
+            ))))
+        }
+    }
+
+    /// Spec: connector-recovery-contract — 无界源的异常终止 SHALL 归类为
+    /// Disconnection 而非 EOF。A stream that fails AFTER yielding rows must
+    /// surface `Error::Disconnection` (reconnect) — mapping it to `EOF`
+    /// would broadcast EOS downstream and acknowledge a truncated result
+    /// set as complete.
+    #[tokio::test]
+    async fn mid_stream_failure_is_disconnection_not_eof() -> Result<(), Error> {
+        let (_dir, path) = seeded_sqlite_file();
+        let sql_config = SqlInputConfig {
+            select_sql: "SELECT id, kind FROM flow.main.events".to_string(),
+            ballista: None,
+            input_type: InputType::Sqlite(SqliteConfig {
+                name: None,
+                path: path.clone(),
+            }),
+        };
+        let input = SqlInput::new(None, sql_config)?;
+        input.connect().await?;
+
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "id",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ]));
+        // Overwrite the installed stream with the failing double: read()
+        // consumes whatever stream is installed, so this drives the exact
+        // mapping under test without depending on a DB that can error
+        // mid-scan on demand.
+        {
+            let mut stream_lock = input.stream.lock().await;
+            *stream_lock = Some(Box::pin(MidStreamFailure {
+                schema,
+                emitted: std::sync::atomic::AtomicBool::new(false),
+            }));
+        }
+
+        // First read: the good batch flows.
+        let (batch, _) = input.read().await?;
+        assert_eq!(batch.num_rows(), 0, "the double's first batch is empty");
+
+        // Second read: the injected failure — Disconnection, never EOF.
+        match input.read().await {
+            Err(Error::Disconnection) => {}
+            Err(other) => panic!("mid-stream failure must be Disconnection, got: {other:?}"),
+            Ok(_) => panic!("a failed stream must not yield data"),
+        }
+        input.close().await?;
+        Ok(())
     }
 }

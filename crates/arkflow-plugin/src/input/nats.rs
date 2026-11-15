@@ -192,9 +192,22 @@ impl Input for NatsInput {
                                                 }
                                             },
                                             None => {
-                                                // Subscription ended
-                                                if let Err(e) = sender.send_async(Delivery::Err(Error::EOF)).await {
-                                                    error!("Failed to send EOF to channel: {}", e);
+                                                // A NATS subscription ending under a
+                                                // live source is an abnormal
+                                                // termination (server shutdown,
+                                                // unsubscribe), not a bounded
+                                                // source's exhaustion: classify as
+                                                // Disconnection so the engine
+                                                // reconnects instead of ending the
+                                                // job as if the data had ended.
+                                                if let Err(e) = sender
+                                                    .send_async(Delivery::Err(Error::Disconnection))
+                                                    .await
+                                                {
+                                                    error!(
+                                                        "Failed to send disconnection to channel: {}",
+                                                        e
+                                                    );
                                                 }
                                                 break;
                                             }
@@ -301,7 +314,15 @@ impl Input for NatsInput {
                             _ = cancellation.cancelled() => {
                                 break;
                             }
-                            result = consumer.fetch().messages()  => {
+                            // A bounded `expires` makes the server hold the
+                            // pull request (long-poll) instead of replying
+                            // instantly on an empty subject: the default
+                            // no-wait fetch would busy-spin a full core with
+                            // thousands of pull requests per second.
+                            result = consumer
+                                .fetch()
+                                .expires(std::time::Duration::from_millis(500))
+                                .messages()  => {
                                 match result {
                                 Ok(mut messages) => {
                                     while let Some(message_result) = messages.next().await {
@@ -698,5 +719,48 @@ mod tests {
             NatsInputBuilder.build(None, &bad, None, &create_test_resource()),
             Err(Error::Config(_))
         ));
+    }
+
+    /// Spec: connector-recovery-contract — NATS JetStream 空闲拉取 SHALL
+    /// 有界等待。Structural pin (the established include_str! pattern, cf.
+    /// input/kafka.rs's drain-engine guard): the JetStream loop's fetch
+    /// must carry `expires(...)` — the server-side long-poll that keeps an
+    /// idle subject from being re-fetched thousands of times a second.
+    #[test]
+    fn jetstream_fetch_loop_pins_a_bounded_expires() {
+        let source = include_str!("nats.rs");
+        let marker = "Start background task for JetStream message processing";
+        let jetstream_loop =
+            &source[source.find(marker).expect("JetStream task comment present")..];
+        assert!(
+            jetstream_loop.contains(".expires("),
+            "the JetStream fetch loop must set a bounded expires (long-poll); \
+             a bare no-wait fetch busy-spins a full core on an idle subject"
+        );
+    }
+
+    /// Spec: connector-recovery-contract — 无界源的异常终止 SHALL 归类为
+    /// Disconnection 而非 EOF。Structural pin: the regular-mode
+    /// subscription-end branch must send Disconnection (not EOF) to the
+    /// delivery channel.
+    #[test]
+    fn regular_subscription_end_sends_disconnection_not_eof() {
+        let source = include_str!("nats.rs");
+        let marker = "Subscription ended";
+        let branch_start = source
+            .find(marker)
+            .expect("subscription-end branch present");
+        let branch = &source[branch_start..];
+        assert!(
+            branch.contains("Error::Disconnection"),
+            "an ended NATS subscription must be classified as Disconnection \
+             (EOF would end the whole job as if the data had legitimately ended)"
+        );
+        // The EOF literal must not reappear in that branch.
+        let branch_end = branch.find("break;").expect("loop break present");
+        assert!(
+            !branch[..branch_end].contains("Error::EOF"),
+            "the subscription-end branch must not send EOF"
+        );
     }
 }
