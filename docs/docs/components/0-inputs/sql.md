@@ -75,3 +75,7 @@ input:
     type: "sqlite"
     path: "/path/to/data.db"
 ```
+
+## Read errors
+
+A read failure after rows have flowed is classified by cause: transient retrieval failures (a dropped database connection, transport errors) return `Disconnection` and the engine reconnects, re-running the query from its start; deterministic failures fail the run with `Error::Process` instead of looping. Reaching the end of the result set remains a clean `EOF`.

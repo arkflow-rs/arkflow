@@ -17,6 +17,44 @@
 use arkflow_core::codec::Codec;
 use arkflow_core::{Bytes, Error, MessageBatch, MessageBatchRef};
 use std::sync::Arc;
+use tracing::warn;
+
+/// Classify a record-batch stream failure of a snapshot-style source
+/// (file/sql inputs).
+///
+/// Transient retrieval failures (IO, object store, connector transport)
+/// map to [`Error::Disconnection`] so the engine reconnects. Deterministic
+/// failures (decode/format corruption, schema errors, query execution
+/// errors) map to a terminal [`Error::Process`]: reconnecting would
+/// rebuild the same scan, replay the intact prefix, and hit the same
+/// corruption again — an endless restart loop, not a recovery.
+pub(crate) fn classify_stream_error(error: datafusion::common::DataFusionError) -> Error {
+    use datafusion::common::DataFusionError as Dfe;
+    match error {
+        Dfe::IoError(io) => {
+            warn!("record batch stream IO failure; reconnecting: {io}");
+            Error::Disconnection
+        }
+        Dfe::ObjectStore(store) => {
+            warn!("record batch stream object-store failure; reconnecting: {store}");
+            Error::Disconnection
+        }
+        // Table-provider connectors (sqlite/duckdb/postgres) surface
+        // dropped connections and transport errors through `External`.
+        Dfe::External(source) => {
+            warn!("record batch stream connector failure; reconnecting: {source}");
+            Error::Disconnection
+        }
+        Dfe::Context(context, source) => {
+            warn!("record batch stream failure ({context}); reclassifying cause");
+            classify_stream_error(*source)
+        }
+        other => Error::Process(format!(
+            "record batch stream failed deterministically (reconnect would replay the \
+             same prefix into the same failure): {other}"
+        )),
+    }
+}
 
 /// Apply codec to payload bytes
 ///

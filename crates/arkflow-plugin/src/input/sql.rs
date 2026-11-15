@@ -40,7 +40,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 
 const DEFAULT_NAME: &str = "flow";
 
@@ -193,14 +192,13 @@ impl Input for SqlInput {
                 Err(Error::EOF)
             }
             result = stream_pin.try_next() => {
-                 // A mid-stream failure is a disconnect, not a clean
-                 // end-of-stream: mapping it to `EOF` would broadcast EOS
-                 // downstream and acknowledge a truncated result set as
-                 // complete. `EOF` is reserved for `Ok(None)` below.
-                 let value = result.map_err(|e| {
-                    warn!("sql input stream failed before exhaustion; reconnecting: {}", e);
-                    Error::Disconnection
-                })?;
+                 // A mid-stream failure is not a clean end-of-stream: `EOF`
+                 // here would acknowledge a truncated result set as
+                 // complete. Transient retrieval failures classify as
+                 // Disconnection (reconnect); deterministic failures fail
+                 // the run loudly instead of looping.
+                 let value =
+                    result.map_err(crate::input::codec_helper::classify_stream_error)?;
                 let Some(x) = value else {
                     return Err(Error::EOF);
                 };
@@ -461,12 +459,13 @@ mod tests {
         assert!(err.to_string().contains("Sql input"), "{err}");
     }
 
-    /// A RecordBatchStream double that yields one good batch and then a
-    /// mid-stream error — the shape a failing DB connection or query
+    /// A RecordBatchStream double that yields one good batch and then an
+    /// injected error — the shape a failing DB connection or query
     /// produces after some rows have already flowed.
     struct MidStreamFailure {
         schema: datafusion::arrow::datatypes::SchemaRef,
         emitted: std::sync::atomic::AtomicBool,
+        error: Option<datafusion::common::DataFusionError>,
     }
 
     impl datafusion::physical_plan::RecordBatchStream for MidStreamFailure {
@@ -485,36 +484,40 @@ mod tests {
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Self::Item>> {
-            if !self.emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let schema = self.schema.clone();
+            let this = self.get_mut();
+            if !this.emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let schema = this.schema.clone();
                 let batch = datafusion::arrow::record_batch::RecordBatch::new_empty(schema);
                 return std::task::Poll::Ready(Some(Ok(batch)));
             }
-            std::task::Poll::Ready(Some(Err(datafusion::common::DataFusionError::Execution(
-                "injected mid-stream failure".into(),
-            ))))
+            let error = this
+                .error
+                .take()
+                .expect("failure polled twice; take a fresh double per case");
+            std::task::Poll::Ready(Some(Err(error)))
         }
     }
 
-    /// Spec: connector-recovery-contract — 无界源的异常终止 SHALL 归类为
-    /// Disconnection 而非 EOF。A stream that fails AFTER yielding rows must
-    /// surface `Error::Disconnection` (reconnect) — mapping it to `EOF`
-    /// would broadcast EOS downstream and acknowledge a truncated result
-    /// set as complete.
-    #[tokio::test]
-    async fn mid_stream_failure_is_disconnection_not_eof() -> Result<(), Error> {
-        let (_dir, path) = seeded_sqlite_file();
-        let sql_config = SqlInputConfig {
-            select_sql: "SELECT id, kind FROM flow.main.events".to_string(),
-            ballista: None,
-            input_type: InputType::Sqlite(SqliteConfig {
-                name: None,
-                path: path.clone(),
-            }),
-        };
-        let input = SqlInput::new(None, sql_config)?;
-        input.connect().await?;
+    fn transient_object_store_error() -> datafusion::common::DataFusionError {
+        datafusion::common::DataFusionError::ObjectStore(Box::new(object_store::Error::Generic {
+            store: "test",
+            source: Box::new(std::io::Error::other("injected transient failure")),
+        }))
+    }
 
+    fn deterministic_decode_error() -> datafusion::common::DataFusionError {
+        datafusion::common::DataFusionError::ArrowError(
+            Box::new(datafusion::arrow::error::ArrowError::ExternalError(
+                Box::new(std::io::Error::other("injected decode failure")),
+            )),
+            None,
+        )
+    }
+
+    async fn install_failing_stream(
+        input: &SqlInput,
+        error: datafusion::common::DataFusionError,
+    ) -> Result<(), Error> {
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
             datafusion::arrow::datatypes::Field::new(
                 "id",
@@ -531,17 +534,79 @@ mod tests {
             *stream_lock = Some(Box::pin(MidStreamFailure {
                 schema,
                 emitted: std::sync::atomic::AtomicBool::new(false),
+                error: Some(error),
             }));
         }
+        Ok(())
+    }
+
+    /// Spec: connector-recovery-contract — 无界源的异常终止 SHALL 归类为
+    /// Disconnection 而非 EOF。A transient retrieval failure (object store,
+    /// IO, connector transport) after rows have flowed must surface
+    /// `Error::Disconnection` (reconnect) — mapping it to `EOF` would
+    /// broadcast EOS downstream and acknowledge a truncated result set as
+    /// complete.
+    #[tokio::test]
+    async fn transient_mid_stream_failure_is_disconnection_not_eof() -> Result<(), Error> {
+        let (_dir, path) = seeded_sqlite_file();
+        let sql_config = SqlInputConfig {
+            select_sql: "SELECT id, kind FROM flow.main.events".to_string(),
+            ballista: None,
+            input_type: InputType::Sqlite(SqliteConfig {
+                name: None,
+                path: path.clone(),
+            }),
+        };
+        let input = SqlInput::new(None, sql_config)?;
+        input.connect().await?;
+        install_failing_stream(&input, transient_object_store_error()).await?;
 
         // First read: the good batch flows.
         let (batch, _) = input.read().await?;
         assert_eq!(batch.num_rows(), 0, "the double's first batch is empty");
 
-        // Second read: the injected failure — Disconnection, never EOF.
+        // Second read: the injected transient failure — Disconnection.
         match input.read().await {
             Err(Error::Disconnection) => {}
-            Err(other) => panic!("mid-stream failure must be Disconnection, got: {other:?}"),
+            Err(other) => panic!("transient failure must be Disconnection, got: {other:?}"),
+            Ok(_) => panic!("a failed stream must not yield data"),
+        }
+        input.close().await?;
+        Ok(())
+    }
+
+    /// Spec: connector-recovery-contract — 确定性失败 SHALL 走致命路径。
+    /// A decode/format failure after rows have flowed must NOT be
+    /// classified as Disconnection: reconnecting would replay the same
+    /// prefix into the same corruption forever. It fails the run loudly
+    /// (`Error::Process`) so an operator notices.
+    #[tokio::test]
+    async fn deterministic_mid_stream_failure_is_terminal_not_reconnect() -> Result<(), Error> {
+        let (_dir, path) = seeded_sqlite_file();
+        let sql_config = SqlInputConfig {
+            select_sql: "SELECT id, kind FROM flow.main.events".to_string(),
+            ballista: None,
+            input_type: InputType::Sqlite(SqliteConfig {
+                name: None,
+                path: path.clone(),
+            }),
+        };
+        let input = SqlInput::new(None, sql_config)?;
+        input.connect().await?;
+        install_failing_stream(&input, deterministic_decode_error()).await?;
+
+        let (_, _) = input.read().await?;
+        match input.read().await {
+            Err(Error::Process(message)) => {
+                assert!(
+                    message.contains("deterministically"),
+                    "the terminal error must explain why it is not a reconnect: {message}"
+                );
+            }
+            Err(Error::Disconnection) => {
+                panic!("a decode failure must not trigger endless reconnects")
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
             Ok(_) => panic!("a failed stream must not yield data"),
         }
         input.close().await?;

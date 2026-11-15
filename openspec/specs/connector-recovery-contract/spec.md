@@ -54,21 +54,26 @@ input 连接器在已连接状态下发生的瞬时失败（连接中断、IO �
 
 ### Requirement: 无界源的异常终止 SHALL 归类为 Disconnection 而非 EOF
 
-订阅型(无界)输入连接器在底层流意外终止(订阅被关闭、流返回错误)时 SHALL 返回 `Error::Disconnection` 以触发内核重连;`Error::EOF` MUST 仅用于有界源的合法耗尽。把流错误映射为 `Error::EOF` 的连接器 MUST 将其改为 `Error::Disconnection` 或结构化错误。
+订阅型(无界)输入连接器在底层流意外终止(订阅被关闭、流返回错误)时 SHALL 返回 `Error::Disconnection` 以触发内核重连;`Error::EOF` MUST 仅用于有界源的合法耗尽。把流错误映射为 `Error::EOF` 的连接器 MUST 将其改为 `Error::Disconnection` 或结构化错误。快照型流源(file/sql)的**暂态检索失败**(IO、对象存储故障、连接器传输中断)SHALL 归类为 `Error::Disconnection`;**确定性失败**(格式/解码损坏、schema 错误)SHALL 保持 `Error::Process` 致命上报——对确定性损坏重连只会重放同一前缀后再次撞上同一损坏,形成无限重启循环。
 
 #### Scenario: NATS 常规订阅被服务端关闭
 - **WHEN** NATS 常规(非 JetStream)订阅的 message 流以 `None` 结束且源声明为无界
 - **THEN** `read()` 返回 `Error::Disconnection`
 - **THEN** 内核进入重连循环而不是向下游广播 EOS
 
-#### Scenario: file 输入读取中途出错
-- **WHEN** file 输入的 record-batch 流在耗尽之前返回错误(对象存储故障、格式损坏)
+#### Scenario: file 输入遭遇暂态检索失败
+- **WHEN** file 输入的 record-batch 流在耗尽之前因暂态故障失败(对象存储中断、IO 错误)
 - **THEN** `read()` 返回 `Error::Disconnection`
 - **THEN** 该错误不携带 `Error::EOF` 语义,已读前缀不作为完整数据集被确认
 
-#### Scenario: sql 输入读取中途出错
-- **WHEN** sql 输入的查询流在耗尽之前返回错误(连接断开、查询失败)
+#### Scenario: sql 输入遭遇暂态检索失败
+- **WHEN** sql 输入的查询流在耗尽之前因暂态故障失败(连接断开、传输中断)
 - **THEN** `read()` 返回 `Error::Disconnection`
+
+#### Scenario: 确定性损坏走致命路径
+- **WHEN** file/sql 输入的流因格式或解码损坏(Arrow/Parquet/schema 错误)失败
+- **THEN** `read()` 返回 `Error::Process`(致命,不触发重连)
+- **THEN** 已读前缀不作为完整数据集被确认;重连循环不会重放同一损坏
 
 #### Scenario: 有界源正常耗尽
 - **WHEN** 有界源(file/sql/generate)的流返回 `None`

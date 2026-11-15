@@ -71,3 +71,7 @@ input:
 使用 `tls://` URL scheme 以 TLS 连接(例如 `tls://nats.example.com:4422`);
 async-nats 对 `tls://` URL 原生协商 TLS,并要求服务端支持 TLS。
 
+
+## 读取错误
+
+常规订阅被关闭返回 `Disconnection`,引擎会重连——不会像数据已读完那样结束整个作业。JetStream 拉取使用有界 `expires` 长轮询,空闲主题不会被高频空转轮询。

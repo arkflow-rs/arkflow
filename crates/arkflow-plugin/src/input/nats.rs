@@ -729,9 +729,16 @@ mod tests {
     #[test]
     fn jetstream_fetch_loop_pins_a_bounded_expires() {
         let source = include_str!("nats.rs");
+        // PRODUCTION code only: the test module's own literals must not be
+        // able to satisfy these assertions.
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code precedes the test module");
         let marker = "Start background task for JetStream message processing";
-        let jetstream_loop =
-            &source[source.find(marker).expect("JetStream task comment present")..];
+        let jetstream_loop = &production[production
+            .find(marker)
+            .expect("JetStream task comment present")..];
         assert!(
             jetstream_loop.contains(".expires("),
             "the JetStream fetch loop must set a bounded expires (long-poll); \
@@ -742,24 +749,29 @@ mod tests {
     /// Spec: connector-recovery-contract — 无界源的异常终止 SHALL 归类为
     /// Disconnection 而非 EOF。Structural pin: the regular-mode
     /// subscription-end branch must send Disconnection (not EOF) to the
-    /// delivery channel.
+    /// delivery channel. Production code only, bounded to the branch.
     #[test]
     fn regular_subscription_end_sends_disconnection_not_eof() {
         let source = include_str!("nats.rs");
-        let marker = "Subscription ended";
-        let branch_start = source
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code precedes the test module");
+        let marker = "live source is an abnormal";
+        let branch_start = production
             .find(marker)
-            .expect("subscription-end branch present");
-        let branch = &source[branch_start..];
+            .expect("subscription-end branch comment present");
+        let branch = &production[branch_start..];
+        // Bound to the branch: everything up to its loop break.
+        let branch_end = branch.find("break;").expect("loop break present");
+        let branch = &branch[..branch_end];
         assert!(
             branch.contains("Error::Disconnection"),
             "an ended NATS subscription must be classified as Disconnection \
              (EOF would end the whole job as if the data had legitimately ended)"
         );
-        // The EOF literal must not reappear in that branch.
-        let branch_end = branch.find("break;").expect("loop break present");
         assert!(
-            !branch[..branch_end].contains("Error::EOF"),
+            !branch.contains("Error::EOF"),
             "the subscription-end branch must not send EOF"
         );
     }

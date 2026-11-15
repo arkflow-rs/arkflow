@@ -147,3 +147,7 @@ input:
       container_name: "my-container"
       access_key: "${AZURE_STORAGE_ACCESS_KEY}"
 ```
+
+## 读取错误
+
+已读出行之后的读取失败按原因分类:暂态检索失败(IO 错误、对象存储中断)返回 `Disconnection`,引擎重连并从头重读快照;确定性失败(文件损坏、schema 错误)以 `Error::Process` 终止运行,不会循环重连。读到数据末尾仍是干净的 `EOF`。

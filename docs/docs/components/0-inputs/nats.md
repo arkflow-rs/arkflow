@@ -72,3 +72,7 @@ Use a `tls://` URL scheme to connect over TLS (for example
 `tls://nats.example.com:4422`); async-nats negotiates TLS natively for
 `tls://` URLs and requires the server to support TLS.
 
+
+## Read errors
+
+An ended regular subscription returns `Disconnection` so the engine reconnects — it does not end the job as if the data had ended. JetStream fetches long-poll with a bounded `expires` wait, so an idle subject is not re-fetched in a tight loop.

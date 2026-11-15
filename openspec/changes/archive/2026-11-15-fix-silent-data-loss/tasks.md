@@ -28,4 +28,5 @@
 
 - [x] 5.1 cargo test -p arkflow-plugin(全量 lib,881 通过)通过
 - [x] 5.2 cargo clippy -p arkflow-plugin --all-targets 零警告;cargo fmt 通过
-- [x] 5.3 文档:mqtt/nats 输出页(EN + zh-Hans)补按行目的地对齐错误行为;file/sql/nats-input 页未描述错误终止语义,无需改动
+- [x] 5.3 文档:mqtt/nats 输出页(EN + zh-Hans)补按行目的地对齐错误行为
+- [x] 5.4 文档:file/sql/nats-input 页(EN + zh-Hans)补充 mid-stream 错误触发 Disconnection 与重连的语义;确定性损坏走致命路径不重连
