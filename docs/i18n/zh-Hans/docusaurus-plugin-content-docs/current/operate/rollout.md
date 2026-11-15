@@ -35,17 +35,29 @@ description: 通过控制平面 Hub 将流处理作业灰度发布到机群。
 
 ## 2. 启动 Hub 并注册 Agent
 
-Hub 是独立的 `arkflow-server` 二进制,通过环境变量配置——`ARKFLOW_NODE_TOKEN`
+Hub 是独立的 `arkflow-server` 二进制,通过环境变量配置——安全启动守卫要求必须配置持久化存储
+(`ARKFLOW_HUB_STORAGE`)以及 operator 与 node 两套凭据(`ARKFLOW_OPERATOR_TOKEN`、
+`ARKFLOW_NODE_TOKEN`)才会绑定监听;`ARKFLOW_NODE_TOKEN`
 必须与 Agent 的共享 `node_token` 一致(参见[部署](./control-plane/deploy.md))。
 `examples/control_plane_node.yaml` 展示了 Agent 侧的部署配置:
 
 ```bash
-# 终端 1 —— Hub
+# 终端 1 —— Hub(安全启动:持久化存储 + operator/node 凭据)
+ARKFLOW_HUB_STORAGE=sqlite:/tmp/arkflow-hub.sqlite \
+ARKFLOW_OPERATOR_TOKEN=replace-with-operator-token \
 ARKFLOW_NODE_TOKEN=replace-with-node-token ./target/release/arkflow-server
 
 # 终端 2+ —— 每个计算节点一个 Agent
 ./target/release/arkflow --config examples/control_plane_node.yaml
 ```
+
+:::tip
+
+纯本地开发可以用 `ARKFLOW_HUB_INSECURE_LOCAL=1`(Hub 绑定环回地址)放宽守卫,
+允许易失状态与省略凭据——参见
+[独立 Hub 的启动安全](/zh-Hans/docs/reference/configuration#独立-hub-的启动安全)。
+
+:::
 
 预期结果:每个 Agent 都会作为持有租约的节点出现在 Hub 的机群 API(`/api/v1`)中。
 失联的节点仍会出现在机群中,但在租约刷新之前不再接收新的分配。

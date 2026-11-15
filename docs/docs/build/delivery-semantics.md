@@ -29,7 +29,7 @@ is persisted locally first.
 | **NATS (JetStream)** | Yes | `message.ack()` on ack only |
 | **Pulsar** | Yes | `consumer.ack()` on ack only |
 | **Redis (List / Pub/Sub)** | **No** (Lists are consumed destructively; Pub/Sub is fire-and-forget; Streams consumer groups are not implemented) | none |
-| **SQL** | Partial (incremental query) | via incremental cursor |
+| **SQL** | **No** (one-shot `SELECT` — the configured query is executed once and its rows are emitted as batches) | none |
 | **HTTP (server)** | **No** (webhook) | none — fire-and-forget |
 | **HTTP (client poll)** | **No** | none |
 | **File** | **No** (read-once stream) | none |
@@ -126,7 +126,9 @@ than silently continuing with potentially lost data (fail-fast).
 
 In practice:
 
-- redb 2.6.3 verifies the entire B-tree at `Database::open` time, so most WAL
+- the embedded redb store fails on open when the database file is unreadable
+  or was written by an unsupported older format (redb-2 files are rejected
+  since the redb 4 upgrade), so most WAL
   corruptions surface as `StreamConfig::build` returning `Err` — the stream
   never reaches the running state.
 - If the WAL opens cleanly but replaying a pending entry cannot be forwarded

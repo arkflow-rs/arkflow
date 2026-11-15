@@ -16,6 +16,7 @@ Pulsar 输出(Output)将消息(Message)发布到 Apache Pulsar 主题(Topic)。�
 | topic | object | yes | — | 目标主题(表达式;见下文)。 |
 | auth | object | no | — | 认证配置(见下文)。 |
 | value_field | string | no | — | 用作消息载荷的记录字段(二进制或字符串列;设置后优先于 `codec` 生效)。 |
+| tls | object | no | — | TLS 配置(见下文)。 |
 
 ### topic
 
@@ -48,6 +49,14 @@ Pulsar 输出(Output)将消息(Message)发布到 Apache Pulsar 主题(Topic)。�
 | issuer_url | string | yes | OAuth2 签发方(issuer)URL。 |
 | credentials_url | string | yes | 客户端凭证文件的 URL。 |
 | audience | string | yes | OAuth2 受众(audience)。 |
+
+### tls
+
+| Field | Type | Required | Default | 描述 |
+|-------|------|----------|---------|-------------|
+| certificate_chain_file | string | no | — | 客户端证书链路径(PEM),用于 mTLS。 |
+| hostname_verification | boolean | no | `true` | 是否校验 broker 证书主机名。 |
+| ca_file | string | no | — | 为 schema 兼容而接受,但当前**不会生效**——底层驱动没有自定义根证书 API,无论是否设置都使用系统信任库。不要把它当作私有信任锚。 |
 
 ## 示例
 

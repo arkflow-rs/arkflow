@@ -18,7 +18,7 @@ ArkFlow 的 SQL 处理器由 Apache DataFusion 驱动。你可以在流水线中
 | [聚合函数(Aggregate Functions)](/zh-Hans/docs/sql/aggregate_functions) | count、sum、avg 等聚合函数。 |
 | [窗口函数(Window Functions)](./sql/6-window_functions.md) | OVER 子句、排名与分析函数。 |
 | [标量函数(Scalar Functions)](/zh-Hans/docs/sql/scalar_functions) | 完整的内置函数目录。 |
-| [特殊函数(Special Functions)](/zh-Hans/docs/sql/special_functions) | 编码、时间与实用函数。 |
+| [特殊函数(Special Functions)](/zh-Hans/docs/sql/special_functions) | `unnest` 等展开函数。 |
 | [UDF](/zh-Hans/docs/sql/udf) | 注册和调用用户自定义函数。 |
 
-`FROM batch` 子句指代流经流水线的当前 Arrow 批次——配置与语义参见 [SQL 处理器](/zh-Hans/docs/components/processors/sql),端到端用法参见[实战配方](/zh-Hans/docs/build/recipes/kafka-to-sql)。
+`FROM flow` 子句指代流经流水线的当前 Arrow 批次(默认表名;可用 SQL 处理器的 `table_name` 配置覆盖)——配置与语义参见 [SQL 处理器](/zh-Hans/docs/components/processors/sql),端到端用法参见[实战配方](/zh-Hans/docs/build/recipes/kafka-to-sql)。

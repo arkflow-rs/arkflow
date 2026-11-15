@@ -63,8 +63,10 @@ VRL values map to and from the following Arrow types:
 
 - **String** (Utf8)
 - **Integer**: Int8, Int16, Int32, Int64
+- **Unsigned Integer**: UInt8, UInt16, UInt32, UInt64 (mapped to VRL integers)
 - **Float**: Float32, Float64
 - **Boolean**
 - **Binary**
 - **Timestamp**
+- **Date**: Date32 / Date64 (mapped to a VRL **integer** epoch value — days for Date32, milliseconds for Date64 — not to a VRL timestamp)
 - **Null**

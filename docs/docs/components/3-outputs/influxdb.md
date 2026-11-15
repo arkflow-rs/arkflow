@@ -1,11 +1,11 @@
 ---
 components: [influxdb]
-description: ArkFlow documentation page.
+description: Writes time-series rows to InfluxDB 2.x via Line Protocol, one request per incoming batch.
 ---
 
 # InfluxDB
 
-The InfluxDB output writes time-series data to InfluxDB 2.x using the Line Protocol. It maps columns to tags and fields, buffers writes in configurable batches, and retries failures with exponential backoff.
+The InfluxDB output writes time-series data to InfluxDB 2.x using the Line Protocol. It maps columns to tags and fields, writes each incoming batch to InfluxDB as a single Line Protocol request, and retries failures with exponential backoff.
 
 ## Configuration
 
@@ -20,8 +20,8 @@ The InfluxDB output writes time-series data to InfluxDB 2.x using the Line Proto
 | tags | `array<object>` | no | — | Tag mappings (indexed fields). |
 | fields | `array<object>` | yes | — | Field mappings (value fields). |
 | timestamp_field | string | no | — | Source column for the point timestamp (nanoseconds). Defaults to current time. |
-| batch_size | integer | no | `1000` | Number of lines to buffer before flushing. |
-| flush_interval | integer | no | — | Flush interval in seconds. |
+| batch_size | integer | no | — | Accepted for compatibility but **currently inert**: every incoming batch is flushed synchronously as one request and batches are never split. The only validated value rule is that `0` is rejected. |
+| flush_interval | integer | no | — | **Currently unused** — defined in the schema but never read by the implementation. |
 | retry_count | integer | no | `3` | Number of retry attempts on failure. |
 | timeout_ms | integer | no | `5000` | HTTP request timeout in milliseconds. |
 
@@ -86,7 +86,7 @@ output:
   timestamp_field: "timestamp"
 ```
 
-### With Batching and Retry
+### With Retry
 
 ```yaml validate=fragment wrap=output
 output:
@@ -107,8 +107,6 @@ output:
       field_name: "battery_level"
       field_type: "integer"
   timestamp_field: "event_time"
-  batch_size: 5000
-  flush_interval: 10
   retry_count: 5
   timeout_ms: 10000
 ```

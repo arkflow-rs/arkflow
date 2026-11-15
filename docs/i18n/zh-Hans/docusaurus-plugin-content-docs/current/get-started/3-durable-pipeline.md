@@ -1,5 +1,5 @@
 ---
-sidebar_position: 1
+sidebar_position: 3
 description: 体验 WAL 支撑的持久化接入——在崩溃中不丢失任何消息。
 ---
 
@@ -61,9 +61,9 @@ streams:
 ./target/release/arkflow --config durable.yaml
 ```
 
-你会在 stdout 上看到源源不断的 JSON 消息,并出现一个 `./data/wal` 目录。这个示例文件随仓库以
+你会在 stdout 上看到源源不断的 JSON 消息,并出现一个 `./data/wal` 目录。该配置的一个变体随仓库以
 [`examples/durability_example.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/durability_example.yaml)
-发布,并由 CI 校验。
+发布(`count` 较小,为 `10`,便于 CI),并由 CI 校验。
 
 ## 3. 狠狠地杀掉它
 

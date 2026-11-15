@@ -1,5 +1,5 @@
 ---
-sidebar_position: 1
+sidebar_position: 3
 description: Walk through WAL-backed durable ingestion — survive a crash without losing messages.
 ---
 
@@ -73,9 +73,9 @@ immediately).
 ```
 
 You should see a steady stream of JSON messages on stdout, and a `./data/wal`
-directory appear. This example file ships as
+directory appear. A variant of this configuration ships as
 [`examples/durability_example.yaml`](https://github.com/arkflow-rs/arkflow/blob/main/examples/durability_example.yaml)
-and is validated by CI.
+(with a smaller `count: 10` for CI) and is validated by CI.
 
 ## 3. Kill it hard
 

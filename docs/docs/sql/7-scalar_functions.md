@@ -4519,8 +4519,11 @@ get_field(expression1, expression2)
 - [json_get_float](#json_get_float)
 - [json_get_bool](#json_get_bool)
 - [json_get_json](#json_get_json)
+- [json_get_array](#json_get_array)
+- [json_object_keys](#json_object_keys)
 - [json_as_text](#json_as_text)
 - [json_length](#json_length)
+- [json_union_to_text](#json_union_to_text)
 
 ### `json_contains`
 
@@ -4838,3 +4841,75 @@ Will be rewritten to:
 select * from foo where json_get_str(attributes, 'bar')='ham'
 ```
 :::
+
+### `json_get_array`
+
+Get a value from a JSON string as an Arrow list, navigating by path keys.
+
+```sql
+json_get_array(json, key)
+```
+
+#### Arguments
+
+- **json**: JSON string to operate on. Can be a constant, column, or function.
+- **key**: One or more keys / array indexes forming the navigation path.
+
+#### Example
+
+```sql
+> select json_get_array('[{"id": 1}, {"id": 2}]', '0');
++----------------------------------------------+
+| json_get_array(Utf8("[{"id": 1}, {"id": 2}]"),"0") |
++----------------------------------------------+
+| [1]                                          |
++----------------------------------------------+
+```
+
+### `json_object_keys`
+
+Get the keys of a JSON object as a list. Alias: `json_keys`.
+
+```sql
+json_object_keys(json)
+```
+
+#### Arguments
+
+- **json**: JSON string to operate on. Can be a constant, column, or function.
+
+#### Example
+
+```sql
+> select json_object_keys('{"a": 1, "b": 2}');
++--------------------------------------------+
+| json_object_keys(Utf8("{"a": 1, "b": 2}")) |
++--------------------------------------------+
+| [a, b]                                     |
++--------------------------------------------+
+```
+
+### `json_union_to_text`
+
+Render a JSON-union typed value back to its JSON text form. Accepts exactly
+one argument whose type is the JSON union (the type produced by this crate's
+JSON functions); any other argument type is a planning error.
+
+```sql
+json_union_to_text(value)
+```
+
+#### Arguments
+
+- **value**: A JSON-union typed expression.
+
+#### Example
+
+```sql
+> select json_union_to_text(json_get('{"a": {"b": 1}}', 'a'));
++---------------------------------------------------+
+| json_union_to_text(json_get(Utf8("{"a": {"b": 1}}"),"a")) |
++---------------------------------------------------+
+| {"b":1}                                           |
++---------------------------------------------------+
+```

@@ -15,7 +15,7 @@ sidebar_label: Generate
 | context | string | yes | — | 每条消息的载荷文本 |
 | interval | duration | yes | — | 两次读取之间的间隔,如 `1ms`、`1s`、`1m`(首次读取立即执行) |
 | count | integer | no | — | 消息总数;达到后返回 EOF。未设置表示无限制 |
-| batch_size | integer | no | `1` | 每次读取返回的消息数 |
+| batch_size | integer | no | `1` | 每次读取返回的消息数;必须在 `1..=1000000` 范围内(超出会在构建期失败) |
 
 ## 示例
 

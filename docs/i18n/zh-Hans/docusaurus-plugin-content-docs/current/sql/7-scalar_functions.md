@@ -4516,8 +4516,11 @@ get_field(expression1, expression2)
 - [json_get_float](#json_get_float)
 - [json_get_bool](#json_get_bool)
 - [json_get_json](#json_get_json)
+- [json_get_array](#json_get_array)
+- [json_object_keys](#json_object_keys)
 - [json_as_text](#json_as_text)
 - [json_length](#json_length)
+- [json_union_to_text](#json_union_to_text)
 
 ### `json_contains`
 
@@ -4835,3 +4838,73 @@ select * from foo where json_get(attributes, 'bar')::string='ham'
 select * from foo where json_get_str(attributes, 'bar')='ham'
 ```
 :::
+
+### `json_get_array`
+
+按键路径从 JSON 字符串中取值,返回 Arrow 列表(List)。
+
+```sql
+json_get_array(json, key)
+```
+
+#### 参数
+
+- **json**: 要操作的 JSON 字符串。可以是常量、列或函数。
+- **key**: 一个或多个键 / 数组下标,构成导航路径。
+
+#### 示例
+
+```sql
+> select json_get_array('[{"id": 1}, {"id": 2}]', '0');
++----------------------------------------------+
+| json_get_array(Utf8("[{"id": 1}, {"id": 2}]"),"0") |
++----------------------------------------------+
+| [1]                                          |
++----------------------------------------------+
+```
+
+### `json_object_keys`
+
+以列表形式返回 JSON 对象的键。别名:`json_keys`。
+
+```sql
+json_object_keys(json)
+```
+
+#### 参数
+
+- **json**: 要操作的 JSON 字符串。可以是常量、列或函数。
+
+#### 示例
+
+```sql
+> select json_object_keys('{"a": 1, "b": 2}');
++--------------------------------------------+
+| json_object_keys(Utf8("{"a": 1, "b": 2}")) |
++--------------------------------------------+
+| [a, b]                                     |
++--------------------------------------------+
+```
+
+### `json_union_to_text`
+
+把 JSON union 类型的值还原为 JSON 文本形式。只接受一个 JSON union 类型参数(本 crate 的 JSON 函数产出的类型);其他参数类型会在计划期报错。
+
+```sql
+json_union_to_text(value)
+```
+
+#### 参数
+
+- **value**: JSON union 类型的表达式。
+
+#### 示例
+
+```sql
+> select json_union_to_text(json_get('{"a": {"b": 1}}', 'a'));
++---------------------------------------------------+
+| json_union_to_text(json_get(Utf8("{"a": {"b": 1}}"),"a")) |
++---------------------------------------------------+
+| {"b":1}                                           |
++---------------------------------------------------+
+```

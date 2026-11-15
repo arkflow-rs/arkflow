@@ -21,7 +21,7 @@ ArkFlow 在崩溃后如何处理消息,取决于输入能否**重新投递**尚�
 | **NATS (JetStream)** | 是 | 仅在 ack 时 `message.ack()` |
 | **Pulsar** | 是 | 仅在 ack 时 `consumer.ack()` |
 | **Redis (List / Pub/Sub)** | **否**(List 为破坏性消费;Pub/Sub 即发即忘;未实现 Streams 消费者组) | 无 |
-| **SQL** | 部分(增量查询) | 通过增量游标 |
+| **SQL** | **否**(一次性 `SELECT`——配置的查询只执行一次,其行以批次形式发出) | 无 |
 | **HTTP(服务端)** | **否**(webhook) | 无——即发即忘 |
 | **HTTP(客户端轮询)** | **否** | 无 |
 | **File** | **否**(一次性读取流) | 无 |
@@ -65,7 +65,7 @@ ArkFlow 提供**至少一次**投递。崩溃恢复后,在途消息可能被投�
 
 实践中:
 
-- redb 2.6.3 会在 `Database::open` 时验证整棵 B-tree,因此大多数 WAL 损坏表现为 `StreamConfig::build` 返回 `Err`——流根本不会进入运行状态。
+- 内嵌 redb 存储在打开时即失败:数据库文件不可读,或来自不受支持的旧格式(redb 4 升级后拒绝 redb-2 格式文件),都会让大多数 WAL 损坏表现为 `StreamConfig::build` 返回 `Err`——流根本不会进入运行状态。
 - 如果 WAL 正常打开,但挂起条目无法转发(例如配置的缓冲拒绝写入),`Stream::run` 会返回 `Err` 且不读取新输入。
 
 运维应监控流启动失败。恢复需要人工介入:要么删除配置的 `durability.path` 处的 WAL 文件(接受挂起条目丢失),要么从备份恢复。可以依赖 k8s/systemd 重启策略持续重试,但持续的 WAL 损坏不会自愈。

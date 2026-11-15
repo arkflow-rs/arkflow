@@ -22,7 +22,7 @@ drift from the binary.
   <div class="col col--4 margin-bottom--md">
     <a class="card padding--md" href="/docs/components/buffers/tumbling_window">
       <div class="card__header"><h3>Buffers</h3><span class="af-badge af-badge--feature">buffer</span></div>
-      <div class="card__body">Tumbling, sliding, and session windows — event-time aware and columnar.</div>
+      <div class="card__body">Tumbling and session windows — event-time aware and columnar (sliding windows are available on the Job DAG `window` operator).</div>
     </a>
   </div>
   <div class="col col--4 margin-bottom--md">

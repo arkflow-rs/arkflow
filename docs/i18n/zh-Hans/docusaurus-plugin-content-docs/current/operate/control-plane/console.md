@@ -62,7 +62,7 @@ description: ArkFlow Web 控制台导览——机群概览、作业 DAG 编辑�
 ## 导航与 URL
 
 每个视图都有独立的 URL 路径(`/`、`/runtime`、`/jobs`、`/configuration`、
-`/rollouts`、`/components`、`/events`、`/audit`、`/users`、`/settings`),因此视图可以
+`/rollouts`、`/approvals`、`/components`、`/events`、`/audit`、`/users`、`/settings`),因此视图可以
 收藏、分享,并支持浏览器的前进/后退按钮。当前选中的计算节点以 `node_id`
 查询参数的形式保存在当前路径上,切换视图时会自动保留。使用旧版 `?page=`
 查询参数的历史链接(例如 `/?page=jobs`)会自动重定向到对应路径,并保留其余

@@ -1,11 +1,11 @@
 ---
 components: [influxdb]
-description: ArkFlow 文档页面。
+description: 通过行协议把时间序列行写入 InfluxDB 2.x,每个输入批次一次请求。
 ---
 
 # InfluxDB
 
-InfluxDB 输出(Output)使用行协议(Line Protocol)将时间序列数据写入 InfluxDB 2.x。它将列映射为 tag 与 field,以可配置的批次(Batch)缓冲写入,并在失败时按指数退避重试。
+InfluxDB 输出(Output)使用行协议(Line Protocol)将时间序列数据写入 InfluxDB 2.x。它将列映射为 tag 与 field,把每个输入批次作为一次行协议请求写入 InfluxDB,并在失败时按指数退避重试。
 
 ## 配置
 
@@ -20,8 +20,8 @@ InfluxDB 输出(Output)使用行协议(Line Protocol)将时间序列数据写入
 | tags | `array<object>` | no | — | 标签(tag)映射(带索引的字段)。 |
 | fields | `array<object>` | yes | — | 字段(field)映射(值字段)。 |
 | timestamp_field | string | no | — | 数据点时间戳(纳秒)的源列。默认为当前时间。 |
-| batch_size | integer | no | `1000` | 刷新前缓冲的行数。 |
-| flush_interval | integer | no | — | 刷新间隔(秒)。 |
+| batch_size | integer | no | — | 为兼容性接受,但当前**无效**:每个输入批次都会同步刷新为一次请求,批次从不拆分。唯一被校验的规则是拒绝 `0`。 |
+| flush_interval | integer | no | — | **当前未被使用**——schema 中有定义,但实现从不读取。 |
 | retry_count | integer | no | `3` | 失败时的重试次数。 |
 | timeout_ms | integer | no | `5000` | HTTP 请求超时时间(毫秒)。 |
 
@@ -86,7 +86,7 @@ output:
   timestamp_field: "timestamp"
 ```
 
-### 使用批量与重试
+### 使用重试
 
 ```yaml validate=fragment wrap=output
 output:
@@ -107,8 +107,6 @@ output:
       field_name: "battery_level"
       field_type: "integer"
   timestamp_field: "event_time"
-  batch_size: 5000
-  flush_interval: 10
   retry_count: 5
   timeout_ms: 10000
 ```

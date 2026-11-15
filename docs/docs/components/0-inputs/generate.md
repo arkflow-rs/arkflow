@@ -15,7 +15,7 @@ The Generate input produces synthetic text messages at a fixed interval, primari
 | context | string | yes | — | Payload text for each message |
 | interval | duration | yes | — | Interval between reads, e.g. `1ms`, `1s`, `1m` (the first read is immediate) |
 | count | integer | no | — | Total number of messages; returns EOF once reached. Unset means unlimited |
-| batch_size | integer | no | `1` | Number of messages returned per read |
+| batch_size | integer | no | `1` | Number of messages returned per read; must be in `1..=1000000` (build fails outside that range) |
 
 ## Examples
 

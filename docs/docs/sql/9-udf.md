@@ -1,5 +1,5 @@
 ---
-description: ArkFlow documentation page.
+description: Register and call user-defined scalar, aggregate, and window functions in SQL.
 ---
 
 # User Defined Functions (UDFs)
@@ -14,33 +14,33 @@ This project supports three types of UDFs:
 
 ## Registering UDFs
 
-To use a custom UDF, you first need to register it with the system. Registration is done by calling the `register` function in the corresponding module:
+To use a custom UDF, you first need to register it with the system. Registration is done by calling the `register` function in the corresponding module of the `arkflow_plugin::udf` crate (note: not `processor::udf`):
 
--   **Scalar UDF**: Use `arkflow_plugin::processor::udf::scalar_udf::register(udf: ScalarUDF)`
--   **Aggregate UDF**: Use `arkflow_plugin::processor::udf::aggregate_udf::register(udf: AggregateUDF)`
--   **Window UDF**: Use `arkflow_plugin::processor::udf::window_udf::register(udf: WindowUDF)`
+-   **Scalar UDF**: Use `arkflow_plugin::udf::scalar_udf::register(udf: ScalarUDF) -> Result<(), Error>`
+-   **Aggregate UDF**: Use `arkflow_plugin::udf::aggregate_udf::register(udf: AggregateUDF) -> Result<(), Error>`
+-   **Window UDF**: Use `arkflow_plugin::udf::window_udf::register(udf: WindowUDF) -> Result<(), Error>`
 
-These `register` functions add your UDF to a global list.
+These `register` functions add your UDF to a global list and return `Err` if a UDF with the same name is already registered — handle the `Result` rather than ignoring it.
 
 ```rust
 use datafusion::logical_expr::{ScalarUDF, AggregateUDF, WindowUDF};
-use arkflow_plugin::processor::udf::{scalar_udf, aggregate_udf, window_udf};
+use arkflow_plugin::udf::{scalar_udf, aggregate_udf, window_udf};
 
 // Example: Registering a scalar UDF
 // let my_scalar_udf = ScalarUDF::new(...);
-// scalar_udf::register(my_scalar_udf);
+// scalar_udf::register(my_scalar_udf)?;
 
 // Example: Registering an aggregate UDF
 // let my_aggregate_udf = AggregateUDF::new(...);
-// aggregate_udf::register(my_aggregate_udf);
+// aggregate_udf::register(my_aggregate_udf)?;
 
 // Example: Registering a window UDF
 // let my_window_udf = WindowUDF::new(...);
-// window_udf::register(my_window_udf);
+// window_udf::register(my_window_udf)?;
 ```
 
 ## Initialization
 
-Registered UDFs are not immediately available in SQL queries. They are automatically added to DataFusion's `FunctionRegistry` during the processor's execution context initialization via an internal call to the `arkflow_plugin::processor::udf::init` function. This `init` function iterates through all registered scalar, aggregate, and window UDFs and registers them with the current DataFusion context.
+Registered UDFs are not immediately available in SQL queries. They are automatically added to DataFusion's `FunctionRegistry` during the processor's execution context initialization via an internal call to the `arkflow_plugin::udf::init` function. This `init` function iterates through all registered scalar, aggregate, and window UDFs and registers them with the current DataFusion context.
 
 Once initialization is complete, you can use your registered UDFs in SQL queries just like built-in functions.

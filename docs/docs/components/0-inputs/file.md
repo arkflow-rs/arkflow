@@ -11,13 +11,12 @@ The File input reads JSON / CSV / Parquet / Avro / Arrow files via DataFusion. I
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| type | string | yes | — | File format: `json` / `csv` / `parquet` / `avro` / `arrow` |
-| path | string | yes | — | File path or object storage URL |
-| store | object | no | — | Object storage configuration (tagged enum), see table below |
-| query | object | no | — | SQL to run over the file data, see table below |
-| ballista | object | no | — | Distributed query configuration, see table below |
+| type | string | yes | — | Constant value `"file"` (the input kind) |
+| input_type | object | yes | — | Format and location, see below: `type` (`json` / `csv` / `parquet` / `avro` / `arrow`), `path` (file path or object storage URL), optional `store` (object storage configuration, tagged enum) |
+| query | object | no | — | SQL to run over the file data, see table below (top-level field) |
+| ballista | object | no | — | Distributed query configuration, see table below (top-level field) |
 
-> Note: the field name in the code is `store` (not `object_store` as in the old docs). The format is specified by the top-level `type` field.
+> Note: `type`, `path`, and `store` live **inside** `input_type`; `query` and `ballista` are siblings of `input_type` (top-level fields of the file input). The field name in the code is `store` (not `object_store` as in the old docs).
 
 ### store
 
@@ -42,8 +41,10 @@ The File input reads JSON / CSV / Parquet / Avro / Arrow files via DataFusion. I
 | type | string | yes | `"gs"` |
 | bucket_name | string | yes | GCS bucket name |
 | url | string | no | Custom endpoint: a `gs://bucket` URL for the same bucket, or an `http(s)://` endpoint for an emulator (the bucket stays `bucket_name`) |
-| service_account_path | string | no | Path to the service account JSON key file |
-| service_account_key | string | no | Raw service account JSON content |
+| service_account_path | string | see note | Path to the service account JSON key file |
+| service_account_key | string | see note | Raw service account JSON content |
+
+> Exactly **one** of `service_account_path` / `service_account_key` is required: providing neither fails with "GCS auth is missing", and providing both fails with "Specify either … not both".
 
 #### Azure (az)
 

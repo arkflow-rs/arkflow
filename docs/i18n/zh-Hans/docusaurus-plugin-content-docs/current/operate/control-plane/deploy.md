@@ -201,7 +201,7 @@ health_check:
 `login_enabled`、`authenticated` 与 principal),遇到 401 时跳转到登录
 流,并为已认证会话显示登出控件。`VITE_API_TOKEN` 部署保持不变——配置了
 静态令牌时控制台不会重定向——控制台也可以在运行期输入 Bearer 凭证,而无需构建期注入。
-Hub 具备持久化存储时会话落盘(`cp_sessions`,schema v5):跨 Hub 重启存活,
+Hub 具备持久化存储时会话落盘(`cp_sessions`,schema v6):跨 Hub 重启存活,
 登出即删除,用户被禁用、删除或调用 `POST /api/v1/users/{id}/revoke-tokens`
 时立即失效。易失 Hub 保持旧的纯内存行为,重启即登出所有人。备份与恢复有意
 排除 `cp_sessions`,因此灾难恢复绝不会让旧登录复活。未配置 client 变量时 Hub
@@ -223,7 +223,8 @@ VITE_API_TOKEN=... .`——而不要依赖本地 `.env` 文件:`.dockerignore` �
 ## 从以健康检查为中心的控制台迁移
 
 旧 UI 把后端当作健康与聚合流监控使用。面向资源的控制台使用 `/api/v1/system`、`/nodes`、`/streams`、
-`/operations`、`/events`、`/configuration` 与 `/components`。生命周期请求是异步的,必须按操作 ID 轮询。
+`/operations`、`/events`、`/components` 以及节点级 `/nodes/{node_id}/configuration`(机群级 `/api/v1/configuration`
+端点只存在于独立节点平面,Hub 上没有)。生命周期请求是异步的,必须按操作 ID 轮询。
 现有的 `/health`、`/readiness`、`/liveness`、`/metrics`、`/status` 与 `/config*`
 路由作为兼容别名保留,但新的集成应使用资源端点。配置版本、操作、审计记录与有界事件历史在 Hub
 模式下是持久的。灰度发布位于 `/api/v1/rollouts`;使用 action 端点来暂停、恢复、取消或创建回滚。

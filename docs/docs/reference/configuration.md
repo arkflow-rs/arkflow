@@ -44,7 +44,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `level` | string | no | `info` | Log level: `debug`, `info`, `warn`, `error`. |
+| `level` | string | no | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error`. |
 | `file_path` | string | no | — | Write logs to this file instead of stdout. |
 | `format` | string | no | `plain` | Log format: `plain` or `json`. |
 
@@ -76,6 +76,27 @@ API and the Hub agent when `hub_urls` is set (see
 | `data_port` | integer | no | — | Data-plane listen port for cross-node shuffle. When absent the node runs without a network data plane and never advertises the `network_shuffle` capability. Set together with `data_host` on every node participating in a `split` placement. |
 | `data_host` | string | no | — | Routable host peers use to reach this node's data plane (e.g. a LAN IP). Required together with `data_port` for split placement. |
 | `observability` | object | no | see below | Process-level Prometheus metrics and health probes (see [Observability](../operate/observability.md)). |
+| `rate_limit` | object | no | see below | Per-credential request rate limiting for the versioned control-plane API (see [`health_check.rate_limit`](#health_checkrate_limit)). |
+
+### `health_check.rate_limit`
+
+Per-credential request rate limiting for the versioned control-plane API:
+one token bucket per credential identity (operator credentials and browser
+sessions share operator buckets; agent nodes get separate buckets).
+Defaults sit orders of magnitude above legitimate deployment traffic — the
+limiter protects against runaway clients, not legitimate load. Rate-limited
+requests answer `429` (see the [API reference](./api.md)).
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | boolean | no | `true` | Master switch; `false` restores the pre-limiting behavior exactly. |
+| `principal_rps` | number | no | `100` | Token refill rate per second for operator-credential buckets. |
+| `principal_burst` | number | no | `200` | Burst capacity of an operator-credential bucket. |
+| `node_rps` | number | no | `500` | Token refill rate per second for agent-node buckets; must cover the register/heartbeat/report/commands/observations cadence of one node. |
+| `node_burst` | number | no | `1000` | Burst capacity of an agent-node bucket. |
+
+Non-positive or non-finite values fall back to the defaults with a startup
+warning.
 
 ### `health_check.observability`
 
@@ -253,7 +274,7 @@ jobs:
 | `version` | integer | yes | — | Job version; state-format compatibility on recovery is evaluated against it. |
 | `parallelism` | integer | no | `1` | Default task parallelism. |
 | `max_parallelism` | integer | no | `128` | Upper bound used for key-group partitioning. |
-| `operators` | array&lt;object&gt; | yes | — | DAG nodes: `id`, `kind` (`source`, `map`, `filter`, `aggregate`, `window`, `sink`, `udf`); `join` is reserved but rejected until a distributed multi-input runtime exists. |
+| `operators` | array&lt;object&gt; | yes | — | DAG nodes: `id`, `kind` (`source`, `map`, `filter`, `aggregate`, `window`, `join`, `sink`, `udf`); a `join` operator requires exactly two inbound edges (see [Stream-stream join](../build/distributed-jobs.md#stream-stream-join)). |
 | `edges` | array&lt;object&gt; | no | `[]` | DAG edges: `id`, `from`, `to`, `partitioned` (key-group routing instead of same-subtask). |
 | `sources` | array&lt;object&gt; | no | `[]` | Attach a component input to a `source` operator: `operator_id`, `input_type`, `config`, `time`. |
 | `sinks` | array&lt;object&gt; | no | `[]` | Attach a component output to a `sink` operator: `operator_id`, `output_type`, `config`. |
@@ -271,7 +292,7 @@ jobs:
 |-------|------|----------|---------|-------------|
 | `mode` | string | yes | — | `event_time` or `processing_time`. |
 | `timestamp_field` | string | no | — | Field read as the event timestamp when `mode: event_time`. |
-| `watermark` | object | no | — | `strategy` (`bounded_out_of_orderness` (default) or `monotonous`), `out_of_orderness_ms`, `idle_timeout_ms`. |
+| `watermark` | object | yes for `event_time` sources; forbidden on `processing_time` sources | — | `strategy` (`bounded_out_of_orderness` (default) or `monotonous`), `out_of_orderness_ms`, `idle_timeout_ms`. Validation rejects an event-time source without one, and rejects one on a processing-time source. |
 | `allowed_lateness_ms` | integer | no | `0` | How far past the watermark late events are still accepted. |
 | `late_event_policy` | string | no | `drop` | What happens to late events: `drop`, `route`, or `update`. |
 | `late_event_route` | string | no | — | Operator receiving routed late events when the policy is `route`. |
@@ -282,7 +303,20 @@ Intermediate operator kinds (`map`, `filter`, `aggregate`, `window`, `join`,
 DAG orchestrator today. Always run `--validate` before deploying: it performs
 the same deep build checks as startup and rejects unsupported operators or
 state backends explicitly. `./target/release/arkflow schema` emits the
-authoritative JSON Schema, including the `jobs` fields, for editor completion.
+JSON Schema for editor completion.
+:::
+
+:::caution
+
+In the current release the **jobs fragment** of the emitted JSON Schema has
+known inaccuracies: the operator `kind` enum omits `filter` and `udf`;
+`edges`/`sources`/`sinks` are marked required although they default to `[]`;
+`recovery` is shown defaulting to `fail` instead of `latest_checkpoint`;
+`max_parallelism` is shown defaulting to `1` instead of `128`; and
+`placement` is typed as a free-form object instead of the
+`colocated|split` enum. Treat **this page** as authoritative for `jobs`
+fields until the schema is regenerated.
+
 :::
 
 ## Validate before running

@@ -36,4 +36,4 @@ input:
 ## Notes
 
 - Client mode only: the component actively calls `connect_async` against `url`; it does not listen on a port. Server-side fields such as `mode`/`host`/`port`/`path` do not exist in the code, and the related descriptions from the old docs have been removed.
-- Automatically attaches the `__meta_source` and `__meta_ingest_time` metadata columns.
+- No metadata columns are attached: deliveries are forwarded decoded, without `__meta_source` or `__meta_ingest_time`.

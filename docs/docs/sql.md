@@ -21,10 +21,11 @@ the built-ins are not enough.
 | [Aggregate functions](./sql/5-aggregate_functions.md) | count, sum, avg, and friends. |
 | [Window functions](./sql/6-window_functions.md) | OVER clauses, ranking, and analytic functions. |
 | [Scalar functions](./sql/7-scalar_functions.md) | The full built-in function catalog. |
-| [Special functions](./sql/8-special_functions.md) | Encoding, time, and utility functions. |
+| [Special functions](./sql/8-special_functions.md) | Expansion functions such as `unnest`. |
 | [UDFs](./sql/9-udf.md) | Registering and calling user-defined functions. |
 
-A `FROM batch` clause refers to the current Arrow batch flowing through the
-pipeline — see the [SQL processor](/docs/components/processors/sql) for
+A `FROM flow` clause refers to the current Arrow batch flowing through the
+pipeline (the default table name; override it with the SQL processor's
+`table_name` config) — see the [SQL processor](/docs/components/processors/sql) for
 configuration and semantics, and the
 [recipes](./build/recipes/1-kafka-to-sql.md) for end-to-end usage.

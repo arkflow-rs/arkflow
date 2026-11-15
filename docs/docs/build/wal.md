@@ -156,9 +156,9 @@ the `flush_interval × message_rate` term becomes the binding one.
 
 ## Dimension 2: Parallel PUT Workers
 
-The `parallel_put` block configures concurrent S3 upload workers. Each
-worker owns an independent bounded channel (16 segments), giving per-worker
-backpressure without global contention.
+The `parallel_put` block reserves configuration space for concurrent S3
+upload workers. Each worker would own an independent bounded channel
+(16 segments), giving per-worker backpressure without global contention.
 
 ```yaml validate=fragment wrap=durability
 durability:
@@ -173,27 +173,21 @@ durability:
       shutdown_timeout: "30s" # wait time for in-flight uploads on close
 ```
 
-**When to use multiple workers:**
+:::warning
 
-- High-throughput streams where S3 PUT is the bottleneck (network
-  bandwidth, not CPU)
-- Single-replica deployments where you can saturate one connection but
-  not a single thread
+**This knob currently has no effect.** Segment seals are serialized under a
+lock so the acknowledged frontier can never advance past an earlier
+unsealed segment; the worker pool therefore has no production call site.
+The field validates (1-8) and is accepted for forward compatibility, but
+setting `workers > 1` only logs a startup warning
+("parallel_put.workers has no effect"). Keep the default `1` and size the
+WAL with [segment tuning](#dimension-1-segment-tuning) and
+[compression](#dimension-3-compression) instead — see
+[Delivery semantics](./delivery-semantics.md) and
+[S3 WAL performance](../develop/s3-wal-performance.md) for what actually
+moves throughput.
 
-**Watch out for:**
-
-- S3 per-prefix rate limits (3,500 PUT/DELETE/sec, 5,500 GET/sec).
-  With 8 workers you can hit them on high-throughput streams.
-- Higher memory: each worker holds up to 16 sealed segments in its
-  channel buffer.
-
-Measured throughput on a 1 Gbit link:
-
-| Workers | Throughput | Speedup |
-|---------|------------|---------|
-| 1 (default) | ~150 MB/s | 1.0× |
-| 4 | ~300 MB/s | 2.0× |
-| 8 | ~400 MB/s | 2.7× |
+:::
 
 ## Dimension 3: Compression
 
@@ -221,6 +215,16 @@ durability:
 | `none` | n/a | n/a | n/a | n/a |
 | `lz4` | 1-16 | 4 | low (40-50%) | very fast |
 | `zstd` | 0-22 | 3 | high (50-70%) | moderate |
+
+:::note
+
+The `lz4` level is validated (1-16) but currently **unused**: LZ4 compression
+runs at a single speed regardless of the configured level, so any value
+produces byte-identical output — the measured ratios below were identical
+for lz4-1, lz4-4, and lz4-9. Tune `zstd` levels instead; the `lz4` default
+of 4 is what the schema records, not a real tuning input.
+
+:::
 
 **Measured compression ratios** on ArkFlow's own WAL segment payloads
 (Arrow IPC frames with repetitive schema metadata):
@@ -340,7 +344,8 @@ See the `examples/` directory for ready-to-use configurations:
 
 - `durability_example_s3.yaml` — baseline (balanced, no compression)
 - `durability_example_aggressive.yaml` — high-throughput
-- `durability_example_parallel.yaml` — 4 PUT workers
+- `durability_example_parallel.yaml` — 4 PUT workers declared (accepted;
+  currently no effect — see the [Parallel PUT Workers](#dimension-2-parallel-put-workers) note)
 - `durability_example_compressed.yaml` — zstd compression
 - `durability_smoke_test.yaml` — all optimizations combined
 

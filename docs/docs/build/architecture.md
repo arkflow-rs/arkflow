@@ -57,7 +57,10 @@ runtime:
 - several **processor workers** (configurable via `pipeline.thread_num`),
 - one **output worker** writing to the sink with ordered delivery.
 
-They communicate through `flume` channels and shut down together via a
-`CancellationToken`. A `TaskTracker` waits for every task to finish on shutdown.
+They communicate through bounded `flume` channels (capacity 1024) and shut
+down together via a `CancellationToken`. Compiled streams run through the
+unified execution kernel, which joins its processor and collector workers on
+shutdown (a `TaskTracker` additionally tracks the fan-in reader tasks of
+`multiple_inputs`).
 
 Continue to [Backpressure & ordered delivery](./backpressure.md).

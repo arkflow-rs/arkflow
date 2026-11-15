@@ -7,15 +7,10 @@ sidebar_position: 1
 ## Prerequisites
 
 - **Rust ≥ 1.97** (toolchain, for building from source)
-- **Protobuf compiler** (`protoc`) — required at build time for protobuf codecs
 
-```bash
-# macOS
-brew install protobuf
-# Debian/Ubuntu
-sudo apt-get install protobuf-compiler
-export PROTOC=$(which protoc)
-```
+No protobuf compiler is needed: Protobuf codec `.proto` files are compiled at
+runtime by the bundled pure-Rust `protox` compiler, and the build does not
+shell out to `protoc` (there is no `build.rs`).
 
 ## Build from source
 

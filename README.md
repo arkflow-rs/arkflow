@@ -29,7 +29,7 @@ ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/
 
 ## Features
 
-- **High Performance**: Built on Rust and Tokio async runtime, offering excellent performance and low latency
+- **High Performance**: Built on Rust and Tokio async runtime, offering excellent performance and low latency (benchmark methodology: [docs/develop/benchmark.md](docs/docs/develop/benchmark.md))
 - **Durable Delivery**: Opt-in per-stream WAL durability for at-least-once delivery, with optional exactly-once for transactional sinks
 - **Multiple Data Sources**: Support for Kafka, MQTT, HTTP, files, SQL databases, and many other input/output sources
 - **Powerful Processing**: Built-in SQL queries, Python UDFs, JSON processing, Protobuf encoding/decoding, batch processing, and VRL
@@ -38,6 +38,23 @@ ArkFlow enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/
 - **Extensible**: Modular design, easy to extend with new input, buffer, output, and processor components
 
 ## Installation
+
+### Docker
+
+Prebuilt images are published to GHCR (the entrypoint is
+`arkflow --config /app/etc/config.yaml`):
+
+```bash
+docker run -d --name arkflow \
+  -p 8080:8080 \
+  -v $PWD/config.yaml:/app/etc/config.yaml:ro \
+  ghcr.io/arkflow-rs/arkflow:0.6.0
+```
+
+Control plane (Hub) and console images are also available:
+`ghcr.io/arkflow-rs/arkflow-server`, `ghcr.io/arkflow-rs/arkflow-console`.
+See [Operate → Docker](docs/docs/operate/docker.md) for volumes, health
+checks, and validation.
 
 ### Building from Source
 
@@ -123,7 +140,7 @@ ArkFlow supports multiple input sources:
 - **SQL** (`sql`): Query data from SQL databases (MySQL, PostgreSQL, SQLite)
 - **NATS** (`nats`): Subscribe to messages from NATS topics with JetStream support
 - **Pulsar** (`pulsar`): Subscribe to messages from Pulsar topics
-- **Redis** (`redis`): Subscribe to messages from Redis streams, lists, or pub/sub channels
+- **Redis** (`redis`): Subscribe to messages from Redis pub/sub channels or lists
 - **WebSocket** (`websocket`): Subscribe to messages from WebSocket connections
 - **Modbus** (`modbus`): Read data from Modbus devices
 - **Memory** (`memory`): In-memory data source for testing
@@ -160,7 +177,7 @@ ArkFlow provides multiple data processors:
 - **Embedding** (`embedding`): Batch-embed a text column via an OpenAI-compatible API and append vector columns
 - **LLM** (`llm`): Send each row to an OpenAI-compatible chat completions API with bounded concurrency and append completions
 - **Vector Search** (`vector_search`): Search a Qdrant collection for top-k nearest neighbors of each row's vector and append matches as JSON
-- **Milvus Search** (`milvus_search`): Search a Milvus collection for top-k nearest neighbors of each row's vector with one batched request
+- **Milvus Search** (`milvus_search`): Search a Milvus collection for top-k nearest neighbors of each row's vector with one REST request per row
 - **pgvector Search** (`pgvector_search`): Search a PostgreSQL table with the pgvector extension for top-k nearest neighbors of each row's vector
 - **Lookup** (`lookup`): Enrich each row with dimension-table columns resolved from an external service, with a TTL cache and bounded ordered concurrency
 
@@ -190,7 +207,7 @@ ArkFlow supports multiple output targets:
 - **MongoDB** (`mongodb`): Write documents to a MongoDB collection
 - **NATS** (`nats`): Publish messages to NATS topics
 - **Pulsar** (`pulsar`): Publish messages to Pulsar topics
-- **Redis** (`redis`): Write to Redis streams, lists, or pub/sub channels
+- **Redis** (`redis`): Write to Redis lists, hashes, strings, or pub/sub channels
 - **SQL** (`sql`): Write to SQL databases (MySQL, PostgreSQL) with batch inserts and UPSERT
 - **Standard Output** (`stdout`): Output data to the console
 - **Drop** (`drop`): Discard data

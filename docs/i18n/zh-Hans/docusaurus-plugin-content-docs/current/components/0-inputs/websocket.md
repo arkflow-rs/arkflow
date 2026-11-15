@@ -36,4 +36,4 @@ input:
 ## 说明
 
 - 仅支持客户端模式:该组件会对 `url` 主动调用 `connect_async`,并不监听端口。代码中不存在 `mode`/`host`/`port`/`path` 等服务端字段,旧文档中的相关描述已移除。
-- 自动附加 `__meta_source` 与 `__meta_ingest_time` 元数据列。
+- 不附加任何元数据列:消息解码后直接转发,没有 `__meta_source` 或 `__meta_ingest_time`。

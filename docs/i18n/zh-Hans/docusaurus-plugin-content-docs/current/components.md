@@ -19,7 +19,7 @@ ArkFlow 内置六类共 50 个注册组件。本节的每个页面都会与实�
   <div class="col col--4 margin-bottom--md">
     <a class="card padding--md" href="/zh-Hans/docs/components/buffers/tumbling_window">
       <div class="card__header"><h3>缓冲</h3><span class="af-badge af-badge--feature">buffer</span></div>
-      <div class="card__body">滚动、滑动与会话窗口——感知事件时间,原生列式。</div>
+      <div class="card__body">滚动与会话窗口——感知事件时间,原生列式(滑动窗口在 Job DAG 的 `window` 算子上可用)。</div>
     </a>
   </div>
   <div class="col col--4 margin-bottom--md">

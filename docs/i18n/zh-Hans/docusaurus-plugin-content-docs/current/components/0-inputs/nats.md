@@ -12,7 +12,7 @@ NATS 输入(Input)连接到 NATS 服务器,支持两种模式:常规订阅(regul
 | Field | Type | Required | Default | 描述 |
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | 常量值 `"nats"` |
-| url | string | yes | — | NATS 服务器 URL,如 `nats://host:4222`;多个服务器以逗号分隔 |
+| url | string | yes | — | 单个 NATS 服务器 URL,如 `nats://host:4222`。(不支持逗号分隔的集群列表:整个字符串会按单个 URL 解析,逗号串会直接失败。) |
 | mode | object | yes | — | 运行模式,见下表(带标签的枚举,通过 `type` 字段区分) |
 | auth | object | no | — | 认证配置,见下表 |
 
@@ -39,7 +39,7 @@ NATS 输入(Input)连接到 NATS 服务器,支持两种模式:常规订阅(regul
 |-------|------|----------|-------------|
 | username | string | no | 用户名 |
 | password | string | no | 密码(与 username 配合使用) |
-| token | string | no | 令牌;与用户名/密码同时存在时优先使用 |
+| token | string | no | Token 认证。优先级:username 与 password 同时设置时**以它们为准**;仅在二者缺省时才使用 token。 |
 
 ## 示例
 

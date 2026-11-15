@@ -63,8 +63,10 @@ VRL 值可与以下 Arrow 类型相互映射:
 
 - **字符串(String)**(Utf8)
 - **整数(Integer)**:Int8、Int16、Int32、Int64
+- **无符号整数(Unsigned Integer)**:UInt8、UInt16、UInt32、UInt64(映射为 VRL 整数)
 - **浮点数(Float)**:Float32、Float64
 - **布尔值(Boolean)**
 - **二进制(Binary)**
 - **时间戳(Timestamp)**
+- **日期(Date)**:Date32 / Date64(映射为 VRL **整数** epoch 值——Date32 为天数、Date64 为毫秒数——而非 VRL 时间戳)
 - **空值(Null)**

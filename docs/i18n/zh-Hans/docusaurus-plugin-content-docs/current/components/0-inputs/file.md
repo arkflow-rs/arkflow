@@ -11,13 +11,12 @@ sidebar_label: File
 
 | Field | Type | Required | Default | 描述 |
 |-------|------|----------|---------|-------------|
-| type | string | yes | — | 文件格式: `json` / `csv` / `parquet` / `avro` / `arrow` |
-| path | string | yes | — | 文件路径或对象存储 URL |
-| store | object | no | — | 对象存储配置(带标签的枚举),见下表 |
-| query | object | no | — | 对文件数据执行的 SQL,见下表 |
-| ballista | object | no | — | 分布式查询配置,见下表 |
+| type | string | yes | — | 常量值 `"file"`(输入类型) |
+| input_type | object | yes | — | 格式与位置,见下文:`type`(`json` / `csv` / `parquet` / `avro` / `arrow`)、`path`(文件路径或对象存储 URL)、可选 `store`(对象存储配置,带标签的枚举) |
+| query | object | no | — | 对文件数据执行的 SQL,见下表(input_type 的同级字段) |
+| ballista | object | no | — | 分布式查询配置,见下表(input_type 的同级字段) |
 
-> 注意:代码中的字段名是 `store`(而不是旧文档中的 `object_store`)。文件格式由顶层的 `type` 字段指定。
+> 注意:`type`、`path`、`store` 位于 **`input_type` 内部**;`query` 与 `ballista` 是 `input_type` 的同级字段(文件输入的顶层字段)。代码中的字段名是 `store`(而不是旧文档中的 `object_store`)。
 
 ### store
 
@@ -42,8 +41,10 @@ sidebar_label: File
 | type | string | yes | `"gs"` |
 | bucket_name | string | yes | GCS 存储桶名称 |
 | url | string | no | 自定义端点:`gs://bucket`(须与 bucket_name 同名)或指向模拟器的 `http(s)://` 端点(桶仍由 bucket_name 决定) |
-| service_account_path | string | no | 服务账号 JSON 密钥文件的路径 |
-| service_account_key | string | no | 服务账号 JSON 原始内容 |
+| service_account_path | string | 见下注 | 服务账号 JSON 密钥文件的路径 |
+| service_account_key | string | 见下注 | 服务账号 JSON 原始内容 |
+
+> `service_account_path` / `service_account_key` 二者**必须恰好提供一个**:都不给会报 "GCS auth is missing",两个都给会报 "Specify either … not both"。
 
 #### Azure (az)
 

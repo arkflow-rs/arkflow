@@ -1,5 +1,5 @@
 ---
-description: ArkFlow documentation page.
+description: Expansion functions such as unnest for arrays, maps, and structs.
 ---
 
 # Special Functions

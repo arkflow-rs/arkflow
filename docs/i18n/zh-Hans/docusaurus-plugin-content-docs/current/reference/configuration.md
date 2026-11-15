@@ -41,7 +41,7 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 
 | 字段 | 类型 | 必填 | 默认值 | 描述 |
 |-------|------|----------|---------|-------------|
-| `level` | string | 否 | `info` | 日志级别:`debug`、`info`、`warn`、`error`。 |
+| `level` | string | 否 | `info` | 日志级别:`trace`、`debug`、`info`、`warn`、`error`。 |
 | `file_path` | string | 否 | — | 把日志写入该文件而不是 stdout。 |
 | `format` | string | 否 | `plain` | 日志格式:`plain` 或 `json`。 |
 
@@ -70,6 +70,21 @@ jobs: []      # optional declarative streaming jobs, see "job" below
 | `data_port` | integer | 否 | — | 用于跨节点 shuffle 的数据面监听端口。缺省时节点不运行网络数据面,也绝不会通告 `network_shuffle` 能力。参与 `split` 放置的每个节点都要把它与 `data_host` 一起设置。 |
 | `data_host` | string | 否 | — | 对等端用于访问本节点数据面的可路由主机(例如局域网 IP)。`split` 放置要求它与 `data_port` 一同设置。 |
 | `observability` | object | 否 | 见下文 | 进程级 Prometheus 指标与健康探针(参见[可观测性](/zh-Hans/docs/operate/observability))。 |
+| `rate_limit` | object | 否 | 见下文 | 带版本控制平面 API 的按凭据限流(见 [`health_check.rate_limit`](#health_checkrate_limit))。 |
+
+### `health_check.rate_limit`
+
+带版本控制平面 API 的按凭据请求限流:每个凭据身份一个令牌桶(operator 凭据与浏览器会话共享 operator 桶;Agent 节点使用独立桶)。默认值比合法部署流量高出几个数量级——限流器防的是失控客户端,不是正常负载。被限流的请求返回 `429`(参见 [API 参考](./api.md))。
+
+| 字段 | 类型 | 必填 | 默认值 | 描述 |
+|-------|------|----------|---------|-------------|
+| `enabled` | boolean | 否 | `true` | 总开关;`false` 精确恢复限流之前的行为。 |
+| `principal_rps` | number | 否 | `100` | operator 凭据桶的每秒令牌补充速率。 |
+| `principal_burst` | number | 否 | `200` | operator 凭据桶的突发容量。 |
+| `node_rps` | number | 否 | `500` | Agent 节点桶的每秒令牌补充速率;必须覆盖单个节点的 register/heartbeat/report/commands/observations 节奏。 |
+| `node_burst` | number | 否 | `1000` | Agent 节点桶的突发容量。 |
+
+非正数或非有限值会回退到默认值并输出启动警告。
 
 ### `health_check.observability`
 
@@ -200,7 +215,7 @@ jobs:
 | `version` | integer | 是 | — | 作业版本;恢复时的状态格式兼容性依据它评估。 |
 | `parallelism` | integer | 否 | `1` | 默认任务并行度。 |
 | `max_parallelism` | integer | 否 | `128` | 用于键组(key-group)分区的上限。 |
-| `operators` | array&lt;object&gt; | 是 | — | DAG 节点:`id`、`kind`(`source`、`map`、`filter`、`aggregate`、`window`、`sink`、`udf`);`join` 已保留,但在存在分布式多输入运行时之前会被拒绝。 |
+| `operators` | array&lt;object&gt; | 是 | — | DAG 节点:`id`、`kind`(`source`、`map`、`filter`、`aggregate`、`window`、`join`、`sink`、`udf`);`join` 算子要求恰好两条入边(参见[双流 join](/zh-Hans/docs/build/distributed-jobs#双流-join))。 |
 | `edges` | array&lt;object&gt; | 否 | `[]` | DAG 边:`id`、`from`、`to`、`partitioned`(按键组路由,而非同子任务)。 |
 | `sources` | array&lt;object&gt; | 否 | `[]` | 把组件输入附加到 `source` 算子:`operator_id`、`input_type`、`config`、`time`。 |
 | `sinks` | array&lt;object&gt; | 否 | `[]` | 把组件输出附加到 `sink` 算子:`operator_id`、`output_type`、`config`。 |
@@ -218,13 +233,19 @@ jobs:
 |-------|------|----------|---------|-------------|
 | `mode` | string | 是 | — | `event_time` 或 `processing_time`。 |
 | `timestamp_field` | string | 否 | — | 当 `mode: event_time` 时作为事件时间戳读取的字段。 |
-| `watermark` | object | 否 | — | `strategy`(`bounded_out_of_orderness`(默认)或 `monotonous`)、`out_of_orderness_ms`、`idle_timeout_ms`。 |
+| `watermark` | object | `event_time` 源必填;`processing_time` 源禁止设置 | — | `strategy`(`bounded_out_of_orderness`(默认)或 `monotonous`)、`out_of_orderness_ms`、`idle_timeout_ms`。校验会拒绝缺少 watermark 的事件时间源,也会拒绝在处理时间源上设置 watermark。 |
 | `allowed_lateness_ms` | integer | 否 | `0` | 超过水印(Watermark)多久的迟到事件仍被接受。 |
 | `late_event_policy` | string | 否 | `drop` | 迟到事件的处理方式:`drop`、`route` 或 `update`。 |
 | `late_event_route` | string | 否 | — | 当策略为 `route` 时接收被路由迟到事件的算子。 |
 
 :::note
-中间算子类别(`map`、`filter`、`aggregate`、`window`、`join`、`udf`)目前主要由流式 SQL 编译器与控制台 DAG 编排器生成。部署前务必运行 `--validate`:它执行与启动时相同的深度构建检查,并显式拒绝不受支持的算子或状态后端。`./target/release/arkflow schema` 会输出权威的 JSON Schema(包含 `jobs` 字段),供编辑器补全使用。
+中间算子类别(`map`、`filter`、`aggregate`、`window`、`join`、`udf`)目前主要由流式 SQL 编译器与控制台 DAG 编排器生成。部署前务必运行 `--validate`:它执行与启动时相同的深度构建检查,并显式拒绝不受支持的算子或状态后端。`./target/release/arkflow schema` 会输出 JSON Schema 供编辑器补全使用。
+:::
+
+:::caution
+
+当前版本中,输出的 JSON Schema 的 **jobs 片段**存在已知不准确之处:算子 `kind` 枚举缺 `filter` 与 `udf`;`edges`/`sources`/`sinks` 被标为必填但实际默认 `[]`;`recovery` 的默认值标为 `fail` 而实际是 `latest_checkpoint`;`max_parallelism` 的默认值标为 `1` 而实际是 `128`;`placement` 类型标为自由 object 而实际是 `colocated|split` 枚举。在 schema 重新生成之前,`jobs` 字段请以**本页**为准。
+
 :::
 
 ## 运行前先校验

@@ -82,8 +82,10 @@ and session persistence — is documented in
 ## API endpoints
 
 Resource endpoints include `/api/v1/system`, `/nodes`, paginated `/streams`,
-`/operations`, `/events`, `/configuration`, `/components`, and `/schema`.
-`/metrics` exposes Prometheus text exposition. Job endpoints include job
+`/operations`, `/events`, `/components`, `/schema`, and node-scoped
+`/nodes/{node_id}/configuration` (a fleet-level `/configuration` endpoint
+exists only on the standalone node plane).
+`/api/v1/metrics` exposes Prometheus text exposition. Job endpoints include job
 CRUD, check­points and savepoints, version history, and upgrades — the
 upgrade endpoint's atomic mode orchestrates savepoint → version commit →
 recovery start behind one call (see

@@ -249,7 +249,7 @@ inside one process. The write still uses ETag-based optimistic concurrency
 process or a manual edit touching the same prefix; a backend without
 conditional PUT (e.g. `LocalFileSystem`) falls back to a single-writer
 unconditional write, so keep `workers: 1` there. See
-`docs/docs/components/0-inputs/delivery-semantics.md` for the
+`docs/docs/build/delivery-semantics.md` for the
 delivery-contract details.
 
 ## Compression
@@ -289,6 +289,17 @@ zstd-9: 50000 -> 276 bytes (ratio: 181.16x)
 
 Real-world ratios on production payloads (mixed data, less repetition)
 will be lower than these synthetic benchmarks but still substantial.
+
+:::note
+
+Two level caveats: the **`lz4` level is currently unused** — LZ4 compresses
+at a single speed, so lz4-1/4/9 are byte-identical by construction. The
+zstd rows above look level-independent only because this synthetic payload
+hits the compression floor at every level; on real payloads zstd levels do
+produce different output. Don't tune the lz4 level — it is validated
+(1-16) but has no effect.
+
+:::
 
 **Min size threshold**: Segments smaller than 10KB are uploaded uncompressed.
 

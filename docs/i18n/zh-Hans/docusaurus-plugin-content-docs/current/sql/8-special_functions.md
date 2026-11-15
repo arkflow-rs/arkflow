@@ -1,5 +1,5 @@
 ---
-description: ArkFlow 文档页面。
+description: unnest 等针对数组、map 与 struct 的展开函数。
 ---
 
 # 特殊函数(Special Functions)

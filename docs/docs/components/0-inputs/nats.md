@@ -12,7 +12,7 @@ The NATS input connects to a NATS server and supports two modes: regular subscri
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | type | string | yes | — | Constant value `"nats"` |
-| url | string | yes | — | NATS server URL, e.g. `nats://host:4222`; multiple servers separated by commas |
+| url | string | yes | — | Single NATS server URL, e.g. `nats://host:4222`. (A comma-separated cluster list is not supported: the string is parsed as one URL and a joined list fails.) |
 | mode | object | yes | — | Operating mode, see table below (tagged enum, distinguished by the `type` field) |
 | auth | object | no | — | Authentication configuration, see table below |
 
@@ -39,7 +39,7 @@ The NATS input connects to a NATS server and supports two modes: regular subscri
 |-------|------|----------|-------------|
 | username | string | no | Username |
 | password | string | no | Password (used together with username) |
-| token | string | no | Token; takes precedence over username/password when both are present |
+| token | string | no | Token auth. Precedence: when both username and password are set they **win**; the token is used only when username/password are absent. |
 
 ## Examples
 

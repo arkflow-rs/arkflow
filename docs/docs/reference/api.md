@@ -16,7 +16,10 @@ service:
 | Hub agent API | `/api/v1/agent/*` | Compute nodes (Agents): registration, heartbeats, reports, command pull. |
 
 Health, readiness, and liveness probes (configurable paths) plus `GET
-/metrics` (Prometheus text format) are served on both node and Hub services.
+/metrics` (Prometheus text format) are served on the node service. On the
+Hub, `/metrics` lives only under the versioned prefix
+(`GET /api/v1/metrics`) and requires operator authentication — the Hub's
+outer router serves just the health probes.
 
 The Hub operator API is a **desired-state API**: a successful HTTP mutation
 means an Intent was durably accepted — it does not mean a node has executed
@@ -297,7 +300,7 @@ Rejections are audited (`job.pause` / `job.resume`, outcome `rejected`, with
 the failure code above) and counted in
 `arkflow_job_pause_total{outcome="rejected"}`; phase transitions emit
 `job.pause_requested`, `job.paused`, `job.resume_requested`, `job.resumed`,
-and `job.pause_failed` on `GET /events/stream`. A capture failure or the
+`job.pause_retrying`, and `job.pause_failed` on `GET /events/stream`. A capture failure or the
 capture deadline aborts the pause, restores the pre-pause recovery pointer, and
 records `pause_savepoint_failed` / `pause_savepoint_timeout` in the Job's
 `last_error`.
@@ -370,9 +373,10 @@ semantics (at most 16 entries). Both routes (and `POST /webhooks/{id}/test`)
 require the `ManageWebhooks` action — admin and operator roles — and every
 accepted replacement or denial is audited (`webhook.replace`). Each entry
 carries `id`, `url` (`http`/`https` only), `event_types` (prefix filters),
-`enabled`, and an optional write-only `secret`: responses never echo it, an
-omitted secret retains the stored one for the same id, and an explicitly
-empty string clears it.
+`enabled`, `created_by`, `created_at_ms`, and an optional write-only `secret`
+(exposed in responses only as a boolean `has_secret`): responses never echo
+the secret itself, an omitted secret retains the stored one for the same id,
+and an explicitly empty string clears it.
 
 Delivery is best-effort (leader-only forwarding, bounded drop-oldest queues,
 3 attempts with backoff, auto-pause after 5 consecutive failed deliveries
@@ -531,7 +535,7 @@ operator API also serves a browser login flow:
 | `GET` | `/auth/oidc/callback` | Exchange the code for an id_token and create the server-side session. |
 | `GET` | `/auth/oidc/logout` | Delete the server-side session and clear the cookie. |
 
-With durable storage the session is persisted (`cp_sessions`, schema v5): it
+With durable storage the session is persisted (`cp_sessions`, schema v6): it
 survives a Hub restart and is invalidated by logout, by disabling/deleting the
 user, or by `POST /users/{id}/revoke-tokens`. Backup and restore exclude
 `cp_sessions` deliberately, so a restored Hub never resurrects logins. On a
@@ -552,7 +556,7 @@ acknowledgement latency with `_count`/`_sum` companions) and
 `arkflow_command_total{command,outcome}`. Labels come from fixed vocabularies
 — command types (`job_start`, `job_stop`, `job_checkpoint`, `job_savepoint`,
 stream actions) and outcome classes (`enqueued`, `acknowledged`, `succeeded`,
-`failed`, `timed_out`, `node_unavailable`, `capacity`, `rejected`); unknown
+`failed`, `cancelled`, `superseded`, `timed_out`, `node_unavailable`, `capacity`, `rejected`); unknown
 command names collapse into `other`, and resource IDs, correlation IDs, and
 error text never become labels. Counters reset on Hub restart.
 

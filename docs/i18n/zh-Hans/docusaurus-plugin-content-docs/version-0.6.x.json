@@ -1,7 +1,7 @@
 {
   "version.label": {
-    "message": "Next",
-    "description": "The label for version current"
+    "message": "0.6.x",
+    "description": "The label for version 0.6.x"
   },
   "sidebar.tutorialSidebar.category.Get Started": {
     "message": "Get Started",
