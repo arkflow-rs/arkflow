@@ -509,9 +509,21 @@ mod tests {
         // The postgres table provider wraps post-first-chunk receive
         // failures in exactly this Execution shape — the inner Display is
         // `PostgresError::QueryError`'s (provider 0.13.1 conn.rs:261-267).
-        // A dropped connection must reconnect, not wedge.
+        // A dropped connection carries NO SQLSTATE (the server never saw
+        // the query) and must reconnect, not wedge.
         datafusion::common::DataFusionError::Execution(
             "Failed to fetch batch: Query execution failed.\nconnection refused".into(),
+        )
+    }
+
+    fn postgres_db_error() -> datafusion::common::DataFusionError {
+        // Same "Query execution failed." prefix, but the provider appended
+        // a SQLSTATE (division by zero = 22012): a server-generated
+        // database error is deterministic given the data — reconnecting
+        // replays the same prefix into the same division by zero.
+        datafusion::common::DataFusionError::Execution(
+            "Failed to fetch batch: Query execution failed.\ndivision by zero\nSQLSTATE: 22012"
+                .into(),
         )
     }
 
@@ -618,6 +630,42 @@ mod tests {
             Err(other) => {
                 panic!("a postgres receive failure must be Disconnection, got: {other:?}")
             }
+            Ok(_) => panic!("a failed stream must not yield data"),
+        }
+        input.close().await?;
+        Ok(())
+    }
+
+    /// Regression (review round 4): `QueryError` also carries
+    /// server-generated database errors (SQLSTATE present) — division by
+    /// zero after the first chunk must terminate, not reconnect + replay.
+    #[tokio::test]
+    async fn postgres_db_error_is_terminal() -> Result<(), Error> {
+        let (_dir, path) = seeded_sqlite_file();
+        let sql_config = SqlInputConfig {
+            select_sql: "SELECT id, kind FROM flow.main.events".to_string(),
+            ballista: None,
+            input_type: InputType::Sqlite(SqliteConfig {
+                name: None,
+                path: path.clone(),
+            }),
+        };
+        let input = SqlInput::new(None, sql_config)?;
+        input.connect().await?;
+        install_failing_stream(&input, postgres_db_error()).await?;
+
+        let (_, _) = input.read().await?;
+        match input.read().await {
+            Err(Error::Process(message)) => {
+                assert!(
+                    message.contains("deterministically"),
+                    "a SQLSTATE-carrying database error must terminate: {message}"
+                );
+            }
+            Err(Error::Disconnection) => {
+                panic!("a database execution error must not trigger reconnect + replay")
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
             Ok(_) => panic!("a failed stream must not yield data"),
         }
         input.close().await?;

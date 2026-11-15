@@ -46,20 +46,27 @@ pub(crate) fn classify_stream_error(error: datafusion::common::DataFusionError) 
             Error::Disconnection
         }
         // The postgres table provider buffers rows in 4,000-row chunks and
-        // wraps BOTH transport and conversion failures after the first
-        // chunk as `Execution("Failed to fetch batch: {inner}")`
+        // wraps transport AND database failures after the first chunk as
+        // `Execution("Failed to fetch batch: {inner}")`
         // (datafusion-table-providers-postgres 0.13.1 conn.rs:485). The
-        // inner Display distinguishes them: `PostgresError::QueryError`
-        // renders "Query execution failed." (transport — reconnect),
-        // `ConversionError` renders "Failed to convert query result to
-        // Arrow." (deterministic — terminal). Unknown inner shapes stay
-        // terminal: reconnecting into an unrecognized failure would replay
-        // the prefix into the same error forever.
+        // inner Display distinguishes three classes:
+        // * `PostgresError::ConversionError` renders "Failed to convert
+        //   query result to Arrow." — deterministic, terminal;
+        // * `PostgresError::QueryError` renders "Query execution failed."
+        //   followed by the server error; the provider's
+        //   `format_postgres_query_error` appends "SQLSTATE: <code>" ONLY
+        //   for server-generated database errors (division by zero,
+        //   constraint violations — deterministic, terminal), while a
+        //   dropped connection has no SQLSTATE (transient, reconnect).
+        // Unknown inner shapes stay terminal: reconnecting into an
+        // unrecognized failure would replay the prefix into the same error
+        // forever.
         Dfe::Execution(message)
             if message.starts_with("Failed to fetch batch:")
-                && message.contains("Query execution failed.") =>
+                && message.contains("Query execution failed.")
+                && !message.contains("SQLSTATE:") =>
         {
-            warn!("postgres record batch stream receive failure; reconnecting: {message}");
+            warn!("postgres record batch stream connection failure; reconnecting: {message}");
             Error::Disconnection
         }
         Dfe::Context(context, source) => {
