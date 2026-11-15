@@ -735,14 +735,25 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("production code precedes the test module");
-        let marker = "Start background task for JetStream message processing";
-        let jetstream_loop = &production[production
-            .find(marker)
-            .expect("JetStream task comment present")..];
+        let marker = ".fetch()";
+        // Pin the LAST fetch call chain in production (the spawned
+        // JetStream loop; the earlier one is connect()'s one-shot warm-up).
+        // Comment-independent: the recurring fetch itself must carry
+        // `expires`, and an unrelated `.expires(` elsewhere must not
+        // satisfy the pin.
+        let fetch_start = production
+            .rfind(marker)
+            .expect("a fetch call site must exist in production code");
+        let fetch_tail = &production[fetch_start..];
+        let fetch_end = fetch_tail
+            .find(".messages()")
+            .expect("the fetch builder chain must drain via .messages()");
+        let fetch_call = &fetch_tail[..fetch_end];
         assert!(
-            jetstream_loop.contains(".expires("),
-            "the JetStream fetch loop must set a bounded expires (long-poll); \
-             a bare no-wait fetch busy-spins a full core on an idle subject"
+            fetch_call.contains(".expires("),
+            "the JetStream fetch call must set a bounded expires (long-poll) on its \
+             own builder chain; a bare no-wait fetch busy-spins a full core on an \
+             idle subject"
         );
     }
 
