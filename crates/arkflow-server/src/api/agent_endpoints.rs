@@ -110,7 +110,7 @@ pub(super) async fn agent_commands(
 }
 pub(super) async fn agent_command_result(
     State(hub): State<hub::Hub>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     headers: HeaderMap,
     Query(query): Query<AgentCommandsQuery>,
     Json(result): Json<hub::CommandResult>,
@@ -128,6 +128,19 @@ pub(super) async fn agent_command_result(
             "missing session token".into(),
         );
     };
+    // The route id and the body id must agree: accepting only the body let a
+    // result addressed to one command settle another. Checked after the
+    // credential gate so an unauthenticated caller still gets 401.
+    if id != result.command_id {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "command_rejected",
+            format!(
+                "path command id `{id}` does not match body command id `{}`",
+                result.command_id
+            ),
+        );
+    }
     match hub
         .command_result(
             hub::AgentAuth {

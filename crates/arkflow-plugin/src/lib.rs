@@ -64,6 +64,31 @@ pub(crate) fn init_latched(
     outcome
 }
 
+/// Register a component catalogue step by step. Unlike a single latch around
+/// the whole list, a later step's failure leaves earlier steps recorded, so a
+/// retry resumes at the failed step instead of re-registering names that are
+/// already present (which the registry rejects as duplicates).
+pub(crate) fn init_steps(
+    completed: &std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    steps: &[fn() -> Result<(), Error>],
+) -> Result<(), Error> {
+    for (index, step) in steps.iter().enumerate() {
+        if completed
+            .lock()
+            .map_err(|_| Error::Config("plugin initialization lock poisoned".to_string()))?
+            .contains(&index)
+        {
+            continue;
+        }
+        step()?;
+        completed
+            .lock()
+            .map_err(|_| Error::Config("plugin initialization lock poisoned".to_string()))?
+            .insert(index);
+    }
+    Ok(())
+}
+
 /// Register the built-in component catalogue once per process.
 ///
 /// Both the local Engine and the standalone Hub expose this metadata to

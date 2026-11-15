@@ -35,11 +35,32 @@ pub(crate) fn normalize_and_concat(batches: &[RecordBatch]) -> Result<RecordBatc
         ));
     }
     if batches.len() == 1 {
+        // Even without a merge, a duplicate column name makes every later
+        // by-name lookup resolve to the first copy — the same stale-value
+        // failure the multi-batch path rejects.
+        if let Some(name) = duplicate_column_name(batches[0].schema().as_ref()) {
+            return Err(Error::Process(format!(
+                "batch merge: a batch has duplicate column `{name}`; merging by name would \
+                 silently drop one of them"
+            )));
+        }
         return Ok(batches[0].clone());
     }
 
     let (schema, projected) = normalize_to_union(batches)?;
     concat_batches(&schema, &projected).map_err(|e| Error::Process(format!("batch merge: {}", e)))
+}
+
+/// First column name that appears more than once in `schema`. Arrow permits
+/// duplicate field names; a by-name projection would silently pick one.
+fn duplicate_column_name(schema: &Schema) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name())
+        .find(|name| !seen.insert(*name))
+        .cloned()
 }
 
 /// Project each batch onto the union schema (first-seen column order,
@@ -53,6 +74,12 @@ pub(crate) fn normalize_to_union(
     let mut fields: Vec<Field> = Vec::new();
     let mut positions: HashMap<String, usize> = HashMap::new();
     for batch in batches {
+        if let Some(name) = duplicate_column_name(batch.schema().as_ref()) {
+            return Err(Error::Process(format!(
+                "batch merge: a batch has duplicate column `{name}`; merging by name would \
+                 silently drop one of them"
+            )));
+        }
         for field in batch.schema().fields() {
             match positions.get(field.name()) {
                 None => {
@@ -184,6 +211,17 @@ mod tests {
             msg.contains("Utf8") && msg.contains("Int64"),
             "message should name both types: {msg}"
         );
+    }
+
+    #[test]
+    fn duplicate_columns_within_one_batch_are_rejected() {
+        let (fa, ca) = utf8("id", vec![Some("a")]);
+        let (fb, cb) = utf8("id", vec![Some("shadowed")]);
+        let duplicated = batch(vec![fa, fb], vec![ca, cb]);
+
+        let err = normalize_and_concat(&[duplicated]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate column `id`"), "{msg}");
     }
 
     #[test]

@@ -7,6 +7,36 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// Distinguishes concurrent temp files for the same key inside one process.
+static CHECKPOINT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Encode a node id as one collision-free object-key component.
+///
+/// The old `replace('/', "_")` mapped `rack/a` and `rack_a` onto the same key,
+/// so two registered nodes could overwrite each other's intermediate
+/// manifests. Percent-encoding is reversible and keeps the safe ASCII set
+/// readable.
+/// The pre-`encode_node_key` mapping (`/` → `_`). Kept only so recovery and
+/// deletion can also look at intermediate manifests written by older builds,
+/// whose keys are not reproducible with the current encoding.
+pub fn legacy_encode_node_key(node_id: &str) -> String {
+    node_id.replace('/', "_")
+}
+
+pub fn encode_node_key(node_id: &str) -> String {
+    let mut encoded = String::with_capacity(node_id.len());
+    for byte in node_id.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePosition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,7 +233,11 @@ impl CheckpointStore for FileCheckpointStore {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| Error::Config("invalid checkpoint store key".into()))?;
-        let temp_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+        let temp_path = path.with_file_name(format!(
+            ".{file_name}.tmp-{}-{}",
+            std::process::id(),
+            CHECKPOINT_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let write_atomic = || -> Result<(), Error> {
             use std::io::Write;
             let mut file = std::fs::File::create(&temp_path)
@@ -215,10 +249,18 @@ impl CheckpointStore for FileCheckpointStore {
             drop(file);
             std::fs::rename(&temp_path, &path)
                 .map_err(|error| Error::Process(format!("publish checkpoint object: {error}")))?;
-            if let Some(parent) = path.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
+            // Make the rename itself durable before retention is allowed to
+            // delete the predecessor (a non-durable rename loses both).
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                let dir = std::fs::File::open(parent).map_err(|error| {
+                    Error::Process(format!("open checkpoint directory for sync: {error}"))
+                })?;
+                dir.sync_all().map_err(|error| {
+                    Error::Process(format!("sync checkpoint directory: {error}"))
+                })?;
             }
             Ok(())
         };
@@ -443,12 +485,22 @@ impl<S: CheckpointStore> CheckpointRepository<S> {
             let intermediate_manifest_keys = manifest
                 .task_attempts
                 .iter()
-                .map(|attempt| {
-                    format!(
-                        "{prefix}/{}/manifests/{}.json",
-                        manifest.checkpoint_id,
-                        attempt.node_id.replace('/', "_")
-                    )
+                .flat_map(|attempt| {
+                    // Pre-encoding builds keyed intermediate manifests with
+                    // `/` replaced by `_`; both spellings must be reclaimed so
+                    // an upgrade does not orphan the old objects.
+                    [
+                        format!(
+                            "{prefix}/{}/manifests/{}.json",
+                            manifest.checkpoint_id,
+                            encode_node_key(&attempt.node_id)
+                        ),
+                        format!(
+                            "{prefix}/{}/manifests/{}.json",
+                            manifest.checkpoint_id,
+                            legacy_encode_node_key(&attempt.node_id)
+                        ),
+                    ]
                 })
                 .collect::<BTreeSet<_>>();
             let other_kind = match artifact.kind {

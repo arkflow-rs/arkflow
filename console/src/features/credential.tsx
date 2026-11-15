@@ -100,7 +100,11 @@ export function RuntimeCredentialPanel({ onError }: { onError?: (message: string
     clearAuthChallenge()
     setBusy(true)
     try {
-      await queryClient.invalidateQueries()
+      // Drop every cached result from the previous identity: keeping it
+      // visible after a failed refetch would expose data the new credential
+      // may not be allowed to read.
+      await queryClient.cancelQueries()
+      queryClient.removeQueries()
     } catch (cause) {
       onError?.(t('settings.credentials.refreshFailed', { message: String(cause) }))
     } finally {

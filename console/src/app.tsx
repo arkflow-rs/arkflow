@@ -122,6 +122,15 @@ function ConsoleShell() {
   const [error, setError] = useState('')
   const [live, setLive] = useState(false)
   const [oidcAuthenticated, setOidcAuthenticated] = useState(false)
+  const [credentialEpoch, setCredentialEpoch] = useState(0)
+
+  // A credential change must also rebuild the live SSE subscription: the
+  // client reads the token only when connecting.
+  useEffect(() => {
+    const onCredentialChanged = () => setCredentialEpoch((value) => value + 1)
+    window.addEventListener('arkflow-credential-changed', onCredentialChanged)
+    return () => window.removeEventListener('arkflow-credential-changed', onCredentialChanged)
+  }, [])
 
   const refresh = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ['live'] })
@@ -146,7 +155,7 @@ function ConsoleShell() {
       window.clearTimeout(pending)
       controller.abort()
     }
-  }, [refresh, selectedNode])
+  }, [refresh, selectedNode, credentialEpoch])
 
   // Query failures render in their own banner so they never clobber error
   // state from mutations and page callbacks; keepPreviousData placeholders on
@@ -278,8 +287,12 @@ function ConsoleShell() {
             {oidcAuthenticated && (
               <button
                 onClick={() => {
-                  setOidcAuthenticated(false)
                   void oidcLogout()
+                    .then((ok) => {
+                      if (ok) setOidcAuthenticated(false)
+                      else setError('Sign-out failed; retry')
+                    })
+                    .catch(() => setError('Sign-out failed; retry'))
                 }}
               >
                 {t('header.signOut')}

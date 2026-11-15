@@ -347,6 +347,7 @@ impl Hub {
             capabilities: sanitize_capabilities(request.capabilities.clone()),
             last_seen_at_ms: now,
             lease_expires_at_ms: now + self.config.lease_ttl_ms,
+            report_seq: 0,
             streams_total: 0,
             streams_running: 0,
             streams_failed: 0,
@@ -359,12 +360,49 @@ impl Hub {
         };
         let mut nodes = self.nodes.write().await;
         if nodes.len() >= MAX_NODES && !nodes.contains_key(&request.node_id) {
-            return Err(HubError::Capacity);
+            // Retired nodes used to occupy the fixed registry forever: the
+            // expiry sweep only changes their state, never removes the map
+            // entry. Reclaim one expired/offline slot instead of rejecting a
+            // live node for the whole process lifetime.
+            let reclaimable = nodes
+                .iter()
+                .find(|(id, record)| {
+                    id.as_str() != request.node_id
+                        && (record.resource.state != NodeConnectionState::Online
+                            || record.resource.lease_expires_at_ms <= now)
+                })
+                .map(|(id, _)| id.clone());
+            match reclaimable {
+                Some(id) => {
+                    nodes.remove(&id);
+                }
+                None => return Err(HubError::Capacity),
+            }
         }
         let old = nodes.remove(&request.node_id);
         let boot_changed = old
             .as_ref()
             .is_some_and(|record| record.boot_id.as_deref() != Some(registered_boot_id.as_str()));
+        // Commands queued for an old process belong to a runtime that no
+        // longer exists. Reconciliation below will enqueue the desired
+        // state for the new boot.
+        //
+        // A same-boot session refresh keeps its leases AS leases. Re-queuing
+        // a still-valid lease looked attractive (a poll response issued under
+        // the expired token might never have reached the Agent), but a
+        // command the Agent already executed but whose result post raced the
+        // session expiry would then be re-executed under the SAME command and
+        // checkpoint id. Checkpoint rounds are not idempotent — the kernel
+        // rejects the repeated barrier ("stale duplicate barrier") — so the
+        // pause capture would fail. The expiry sweep is the recovery path: it
+        // settles the timed-out operation and the caller re-dispatches a
+        // FRESH capture id.
+        let (commands, leased_commands) = match &old {
+            Some(record) if !boot_changed => {
+                (record.commands.clone(), record.leased_commands.clone())
+            }
+            _ => (VecDeque::new(), BTreeMap::new()),
+        };
         nodes.insert(
             request.node_id.clone(),
             NodeRecord {
@@ -378,23 +416,8 @@ impl Hub {
                 // registrations: a reconnecting node re-earns its streak
                 // within a few report intervals (bounded rebalance delay).
                 pressure_streak: 0,
-                // Commands queued for an old process belong to a runtime that
-                // no longer exists. Reconciliation below will enqueue the
-                // desired state for the new boot.
-                commands: if boot_changed {
-                    VecDeque::new()
-                } else {
-                    old.as_ref()
-                        .map(|record| record.commands.clone())
-                        .unwrap_or_default()
-                },
-                leased_commands: if boot_changed {
-                    BTreeMap::new()
-                } else {
-                    old.as_ref()
-                        .map(|record| record.leased_commands.clone())
-                        .unwrap_or_default()
-                },
+                commands,
+                leased_commands,
                 streams: old
                     .as_ref()
                     .map(|record| record.streams.clone())
@@ -631,6 +654,9 @@ impl Hub {
         }
         let now = now_ms();
         node.resource.last_seen_at_ms = now;
+        // The node view reports which state report it reflects; heartbeats
+        // refresh last_seen but never this.
+        node.resource.report_seq = node.report_seq;
         node.resource.lease_expires_at_ms = now + self.config.lease_ttl_ms;
         node.resource.state = if report.state == "draining" {
             NodeConnectionState::Draining

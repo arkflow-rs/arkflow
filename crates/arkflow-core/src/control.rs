@@ -238,6 +238,7 @@ pub struct EngineStatus {
     /// Whether the configuration approval gate is enabled on this Hub (see
     /// `configuration-approval`); absent (false) on older binaries. The
     /// Console uses it to switch the publish flow to submit-for-approval.
+    #[serde(default)]
     pub approval_required: bool,
 }
 

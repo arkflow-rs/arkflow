@@ -10,7 +10,10 @@ use crate::MessageBatchRef;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 /// Trigger policy for a window operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +289,27 @@ pub(crate) struct WindowFiredAck {
     pub(crate) inner: Arc<dyn Ack>,
     pub(crate) rollback: Arc<WindowRollback>,
     pub(crate) operation_guard: Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
+    /// A successful acknowledgement already installed the `after` snapshot.
+    /// A retained handle acknowledged again must not re-apply it (it could
+    /// move watermarks/processing timers backwards).
+    pub(crate) completed: AtomicBool,
+}
+
+/// Restores the `before` snapshot if the acknowledgement future is dropped
+/// (cancelled) before it settles. `Drop` is synchronous; the rollback path
+/// only takes std mutexes and does best-effort backend writes.
+struct CancelRollback<'a> {
+    rollback: &'a WindowRollback,
+    armed: bool,
+}
+
+impl Drop for CancelRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.rollback.restore(&self.rollback.before);
+            self.rollback.restore_persist_undo();
+        }
+    }
 }
 
 impl WindowFiredAck {
@@ -307,15 +331,25 @@ impl WindowFiredAck {
 impl Ack for WindowFiredAck {
     async fn ack(&self) -> Result<(), Error> {
         self.inner.release_held();
+        if self.completed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let guard = self.take_guard().await;
+        let mut cancel_guard = CancelRollback {
+            rollback: &self.rollback,
+            armed: true,
+        };
         match self.inner.ack().await {
             Ok(()) => {
+                cancel_guard.armed = false;
                 self.rollback.restore(&self.rollback.after);
                 self.rollback.clear_persist_undo();
+                self.completed.store(true, Ordering::Release);
                 drop(guard);
                 Ok(())
             }
             Err(error) => {
+                cancel_guard.armed = false;
                 self.rollback.restore(&self.rollback.before);
                 self.rollback.restore_persist_undo();
                 self.retain_guard(guard);
@@ -335,6 +369,7 @@ impl Ack for WindowFiredAck {
         // of which error is returned.
         self.rollback.restore(&self.rollback.before);
         self.rollback.restore_persist_undo();
+        self.completed.store(false, Ordering::Release);
         drop(guard);
         result
     }
@@ -345,6 +380,7 @@ impl Ack for WindowFiredAck {
         let result = self.inner.abort().await;
         self.rollback.restore(&self.rollback.before);
         self.rollback.restore_persist_undo();
+        self.completed.store(false, Ordering::Release);
         drop(guard);
         result
     }

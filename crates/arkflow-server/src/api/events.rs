@@ -56,6 +56,21 @@ pub(super) async fn hub_events(
     .into_response()
 }
 
+fn sse_event(update: hub::HubEvent) -> SseEvent {
+    let mut event = SseEvent::default();
+    // Only persisted events carry a replayable cursor. A live-only Hub event
+    // must not advance Last-Event-ID into a timestamp space that the replay
+    // path (persisted integer ids) cannot interpret; the reconnect branch
+    // sends `resync` when such events exist.
+    if let Some(event_id) = update.event_id {
+        event = event.id(event_id.to_string());
+    }
+    event
+        .event(update.event.event_type.clone())
+        .json_data(update)
+        .unwrap_or_else(|_| SseEvent::default().event("resync").data("{}"))
+}
+
 pub(super) async fn hub_event_stream(
     State(hub): State<hub::Hub>,
     Query(query): Query<EventQuery>,
@@ -86,9 +101,18 @@ pub(super) async fn hub_event_stream(
     // deduplicated by event id below — only for replaying clients, since a
     // live-only client never receives the snapshot.
     let receiver = hub.subscribe();
-    let mut existing = hub.events(query.node_id.as_deref()).await;
+    let all_events = hub.events(query.node_id.as_deref()).await;
+    // Retention boundary comes from the UNFILTERED window: a cursor older
+    // than the oldest retained event is expired even when the subscription
+    // filter happens to match nothing.
+    let retention_oldest_id = all_events.iter().filter_map(|event| event.event_id).min();
+    let mut existing = all_events;
     existing.retain(|event| event_matches(event, &query));
     let seen_through = existing.iter().filter_map(|event| event.event_id).max();
+    // Hub events reported by Agents are in-memory only (no persisted id).
+    // They cannot be replayed from a persisted cursor, so a reconnecting
+    // client must be told to resynchronize instead of silently missing them.
+    let has_live_only = existing.iter().any(|event| event.event_id.is_none());
     let dedup_through = if last_event_id.is_some() {
         seen_through
     } else {
@@ -97,8 +121,10 @@ pub(super) async fn hub_event_stream(
     let mut replay = VecDeque::new();
     if let Some(last_event_id) = last_event_id {
         let last_event_id = last_event_id.min(i64::MAX as u64) as i64;
-        let oldest_id = existing.iter().filter_map(|event| event.event_id).min();
-        if oldest_id.is_some_and(|event_id| last_event_id < event_id.saturating_sub(1)) {
+        if has_live_only
+            || retention_oldest_id
+                .is_some_and(|event_id| last_event_id < event_id.saturating_sub(1))
+        {
             replay.push_back(None);
         }
         let mut pending = existing
@@ -117,16 +143,7 @@ pub(super) async fn hub_event_stream(
         |(mut replay, mut receiver, query, dedup_through)| async move {
             if let Some(update) = replay.pop_front() {
                 let event = update
-                    .map(|update| {
-                        SseEvent::default()
-                            .id(update
-                                .event_id
-                                .unwrap_or(update.event.occurred_at_ms as i64)
-                                .to_string())
-                            .event(update.event.event_type.clone())
-                            .json_data(update)
-                            .unwrap_or_else(|_| SseEvent::default().event("resync").data("{}"))
-                    })
+                    .map(sse_event)
                     .unwrap_or_else(|| SseEvent::default().event("resync").data("{}"));
                 return Some((
                     Ok::<_, Infallible>(event),
@@ -141,14 +158,7 @@ pub(super) async fn hub_event_stream(
                                 .event_id
                                 .is_some_and(|id| dedup_through.is_some_and(|seen| id <= seen)) =>
                     {
-                        let event = SseEvent::default()
-                            .id(update
-                                .event_id
-                                .unwrap_or(update.event.occurred_at_ms as i64)
-                                .to_string())
-                            .event(update.event.event_type.clone())
-                            .json_data(update)
-                            .unwrap_or_else(|_| SseEvent::default().event("resync").data("{}"));
+                        let event = sse_event(update);
                         break Some((
                             Ok::<_, Infallible>(event),
                             (replay, receiver, query, dedup_through),

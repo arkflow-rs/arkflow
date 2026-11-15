@@ -204,10 +204,16 @@ impl PulsarConfigValidator {
             )));
         }
 
-        // Check if URL has more than just the prefix
-        if url.len() <= "pulsar://".len()
-            || (url.starts_with("pulsar+ssl://") && url.len() <= "pulsar+ssl://".len())
-        {
+        // Check that a host is actually present: `pulsar:///missing-host`
+        // passes a pure length check but has no authority.
+        let rest = url
+            .strip_prefix("pulsar+ssl://")
+            .or_else(|| url.strip_prefix("pulsar://"))
+            .unwrap_or_default();
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        // Strip userinfo, if any: the host follows the last '@'.
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        if host.is_empty() || host.starts_with(':') {
             return Err(Error::Config("Service URL must include host".to_string()));
         }
 

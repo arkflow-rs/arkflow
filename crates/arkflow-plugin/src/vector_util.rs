@@ -64,15 +64,24 @@ pub(crate) fn extract_vectors(
                     (start..start + *dim as i64)
                         .map(|slot| {
                             if values.is_null(slot as usize) {
-                                Err(null_vector_element_error(
+                                return Err(null_vector_element_error(
                                     component,
                                     field,
                                     row,
                                     slot as usize,
-                                ))
-                            } else {
-                                Ok(values.value(slot as usize))
+                                ));
                             }
+                            let value = values.value(slot as usize);
+                            if !value.is_finite() {
+                                return Err(non_finite_vector_element_error(
+                                    component,
+                                    field,
+                                    row,
+                                    slot as usize,
+                                    value,
+                                ));
+                            }
+                            Ok(value)
                         })
                         .collect::<Result<Vec<f32>, Error>>()?,
                 );
@@ -98,10 +107,15 @@ pub(crate) fn extract_vectors(
                         .map(|slot| {
                             let slot = slot as usize;
                             if values.is_null(slot) {
-                                Err(null_vector_element_error(component, field, row, slot))
-                            } else {
-                                Ok(values.value(slot))
+                                return Err(null_vector_element_error(component, field, row, slot));
                             }
+                            let value = values.value(slot);
+                            if !value.is_finite() {
+                                return Err(non_finite_vector_element_error(
+                                    component, field, row, slot, value,
+                                ));
+                            }
+                            Ok(value)
                         })
                         .collect::<Result<Vec<f32>, Error>>()?,
                 );
@@ -139,6 +153,21 @@ fn null_vector_element_error(component: &str, field: &str, row: usize, slot: usi
     ))
 }
 
+/// JSON has no NaN/Infinity: serde_json silently turns non-finite floats
+/// into `null`, which a remote service rejects (or worse, stores) without
+/// pointing back at the input row. Reject them here instead.
+fn non_finite_vector_element_error(
+    component: &str,
+    field: &str,
+    row: usize,
+    slot: usize,
+    value: f32,
+) -> Error {
+    Error::Process(format!(
+        "{component}: column '{field}' has a non-finite vector element ({value}) at row {row}, slot {slot}"
+    ))
+}
+
 /// Appends a UTF-8 column of `values` to a copy of `batch`.
 pub(crate) fn append_column(
     component: &str,
@@ -147,6 +176,12 @@ pub(crate) fn append_column(
     values: &[String],
 ) -> Result<MessageBatch, Error> {
     let schema = batch.schema();
+    if schema.column_with_name(target_field).is_some() {
+        return Err(Error::Process(format!(
+            "{component}: target field '{target_field}' already exists; a duplicate Arrow \
+             column would make name lookup read the stale input"
+        )));
+    }
     let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(target_field, DataType::Utf8, true)));
     let mut columns: Vec<ArrayRef> = (0..batch.num_columns())
@@ -308,5 +343,51 @@ pub(crate) mod test_support {
         pub(crate) fn max_in_flight(&self) -> usize {
             self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixed_size_vector_batch(values: Vec<Vec<f32>>) -> MessageBatchRef {
+        let dim = values.first().map(Vec::len).unwrap_or(0) as i32;
+        let flat: Vec<f32> = values.into_iter().flatten().collect();
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let list = FixedSizeListArray::new(
+            Arc::clone(&item),
+            dim,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "embedding",
+                DataType::FixedSizeList(item, dim),
+                true,
+            )])),
+            vec![Arc::new(list)],
+        )
+        .unwrap();
+        MessageBatch::new_arrow(batch).into_arc()
+    }
+
+    #[test]
+    fn non_finite_vector_elements_are_rejected_before_json() {
+        let batch = fixed_size_vector_batch(vec![vec![1.0, f32::NAN], vec![f32::INFINITY, 0.0]]);
+        let error = extract_vectors("test", &batch, "embedding")
+            .expect_err("NaN/Infinity must not reach JSON serialization")
+            .to_string();
+        assert!(error.contains("non-finite vector element"), "{error}");
+        assert!(error.contains("row 0, slot 1"), "{error}");
+    }
+
+    #[test]
+    fn finite_vector_elements_round_trip() {
+        let batch = fixed_size_vector_batch(vec![vec![1.0, -2.5]]);
+        assert_eq!(
+            extract_vectors("test", &batch, "embedding").unwrap(),
+            vec![vec![1.0, -2.5]]
+        );
     }
 }

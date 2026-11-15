@@ -150,6 +150,8 @@ fn sweep_leftover_servers() {
             "ps",
             "-aq",
             "--filter",
+            "status=exited",
+            "--filter",
             "label=org.testcontainers.managed-by=testcontainers",
             "--filter",
             "ancestor=nats:2-alpine",
@@ -420,28 +422,33 @@ async fn jetstream_input_reads_and_acks_durable_messages() {
     );
     input.close().await.expect("close input");
 
-    // A second durable consumer on the same subscription must not
-    // re-receive the acknowledged messages.
-    let verifier = build_input(serde_json::json!({
-        "url": NATS_URL,
-        "mode": {
-            "type": "jet_stream",
-            "stream": stream_name,
-            "consumer_name": consumer_name,
-            "durable_name": consumer_name,
-        },
-        "auth": auth(),
-    }))
-    .await;
-    match tokio::time::timeout(Duration::from_secs(2), verifier.read()).await {
-        Err(_) => {}     // no redelivery within the window: pass
-        Ok(Err(_)) => {} // surfaced as disconnection, not redelivered data: pass
-        Ok(Ok((batch, _))) => panic!(
-            "acknowledged JetStream messages were re-delivered: {:?}",
-            batch.to_binary("__value__")
-        ),
-    }
-    verifier.close().await.expect("close verifier");
+    // Verify through the broker's own consumer state. A second input used to
+    // stand in for this probe, but it counted ANY read error (failed attach,
+    // broker refused the consumer) as "no redelivery", so a verifier that
+    // never worked looked like a pass.
+    let verifier_client = admin_client().await.expect("verifier client");
+    let verifier_js = async_nats::jetstream::new(verifier_client);
+    let mut consumer: async_nats::jetstream::consumer::PullConsumer = verifier_js
+        .get_consumer_from_stream(consumer_name.as_str(), stream_name.as_str())
+        .await
+        .expect("consumer lookup");
+    let info = consumer.info().await.expect("consumer info");
+    assert_eq!(
+        info.num_ack_pending, 0,
+        "every delivered JetStream message must be acknowledged"
+    );
+    assert_eq!(
+        info.num_redelivered, 0,
+        "acknowledged JetStream messages must not be redelivered"
+    );
+    assert_eq!(
+        info.ack_floor.stream_sequence, TOTAL as u64,
+        "the consumer's acknowledged stream sequence must cover every message"
+    );
+    assert_eq!(
+        info.num_pending, 0,
+        "the consumer must have consumed the whole stream"
+    );
 }
 
 #[tokio::test]

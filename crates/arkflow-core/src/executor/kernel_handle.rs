@@ -55,6 +55,13 @@ impl CompletionSlot {
     }
 }
 
+/// One checkpoint failure reported by a chain: the barrier it belongs to
+/// (`None` for a failure that cannot be attributed to a round) plus the error.
+type CheckpointErrorReport = (Option<crate::checkpoint::CheckpointBarrier>, Error);
+
+/// Receiver for the per-chain checkpoint failure reports above.
+type CheckpointErrorReceiver = tokio::sync::mpsc::UnboundedReceiver<CheckpointErrorReport>;
+
 /// Handle to a running kernel Job: snapshot/restore/stop without consuming
 /// the handle; completion is observed via `watcher`.
 pub struct KernelJobHandle {
@@ -75,12 +82,17 @@ pub struct KernelJobHandle {
     reports: Arc<
         tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<super::barrier::ChainSnapshot>>,
     >,
-    checkpoint_errors: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Error>>>,
+    checkpoint_errors: Arc<tokio::sync::Mutex<CheckpointErrorReceiver>>,
     /// Exit notifications from chains, used to exempt ended chains from
     /// barrier rounds. The handle holds a keep-alive sender so the receiver
     /// only reports real notifications, never channel closure.
     chain_finished: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     _finished_keepalive: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Chains that have exited. Once observed, the exemption must survive
+    /// every later round: the one-shot `chain_finished` notification cannot
+    /// be re-read, and a later round would otherwise inject a barrier into a
+    /// closed channel and wait for a report that can never arrive.
+    ended_tasks: tokio::sync::Mutex<BTreeSet<String>>,
     checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
     /// Round deadline in milliseconds (see CHECKPOINT_ROUND_TIMEOUT);
     /// AtomicU64 so tests can shrink it without waiting 10 minutes.
@@ -222,9 +234,10 @@ impl KernelJobHandle {
         }
         // Chains whose event loop already exited can neither receive barriers
         // (their barrier receiver dropped with the hook) nor send reports.
-        // Exempt them from this round instead of parking the wait loop on a
-        // report that will never arrive.
-        let mut ended = BTreeSet::new();
+        // Exempt them from this and every later round instead of parking the
+        // wait loop on a report that will never arrive. The exit notification
+        // is one-shot, so the set must live in the handle, not in this call.
+        let mut ended = self.ended_tasks.lock().await;
         {
             let mut finished = self.chain_finished.lock().await;
             while let Ok(task_id) = finished.try_recv() {
@@ -232,14 +245,39 @@ impl KernelJobHandle {
             }
         }
         if inject_locally {
+            // Barrier injection must obey the same deadline and cancellation
+            // as report collection: a source whose bounded barrier queue is
+            // full used to park this call while holding the round lock, so
+            // every later checkpoint blocked behind it.
+            let injection_deadline = tokio::time::Instant::now() + self.round_timeout();
             for (task_id, sender) in &self.barrier_senders {
                 if ended.contains(task_id) {
                     continue;
                 }
-                sender
-                    .send_async(super::envelope::Envelope::Barrier(barrier.clone()))
-                    .await
-                    .map_err(|_| Error::Process("source barrier channel is closed".into()))?;
+                tokio::select! {
+                    _ = self.cancellation.cancelled() => {
+                        return Err(Error::Process(
+                            "kernel cancelled during checkpoint barrier injection".into(),
+                        ));
+                    }
+                    result = tokio::time::timeout_at(
+                        injection_deadline,
+                        sender.send_async(super::envelope::Envelope::Barrier(barrier.clone())),
+                    ) => match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            return Err(Error::Process(
+                                "source barrier channel is closed".into(),
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(Error::Process(format!(
+                                "checkpoint barrier injection timed out after {:?}",
+                                self.round_timeout()
+                            )));
+                        }
+                    }
+                }
             }
         }
         let mut remaining: BTreeSet<String> = self
@@ -277,10 +315,34 @@ impl KernelJobHandle {
                         )));
                     }
                     error = checkpoint_errors.recv() => {
-                        if let Some(error) = error {
-                            return Err(error);
+                        match error {
+                            Some((error_barrier, error)) => {
+                                // A failure with a round identity may belong to
+                                // an abandoned earlier round; do not fail the
+                                // current round with it. `None` is a failure
+                                // that could not be attributed and applies to
+                                // the current round.
+                                if error_barrier
+                                    .as_ref()
+                                    .is_some_and(|failed| failed != &barrier)
+                                {
+                                    tracing::warn!(
+                                        checkpoint = %error_barrier
+                                            .as_ref()
+                                            .map(|barrier| barrier.checkpoint_id.as_str())
+                                            .unwrap_or_default(),
+                                        "ignoring stale checkpoint failure"
+                                    );
+                                    continue;
+                                }
+                                return Err(error);
+                            }
+                            None => {
+                                return Err(Error::Process(
+                                    "checkpoint error channel closed".into(),
+                                ));
+                            }
                         }
-                        return Err(Error::Process("checkpoint error channel closed".into()));
                     }
                     finished = chain_finished.recv() => {
                         // Unreachable None while the handle holds a keep-alive
@@ -290,6 +352,10 @@ impl KernelJobHandle {
                                 "kernel ended before checkpoint completed".into(),
                             ));
                         };
+                        // Persist the exemption for all future rounds before
+                        // any early return below: the notification will not
+                        // be delivered again.
+                        ended.insert(task_id.clone());
                         // A chain sends its report before its finished
                         // notification, so once the exit is observed the
                         // report is already queued (possibly behind reports
@@ -390,10 +456,25 @@ impl KernelJobHandle {
         // ready error branch: a snapshot error queued alongside the reports
         // would otherwise be bypassed and the round would persist as
         // successful. Drain the queue before declaring the cut consistent —
-        // the chain loop sends at most one error instead of its report, so an
-        // error queued for this round invalidates it.
-        if let Ok(error) = self.checkpoint_errors.lock().await.try_recv() {
-            return Err(error);
+        // a failure tagged with a DIFFERENT barrier belongs to an abandoned
+        // round and must not poison this one.
+        {
+            let mut errors = self.checkpoint_errors.lock().await;
+            while let Ok((error_barrier, error)) = errors.try_recv() {
+                if error_barrier
+                    .as_ref()
+                    .is_none_or(|error_barrier| *error_barrier == barrier)
+                {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    checkpoint = %error_barrier
+                        .as_ref()
+                        .map(|barrier| barrier.checkpoint_id.as_str())
+                        .unwrap_or_default(),
+                    "ignoring stale checkpoint failure"
+                );
+            }
         }
 
         // The checkpoint's state format is the CONFIGURED Job/backend
@@ -891,6 +972,7 @@ impl KernelJobRunner {
             checkpoint_errors,
             chain_finished,
             _finished_keepalive: chain_finished_tx,
+            ended_tasks: tokio::sync::Mutex::new(BTreeSet::new()),
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_round_timeout_ms: AtomicU64::new(CHECKPOINT_ROUND_TIMEOUT.as_millis() as u64),
             next_snapshot_id: AtomicU64::new(0),
@@ -931,7 +1013,10 @@ mod tests {
     /// Senders paired with a synthetically constructed handle's receivers.
     struct SyntheticChannels {
         report: tokio::sync::mpsc::UnboundedSender<ChainSnapshot>,
-        error: tokio::sync::mpsc::UnboundedSender<Error>,
+        error: tokio::sync::mpsc::UnboundedSender<(
+            Option<crate::checkpoint::CheckpointBarrier>,
+            Error,
+        )>,
         finished: tokio::sync::mpsc::UnboundedSender<String>,
     }
 
@@ -953,6 +1038,7 @@ mod tests {
             checkpoint_errors: Arc::new(tokio::sync::Mutex::new(error_rx)),
             chain_finished: Arc::new(tokio::sync::Mutex::new(finished_rx)),
             _finished_keepalive: finished_tx.clone(),
+            ended_tasks: tokio::sync::Mutex::new(BTreeSet::new()),
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_round_timeout_ms: AtomicU64::new(10 * 60 * 1000),
             next_snapshot_id: AtomicU64::new(0),
@@ -995,6 +1081,7 @@ mod tests {
                     tokio::sync::mpsc::unbounded_channel::<String>();
                 unrelated_tx
             },
+            ended_tasks: tokio::sync::Mutex::new(BTreeSet::new()),
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_round_timeout_ms: AtomicU64::new(10 * 60 * 1000),
             next_snapshot_id: AtomicU64::new(0),
@@ -1061,6 +1148,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ended_chain_stays_exempt_across_rounds() {
+        let (handle, channels) = synthetic_handle(&["a", "b"], CancellationToken::new());
+        // Round 1: b exits while the round is already waiting for reports.
+        // The round must fail (b never reported), but the exit must be
+        // remembered for every later round.
+        let (error, ()) = tokio::join!(handle.checkpoint_barrier("cp-1", 0), async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            channels
+                .report
+                .send(snapshot_report("a", "cp-1", 0))
+                .unwrap();
+            channels.finished.send("b".into()).unwrap();
+        });
+        let error = error.expect_err("a chain that ended without reporting fails the round");
+        assert!(
+            error.to_string().contains("without reporting a snapshot"),
+            "{error}"
+        );
+
+        // Round 2: only a is still running. It must not wait for b's
+        // one-shot exit notification again.
+        channels
+            .report
+            .send(snapshot_report("a", "cp-2", 1))
+            .unwrap();
+        handle
+            .checkpoint_barrier("cp-2", 1)
+            .await
+            .expect("the ended chain must stay exempt in later rounds");
+    }
+
+    #[tokio::test]
     async fn checkpoint_fails_when_the_source_barrier_channel_is_closed() {
         let (mut handle, _channels) = synthetic_handle(&["a"], CancellationToken::new());
         // A source chain whose barrier receiver was dropped with its event
@@ -1116,7 +1235,7 @@ mod tests {
         let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
         channels
             .error
-            .send(Error::Process("injected snapshot failure".into()))
+            .send((None, Error::Process("injected snapshot failure".into())))
             .unwrap();
         let error = handle
             .checkpoint_barrier("cp-1", 0)
@@ -1258,7 +1377,7 @@ mod tests {
             let (handle, channels) = synthetic_handle(&["a"], CancellationToken::new());
             channels
                 .error
-                .send(Error::Process("injected post-report failure".into()))
+                .send((None, Error::Process("injected post-report failure".into())))
                 .unwrap();
             channels
                 .report

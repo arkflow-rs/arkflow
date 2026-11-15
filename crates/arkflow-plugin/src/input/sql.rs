@@ -128,7 +128,9 @@ pub struct SqlInput {
     input_name: Option<String>,
     sql_config: SqlInputConfig,
     stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
-    cancellation_token: CancellationToken,
+    /// Replaceable so a close→connect cycle starts with a live token; the old
+    /// token stayed cancelled and the next read returned EOF immediately.
+    cancellation_token: Arc<Mutex<CancellationToken>>,
 }
 
 impl SqlInput {
@@ -138,7 +140,7 @@ impl SqlInput {
             input_name: name.map(str::to_string),
             sql_config,
             stream: Arc::new(Mutex::new(None)),
-            cancellation_token,
+            cancellation_token: Arc::new(Mutex::new(cancellation_token)),
         })
     }
 }
@@ -146,6 +148,8 @@ impl SqlInput {
 #[async_trait]
 impl Input for SqlInput {
     async fn connect(&self) -> Result<(), Error> {
+        // A reconnect replaces both the stream and the cancellation token.
+        *self.cancellation_token.lock().await = CancellationToken::new();
         let stream_arc = self.stream.clone();
         let mut stream_lock = stream_arc.lock().await;
 
@@ -174,10 +178,13 @@ impl Input for SqlInput {
         let stream_arc = self.stream.clone();
         let mut stream_lock = stream_arc.lock().await;
         if stream_lock.is_none() {
+            if self.cancellation_token.lock().await.is_cancelled() {
+                return Err(Error::EOF);
+            }
             return Err(Error::Process("Stream is None".to_string()));
         }
 
-        let cancellation_token = self.cancellation_token.clone();
+        let cancellation_token = self.cancellation_token.lock().await.clone();
 
         let stream_lock = stream_lock.as_mut().unwrap();
         let mut stream_pin = stream_lock.as_mut();
@@ -203,7 +210,10 @@ impl Input for SqlInput {
     }
 
     async fn close(&self) -> Result<(), Error> {
-        let _ = self.cancellation_token.clone().cancel();
+        self.cancellation_token.lock().await.cancel();
+        // Release the installed DataFusion stream instead of leaving the plan
+        // and its resources alive with the input instance.
+        *self.stream.lock().await = None;
         Ok(())
     }
 }

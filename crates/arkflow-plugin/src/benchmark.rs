@@ -33,10 +33,12 @@ use arkflow_core::config::EngineConfig;
 use arkflow_core::executor::run_job;
 use arkflow_core::executor::stream_adapter::StreamJobAdapter;
 use arkflow_core::executor::stream_compiler::compile_stream;
+use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
 use arkflow_core::state::RedbStateBackend;
 use arkflow_core::state::StateBackend as _;
-use arkflow_core::{Bytes, Error, MessageBatch, Resource};
+use arkflow_core::{Bytes, Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -67,6 +69,48 @@ fn setup_plugins() {
     let _ = crate::processor::init();
     let _ = crate::buffer::init();
     let _ = crate::codec::init();
+    // The suite's row counter. It sits between decode and the workload's
+    // SQL step and counts the rows the kernel actually processed. The
+    // report used to divide the REQUESTED row count by wall time, so a
+    // workload that processed fewer rows than requested (early exit, a
+    // dropped tail batch) reported inflated throughput.
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        let _ = register_processor_builder("__benchmark_count_rows", Arc::new(RowCounterBuilder));
+    });
+}
+
+/// Rows the benchmark pipeline observed during the current scenario.
+static BENCH_PROCESSED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// Pass-through processor that counts rows and forwards the batch unchanged.
+/// Stateless, so the graph fuses it into the neighbouring chain at no
+/// measurable cost.
+struct RowCounter;
+
+#[async_trait::async_trait]
+impl Processor for RowCounter {
+    async fn process(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+        BENCH_PROCESSED_ROWS.fetch_add(msg_batch.len() as u64, Ordering::Relaxed);
+        Ok(ProcessResult::Single(msg_batch))
+    }
+
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+struct RowCounterBuilder;
+
+impl ProcessorBuilder for RowCounterBuilder {
+    fn build(
+        &self,
+        _name: Option<&str>,
+        _config: &Option<serde_json::Value>,
+        _resource: &Resource,
+    ) -> Result<Arc<dyn Processor>, Error> {
+        Ok(Arc::new(RowCounter))
+    }
 }
 
 fn stream_workload(count: usize, query: &str) -> String {
@@ -84,6 +128,7 @@ streams:
       thread_num: 1
       processors:
         - type: "json_to_arrow"
+        - type: "__benchmark_count_rows"
         - type: "sql"
           query: "{query}"
     output:
@@ -92,7 +137,11 @@ streams:
     )
 }
 
-async fn run_stream(config: &EngineConfig) -> Result<Duration, Error> {
+/// Run the compiled stream and return `(wall, rows actually processed)`. The
+/// row count comes from the in-pipeline counter, not from the requested
+/// `count`.
+async fn run_stream(config: &EngineConfig) -> Result<(Duration, u64), Error> {
+    BENCH_PROCESSED_ROWS.store(0, Ordering::SeqCst);
     let started = Instant::now();
     let spec = compile_stream(&config.streams[0], 0)?;
     let adapter = StreamJobAdapter::new(config.streams[0].durability.as_ref())?;
@@ -101,7 +150,10 @@ async fn run_stream(config: &EngineConfig) -> Result<Duration, Error> {
         input_names: std::cell::RefCell::new(Vec::new()),
     };
     run_job(&spec, &adapter, &mut resource, CancellationToken::new()).await?;
-    Ok(started.elapsed())
+    Ok((
+        started.elapsed(),
+        BENCH_PROCESSED_ROWS.load(Ordering::SeqCst),
+    ))
 }
 
 async fn stream_scenario(
@@ -112,12 +164,12 @@ async fn stream_scenario(
 ) -> Result<ScenarioResult, Error> {
     let config: EngineConfig = serde_yaml::from_str(&stream_workload(count, query))
         .map_err(|e| Error::Config(format!("benchmark workload invalid: {e}")))?;
-    let wall = run_stream(&config).await?;
+    let (wall, operations) = run_stream(&config).await?;
     Ok(ScenarioResult {
         name,
         description,
         unit: "rows",
-        operations: count as u64,
+        operations,
         wall,
     })
 }
@@ -126,7 +178,7 @@ async fn stream_scenario(
 async fn linear_sql(count: usize) -> Result<ScenarioResult, Error> {
     stream_scenario(
         "linear-sql",
-        "generate → json_to_arrow → sql(sum) → drop",
+        "generate → json_to_arrow → count → sql(sum) → drop",
         count,
         "SELECT sum(value) as total FROM flow",
     )
@@ -137,7 +189,7 @@ async fn linear_sql(count: usize) -> Result<ScenarioResult, Error> {
 async fn groupby_sql(count: usize) -> Result<ScenarioResult, Error> {
     stream_scenario(
         "groupby-sql",
-        "generate → json_to_arrow → sql(sum group by sensor) → drop",
+        "generate → json_to_arrow → count → sql(sum group by sensor) → drop",
         count,
         "SELECT sensor, sum(value) as total FROM flow GROUP BY sensor",
     )
@@ -148,7 +200,7 @@ async fn groupby_sql(count: usize) -> Result<ScenarioResult, Error> {
 async fn filter_project_sql(count: usize) -> Result<ScenarioResult, Error> {
     stream_scenario(
         "filter-project-sql",
-        "generate → json_to_arrow → sql(where + projection) → drop",
+        "generate → json_to_arrow → count → sql(where + projection) → drop",
         count,
         "SELECT *, value * 2 as doubled FROM flow WHERE value >= 1",
     )
@@ -415,6 +467,13 @@ async fn run_each(count: usize) -> Result<Vec<ScenarioResult>, Error> {
     ])
 }
 
+/// Serializes whole suite runs. The stream scenarios count the rows the
+/// kernel actually processed through one process-wide counter; two suites
+/// running concurrently (the library tests do) would reset and read each
+/// other's counters and report zero workload.
+static SUITE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Runs the whole suite: `warmup` untimed passes followed by `runs` measured
 /// passes, reporting the best (minimum wall clock) per scenario.
 pub async fn run_suite(
@@ -423,6 +482,7 @@ pub async fn run_suite(
     runs: usize,
 ) -> Result<Vec<ScenarioResult>, Error> {
     assert!(runs >= 1, "at least one measured run is required");
+    let _suite = SUITE_LOCK.lock().await;
     setup_plugins();
     for _ in 0..warmup {
         run_each(count).await?;

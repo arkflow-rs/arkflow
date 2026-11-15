@@ -596,6 +596,33 @@ impl JobSpec {
                 self.id
             )));
         }
+        // Each parallel sink instance constructs its own producer. Two
+        // transactional producers that share one transactional.id fence each
+        // other, so an exactly-once Kafka sink cannot run with parallelism
+        // above 1 until per-subtask transactional ids are supported.
+        if self.parallelism > 1 {
+            for sink in &self.sinks {
+                if sink.output_type == "kafka"
+                    && sink
+                        .config
+                        .get("exactly_once")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                {
+                    return Err(Error::Config(format!(
+                        "kafka sink '{}' enables exactly_once with Job parallelism {}; every \
+                         instance would share transactional_id '{}' and fence the others. Use \
+                         parallelism 1 for transactional sinks",
+                        sink.operator_id,
+                        self.parallelism,
+                        sink.config
+                            .get("transactional_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("<unset>")
+                    )));
+                }
+            }
+        }
         if self.max_parallelism == 0 {
             return Err(Error::Config("Job max_parallelism must be positive".into()));
         }
@@ -2790,6 +2817,27 @@ mod coverage_tests {
         job.state = None;
         job.checkpoint = None;
         job
+    }
+
+    #[test]
+    fn rejects_exactly_once_kafka_sink_with_parallelism_above_one() {
+        let mut job = stateless_job();
+        job.parallelism = 2;
+        job.max_parallelism = 2;
+        job.sinks[0].output_type = "kafka".into();
+        job.sinks[0].config = serde_json::json!({
+            "exactly_once": true,
+            "transactional_id": "t1"
+        });
+        let error = job.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("exactly_once") && error.contains("transactional_id"),
+            "{error}"
+        );
+
+        // A single instance is the supported shape.
+        job.parallelism = 1;
+        job.validate().unwrap();
     }
 
     #[test]

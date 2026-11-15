@@ -916,13 +916,38 @@ impl RescaleContext {
             .find(marker)
             .ok_or_else(|| Error::Process("state namespace lacks a task segment".into()))?
             + marker.len();
-        Ok(namespace[start..]
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .replace("%3A", ":")
-            .replace("%25", "%"))
+        percent_decode(namespace[start..].split(':').next().unwrap_or_default())
     }
+}
+
+/// Decode the percent-encoding used by `encode_state_component` for every
+/// escaped byte, not just `%3A`/`%25`: operator/task ids may contain `/`,
+/// spaces, or non-ASCII characters and must round-trip to the plan's id.
+fn percent_decode(value: &str) -> Result<String, Error> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = value.get(index + 1..index + 3).ok_or_else(|| {
+                Error::Process(format!(
+                    "state namespace has a truncated percent escape: {value}"
+                ))
+            })?;
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+                Error::Process(format!(
+                    "state namespace has an invalid percent escape: {value}"
+                ))
+            })?;
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| Error::Process(format!("state namespace is not valid UTF-8: {value}")))
 }
 
 /// Extract the operator-id segment from a state namespace built by
@@ -936,7 +961,7 @@ fn namespace_operator(namespace: &str) -> Result<String, Error> {
         + marker.len();
     let rest = &namespace[start..];
     let end = rest.find(":task:").unwrap_or(rest.len());
-    Ok(rest[..end].replace("%3A", ":").replace("%25", "%"))
+    percent_decode(&rest[..end])
 }
 
 fn restore_local_snapshot<S: crate::checkpoint::CheckpointStore>(
@@ -1041,11 +1066,23 @@ async fn run_local_checkpoint_loop(
             return;
         }
     };
-    let store = match crate::checkpoint::FileCheckpointStore::new(&root) {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::error!(job_id = %plan.spec.id, %error, "local Job checkpoint store could not be opened");
-            return;
+    let store = loop {
+        match crate::checkpoint::FileCheckpointStore::new(&root) {
+            Ok(store) => break store,
+            Err(error) => {
+                // A temporarily unwritable directory must not disable
+                // checkpointing for the rest of the process lifetime; retry
+                // until the store opens or the job stops.
+                tracing::warn!(
+                    job_id = %plan.spec.id,
+                    %error,
+                    "local Job checkpoint store could not be opened; retrying"
+                );
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                }
+            }
         }
     };
     let mut catalog = local_checkpoint_catalog(&root, &store, &plan);
@@ -1163,8 +1200,17 @@ fn persist_local_checkpoint(
     let planned_tasks = participants.iter().cloned().collect::<BTreeSet<_>>();
     let artifact = repository.write_checkpoint_with_plan(&manifest, &planned_tasks)?;
     catalog.record(artifact);
-    for removed in catalog.retain_checkpoints(checkpoint.retention as usize) {
-        repository.delete(&removed)?;
+    let removed = catalog.retain_checkpoints(checkpoint.retention as usize);
+    for (index, artifact) in removed.iter().enumerate() {
+        if let Err(error) = repository.delete(artifact) {
+            // The catalog already forgot these entries. Re-record the failed
+            // item and every later one so a later cycle retries the physical
+            // deletion instead of leaking objects until a restart.
+            for pending in &removed[index..] {
+                catalog.record(pending.clone());
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -3153,7 +3199,8 @@ mod runner_tests {
         )
         .await;
 
-        // A store root that cannot be created also stops the loop.
+        // A store root that cannot be created is retried rather than
+        // permanently disabling checkpointing; stop must still release it.
         let directory = tempfile::tempdir().unwrap();
         let blocked = directory.path().join("not-a-directory");
         std::fs::write(&blocked, b"file").unwrap();
@@ -3162,14 +3209,19 @@ mod runner_tests {
             retention: 1,
             object_store_uri: format!("file://{}", blocked.display()),
         };
-        run_local_checkpoint_loop(
+        let stop = CancellationToken::new();
+        let loop_task = tokio::spawn(run_local_checkpoint_loop(
             handle.clone(),
-            plan,
-            participants,
+            plan.clone(),
+            participants.clone(),
             unwritable,
-            CancellationToken::new(),
-        )
-        .await;
+            stop.clone(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        stop.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), loop_task)
+            .await
+            .expect("a cancelled checkpoint loop must stop even while retrying store open");
 
         // With an already-ended graph the barrier fails and the loop keeps
         // logging until the stop token fires.

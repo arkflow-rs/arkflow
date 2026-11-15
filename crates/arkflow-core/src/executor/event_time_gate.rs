@@ -1390,6 +1390,11 @@ fn topic_for_row(batch: &crate::MessageBatchRef, row: usize) -> Option<&str> {
         .record_batch()
         .column_by_name(crate::meta_columns::EXT)?;
     let map = column.as_any().downcast_ref::<MapArray>()?;
+    // A null Map row may still occupy an underlying entry range; reading it
+    // would attribute the row to an unrelated topic.
+    if map.is_null(row) {
+        return None;
+    }
     let entries = map.entries();
     let keys = entries.column(0).as_any().downcast_ref::<StringArray>()?;
     let values = entries.column(1).as_any().downcast_ref::<StringArray>()?;
@@ -1420,24 +1425,25 @@ pub(crate) fn split_by_physical_partition_for_source(
         )
     };
 
-    let Some(column) = batch
-        .record_batch()
-        .column_by_name(crate::meta_columns::PARTITION)
-    else {
+    let record = batch.record_batch();
+    let column = record.column_by_name(crate::meta_columns::PARTITION);
+    if column.is_none() && record.column_by_name(crate::meta_columns::EXT).is_none() {
         return Ok(vec![(fallback(fallback_partition), batch.clone())]);
-    };
-    let casted = if column.data_type() == &DataType::UInt32 {
-        None
-    } else {
-        Some(cast(column, &DataType::UInt32).map_err(|error| {
+    }
+    // A missing partition column does not mean the batch has no partition
+    // identity: `__meta_ext` may still carry a topic. Group per topic (using
+    // the fallback partition) instead of merging every topic's progress.
+    let casted = match column {
+        Some(column) if column.data_type() == &DataType::UInt32 => None,
+        Some(column) => Some(cast(column, &DataType::UInt32).map_err(|error| {
             Error::Process(format!("read physical partition metadata: {error}"))
-        })?)
+        })?),
+        None => None,
     };
     let values = casted
         .as_ref()
         .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
-        .or_else(|| column.as_any().downcast_ref::<UInt32Array>())
-        .ok_or_else(|| Error::Process("physical partition metadata is not UInt32".into()))?;
+        .or_else(|| column.and_then(|column| column.as_any().downcast_ref::<UInt32Array>()));
 
     // Single pass over borrowed (topic, partition) keys: each distinct
     // partition constructs its identity exactly once (the source-derived
@@ -1446,11 +1452,10 @@ pub(crate) fn split_by_physical_partition_for_source(
     let mut slot_of: HashMap<(Option<&str>, u32), usize> = HashMap::new();
     let mut groups: Vec<(EventTimePartition, Vec<u32>)> = Vec::new();
     for row in 0..batch.len() {
-        let partition = if values.is_null(row) {
-            fallback_partition
-        } else {
-            values.value(row)
-        };
+        let partition = values
+            .filter(|values| !values.is_null(row))
+            .map(|values| values.value(row))
+            .unwrap_or(fallback_partition);
         let borrowed = (topic_for_row(batch, row), partition);
         let slot = *slot_of.entry(borrowed).or_insert_with(|| {
             let identity = match borrowed.0 {

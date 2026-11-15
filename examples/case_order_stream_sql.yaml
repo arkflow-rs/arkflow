@@ -31,8 +31,6 @@ streams:
         # Keep paying orders only.
         - type: sql
           query: "SELECT * FROM flow WHERE status = 'PAID'"
-        # Re-encode to JSON rows for the sink.
-        - type: arrow_to_json
 
     output:
       type: sql

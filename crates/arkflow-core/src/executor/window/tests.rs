@@ -1863,6 +1863,30 @@ mod sliding_enumeration_tests {
         assert!((buffer.widened_max() - 100.0).abs() < 1e-9);
     }
 
+    #[test]
+    fn non_finite_float_rows_still_count() {
+        // NaN/Infinity cannot be represented in the persisted JSON aggregate,
+        // so the VALUE is excluded from sum/min/max — but COUNT counts rows,
+        // and dropping the row from count (and from an all-NaN window's
+        // output) silently disagreed with the input batch.
+        let mut buffer = AggregateBuffer::default();
+        buffer.observe_float(1.0, NumericKind::Float64);
+        buffer.observe_float(f64::NAN, NumericKind::Float64);
+        buffer.observe_float(f64::INFINITY, NumericKind::Float64);
+        buffer.observe_float(2.0, NumericKind::Float64);
+        assert_eq!(buffer.count, 4);
+        assert_eq!(buffer.float_observations, 2);
+        assert_eq!(buffer.non_finite_observations, 2);
+        assert_eq!(buffer.widened_sum(), 3.0);
+        assert_eq!(buffer.widened_min(), 1.0);
+        assert_eq!(buffer.widened_max(), 2.0);
+        // The counters survive a state round trip.
+        let encoded = serde_json::to_vec(&buffer).unwrap();
+        let decoded = decode_buffer(&encoded).unwrap();
+        assert_eq!(decoded.count, 4);
+        assert_eq!(decoded.non_finite_observations, 2);
+    }
+
     /// Regression: an integer observation that follows a float one must seed
     /// the integer bounds from ITS OWN first value. Seeding from `count`
     /// instead takes the `else` branch against the `Default` zero and the

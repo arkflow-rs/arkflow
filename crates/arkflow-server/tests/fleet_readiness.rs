@@ -72,14 +72,13 @@ const CONVERGENCE_SLACK: i64 = 512;
 /// Fraction (1 in N) of the fleet whose jobs toggle running/stopped per
 /// churn round.
 const TOGGLE_ONE_IN: usize = 10;
-/// Job lifecycle toggles (desired running/stopped with a generation bump)
-/// under session-TTL churn currently wedge `job_start` operations: the
-/// duplicate start cancels and awaits the previous kernel, whose WAL-safe
-/// teardown does not always finish, so the command never completes and its
-/// operation wedges past the retry cap. Disabled in the soak until that
-/// product defect is fixed by its own change; the CI staircase keeps
-/// exercising toggles (no restarts there) so the path stays covered.
-const ENABLE_JOB_TOGGLES: bool = false;
+// Job lifecycle toggles (desired running/stopped with a generation bump)
+// under session-TTL churn currently wedge `job_start` operations: the
+// duplicate start cancels and awaits the previous kernel, whose WAL-safe
+// teardown does not always finish, so the command never completes and its
+// operation wedges past the retry cap. The SOAK therefore passes
+// `toggle = false` until that product defect is fixed by its own change;
+// the CI staircase (no restarts) passes `true`, keeping the path covered.
 /// RSS growth slope treated as "platform"; calibrated generously against the
 /// first recorded soak run (~3MB/min) — see PLANNING.md capacity notes.
 /// Gated on Linux only (see the assertion); unused elsewhere.
@@ -660,16 +659,39 @@ async fn wait_quiescent(hub: &Hub, timeout: Duration) -> Duration {
     }
 }
 
-/// One churn round: optionally toggle a subset of job desired states, fire
-/// due checkpoints fleet-wide, and wait for full quiescence.
-async fn churn_round(hub: &Hub, jobs: &[String], round: usize, recorder: &mut LatencyRecorder) {
-    if ENABLE_JOB_TOGGLES {
+/// Result of one churn round: how many periodic checkpoints the Hub fired
+/// and how many terminal operations the round produced. A round that did no
+/// work must not count as a converged load sample.
+struct RoundWork {
+    fired_checkpoints: usize,
+    terminal_operations_added: i64,
+}
+
+/// One churn round: fire due checkpoints, optionally toggle a subset of job
+/// desired states, and wait for full quiescence.
+async fn churn_round(
+    hub: &Hub,
+    store: &ControlPlaneStore,
+    jobs: &[String],
+    round: usize,
+    recorder: &mut LatencyRecorder,
+    toggle: bool,
+) -> RoundWork {
+    let terminal_before = history_counts(store).await[0];
+    // Schedule before the toggles: a fresh level's jobs are running now, and
+    // a toggle may legitimately stop the very job whose first checkpoint was
+    // due.
+    let fired = hub.schedule_periodic_checkpoints().await.unwrap();
+    if toggle {
         toggle_job_subset(hub, jobs, round).await;
     }
-    let fired = hub.schedule_periodic_checkpoints().await.unwrap();
-    let _ = fired;
     let elapsed = wait_quiescent(hub, ROUND_TIMEOUT).await;
+    let terminal_after = history_counts(store).await[0];
     recorder.record(elapsed);
+    RoundWork {
+        fired_checkpoints: fired,
+        terminal_operations_added: terminal_after - terminal_before,
+    }
 }
 
 // --- Assertions ---------------------------------------------------------------
@@ -846,10 +868,47 @@ async fn run_staircase(levels: &[usize], rounds_per_level: usize, worker_note: &
         let new_jobs = create_fleet_jobs(&live.hub, &new_nodes, checkpoint_dir.path()).await;
         // Let the reconcile tick dispatch and the agents complete the starts.
         wait_quiescent(&live.hub, ROUND_TIMEOUT).await;
-        jobs.extend(new_jobs);
+        // Functional completeness before the level counts as load: a stuck
+        // start must fail here instead of being masked by "converged".
+        for job_id in &new_jobs {
+            let job = live
+                .hub
+                .job(job_id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("staircase level {level}: {job_id} disappeared"));
+            assert_eq!(
+                job.observed_state, "running",
+                "staircase level {level}: {job_id} never reached running \
+                 (desired={}, last_error={:?})",
+                job.desired_state, job.last_error
+            );
+        }
+        jobs.extend(new_jobs.iter().cloned());
 
+        let terminal_before_rounds = history_counts(&store).await[0];
+        let mut fired_checkpoints = 0usize;
         for round in 0..rounds_per_level {
-            churn_round(&live.hub, &jobs, round, &mut recorder).await;
+            let work = churn_round(&live.hub, &store, &jobs, round, &mut recorder, true).await;
+            fired_checkpoints += work.fired_checkpoints;
+        }
+        // Toggles (on for the staircase) must produce terminal work;
+        // otherwise these rounds exercised nothing and must not be reported
+        // as converged samples.
+        assert!(
+            history_counts(&store).await[0] > terminal_before_rounds,
+            "staircase level {level}: {rounds_per_level} rounds produced no terminal \
+             operation (checkpoints scheduled explicitly: {fired_checkpoints})"
+        );
+        // Each fresh level's Jobs must also have been checkpointed: the
+        // serve_hub tick (which may win the race against the explicit
+        // schedule above) fires the first wave, so the records exist
+        // regardless of who scheduled them.
+        for job_id in &new_jobs {
+            assert!(
+                !live.hub.job_checkpoints(job_id).await.unwrap().is_empty(),
+                "staircase level {level}: {job_id} never received a periodic checkpoint"
+            );
         }
         assert_history_converged(&live.hub, &store, &format!("staircase level {level}")).await;
         println!(
@@ -893,6 +952,20 @@ async fn run_soak(
     let nodes = fleet.node_ids();
     let jobs = create_fleet_jobs(&live.hub, &nodes, checkpoint_dir.path()).await;
     wait_quiescent(&live.hub, ROUND_TIMEOUT).await;
+    // The soak's load is only meaningful once every Job actually runs.
+    for job_id in &jobs {
+        let job = live
+            .hub
+            .job(job_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{worker_note}: {job_id} disappeared before the soak"));
+        assert_eq!(
+            job.observed_state, "running",
+            "{worker_note}: {job_id} never reached running (desired={}, last_error={:?})",
+            job.desired_state, job.last_error
+        );
+    }
 
     let monitor_stop = CancellationToken::new();
     let rss_task = spawn_rss_monitor(monitor_stop.clone());
@@ -911,6 +984,12 @@ async fn run_soak(
     // restart recovery; they must still converge (hard assertion).
     let mut recovery_recorder = LatencyRecorder::default();
     let mut in_restart_window = false;
+    // Load-coverage evidence. The terminal-operation delta is informative
+    // only: the retention sweep runs every tick, so a round that completed
+    // work can still show a flat (or negative) terminal count. The per-Job
+    // checkpoint assertion below is the authoritative gate.
+    let mut fired_checkpoints = 0usize;
+    let mut terminal_operations_added = 0i64;
 
     while started.elapsed() < duration {
         if next_restart < restart_at.len() && started.elapsed() >= restart_at[next_restart] {
@@ -931,7 +1010,19 @@ async fn run_soak(
         } else {
             &mut recorder
         };
-        churn_round(&live.hub, &jobs, round, recorder_for_round).await;
+        let work = churn_round(
+            &live.hub,
+            &store,
+            &jobs,
+            round,
+            recorder_for_round,
+            // Job toggles are disabled under session-TTL churn: see the
+            // toggle note near the tuning constants.
+            false,
+        )
+        .await;
+        fired_checkpoints += work.fired_checkpoints;
+        terminal_operations_added += work.terminal_operations_added;
         in_restart_window = false;
         round += 1;
         if started.elapsed() > duration / 2
@@ -944,6 +1035,19 @@ async fn run_soak(
 
     monitor_stop.cancel();
     let rss_samples = rss_task.await.unwrap();
+    // A soak whose Jobs were never checkpointed proves nothing about
+    // recovery or convergence under load. This is asserted per Job: the
+    // serve_hub tick may schedule the wave before the explicit churn call,
+    // and the retention sweep can keep the terminal-operation counter flat,
+    // so neither in-loop counter is a reliable hard gate on its own.
+    for job_id in &jobs {
+        assert!(
+            !live.hub.job_checkpoints(job_id).await.unwrap().is_empty(),
+            "{worker_note}: {job_id} never received a periodic checkpoint \
+             (explicitly scheduled in-loop: {fired_checkpoints}, terminal ops delta: \
+             {terminal_operations_added})"
+        );
+    }
     // Final recovery proof, then the boundedness gate. Terminal operations
     // legitimately accumulate with restart-driven re-dispatch and checkpoint
     // waves (they converge AT the retention bound, not at zero), so absolute
@@ -972,37 +1076,58 @@ async fn run_soak(
         );
     }
     let final_counts = after_second;
-    if let Some(slope) = rss_slope_kb_per_sec(&rss_samples) {
+    let whole_slope = rss_slope_kb_per_sec(&rss_samples);
+    if gate_rss_slope {
+        #[cfg(target_os = "linux")]
+        {
+            // A run that gated RSS must actually have measurable samples:
+            // silently skipping the gate on too-few samples let a sampler
+            // regression (or a cut-short run) pass as clean.
+            let slope = whole_slope.unwrap_or_else(|| {
+                panic!(
+                    "{worker_note}: RSS gating is enabled but the whole-run slope is \
+                     unmeasurable ({} samples)",
+                    rss_samples.len()
+                )
+            });
+            println!(
+                "[{worker_note}] rss slope {slope:.1} KB/s over {} samples",
+                rss_samples.len()
+            );
+            // A cold 90s window measures warm-up (allocator arenas,
+            // connection pools, page cache attribution), not leaks: the
+            // whole-window ramp is recorded, never gated — the first CI run
+            // measured 772 KB/s of pure warm-up on an otherwise fully green
+            // soak. The design's "second-half slope ≈ 0" gate is measurable
+            // only in the ≥1h soak, where warm-up is amortized and the
+            // tolerance was calibrated (38.5 KB/s measured against 50).
+            // Bounded-storage convergence above remains the leak gate that
+            // runs on every tier and platform.
+            let warm = &rss_samples[rss_samples.len() / 2..];
+            let warm_slope = rss_slope_kb_per_sec(warm).unwrap_or_else(|| {
+                panic!(
+                    "{worker_note}: RSS gating is enabled but the second-half slope is \
+                     unmeasurable ({} samples)",
+                    rss_samples.len()
+                )
+            });
+            // glibc (the CI platform) returns freed memory; a sustained ramp
+            // means growth. (macOS libmalloc does not return freed memory
+            // while kernels keep allocating, so the gate is Linux-only.)
+            assert!(
+                warm_slope <= RSS_SLOPE_TOLERANCE_KB_PER_SEC,
+                "{worker_note}: second-half RSS slope {warm_slope:.1} KB/s exceeds the tolerance {} KB/s (samples: {:?})",
+                RSS_SLOPE_TOLERANCE_KB_PER_SEC,
+                warm
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = whole_slope;
+    } else if let Some(slope) = whole_slope {
         println!(
             "[{worker_note}] rss slope {slope:.1} KB/s over {} samples",
             rss_samples.len()
         );
-        // A cold 90s window measures warm-up (allocator arenas, connection
-        // pools, page cache attribution), not leaks: the whole-window ramp is
-        // recorded, never gated — the first CI run measured 772 KB/s of pure
-        // warm-up on an otherwise fully green soak. The design's "second-half
-        // slope ≈ 0" gate is measurable only in the ≥1h soak, where warm-up
-        // is amortized and the tolerance was calibrated (38.5 KB/s measured
-        // against 50). Bounded-storage convergence above remains the leak
-        // gate that runs on every tier and platform.
-        if gate_rss_slope {
-            let warm = &rss_samples[rss_samples.len() / 2..];
-            if let Some(warm_slope) = rss_slope_kb_per_sec(warm) {
-                #[cfg(not(target_os = "linux"))]
-                let _ = warm_slope;
-                // macOS libmalloc does not return freed memory to the OS
-                // while kernels keep allocating, so a linear RSS ramp there
-                // is expected allocator behavior; glibc (the CI platform)
-                // returns memory and a sustained ramp means growth.
-                #[cfg(target_os = "linux")]
-                assert!(
-                    warm_slope <= RSS_SLOPE_TOLERANCE_KB_PER_SEC,
-                    "{worker_note}: second-half RSS slope {warm_slope:.1} KB/s exceeds the tolerance {} KB/s (samples: {:?})",
-                    RSS_SLOPE_TOLERANCE_KB_PER_SEC,
-                    warm
-                );
-            }
-        }
     }
     let first_third: Vec<u64> = recorder.samples_ms[..recorder.samples_ms.len() / 3].to_vec();
     let last_third: Vec<u64> = recorder.samples_ms[recorder.samples_ms.len() * 2 / 3..].to_vec();

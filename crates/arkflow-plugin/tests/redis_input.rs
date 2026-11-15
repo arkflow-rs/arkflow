@@ -46,6 +46,15 @@ fn docker_available() -> bool {
         .unwrap_or(false)
 }
 
+fn skip_without_docker(case: &str) {
+    if std::env::var_os("ARKFLOW_REQUIRE_DOCKER").is_some() {
+        panic!(
+            "{case}: Docker is required (ARKFLOW_REQUIRE_DOCKER is set) but no daemon is reachable"
+        );
+    }
+    eprintln!("--- SKIPPED {case}: Docker is unavailable ---");
+}
+
 async fn start_redis() -> ContainerAsync<GenericImage> {
     GenericImage::new("redis", "7-alpine")
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
@@ -119,7 +128,7 @@ async fn redis_lease() -> Option<RedisLease> {
     let mut redis = REDIS.lock().await;
     if redis.is_none() {
         if !docker_available() {
-            eprintln!("skipping redis_input tests: Docker is unavailable");
+            skip_without_docker("redis input");
             return None;
         }
         let container = start_redis().await;
@@ -249,6 +258,12 @@ async fn channel_subscription_delivers_published_payloads() {
 
     let batch = read_with_timeout(&input).await;
     assert_eq!(first_payload(&batch), b"hello-channels");
+    // The unrelated channel's payload must not surface, now or later.
+    let unexpected = tokio::time::timeout(Duration::from_millis(700), input.read()).await;
+    assert!(
+        unexpected.is_err(),
+        "a message published to another channel must not be delivered"
+    );
     input.close().await.expect("close redis input");
 }
 
@@ -275,6 +290,11 @@ async fn pattern_subscription_delivers_matching_payloads() {
 
     let batch = read_with_timeout(&input).await;
     assert_eq!(first_payload(&batch), b"hello-patterns");
+    let unexpected = tokio::time::timeout(Duration::from_millis(700), input.read()).await;
+    assert!(
+        unexpected.is_err(),
+        "a channel that does not match the pattern must not be delivered"
+    );
     input.close().await.expect("close redis input");
 }
 
@@ -309,11 +329,16 @@ async fn unreachable_single_url_reports_connection_failure() {
         "redis_type": {"type": "subscribe", "subscribe": {"type": "channels", "channels": ["c"]}}
     }))
     .await;
-    // ConnectionManager retries with exponential backoff; bound the wait so
-    // the test fails fast either through the error or through the timeout.
-    let outcome = tokio::time::timeout(Duration::from_secs(10), input.connect()).await;
+    // ConnectionManager retries with exponential backoff (6 attempts), so
+    // allow ~30s. A timeout here is a failure, not a pass: accepting it let a
+    // permanently hanging connect look like a rejected one.
+    let outcome = tokio::time::timeout(Duration::from_secs(30), input.connect())
+        .await
+        .expect("connecting to a refused port must fail, not hang");
+    let error = outcome.expect_err("connecting to a refused port must not succeed");
+    let text = error.to_string().to_lowercase();
     assert!(
-        outcome.is_err() || outcome.unwrap().is_err(),
-        "connecting to a refused port must not succeed"
+        text.contains("connect") || text.contains("refused") || text.contains("redis"),
+        "the error must describe the connection failure: {error}"
     );
 }

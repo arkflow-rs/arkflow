@@ -92,6 +92,13 @@ export function pageSizeParam(searchParams: URLSearchParams): number {
     Math.abs(size - requested) < Math.abs(closest - requested) ? size : closest,
   )
 }
+
+/** Parse a URL page number, rejecting fractions, Infinity and unsafe values
+ *  before they reach the API (Option<usize> rejects them with a query error). */
+export function pageParam(searchParams: URLSearchParams): number {
+  const requested = Number(searchParams.get('page') ?? '1')
+  return Number.isSafeInteger(requested) && requested >= 1 ? requested : 1
+}
 export function Pagination({
   page,
   pages,

@@ -630,6 +630,11 @@ pub fn build_config_schema() -> serde_json::Value {
                     }
                 },
                 "buffer": {"$ref": "#/$defs/buffer"},
+                "durability": {
+                    "type": "object",
+                    "description": "Input WAL durability settings (enabled/path/policy/compression).",
+                    "additionalProperties": true
+                },
                 "state": {
                     "type": "object",
                     "additionalProperties": false,
@@ -701,6 +706,29 @@ fn job_schema() -> serde_json::Value {
                 "default": 1,
                 "description": "Requested task parallelism."
             },
+            "rescale": {
+                "type": "boolean",
+                "default": false,
+                "description": "Redistribute keyed state when the parallelism changes."
+            },
+            "placement": {
+                "type": "object",
+                "description": "Placement constraints (node affinity/anti-affinity).",
+                "additionalProperties": true
+            },
+            "rebalance": {
+                "type": "object",
+                "description": "Runtime rebalancing policy.",
+                "additionalProperties": true
+            },
+            "resources": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "cpu_millicores": {"type": "integer", "minimum": 1},
+                    "memory_bytes": {"type": "integer", "minimum": 1}
+                }
+            },
             "operators": {
                 "type": "array",
                 "items": {"$ref": "#/$defs/job_operator"}
@@ -736,6 +764,7 @@ fn job_schema() -> serde_json::Value {
                     "properties": {
                         "operator_id": {"type": "string"},
                         "output_type": {"type": "string"},
+                        "codec": codec_schema(),
                         "config": {"type": "object"}
                     }
                 }
@@ -808,6 +837,7 @@ fn job_source_schema_fragment() -> serde_json::Value {
         "properties": {
             "operator_id": {"type": "string"},
             "input_type": {"type": "string"},
+            "codec": codec_schema(),
             "config": {"type": "object"},
             "time": {
                 "type": "object",
@@ -925,12 +955,27 @@ fn variant_schemas(kind: ComponentKind) -> serde_json::Value {
                 }
             }
             let example = m.config_example.clone();
+            // Preserve the metadata's required fields; the old generator
+            // hard-coded only "type", so editors allowed examples that the
+            // runtime builder rejects (generate without context/interval).
+            let mut required = vec![serde_json::json!("type")];
+            if let Some(list) = m
+                .config_schema
+                .get("required")
+                .and_then(|required| required.as_array())
+            {
+                for field in list {
+                    if !required.contains(field) {
+                        required.push(field.clone());
+                    }
+                }
+            }
             let mut variant = serde_json::json!({
                 "type": "object",
                 "title": m.name.clone(),
                 "description": m.description.clone(),
                 "properties": properties,
-                "required": ["type"]
+                "required": required
             });
             if let Some(ex) = example {
                 variant
@@ -948,14 +993,41 @@ fn codec_schema() -> serde_json::Value {
     let variants: Vec<serde_json::Value> = list_components_by_kind(ComponentKind::Codec)
         .into_iter()
         .map(|m| {
+            // Codec metadata carries real fields (message_type, proto_inputs,
+            // …). Emitting only `type` hid them from editors and accepted
+            // missing required options.
+            let mut properties = serde_json::Map::new();
+            properties.insert(
+                "type".to_string(),
+                serde_json::json!({"type": "string", "const": m.name}),
+            );
+            if let Some(inner) = m
+                .config_schema
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+            {
+                for (key, value) in inner {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+            let mut required = vec![serde_json::json!("type")];
+            if let Some(list) = m
+                .config_schema
+                .get("required")
+                .and_then(|required| required.as_array())
+            {
+                for field in list {
+                    if !required.contains(field) {
+                        required.push(field.clone());
+                    }
+                }
+            }
             serde_json::json!({
                 "type": "object",
                 "title": m.name,
                 "description": m.description,
-                "properties": {
-                    "type": {"type": "string", "const": m.name}
-                },
-                "required": ["type"]
+                "properties": properties,
+                "required": required
             })
         })
         .collect();

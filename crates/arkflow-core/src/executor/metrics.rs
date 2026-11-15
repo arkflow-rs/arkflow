@@ -75,8 +75,29 @@ pub struct KernelMetrics {
     pub checkpoint_failures: AtomicU64,
     /// Max watermark lag across sources (0 = no event-time sources).
     pub watermark_lag_ms: AtomicI64,
+    /// Latest lag per source, with the observation instant. The gauge must
+    /// fall after a source catches up; a lifetime `fetch_max` kept the
+    /// historical maximum forever. Entries idle for over a minute are
+    /// dropped so a stopped source stops pinning the gauge.
+    watermark_lag_by_source: std::sync::Mutex<BTreeMap<String, (i64, std::time::Instant)>>,
     /// Late events dropped/routed/updated across gates.
     pub late_events: AtomicU64,
+}
+
+impl KernelMetrics {
+    /// Record one source's CURRENT watermark lag and publish the maximum
+    /// across recently reporting sources.
+    pub fn record_watermark_lag(&self, source: &str, lag_ms: i64) {
+        let now = std::time::Instant::now();
+        let mut sources = self.watermark_lag_by_source.lock().unwrap();
+        sources.insert(source.to_owned(), (lag_ms.max(0), now));
+        sources.retain(|_, (_, observed)| {
+            now.duration_since(*observed) < std::time::Duration::from_secs(60)
+        });
+        let max = sources.values().map(|(lag, _)| *lag).max().unwrap_or(0);
+        self.watermark_lag_ms
+            .store(max, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for KernelMetrics {

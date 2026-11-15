@@ -771,7 +771,7 @@ impl SqliteBackend {
             let candidate: Option<(i64, String, String, String, Option<String>, Option<String>)> =
                 transaction
                     .query_row(
-                        "SELECT outbox_id, event_key, event_type, node_id, stream_id, intent_id FROM cp_outbox WHERE processed_at_ms IS NULL AND available_at_ms <= ?1 AND (claimed_at_ms IS NULL OR claimed_at_ms < ?2) ORDER BY outbox_id LIMIT 1",
+                        "SELECT o.outbox_id, o.event_key, o.event_type, o.node_id, o.stream_id, o.intent_id FROM cp_outbox o LEFT JOIN cp_nodes n ON n.node_id = o.node_id WHERE o.processed_at_ms IS NULL AND o.available_at_ms <= ?1 AND (o.claimed_at_ms IS NULL OR o.claimed_at_ms < ?2) AND (n.node_id IS NULL OR (n.state = 'online' AND n.lease_expires_at_ms > ?1)) ORDER BY o.outbox_id LIMIT 1",
                         rusqlite::params![now_ms, now_ms.saturating_sub(CLAIM_LEASE_MS)],
                         |row| {
                             Ok((
@@ -1178,23 +1178,32 @@ impl SqliteBackend {
                     | "cancelled"
                     | "superseded"
             );
-            transaction.execute(
-                "UPDATE cp_attempts SET state = ?1, failure_class = ?2, finished_at_ms = CASE WHEN ?3 THEN ?4 ELSE finished_at_ms END WHERE attempt_id = ?5",
+            let attempt_updated = transaction.execute(
+                "UPDATE cp_attempts SET state = ?1, failure_class = ?2, finished_at_ms = CASE WHEN ?3 THEN ?4 ELSE finished_at_ms END WHERE attempt_id = ?5 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'node_unavailable', 'cancelled', 'superseded')",
                 rusqlite::params![state, failure_class, terminal, now_ms(), attempt_id],
             )?;
+            // A duplicate terminal report must not re-run the accounting
+            // below (retry counter increments / duplicate outbox rows).
+            if attempt_updated == 0 {
+                return Ok(());
+            }
             if terminal {
                 match failure_class {
                     Some("temporary_execution") | Some("transport") | Some("node_unavailable") => {
                         let retry_at = now_ms() + 1_000;
-                        transaction.execute(
+                        let intent_updated = transaction.execute(
                             "UPDATE cp_intents SET state = 'retrying', convergence_state = 'degraded', retry_count = retry_count + 1, next_retry_at_ms = ?1, last_failure_class = ?2, updated_at_ms = ?1 WHERE intent_id = ?3 AND state IN ('accepted', 'converging', 'retrying')",
                             rusqlite::params![retry_at, failure_class, intent_id],
                         )?;
-                        let event_key = format!("reconcile:retry:{attempt_id}");
-                        transaction.execute(
-                            "INSERT OR IGNORE INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) VALUES (?1, 'retry_intent', ?2, ?3, ?4, ?5, ?5)",
-                            rusqlite::params![event_key, node_id, stream_id, intent_id, retry_at],
-                        )?;
+                        // A superseded/terminal intent updates zero rows: do
+                        // not enqueue a retry for a state that can never run.
+                        if intent_updated == 1 {
+                            let event_key = format!("reconcile:retry:{attempt_id}");
+                            transaction.execute(
+                                "INSERT OR IGNORE INTO cp_outbox (event_key, event_type, node_id, stream_id, intent_id, available_at_ms, created_at_ms) VALUES (?1, 'retry_intent', ?2, ?3, ?4, ?5, ?5)",
+                                rusqlite::params![event_key, node_id, stream_id, intent_id, retry_at],
+                            )?;
+                        }
                     }
                     Some("stale_generation") => {
                         transaction.execute(
@@ -2675,7 +2684,8 @@ impl SqliteBackend {
                     last_error = COALESCE(?13, last_error), \
                     requested_by = COALESCE(?17, requested_by), \
                     updated_at_ms = ?14 \
-                 WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS ?16",
+                 WHERE job_id = ?1 AND generation = ?15 AND pause_phase IS ?16 \
+                   AND (?18 IS NULL OR pause_retry_count = ?18)",
                 rusqlite::params![
                     job_id,
                     update.desired_state,
@@ -2694,6 +2704,7 @@ impl SqliteBackend {
                     update.expected_generation,
                     update.expected_phase,
                     update.requested_by,
+                    update.expected_retry_count,
                 ],
             )?;
             if changed == 0 {
@@ -3482,6 +3493,16 @@ impl SqliteBackend {
         revoked_at_ms: u64,
     ) -> Result<bool, StorageError> {
         self.immediate_transaction(|connection| {
+            // Revoke the previous credential conditionally FIRST. The old
+            // read-then-insert let two concurrent rotations both see an
+            // active credential and issue two valid replacements.
+            let changed = connection.execute(
+                "UPDATE cp_credentials SET revoked_at_ms = ?2 WHERE credential_id = ?1 AND revoked_at_ms IS NULL",
+                rusqlite::params![previous_credential_id, revoked_at_ms],
+            )?;
+            if changed != 1 {
+                return Ok(false);
+            }
             connection.execute(
                 "INSERT INTO cp_credentials (credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
@@ -3495,11 +3516,7 @@ impl SqliteBackend {
                     record.revoked_at_ms,
                 ],
             )?;
-            let changed = connection.execute(
-                "UPDATE cp_credentials SET revoked_at_ms = COALESCE(revoked_at_ms, ?2) WHERE credential_id = ?1",
-                rusqlite::params![previous_credential_id, revoked_at_ms],
-            )?;
-            Ok(changed > 0)
+            Ok(true)
         })
     }
 

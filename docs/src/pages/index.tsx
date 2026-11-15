@@ -33,7 +33,6 @@ const PIPELINE_YAML = `streams:
         - type: json_to_arrow
         - type: sql
           query: "SELECT * FROM flow WHERE status = 'PAID'"
-        - type: arrow_to_json
     output:
       type: sql
       output_type:
@@ -140,23 +139,32 @@ function useReveal<T extends HTMLElement>() {
   useEffect(() => {
     const el = ref.current;
     if (!el || prefersReducedMotion()) return;
-    el.classList.add(styles.revealPending);
+    if (typeof IntersectionObserver === 'undefined') return;
+    // Construct the observer FIRST: adding the hidden class before a
+    // throwing constructor (missing API in an old webview) left the
+    // section at opacity zero forever.
+    let observer: IntersectionObserver;
     // A healthy observer reports the initial state immediately, even
     // when not intersecting. If it never calls back (broken webview),
     // never leave the content invisible.
     let gotCallback = false;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        gotCallback = true;
-        for (const entry of entries) {
-          if (entry.isIntersecting) {
-            el.classList.add(styles.revealVisible);
-            observer.disconnect();
+    try {
+      observer = new IntersectionObserver(
+        (entries) => {
+          gotCallback = true;
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              el.classList.add(styles.revealVisible);
+              observer.disconnect();
+            }
           }
-        }
-      },
-      {threshold: 0.15, rootMargin: '0px 0px -40px 0px'},
-    );
+        },
+        {threshold: 0.15, rootMargin: '0px 0px -40px 0px'},
+      );
+    } catch {
+      return;
+    }
+    el.classList.add(styles.revealPending);
     observer.observe(el);
     const failsafe = setTimeout(() => {
       if (!gotCallback) {

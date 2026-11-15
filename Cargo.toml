@@ -82,9 +82,9 @@ mockall = "0.15"
 redb = "4"
 object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 bytes = "1"
-arkflow-core = { path = "crates/arkflow-core" }
-arkflow-plugin = { path = "crates/arkflow-plugin" }
-arkflow-server = { path = "crates/arkflow-server" }
+arkflow-core = { path = "crates/arkflow-core", version = "0.6.0" }
+arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.6.0" }
+arkflow-server = { path = "crates/arkflow-server", version = "0.6.0" }
 
 [profile.release]
 codegen-units = 1

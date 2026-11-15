@@ -40,6 +40,33 @@ fn args(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
+/// Swap the database name in a PostgreSQL URL while preserving any query
+/// parameters (TLS options such as `sslmode`). Rebuilding from only scheme
+/// and authority silently dropped them.
+fn url_for_database(base: &str, database: &str) -> String {
+    let (path_part, query) = match base.split_once('?') {
+        Some((head, query)) => (head, Some(query)),
+        None => (base, None),
+    };
+    let (scheme, rest) = path_part.split_once("://").expect("url with scheme");
+    let authority = rest.split('/').next().expect("authority");
+    match query {
+        Some(query) => format!("{scheme}://{authority}/{database}?{query}"),
+        None => format!("{scheme}://{authority}/{database}"),
+    }
+}
+
+/// Per-process, per-run suffix for dedicated test databases. A fixed name
+/// let two workspaces running the same test on one server FORCE-drop each
+/// other's database.
+fn run_scoped_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!("{}_{nanos}", std::process::id())
+}
+
 async fn seed_store(store: &ControlPlaneStore) {
     StorageBackend::upsert_job(
         store,
@@ -618,15 +645,16 @@ async fn backup_restore_round_trip_against_live_postgres_when_available() {
         return;
     };
     // Replace (not append to) the base URL's path: the base may point at a
-    // specific database while the tests need dedicated ones.
-    let (scheme, rest) = base.split_once("://").expect("url with scheme");
-    let authority = rest.split('/').next().expect("authority");
-    let url_for = |db: &str| format!("{scheme}://{authority}/{db}");
+    // specific database while the tests need dedicated ones. Query
+    // parameters (TLS options) are preserved.
+    let run = run_scoped_suffix();
+    let source_db = format!("ct_backup_src_{run}");
+    let target_db = format!("ct_backup_dst_{run}");
     use sqlx::Connection as _;
-    let mut admin = sqlx::PgConnection::connect(&url_for("postgres"))
+    let mut admin = sqlx::PgConnection::connect(&url_for_database(&base, "postgres"))
         .await
         .unwrap();
-    for name in ["ct_backup_restore_src", "ct_backup_restore_dst"] {
+    for name in [source_db.as_str(), target_db.as_str()] {
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
         )))
@@ -638,8 +666,8 @@ async fn backup_restore_round_trip_against_live_postgres_when_available() {
             .unwrap();
     }
     drop(admin);
-    let source_url = url_for("ct_backup_restore_src");
-    let target_url = url_for("ct_backup_restore_dst");
+    let source_url = url_for_database(&base, &source_db);
+    let target_url = url_for_database(&base, &target_db);
 
     let store = ControlPlaneStore::open(&source_url).await.unwrap();
     seed_store(&store).await;
@@ -700,17 +728,18 @@ async fn postgres_restore_is_exclusive_and_atomic_when_available() {
         return;
     };
     use sqlx::Row as _;
-    let (scheme, rest) = base.split_once("://").expect("url with scheme");
-    let authority = rest.split('/').next().expect("authority");
-    let url_for = |db: &str| format!("{scheme}://{authority}/{db}");
+    let run = run_scoped_suffix();
+    let busy_src_db = format!("ct_restore_busy_src_{run}");
+    let busy_dst_db = format!("ct_restore_busy_dst_{run}");
+    let atomic_db = format!("ct_restore_atomic_{run}");
     use sqlx::Connection as _;
-    let mut admin = sqlx::PgConnection::connect(&url_for("postgres"))
+    let mut admin = sqlx::PgConnection::connect(&url_for_database(&base, "postgres"))
         .await
         .unwrap();
     for name in [
-        "ct_restore_busy_src",
-        "ct_restore_busy_dst",
-        "ct_restore_atomic",
+        busy_src_db.as_str(),
+        busy_dst_db.as_str(),
+        atomic_db.as_str(),
     ] {
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
@@ -728,7 +757,7 @@ async fn postgres_restore_is_exclusive_and_atomic_when_available() {
     let snapshot_path = dir.path().join("snapshot.sqlite");
 
     // --- exclusive access: a held row lock makes the restore fail loudly ---
-    let source_url = url_for("ct_restore_busy_src");
+    let source_url = url_for_database(&base, &busy_src_db);
     let store = ControlPlaneStore::open(&source_url).await.unwrap();
     seed_store(&store).await;
     drop(store);
@@ -746,7 +775,7 @@ async fn postgres_restore_is_exclusive_and_atomic_when_available() {
     .unwrap();
     assert_eq!(code, 0);
 
-    let target_url = url_for("ct_restore_busy_dst");
+    let target_url = url_for_database(&base, &busy_dst_db);
     ControlPlaneStore::open(&target_url).await.unwrap(); // converge target DDL
                                                          // A Hub-like writer holds a lock on a business table of the target.
     let mut writer = sqlx::PgConnection::connect(&target_url).await.unwrap();
@@ -794,7 +823,7 @@ async fn postgres_restore_is_exclusive_and_atomic_when_available() {
 
     // --- atomicity: a coercion failure on the SECOND table rolls back the
     // first table's rows, so the target stays empty for a retry ---
-    let atomic_url = url_for("ct_restore_atomic");
+    let atomic_url = url_for_database(&base, &atomic_db);
     ControlPlaneStore::open(&atomic_url).await.unwrap(); // converge target DDL
     let corrupt = dir.path().join("corrupt.sqlite");
     std::fs::copy(&snapshot_path, &corrupt).unwrap();
@@ -925,6 +954,18 @@ async fn backup_carries_identity_directory_but_never_sessions() {
     let restored = ControlPlaneStore::open(restored_path.to_str().unwrap())
         .await
         .unwrap();
+    // The SNAPSHOT itself must not carry live bearer secrets either:
+    // VACUUM INTO copies cp_sessions, so the finalizer has to purge it.
+    let snapshot = ControlPlaneStore::open(snapshot_path.to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        StorageBackend::get_session(&snapshot, "session-hash")
+            .await
+            .unwrap()
+            .is_none(),
+        "the backup snapshot must not carry session records"
+    );
     let users = StorageBackend::list_users(&restored).await.unwrap();
     assert_eq!(users.len(), 1);
     assert_eq!(users[0].oidc_subject.as_deref(), Some("sub-alice"));

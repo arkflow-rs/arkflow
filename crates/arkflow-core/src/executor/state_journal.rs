@@ -171,6 +171,12 @@ struct JournalInner {
     /// (replaying a relative `Increment` would count its delta twice).
     /// Cleared when the transaction completes or is discarded.
     replay_applied: BTreeMap<u64, std::collections::BTreeSet<usize>>,
+    /// Transactions whose apply failed AND whose compensating restore also
+    /// failed partway. The backend is in an unknown mixed state; a retried
+    /// apply would execute relative mutations (Increment) a second time, so
+    /// the journal refuses to apply them again until the transaction is
+    /// discarded.
+    failed_compensation: std::collections::BTreeSet<u64>,
 }
 
 impl JournalInner {
@@ -411,6 +417,10 @@ impl StateJournal {
     /// owns the key) are already embedded in the backend value and are
     /// excluded, so the overlay does not count them twice either.
     fn overlay_value(&self, namespace: &str, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, Error> {
+        // Serialize with apply/undo: a read must not observe the window where
+        // a transaction's mutations are already in the backend but its state
+        // is still Staged, which would apply the same increment twice.
+        let _commit_guard = self.commit_lock.lock().unwrap();
         let inner = self.inner.lock().unwrap();
         let mut value = self.backend.get(namespace, key)?;
         let mut touched = false;
@@ -627,6 +637,13 @@ impl StateJournal {
         let _commit_guard = self.commit_lock.lock().unwrap();
         let (mutations, staged_versions, replay_applied) = {
             let inner = self.inner.lock().unwrap();
+            if inner.failed_compensation.contains(&txn.id) {
+                return Err(Error::Process(
+                    "state journal transaction already failed to compensate; refusing to \
+                     re-apply mutations over an unknown backend state"
+                        .into(),
+                ));
+            }
             match inner.txns.get(&txn.id) {
                 Some(TxnState::Staged(mutations)) => {
                     // The fence records the key version each mutation observed
@@ -728,6 +745,11 @@ impl StateJournal {
                             &previous_versions,
                             &applied_versions,
                         ) {
+                            self.inner
+                                .lock()
+                                .unwrap()
+                                .failed_compensation
+                                .insert(txn.id);
                             return Err(Error::Process(format!(
                                 "state journal apply refused a stale mutation; rollback also \
                                  failed ({rollback_error})"
@@ -799,6 +821,11 @@ impl StateJournal {
                         &applied_versions,
                     );
                     if let Err(rollback_error) = ownership_skipped {
+                        self.inner
+                            .lock()
+                            .unwrap()
+                            .failed_compensation
+                            .insert(txn.id);
                         return Err(Error::Process(format!(
                             "state journal apply failed ({error}); rollback also failed ({rollback_error})"
                         )));
@@ -828,13 +855,74 @@ impl StateJournal {
         let mut inner = self.inner.lock().unwrap();
         inner.apply_fences.remove(&txn.id);
         inner.replay_applied.remove(&txn.id);
+        inner.failed_compensation.remove(&txn.id);
         if let Some(state) = inner.txns.remove(&txn.id) {
-            match state {
-                TxnState::Staged(mutations) | TxnState::Applied { mutations, .. } => {
-                    inner.release_bytes(&mutations);
+            let (mutations, applied_versions) = match state {
+                // A rolled-back transaction never touched the backend: its
+                // staged fences belong to the PREVIOUS value and must stay.
+                TxnState::Staged(mutations) => (mutations, Vec::new()),
+                TxnState::Applied {
+                    mutations,
+                    applied_versions,
+                    ..
+                } => (mutations, applied_versions),
+            };
+            // A COMPLETED delete leaves no live value, so its fence can be
+            // reclaimed — but only when the fence still belongs to this
+            // delete and no pending transaction staged on top of it. Removing
+            // it unconditionally made a Put staged after the delete (fence =
+            // the delete's version) look stale and silently drop the write;
+            // removing a fence a newer commit now owns would break that
+            // transaction's undo ownership check.
+            for (index, mutation) in mutations.iter().enumerate() {
+                let StagedMutation::Delete { .. } = mutation else {
+                    continue;
+                };
+                let Some(version) = applied_versions.get(index).copied().flatten() else {
+                    continue;
+                };
+                let (namespace, key) = mutation.storage();
+                let version_key = (namespace.to_owned(), key.to_vec());
+                if inner.key_versions.get(&version_key).copied() != Some(version) {
+                    continue;
                 }
+                if Self::fence_referenced(&inner, txn.id, &version_key, version) {
+                    continue;
+                }
+                inner.key_versions.remove(&version_key);
             }
+            inner.release_bytes(&mutations);
         }
+    }
+
+    /// Whether another live transaction staged a mutation on `key` while the
+    /// key's fence was `version`. Such a transaction's apply is not stale:
+    /// the fence it captured is the value it intends to build on, so the
+    /// delete's fence must survive until that transaction settles.
+    fn fence_referenced(
+        inner: &JournalInner,
+        completed: u64,
+        key: &(String, Vec<u8>),
+        version: u64,
+    ) -> bool {
+        inner.txns.iter().any(|(id, state)| {
+            if *id == completed {
+                return false;
+            }
+            let mutations = match state {
+                TxnState::Staged(mutations) => mutations,
+                TxnState::Applied { mutations, .. } => mutations,
+            };
+            let Some(fences) = inner.apply_fences.get(id) else {
+                return false;
+            };
+            mutations.iter().enumerate().any(|(index, mutation)| {
+                let (namespace, candidate) = mutation.storage();
+                namespace == key.0.as_str()
+                    && candidate == key.1.as_slice()
+                    && fences.get(index).copied().flatten() == Some(version)
+            })
+        })
     }
 
     /// Compensating rollback of an applied transaction: restore the
@@ -1104,18 +1192,30 @@ impl Ack for CommitGroupOnAck {
         self.journal
             .with_finalize_scope(async {
                 let inner_result = self.inner.abort().await;
+                let mut compensation_error = None;
                 for txn in &self.txns {
                     if self.journal.transaction_is_registered(*txn) {
-                        let _ = self.journal.undo(*txn);
+                        if let Err(error) = self.journal.undo(*txn) {
+                            compensation_error.get_or_insert(error);
+                        }
                         self.journal.rollback(*txn);
                     }
                 }
                 if let Some(rollbacks) = self.completed_rollbacks.lock().unwrap().take() {
                     for rollback in rollbacks.iter().rev() {
-                        let _ = self.journal.undo_snapshot(rollback);
+                        if let Err(error) = self.journal.undo_snapshot(rollback) {
+                            compensation_error.get_or_insert(error);
+                        }
                     }
                 }
-                inner_result
+                match (inner_result, compensation_error) {
+                    (Ok(()), None) => Ok(()),
+                    (Ok(()), Some(error)) => Err(error),
+                    (Err(error), Some(compensation)) => Err(Error::Process(format!(
+                        "{error}; compensation also failed: {compensation}"
+                    ))),
+                    (Err(error), None) => Err(error),
+                }
             })
             .await
     }
@@ -1202,16 +1302,28 @@ impl Ack for CommitOnAck {
         self.journal
             .with_finalize_scope(async {
                 let inner_result = self.inner.abort().await;
+                let mut compensation_error = None;
                 if self.journal.transaction_is_registered(self.txn) {
-                    let _ = self.journal.undo(self.txn);
+                    if let Err(error) = self.journal.undo(self.txn) {
+                        compensation_error.get_or_insert(error);
+                    }
                     self.journal.rollback(self.txn);
                 } else {
                     let completed_rollback = { self.completed_rollback.lock().unwrap().take() };
                     if let Some(rollback) = completed_rollback {
-                        let _ = self.journal.undo_snapshot(&rollback);
+                        if let Err(error) = self.journal.undo_snapshot(&rollback) {
+                            compensation_error.get_or_insert(error);
+                        }
                     }
                 }
-                inner_result
+                match (inner_result, compensation_error) {
+                    (Ok(()), None) => Ok(()),
+                    (Ok(()), Some(error)) => Err(error),
+                    (Err(error), Some(compensation)) => Err(Error::Process(format!(
+                        "{error}; compensation also failed: {compensation}"
+                    ))),
+                    (Err(error), None) => Err(error),
+                }
             })
             .await
     }
@@ -1594,6 +1706,47 @@ mod tests {
             journal.backend().get("ns", b"k").unwrap(),
             Some(b"1".to_vec()),
             "the retried increment applies exactly once when the key was never taken over"
+        );
+    }
+
+    #[test]
+    fn delete_completion_keeps_fences_referenced_by_pending_transactions() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"k", b"old").unwrap();
+        // A deletes the key and applies; its wrapped ack is still pending.
+        let a = journal.begin().unwrap();
+        journal.delete(a, "ns", b"k").unwrap();
+        journal.apply(a).unwrap();
+        assert!(journal.backend().get("ns", b"k").unwrap().is_none());
+        // B stages a Put AFTER the delete applied: it captures A's fence.
+        let b = journal.begin().unwrap();
+        journal.put(b, "ns", b"k", b"new".to_vec(), None).unwrap();
+        // A's completion must not reclaim the fence B captured, or B's Put
+        // would look stale and be silently skipped.
+        journal.complete(a);
+        journal.apply(b).unwrap();
+        journal.complete(b);
+        assert_eq!(
+            journal.backend().get("ns", b"k").unwrap(),
+            Some(b"new".to_vec()),
+            "a Put staged after a completed delete must not be fenced out"
+        );
+    }
+
+    #[test]
+    fn delete_completion_reclaims_an_unreferenced_fence() {
+        let journal = StateJournal::new(backend());
+        journal.backend().put("ns", b"k", b"old").unwrap();
+        let a = journal.begin().unwrap();
+        journal.delete(a, "ns", b"k").unwrap();
+        journal.apply(a).unwrap();
+        journal.complete(a);
+        let inner = journal.inner.lock().unwrap();
+        assert!(
+            !inner
+                .key_versions
+                .contains_key(&("ns".to_string(), b"k".to_vec())),
+            "a completed delete with no pending stager reclaims its fence"
         );
     }
 
@@ -2431,6 +2584,13 @@ mod coverage_tests {
         assert!(
             error.contains("apply failed") && error.contains("rollback also failed"),
             "{error}"
+        );
+        // A retried apply must not re-execute the increment/put that is still
+        // in the backend while the compensating restore is incomplete.
+        let retry = journal.commit(txn).unwrap_err().to_string();
+        assert!(
+            retry.contains("already failed to compensate"),
+            "retry must be refused after a failed compensation: {retry}"
         );
     }
 

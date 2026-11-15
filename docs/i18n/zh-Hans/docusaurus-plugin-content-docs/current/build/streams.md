@@ -25,7 +25,6 @@ streams:
         - type: json_to_arrow  # decode into columnar batches
         - type: sql            # DataFusion SQL over the batch
           query: "SELECT * FROM flow WHERE status = 'PAID'"
-        - type: arrow_to_json  # re-encode for the sink
     output:
       type: sql
       output_type:

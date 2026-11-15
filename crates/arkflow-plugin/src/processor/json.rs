@@ -47,12 +47,22 @@ struct JsonToArrowProcessor {
 #[async_trait]
 impl Processor for JsonToArrowProcessor {
     async fn process(&self, msg_batch: MessageBatchRef) -> Result<ProcessResult, Error> {
+        let rows = msg_batch.num_rows();
         let result = msg_batch.to_binary(
             self.config
                 .value_field
                 .as_deref()
                 .unwrap_or(DEFAULT_BINARY_VALUE_FIELD),
         )?;
+        // `to_binary` skips NULL cells; decoding the remaining payloads would
+        // silently drop those rows while the batch is still acknowledged.
+        if result.len() != rows {
+            return Err(Error::Process(format!(
+                "JSON processor: {} payloads for {rows} rows; NULL payload rows cannot be \
+                 decoded silently",
+                result.len()
+            )));
+        }
 
         let json_data: Vec<u8> = result.join(b"\n" as &[u8]);
         let record_batch = self.json_to_arrow(&json_data)?;

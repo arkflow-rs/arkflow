@@ -304,7 +304,7 @@ async fn durable_sessions_survive_restart_and_are_revocable() {
     };
     let session_id = restarted.create_session(principal).await.unwrap();
     assert!(restarted.resolve_session(&session_id).await.is_some());
-    restarted.remove_session(&session_id).await;
+    let _ = restarted.remove_session(&session_id).await;
     assert!(restarted.resolve_session(&session_id).await.is_none());
 }
 

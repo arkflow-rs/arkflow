@@ -192,7 +192,7 @@ impl Ack for FanoutAckChild {
         let slot = &self.state.slots[self.index];
         // A downstream retry or a duplicated control path must not decrement
         // the group more than once.
-        if slot.acknowledged.swap(true, Ordering::AcqRel) {
+        if slot.acknowledged.load(Ordering::Acquire) {
             return Ok(());
         }
         // A branch that completes while still marked held (its operator acked
@@ -201,9 +201,15 @@ impl Ack for FanoutAckChild {
         if slot.held.swap(false, Ordering::AcqRel) {
             self.state.parent.release_held();
         }
-        if self.state.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+        // Only the final child commits the parent. Do not decrement (or mark
+        // the slot acknowledged) before that await: a cancelled final ack
+        // used to leave remaining at zero with the parent uncommitted, so a
+        // retry returned Ok without ever completing the source.
+        if self.state.remaining.load(Ordering::Acquire) == 1 {
             match self.state.parent.ack().await {
                 Ok(()) => {
+                    slot.acknowledged.store(true, Ordering::Release);
+                    self.state.remaining.store(0, Ordering::Release);
                     self.state.parent_acked.store(true, Ordering::Release);
                     Ok(())
                 }
@@ -212,12 +218,12 @@ impl Ack for FanoutAckChild {
                     // group pending when the parent could not commit so the
                     // caller can retry this child without losing the source
                     // acknowledgement.
-                    self.state.remaining.fetch_add(1, Ordering::AcqRel);
-                    slot.acknowledged.store(false, Ordering::Release);
                     Err(error)
                 }
             }
         } else {
+            slot.acknowledged.store(true, Ordering::Release);
+            self.state.remaining.fetch_sub(1, Ordering::AcqRel);
             Ok(())
         }
     }
@@ -243,26 +249,32 @@ impl Ack for FanoutAckChild {
 
     async fn abort(&self) -> Result<(), Error> {
         let _guard = self.state.parent_lock.lock().await;
-        if self.state.aborted.swap(true, Ordering::AcqRel) {
+        if self.state.aborted.load(Ordering::Acquire) {
             return Ok(());
         }
-        let parent_was_acked = self.state.parent_acked.swap(false, Ordering::AcqRel);
+        let parent_was_acked = self.state.parent_acked.load(Ordering::Acquire);
         // An aborted fan-out may have no completed parent acknowledgement yet,
         // while the parent still owns staged state (for example a
-        // CommitGroupOnAck wrapped around the source ack).  Abort that parent
+        // CommitGroupOnAck wrapped around the source ack). Abort that parent
         // as well so a failed send cannot leave a transaction live forever.
         let parent_result = if parent_was_acked {
             self.state.parent.undo().await
         } else {
             self.state.parent.abort().await
         };
+        // Do not latch the terminal flag before the parent compensation
+        // succeeds: a failed abort must be retryable, and a latched flag made
+        // the retry return Ok without ever settling the parent.
+        parent_result?;
+        self.state.aborted.store(true, Ordering::Release);
+        self.state.parent_acked.store(false, Ordering::Release);
         for slot in self.state.slots.iter() {
             slot.acknowledged.store(false, Ordering::Release);
         }
         self.state
             .remaining
             .store(self.state.slots.len(), Ordering::Release);
-        parent_result
+        Ok(())
     }
 
     fn mark_held(&self) {
@@ -376,10 +388,19 @@ impl Ack for VecAck {
                     // failed child as well as the earlier successful
                     // children; otherwise a composite failure can roll back
                     // state while one source cursor remains past the input.
+                    let mut compensation_errors = Vec::new();
                     for child in self.0[..=index].iter().rev() {
-                        let _ = child.undo().await;
+                        if let Err(undo_error) = child.undo().await {
+                            compensation_errors.push(undo_error.to_string());
+                        }
                     }
-                    return Err(error);
+                    if compensation_errors.is_empty() {
+                        return Err(error);
+                    }
+                    return Err(Error::Process(format!(
+                        "{error}; compensation also failed: {}",
+                        compensation_errors.join("; ")
+                    )));
                 }
             }
         }
@@ -464,12 +485,20 @@ impl Ack for ConcurrentAck {
             // make undo idempotent for the not-yet-committed case.
             // Reverse order matters for source positions in one partition:
             // undo a later durable cursor before compensating an earlier one.
+            let mut compensation_errors = Vec::new();
             for ack in self.0.iter().rev() {
                 if let Err(error) = ack.undo().await {
-                    first_error.get_or_insert(Error::Process(format!(
-                        "source acknowledgement failed and compensation failed: {error}"
-                    )));
+                    compensation_errors.push(error.to_string());
                 }
+            }
+            if !compensation_errors.is_empty() {
+                let original = first_error
+                    .take()
+                    .expect("first_error was checked as present");
+                return Err(Error::Process(format!(
+                    "{original}; compensation also failed: {}",
+                    compensation_errors.join("; ")
+                )));
             }
         }
         first_error.map_or(Ok(()), Err)

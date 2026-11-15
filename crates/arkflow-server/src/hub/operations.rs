@@ -550,8 +550,16 @@ impl Hub {
                         .min_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then(a.id.cmp(&b.id)))
                 })
                 .map(|operation| operation.id.clone());
-            if let Some(oldest) = eviction {
-                operations.remove(&oldest);
+            let evicted_command = eviction.and_then(|oldest| {
+                operations
+                    .remove(&oldest)
+                    .map(|operation| operation.command_id)
+            });
+            if let Some(command_id) = evicted_command {
+                // The settled marker only needs to outlive its operation;
+                // evicting the operation without it leaks one command id per
+                // settled command for the whole Hub process lifetime.
+                self.settled_commands.write().await.remove(&command_id);
             }
         }
         // Audit the logical mutation once: reconciler re-dispatches of the
@@ -677,10 +685,26 @@ impl Hub {
         if operation.generation != result.generation {
             return Ok(operation.clone());
         }
-        if operation.state.is_terminal() {
+        if operation.state.is_terminal()
+            && self
+                .settled_commands
+                .read()
+                .await
+                .contains(&operation.command_id)
+        {
             // A late result from an in-flight Agent must not resurrect or
-            // otherwise rewrite a terminal operation. Returning the stored
-            // record keeps duplicate result delivery idempotent.
+            // otherwise rewrite a terminal operation. The settled marker is
+            // set only after the storage writes and aggregations completed;
+            // an unmarked terminal retry falls through to finish them.
+            return Ok(operation.clone());
+        }
+        let already_terminal = operation.state.is_terminal();
+        // A terminal result that CONTRADICTS the recorded terminal state is
+        // stale (the operation was settled by the lease sweep or another
+        // path). Re-running the checkpoint side effects for it would
+        // overwrite an artifact with a late, unrelated outcome — e.g. a
+        // timed-out pause capture marked failed after it had completed.
+        if already_terminal && operation.state != result.state {
             return Ok(operation.clone());
         }
         if result.state.is_terminal() {
@@ -691,50 +715,56 @@ impl Hub {
                 node.leased_commands.remove(&result.command_id);
             }
         }
-        operation.state = result.state;
-        operation.progress = result.progress;
-        operation.error = result.error.clone();
-        operation.failure_class = result.failure_class.clone();
-        // Read-only command reports (validation/diff) ride the terminal
-        // result; mutations never set the field.
-        if result.result.is_some() {
-            operation.result = result.result.clone();
-        }
-        if result.state.is_terminal() {
-            operation.finished_at_ms = Some(now_ms());
-        }
-        if matches!(result.state, HubOperationState::Acknowledged) {
+        if !already_terminal {
+            operation.state = result.state;
             operation.progress = result.progress;
-            let now = now_ms();
-            operation.acknowledged_at_ms = Some(now);
-            // Enqueue-to-acknowledgement latency, the metric the spec
-            // commits to; terminal outcomes settle the outcome counters.
-            self.command_metrics.record_latency(
-                operation.operation.as_str(),
-                now.saturating_sub(operation.created_at_ms),
-            );
-            self.command_metrics
-                .record_outcome(operation.operation.as_str(), "acknowledged");
-        }
-        if matches!(
-            result.state,
-            HubOperationState::Acknowledged | HubOperationState::Running
-        ) {
-            // A progress report renews the command lease. The expiry is
-            // stamped at enqueue, so without this a JobStart that outlives
-            // lease_ttl (connect + checkpoint restore) would be swept as
-            // expired, marked TimedOut and dispatched a second time while the
-            // agent still runs it. A silent agent stops renewing and still
-            // expires, so liveness detection is preserved.
-            if let Some(node) = nodes.get_mut(&auth.node_id) {
-                if let Some(command) = node.leased_commands.get_mut(&result.command_id) {
-                    command.expires_at_ms = now_ms() + self.config.lease_ttl_ms;
+            operation.error = result.error.clone();
+            operation.failure_class = result.failure_class.clone();
+            // Read-only command reports (validation/diff) ride the terminal
+            // result; mutations never set the field.
+            if result.result.is_some() {
+                operation.result = result.result.clone();
+            }
+            if result.state.is_terminal() {
+                operation.finished_at_ms = Some(now_ms());
+            }
+            if matches!(result.state, HubOperationState::Acknowledged) {
+                operation.progress = result.progress;
+                // A retried/duplicated Acknowledged report must not move the
+                // first-confirmation time or count the latency twice.
+                if operation.acknowledged_at_ms.is_none() {
+                    let now = now_ms();
+                    operation.acknowledged_at_ms = Some(now);
+                    // Enqueue-to-acknowledgement latency, the metric the spec
+                    // commits to; terminal outcomes settle the outcome counters.
+                    self.command_metrics.record_latency(
+                        operation.operation.as_str(),
+                        now.saturating_sub(operation.created_at_ms),
+                    );
+                    self.command_metrics
+                        .record_outcome(operation.operation.as_str(), "acknowledged");
                 }
             }
-        }
-        if let Some(outcome) = CommandMetrics::outcome_label(result.state) {
-            self.command_metrics
-                .record_outcome(operation.operation.as_str(), outcome);
+            if matches!(
+                result.state,
+                HubOperationState::Acknowledged | HubOperationState::Running
+            ) {
+                // A progress report renews the command lease. The expiry is
+                // stamped at enqueue, so without this a JobStart that outlives
+                // lease_ttl (connect + checkpoint restore) would be swept as
+                // expired, marked TimedOut and dispatched a second time while the
+                // agent still runs it. A silent agent stops renewing and still
+                // expires, so liveness detection is preserved.
+                if let Some(node) = nodes.get_mut(&auth.node_id) {
+                    if let Some(command) = node.leased_commands.get_mut(&result.command_id) {
+                        command.expires_at_ms = now_ms() + self.config.lease_ttl_ms;
+                    }
+                }
+            }
+            if let Some(outcome) = CommandMetrics::outcome_label(result.state) {
+                self.command_metrics
+                    .record_outcome(operation.operation.as_str(), outcome);
+            }
         }
         let updated = operation.clone();
         let attempt_id = operation.attempt_id.clone();
@@ -908,6 +938,12 @@ impl Hub {
                     }
                 }
             }
+        }
+        if updated.state.is_terminal() {
+            self.settled_commands
+                .write()
+                .await
+                .insert(updated.command_id.clone());
         }
         Ok(updated)
     }

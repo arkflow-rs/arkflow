@@ -73,6 +73,34 @@ pub(crate) fn field_payloads(
             .iter()
             .map(|v| v.map(|s| s.as_bytes().to_vec()).ok_or_else(|| null_value_field(component, field)))
             .collect::<Result<Vec<_>, _>>()?),
+        // DataFusion 54 infers Parquet string/binary columns as View types by
+        // default; they represent the same per-row payload and must be
+        // accepted, not rejected as a configuration error.
+        DataType::Utf8View => {
+            let casted = datafusion::arrow::compute::cast(column, &DataType::Utf8).map_err(|e| {
+                Error::Process(format!("{component} value_field '{field}' cast failed: {e}"))
+            })?;
+            Ok(casted
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("cast to utf8")
+                .iter()
+                .map(|v| v.map(|s| s.as_bytes().to_vec()).ok_or_else(|| null_value_field(component, field)))
+                .collect::<Result<Vec<_>, _>>()?)
+        }
+        DataType::BinaryView => {
+            let casted =
+                datafusion::arrow::compute::cast(column, &DataType::Binary).map_err(|e| {
+                    Error::Process(format!("{component} value_field '{field}' cast failed: {e}"))
+                })?;
+            Ok(casted
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("cast to binary")
+                .iter()
+                .map(|v| v.map(<[u8]>::to_vec).ok_or_else(|| null_value_field(component, field)))
+                .collect::<Result<Vec<_>, _>>()?)
+        }
         other => Err(Error::Config(format!(
             "{component} value_field '{field}' has unsupported type {other} (use a binary or string column)"
         ))),

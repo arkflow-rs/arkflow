@@ -85,6 +85,29 @@ async fn seed_running_job(storage: &StorageActor, job_id: &str, restoration: &st
 }
 
 #[tokio::test]
+async fn a_fresh_capture_artifact_is_not_retried_before_its_dispatch() {
+    let (hub, storage) = pause_fixture("pause_dispatch_grace").await;
+    seed_running_job(&storage, "orders", "latest_checkpoint").await;
+
+    // Pausing commits the pause pointer and then dispatches the capture. With
+    // no placed nodes no capture operation is created, reproducing the window
+    // a concurrent reconcile tick can land in between those two steps.
+    let begun = hub.pause_job("orders", "admin").await.unwrap();
+    let artifact = begun.pause_artifact_id.clone().unwrap();
+    assert_eq!(
+        hub.reconcile_job_pauses().await.unwrap(),
+        0,
+        "a just-created capture artifact must not be re-dispatched"
+    );
+    let job = hub.job("orders").await.unwrap().unwrap();
+    assert_eq!(job.pause_artifact_id.as_deref(), Some(artifact.as_str()));
+    assert_eq!(
+        job.pause_retry_count, 0,
+        "the bounded retry budget must not be spent on the dispatch window"
+    );
+}
+
+#[tokio::test]
 async fn pause_captures_then_stops_and_resume_restores_from_the_capture() {
     let (hub, storage) = pause_fixture("pause_captures_then_stops_and_resume").await;
     seed_running_job(&storage, "orders", "latest_checkpoint").await;

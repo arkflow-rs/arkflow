@@ -24,7 +24,7 @@ jobs:
         uses: lycheeverse/lychee-action@v2
         with:
           # Checked-in config: docs/lychee.toml (retries, timeouts, exclusions)
-          args: --config ./docs/lychee.toml './docs/docs/**/*.md' './docs/docs/**/*.mdx' './README.md' './README_zh.md' './docs/DOCUMENTATION.md'
+          args: --config ./docs/lychee.toml './docs/docs/**/*.md' './docs/docs/**/*.mdx' './docs/i18n/**/*.md' './docs/i18n/**/*.mdx' './docs/versioned_docs/**/*.md' './docs/versioned_docs/**/*.mdx' './README.md' './README_zh.md' './docs/DOCUMENTATION.md'
           # Report-only: the action never fails this workflow; the lychee
           # exit code is read from the step output below.
           fail: false

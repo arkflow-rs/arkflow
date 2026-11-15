@@ -12,7 +12,19 @@ use tower::ServiceExt;
 fn job_config() -> EngineConfig {
     serde_json::from_str(
         r#"{
-        "streams": [],
+        "streams": [
+            {
+                "id": "stream-a",
+                "input": {
+                    "type": "generate",
+                    "context": "{ \"sensor\": \"temp_2\", \"value\": 5 }",
+                    "interval": "20ms",
+                    "batch_size": 5
+                },
+                "pipeline": {"thread_num": 1, "processors": []},
+                "output": {"type": "drop"}
+            }
+        ],
         "jobs": [
             {
                 "id": "sensor-window-job",
@@ -35,6 +47,37 @@ fn job_config() -> EngineConfig {
                             "context": "{ \"sensor\": \"temp_1\", \"value\": 10, \"ts\": 1757000000000 }",
                             "interval": "20ms",
                             "batch_size": 10
+                        },
+                        "time": {
+                            "mode": "processing_time"
+                        }
+                    }
+                ],
+                "sinks": [
+                    {"operator_id": "sink", "output_type": "drop"}
+                ]
+            },
+            {
+                "id": "second-window-job",
+                "version": 1,
+                "parallelism": 1,
+                "max_parallelism": 128,
+                "operators": [
+                    {"id": "source", "kind": "source"},
+                    {"id": "sink", "kind": "sink"}
+                ],
+                "edges": [
+                    {"id": "e1", "from": "source", "to": "sink", "partitioned": true}
+                ],
+                "sources": [
+                    {
+                        "operator_id": "source",
+                        "input_type": "generate",
+                        "config": {
+                            "type": "generate",
+                            "context": "{ \"sensor\": \"temp_3\", \"value\": 7 }",
+                            "interval": "20ms",
+                            "batch_size": 4
                         },
                         "time": {
                             "mode": "processing_time"
@@ -148,6 +191,38 @@ async fn local_job_exports_kernel_metrics_and_counters_advance() {
         first.contains("job=\"sensor-window-job\""),
         "missing job label in:\n{first}"
     );
+    // Multiple jobs AND a compiled stream feed the same families: the
+    // exposition must merge them into ONE family declaration (a per-resource
+    // block duplicated HELP/TYPE), while every resource keeps its samples.
+    for label in ["job=\"sensor-window-job\"", "job=\"second-window-job\""] {
+        assert!(
+            first.contains(label),
+            "missing {label} in the exposition:\n{first}"
+        );
+    }
+    assert!(
+        first.contains("stream_id=\"stream-a\""),
+        "missing the compiled stream's samples in the exposition:\n{first}"
+    );
+    for prefix in [
+        "# HELP arkflow_job_chain_batches_in_total",
+        "# TYPE arkflow_job_chain_batches_in_total",
+        "# HELP arkflow_stream_input_messages",
+        "# TYPE arkflow_stream_input_messages",
+    ] {
+        let declarations = first
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .count();
+        assert_eq!(
+            declarations, 1,
+            "the metric family must be declared exactly once, got {declarations} for `{prefix}`"
+        );
+    }
+    assert!(
+        batches_in_total(&first, "second-window-job") > 0,
+        "the second Job must export its own chain counters"
+    );
     // The full vocabulary is present, including the event-time gauges.
     assert!(first.contains("# TYPE arkflow_job_watermark_lag_ms gauge"));
     assert!(first.contains("# TYPE arkflow_job_checkpoint_duration_ms gauge"));
@@ -164,12 +239,22 @@ async fn local_job_exports_kernel_metrics_and_counters_advance() {
     );
 
     cancellation.cancel();
-    loop {
-        use std::task::Poll;
-        if let Poll::Ready(result) = futures_util::poll!(engine_fut.as_mut()) {
-            result.expect("engine failed during shutdown");
-            break;
+    // Bounded shutdown: the loop used to poll forever when the engine could
+    // not stop, turning a hang into a test-suite timeout with no clue which
+    // resource kept running.
+    let stopped = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            use std::task::Poll;
+            if let Poll::Ready(result) = futures_util::poll!(engine_fut.as_mut()) {
+                result.expect("engine failed during shutdown");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await;
+    assert!(
+        stopped.is_ok(),
+        "engine did not shut down within 15s of cancellation"
+    );
 }

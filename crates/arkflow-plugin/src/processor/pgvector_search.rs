@@ -313,6 +313,13 @@ impl ProcessorBuilder for PgVectorSearchProcessorBuilder {
                 "pgvector_search processor: 'concurrency' must be at least 1".to_string(),
             ));
         }
+        if config.max_connections == 0 {
+            // sqlx builds an ArrayQueue with this capacity; zero panics during
+            // pool construction instead of returning a config error.
+            return Err(Error::Config(
+                "pgvector_search processor: 'max_connections' must be at least 1".to_string(),
+            ));
+        }
         // Lazy pool: no network I/O until the first query, so building a
         // processor stays offline-safe (config validation, tests).
         let options: sqlx::postgres::PgConnectOptions = config

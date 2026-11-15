@@ -11,6 +11,7 @@
 use super::error::HubError;
 use super::{now_ms, Hub, HUB_SEQUENCE};
 use crate::storage::{AuditRecord, ConfigApprovalRequest, ConfigApprovalStatus};
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 /// Terminal requests are pruned after 30 days.
@@ -55,19 +56,20 @@ impl Hub {
         {
             return Err(HubError::Invalid("configuration version not found".into()));
         }
-        let registered = self.nodes().await;
-        let known: std::collections::BTreeSet<String> =
-            registered.into_iter().map(|node| node.id).collect();
-        let unknown: Vec<String> = node_ids
-            .iter()
-            .filter(|id| !known.contains(*id))
-            .cloned()
-            .collect();
-        if !unknown.is_empty() {
-            return Err(HubError::Invalid(format!(
-                "approval request targets unknown node(s): {}",
-                unknown.join(", ")
-            )));
+        // Match direct rollout creation: reject empty/duplicate target lists
+        // but do not require the node to be re-registered in this process.
+        // Label resolution reads durable labels, so a Hub restart legitimately
+        // produces targets that have not re-registered yet.
+        if node_ids.is_empty() {
+            return Err(HubError::Invalid(
+                "approval request requires at least one target node".into(),
+            ));
+        }
+        let unique: std::collections::BTreeSet<&String> = node_ids.iter().collect();
+        if unique.len() != node_ids.len() {
+            return Err(HubError::Invalid(
+                "approval request targets contain duplicate node ids".into(),
+            ));
         }
         let now = now_ms();
         let request = ConfigApprovalRequest {
@@ -153,6 +155,10 @@ impl Hub {
         approver_id: String,
         note: Option<String>,
     ) -> Result<ConfigApprovalRequest, HubError> {
+        // A retry of a crashed approval re-enters at `approving` and skips
+        // the status CAS; serialize the whole adopt-or-create decision so
+        // two such callers cannot each create a rollout for one correlation.
+        let _decision = self.approval_lock.lock().await;
         let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
         let request = storage
             .get_config_approval_request(request_id)
@@ -257,24 +263,36 @@ impl Hub {
                 {
                     Ok(rollout) => rollout,
                     Err(error) => {
-                        // Roll the reservation back: the request stays
-                        // decidable, the failure reason is recorded.
-                        let _ = storage
-                            .reset_config_approval_request(
-                                request_id,
-                                &format!("rollout creation failed: {error}"),
-                                now_ms(),
+                        // Rollout creation can fail AFTER the rollout and its
+                        // targets were persisted (e.g. the audit write). Do
+                        // not reset the approval to pending in that case:
+                        // periodic recovery only adopts `approving` rows, so
+                        // the already-created rollout would never be linked.
+                        if let Ok(Some(existing)) = storage
+                            .find_rollout_by_correlation(&request.correlation_id)
+                            .await
+                        {
+                            existing
+                        } else {
+                            // Roll the reservation back: the request stays
+                            // decidable, the failure reason is recorded.
+                            let _ = storage
+                                .reset_config_approval_request(
+                                    request_id,
+                                    &format!("rollout creation failed: {error}"),
+                                    now_ms(),
+                                )
+                                .await;
+                            self.record_approval_audit(
+                                "config_approval.approve",
+                                &request,
+                                &approver_id,
+                                note.as_deref(),
+                                "failed",
                             )
-                            .await;
-                        self.record_approval_audit(
-                            "config_approval.approve",
-                            &request,
-                            &approver_id,
-                            note.as_deref(),
-                            "failed",
-                        )
-                        .await?;
-                        return Err(error);
+                            .await?;
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -378,6 +396,7 @@ impl Hub {
     ) -> Result<bool, HubError> {
         let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
         let rollouts = storage.list_rollouts().await.map_err(HubError::from)?;
+        let mut applied: BTreeSet<String> = BTreeSet::new();
         for rollout in &rollouts {
             if rollout.config_version_id != config_version_id {
                 continue;
@@ -386,14 +405,18 @@ impl Hub {
                 .list_rollout_targets(&rollout.rollout_id)
                 .await
                 .map_err(HubError::from)?;
-            if targets.iter().any(|target| {
-                node_ids.contains(&target.node_id)
+            for target in targets {
+                if node_ids.contains(&target.node_id)
                     && (target.observed_config_version.as_deref() == Some(config_version_id)
                         || matches!(target.state.as_str(), "applied" | "converged" | "succeeded"))
-            }) {
-                return Ok(true);
+                {
+                    applied.insert(target.node_id);
+                }
             }
         }
-        Ok(false)
+        // Every rollback target must have an application record: a version
+        // applied to only part of the fleet must not reach the remaining
+        // nodes through the rollback path around the approval gate.
+        Ok(node_ids.iter().all(|node_id| applied.contains(node_id)))
     }
 }

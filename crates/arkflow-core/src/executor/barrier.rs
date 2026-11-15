@@ -69,6 +69,9 @@ pub(crate) struct Aligner {
     /// Last completed barrier, used to reject an accidental duplicate after a
     /// one-input vertex has already forwarded it.
     last_completed: Option<CheckpointBarrier>,
+    /// Barrier whose alignment attempt just failed, used to attribute a
+    /// checkpoint failure to the round that actually observed it.
+    failed_barrier: Option<CheckpointBarrier>,
 }
 
 impl Aligner {
@@ -82,13 +85,21 @@ impl Aligner {
             passthrough: None,
             in_flight: None,
             last_completed: None,
+            failed_barrier: None,
         }
     }
 
+    /// Barrier whose alignment attempt most recently failed. `None` when the
+    /// failure cannot be attributed to a specific round.
+    pub fn failed_barrier(&self) -> Option<CheckpointBarrier> {
+        self.failed_barrier.clone()
+    }
+
     /// Feed one envelope from input `index`. Returns `Some(barrier)` when the
-    /// last missing barrier arrives (all inputs aligned); data envelopes are
-    /// buffered until then, or parked for `take_passthrough` when no
-    /// alignment is in progress.
+    /// last missing barrier arrives (all inputs aligned). Post-barrier data
+    /// (from an input whose own barrier already arrived) is buffered until
+    /// then; pre-barrier data from a still-waiting input is parked for
+    /// `take_passthrough` so it is processed before the snapshot is taken.
     pub fn observe(
         &mut self,
         index: usize,
@@ -161,6 +172,17 @@ impl Aligner {
             }
             if let Some(expected) = self.in_flight.clone() {
                 if expected != barrier {
+                    // Blame the barrier the coordinator is most likely
+                    // waiting for: a newer round was injected after the
+                    // in-flight one timed out, and the chain just consumed
+                    // it, so tagging the OLD round would let the coordinator
+                    // discard the failure as stale and wait out the full
+                    // round timeout for a report that can never arrive.
+                    self.failed_barrier = Some(if barrier.generation >= expected.generation {
+                        barrier.clone()
+                    } else {
+                        expected.clone()
+                    });
                     self.in_flight = None;
                     self.aligned.clear();
                     return Err(crate::Error::Process(format!(
@@ -184,6 +206,7 @@ impl Aligner {
             if self.barrier_complete() {
                 self.aligned.clear();
                 self.in_flight = None;
+                self.failed_barrier = None;
                 self.last_completed = Some(barrier.clone());
                 return Ok(Some(barrier));
             }
@@ -191,6 +214,16 @@ impl Aligner {
         }
         if self.aligned.is_empty() && self.buffered.is_empty() {
             // Fast path: no alignment in progress; park for pass-through.
+            self.passthrough = Some(envelope);
+            return Ok(None);
+        }
+        if !self.aligned.contains(&index) {
+            // This input has not delivered its own barrier yet. The record
+            // precedes that input's barrier (channels are FIFO), so it
+            // belongs BEFORE the checkpoint cut and must be processed now.
+            // Buffering it until release would take the state snapshot
+            // without its effect while the source position has already
+            // advanced past it.
             self.passthrough = Some(envelope);
             return Ok(None);
         }
@@ -207,6 +240,7 @@ impl Aligner {
             // Drop the alignment attempt; the buffered envelopes are released
             // by `release` and the checkpoint fails upstream rather than
             // growing memory without bound.
+            self.failed_barrier = self.in_flight.clone();
             self.aligned.clear();
             self.in_flight = None;
             return Err(crate::Error::Process(format!(
@@ -223,6 +257,7 @@ impl Aligner {
 
     /// Whether `index` is currently held back by alignment (its data must be
     /// buffered rather than processed).
+    #[cfg(test)]
     pub fn is_aligning(&self) -> bool {
         self.in_flight.is_some() || !self.aligned.is_empty() || !self.buffered.is_empty()
     }
@@ -469,21 +504,39 @@ mod tests {
     }
 
     #[test]
-    fn an_eos_is_buffered_when_alignment_already_drained_data() {
+    fn pre_barrier_data_from_a_waiting_input_is_processed_not_buffered() {
+        let mut aligner = Aligner::new(2, 10);
+        assert!(aligner.observe(0, barrier("cp-1", 1)).unwrap().is_none());
+        // Input 0 already delivered its barrier: later data from it is
+        // post-barrier and must be held out of the running state.
+        assert!(aligner.observe(0, data()).unwrap().is_none());
+        assert!(aligner.take_passthrough().is_none());
+        // Input 1 has not delivered its barrier yet: this record precedes
+        // the cut and must be processed before the snapshot.
+        assert!(aligner.observe(1, data()).unwrap().is_none());
+        assert!(
+            aligner.take_passthrough().is_some(),
+            "pre-barrier data from the waiting input must pass through"
+        );
+        assert!(aligner.observe(1, barrier("cp-1", 1)).unwrap().is_some());
+        // Only input 0's held post-barrier data is released.
+        assert_eq!(aligner.release().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_round_keeps_holding_post_barrier_data_until_release() {
         let mut aligner = Aligner::new(2, 10);
         aligner.observe(0, barrier("cp-1", 1)).unwrap();
+        // Post-barrier data from the aligned input is held.
+        aligner.observe(0, data()).unwrap();
+        // Pre-barrier data from the waiting input passes through.
         aligner.observe(1, data()).unwrap();
-        // A mismatched barrier fails the round and clears the in-flight state
-        // while leaving the buffered data in place.
+        assert!(aligner.take_passthrough().is_some());
+        // A mismatched barrier fails the round and clears the in-flight
+        // state while leaving the held data for `release`.
         assert!(aligner.observe(0, barrier("cp-2", 1)).is_err());
-        assert!(aligner
-            .observe(1, crate::executor::Envelope::Eos)
-            .unwrap()
-            .is_none());
-        // The EOS joined the buffer instead of passing through.
-        assert!(aligner.take_passthrough().is_none());
         let released = aligner.release();
-        assert_eq!(released.len(), 2);
+        assert_eq!(released.len(), 1);
     }
 
     #[test]
@@ -529,6 +582,19 @@ mod tests {
         assert!(error.to_string().contains("barrier mismatch"), "{error}");
         // The failed alignment no longer holds data back.
         assert!(!aligner.is_aligning());
+    }
+
+    #[test]
+    fn a_mismatched_newer_barrier_is_the_one_reported_failed() {
+        let mut aligner = Aligner::new(2, 10);
+        aligner.observe(0, barrier("cp-1", 1)).unwrap();
+        let error = aligner.observe(1, barrier("cp-2", 2)).unwrap_err();
+        assert!(error.to_string().contains("barrier mismatch"), "{error}");
+        assert_eq!(
+            aligner.failed_barrier().map(|b| b.checkpoint_id),
+            Some("cp-2".to_string()),
+            "the newly received round is the one the coordinator waits for"
+        );
     }
 
     #[test]

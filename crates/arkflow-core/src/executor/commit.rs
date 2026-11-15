@@ -64,6 +64,15 @@ struct PartitionFrontier {
     next_offset: u64,
     /// Acknowledged next-offsets waiting for the gap before them to close.
     pending: BTreeSet<u64>,
+    /// Record offsets that were delivered but not yet acknowledged. An
+    /// offset below a later delivery that is absent here was never produced
+    /// by the broker (compaction/control batches) and must not wedge the
+    /// frontier forever; an offset still present here is in flight.
+    delivered: BTreeSet<u64>,
+    /// Whether the connector uses [`CommitFrontier::anchor_delivery`]. Only
+    /// then can an undelivered offset below a later ack be proven absent;
+    /// without delivery observation every integer gap may be in flight.
+    track_deliveries: bool,
 }
 
 /// Snapshot of one partition frontier used by connectors that must
@@ -75,6 +84,8 @@ pub struct FrontierSnapshot {
     active: bool,
     next_offset: u64,
     pending: BTreeSet<u64>,
+    delivered: BTreeSet<u64>,
+    track_deliveries: bool,
 }
 
 /// An immutable sealed view of the acknowledged frontier at one instant.
@@ -199,6 +210,8 @@ impl CommitFrontier {
             // stale seed rather than merging with it.
             frontier.next_offset = position.offset;
             frontier.pending.clear();
+            frontier.delivered.clear();
+            frontier.track_deliveries = false;
             failures.remove(&PartitionKey::from_position(position));
         }
     }
@@ -213,6 +226,12 @@ impl CommitFrontier {
         let frontier = partitions
             .entry(PartitionKey::from_position(position))
             .or_default();
+        // The record this acknowledgement covers is no longer in flight.
+        // Only a record that was actually observed as delivered proves that
+        // the offsets below it were absent; an unanchored ack keeps the
+        // strict contiguous contract.
+        let acked_record = position.offset.saturating_sub(1);
+        let acked_was_delivered = frontier.delivered.remove(&acked_record);
         if !frontier.active {
             frontier.active = true;
             frontier.next_offset = position.offset;
@@ -222,6 +241,34 @@ impl CommitFrontier {
         }
         if position.offset <= frontier.next_offset {
             return AckAdvance::AlreadyCovered;
+        }
+        // Skip offsets that a later delivery/ack proves the broker never
+        // produced. Kafka offsets are not necessarily contiguous (compaction,
+        // transaction control batches); treating every integer gap as an
+        // in-flight record wedged the frontier forever for a record that
+        // would never be delivered. Stop at a delivered offset: that record
+        // is still in flight and must be acknowledged first.
+        if frontier.track_deliveries
+            && acked_was_delivered
+            && !frontier.delivered.contains(&frontier.next_offset)
+        {
+            let proven = position.offset.saturating_sub(1);
+            let mut next = frontier.next_offset;
+            while next < proven {
+                let candidate = next + 1;
+                if frontier.pending.remove(&candidate) {
+                    next = candidate;
+                    continue;
+                }
+                if frontier.delivered.contains(&candidate) {
+                    break;
+                }
+                next = candidate;
+            }
+            frontier.next_offset = next;
+            if position.offset <= frontier.next_offset {
+                return AckAdvance::AlreadyCovered;
+            }
         }
         frontier.pending.insert(position.offset);
         if position.offset == frontier.next_offset + 1 {
@@ -235,6 +282,13 @@ impl CommitFrontier {
             }
             frontier.next_offset = next;
             return AckAdvance::Advanced { next_offset: next };
+        }
+        // The ack is not settled yet: restore the delivery anchor removed at
+        // the top so a retry can still tell that this record was delivered
+        // and may skip the sparse offsets below it (Kafka anchors only each
+        // segment's first offset).
+        if acked_was_delivered {
+            frontier.delivered.insert(acked_record);
         }
         AckAdvance::Pending {
             gap: frontier.next_offset + 1,
@@ -252,6 +306,10 @@ impl CommitFrontier {
         let frontier = partitions
             .entry(PartitionKey::from_position(position))
             .or_default();
+        // Remember the in-flight record even for an active partition: the
+        // gap scan below must stop at it instead of skipping it as absent.
+        frontier.delivered.insert(position.offset);
+        frontier.track_deliveries = true;
         if frontier.active {
             return;
         }
@@ -299,11 +357,15 @@ impl CommitFrontier {
                 active: frontier.active,
                 next_offset: frontier.next_offset,
                 pending: frontier.pending.clone(),
+                delivered: frontier.delivered.clone(),
+                track_deliveries: frontier.track_deliveries,
             })
             .unwrap_or_else(|| FrontierSnapshot {
                 active: false,
                 next_offset: 0,
                 pending: BTreeSet::new(),
+                delivered: BTreeSet::new(),
+                track_deliveries: false,
             })
     }
 
@@ -340,6 +402,8 @@ impl CommitFrontier {
         frontier.active = snapshot.active;
         frontier.next_offset = snapshot.next_offset;
         frontier.pending = snapshot.pending;
+        frontier.delivered = snapshot.delivered;
+        frontier.track_deliveries = snapshot.track_deliveries;
         true
     }
 
@@ -363,6 +427,15 @@ impl CommitFrontier {
             return false;
         }
         frontier.next_offset = expected_next_offset.saturating_sub(1);
+        // The rewound record must be delivered and acknowledged again: mark
+        // it in flight so a later delivery's sparse gap scan stops here
+        // instead of treating the rewound offsets as broker gaps that can be
+        // skipped (which committed past the compensated segment).
+        if frontier.track_deliveries {
+            frontier
+                .delivered
+                .insert(expected_next_offset.saturating_sub(1));
+        }
         frontier
             .pending
             .retain(|offset| *offset <= frontier.next_offset);
@@ -823,6 +896,36 @@ mod tests {
     }
 
     #[test]
+    fn sparse_offsets_do_not_wedge_the_frontier() {
+        let frontier = CommitFrontier::new();
+        frontier.anchor_delivery(&position("orders", 0, 5));
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, 6)),
+            AckAdvance::Advanced { next_offset: 6 }
+        );
+        // Offset 6 is never delivered (compaction/control batch); the next
+        // segment starts at 7 and must still advance.
+        frontier.anchor_delivery(&position("orders", 0, 7));
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, 8)),
+            AckAdvance::Advanced { next_offset: 8 }
+        );
+    }
+
+    #[test]
+    fn an_in_flight_offset_still_blocks_a_later_ack() {
+        let frontier = CommitFrontier::new();
+        // Record 5 is delivered but not yet acknowledged; record 7 is
+        // acknowledged first. The frontier must not skip 5 as absent.
+        frontier.anchor_delivery(&position("orders", 0, 5));
+        frontier.anchor_delivery(&position("orders", 0, 7));
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, 8)),
+            AckAdvance::Pending { gap: 6 }
+        );
+    }
+
+    #[test]
     fn delivery_anchor_prevents_first_ack_from_skipping_a_burst() {
         // A fan-out can complete the later branch first; without a delivery
         // anchor the first acknowledgement would claim the earlier records of
@@ -1239,6 +1342,46 @@ mod tests {
             AckAdvance::Pending { gap: 7 },
             "9 no longer sits in the pending set after the rewind"
         );
+    }
+
+    #[test]
+    fn a_rewound_segment_is_not_skipped_by_a_later_partition_ack() {
+        let frontier = CommitFrontier::new();
+        // Segment A covers 0..=2, anchored (as Kafka does) at its first
+        // offset, and is acknowledged.
+        frontier.anchor_delivery(&position("orders", 0, 0));
+        for offset in 1..=3 {
+            frontier.acknowledge(&position("orders", 0, offset));
+        }
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(3));
+        // Compensation rewinds the whole segment one step at a time.
+        for expected in (1..=3).rev() {
+            assert!(frontier.rewind_position(Some("orders"), 0, expected));
+        }
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(0));
+
+        // Segment B (anchored at 100) is acknowledged while A awaits
+        // redelivery: it must not skip the rewound segment.
+        frontier.anchor_delivery(&position("orders", 0, 100));
+        assert!(
+            matches!(
+                frontier.acknowledge(&position("orders", 0, 101)),
+                AckAdvance::Pending { gap: 1 }
+            ),
+            "a later ack must wait for the compensated segment"
+        );
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(0));
+
+        // A is redelivered and re-acknowledged; B's retry then closes the
+        // sparse gap and advances past its own record.
+        for offset in 1..=3 {
+            frontier.acknowledge(&position("orders", 0, offset));
+        }
+        assert_eq!(
+            frontier.acknowledge(&position("orders", 0, 101)),
+            AckAdvance::Advanced { next_offset: 101 }
+        );
+        assert_eq!(frontier.next_offset_of(Some("orders"), 0), Some(101));
     }
 
     #[test]

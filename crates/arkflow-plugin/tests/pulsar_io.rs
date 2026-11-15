@@ -162,6 +162,8 @@ fn sweep_leftover_brokers() {
             "ps",
             "-aq",
             "--filter",
+            "status=exited",
+            "--filter",
             "label=org.testcontainers.managed-by=testcontainers",
             "--filter",
             "ancestor=apachepulsar/pulsar:3.3.3",
@@ -576,13 +578,18 @@ async fn input_reads_and_ack_prevents_redelivery() {
         .build()
         .await
         .expect("verify consumer");
-    if let Ok(Some(Ok(message))) =
-        tokio::time::timeout(Duration::from_secs(5), verifier.next()).await
-    {
-        panic!(
+    match tokio::time::timeout(Duration::from_secs(5), verifier.next()).await {
+        // No redelivery within the window: pass.
+        Err(_) | Ok(None) => {}
+        // An error means the probe never established its premise; treating
+        // it as "no message" let a broken verifier mask a real redelivery.
+        Ok(Some(Err(error))) => {
+            panic!("verifier consumer failed before proving no redelivery: {error}")
+        }
+        Ok(Some(Ok(message))) => panic!(
             "acknowledged message re-delivered: {:?}",
             message.payload.data
-        );
+        ),
     }
 }
 

@@ -3,7 +3,7 @@
 //! repository construction, and recovery artifact validation/restore.
 use arkflow_core::checkpoint::{
     recovery_manifest_key, CheckpointRepository, CheckpointStatus, CheckpointStore,
-    RecoveryArtifact, RecoveryArtifactKind,
+    RecoveryArtifact, RecoveryArtifactKind, StateSnapshotRef,
 };
 use arkflow_core::job::JobPlan;
 use arkflow_core::state::StateBackend;
@@ -106,8 +106,20 @@ pub(super) fn checkpoint_worker() -> &'static flume::Sender<CheckpointJob> {
                     }
                 };
                 runtime.block_on(async move {
+                    // Bound in-flight object-store work. The channel only
+                    // bounds queued jobs; once spawned, a slow request still
+                    // owns a snapshot and a blocked caller.
+                    let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
                     while let Ok(job) = receiver.recv_async().await {
-                        let handle = tokio::spawn(job.future);
+                        let permit = in_flight
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("checkpoint worker semaphore is never closed");
+                        let handle = tokio::spawn(async move {
+                            let _permit = permit;
+                            job.future.await;
+                        });
                         tokio::spawn(async move {
                             if handle.await.is_err() {
                                 tracing::error!("checkpoint object store command panicked");
@@ -154,7 +166,14 @@ impl CheckpointStore for SharedCheckpointStore {
     fn delete(&self, key: &str) -> Result<(), arkflow_core::Error> {
         let path = self.path_for(key)?;
         let client = self.client.clone();
-        self.block_on(async move { client.delete(&path).await })
+        self.block_on(async move {
+            match client.delete(&path).await {
+                // Deleting a key that is already gone is success: a retry
+                // after a partial delete must be able to finish the rest.
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(error) => Err(error),
+            }
+        })
     }
 }
 
@@ -336,6 +355,15 @@ pub(super) fn validate_recovery_manifest(
     Ok(())
 }
 
+fn unique_snapshot_refs(refs: &[StateSnapshotRef]) -> Vec<&StateSnapshotRef> {
+    // Every task of one node references the SAME physical state object. Read
+    // and validate each object once per operation instead of once per task.
+    let mut seen = BTreeSet::new();
+    refs.iter()
+        .filter(|snapshot| seen.insert((snapshot.uri.clone(), snapshot.checksum)))
+        .collect()
+}
+
 pub(super) fn validate_recovery_snapshots<S: CheckpointStore>(
     plan: &JobPlan,
     repository: &CheckpointRepository<S>,
@@ -359,7 +387,7 @@ pub(super) fn validate_recovery_snapshots<S: CheckpointStore>(
     }
     let expected_prefix =
         arkflow_core::job::state_namespace_prefix(&plan.spec.id, plan.spec.state.as_ref());
-    for snapshot_ref in &manifest.state_snapshots {
+    for snapshot_ref in unique_snapshot_refs(&manifest.state_snapshots) {
         let snapshot = repository
             .read_state_snapshot(snapshot_ref)
             .map_err(|error| error.to_string())?;
@@ -423,8 +451,7 @@ pub(crate) fn recovery_record_is_valid(
     {
         return false;
     }
-    manifest
-        .state_snapshots
+    unique_snapshot_refs(&manifest.state_snapshots)
         .iter()
         .all(|snapshot| repository.read_state_snapshot(snapshot).is_ok())
 }
@@ -453,7 +480,7 @@ pub(super) fn restore_recovery_state<S: CheckpointStore>(
         let context = arkflow_core::executor::job_runner_adapter::RescaleContext::from_plan(plan)
             .map_err(|error| error.to_string())?;
         let mut entries = Vec::new();
-        for snapshot_ref in &manifest.state_snapshots {
+        for snapshot_ref in unique_snapshot_refs(&manifest.state_snapshots) {
             let snapshot = repository
                 .read_state_snapshot(snapshot_ref)
                 .map_err(|error| error.to_string())?;
@@ -474,10 +501,14 @@ pub(super) fn restore_recovery_state<S: CheckpointStore>(
         let snapshot = arkflow_core::state::StateSnapshot::new(state.format_version(), entries);
         return state.restore(&snapshot).map_err(|error| error.to_string());
     }
-    let mut snapshots = manifest
+    let assigned_refs = manifest
         .state_snapshots
         .iter()
         .filter(|snapshot_ref| assigned_task_ids.contains(snapshot_ref.task_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut snapshots = unique_snapshot_refs(&assigned_refs)
+        .iter()
         .map(|snapshot_ref| {
             repository
                 .read_state_snapshot(snapshot_ref)

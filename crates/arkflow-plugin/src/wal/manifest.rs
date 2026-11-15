@@ -46,7 +46,8 @@ pub enum SegmentCompression {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Manifest {
     /// Schema version. Bumped only on incompatible changes; recovery
-    /// treats an unknown `version` as an empty manifest.
+    /// refuses a manifest version this build does not understand rather
+    /// than resuming from cursor semantics that may have changed.
     #[serde(default = "default_version")]
     pub version: u32,
     /// Stable per-pod identifier (sanity check on recovery — the segment
@@ -100,7 +101,17 @@ impl Manifest {
     }
 
     pub(crate) fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+        let manifest: Self = serde_json::from_slice(bytes)?;
+        // v1 lacks `active_segment_compression`; v2 adds it. A newer writer
+        // may change cursor semantics, so refuse it instead of resuming
+        // acknowledged progress from a position this build misreads.
+        if !(1..=2).contains(&manifest.version) {
+            return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                "unsupported WAL manifest version {} (this build reads versions 1..=2)",
+                manifest.version
+            )));
+        }
+        Ok(manifest)
     }
 }
 
@@ -114,6 +125,20 @@ mod tests {
         let bytes = m.to_json().unwrap();
         let back = Manifest::from_json(&bytes).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn unknown_version_is_rejected_before_cursor_use() {
+        let json = r#"{
+            "version": 3,
+            "node_id": "a",
+            "stream_id": "b",
+            "cursor": 42,
+            "max_sealed_seq": 42,
+            "sealed_segments": []
+        }"#;
+        let error = Manifest::from_json(json.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("unsupported"), "{error}");
     }
 
     #[test]

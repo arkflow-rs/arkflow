@@ -260,6 +260,10 @@ impl<T: MqttClient> Output for MqttOutput<T> {
         if payloads.is_empty() {
             return Ok(());
         }
+        // A codec that skips NULL payload rows returns fewer payloads than
+        // rows; pairing them with per-row topics by index would publish each
+        // row under a previous row's topic.
+        crate::output::codec_helper::ensure_row_aligned(&payloads, msg.num_rows(), "mqtt")?;
 
         let topic = self.config.topic.evaluate_expr(&msg).await?;
 

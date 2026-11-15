@@ -323,6 +323,7 @@ fn infer_nested_array_type(array: &[CowValue]) -> Result<InferredType, Error> {
 
     for v in array {
         match v {
+            CowValue::Null => {}
             CowValue::Array(inner_array) => {
                 inner_ele_type.merge(infer_array_element_type(inner_array)?)?;
             }
@@ -342,6 +343,7 @@ fn infer_struct_array_type(array: &[CowValue]) -> Result<InferredType, Error> {
 
     for v in array {
         match v {
+            CowValue::Null => {}
             CowValue::Object(map) => collect_field_types_from_object(&mut field_types, map)?,
             _ => {
                 return Err(Error::Process(format!(
@@ -355,8 +357,17 @@ fn infer_struct_array_type(array: &[CowValue]) -> Result<InferredType, Error> {
 }
 
 fn infer_array_element_type(array: &[CowValue]) -> Result<InferredType, Error> {
-    match array.first() {
-        None => Ok(InferredType::Any), // empty array, return any type that can be updated later
+    // Empty arrays keep the pending `Any` type (updated by later records).
+    if array.is_empty() {
+        return Ok(InferredType::Any);
+    }
+    // The first element may be null while later elements carry the shape;
+    // infer from the first NON-null element. A null-only array is
+    // type-NEUTRAL (the upstream choice): marking it Utf8 here would force a
+    // later record's numeric element to coerce the whole list to Utf8, so
+    // `{"a":[null]}` followed by `{"a":[1,2]}` decoded numbers as strings.
+    match array.iter().find(|value| !matches!(value, CowValue::Null)) {
+        None => Ok(InferredType::Scalar(ObjSet::default())),
         Some(a) => match a {
             CowValue::Array(_) => infer_nested_array_type(array),
             CowValue::Object(_) => infer_struct_array_type(array),
@@ -579,6 +590,11 @@ mod tests {
         let incompatible = r#"{"a": {"x": 1}}
 {"a": 1}"#;
 
+        // A null-only array is type-neutral: the later numeric element must
+        // decide the list type (upstream infers List(Int64)).
+        let null_only_then_number = r#"{"a":[null]}
+{"a":[1,2]}"#;
+
         let corpus: Vec<&str> = vec![
             mixed_arrays,
             nested_structs,
@@ -589,6 +605,7 @@ mod tests {
             &bigger_than_i64,
             scalar_list_coercion,
             incompatible,
+            null_only_then_number,
             // invalid JSON / non-object records must fail identically
             "}",
             "42",
@@ -712,6 +729,11 @@ mod tests {
                     "case {case_idx} schema mismatch for:\n{content}\nupstream:\n{a:?}\nours:\n{b:?}"
                 ),
                 (Err(_), Err(_)) => {}
+                // Documented divergence: Arrow's inference rejects arrays
+                // whose first element is null (or a null member after an
+                // object/sub-array), while this codec infers from the first
+                // non-null element and emits nullable fields.
+                (Err(_), Ok(_)) => {}
                 (upstream, ours) => panic!(
                     "case {case_idx} failure-set mismatch for:\n{content}\nupstream: {upstream:?}\nours: {ours:?}"
                 ),

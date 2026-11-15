@@ -202,7 +202,15 @@ impl MilvusOutput {
                             Error::Process(format!("Milvus response parse failed: {}", e))
                         })?;
                         match parsed.get("code") {
-                            None => return Ok(()), // Lenient with older builds that omit the code.
+                            // A response without the confirmation code is not
+                            // proof of a write: proxies/error routes return
+                            // generic JSON too. Require the explicit success
+                            // code.
+                            None => {
+                                return Err(Error::Process(
+                                    "Milvus response lacks a confirmation code".into(),
+                                ))
+                            }
                             Some(code) if code.as_i64() == Some(0) => return Ok(()),
                             Some(code) => {
                                 let message = parsed
@@ -412,6 +420,22 @@ impl OutputBuilder for MilvusOutputBuilder {
                     .to_string(),
             ));
         }
+        // The write assembles id, vector, and payload into one JSON object;
+        // equal field names would overwrite the primary key or the vector.
+        let mut fields = vec![
+            config.id_field.clone().unwrap_or_default(),
+            config.vector_field.clone(),
+        ];
+        if !config.payload_field.is_empty() {
+            fields.push(config.payload_field.clone());
+        }
+        let unique: std::collections::BTreeSet<_> = fields.iter().collect();
+        if unique.len() != fields.len() {
+            return Err(Error::Config(
+                "milvus output: id_field, vector_field, and payload_field must be distinct"
+                    .to_string(),
+            ));
+        }
         // Loopback endpoints (local Milvus dev instances, tests) bypass a
         // system proxy — proxying localhost is never what a user means.
         let is_loopback = reqwest::Url::parse(&format!("{}/", config.url.trim_end_matches('/')))
@@ -586,10 +610,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_200_without_code_is_lenient() {
+    async fn http_200_without_code_is_not_treated_as_success() {
         let mock = MockMilvus::spawn(|_body| (200, r#"{"status":"ok"}"#.to_string()));
         let output = build_output(base_config(mock.addr(), serde_json::json!({})));
-        assert!(output.write(sample_batch()).await.is_ok());
+        let error = output.write(sample_batch()).await.unwrap_err().to_string();
+        assert!(error.contains("confirmation code"), "{error}");
     }
 
     #[tokio::test]

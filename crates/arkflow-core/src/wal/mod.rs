@@ -335,6 +335,10 @@ const WAL_ACK_PARK_TIMEOUT: Duration = Duration::from_secs(60);
 /// of `executor::event_time_gate`.
 const WAL_FLUSH_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Pause after a failed group-commit flush before retrying the restored
+/// batch, so a persistently failing backend cannot spin the flusher.
+const WAL_FLUSH_RETRY_BACKOFF_MS: u64 = 100;
+
 /// Consecutive wake-path flush failures before the log escalates to error
 /// level. Roughly one `flush_interval`'s worth of failed cycles separates
 /// "retrying after a transient error" from "the flusher is not making
@@ -375,7 +379,17 @@ impl Wal {
         // backend) keeps the default, since the segment index already covers
         // every written entry and the recovery `LIST` fallback re-discovers
         // them on startup.
-        let next_seq = store.next_seq_hint().max(1);
+        let mut next_seq = store.next_seq_hint().max(1);
+        // Backends whose default hint is only `cursor + 1` may hold persisted
+        // but unacknowledged entries above it. Scan the backlog once at open
+        // and raise the allocator so a reused sequence cannot collide.
+        if !store.next_seq_hint_is_exact() {
+            if let Ok(entries) = store.read_after_cursor() {
+                if let Some(max) = entries.iter().map(|(seq, _)| *seq).max() {
+                    next_seq = next_seq.max(max.saturating_add(1));
+                }
+            }
+        }
         Self::open_with_store(config, store, next_seq)
     }
 
@@ -456,7 +470,16 @@ impl Wal {
                         // remains retryable.
                         match wal.flush_pending().await {
                             Ok(()) => wal.note_flush_success(),
-                            Err(error) => wal.note_flush_failure(&error),
+                            Err(error) => {
+                                wal.note_flush_failure(&error);
+                                // The restored batch is re-notified immediately;
+                                // without a pause a persistently failing
+                                // backend spins this loop at full CPU.
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    WAL_FLUSH_RETRY_BACKOFF_MS,
+                                ))
+                                .await;
+                            }
                         }
                     }
                 }
@@ -1017,6 +1040,19 @@ impl Wal {
     /// cursor, in ascending order. Used by recovery replay.
     pub async fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
         self.call_store(|store| store.read_after_cursor()).await
+    }
+
+    /// Read at most `limit` entries with sequence strictly greater than
+    /// `after`. Recovery pages through the backlog so a large on-disk
+    /// backlog does not have to be decoded into memory before the first
+    /// delivery.
+    pub async fn read_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
+        self.call_store(move |store| store.read_after(after, limit))
+            .await
     }
 
     /// Flush staged appends before a record is exposed to downstream

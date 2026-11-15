@@ -31,8 +31,9 @@ impl Input for ForeverInput {
         Ok(())
     }
     async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
-        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(5)).await;
+        // Count only completed reads (a cancelled read delivered nothing).
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok((
             Arc::new(MessageBatch::new_arrow(sample_batch())),
             Arc::new(arkflow_core::input::NoopAck),
@@ -370,6 +371,8 @@ async fn recovery_restores_positions_before_new_reads() {
     struct PositionRecordingInput {
         reads: AtomicUsize,
         restored: std::sync::Mutex<Vec<u64>>,
+        /// Read count observed when the restore call arrived.
+        reads_at_restore: AtomicUsize,
     }
     #[async_trait]
     impl Input for PositionRecordingInput {
@@ -377,8 +380,11 @@ async fn recovery_restores_positions_before_new_reads() {
             Ok(())
         }
         async fn read(&self) -> Result<(MessageBatchRef, Arc<dyn Ack>), Error> {
-            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(2)).await;
+            // Count only completed reads: a read future the kernel cancels
+            // during the wait delivered nothing and must not advance the
+            // position reported below.
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok((
                 Arc::new(MessageBatch::new_arrow(sample_batch())),
                 Arc::new(arkflow_core::input::NoopAck),
@@ -388,6 +394,10 @@ async fn recovery_restores_positions_before_new_reads() {
             &self,
             positions: &[arkflow_core::checkpoint::SourcePosition],
         ) -> Result<(), Error> {
+            self.reads_at_restore.store(
+                self.reads.load(std::sync::atomic::Ordering::SeqCst),
+                std::sync::atomic::Ordering::SeqCst,
+            );
             let mut restored = self.restored.lock().unwrap();
             restored.extend(positions.iter().map(|position| position.offset));
             Ok(())
@@ -413,17 +423,21 @@ async fn recovery_restores_positions_before_new_reads() {
     let input = Arc::new(PositionRecordingInput {
         reads: AtomicUsize::new(0),
         restored: std::sync::Mutex::new(Vec::new()),
+        reads_at_restore: AtomicUsize::new(usize::MAX),
     });
     let adapter = FixtureAdapter {
         input: input.clone() as Arc<dyn Input>,
         output: Arc::new(CollectOutput::default()),
     };
-    let state_dir = tempfile_dir();
-    let state: Arc<dyn StateBackend> = Arc::new(RedbStateBackend::open(state_dir, 1).unwrap());
     let resource = Resource {
         temporary: std::collections::HashMap::new(),
         input_names: std::cell::RefCell::new(Vec::new()),
     };
+    let mut states = BTreeMap::new();
+    states.insert(
+        "source-0".to_string(),
+        Arc::new(RedbStateBackend::open(tempfile_dir(), 1).unwrap()) as Arc<dyn StateBackend>,
+    );
     let graph = ExecutionGraphBuilder::default()
         .build_subgraph(&plan, &task_ids, &adapter, &resource, None)
         .unwrap();
@@ -432,24 +446,18 @@ async fn recovery_restores_positions_before_new_reads() {
         .iter()
         .filter_map(|chain| chain.source.clone())
         .collect::<Vec<_>>();
-    let mut states = BTreeMap::new();
-    states.insert("source-0".to_string(), state);
-
-    let cancellation = CancellationToken::new();
     let handle = KernelJobRunner::spawn_with_cancellation(
         graph,
         inputs,
         states,
         BTreeMap::new(),
         false,
-        cancellation,
+        CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    // Let reads accumulate, then "restart": restore positions from the
-    // snapshot before the graph reads again (the kernel path applies the
-    // recovery plan at start; here we verify the contract on the handle).
+    // First run: let reads accumulate, then snapshot and stop.
     tokio::time::sleep(Duration::from_millis(120)).await;
     let (_snapshot, positions, _watermarks) = handle.checkpoint_snapshot().await.unwrap();
     handle.stop();
@@ -459,13 +467,69 @@ async fn recovery_restores_positions_before_new_reads() {
         .expect("stop for restart")
         .unwrap()
         .unwrap();
+    let reads_before_restore = input.reads.load(std::sync::atomic::Ordering::SeqCst);
 
-    let restored_offsets = input.restored.lock().unwrap().clone();
-    assert!(
-        restored_offsets.iter().all(|offset| *offset <= positions[0].offset),
-        "restore must only carry offsets at or before the checkpoint (got {restored_offsets:?} vs checkpoint {})",
-        positions[0].offset
+    // Recovery contract: the caller restores the checkpointed positions
+    // BEFORE the replacement graph reads again. The previous version of
+    // this test never called restore at all, so its (vacuously empty)
+    // assertion could not fail.
+    input
+        .restore_positions(&positions)
+        .await
+        .expect("restore the checkpointed positions");
+    assert_eq!(
+        input
+            .reads_at_restore
+            .load(std::sync::atomic::Ordering::SeqCst),
+        reads_before_restore,
+        "the replacement must not read before the positions are restored"
     );
+    assert_eq!(
+        input.restored.lock().unwrap().clone(),
+        positions
+            .iter()
+            .map(|position| position.offset)
+            .collect::<Vec<_>>(),
+        "recovery must restore exactly the checkpointed offsets"
+    );
+
+    // Start the replacement runner over a fresh graph. The prepared spawn
+    // skips source reconnects, mirroring the Agent recovery path; a new read
+    // afterwards proves the run actually resumed from the restore.
+    let mut states = BTreeMap::new();
+    states.insert(
+        "source-0".to_string(),
+        Arc::new(RedbStateBackend::open(tempfile_dir(), 1).unwrap()) as Arc<dyn StateBackend>,
+    );
+    let graph = ExecutionGraphBuilder::default()
+        .build_subgraph(&plan, &task_ids, &adapter, &resource, None)
+        .unwrap();
+    let inputs = graph
+        .chains
+        .iter()
+        .filter_map(|chain| chain.source.clone())
+        .collect::<Vec<_>>();
+    let recovered = KernelJobRunner::spawn_prepared_with_cancellation(
+        graph,
+        inputs,
+        states,
+        BTreeMap::new(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        input.reads.load(std::sync::atomic::Ordering::SeqCst) > reads_before_restore,
+        "the recovered runner must read new data after the restore"
+    );
+    recovered.stop();
+    let watcher = recovered.watcher();
+    tokio::time::timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("stop recovered runner")
+        .unwrap()
+        .unwrap();
 }
 
 fn kernel_job_spec() -> JobSpec {

@@ -344,10 +344,47 @@ impl AgentConfig {
                         "health_check.hub_urls[{index}] must start with http:// or https://: {url:?}"
                     ))
                 })?;
-            if rest.trim().is_empty() || rest.trim_matches('/').is_empty() {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            // Strip userinfo; the host (and optional port) follow the last @.
+            let host_port = authority.rsplit('@').next().unwrap_or(authority);
+            if host_port.is_empty() || host_port.contains(char::is_whitespace) {
                 return Err(Error::Config(format!(
                     "health_check.hub_urls[{index}] is missing a host: {url:?}"
                 )));
+            }
+            let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+                let Some((host, after)) = rest.split_once(']') else {
+                    return Err(Error::Config(format!(
+                        "health_check.hub_urls[{index}] has an unterminated IPv6 host: {url:?}"
+                    )));
+                };
+                let port = match after.strip_prefix(':') {
+                    Some(port) => Some(port),
+                    None if after.is_empty() => None,
+                    None => {
+                        return Err(Error::Config(format!(
+                            "health_check.hub_urls[{index}] has an invalid host: {url:?}"
+                        )))
+                    }
+                };
+                (host, port)
+            } else {
+                match host_port.rsplit_once(':') {
+                    Some((host, port)) => (host, Some(port)),
+                    None => (host_port, None),
+                }
+            };
+            if host.is_empty() {
+                return Err(Error::Config(format!(
+                    "health_check.hub_urls[{index}] is missing a host: {url:?}"
+                )));
+            }
+            if let Some(port) = port {
+                if port.is_empty() || port.parse::<u16>().is_err() {
+                    return Err(Error::Config(format!(
+                        "health_check.hub_urls[{index}] has an invalid port: {url:?}"
+                    )));
+                }
             }
         }
         Ok(())

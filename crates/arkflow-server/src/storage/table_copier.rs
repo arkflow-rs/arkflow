@@ -431,10 +431,23 @@ async fn pg_insert_rows(
     rows: &[Vec<PgVal>],
 ) -> Result<(), StorageError> {
     let column_list = columns.join(", ");
+    // Existing target rows must take the SOURCE values: `DO NOTHING` kept
+    // stale values while the row-count check still passed. DO UPDATE makes
+    // the copy idempotent and source-of-truth for every key.
+    let update_list = columns
+        .iter()
+        .map(|column| format!("{column} = EXCLUDED.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conflict_clause = if update_list.is_empty() {
+        "ON CONFLICT DO NOTHING".to_string()
+    } else {
+        format!("ON CONFLICT DO UPDATE SET {update_list}")
+    };
     for values in rows {
         let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${i}")).collect();
         let sql = format!(
-            "INSERT INTO {table} ({column_list}) VALUES ({}) ON CONFLICT DO NOTHING",
+            "INSERT INTO {table} ({column_list}) VALUES ({}) {conflict_clause}",
             placeholders.join(", ")
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
@@ -606,11 +619,19 @@ pub async fn backup_postgres_to_sqlite(
             }
             Ok(())
         })?;
+        // Verify the SNAPSHOT's row count, not the source's: comparing two
+        // reads of the same PostgreSQL transaction cannot detect a target
+        // insert that was skipped.
+        let snapshot_count = snapshot.with_connection(|connection| {
+            connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })?;
         verify_count(
             &mut report,
             table,
             rows.len(),
-            pg_count(&mut *tx, table).await?,
+            usize::try_from(snapshot_count).unwrap_or_default(),
         )?;
     }
     drop(tx);
@@ -647,6 +668,9 @@ pub async fn restore_sqlite_target(
         if !non_empty.is_empty() {
             return Err(StorageError::NonEmptyTarget { tables: non_empty });
         }
+        // cp_sessions is deliberately excluded from the business-table empty
+        // check; a leftover session row would be resurrected by the restore.
+        connection.execute("DELETE FROM cp_sessions", [])?;
         let mut report = CopyReport::default();
         for (table, columns, rows) in &tables {
             for chunk in rows.chunks(CHUNK) {
@@ -692,6 +716,20 @@ pub async fn restore_postgres_target(
     if !non_empty.is_empty() {
         return Err(StorageError::NonEmptyTarget { tables: non_empty });
     }
+    // Sessions are outside TABLE_ORDER; lock and clear them so a restore
+    // cannot resurrect pre-restore browser sessions. The lock is required:
+    // the DELETE alone races a live Hub's concurrent session insert (or an
+    // uncommitted insert that commits later), leaving a pre-restore token
+    // valid after the restore.
+    let session_lock = "LOCK TABLE cp_sessions IN ACCESS EXCLUSIVE MODE NOWAIT";
+    if let Err(error) = sqlx::query(session_lock).execute(&mut *tx).await {
+        return Err(StorageError::TargetBusy(format!(
+            "could not lock table cp_sessions exclusively: {error}"
+        )));
+    }
+    sqlx::query("DELETE FROM cp_sessions")
+        .execute(&mut *tx)
+        .await?;
     let mut report = CopyReport::default();
     for table in TABLE_ORDER {
         let (columns, rows) = read_sqlite_table_ordered(source, table)?;

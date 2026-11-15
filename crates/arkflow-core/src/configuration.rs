@@ -263,6 +263,54 @@ fn location_for_offset(content: &str, offset: usize) -> String {
 /// starting any Stream task.
 pub fn validate_config(config: &EngineConfig) -> ConfigValidationReport {
     let mut errors = Vec::new();
+    // Probe routes are registered verbatim with Axum. Invalid syntax or two
+    // configured endpoints sharing one GET path make router construction
+    // panic after validation reported success; reject them here.
+    let mut probe_paths = std::collections::BTreeSet::new();
+    for (path, value) in [
+        (
+            "health_check.health_path",
+            config.node.health.health_path.as_str(),
+        ),
+        (
+            "health_check.readiness_path",
+            config.node.health.readiness_path.as_str(),
+        ),
+        (
+            "health_check.liveness_path",
+            config.node.health.liveness_path.as_str(),
+        ),
+        (
+            "observability.metrics_path",
+            config.node.observability.metrics_path.as_str(),
+        ),
+        (
+            "observability.ready_path",
+            config.node.observability.ready_path.as_str(),
+        ),
+        (
+            "observability.live_path",
+            config.node.observability.live_path.as_str(),
+        ),
+    ] {
+        if !value.starts_with('/')
+            || value.chars().any(|character| {
+                character.is_whitespace() || matches!(character, '*' | '{' | '}' | '?' | '#')
+            })
+        {
+            errors.push(ConfigIssue {
+                path: path.to_string(),
+                message: format!("probe path {value:?} is not a valid static HTTP path"),
+            });
+            continue;
+        }
+        if !probe_paths.insert(value.to_string()) {
+            errors.push(ConfigIssue {
+                path: path.to_string(),
+                message: format!("probe path {value:?} is configured more than once"),
+            });
+        }
+    }
     if let Err(error) = config.stream_ids() {
         errors.push(ConfigIssue {
             path: "streams".to_string(),
@@ -451,6 +499,12 @@ fn is_secret_key(key: &str) -> bool {
         "secret",
         "credential",
         "api_key",
+        // Connector credential fields that do not contain "secret"/"token":
+        // AWS-style access keys, GCS service-account JSON (which embeds a
+        // private key), Azure storage account keys, and raw PEM keys.
+        "access_key",
+        "private_key",
+        "account_key",
     ]
     .iter()
     .any(|part| key.contains(part))
@@ -602,6 +656,30 @@ mod tests {
             .unwrap_err()
             .path
             .starts_with("line 1, column"));
+    }
+
+    #[test]
+    fn redaction_masks_file_connector_credential_fields() {
+        let value = serde_json::json!({
+            "object_store": {
+                "type": "gcs",
+                "service_account_key": "{\"private_key\":\"-----BEGIN PRIVATE KEY-----\"}",
+                "access_key": "azure-account-key",
+                "access_key_id": "aws-access-id",
+                "secret_access_key": "aws-secret",
+                "private_key": "-----BEGIN PRIVATE KEY-----",
+                "service_account_path": "/var/run/secrets/gcp.json"
+            }
+        });
+        let redacted = redact_secrets(&value);
+        let store = &redacted["object_store"];
+        assert_eq!(store["service_account_key"], "******");
+        assert_eq!(store["access_key"], "******");
+        assert_eq!(store["access_key_id"], "******");
+        assert_eq!(store["secret_access_key"], "******");
+        assert_eq!(store["private_key"], "******");
+        // A path is not itself a secret and must stay readable.
+        assert_eq!(store["service_account_path"], "/var/run/secrets/gcp.json");
     }
 
     #[test]

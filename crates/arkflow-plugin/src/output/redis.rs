@@ -100,6 +100,10 @@ impl Output for RedisOutput {
                 .map(|p| p.to_vec())
                 .collect()
         };
+        // Redis routes each payload by its row position (channel/key/field);
+        // a NULL `__value__` is skipped by `to_binary`, so a short payload
+        // list must fail instead of shifting later rows onto earlier routes.
+        crate::output::codec_helper::ensure_row_aligned(&data, msg.num_rows(), "redis")?;
         let client_lock = self.client.lock().await;
         let Some(cli) = client_lock.as_ref() else {
             return Err(Error::Process(
