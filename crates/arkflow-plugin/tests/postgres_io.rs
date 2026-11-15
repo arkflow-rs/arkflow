@@ -698,12 +698,14 @@ fn pg_dsn() -> String {
 async fn build_pg_input(
     uri: &str,
     select_sql: &str,
+    app_name: &str,
 ) -> Result<Arc<dyn arkflow_core::input::Input>, arkflow_core::Error> {
     ensure_input_init();
     // Tag the input's backend so the connection-loss test can terminate
-    // exactly this connection (the provider forwards application_name
-    // verbatim; its DSN parser splits on whitespace).
-    let dsn = format!("{} application_name=arkflow_midstream_test", pg_dsn());
+    // exactly THIS connection (the provider forwards application_name
+    // verbatim; its DSN parser splits on whitespace). A per-test name keeps
+    // parallel tests from terminating each other's backends.
+    let dsn = format!("{} application_name={}", pg_dsn(), app_name);
     let config = Some(serde_json::json!({
         "select_sql": select_sql,
         "input_type": {
@@ -760,6 +762,7 @@ async fn sql_input_pg_midstream_server_error_is_process() {
         &format!(
             "SELECT i, 1 / CASE WHEN i <= 4000 THEN 1 ELSE 0 END AS d FROM flow.public.{table}"
         ),
+        "arkflow_midstream_server_error",
     )
     .await
     .expect("input config must build");
@@ -821,9 +824,13 @@ async fn sql_input_pg_midstream_connection_loss_is_disconnection() {
     )
     .await;
 
-    let input = build_pg_input(&uri, &format!("SELECT i FROM flow.public.{table}"))
-        .await
-        .expect("input config must build");
+    let input = build_pg_input(
+        &uri,
+        &format!("SELECT i FROM flow.public.{table}"),
+        "arkflow_midstream_connection_loss",
+    )
+    .await
+    .expect("input config must build");
     input
         .connect()
         .await
@@ -838,7 +845,8 @@ async fn sql_input_pg_midstream_connection_loss_is_disconnection() {
     // Kill the input's backend by its dedicated application_name.
     let terminated = sqlx::query_scalar::<_, bool>(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-         WHERE application_name = 'arkflow_midstream_test' AND pid <> pg_backend_pid()",
+         WHERE application_name = 'arkflow_midstream_connection_loss' \
+         AND pid <> pg_backend_pid()",
     )
     .fetch_all(&mut admin)
     .await
