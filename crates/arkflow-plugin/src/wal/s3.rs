@@ -1243,7 +1243,7 @@ fn warn_segment_truncation(segment: &str, decoded: &segment::DecodedSegment) {
             truncated_at = t.truncated_at,
             dropped_bytes = t.dropped_bytes,
             kind = ?t.kind,
-            "sealed WAL segment decoded with dropped bytes; unacked replay data in it is skipped"
+            "sealed WAL segment decoded with dropped bytes; the dropped range may include acknowledged entries at or below the cursor, and only entries above the cursor are replay data that is now skipped"
         );
     }
 }
@@ -1255,7 +1255,8 @@ fn warn_missing_segment(segment: &str) {
     tracing::warn!(
         segment,
         "manifest-referenced sealed WAL segment is missing from the object store; \
-         unacked replay data in it is skipped"
+         the segment may include acknowledged entries, and only its entries above the \
+         cursor are replay data that is now skipped"
     );
 }
 

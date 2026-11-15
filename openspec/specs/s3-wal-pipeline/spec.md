@@ -52,7 +52,7 @@ The system SHALL accept manifest mutations as closures that run against a freshl
 - **AND** the closure does NOT execute against a snapshot obtained outside the coordination window
 
 ### Requirement: Failure handling and recovery
-The system SHALL handle PUT failures without data loss and maintain compatibility with existing recovery semantics. Manifest PUT failures arising from concurrent contention SHALL be resolved by the ETag-coordinated retry path rather than by surfacing an error to the caller. 对象存储后端的恢复读取 SHALL 对每类异常保留可观测痕迹:段解码因 CRC 校验失败或撕裂尾而提前停止时,SHALL 以 `tracing::warn` 记录 segment 标识、截断点偏移与被丢弃的字节数(损坏数据无法可靠计数条目,故以字节为准);恢复读取遇到 manifest 引用但对象缺失(NotFound)的已封段时,SHALL 以 `tracing::warn` 记录该段标识。告警 MUST NOT 将已确认(cursor 之前)的数据标记为丢失——被截断/缺失的段只可能包含未确认的重放数据。
+The system SHALL handle PUT failures without data loss and maintain compatibility with existing recovery semantics. Manifest PUT failures arising from concurrent contention SHALL be resolved by the ETag-coordinated retry path while the retry budget lasts; an exhausted retry budget SHALL surface as an error to the caller (see Manifest writes are ETag-coordinated). 对象存储后端的恢复读取 SHALL 对每类异常保留可观测痕迹:段解码因 CRC 校验失败或撕裂尾而提前停止时,SHALL 以 `tracing::warn` 记录 segment 标识、截断点偏移与被丢弃的字节数(损坏数据无法可靠计数条目,故以字节为准);恢复读取遇到 manifest 引用但对象缺失(NotFound)的已封段时,SHALL 以 `tracing::warn` 记录该段标识。告警 MUST NOT 将已确认(cursor 之前)的数据标记为丢失——被截断/缺失的段可能同时包含已确认(不高于 cursor)与未确认的条目,报告的字节范围可能覆盖两者,仅高于 cursor 的条目属于待重放数据。
 
 #### Scenario: PUT failure is surfaced to caller
 - **WHEN** an asynchronous segment PUT fails
@@ -64,10 +64,11 @@ The system SHALL handle PUT failures without data loss and maintain compatibilit
 - **THEN** recovery reads both sealed segments and any in-flight segment data
 - **AND** the union of manifest and LIST fallback behavior is preserved
 
-#### Scenario: Concurrent manifest contention is resolved silently
+#### Scenario: Concurrent manifest contention is resolved silently within the retry budget
 - **WHEN** two writers contend on the manifest and one's ETag precondition fails
 - **THEN** the loser retries against the new manifest state
-- **AND** the contention is absorbed by the retry path rather than surfacing as an error to the caller
+- **AND** while the retry budget lasts, the contention is absorbed by the retry path rather than surfacing as an error to the caller
+- **AND** if the retry budget is exhausted without convergence, the error surfaces to the caller (consistent with Manifest writes are ETag-coordinated)
 - **AND** the recovery process remains unchanged (recovery still reads the manifest once and treats it as the source of truth)
 
 #### Scenario: 恢复读取遇到段中部 CRC 损坏

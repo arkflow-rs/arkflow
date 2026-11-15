@@ -505,6 +505,15 @@ mod tests {
         }))
     }
 
+    fn postgres_transport_error() -> datafusion::common::DataFusionError {
+        // The postgres table provider wraps post-first-chunk receive
+        // failures in exactly this Execution shape (provider 0.13.1
+        // conn.rs:485) — a dropped connection must reconnect, not wedge.
+        datafusion::common::DataFusionError::Execution(
+            "Failed to fetch batch: connection refused".into(),
+        )
+    }
+
     fn deterministic_decode_error() -> datafusion::common::DataFusionError {
         datafusion::common::DataFusionError::ArrowError(
             Box::new(datafusion::arrow::error::ArrowError::ExternalError(
@@ -569,6 +578,36 @@ mod tests {
         match input.read().await {
             Err(Error::Disconnection) => {}
             Err(other) => panic!("transient failure must be Disconnection, got: {other:?}"),
+            Ok(_) => panic!("a failed stream must not yield data"),
+        }
+        input.close().await?;
+        Ok(())
+    }
+
+    /// Spec: connector-recovery-contract — postgres provider 的传输失败
+    /// 以 `Execution("Failed to fetch batch: ...")` 形态抵达,必须归类为
+    /// Disconnection(重连)而非终端失败。
+    #[tokio::test]
+    async fn postgres_transport_failure_is_disconnection() -> Result<(), Error> {
+        let (_dir, path) = seeded_sqlite_file();
+        let sql_config = SqlInputConfig {
+            select_sql: "SELECT id, kind FROM flow.main.events".to_string(),
+            ballista: None,
+            input_type: InputType::Sqlite(SqliteConfig {
+                name: None,
+                path: path.clone(),
+            }),
+        };
+        let input = SqlInput::new(None, sql_config)?;
+        input.connect().await?;
+        install_failing_stream(&input, postgres_transport_error()).await?;
+
+        let (_, _) = input.read().await?;
+        match input.read().await {
+            Err(Error::Disconnection) => {}
+            Err(other) => {
+                panic!("a postgres receive failure must be Disconnection, got: {other:?}")
+            }
             Ok(_) => panic!("a failed stream must not yield data"),
         }
         input.close().await?;
