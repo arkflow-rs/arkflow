@@ -46,13 +46,19 @@ pub(crate) fn classify_stream_error(error: datafusion::common::DataFusionError) 
             Error::Disconnection
         }
         // The postgres table provider buffers rows in 4,000-row chunks and
-        // wraps receive failures after the first chunk as
-        // `Execution("Failed to fetch batch: ...")` (datafusion-table-
-        // providers-postgres 0.13.1 conn.rs) — a dropped connection would
-        // otherwise land in the terminal fallback. Match the provider's
-        // prefix narrowly; its deterministic conversion failures use other
-        // messages and stay terminal.
-        Dfe::Execution(message) if message.starts_with("Failed to fetch batch:") => {
+        // wraps BOTH transport and conversion failures after the first
+        // chunk as `Execution("Failed to fetch batch: {inner}")`
+        // (datafusion-table-providers-postgres 0.13.1 conn.rs:485). The
+        // inner Display distinguishes them: `PostgresError::QueryError`
+        // renders "Query execution failed." (transport — reconnect),
+        // `ConversionError` renders "Failed to convert query result to
+        // Arrow." (deterministic — terminal). Unknown inner shapes stay
+        // terminal: reconnecting into an unrecognized failure would replay
+        // the prefix into the same error forever.
+        Dfe::Execution(message)
+            if message.starts_with("Failed to fetch batch:")
+                && message.contains("Query execution failed.") =>
+        {
             warn!("postgres record batch stream receive failure; reconnecting: {message}");
             Error::Disconnection
         }

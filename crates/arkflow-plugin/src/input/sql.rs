@@ -507,10 +507,20 @@ mod tests {
 
     fn postgres_transport_error() -> datafusion::common::DataFusionError {
         // The postgres table provider wraps post-first-chunk receive
-        // failures in exactly this Execution shape (provider 0.13.1
-        // conn.rs:485) — a dropped connection must reconnect, not wedge.
+        // failures in exactly this Execution shape — the inner Display is
+        // `PostgresError::QueryError`'s (provider 0.13.1 conn.rs:261-267).
+        // A dropped connection must reconnect, not wedge.
         datafusion::common::DataFusionError::Execution(
-            "Failed to fetch batch: connection refused".into(),
+            "Failed to fetch batch: Query execution failed.\nconnection refused".into(),
+        )
+    }
+
+    fn postgres_conversion_error() -> datafusion::common::DataFusionError {
+        // Same outer prefix, but the inner Display is `ConversionError`'s:
+        // a deterministic conversion failure after the first chunk must
+        // terminate instead of triggering reconnect + query replay.
+        datafusion::common::DataFusionError::Execution(
+            "Failed to fetch batch: Failed to convert query result to Arrow.\ninjected".into(),
         )
     }
 
@@ -608,6 +618,42 @@ mod tests {
             Err(other) => {
                 panic!("a postgres receive failure must be Disconnection, got: {other:?}")
             }
+            Ok(_) => panic!("a failed stream must not yield data"),
+        }
+        input.close().await?;
+        Ok(())
+    }
+
+    /// Regression (review round 3): the SAME outer prefix also wraps the
+    /// provider's deterministic `ConversionError` — it must terminate, not
+    /// reconnect.
+    #[tokio::test]
+    async fn postgres_conversion_failure_is_terminal() -> Result<(), Error> {
+        let (_dir, path) = seeded_sqlite_file();
+        let sql_config = SqlInputConfig {
+            select_sql: "SELECT id, kind FROM flow.main.events".to_string(),
+            ballista: None,
+            input_type: InputType::Sqlite(SqliteConfig {
+                name: None,
+                path: path.clone(),
+            }),
+        };
+        let input = SqlInput::new(None, sql_config)?;
+        input.connect().await?;
+        install_failing_stream(&input, postgres_conversion_error()).await?;
+
+        let (_, _) = input.read().await?;
+        match input.read().await {
+            Err(Error::Process(message)) => {
+                assert!(
+                    message.contains("deterministically"),
+                    "a provider-wrapped conversion failure must terminate: {message}"
+                );
+            }
+            Err(Error::Disconnection) => {
+                panic!("a conversion failure must not trigger reconnect + query replay")
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
             Ok(_) => panic!("a failed stream must not yield data"),
         }
         input.close().await?;
