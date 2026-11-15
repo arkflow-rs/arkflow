@@ -661,3 +661,226 @@ async fn pgvector_search_processor_returns_nearest_neighbors() {
     failing.close().await.expect("close failing processor");
     exec(&mut admin, &format!("DROP TABLE IF EXISTS {table}")).await;
 }
+
+// --- SQL input: real-provider mid-stream failure classification ---
+// (CodeRabbit review on #1367: the classifier's Disconnection/Process arms
+// must be exercised through the ACTUAL postgres provider after the first
+// 4,000-row chunk, not only via injected error strings. The provider
+// buffers rows in 4,000-row chunks (datafusion-table-providers-postgres
+// 0.13.1 conn.rs:458) and wraps post-first-chunk failures as
+// DataFusionError::Execution("Failed to fetch batch: ..."), which is
+// exactly what the classifier sees.)
+
+static INPUT_INIT: Once = Once::new();
+
+fn ensure_input_init() {
+    INPUT_INIT.call_once(|| {
+        arkflow_plugin::input::init().expect("plugin input init");
+    });
+}
+
+/// The sql input's provider parses its URI as a libpq keyword DSN
+/// (`host=... user=... ...`), not a `postgres://` URL — build one from the
+/// test URL so both forms stay derived from ARKFLOW_TEST_PG_URI.
+fn pg_dsn() -> String {
+    let url = pg_uri();
+    let rest = url.strip_prefix("postgres://").unwrap_or(&url);
+    let userinfo_path = rest;
+    let (userinfo, hostpart) = userinfo_path
+        .split_once('@')
+        .unwrap_or(("arkflow:arkflow", "localhost:5433"));
+    let (host, port_db) = hostpart.split_once(':').unwrap_or((hostpart, "5432"));
+    let (port, db) = port_db.split_once('/').unwrap_or((port_db, "arkflow_test"));
+    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    format!("host={host} port={port} user={user} password={password} dbname={db}")
+}
+
+async fn build_pg_input(
+    uri: &str,
+    select_sql: &str,
+) -> Result<Arc<dyn arkflow_core::input::Input>, arkflow_core::Error> {
+    ensure_input_init();
+    // Tag the input's backend so the connection-loss test can terminate
+    // exactly this connection (the provider forwards application_name
+    // verbatim; its DSN parser splits on whitespace).
+    let dsn = format!("{} application_name=arkflow_midstream_test", pg_dsn());
+    let config = Some(serde_json::json!({
+        "select_sql": select_sql,
+        "input_type": {
+            "type": "postgres",
+            "uri": dsn,
+            "ssl": {"ssl_mode": "disable", "root_cert": null}
+        }
+    }));
+    arkflow_core::input::InputConfig {
+        input_type: "sql".to_string(),
+        name: None,
+        codec: None,
+        config,
+    }
+    .build(&resource())
+}
+
+async fn read_with_timeout(
+    input: &Arc<dyn arkflow_core::input::Input>,
+    case: &str,
+) -> Result<
+    (
+        arkflow_core::MessageBatchRef,
+        Arc<dyn arkflow_core::input::Ack>,
+    ),
+    arkflow_core::Error,
+> {
+    tokio::time::timeout(Duration::from_secs(15), input.read())
+        .await
+        .unwrap_or_else(|_| panic!("{case}: read must not hang"))
+}
+
+/// Deterministic server error AFTER the first chunk: rows 1..=4000 divide
+/// safely, rows past 4000 divide by zero (SQLSTATE 22012). The provider
+/// consumes the first chunk at connect() and wraps chunk 2's server error
+/// as `Failed to fetch batch: ... SQLSTATE: 22012` — the classifier must
+/// treat it as terminal `Error::Process`: reconnecting would replay the
+/// same 4,000-row prefix into the same division by zero forever.
+#[tokio::test]
+async fn sql_input_pg_midstream_server_error_is_process() {
+    let uri = pg_uri();
+    let Some(mut admin) = try_connect(&uri, "sql-input-midstream-server-error").await else {
+        return;
+    };
+    let table = unique_table("midstream_err");
+    exec(
+        &mut admin,
+        &format!("CREATE TABLE {table} AS SELECT i FROM generate_series(1, 1000000) AS t(i)"),
+    )
+    .await;
+
+    let input = build_pg_input(
+        &uri,
+        &format!(
+            "SELECT i, 1 / CASE WHEN i <= 4000 THEN 1 ELSE 0 END AS d FROM flow.public.{table}"
+        ),
+    )
+    .await
+    .expect("input config must build");
+    input
+        .connect()
+        .await
+        .expect("connect must succeed (the first chunk is clean)");
+
+    // DataFusion's execution pipeline may prefetch past the provider's
+    // first chunk, so the division-by-zero can surface on ANY read from
+    // here on. Read until it does: it must classify as terminal Process
+    // (an ArrowError without SQLSTATE — deterministic), never as
+    // Disconnection (which would loop reconnect + prefix replay).
+    let mut terminal = None;
+    for attempt in 0..6 {
+        match read_with_timeout(&input, "midstream-server-error").await {
+            Err(arkflow_core::Error::Process(message)) => {
+                assert!(
+                    message.contains("deterministically"),
+                    "the terminal error must explain why it is not a reconnect: {message}"
+                );
+                terminal = Some(message);
+                break;
+            }
+            Err(arkflow_core::Error::Disconnection) => {
+                panic!("a deterministic server error must not trigger reconnect + prefix replay")
+            }
+            Err(other) => panic!("attempt {attempt}: unexpected error: {other:?}"),
+            Ok((batch, _)) => {
+                assert!(
+                    batch.num_rows() <= 4000,
+                    "attempt {attempt}: chunk exceeded the provider's 4,000-row bound"
+                );
+            }
+        }
+    }
+    let message = terminal.expect("the mid-stream division by zero must surface within 6 reads");
+    println!("server error classified terminal: {message}");
+
+    let _ = exec(&mut admin, &format!("DROP TABLE IF EXISTS {table}")).await;
+    input.close().await.expect("close input");
+}
+
+/// Transport failure AFTER the first chunk: the input's backend is
+/// terminated once the clean first chunk has been delivered. The provider's
+/// next fetch fails on the dead connection (the server sends 57P01 /
+/// connection loss before closing) — the classifier must return
+/// `Error::Disconnection` so the engine reconnects, never `Process`.
+#[tokio::test]
+async fn sql_input_pg_midstream_connection_loss_is_disconnection() {
+    let uri = pg_uri();
+    let Some(mut admin) = try_connect(&uri, "sql-input-midstream-connection-loss").await else {
+        return;
+    };
+    let table = unique_table("midstream_drop");
+    exec(
+        &mut admin,
+        &format!("CREATE TABLE {table} AS SELECT i FROM generate_series(1, 1000000) AS t(i)"),
+    )
+    .await;
+
+    let input = build_pg_input(&uri, &format!("SELECT i FROM flow.public.{table}"))
+        .await
+        .expect("input config must build");
+    input
+        .connect()
+        .await
+        .expect("connect must succeed (the first chunk is clean)");
+
+    // First read delivers the clean first chunk (4,000 rows).
+    let (batch, _) = read_with_timeout(&input, "midstream-connection-loss/first")
+        .await
+        .expect("the first chunk must read cleanly");
+    assert_eq!(batch.num_rows(), 4000, "first chunk must carry 4,000 rows");
+
+    // Kill the input's backend by its dedicated application_name.
+    let terminated = sqlx::query_scalar::<_, bool>(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE application_name = 'arkflow_midstream_test' AND pid <> pg_backend_pid()",
+    )
+    .fetch_all(&mut admin)
+    .await
+    .expect("admin terminate query");
+    assert!(
+        terminated.iter().any(|ok| *ok),
+        "must have terminated at least one input backend (got {:?})",
+        terminated
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The pipeline may have buffered prefetch chunks, so reads can keep
+    // returning data for a while — but the loss itself MUST classify as
+    // Disconnection (the server sent 57P01 / the socket died), never as
+    // terminal Process. Read until the loss surfaces (bounded).
+    let mut loss = None;
+    for attempt in 0..12 {
+        match read_with_timeout(&input, "midstream-connection-loss").await {
+            Err(arkflow_core::Error::Disconnection) => {
+                loss = Some(attempt);
+                break;
+            }
+            Err(other) => {
+                panic!("attempt {attempt}: a dead connection must be Disconnection, got: {other:?}")
+            }
+            Ok((batch, _)) => {
+                assert!(
+                    batch.num_rows() <= 4000,
+                    "attempt {attempt}: chunk exceeded the provider's 4,000-row bound"
+                );
+            }
+        }
+    }
+    assert!(
+        loss.is_some(),
+        "the terminated backend must surface a Disconnection within 8 reads"
+    );
+    println!(
+        "connection loss surfaced as Disconnection at read {:?}",
+        loss
+    );
+
+    let _ = exec(&mut admin, &format!("DROP TABLE IF EXISTS {table}")).await;
+    input.close().await.expect("close input");
+}
