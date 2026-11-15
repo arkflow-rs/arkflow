@@ -855,7 +855,11 @@ async fn sql_input_pg_midstream_connection_loss_is_disconnection() {
     // Disconnection (the server sent 57P01 / the socket died), never as
     // terminal Process. Read until the loss surfaces (bounded).
     let mut loss = None;
-    for attempt in 0..12 {
+    // Postgres streams results eagerly, so a small result can sit entirely in
+    // client-side buffers — killing the backend only bites once the reads
+    // catch up to the wire. 1M rows = 250 chunks; read until the dead
+    // connection is hit (buffered chunks may precede it).
+    for attempt in 0..400 {
         match read_with_timeout(&input, "midstream-connection-loss").await {
             Err(arkflow_core::Error::Disconnection) => {
                 loss = Some(attempt);
@@ -874,7 +878,7 @@ async fn sql_input_pg_midstream_connection_loss_is_disconnection() {
     }
     assert!(
         loss.is_some(),
-        "the terminated backend must surface a Disconnection within 8 reads"
+        "the terminated backend must surface a Disconnection within 400 reads"
     );
     println!(
         "connection loss surfaced as Disconnection at read {:?}",
