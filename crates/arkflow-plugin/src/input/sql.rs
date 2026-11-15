@@ -516,6 +516,16 @@ mod tests {
         )
     }
 
+    fn postgres_shutdown_error() -> datafusion::common::DataFusionError {
+        // 57P01 admin_shutdown: the server told the client to go away —
+        // carries a SQLSTATE but is transient (reconnect), unlike 22012.
+        datafusion::common::DataFusionError::Execution(
+            "Failed to fetch batch: Query execution failed.\nterminating connection due to \
+             administrator command\nSQLSTATE: 57P01"
+                .into(),
+        )
+    }
+
     fn postgres_db_error() -> datafusion::common::DataFusionError {
         // Same "Query execution failed." prefix, but the provider appended
         // a SQLSTATE (division by zero = 22012): a server-generated
@@ -666,6 +676,36 @@ mod tests {
                 panic!("a database execution error must not trigger reconnect + replay")
             }
             Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("a failed stream must not yield data"),
+        }
+        input.close().await?;
+        Ok(())
+    }
+
+    /// Regression (review round 5): shutdown-class SQLSTATEs (57P01/
+    /// 57P02/57P03) and the 08xxx connection-exception class are transient
+    /// — a mid-stream 57P01 must reconnect, not terminate.
+    #[tokio::test]
+    async fn postgres_shutdown_sqlstate_is_disconnection() -> Result<(), Error> {
+        let (_dir, path) = seeded_sqlite_file();
+        let sql_config = SqlInputConfig {
+            select_sql: "SELECT id, kind FROM flow.main.events".to_string(),
+            ballista: None,
+            input_type: InputType::Sqlite(SqliteConfig {
+                name: None,
+                path: path.clone(),
+            }),
+        };
+        let input = SqlInput::new(None, sql_config)?;
+        input.connect().await?;
+        install_failing_stream(&input, postgres_shutdown_error()).await?;
+
+        let (_, _) = input.read().await?;
+        match input.read().await {
+            Err(Error::Disconnection) => {}
+            Err(other) => {
+                panic!("a shutdown SQLSTATE (57P01) must be Disconnection, got: {other:?}")
+            }
             Ok(_) => panic!("a failed stream must not yield data"),
         }
         input.close().await?;

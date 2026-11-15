@@ -54,17 +54,20 @@ pub(crate) fn classify_stream_error(error: datafusion::common::DataFusionError) 
         //   query result to Arrow." — deterministic, terminal;
         // * `PostgresError::QueryError` renders "Query execution failed."
         //   followed by the server error; the provider's
-        //   `format_postgres_query_error` appends "SQLSTATE: <code>" ONLY
-        //   for server-generated database errors (division by zero,
-        //   constraint violations — deterministic, terminal), while a
-        //   dropped connection has no SQLSTATE (transient, reconnect).
+        //   `format_postgres_query_error` appends "SQLSTATE: <code>" for
+        //   server-generated errors — the CODE decides: shutdown
+        //   (57P01/57P02/57P03) and connection-exception (08xxx) classes
+        //   are transient (the server told us to go away / the connection
+        //   broke), everything else (division by zero, constraint
+        //   violations) is deterministic and terminal. A message without
+        //   SQLSTATE is a dropped connection (transient).
         // Unknown inner shapes stay terminal: reconnecting into an
         // unrecognized failure would replay the prefix into the same error
         // forever.
         Dfe::Execution(message)
             if message.starts_with("Failed to fetch batch:")
                 && message.contains("Query execution failed.")
-                && !message.contains("SQLSTATE:") =>
+                && sqlstate_is_retryable(&message) =>
         {
             warn!("postgres record batch stream connection failure; reconnecting: {message}");
             Error::Disconnection
@@ -77,6 +80,25 @@ pub(crate) fn classify_stream_error(error: datafusion::common::DataFusionError) 
             "record batch stream failed deterministically (reconnect would replay the \
              same prefix into the same failure): {other}"
         )),
+    }
+}
+
+/// Whether a postgres `Failed to fetch batch:` message is retryable.
+///
+/// A message without SQLSTATE is a dropped connection (the server never
+/// produced a response — transport). A SQLSTATE is retryable only for the
+/// shutdown classes (`57P01` admin_shutdown, `57P02` crash_shutdown,
+/// `57P03` cannot_connect_now) and the connection-exception class
+/// (`08xxx`) — the server told the client to go away or the connection
+/// broke. Every other SQLSTATE (division by zero, constraint violations,
+/// data errors) is deterministic given the data and stays terminal.
+fn sqlstate_is_retryable(message: &str) -> bool {
+    match message.rsplit_once("SQLSTATE: ") {
+        None => true,
+        Some((_, rest)) => {
+            let code = rest.get(..5).unwrap_or(rest);
+            matches!(code, "57P01" | "57P02" | "57P03") || code.starts_with("08")
+        }
     }
 }
 
