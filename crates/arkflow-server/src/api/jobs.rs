@@ -7,7 +7,7 @@ use crate::api_contract::{
 };
 use crate::hub;
 use crate::storage::JobRecord;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -97,7 +97,20 @@ fn redact_record_fields(record: &mut serde_json::Value) {
     }
 }
 
-pub(super) async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+/// Serialize a record and redact it through the read-path mask. Mutation
+/// responses must not disclose credential material either: a caller cannot
+/// read back the plaintext it just wrote (spec: control-plane-credentials).
+fn redacted_record_response<T: serde::Serialize>(record: &T) -> serde_json::Value {
+    let mut value = serde_json::to_value(record).unwrap_or_default();
+    redact_record_fields(&mut value);
+    value
+}
+
+pub(super) async fn hub_jobs(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<super::ListPageQuery>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(response) =
         require_operator_action(&hub, &headers, OperatorAction::Read, "job", None).await
     {
@@ -113,7 +126,7 @@ pub(super) async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) ->
                     value
                 })
                 .collect::<Vec<_>>();
-            Json(items).into_response()
+            Json(super::page_items(items, &(&query).into())).into_response()
         }
         Err(error) => hub_problem(error),
     }
@@ -247,13 +260,13 @@ pub(super) async fn hub_job_action(
     let pausing = current.pause_phase.is_some();
     match action.as_str() {
         "pause" => match hub.pause_job(&job_id, &principal.id).await {
-            Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+            Ok(job) => (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response(),
             Err(error) => {
                 pause_action_rejection(&hub, &job_id, "job.pause", &principal.id, error).await
             }
         },
         "resume" => match hub.resume_job(&job_id, &principal.id).await {
-            Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+            Ok(job) => (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response(),
             Err(error) => {
                 pause_action_rejection(&hub, &job_id, "job.resume", &principal.id, error).await
             }
@@ -261,13 +274,13 @@ pub(super) async fn hub_job_action(
         // A paused Job only understands resume/stop: start and restart both
         // mean "bring the paused Job back", and stop settles it as stopped.
         "start" | "restart" if pausing => match hub.resume_job(&job_id, &principal.id).await {
-            Ok(job) => Json(job).into_response(),
+            Ok(job) => Json(redacted_record_response(&job)).into_response(),
             Err(error) => {
                 pause_action_rejection(&hub, &job_id, "job.resume", &principal.id, error).await
             }
         },
         "stop" if pausing => match hub.stop_paused_job(&job_id, &principal.id).await {
-            Ok(job) => Json(job).into_response(),
+            Ok(job) => Json(redacted_record_response(&job)).into_response(),
             Err(error) => {
                 pause_action_rejection(&hub, &job_id, "job.stop", &principal.id, error).await
             }
@@ -285,7 +298,7 @@ pub(super) async fn hub_job_action(
                 .update_job_desired_state_as(&job_id, state, current.generation, &principal.id)
                 .await
             {
-                Ok(Some(job)) => Json(job).into_response(),
+                Ok(Some(job)) => Json(redacted_record_response(&job)).into_response(),
                 Ok(None) => problem(
                     StatusCode::NOT_FOUND,
                     "job_not_found",
@@ -766,7 +779,7 @@ pub(super) async fn hub_job_upgrade(
                     "upgrade_id": record.upgrade_id,
                     "state": record.phase,
                     "savepoint_id": serde_json::Value::Null,
-                    "job": current,
+                    "job": redacted_record_response(&current),
                 })),
             )
                 .into_response(),
@@ -898,7 +911,7 @@ pub(super) async fn hub_job_upgrade(
                 "upgrade_id": format!("upgrade-{}", hub::now_ms_for_metrics()),
                 "state": "pending_recovery",
                 "savepoint_id": checkpoint.checkpoint_id,
-                "job": job,
+                "job": redacted_record_response(&job),
             })),
         )
             .into_response(),
@@ -1075,7 +1088,7 @@ pub(super) async fn hub_job_upgrade_rollback(
         .update_job_with_expected_generation_as(restored, current.generation, &principal.id)
         .await
     {
-        Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Ok(job) => (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response(),
         Err(hub::HubError::GenerationConflict { expected, current }) => problem(
             StatusCode::PRECONDITION_FAILED,
             "generation_conflict",
@@ -1342,7 +1355,7 @@ pub(super) async fn hub_create_job(
         paused_by: None,
     };
     match hub.upsert_job_as(job, &principal.id).await {
-        Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Ok(job) => (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response(),
         Err(error) => hub_problem(error),
     }
 }
@@ -1403,7 +1416,7 @@ pub(super) async fn hub_job_desired_state(
     };
     if let Some((action, outcome)) = paused_action {
         return match outcome {
-            Ok(job) => Json(job).into_response(),
+            Ok(job) => Json(redacted_record_response(&job)).into_response(),
             Err(error) => pause_action_rejection(&hub, &job_id, action, &principal.id, error).await,
         };
     }
@@ -1416,7 +1429,7 @@ pub(super) async fn hub_job_desired_state(
         )
         .await;
     match result {
-        Ok(Some(job)) => Json(job).into_response(),
+        Ok(Some(job)) => Json(redacted_record_response(&job)).into_response(),
         Ok(None) => problem(
             StatusCode::NOT_FOUND,
             "job_not_found",

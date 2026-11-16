@@ -490,20 +490,24 @@ impl Hub {
                 .map_err(HubError::from)?;
             // A concurrent label replacement may have committed between the
             // pre-insert hydration read and this point. Re-sync the labels
-            // with the read and the write inside one hold of the node-map
-            // write lock: `replace_node_labels` takes the same lock for its
-            // memory update after its storage write, so a replacement either
-            // lands its storage write before our read (we pick it up) or its
-            // memory update after our release (it overwrites us) — the
-            // in-memory map can never end this registration stale.
+            // with a read taken BEFORE the write lock: `replace_node_labels`
+            // writes storage first and takes this same write lock for its
+            // memory update afterwards, so a replacement either lands its
+            // storage write before our read (we pick it up) or its memory
+            // update after our release (it overwrites us) — the in-memory
+            // map can never end this registration stale. The storage round
+            // trip stays out of the lock: a slow label query must not stall
+            // every writer queued on this lock (registration, reports).
+            let fresh_labels = storage
+                .get_node_labels(&request.node_id)
+                .await
+                .ok()
+                .flatten();
             {
                 let mut nodes = self.nodes.write().await;
-                if nodes.contains_key(&request.node_id) {
-                    let fresh = storage.get_node_labels(&request.node_id).await;
-                    if let Some(node) = nodes.get_mut(&request.node_id) {
-                        if let Ok(Some(fresh)) = fresh {
-                            node.resource.labels = fresh;
-                        }
+                if let Some(node) = nodes.get_mut(&request.node_id) {
+                    if let Some(fresh) = fresh_labels {
+                        node.resource.labels = fresh;
                     }
                 }
             }

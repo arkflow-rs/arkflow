@@ -7,6 +7,17 @@ import type { Job } from './api'
 import { ConfirmProvider } from './features/confirm'
 import { Jobs } from './features/jobs'
 
+// The server wraps list collections in the standard Page envelope and the
+// list hooks page through it (fetchAllPages); mocks emulate that shape.
+const pageOf = <T,>(items: T[]) => ({
+  items,
+  page: 1,
+  page_size: Math.max(items.length, 50),
+  total: items.length,
+})
+const pathOf = (url: string) => url.split('?')[0]
+
+
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
@@ -85,7 +96,7 @@ describe('Job pause/resume controls', () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/jobs/orders/actions/pause') && init?.method === 'POST')
         return ok({ ...runningJob, desired_state: 'paused', pause_phase: 'capturing' }, 202)
-      if (url.endsWith('/jobs') && init?.method !== 'POST') return ok([runningJob])
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST') return ok(pageOf([runningJob]))
       if (url.includes('/nodes?')) return ok(page([]))
       return ok([])
     })
@@ -112,7 +123,7 @@ describe('Job pause/resume controls', () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/jobs/orders/actions/resume') && init?.method === 'POST')
         return ok({ ...pausedJob, desired_state: 'running', pause_phase: 'resuming' }, 202)
-      if (url.endsWith('/jobs') && init?.method !== 'POST') return ok([pausedJob])
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST') return ok(pageOf([pausedJob]))
       if (url.includes('/nodes?')) return ok(page([]))
       return ok([])
     })
@@ -150,7 +161,7 @@ describe('Job pause/resume controls', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn((url: string) => {
-        if (url.endsWith('/jobs')) return ok([capturing])
+        if (pathOf(url).endsWith('/jobs')) return ok(pageOf([capturing]))
         return ok(page([]))
       }),
     )
@@ -167,7 +178,7 @@ describe('Job pause/resume controls', () => {
 
   it('gates pause and resume behind the operate permission without hiding them', async () => {
     const fetchMock = vi.fn((url: string) => {
-      if (url.endsWith('/jobs')) return ok([runningJob, { ...pausedJob, job_id: 'billing' }])
+      if (pathOf(url).endsWith('/jobs')) return ok(pageOf([runningJob, { ...pausedJob, job_id: 'billing' }]))
       return ok(page([]))
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -188,7 +199,7 @@ describe('Job pause/resume controls', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn((url: string) => {
-        if (url.endsWith('/jobs')) return ok([runningJob, { ...pausedJob, job_id: 'billing' }])
+        if (pathOf(url).endsWith('/jobs')) return ok(pageOf([runningJob, { ...pausedJob, job_id: 'billing' }]))
         return ok(page([]))
       }),
     )
@@ -208,7 +219,7 @@ describe('Job pause/resume controls', () => {
       if (url.endsWith('/jobs/billing/actions/resume') && init?.method === 'POST')
         return ok({ ...pausedJob, desired_state: 'running', pause_phase: 'resuming' }, 202)
       if (url.endsWith('/jobs/billing/detail')) return ok(jobDetail({ ...pausedJob, job_id: 'billing' }))
-      if (url.endsWith('/jobs') && init?.method !== 'POST') return ok([{ ...pausedJob, job_id: 'billing' }])
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST') return ok(pageOf([{ ...pausedJob, job_id: 'billing' }]))
       if (url.includes('/nodes?')) return ok(page([]))
       return ok([])
     })
@@ -241,7 +252,7 @@ describe('Job pause/resume controls', () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/jobs/orders/desired-state') && init?.method === 'PUT')
         return ok({ ...pausedJob, desired_state: 'stopped', pause_phase: undefined })
-      if (url.endsWith('/jobs') && init?.method !== 'POST') return ok([pausedJob])
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST') return ok(pageOf([pausedJob]))
       if (url.includes('/nodes?')) return ok(page([]))
       return ok([])
     })
@@ -267,7 +278,7 @@ describe('Job pause/resume controls', () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/jobs/orders/actions/pause') && init?.method === 'POST')
         return fail(409, { code: 'pause_requires_recovery_policy', message: 'Recovery policy is fail' })
-      if (url.endsWith('/jobs') && init?.method !== 'POST') return ok([runningJob])
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST') return ok(pageOf([runningJob]))
       if (url.includes('/nodes?')) return ok(page([]))
       return ok([])
     })

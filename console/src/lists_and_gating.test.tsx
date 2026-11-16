@@ -12,6 +12,17 @@ import { Configuration } from './features/configuration'
 import { ActiveUpgradeCard } from './features/jobs'
 import { OperationRow } from './features/shared'
 
+// The server wraps list collections in the standard Page envelope and the
+// list hooks page through it (fetchAllPages); mocks emulate that shape.
+const pageOf = <T,>(items: T[]) => ({
+  items,
+  page: 1,
+  page_size: Math.max(items.length, 50),
+  total: items.length,
+})
+const pathOf = (url: string) => url.split('?')[0]
+
+
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
@@ -143,7 +154,7 @@ describe('server-side lists and role gating', () => {
       if (url.includes('/config-approvals'))
         return Promise.resolve({
           ok: true,
-          json: async () => [
+          json: async () => pageOf([
             {
               request_id: 'approval-x',
               requester_id: 'ops',
@@ -153,7 +164,7 @@ describe('server-side lists and role gating', () => {
               status: 'pending',
               created_at_ms: 1,
             },
-          ],
+          ]),
         })
       throw new Error(`unexpected fetch: ${url}`)
     })
@@ -231,7 +242,7 @@ describe('server-side lists and role gating', () => {
       updated_at_ms: 1,
     }
     const fetchMock = vi.fn((url: string) => {
-      if (url.endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => [rollout] })
+      if (pathOf(url).endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => pageOf([rollout]) })
       if (url.includes('/rollouts/r-1'))
         return Promise.resolve({
           ok: true,
@@ -452,7 +463,7 @@ describe('server-side lists and role gating', () => {
       if (url.includes('/config-approvals'))
         return Promise.resolve({
           ok: true,
-          json: async () => [
+          json: async () => pageOf([
             {
               request_id: 'approval-r',
               requester_id: 'ops',
@@ -462,7 +473,7 @@ describe('server-side lists and role gating', () => {
               status: 'rejected',
               created_at_ms: 1,
             },
-          ],
+          ]),
         })
       throw new Error(`unexpected fetch: ${url}`)
     })

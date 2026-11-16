@@ -28,7 +28,16 @@ use tokio_util::sync::CancellationToken;
 /// component, unsupported backend, or broken graph fails startup visibly.
 pub fn validate_local_job(spec: &JobSpec) -> Result<(), Error> {
     let plan = JobPlan::compile(spec.clone())?;
-    let state = local_state_backend(&plan)?;
+    // Validation must not open the candidate's durable state root: a
+    // running Job holds the redb exclusive lock there, so applying,
+    // rolling back, or even offline-validating a durable-state Job would
+    // fail while the old version runs. Open the same backend kind and
+    // format against a throwaway root instead — the same pattern the
+    // stream validator uses for its temporary WAL.
+    let validation_root = std::env::temp_dir()
+        .join("arkflow-job-validation")
+        .join(ephemeral_state_nonce());
+    let state = local_state_backend_with_root(&plan, Some(&validation_root))?;
     let builder = match state {
         Some(state) => ExecutionGraphBuilder::default().with_state(state),
         None => ExecutionGraphBuilder::default(),
@@ -38,8 +47,11 @@ pub fn validate_local_job(spec: &JobSpec) -> Result<(), Error> {
         temporary: std::collections::HashMap::new(),
         input_names: std::cell::RefCell::new(Vec::new()),
     };
-    builder.build(&plan, &adapter, &resource)?;
-    Ok(())
+    // Drop the graph (and with it the backend's redb lock) before deleting
+    // the throwaway root.
+    let outcome = builder.build(&plan, &adapter, &resource).map(|_| ());
+    let _ = std::fs::remove_dir_all(&validation_root);
+    outcome
 }
 
 /// Run a whole JobSpec locally (all tasks, single process).
@@ -344,6 +356,16 @@ pub(crate) async fn run_job_with_metrics_started<A: JobComponentAdapter>(
 fn local_state_backend(
     plan: &JobPlan,
 ) -> Result<Option<std::sync::Arc<dyn crate::state::StateBackend>>, Error> {
+    local_state_backend_with_root(plan, None)
+}
+
+/// Same backend construction as [`local_state_backend`], with the state root
+/// replaced by `root_override` for deep validation (the real run paths pass
+/// `None` and use the configured root).
+fn local_state_backend_with_root(
+    plan: &JobPlan,
+    root_override: Option<&std::path::Path>,
+) -> Result<Option<std::sync::Arc<dyn crate::state::StateBackend>>, Error> {
     let Some(state) = &plan.spec.state else {
         return Ok(None);
     };
@@ -353,7 +375,10 @@ fn local_state_backend(
             state.backend
         )));
     }
-    let root = local_state_root(plan).expect("state section checked above");
+    let root = match root_override {
+        Some(root) => root.to_path_buf(),
+        None => local_state_root(plan).expect("state section checked above"),
+    };
     let backend = crate::state::RedbStateBackend::open(root, state.format_version)?;
     let backend = match state.max_bytes {
         Some(max_bytes) => backend.with_max_bytes(max_bytes),
@@ -3701,6 +3726,51 @@ mod runner_tests {
         spec.operators.last_mut().unwrap().config = serde_json::json!({"type": output_type});
         spec.operators[1].config = serde_json::json!({"type": processor_type});
         validate_local_job(&spec).expect("a registered stateful Job must deep-validate");
+    }
+
+    /// Deep validation must not open the candidate's durable state root: a
+    /// running Job holds the redb exclusive lock there, so a Hub apply or
+    /// rollback (even offline `--validate` against a live engine) would fail
+    /// while the old version runs. With the lock held by a stand-in "running"
+    /// backend on the real root, validation still succeeds through its
+    /// throwaway root.
+    #[test]
+    fn validate_local_job_does_not_lock_a_running_jobs_state_root() {
+        let input_type = "runner-validate-live-input";
+        let output_type = "runner-validate-live-output";
+        let processor_type = "runner-validate-live-passthrough";
+        let _ = crate::input::register_input_builder(input_type, Arc::new(EofInputBuilder));
+        let _ = crate::output::register_output_builder(output_type, Arc::new(DevNullOutputBuilder));
+        let _ = crate::processor::register_processor_builder(
+            processor_type,
+            Arc::new(PassThroughProcessorBuilder),
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "runner-validate-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = SpecBuilder::new("runner-validate-live-job", true)
+            .durable_state(&dir, &dir)
+            .build();
+        let mut spec = spec;
+        spec.sources[0].input_type = input_type.into();
+        spec.operators[0].config = serde_json::json!({"type": input_type});
+        spec.sinks[0].output_type = output_type.into();
+        spec.operators.last_mut().unwrap().config = serde_json::json!({"type": output_type});
+        spec.operators[1].config = serde_json::json!({"type": processor_type});
+
+        // The "running" Job holds the exclusive redb lock on the real root.
+        let running = crate::state::RedbStateBackend::open(dir.clone(), 1)
+            .expect("the running Job opens the real state root");
+        validate_local_job(&spec)
+            .expect("validation must succeed while the real state root is locked");
+        drop(running);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------- recovery: seed failures and marker persistence ----------

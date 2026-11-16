@@ -84,13 +84,13 @@ Hub 返回 `202 Accepted`,其中 `Location` 指向该操作,并带有新代数�
 
 ### 分页
 
-分页的集合端点(`/nodes`、`/streams`、`/operations`、`/events`、`/audit`)返回:
+分页的集合端点(`/nodes`、`/streams`、`/jobs`、`/rollouts`、`/config-approvals`、`/operations`、`/events`、`/audit`)返回:
 
 ```json
 {"items": [], "page": 1, "page_size": 50, "total": 0}
 ```
 
-`page_size` 上限为 100。其余集合端点(`/jobs`、`/rollouts`、`/config-approvals`、`/users` 与 `/users/{id}/credentials`)返回纯数组,`GET /webhooks` 则把列表包在 `{"subscriptions": [...]}` 中。操作列表支持 `node_id`、`resource_id`、`operation`、`state` 与 `correlation_id` 过滤。请使用 `intent_id` 与 `generation` 作为稳定的对账依据,不要假设某个命令 ID 代表最终成功。
+`page_size` 上限为 100。其余集合端点(`/users` 与 `/users/{id}/credentials`)返回纯数组,`GET /webhooks` 则把列表包在 `{"subscriptions": [...]}` 中。操作列表支持 `node_id`、`resource_id`、`operation`、`state` 与 `correlation_id` 过滤。请使用 `intent_id` 与 `generation` 作为稳定的对账依据,不要假设某个命令 ID 代表最终成功。
 
 ### 问题信封
 
@@ -122,6 +122,19 @@ Content-Type: application/json
 ```
 
 `Retry-After` 携带整秒补充估算。被拒请求不产生审计事件、不产生操作记录,并经 `arkflow_control_plane_rate_limit_rejections_total{plane,key_kind}` counter family 导出(`plane` 为 `local` 或 `hub`;`key_kind` 为 `principal`、`node` 或 `catch_all`——吸收超出有界桶表流量的共享桶)。配置位于节点面的 `health_check.rate_limit`(control-API 节以 flatten 形态并入 `health_check`)与 Hub 侧的 `ARKFLOW_RATE_LIMIT_*` 环境变量(见[部署](../operate/control-plane/deploy.md#限速))。默认开启且限值远高于合法流量;`enabled: false` 精确恢复不限速行为。
+
+### 请求超时
+
+两个控制面还对版本化 API 与健康路由施加每请求超时(30 秒)。handler 在时限内未响应的请求被切断并返回标准问题信封:
+
+```http
+HTTP/1.1 408 Request Timeout
+Content-Type: application/json
+
+{"code":"request_timeout","message":"request did not complete within 30000ms"}
+```
+
+时限只覆盖 handler 阶段:已经开始流式输出的响应(如 SSE 事件流)在响应头产出后继续传输,不再受服务端切断。
 
 ## 节点 API
 
@@ -156,7 +169,7 @@ Content-Type: application/json
 
 ### 作业
 
-作业与流使用相同的期望状态语义管理。变更返回更新后的作业记录:创建与暂停/恢复返回 `202 Accepted`,其余生命周期变更返回 `200 OK`。作业生命周期变更没有独立的 operation 记录——观察返回的作业及其 `convergence` 即可。
+作业与流使用相同的期望状态语义管理。变更返回更新后的作业记录:创建与暂停/恢复返回 `202 Accepted`,其余生命周期变更返回 `200 OK`。作业生命周期变更没有独立的 operation 记录——观察返回的作业及其 `convergence` 即可。变更响应与读取端点走同一套凭证脱敏,调用方无法读回自己刚写入的明文。`GET /jobs` 以标准分页信封返回记录(`page`/`page_size`/`total`,见[分页](#分页))。
 
 | 方法 | 路由 | 用途 |
 |--------|-------|---------|

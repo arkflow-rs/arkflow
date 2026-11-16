@@ -336,7 +336,7 @@ impl JobRuntime {
             let outcome = await_previous_teardown(
                 &job_id,
                 &mut existing.handle,
-                KERNEL_TEARDOWN_JOIN_TIMEOUT,
+                kernel_teardown_join_timeout(),
             )
             .await;
             let _ = existing.state.close();
@@ -1091,7 +1091,7 @@ impl JobRuntime {
         for (job_id, mut task) in tasks {
             let dedicated = task.dedicated_runtime.take();
             task.cancellation.cancel();
-            let _ = (&mut task.handle).await;
+            bounded_teardown_join(&job_id, &mut task.handle).await;
             let _ = task.state.close();
             shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
@@ -1115,7 +1115,7 @@ impl JobRuntime {
             let task_generation = task.generation;
             let dedicated = task.dedicated_runtime.take();
             task.cancellation.cancel();
-            let _ = (&mut task.handle).await;
+            bounded_teardown_join(job_id, &mut task.handle).await;
             let _ = task.state.close();
             shutdown_dedicated_runtime(dedicated);
             if let Some(manager) = &self.data_plane {
@@ -1540,8 +1540,14 @@ impl JobComponentAdapter for RegistryJobAdapter {
 
 /// How long a redundant start waits for the previous kernel's WAL-safe
 /// teardown before giving up on joining it. Well beyond any healthy teardown
-/// (millisecond-scale in practice), well short of "forever".
-const KERNEL_TEARDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// (millisecond-scale in practice), well short of "forever". Kept mutable so
+/// tests can shrink it without waiting the production window.
+static KERNEL_TEARDOWN_JOIN_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(10_000);
+
+fn kernel_teardown_join_timeout() -> Duration {
+    Duration::from_millis(KERNEL_TEARDOWN_JOIN_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst))
+}
 
 /// Await a superseded kernel's teardown, bounded: a wedged teardown must not
 /// hold the start path (and its mutex) forever — after the bound the old task
@@ -1567,6 +1573,25 @@ pub(super) async fn await_previous_teardown(
         Ok(Ok(Ok(()))) => Some(Ok(())),
         Ok(Ok(Err(error))) => Some(Err(error.to_string())),
         Ok(Err(error)) => Some(Err(error.to_string())),
+    }
+}
+
+/// Bounded teardown join for the stop/stop-all paths: same bound and same
+/// "wedged teardown finishes detached" rationale as
+/// [`await_previous_teardown`], but no outcome is consumed — the stop path
+/// releases the start mutex within the bound and proceeds with state close
+/// and session removal regardless of how the detached kernel settles.
+async fn bounded_teardown_join(
+    job_id: &str,
+    handle: &mut tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
+) {
+    let bound = kernel_teardown_join_timeout();
+    if tokio::time::timeout(bound, &mut *handle).await.is_err() {
+        warn!(
+            job_id = %job_id,
+            bound_ms = bound.as_millis() as u64,
+            "kernel teardown did not finish within the bounded stop wait; continuing detached"
+        );
     }
 }
 
@@ -1607,4 +1632,41 @@ async fn crashed_previous_teardown_surfaces_the_join_error() {
         matches!(&outcome, Some(Err(message)) if message.contains("kernel exploded")),
         "the crash outcome must pass through: {outcome:?}"
     );
+}
+
+#[cfg(test)]
+mod stop_bounded_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// A wedged kernel must not hold the stop path (and its start mutex)
+    /// forever: past the bound the stop proceeds detached.
+    #[tokio::test]
+    async fn wedged_kernel_teardown_does_not_hold_the_stop_path() {
+        let previous = KERNEL_TEARDOWN_JOIN_TIMEOUT_MS.load(Ordering::SeqCst);
+        KERNEL_TEARDOWN_JOIN_TIMEOUT_MS.store(50, Ordering::SeqCst);
+        let mut handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok::<(), arkflow_core::Error>(())
+        });
+        let started = std::time::Instant::now();
+        bounded_teardown_join("wedged-job", &mut handle).await;
+        KERNEL_TEARDOWN_JOIN_TIMEOUT_MS.store(previous, Ordering::SeqCst);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stop must proceed within the bound, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A prompt teardown still joins (the unchanged normal path).
+    #[tokio::test]
+    async fn prompt_kernel_teardown_still_joins() {
+        let mut handle = tokio::spawn(async { Ok::<(), arkflow_core::Error>(()) });
+        bounded_teardown_join("prompt-job", &mut handle).await;
+        assert!(
+            handle.is_finished(),
+            "a prompt teardown must have been joined to completion"
+        );
+    }
 }

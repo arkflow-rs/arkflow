@@ -12,6 +12,18 @@ use serde::Deserialize;
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ApprovalListQuery {
     status: Option<String>,
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+impl From<&ApprovalListQuery> for super::PageQuery {
+    fn from(query: &ApprovalListQuery) -> Self {
+        super::PageQuery {
+            page: query.page,
+            page_size: query.page_size,
+            node_id: None,
+        }
+    }
 }
 
 pub(super) async fn submit_approval(
@@ -87,7 +99,7 @@ pub(super) async fn list_approvals(
         }
     }
     match hub.config_approvals(status).await {
-        Ok(approvals) => Json(approvals).into_response(),
+        Ok(approvals) => Json(super::page_items(approvals, &(&query).into())).into_response(),
         Err(error) => hub_problem(error),
     }
 }

@@ -3433,7 +3433,8 @@ async fn hub_job_read_routes_report_missing_and_corrupt_records() {
     let app = hub_router(hub.clone(), &ServerConfig::default());
     let (status, jobs) = get_json(&app, "/api/v1/jobs", "operator").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(jobs.as_array().unwrap().len(), 0);
+    assert_eq!(jobs["items"].as_array().unwrap().len(), 0);
+    assert_eq!(jobs["total"], 0);
 
     create_job(&app, "readable-job").await;
     let (status, plan) = get_json(&app, "/api/v1/jobs/readable-job/plan", "operator").await;
@@ -4720,7 +4721,7 @@ async fn rollout_routes_manage_staged_configuration_rollouts() {
 
     let (status, rollouts) = get_json(&app, "/api/v1/rollouts", "operator").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(rollouts
+    assert!(rollouts["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -8096,4 +8097,132 @@ async fn hub_identity_boundaries_are_explicit() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "user_limit");
+}
+
+/// Mutation responses must disclose no more than reads do: the record a
+/// create/pause/desired-state call echoes back passes through the same
+/// spec/plan redaction as the GET path, so a caller cannot read back the
+/// plaintext it just wrote (spec: control-plane-credentials).
+#[tokio::test]
+async fn mutation_responses_redact_credential_material_like_reads() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    let mut spec = job_spec("redact-mutation-job", 1);
+    spec["sinks"][0]["config"] = serde_json::json!({"password": "hunter2-plaintext"});
+
+    let (status, created) = post_json(
+        &app,
+        "/api/v1/jobs",
+        "operator",
+        serde_json::json!({"spec": spec, "desired_state": "stopped"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    assert!(
+        !created.to_string().contains("hunter2-plaintext"),
+        "create response leaked the plaintext: {created}"
+    );
+    assert!(
+        created.to_string().contains("******"),
+        "create response carried no mask at all: {created}"
+    );
+
+    // The read path shows the same mask: mutation and read responses agree.
+    let (status, read) = get_json(&app, "/api/v1/jobs/redact-mutation-job", "operator").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!read.to_string().contains("hunter2-plaintext"));
+
+    // A desired-state mutation echoes the record too — same redaction.
+    let (status, updated) = put_json(
+        &app,
+        "/api/v1/jobs/redact-mutation-job/desired-state",
+        "operator",
+        serde_json::json!({"state": "running"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert!(!updated.to_string().contains("hunter2-plaintext"));
+
+    // A lifecycle action echoes the record too.
+    let (status, started) = request_without_body(
+        &app,
+        "POST",
+        "/api/v1/jobs/redact-mutation-job/actions/start",
+        Some("operator"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    assert!(!started.to_string().contains("hunter2-plaintext"));
+}
+
+/// The jobs/rollouts/approvals collections page through the same
+/// `Page<T>` envelope as nodes and streams (spec: control-plane-service).
+#[tokio::test]
+async fn job_collection_pages_through_the_standard_envelope() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    for index in 0..3 {
+        create_job(&app, &format!("paged-job-{index}")).await;
+    }
+
+    // Default page (no parameters): envelope with the default page size.
+    let (status, first) = get_json(&app, "/api/v1/jobs", "operator").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["total"], 3);
+    assert_eq!(first["page"], 1);
+    assert_eq!(first["page_size"], 50);
+    assert_eq!(first["items"].as_array().unwrap().len(), 3);
+
+    // A bounded page returns only its slice plus totals.
+    let (status, slice) = get_json(&app, "/api/v1/jobs?page=2&page_size=2", "operator").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(slice["total"], 3);
+    assert_eq!(slice["page"], 2);
+    assert_eq!(slice["page_size"], 2);
+    let items = slice["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "page 2 of 3 jobs at size 2 holds the last job"
+    );
+
+    // An out-of-range page is empty, not an error (saturating arithmetic).
+    let (status, empty) = get_json(&app, "/api/v1/jobs?page=99&page_size=2", "operator").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty["items"].as_array().unwrap().len(), 0);
+    assert_eq!(empty["total"], 3);
+}
+
+/// A control-route request that outlives the per-request timeout is cut
+/// with a standard-envelope 408 (spec: control-plane-api).
+#[tokio::test]
+async fn stalled_control_request_times_out_with_the_standard_envelope() {
+    use std::time::Duration;
+    let app = axum::Router::new()
+        .route(
+            "/stalled",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "unreachable"
+            }),
+        )
+        .layer(axum::middleware::from_fn(request_timeout_middleware));
+    // Shrink the bound for the test; the middleware reads it per request.
+    let previous = CONTROL_REQUEST_TIMEOUT_MS.load(Ordering::SeqCst);
+    CONTROL_REQUEST_TIMEOUT_MS.store(50, Ordering::SeqCst);
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/stalled")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    CONTROL_REQUEST_TIMEOUT_MS.store(previous, Ordering::SeqCst);
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["code"], "request_timeout");
 }
