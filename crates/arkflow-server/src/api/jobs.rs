@@ -1188,7 +1188,9 @@ pub(super) async fn hub_job_upgrade_action(
         )
         .await
     {
-        Ok(record) if record.job_id == job_id => Json(record).into_response(),
+        Ok(record) if record.job_id == job_id => {
+            Json(redacted_record_response(&record)).into_response()
+        }
         Ok(_) => problem(
             StatusCode::NOT_FOUND,
             "job_upgrade_not_found",
@@ -1278,7 +1280,7 @@ pub(super) async fn hub_job_recovery_artifact(
                 ),
             )
             .await;
-            (StatusCode::ACCEPTED, Json(job)).into_response()
+            (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response()
         }
         Ok(None) => problem(
             StatusCode::NOT_FOUND,
