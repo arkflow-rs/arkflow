@@ -2,7 +2,7 @@
 
 ### Requirement: Credential material SHALL never be disclosed
 
-The Hub SHALL NOT store credential plaintext, log it, emit it in audit records, metrics labels, or any list/detail/mutation response, and SHALL compare presented secrets in constant time. Responses, logs, and audit messages SHALL expose only stable identifiers and scalar metadata. Mutation endpoints that return a stored record (create, update, upgrade, rollback, restore, recovery, trigger, desired-state, and lifecycle actions) SHALL pass the returned record through the same redaction applied to read paths, so a caller cannot read back credential material it just wrote.
+The Hub SHALL NOT store credential plaintext, log it, emit it in audit records, metrics labels, or list/detail responses, and SHALL compare presented secrets in constant time. Responses, logs, and audit messages SHALL expose only stable identifiers and scalar metadata. Job-record mutation responses (create, update, upgrade, rollback, restore, recovery, trigger, desired-state, and lifecycle actions) SHALL pass the returned record through the same redaction applied to read paths, so a caller cannot read back credential material it just wrote. This redaction obligation covers stored records echoed back to the caller; it does not alter the issuance response, whose plaintext token is disclosed exactly once by design (see the managed-lifecycle requirement).
 
 #### Scenario: List responses carry no secrets
 
@@ -14,7 +14,7 @@ The Hub SHALL NOT store credential plaintext, log it, emit it in audit records, 
 - **WHEN** a credential is issued, rotated, or revoked
 - **THEN** the audit record names the actor, action, user, and credential identifiers without token material
 
-#### Scenario: Mutation responses carry no secrets
+#### Scenario: Job mutation responses carry no secrets
 
 - **WHEN** a mutation that returns a Job record (for example create, upgrade, rollback, or desired-state change) contains credential-looking fields in its specification
 - **THEN** the response carries the same redacted values the corresponding GET detail would return, and no plaintext secret appears in the response body

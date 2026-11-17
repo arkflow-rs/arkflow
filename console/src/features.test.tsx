@@ -347,6 +347,13 @@ describe('distributed Job workbench', () => {
             updated_at_ms: 1,
           }),
         })
+      // The list hooks page through the Page envelope: an unmatched GET
+      // /jobs must still answer with a valid empty page, or fetchAllPages
+      // would reject on `first.items` and the workbench would render its
+      // error state instead of the dialog under test. Other collections
+      // (/components, ...) keep their plain-array shape.
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST')
+        return Promise.resolve({ ok: true, json: async () => pageOf([]) })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -378,12 +385,17 @@ describe('distributed Job workbench', () => {
   })
 
   it('requires a fresh validation after Job settings change', async () => {
-    const fetchMock = vi.fn((url: string) => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/jobs/validate'))
         return Promise.resolve({
           ok: true,
           json: async () => ({ valid: true, plan: {}, required_capabilities: [], nodes: [], warnings: [] }),
         })
+      // The Jobs workbench lists through the Page envelope: an unmatched
+      // GET /jobs must answer a valid empty page or fetchAllPages rejects.
+      // Other collections (/components, ...) keep their plain-array shape.
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST')
+        return Promise.resolve({ ok: true, json: async () => pageOf([]) })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch

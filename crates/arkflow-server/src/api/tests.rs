@@ -8194,10 +8194,14 @@ async fn job_collection_pages_through_the_standard_envelope() {
 }
 
 /// A control-route request that outlives the per-request timeout is cut
-/// with a standard-envelope 408 (spec: control-plane-api).
+/// with a standard-envelope 408 (spec: control-plane-api). The bound is
+/// bound into this test's own router via `request_timeout_with` — the
+/// process-wide default stays untouched, so concurrently running tests
+/// never see a 50ms budget on their requests.
 #[tokio::test]
 async fn stalled_control_request_times_out_with_the_standard_envelope() {
     use std::time::Duration;
+    let bound = Duration::from_millis(50);
     let app = axum::Router::new()
         .route(
             "/stalled",
@@ -8206,10 +8210,11 @@ async fn stalled_control_request_times_out_with_the_standard_envelope() {
                 "unreachable"
             }),
         )
-        .layer(axum::middleware::from_fn(request_timeout_middleware));
-    // Shrink the bound for the test; the middleware reads it per request.
-    let previous = CONTROL_REQUEST_TIMEOUT_MS.load(Ordering::SeqCst);
-    CONTROL_REQUEST_TIMEOUT_MS.store(50, Ordering::SeqCst);
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                request_timeout_with(bound, request, next).await
+            },
+        ));
     let response = app
         .oneshot(
             axum::http::Request::get("/stalled")
@@ -8218,7 +8223,6 @@ async fn stalled_control_request_times_out_with_the_standard_envelope() {
         )
         .await
         .unwrap();
-    CONTROL_REQUEST_TIMEOUT_MS.store(previous, Ordering::SeqCst);
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

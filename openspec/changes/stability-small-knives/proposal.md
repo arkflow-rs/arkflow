@@ -44,6 +44,7 @@
 ## Non-goals
 
 - 不做数据面强制认证(P0,唯一 P0,需要协议决策,单独 openspec change)。
+- 不做 listener 级 HTTP/1 header-read timeout(慢客户端头读取阶段限速):该相位先于请求派发,每请求超时覆盖不到;实现需换 hyper-util listener 栈或升级 axum,属后续项,spec 如实声明为部署级(反向代理)依赖。
 - 不做性能批次(EXPR_CACHE 分隔符混叠、JSON 双解析、窗口 journaled O(状态)、SQL SessionState 克隆、max_connections 连接模型等)。
 - 不做 CI 卫生项(docs-check workflow 的 examples/** 过滤、--locked、workspace.lints、rand 统一)。
 - 不做连接器批次剩余项(HTTP output Mutex 串行化、Pulsar ca_file)。

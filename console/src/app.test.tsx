@@ -515,7 +515,7 @@ describe('console application', () => {
             }
           }
           if (url.includes('/nodes?')) return page([])
-          if (url.endsWith('/jobs')) return []
+          if (url.endsWith('/jobs')) return page([])
           return []
         },
       })
@@ -571,7 +571,7 @@ describe('console application', () => {
               streams_failed: 0,
               capabilities: ['fleet_aggregation'],
             }
-          if (url.endsWith('/jobs')) return []
+          if (url.endsWith('/jobs')) return page([])
           return page([])
         },
       }),
@@ -598,7 +598,7 @@ describe('console application', () => {
               streams_failed: 0,
               capabilities: ['fleet_aggregation'],
             }
-          if (url.endsWith('/jobs')) return []
+          if (url.endsWith('/jobs')) return page([])
           return page([])
         },
       }),

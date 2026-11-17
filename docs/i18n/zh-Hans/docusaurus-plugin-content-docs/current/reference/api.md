@@ -134,7 +134,7 @@ Content-Type: application/json
 {"code":"request_timeout","message":"request did not complete within 30000ms"}
 ```
 
-时限只覆盖 handler 阶段:已经开始流式输出的响应(如 SSE 事件流)在响应头产出后继续传输,不再受服务端切断。
+时限只覆盖 handler 阶段:已经开始流式输出的响应(如 SSE 事件流)在响应头产出后继续传输,不再受服务端切断。监听器上的 HTTP/1 头读取阶段先于请求派发,不受引擎限时——需要头读取上限的部署应在控制面前置反向代理来实施。
 
 ## 节点 API
 

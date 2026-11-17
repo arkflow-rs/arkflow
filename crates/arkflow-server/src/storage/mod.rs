@@ -3734,8 +3734,11 @@ mod tests {
             .iter()
             .all(|outcome| *outcome == HubLeaseRenew::Renewed { epoch: 1 }));
         assert_eq!(store.hub_lease_snapshot().await.unwrap().unwrap().epoch, 1);
-        // Past expiry, a holder renewal racing a takeover must end Lost (or
-        // before the takeover), and the winner's epoch is what the row shows.
+        // Past expiry, a holder renewal racing a takeover must end Lost
+        // regardless of execution order: the previous renewals set
+        // expires_at_ms to 60_200, so at now_ms=70_000 the renewal's
+        // `expires_at_ms > now_ms` guard fails. A backend that lets this
+        // renewal succeed would extend an expired lease and break takeover.
         let (renew, take) = tokio::join!(
             async {
                 store
@@ -3751,20 +3754,10 @@ mod tests {
             }
         );
         let snapshot = store.hub_lease_snapshot().await.unwrap().unwrap();
-        match renew {
-            HubLeaseRenew::Renewed { epoch } => {
-                // The renewal won the race: the takeover must be reflected
-                // only by a later acquire, never by a silently bumped row.
-                assert_eq!(epoch, 1);
-                assert_eq!(snapshot.holder, "hub-a");
-                assert_eq!(snapshot.epoch, 1);
-            }
-            HubLeaseRenew::Lost => {
-                assert!(matches!(take, HubLeaseAcquire::Acquired { epoch: 2 }));
-                assert_eq!(snapshot.holder, "hub-b");
-                assert_eq!(snapshot.epoch, 2);
-            }
-        }
+        assert!(matches!(renew, HubLeaseRenew::Lost));
+        assert!(matches!(take, HubLeaseAcquire::Acquired { epoch: 2 }));
+        assert_eq!(snapshot.holder, "hub-b");
+        assert_eq!(snapshot.epoch, 2);
     }
 
     #[tokio::test]

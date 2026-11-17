@@ -1088,14 +1088,31 @@ impl JobRuntime {
             let mut tasks = self.tasks.lock().await;
             std::mem::take(&mut *tasks).into_iter().collect::<Vec<_>>()
         };
+        // Cancel every kernel BEFORE waiting, then overlap the bounded
+        // joins: N serial joins would hold the start mutex for N × bound
+        // and delay cancelling the kernels queued behind the first wedged
+        // one. Overlapped, the whole stop settles within one teardown
+        // bound regardless of how many kernels are wedged.
+        let mut pending = Vec::with_capacity(tasks.len());
         for (job_id, mut task) in tasks {
             let dedicated = task.dedicated_runtime.take();
+            let generation = task.generation;
             task.cancellation.cancel();
-            bounded_teardown_join(&job_id, &mut task.handle).await;
-            let _ = task.state.close();
-            shutdown_dedicated_runtime(dedicated);
+            pending.push((job_id, task, dedicated, generation));
+        }
+        let teardowns =
+            pending
+                .into_iter()
+                .map(|(job_id, mut task, dedicated, generation)| async move {
+                    bounded_teardown_join(&job_id, &mut task.handle).await;
+                    let _ = task.state.close();
+                    shutdown_dedicated_runtime(dedicated);
+                    (job_id, generation)
+                });
+        let finished = futures_util::future::join_all(teardowns).await;
+        for (job_id, generation) in finished {
             if let Some(manager) = &self.data_plane {
-                manager.remove_job_session(&job_id, task.generation);
+                manager.remove_job_session(&job_id, generation);
             }
         }
     }
@@ -1640,21 +1657,21 @@ mod stop_bounded_tests {
     use std::sync::atomic::Ordering;
 
     /// A wedged kernel must not hold the stop path (and its start mutex)
-    /// forever: past the bound the stop proceeds detached.
+    /// forever: past the bound the stop proceeds detached. The kernel never
+    /// completes, so an unbounded (ordinary) join would hang this test —
+    /// only the bounded wait can pass, and the deadline is tight around the
+    /// shrunk bound rather than a loose upper limit.
     #[tokio::test]
     async fn wedged_kernel_teardown_does_not_hold_the_stop_path() {
         let previous = KERNEL_TEARDOWN_JOIN_TIMEOUT_MS.load(Ordering::SeqCst);
         KERNEL_TEARDOWN_JOIN_TIMEOUT_MS.store(50, Ordering::SeqCst);
-        let mut handle = tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            Ok::<(), arkflow_core::Error>(())
-        });
+        let mut handle = tokio::spawn(std::future::pending::<Result<(), arkflow_core::Error>>());
         let started = std::time::Instant::now();
         bounded_teardown_join("wedged-job", &mut handle).await;
         KERNEL_TEARDOWN_JOIN_TIMEOUT_MS.store(previous, Ordering::SeqCst);
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "stop must proceed within the bound, took {:?}",
+            started.elapsed() < Duration::from_secs(1),
+            "stop must proceed within the (50ms) bound, took {:?}",
             started.elapsed()
         );
     }

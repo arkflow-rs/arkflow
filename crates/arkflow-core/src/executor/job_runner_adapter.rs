@@ -3764,11 +3764,18 @@ mod runner_tests {
         spec.operators.last_mut().unwrap().config = serde_json::json!({"type": output_type});
         spec.operators[1].config = serde_json::json!({"type": processor_type});
 
-        // The "running" Job holds the exclusive redb lock on the real root.
-        let running = crate::state::RedbStateBackend::open(dir.clone(), 1)
-            .expect("the running Job opens the real state root");
+        // The "running" Job holds the exclusive redb lock on the database
+        // execution actually opens: `local_state_root` nests the durable
+        // root one level deeper (`<root>/jobs/<job>/version-N`), so locking
+        // `dir` itself would not contend with a validator that still
+        // opened the execution path.
+        let plan = JobPlan::compile(spec.clone()).expect("the fixture spec must compile");
+        let execution_root = local_state_root(&plan).expect("state section checked above");
+        std::fs::create_dir_all(&execution_root).unwrap();
+        let running = crate::state::RedbStateBackend::open(execution_root, 1)
+            .expect("the running Job opens the execution state database");
         validate_local_job(&spec)
-            .expect("validation must succeed while the real state root is locked");
+            .expect("validation must succeed while the execution database is locked");
         drop(running);
         let _ = std::fs::remove_dir_all(&dir);
     }

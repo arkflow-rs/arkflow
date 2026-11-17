@@ -1514,22 +1514,29 @@ static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// holding its slot indefinitely (Slowloris-style budget exhaustion).
 /// The bound covers only the handler phase — a response whose body streams
 /// (SSE) is produced first and streams on unbounded afterwards. Kept
-/// mutable so tests can shrink it without waiting the production window.
+/// mutable so tests can shrink it without waiting the production window;
+/// tests that need an unusual bound should prefer [`request_timeout_with`]
+/// bound into their own router rather than mutating this shared static.
 static CONTROL_REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
 
 async fn request_timeout_middleware(request: Request<Body>, next: Next) -> Response {
     let bound_ms = CONTROL_REQUEST_TIMEOUT_MS.load(Ordering::SeqCst);
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(bound_ms),
-        next.run(request),
-    )
-    .await
-    {
+    request_timeout_with(std::time::Duration::from_millis(bound_ms), request, next).await
+}
+
+/// The timeout behaviour with an explicit bound, so tests can pin the
+/// per-request timeout without touching the process-wide default.
+async fn request_timeout_with(
+    bound: std::time::Duration,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(bound, next.run(request)).await {
         Ok(response) => response,
         Err(_) => problem(
             StatusCode::REQUEST_TIMEOUT,
             "request_timeout",
-            format!("request did not complete within {bound_ms}ms"),
+            format!("request did not complete within {}ms", bound.as_millis()),
         ),
     }
 }

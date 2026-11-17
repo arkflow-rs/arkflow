@@ -182,7 +182,10 @@ Content-Type: application/json
 
 The bound covers the handler phase only: a response that has started streaming
 (such as the SSE event stream) streams on without a server-side cut after its
-headers are produced.
+headers are produced. The HTTP/1 header-read phase on the listener predates
+request dispatch and is not bounded by the engine — deployments that require a
+header-read bound enforce it with a reverse proxy in front of the control
+plane.
 
 ## Node API
 

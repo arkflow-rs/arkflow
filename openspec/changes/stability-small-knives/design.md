@@ -22,7 +22,7 @@ CODE-REVIEW-2026-11-15.md 批次 2~5 中 9 个低风险 P1。2026-11-16 存活�
 
 ### D3: 每请求超时 = tower `TimeoutLayer` + `HandleErrorLayer` 映射为标准 problem 响应
 
-tower-http 的 `TimeoutLayer` 固定返回裸 408,违反 control-plane-api "Standard API errors" 的信封约定。采用 tower 组合:`HandleErrorLayer::new(...)` + `TimeoutLayer`,把 Elapsed 映射为 `problem(408, "request_timeout")`,与限流 429 (`rate_limited`) 同构。超时时长取固定默认(如 30s)并进 `RateLimitConfig` 同级的控制面配置?——不:本批不做新配置面,先定常量并留 TODO 注释,配置化留给后续。两处栈(local :495-506、hub :866-868)都加。
+tower-http 的 `TimeoutLayer` 固定返回裸 408,违反 control-plane-api "Standard API errors" 的信封约定。采用 tower 组合:`HandleErrorLayer::new(...)` + `TimeoutLayer`,把 Elapsed 映射为 `problem(408, "request_timeout")`,与限流 429 (`rate_limited`) 同构。超时时长取固定默认(如 30s)并进 `RateLimitConfig` 同级的控制面配置?——不:本批不做新配置面,先定常量并留 TODO 注释,配置化留给后续。两处栈(local :495-506、hub :866-868)都加。**评审修订(CodeRabbit)**:middleware 实现为可显式传 bound 的 `request_timeout_with`,生产路径读共享 static,测试把自己的 bound 绑进自有 router,不再改全局静态(避免并行测试看到 50ms 预算)。超时只覆盖请求派发到响应产出;HTTP/1 头读取相位在派发之前,引擎不限时——spec 如实声明为部署级(反向代理)依赖,listener 级 header-read timeout 是后续项。
 
 ### D4: PG lease 续约 = 单条 `UPDATE ... RETURNING`
 
@@ -34,7 +34,7 @@ postgres_methods.rs:3153-3162 的 guarded UPDATE + 独立 SELECT 合并为 `UPDA
 
 ### D6: stop/stop_all 有界落定 = 复用 teardown 常量,超时后 detach
 
-stop/stop_all(kernel.rs:1094,1118)的裸 join 改为 `timeout(KERNEL_TEARDOWN_JOIN_TIMEOUT, &mut handle)`;超时则 `warn!` 后继续 detach——与 start 路径(await_previous_teardown 文档注释)语义一致:楔死的内核自己收敛,启停路径不永久持 `_start_guard`。detached 后仍执行 `state.close()` 与 session 移除(与现状一致)。不把 await_previous_teardown 改成公共助手再复用(其返回值语义是 start 专用),stop 处直接用 `tokio::time::timeout` 三行实现,注释互相引用。
+stop/stop_all(kernel.rs:1094,1118)的裸 join 改为 `timeout(KERNEL_TEARDOWN_JOIN_TIMEOUT, &mut handle)`;超时则 `warn!` 后继续 detach——与 start 路径(await_previous_teardown 文档注释)语义一致:楔死的内核自己收敛,启停路径不永久持 `_start_guard`。detached 后仍执行 `state.close()` 与 session 移除(与现状一致)。不把 await_previous_teardown 改成公共助手再复用(其返回值语义是 start 专用),stop 处直接用 `tokio::time::timeout` 三行实现,注释互相引用。**评审修订(CodeRabbit)**:stop_all 先取消全部内核再**并行**做有界 join(join_all),否则 N 个楔死内核串行累计 N×bound 持锁,且排在后面的内核取消被延迟;并行后整个 stop_all 在一个 bound 内落定,符合 compute-node-agent 新增 spec 的措辞。
 
 ### D7: Kafka close flush = `spawn_blocking`
 
