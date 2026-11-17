@@ -17,7 +17,6 @@ const pageOf = <T,>(items: T[]) => ({
 })
 const pathOf = (url: string) => url.split('?')[0]
 
-
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
@@ -199,7 +198,8 @@ describe('Job pause/resume controls', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn((url: string) => {
-        if (pathOf(url).endsWith('/jobs')) return ok(pageOf([runningJob, { ...pausedJob, job_id: 'billing' }]))
+        if (pathOf(url).endsWith('/jobs'))
+          return ok(pageOf([runningJob, { ...pausedJob, job_id: 'billing' }]))
         return ok(page([]))
       }),
     )
@@ -219,7 +219,8 @@ describe('Job pause/resume controls', () => {
       if (url.endsWith('/jobs/billing/actions/resume') && init?.method === 'POST')
         return ok({ ...pausedJob, desired_state: 'running', pause_phase: 'resuming' }, 202)
       if (url.endsWith('/jobs/billing/detail')) return ok(jobDetail({ ...pausedJob, job_id: 'billing' }))
-      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST') return ok(pageOf([{ ...pausedJob, job_id: 'billing' }]))
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST')
+        return ok(pageOf([{ ...pausedJob, job_id: 'billing' }]))
       if (url.includes('/nodes?')) return ok(page([]))
       return ok([])
     })

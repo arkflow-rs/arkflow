@@ -22,7 +22,6 @@ const pageOf = <T,>(items: T[]) => ({
 })
 const pathOf = (url: string) => url.split('?')[0]
 
-
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
@@ -154,17 +153,18 @@ describe('server-side lists and role gating', () => {
       if (url.includes('/config-approvals'))
         return Promise.resolve({
           ok: true,
-          json: async () => pageOf([
-            {
-              request_id: 'approval-x',
-              requester_id: 'ops',
-              config_version_id: 'v1',
-              targets: ['node-a'],
-              batch_size: 1,
-              status: 'pending',
-              created_at_ms: 1,
-            },
-          ]),
+          json: async () =>
+            pageOf([
+              {
+                request_id: 'approval-x',
+                requester_id: 'ops',
+                config_version_id: 'v1',
+                targets: ['node-a'],
+                batch_size: 1,
+                status: 'pending',
+                created_at_ms: 1,
+              },
+            ]),
         })
       throw new Error(`unexpected fetch: ${url}`)
     })
@@ -242,7 +242,8 @@ describe('server-side lists and role gating', () => {
       updated_at_ms: 1,
     }
     const fetchMock = vi.fn((url: string) => {
-      if (pathOf(url).endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => pageOf([rollout]) })
+      if (pathOf(url).endsWith('/rollouts'))
+        return Promise.resolve({ ok: true, json: async () => pageOf([rollout]) })
       if (url.includes('/rollouts/r-1'))
         return Promise.resolve({
           ok: true,
@@ -463,17 +464,18 @@ describe('server-side lists and role gating', () => {
       if (url.includes('/config-approvals'))
         return Promise.resolve({
           ok: true,
-          json: async () => pageOf([
-            {
-              request_id: 'approval-r',
-              requester_id: 'ops',
-              config_version_id: 'v1',
-              targets: ['node-a'],
-              batch_size: 1,
-              status: 'rejected',
-              created_at_ms: 1,
-            },
-          ]),
+          json: async () =>
+            pageOf([
+              {
+                request_id: 'approval-r',
+                requester_id: 'ops',
+                config_version_id: 'v1',
+                targets: ['node-a'],
+                batch_size: 1,
+                status: 'rejected',
+                created_at_ms: 1,
+              },
+            ]),
         })
       throw new Error(`unexpected fetch: ${url}`)
     })

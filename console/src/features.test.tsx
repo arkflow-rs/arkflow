@@ -24,7 +24,6 @@ const pageOf = <T,>(items: T[]) => ({
 })
 const pathOf = (url: string) => url.split('?')[0]
 
-
 afterEach(() => cleanup())
 
 const page = (items: unknown[]) => ({ items, page: 1, page_size: items.length || 50, total: items.length })
@@ -193,7 +192,8 @@ describe('rollout workflow', () => {
             updated_at_ms: 1,
           }),
         })
-      if (pathOf(url).endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => pageOf([]) })
+      if (pathOf(url).endsWith('/rollouts'))
+        return Promise.resolve({ ok: true, json: async () => pageOf([]) })
       if (url.endsWith('/rollouts/r-1'))
         return Promise.resolve({
           ok: true,
@@ -263,7 +263,8 @@ describe('rollout workflow', () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (pathOf(url).endsWith('/rollouts') && init?.method === 'POST')
         return Promise.resolve({ ok: true, json: async () => rollout() })
-      if (pathOf(url).endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => pageOf([rollout()]) })
+      if (pathOf(url).endsWith('/rollouts'))
+        return Promise.resolve({ ok: true, json: async () => pageOf([rollout()]) })
       if (url.endsWith('/rollouts/r-1/actions')) {
         state = 'paused'
         return Promise.resolve({ ok: true, json: async () => rollout() })
@@ -400,18 +401,19 @@ describe('distributed Job workbench', () => {
       if (pathOf(url).endsWith('/jobs'))
         return Promise.resolve({
           ok: true,
-          json: async () => pageOf([
-            {
-              job_id: 'scoped-job',
-              version: 1,
-              desired_state: 'running',
-              observed_state: 'running',
-              convergence: 'in_sync',
-              generation: 1,
-              node_ids: ['n1'],
-              updated_at_ms: 1,
-            },
-          ]),
+          json: async () =>
+            pageOf([
+              {
+                job_id: 'scoped-job',
+                version: 1,
+                desired_state: 'running',
+                observed_state: 'running',
+                convergence: 'in_sync',
+                generation: 1,
+                node_ids: ['n1'],
+                updated_at_ms: 1,
+              },
+            ]),
         })
       if (url.endsWith('/jobs/scoped-job/detail'))
         return Promise.resolve({
