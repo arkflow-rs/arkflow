@@ -491,23 +491,32 @@ fn redact_url_password(text: &str) -> Option<String> {
 }
 
 fn is_secret_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
+    // Separator-insensitive matching: `apiKey` lowercases to `apikey`,
+    // which does not contain `api_key` — connectors routinely emit
+    // camelCase credential fields and every spelling variant must mask.
+    // The needle list is normalized the same way, so the snake_case parts
+    // match camelCase, kebab-case, and plain lowercase keys alike.
+    let normalized: String = key
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     [
         "password",
         "passwd",
         "token",
         "secret",
         "credential",
-        "api_key",
+        "apikey",
         // Connector credential fields that do not contain "secret"/"token":
         // AWS-style access keys, GCS service-account JSON (which embeds a
         // private key), Azure storage account keys, and raw PEM keys.
-        "access_key",
-        "private_key",
-        "account_key",
+        "accesskey",
+        "privatekey",
+        "accountkey",
     ]
     .iter()
-    .any(|part| key.contains(part))
+    .any(|part| normalized.contains(part))
 }
 
 fn now_ms() -> u64 {
@@ -535,6 +544,32 @@ pub fn redacted_config(config: &EngineConfig) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Credential keys mask regardless of separator/casing spelling:
+    /// `apiKey` normalizes to the same needle as `api_key`, so camelCase
+    /// connector fields cannot slip through the read/mutation redaction.
+    #[test]
+    fn secret_keys_match_across_separator_and_case_spellings() {
+        for key in [
+            "api_key",
+            "apiKey",
+            "APIKey",
+            "access_key",
+            "accessToken",
+            "private_key",
+            "privateKey",
+            "password",
+            "userPassword",
+        ] {
+            assert!(
+                is_secret_key(key),
+                "credential-looking key '{key}' must mask"
+            );
+        }
+        for key in ["zone", "tier", "parallelism", "batchSize", "mode"] {
+            assert!(!is_secret_key(key), "benign key '{key}' must not mask");
+        }
+    }
 
     #[test]
     fn versions_persist_verbatim_content_when_present() {

@@ -135,6 +135,13 @@ pub(crate) struct NodeRecord {
     config_versions: Vec<arkflow_core::configuration::ConfigVersion>,
     /// Task ids each Job kernel is currently executing on the node.
     job_tasks: BTreeMap<String, Vec<String>>,
+    /// Bumped by every in-memory label replacement (including same-value
+    /// ones). Registration's label re-sync snapshots this revision before
+    /// its storage read and only applies the pre-read when the revision is
+    /// unchanged, so a replacement landing during the read window can never
+    /// be regressed by the registration's (possibly stale) snapshot —
+    /// value equality alone would miss a replacement back to the same map.
+    labels_rev: u64,
 }
 
 #[derive(Clone)]

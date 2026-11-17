@@ -454,6 +454,10 @@ impl Hub {
                         .map(|record| record.job_tasks.clone())
                         .unwrap_or_default()
                 },
+                // Registration re-hydrates labels from storage further down;
+                // the revision baseline comes from the record this insert
+                // replaced (or 0 for a fresh node).
+                labels_rev: old.as_ref().map(|record| record.labels_rev).unwrap_or(0),
                 metrics: old.map(|record| record.metrics).unwrap_or_default(),
             },
         );
@@ -495,22 +499,22 @@ impl Hub {
             // memory update afterwards. The storage round trip stays out of
             // the lock — a slow label query must not stall every writer
             // queued on this lock (registration, reports) — so the read is
-            // paired with an in-memory snapshot taken before it: the
-            // pre-read is applied under the write lock only when the
-            // in-memory labels are still exactly that snapshot. If they
-            // changed during the read window, a replacement's memory update
-            // already landed (its own storage write precedes its memory
-            // update, so it is at least as new as anything this registration
-            // read) and re-applying the stale snapshot here would regress
-            // it; a replacement whose memory update lands after our release
-            // overwrites us regardless. The map can never end this
-            // registration stale.
-            let labels_before = self
+            // paired with an in-memory labels-revision snapshot taken before
+            // it: the pre-read is applied under the write lock only when no
+            // replacement has landed since. Value comparison would be
+            // unsound (a replacement back to the same map is invisible);
+            // `labels_rev` advances on every replacement, so any replacement
+            // landing during the read window suppresses the stale pre-read —
+            // its own storage write precedes its memory update, making it at
+            // least as new as anything this registration read. A replacement
+            // whose memory update lands after our release overwrites us
+            // regardless. The map can never end this registration stale.
+            let labels_rev_before = self
                 .nodes
                 .read()
                 .await
                 .get(&request.node_id)
-                .map(|node| node.resource.labels.clone());
+                .map(|node| node.labels_rev);
             let fresh_labels = storage
                 .get_node_labels(&request.node_id)
                 .await
@@ -520,7 +524,7 @@ impl Hub {
                 let mut nodes = self.nodes.write().await;
                 if let Some(node) = nodes.get_mut(&request.node_id) {
                     if let Some(fresh) = fresh_labels {
-                        if labels_before.as_ref() == Some(&node.resource.labels) {
+                        if labels_rev_before == Some(node.labels_rev) {
                             node.resource.labels = fresh;
                         }
                     }
@@ -1048,6 +1052,11 @@ impl Hub {
         let mut nodes = self.nodes.write().await;
         if let Some(node) = nodes.get_mut(node_id) {
             node.resource.labels = labels.clone();
+            // Every replacement advances the revision — including same-value
+            // ones — so registration's re-sync can tell "nothing happened
+            // during my read window" from "a replacement landed that wrote
+            // the same map I snapshotted".
+            node.labels_rev = node.labels_rev.wrapping_add(1);
         }
         Ok(labels)
     }

@@ -321,6 +321,19 @@ describe('rollout workflow', () => {
 
 describe('distributed Job workbench', () => {
   it('validates a Job plan before creating it in stopped state', async () => {
+    // The list reload after the create carries the new job, so the test
+    // asserts the reload RESULT, not just that the GET requests happened.
+    let created = false
+    const newJob = {
+      job_id: 'new-job',
+      version: 1,
+      desired_state: 'stopped',
+      observed_state: 'validated',
+      convergence: 'pending',
+      generation: 1,
+      node_ids: [],
+      updated_at_ms: 1,
+    }
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/jobs/validate'))
         return Promise.resolve({
@@ -333,27 +346,17 @@ describe('distributed Job workbench', () => {
             warnings: [],
           }),
         })
-      if (pathOf(url).endsWith('/jobs') && init?.method === 'POST')
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({
-            job_id: 'new-job',
-            version: 1,
-            desired_state: 'stopped',
-            observed_state: 'validated',
-            convergence: 'pending',
-            generation: 1,
-            node_ids: [],
-            updated_at_ms: 1,
-          }),
-        })
+      if (pathOf(url).endsWith('/jobs') && init?.method === 'POST') {
+        created = true
+        return Promise.resolve({ ok: true, json: async () => newJob })
+      }
       // The list hooks page through the Page envelope: an unmatched GET
       // /jobs must still answer with a valid empty page, or fetchAllPages
       // would reject on `first.items` and the workbench would render its
       // error state instead of the dialog under test. Other collections
       // (/components, ...) keep their plain-array shape.
       if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST')
-        return Promise.resolve({ ok: true, json: async () => pageOf([]) })
+        return Promise.resolve({ ok: true, json: async () => pageOf(created ? [newJob] : []) })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -382,6 +385,8 @@ describe('distributed Job workbench', () => {
         ).length,
       ).toBeGreaterThanOrEqual(2),
     )
+    // The post-create reload succeeds and the list shows the created job.
+    expect(await screen.findByText('new-job')).toBeInTheDocument()
   })
 
   it('requires a fresh validation after Job settings change', async () => {

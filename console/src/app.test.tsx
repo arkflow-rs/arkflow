@@ -515,13 +515,16 @@ describe('console application', () => {
             }
           }
           if (url.includes('/nodes?')) return page([])
-          if (url.endsWith('/jobs')) return page([])
+          if (url.split('?')[0].endsWith('/jobs')) return page([])
           return []
         },
       })
     })
     window.history.replaceState(null, '', '/jobs')
     render(<App />)
+    // The paginated /jobs mock is pathname-matched: assert the initial list
+    // actually loads (empty state) before exercising the mutation flow.
+    expect(await screen.findByText('No distributed Jobs match the current filters.')).toBeInTheDocument()
     fireEvent.click(await screen.findByRole('button', { name: 'Create Job' }))
     fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
     expect(await screen.findByText(/not authorized/i)).toBeInTheDocument()
@@ -571,7 +574,7 @@ describe('console application', () => {
               streams_failed: 0,
               capabilities: ['fleet_aggregation'],
             }
-          if (url.endsWith('/jobs')) return page([])
+          if (url.split('?')[0].endsWith('/jobs')) return page([])
           return page([])
         },
       }),
@@ -598,7 +601,7 @@ describe('console application', () => {
               streams_failed: 0,
               capabilities: ['fleet_aggregation'],
             }
-          if (url.endsWith('/jobs')) return page([])
+          if (url.split('?')[0].endsWith('/jobs')) return page([])
           return page([])
         },
       }),
