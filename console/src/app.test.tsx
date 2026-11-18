@@ -515,7 +515,19 @@ describe('console application', () => {
             }
           }
           if (url.includes('/nodes?')) return page([])
-          if (url.split('?')[0].endsWith('/jobs')) return page([])
+          if (url.split('?')[0].endsWith('/jobs'))
+            return page([
+              {
+                job_id: 'perm-job',
+                version: 1,
+                desired_state: 'stopped',
+                observed_state: 'stopped',
+                convergence: 'in_sync',
+                generation: 1,
+                node_ids: [],
+                updated_at_ms: 1,
+              },
+            ])
           return []
         },
       })
@@ -523,8 +535,9 @@ describe('console application', () => {
     window.history.replaceState(null, '', '/jobs')
     render(<App />)
     // The paginated /jobs mock is pathname-matched: assert the initial list
-    // actually loads (empty state) before exercising the mutation flow.
-    expect(await screen.findByText('No distributed Jobs match the current filters.')).toBeInTheDocument()
+    // actually loads — with a real row, so a silently failed list request
+    // (which would render the empty state anyway) cannot pass.
+    expect(await screen.findByText('perm-job')).toBeInTheDocument()
     fireEvent.click(await screen.findByRole('button', { name: 'Create Job' }))
     fireEvent.click(screen.getByRole('button', { name: 'Validate Plan' }))
     expect(await screen.findByText(/not authorized/i)).toBeInTheDocument()
@@ -574,14 +587,26 @@ describe('console application', () => {
               streams_failed: 0,
               capabilities: ['fleet_aggregation'],
             }
-          if (url.split('?')[0].endsWith('/jobs')) return page([])
+          if (url.split('?')[0].endsWith('/jobs'))
+            return page([
+              {
+                job_id: 'perm-job',
+                version: 1,
+                desired_state: 'stopped',
+                observed_state: 'stopped',
+                convergence: 'in_sync',
+                generation: 1,
+                node_ids: [],
+                updated_at_ms: 1,
+              },
+            ])
           return page([])
         },
       }),
     )
     window.history.replaceState(null, '', '/jobs')
     render(<App />)
-    expect(await screen.findByText('No distributed Jobs match the current filters.')).toBeInTheDocument()
+    expect(await screen.findByText('perm-job')).toBeInTheDocument()
     expect(screen.getByLabelText('Job filter')).toBeInTheDocument()
     expect(window.location.pathname).toBe('/jobs')
   })
@@ -601,14 +626,26 @@ describe('console application', () => {
               streams_failed: 0,
               capabilities: ['fleet_aggregation'],
             }
-          if (url.split('?')[0].endsWith('/jobs')) return page([])
+          if (url.split('?')[0].endsWith('/jobs'))
+            return page([
+              {
+                job_id: 'perm-job',
+                version: 1,
+                desired_state: 'stopped',
+                observed_state: 'stopped',
+                convergence: 'in_sync',
+                generation: 1,
+                node_ids: [],
+                updated_at_ms: 1,
+              },
+            ])
           return page([])
         },
       }),
     )
     window.history.replaceState(null, '', '/?page=jobs&node_id=node-a')
     render(<App />)
-    expect(await screen.findByText('No distributed Jobs match the current filters.')).toBeInTheDocument()
+    expect(await screen.findByText('perm-job')).toBeInTheDocument()
     expect(window.location.pathname).toBe('/jobs')
     expect(window.location.search).toBe('?node_id=node-a')
   })

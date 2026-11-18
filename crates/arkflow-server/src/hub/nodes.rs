@@ -523,9 +523,18 @@ impl Hub {
             {
                 let mut nodes = self.nodes.write().await;
                 if let Some(node) = nodes.get_mut(&request.node_id) {
-                    if let Some(fresh) = fresh_labels {
-                        if labels_rev_before == Some(node.labels_rev) {
-                            node.resource.labels = fresh;
+                    // The revision guard binds to THIS registration's record:
+                    // if the storage read was delayed past lease expiry, a
+                    // capacity reclaim could have dropped the node and a
+                    // fresh registration re-created it (labels_rev reset to
+                    // 0) — without the session-token check this
+                    // registration's stale completion would pass the
+                    // revision guard and regress that new record.
+                    if node.session_token == session_token {
+                        if let Some(fresh) = fresh_labels {
+                            if labels_rev_before == Some(node.labels_rev) {
+                                node.resource.labels = fresh;
+                            }
                         }
                     }
                 }
