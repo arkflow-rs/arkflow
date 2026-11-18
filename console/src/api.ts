@@ -749,7 +749,13 @@ export const api = {
       { method: 'POST' },
     ),
   cancel: (id: string) => request<Operation>(`/operations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  jobs: () => request<Job[]>('/jobs'),
+  jobs: (page?: number, pageSize?: number) =>
+    request<Page<Job>>(
+      withQuery('/jobs', {
+        ...(page ? { page } : {}),
+        ...(pageSize ? { page_size: pageSize } : {}),
+      }),
+    ),
   jobDetail: (id: string) => request<JobDetail>(`/jobs/${encodeURIComponent(id)}/detail`),
   jobVersions: (id: string) => request<JobVersion[]>(`/jobs/${encodeURIComponent(id)}/versions`),
   validateJob: (spec: unknown, nodeIds: string[] = []) =>
@@ -815,7 +821,13 @@ export const api = {
     request<Job>(`/jobs/${encodeURIComponent(id)}/upgrades/${encodeURIComponent(upgradeId)}/rollback`, {
       method: 'POST',
     }),
-  rollouts: () => request<Rollout[]>('/rollouts'),
+  rollouts: (page?: number, pageSize?: number) =>
+    request<Page<Rollout>>(
+      withQuery('/rollouts', {
+        ...(page ? { page } : {}),
+        ...(pageSize ? { page_size: pageSize } : {}),
+      }),
+    ),
   rollout: (id: string) => request<RolloutDetail>(`/rollouts/${encodeURIComponent(id)}`),
   createRollout: (
     configVersion: string,
@@ -831,8 +843,14 @@ export const api = {
           : { config_version: configVersion, node_ids: nodeIds, batch_size: batchSize },
       ),
     }),
-  configApprovals: (status?: string) =>
-    request<ConfigApproval[]>(`/config-approvals${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  configApprovals: (status?: string, page?: number, pageSize?: number) =>
+    request<Page<ConfigApproval>>(
+      withQuery('/config-approvals', {
+        ...(status ? { status } : {}),
+        ...(page ? { page } : {}),
+        ...(pageSize ? { page_size: pageSize } : {}),
+      }),
+    ),
   configApproval: (id: string) => request<ConfigApproval>(`/config-approvals/${encodeURIComponent(id)}`),
   submitConfigApproval: (
     configVersion: string,

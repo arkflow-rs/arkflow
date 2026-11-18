@@ -3150,21 +3150,20 @@ impl StorageBackend for PostgresBackend {
     ) -> Result<HubLeaseRenew, StorageError> {
         {
             let mut connection = self.lease().await?;
-            let updated = connection.execute(
-                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2, advertise_url = ?3 WHERE id = 1 AND holder = ?4 AND expires_at_ms > ?5",
+            // One conditional statement returning the effective epoch: a
+            // separate read after the guarded UPDATE would misattribute
+            // another writer's epoch bump to this renewal (millisecond
+            // split-brain window). Real storage failures still propagate
+            // as `Err` — only "no row matched the guard" is Lost.
+            let epoch = connection.query_row(
+                "UPDATE cp_hub_lease SET expires_at_ms = ?1, updated_at_ms = ?2, advertise_url = ?3 WHERE id = 1 AND holder = ?4 AND expires_at_ms > ?5 RETURNING epoch",
                 binds![now_ms + ttl_ms, now_ms, advertise_url, holder, now_ms],
-            ).await?;
-            if updated == 1 {
-                let epoch = connection.query_row(
-                    "SELECT epoch FROM cp_hub_lease WHERE id = 1",
-                    binds![],
-                    |row| row.get::<u64>(0),
-                ).await.optional()?;
-                return Ok(HubLeaseRenew::Renewed {
-                    epoch: epoch.unwrap_or(0),
-                });
+                |row| row.get::<u64>(0),
+            ).await.optional()?;
+            match epoch {
+                Some(epoch) => Ok(HubLeaseRenew::Renewed { epoch }),
+                None => Ok(HubLeaseRenew::Lost),
             }
-            Ok(HubLeaseRenew::Lost)
         }
     }
     async fn release_hub_lease(&self, holder: &str, now_ms: u64) -> Result<bool, StorageError> {

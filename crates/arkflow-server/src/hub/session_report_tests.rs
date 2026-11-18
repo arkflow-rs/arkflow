@@ -806,6 +806,7 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
             report_seq: 0,
             config_versions: Vec::new(),
             job_tasks: BTreeMap::new(),
+            labels_rev: 0,
             commands: VecDeque::new(),
             leased_commands: BTreeMap::new(),
             streams: vec![],
