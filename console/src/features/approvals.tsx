@@ -25,8 +25,8 @@ export function Approvals({ onError, canMutate = true, canSubmit = true }: Appro
   const reportMutationFailure = useMutationFailure()
   const confirm = useConfirm()
   const prompt = usePrompt()
-  const pending = useConfigApprovals('pending').data ?? []
-  const decided = useConfigApprovals().data ?? []
+  const pending = useConfigApprovals('pending').data?.items ?? []
+  const decided = useConfigApprovals().data?.items ?? []
   const [busy, setBusy] = useState(false)
   const [filter, setFilter] = useState<'pending' | 'all'>('pending')
   const shown = filter === 'pending' ? pending : decided

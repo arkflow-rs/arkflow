@@ -106,16 +106,15 @@ an `ETag` for the new generation:
 
 ### Pagination
 
-Paginated collection endpoints (`/nodes`, `/streams`, `/operations`,
-`/events`, `/audit`) return:
+Paginated collection endpoints (`/nodes`, `/streams`, `/jobs`, `/rollouts`,
+`/config-approvals`, `/operations`, `/events`, `/audit`) return:
 
 ```json
 {"items": [], "page": 1, "page_size": 50, "total": 0}
 ```
 
-`page_size` is bounded to 100. The remaining collection endpoints (`/jobs`,
-`/rollouts`, `/config-approvals`, `/users`, and `/users/{id}/credentials`)
-return plain arrays, and `GET /webhooks`
+`page_size` is bounded to 100. The remaining collection endpoints (`/users`
+and `/users/{id}/credentials`) return plain arrays, and `GET /webhooks`
 wraps its list in `{"subscriptions": [...]}`. Operation listing supports `node_id`,
 `resource_id`, `operation`, `state`, and `correlation_id` filters. Use
 `intent_id` and `generation` as stable reconciliation references instead of
@@ -168,6 +167,26 @@ plane (the control-API section is flattened into `health_check`) and the `ARKFLO
 enabled with limits far above legitimate traffic; `enabled: false` restores
 the unlimited behavior exactly.
 
+### Request timeout
+
+Both control planes also enforce a per-request timeout (30 seconds) on the
+versioned API and the health routes. A request whose handler does not respond
+within the bound is cut with the standard problem envelope:
+
+```http
+HTTP/1.1 408 Request Timeout
+Content-Type: application/json
+
+{"code":"request_timeout","message":"request did not complete within 30000ms"}
+```
+
+The bound covers the handler phase only: a response that has started streaming
+(such as the SSE event stream) streams on without a server-side cut after its
+headers are produced. The HTTP/1 header-read phase on the listener predates
+request dispatch and is not bounded by the engine — deployments that require a
+header-read bound enforce it with a reverse proxy in front of the control
+plane.
+
 ## Node API
 
 | Method | Route | Purpose |
@@ -205,7 +224,10 @@ Jobs are managed with the same desired-state semantics as streams. A mutation
 returns the updated Job record: creation and pause/resume answer
 `202 Accepted`, the other lifecycle mutations answer `200 OK`. There is no
 separate operation record for a Job lifecycle mutation — observe the returned
-Job and its `convergence`.
+Job and its `convergence`. Mutation responses pass the record through the same
+credential redaction as the read endpoints, so a caller cannot read back the
+plaintext it just wrote. `GET /jobs` returns the records inside the standard
+pagination envelope (`page`/`page_size`/`total`, see [Pagination](#pagination)).
 
 | Method | Route | Purpose |
 |--------|-------|---------|

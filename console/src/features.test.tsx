@@ -14,6 +14,16 @@ import type { Job, JobCheckpoint } from './api'
 import { Rollouts } from './features/rollouts'
 import { Approvals } from './features/approvals'
 
+// The server wraps list collections in the standard Page envelope and the
+// list hooks page through it (fetchAllPages); mocks emulate that shape.
+const pageOf = <T,>(items: T[]) => ({
+  items,
+  page: 1,
+  page_size: Math.max(items.length, 50),
+  total: items.length,
+})
+const pathOf = (url: string) => url.split('?')[0]
+
 afterEach(() => cleanup())
 
 const page = (items: unknown[]) => ({ items, page: 1, page_size: items.length || 50, total: items.length })
@@ -168,7 +178,7 @@ describe('configuration workflow', () => {
 describe('rollout workflow', () => {
   it('creates a bounded rollout from selected nodes', async () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
-      if (url.endsWith('/rollouts') && init?.method === 'POST')
+      if (pathOf(url).endsWith('/rollouts') && init?.method === 'POST')
         return Promise.resolve({
           ok: true,
           json: async () => ({
@@ -182,7 +192,8 @@ describe('rollout workflow', () => {
             updated_at_ms: 1,
           }),
         })
-      if (url.endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => [] })
+      if (pathOf(url).endsWith('/rollouts'))
+        return Promise.resolve({ ok: true, json: async () => pageOf([]) })
       if (url.endsWith('/rollouts/r-1'))
         return Promise.resolve({
           ok: true,
@@ -250,9 +261,10 @@ describe('rollout workflow', () => {
       updated_at_ms: 1,
     })
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
-      if (url.endsWith('/rollouts') && init?.method === 'POST')
+      if (pathOf(url).endsWith('/rollouts') && init?.method === 'POST')
         return Promise.resolve({ ok: true, json: async () => rollout() })
-      if (url.endsWith('/rollouts')) return Promise.resolve({ ok: true, json: async () => [rollout()] })
+      if (pathOf(url).endsWith('/rollouts'))
+        return Promise.resolve({ ok: true, json: async () => pageOf([rollout()]) })
       if (url.endsWith('/rollouts/r-1/actions')) {
         state = 'paused'
         return Promise.resolve({ ok: true, json: async () => rollout() })
@@ -309,6 +321,19 @@ describe('rollout workflow', () => {
 
 describe('distributed Job workbench', () => {
   it('validates a Job plan before creating it in stopped state', async () => {
+    // The list reload after the create carries the new job, so the test
+    // asserts the reload RESULT, not just that the GET requests happened.
+    let created = false
+    const newJob = {
+      job_id: 'new-job',
+      version: 1,
+      desired_state: 'stopped',
+      observed_state: 'validated',
+      convergence: 'pending',
+      generation: 1,
+      node_ids: [],
+      updated_at_ms: 1,
+    }
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/jobs/validate'))
         return Promise.resolve({
@@ -321,20 +346,17 @@ describe('distributed Job workbench', () => {
             warnings: [],
           }),
         })
-      if (url.endsWith('/jobs') && init?.method === 'POST')
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({
-            job_id: 'new-job',
-            version: 1,
-            desired_state: 'stopped',
-            observed_state: 'validated',
-            convergence: 'pending',
-            generation: 1,
-            node_ids: [],
-            updated_at_ms: 1,
-          }),
-        })
+      if (pathOf(url).endsWith('/jobs') && init?.method === 'POST') {
+        created = true
+        return Promise.resolve({ ok: true, json: async () => newJob })
+      }
+      // The list hooks page through the Page envelope: an unmatched GET
+      // /jobs must still answer with a valid empty page, or fetchAllPages
+      // would reject on `first.items` and the workbench would render its
+      // error state instead of the dialog under test. Other collections
+      // (/components, ...) keep their plain-array shape.
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST')
+        return Promise.resolve({ ok: true, json: async () => pageOf(created ? [newJob] : []) })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -359,19 +381,26 @@ describe('distributed Job workbench', () => {
       expect(
         fetchMock.mock.calls.filter(
           ([url, init]) =>
-            String(url).endsWith('/jobs') && (init as RequestInit | undefined)?.method !== 'POST',
+            pathOf(String(url)).endsWith('/jobs') && (init as RequestInit | undefined)?.method !== 'POST',
         ).length,
       ).toBeGreaterThanOrEqual(2),
     )
+    // The post-create reload succeeds and the list shows the created job.
+    expect(await screen.findByText('new-job')).toBeInTheDocument()
   })
 
   it('requires a fresh validation after Job settings change', async () => {
-    const fetchMock = vi.fn((url: string) => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith('/jobs/validate'))
         return Promise.resolve({
           ok: true,
           json: async () => ({ valid: true, plan: {}, required_capabilities: [], nodes: [], warnings: [] }),
         })
+      // The Jobs workbench lists through the Page envelope: an unmatched
+      // GET /jobs must answer a valid empty page or fetchAllPages rejects.
+      // Other collections (/components, ...) keep their plain-array shape.
+      if (pathOf(url).endsWith('/jobs') && init?.method !== 'POST')
+        return Promise.resolve({ ok: true, json: async () => pageOf([]) })
       return Promise.resolve({ ok: true, json: async () => [] })
     })
     globalThis.fetch = fetchMock as unknown as typeof fetch
@@ -386,21 +415,22 @@ describe('distributed Job workbench', () => {
 
   it('renders only measured Job metrics and distinguishes observed tasks', async () => {
     const fetchMock = vi.fn((url: string) => {
-      if (url.endsWith('/jobs'))
+      if (pathOf(url).endsWith('/jobs'))
         return Promise.resolve({
           ok: true,
-          json: async () => [
-            {
-              job_id: 'scoped-job',
-              version: 1,
-              desired_state: 'running',
-              observed_state: 'running',
-              convergence: 'in_sync',
-              generation: 1,
-              node_ids: ['n1'],
-              updated_at_ms: 1,
-            },
-          ],
+          json: async () =>
+            pageOf([
+              {
+                job_id: 'scoped-job',
+                version: 1,
+                desired_state: 'running',
+                observed_state: 'running',
+                convergence: 'in_sync',
+                generation: 1,
+                node_ids: ['n1'],
+                updated_at_ms: 1,
+              },
+            ]),
         })
       if (url.endsWith('/jobs/scoped-job/detail'))
         return Promise.resolve({
@@ -1065,9 +1095,9 @@ describe('configuration approvals', () => {
       if (url.endsWith('/decide') && init?.method === 'POST')
         return Promise.resolve({ ok: true, json: async () => ({ ...pendingRequest, status: 'approved' }) })
       if (url.includes('/config-approvals?status=pending'))
-        return Promise.resolve({ ok: true, json: async () => [pendingRequest] })
-      if (url.endsWith('/config-approvals'))
-        return Promise.resolve({ ok: true, json: async () => [pendingRequest, rejectedRequest] })
+        return Promise.resolve({ ok: true, json: async () => pageOf([pendingRequest]) })
+      if (pathOf(url).endsWith('/config-approvals'))
+        return Promise.resolve({ ok: true, json: async () => pageOf([pendingRequest, rejectedRequest]) })
       throw new Error(`unexpected fetch: ${url}`)
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -1089,12 +1119,12 @@ describe('configuration approvals', () => {
 
   it('resubmits a rejected request with its pinned snapshot', async () => {
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
-      if (url.endsWith('/config-approvals') && init?.method === 'POST')
+      if (pathOf(url).endsWith('/config-approvals') && init?.method === 'POST')
         return Promise.resolve({ ok: true, json: async () => pendingRequest })
-      if (url.includes('/config-approvals?status=pending'))
-        return Promise.resolve({ ok: true, json: async () => [] })
-      if (url.endsWith('/config-approvals'))
-        return Promise.resolve({ ok: true, json: async () => [rejectedRequest] })
+      if (pathOf(url) === '/config-approvals' && url.includes('status=pending'))
+        return Promise.resolve({ ok: true, json: async () => pageOf([]) })
+      if (pathOf(url).endsWith('/config-approvals'))
+        return Promise.resolve({ ok: true, json: async () => pageOf([rejectedRequest]) })
       throw new Error(`unexpected fetch: ${url}`)
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -1105,7 +1135,7 @@ describe('configuration approvals', () => {
     fireEvent.click(await screen.findByText('Resubmit'))
     await waitFor(() => {
       const submit = fetchMock.mock.calls.find(
-        ([url, init]) => url.endsWith('/config-approvals') && init?.method === 'POST',
+        ([url, init]) => pathOf(url).endsWith('/config-approvals') && init?.method === 'POST',
       )
       expect(submit).toBeTruthy()
       expect(String(submit![1]!.body)).toContain('"config_version":"cfg-1"')

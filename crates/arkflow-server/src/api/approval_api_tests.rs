@@ -234,7 +234,7 @@ async fn approval_flow_over_http_end_to_end() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(list
+    assert!(list["items"]
         .as_array()
         .unwrap()
         .iter()
