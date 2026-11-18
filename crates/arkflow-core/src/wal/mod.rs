@@ -252,6 +252,12 @@ pub struct Wal {
     /// Next sequence number to assign. Append is single-threaded (the input
     /// worker), but an atomic keeps it race-free regardless.
     next_seq: AtomicU64,
+    /// Sequences returned by failed per-entry appends, handed out again
+    /// before the counter advances. A plain `fetch_sub` on `next_seq` would
+    /// re-issue a sequence already assigned to a concurrent reserver; the
+    /// free list keeps every sequence assigned at most once. Failure is a
+    /// rare path, so the list stays bounded by the in-flight append count.
+    returned_seqs: std::sync::Mutex<Vec<u64>>,
     /// Close drain window in milliseconds; kept mutable so tests can shrink
     /// it without waiting the production window.
     ack_drain_window_ms: AtomicU64,
@@ -413,6 +419,7 @@ impl Wal {
             frontier,
             acknowledgements: Mutex::new(BTreeMap::new()),
             next_seq: AtomicU64::new(next_seq),
+            returned_seqs: std::sync::Mutex::new(Vec::new()),
             ack_drain_window_ms: AtomicU64::new(WAL_ACK_DRAIN_WINDOW.as_millis() as u64),
             ack_park_timeout_ms: AtomicU64::new(WAL_ACK_PARK_TIMEOUT.as_millis() as u64),
             policy: sync_policy,
@@ -534,9 +541,24 @@ impl Wal {
                 // stays inline (see `call_store` for why redb must not touch
                 // the blocking pool); the object-store backend is driven on
                 // the blocking pool by `call_store`.
-                let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+                // A returned sequence is re-issued before the counter
+                // advances: a failed append must not leave a permanently
+                // missing sequence — the gap would park every later
+                // acknowledgement in the retry loop.
+                let seq = self
+                    .returned_seqs
+                    .lock()
+                    .expect("returned-sequence free list")
+                    .pop()
+                    .unwrap_or_else(|| self.next_seq.fetch_add(1, Ordering::AcqRel));
                 self.call_store(move |store| store.append_batch(vec![(seq, bytes)]))
-                    .await?;
+                    .await
+                    .inspect_err(|_| {
+                        self.returned_seqs
+                            .lock()
+                            .expect("returned-sequence free list")
+                            .push(seq);
+                    })?;
                 Ok(seq)
             }
             SyncPolicy::GroupCommit | SyncPolicy::Periodic(_) => {
@@ -1350,6 +1372,78 @@ mod tests {
         fn close(&self) -> Result<(), Error> {
             Ok(())
         }
+    }
+
+    /// A store that fails the next append while the flag is armed, then
+    /// succeeds. Records the sequences it accepted so tests can pin the
+    /// sequence-return contract for per-entry appends.
+    struct FailNextAppendStore {
+        fail_next: StdMutex<bool>,
+        appended: StdMutex<Vec<u64>>,
+    }
+
+    impl crate::wal::store::WalStore for FailNextAppendStore {
+        fn kind(&self) -> &'static str {
+            "object_store"
+        }
+        fn append_batch(&self, entries: Vec<(u64, Vec<u8>)>) -> Result<(), Error> {
+            let mut fail_next = self.fail_next.lock().unwrap();
+            if *fail_next {
+                *fail_next = false;
+                return Err(Error::Process("injected append failure".into()));
+            }
+            drop(fail_next);
+            self.appended
+                .lock()
+                .unwrap()
+                .extend(entries.iter().map(|(seq, _)| *seq));
+            Ok(())
+        }
+        fn advance_cursor(&self, _seq: u64) -> Result<(), Error> {
+            Ok(())
+        }
+        fn read_after_cursor(&self) -> Result<Vec<(u64, crate::MessageBatchRef)>, Error> {
+            Ok(Vec::new())
+        }
+        fn cursor(&self) -> u64 {
+            0
+        }
+        fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// A failed per-entry append must return its reserved sequence: a
+    /// permanently missing sequence parks every later acknowledgement in
+    /// the retry loop. The next append re-issues the returned sequence and
+    /// fills the hole (store layer accepts out-of-order, key-indexed
+    /// writes), instead of skipping ahead and stranding the frontier.
+    #[tokio::test]
+    async fn failed_per_entry_append_returns_its_sequence() {
+        let concrete = Arc::new(FailNextAppendStore {
+            fail_next: StdMutex::new(false),
+            appended: StdMutex::new(Vec::new()),
+        });
+        let store: Arc<dyn crate::wal::store::WalStore> = concrete.clone();
+        let config = WalConfig {
+            sync: SyncPolicy::PerEntry,
+            ..WalConfig::default()
+        };
+        let wal = Wal::open_with_store(&config, store, 1).unwrap();
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        // Arm the injected failure: the next append has its sequence
+        // already reserved when the store rejects it...
+        *concrete.fail_next.lock().unwrap() = true;
+        assert!(wal.append(&StdArc::new(sample_batch(None))).await.is_err());
+        // ...and the append after that must fill the hole, not skip past it.
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            2
+        );
+        assert_eq!(*concrete.appended.lock().unwrap(), vec![1, 2]);
     }
 
     /// CodeRabbit/CR finding: a flush future cancelled while its store call

@@ -5,10 +5,13 @@ import {
   errorMessage,
   isPermissionError,
   type AuditListQuery,
+  type ConfigApproval,
   type ControlNode,
   type EventListQuery,
+  type Job,
   type OperationListQuery,
   type Page,
+  type Rollout,
   type StreamStatus,
   JOB_DETAIL_INTERVAL_MS,
   ROLLOUT_DETAIL_INTERVAL_MS,
@@ -136,7 +139,11 @@ export function useStreams(nodeId?: string) {
 }
 
 export function useJobs() {
-  return useQuery({ queryKey: ['live', 'jobs'], queryFn: () => api.jobs(), ...live })
+  return useQuery<Page<Job>>({
+    queryKey: ['live', 'jobs'],
+    queryFn: () => fetchAllPages<Job>((page) => api.jobs(page, FLEET_PAGE_SIZE)),
+    ...live,
+  })
 }
 
 export function useJobDetail(jobId: string | undefined) {
@@ -174,7 +181,11 @@ export function useMetrics(nodeId?: string) {
 }
 
 export function useRollouts() {
-  return useQuery({ queryKey: ['live', 'rollouts'], queryFn: () => api.rollouts(), ...live })
+  return useQuery<Page<Rollout>>({
+    queryKey: ['live', 'rollouts'],
+    queryFn: () => fetchAllPages<Rollout>((page) => api.rollouts(page, FLEET_PAGE_SIZE)),
+    ...live,
+  })
 }
 
 // Audit history is append-only and paged server-side: not 'live' (no SSE
@@ -189,9 +200,10 @@ export function useAudit(query: AuditListQuery = {}) {
 }
 
 export function useConfigApprovals(status?: string) {
-  return useQuery({
+  return useQuery<Page<ConfigApproval>>({
     queryKey: ['live', 'config-approvals', status ?? null],
-    queryFn: () => api.configApprovals(status),
+    queryFn: () =>
+      fetchAllPages<ConfigApproval>((page) => api.configApprovals(status, page, FLEET_PAGE_SIZE)),
     ...live,
   })
 }

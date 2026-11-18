@@ -3701,6 +3701,65 @@ mod tests {
         );
     }
 
+    /// Renewal under concurrency: every renewal is one conditional
+    /// statement whose returned epoch matches the lease row right after it,
+    /// and expired/foreign renewals are Lost without misattributing a
+    /// competitor's epoch bump (the PG regression pin for the split-brain
+    /// window; the SQLite backend serializes through its connection lock
+    /// and satisfies the same assertions).
+    #[tokio::test]
+    async fn hub_lease_concurrent_renewals_keep_epoch_consistent() {
+        let store = ControlPlaneStore::contract("hub_lease_concurrent_renewals_keep_epoch").await;
+        assert_eq!(
+            store
+                .try_acquire_hub_lease("hub-a", None, 60_000, 100)
+                .await
+                .unwrap(),
+            HubLeaseAcquire::Acquired { epoch: 1 }
+        );
+        // Live holder: concurrent renewals all succeed and agree on the
+        // epoch, and the row right after the race still matches what the
+        // renewals returned.
+        let outcomes = futures_util::future::join_all((0..8).map(|_| {
+            let store = &store;
+            async move {
+                store
+                    .renew_hub_lease("hub-a", None, 60_000, 200)
+                    .await
+                    .unwrap()
+            }
+        }))
+        .await;
+        assert!(outcomes
+            .iter()
+            .all(|outcome| *outcome == HubLeaseRenew::Renewed { epoch: 1 }));
+        assert_eq!(store.hub_lease_snapshot().await.unwrap().unwrap().epoch, 1);
+        // Past expiry, a holder renewal racing a takeover must end Lost
+        // regardless of execution order: the previous renewals set
+        // expires_at_ms to 60_200, so at now_ms=70_000 the renewal's
+        // `expires_at_ms > now_ms` guard fails. A backend that lets this
+        // renewal succeed would extend an expired lease and break takeover.
+        let (renew, take) = tokio::join!(
+            async {
+                store
+                    .renew_hub_lease("hub-a", None, 60_000, 70_000)
+                    .await
+                    .unwrap()
+            },
+            async {
+                store
+                    .try_acquire_hub_lease("hub-b", None, 60_000, 70_000)
+                    .await
+                    .unwrap()
+            }
+        );
+        let snapshot = store.hub_lease_snapshot().await.unwrap().unwrap();
+        assert!(matches!(renew, HubLeaseRenew::Lost));
+        assert!(matches!(take, HubLeaseAcquire::Acquired { epoch: 2 }));
+        assert_eq!(snapshot.holder, "hub-b");
+        assert_eq!(snapshot.epoch, 2);
+    }
+
     #[tokio::test]
     async fn audit_and_rollout_records_survive_store_reopen() {
         let path = std::env::temp_dir().join(format!(

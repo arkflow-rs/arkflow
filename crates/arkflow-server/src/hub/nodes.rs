@@ -454,6 +454,10 @@ impl Hub {
                         .map(|record| record.job_tasks.clone())
                         .unwrap_or_default()
                 },
+                // Registration re-hydrates labels from storage further down;
+                // the revision baseline comes from the record this insert
+                // replaced (or 0 for a fresh node).
+                labels_rev: old.as_ref().map(|record| record.labels_rev).unwrap_or(0),
                 metrics: old.map(|record| record.metrics).unwrap_or_default(),
             },
         );
@@ -490,19 +494,47 @@ impl Hub {
                 .map_err(HubError::from)?;
             // A concurrent label replacement may have committed between the
             // pre-insert hydration read and this point. Re-sync the labels
-            // with the read and the write inside one hold of the node-map
-            // write lock: `replace_node_labels` takes the same lock for its
-            // memory update after its storage write, so a replacement either
-            // lands its storage write before our read (we pick it up) or its
-            // memory update after our release (it overwrites us) — the
-            // in-memory map can never end this registration stale.
+            // with a read taken BEFORE the write lock: `replace_node_labels`
+            // writes storage first and takes this same write lock for its
+            // memory update afterwards. The storage round trip stays out of
+            // the lock — a slow label query must not stall every writer
+            // queued on this lock (registration, reports) — so the read is
+            // paired with an in-memory labels-revision snapshot taken before
+            // it: the pre-read is applied under the write lock only when no
+            // replacement has landed since. Value comparison would be
+            // unsound (a replacement back to the same map is invisible);
+            // `labels_rev` advances on every replacement, so any replacement
+            // landing during the read window suppresses the stale pre-read —
+            // its own storage write precedes its memory update, making it at
+            // least as new as anything this registration read. A replacement
+            // whose memory update lands after our release overwrites us
+            // regardless. The map can never end this registration stale.
+            let labels_rev_before = self
+                .nodes
+                .read()
+                .await
+                .get(&request.node_id)
+                .map(|node| node.labels_rev);
+            let fresh_labels = storage
+                .get_node_labels(&request.node_id)
+                .await
+                .ok()
+                .flatten();
             {
                 let mut nodes = self.nodes.write().await;
-                if nodes.contains_key(&request.node_id) {
-                    let fresh = storage.get_node_labels(&request.node_id).await;
-                    if let Some(node) = nodes.get_mut(&request.node_id) {
-                        if let Ok(Some(fresh)) = fresh {
-                            node.resource.labels = fresh;
+                if let Some(node) = nodes.get_mut(&request.node_id) {
+                    // The revision guard binds to THIS registration's record:
+                    // if the storage read was delayed past lease expiry, a
+                    // capacity reclaim could have dropped the node and a
+                    // fresh registration re-created it (labels_rev reset to
+                    // 0) — without the session-token check this
+                    // registration's stale completion would pass the
+                    // revision guard and regress that new record.
+                    if node.session_token == session_token {
+                        if let Some(fresh) = fresh_labels {
+                            if labels_rev_before == Some(node.labels_rev) {
+                                node.resource.labels = fresh;
+                            }
                         }
                     }
                 }
@@ -1029,6 +1061,11 @@ impl Hub {
         let mut nodes = self.nodes.write().await;
         if let Some(node) = nodes.get_mut(node_id) {
             node.resource.labels = labels.clone();
+            // Every replacement advances the revision — including same-value
+            // ones — so registration's re-sync can tell "nothing happened
+            // during my read window" from "a replacement landed that wrote
+            // the same map I snapshotted".
+            node.labels_rev = node.labels_rev.wrapping_add(1);
         }
         Ok(labels)
     }
