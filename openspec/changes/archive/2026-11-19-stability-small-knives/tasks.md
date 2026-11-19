@@ -26,7 +26,7 @@
 
 ## 5. 门禁与收尾
 
-- [ ] 5.1 `cargo fmt` + `cargo clippy --workspace --all-targets` 全绿
-- [ ] 5.2 `cargo test --workspace --all-targets` 全绿（含 docs_inventory_snapshot 如注册有变）
-- [ ] 5.3 `pnpm docs:check` 全绿（EN/zh 链接、README 一致性、YAML 分类）
-- [ ] 5.4 openspec verify + 归档准备（归档 PR 另行）
+- [x] 5.1 `cargo fmt` + `cargo clippy --workspace --all-targets` 全绿
+- [x] 5.2 `cargo test --workspace --all-targets` 全绿（含 docs_inventory_snapshot 如注册有变）（#1372 合并树上 CI 全绿，本地复验 fmt/clippy/docs:check）
+- [x] 5.3 `pnpm docs:check` 全绿（EN/zh 链接、README 一致性、YAML 分类）
+- [x] 5.4 openspec verify + 归档准备（归档 PR 另行）
