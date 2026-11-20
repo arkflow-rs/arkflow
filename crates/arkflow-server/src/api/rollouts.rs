@@ -2,7 +2,7 @@
 use super::{hub_problem, problem, require_operator_action};
 use crate::api_contract::{CreateRolloutRequest, OperatorAction, RolloutActionRequest};
 use crate::hub;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -64,14 +64,18 @@ pub(super) async fn create_rollout(
     }
 }
 
-pub(super) async fn hub_rollouts(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+pub(super) async fn hub_rollouts(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<super::ListPageQuery>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(response) =
         require_operator_action(&hub, &headers, OperatorAction::Read, "rollout", None).await
     {
         return response;
     }
     match hub.rollouts().await {
-        Ok(rollouts) => Json(rollouts).into_response(),
+        Ok(rollouts) => Json(super::page_items(rollouts, &(&query).into())).into_response(),
         Err(error) => hub_problem(error),
     }
 }

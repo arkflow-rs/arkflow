@@ -7,7 +7,7 @@ use crate::api_contract::{
 };
 use crate::hub;
 use crate::storage::JobRecord;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -36,19 +36,29 @@ fn restore_masked_secrets(submitted: &mut serde_json::Value, stored: &serde_json
             }
         }
         (serde_json::Value::Array(submitted), serde_json::Value::Array(stored)) => {
-            // Match array elements by their stable `id`, never by position:
-            // an upgrade may reorder operators, and a positional zip would
-            // hand one operator another operator's persisted secret.
+            // Match array elements by their stable identity, never by
+            // position: an upgrade may reorder operators, and a positional
+            // zip would hand one operator another operator's persisted
+            // secret. Operators carry `id`; sources and sinks are keyed by
+            // `operator_id` and have no `id` of their own — without that
+            // fallback a masked credential in a source/sink config could
+            // never be restored, and the unedited echo-back would be
+            // rejected as a persistent mask.
             for element in submitted.iter_mut() {
-                let Some(identity) = element
-                    .get("id")
+                let identity_key = match (element.get("id"), element.get("operator_id")) {
+                    (Some(serde_json::Value::String(_)), _) => "id",
+                    (_, Some(serde_json::Value::String(_))) => "operator_id",
+                    _ => continue,
+                };
+                let identity = element
+                    .get(identity_key)
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
-                else {
-                    continue;
-                };
+                    .expect("identity key matched above");
                 if let Some(stored_element) = stored.iter().find(|candidate| {
-                    candidate.get("id").and_then(serde_json::Value::as_str)
+                    candidate
+                        .get(identity_key)
+                        .and_then(serde_json::Value::as_str)
                         == Some(identity.as_str())
                 }) {
                     restore_masked_secrets(element, stored_element);
@@ -97,7 +107,20 @@ fn redact_record_fields(record: &mut serde_json::Value) {
     }
 }
 
-pub(super) async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+/// Serialize a record and redact it through the read-path mask. Mutation
+/// responses must not disclose credential material either: a caller cannot
+/// read back the plaintext it just wrote (spec: control-plane-credentials).
+fn redacted_record_response<T: serde::Serialize>(record: &T) -> serde_json::Value {
+    let mut value = serde_json::to_value(record).unwrap_or_default();
+    redact_record_fields(&mut value);
+    value
+}
+
+pub(super) async fn hub_jobs(
+    State(hub): State<hub::Hub>,
+    Query(query): Query<super::ListPageQuery>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(response) =
         require_operator_action(&hub, &headers, OperatorAction::Read, "job", None).await
     {
@@ -113,7 +136,7 @@ pub(super) async fn hub_jobs(State(hub): State<hub::Hub>, headers: HeaderMap) ->
                     value
                 })
                 .collect::<Vec<_>>();
-            Json(items).into_response()
+            Json(super::page_items(items, &(&query).into())).into_response()
         }
         Err(error) => hub_problem(error),
     }
@@ -247,13 +270,13 @@ pub(super) async fn hub_job_action(
     let pausing = current.pause_phase.is_some();
     match action.as_str() {
         "pause" => match hub.pause_job(&job_id, &principal.id).await {
-            Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+            Ok(job) => (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response(),
             Err(error) => {
                 pause_action_rejection(&hub, &job_id, "job.pause", &principal.id, error).await
             }
         },
         "resume" => match hub.resume_job(&job_id, &principal.id).await {
-            Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+            Ok(job) => (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response(),
             Err(error) => {
                 pause_action_rejection(&hub, &job_id, "job.resume", &principal.id, error).await
             }
@@ -261,13 +284,13 @@ pub(super) async fn hub_job_action(
         // A paused Job only understands resume/stop: start and restart both
         // mean "bring the paused Job back", and stop settles it as stopped.
         "start" | "restart" if pausing => match hub.resume_job(&job_id, &principal.id).await {
-            Ok(job) => Json(job).into_response(),
+            Ok(job) => Json(redacted_record_response(&job)).into_response(),
             Err(error) => {
                 pause_action_rejection(&hub, &job_id, "job.resume", &principal.id, error).await
             }
         },
         "stop" if pausing => match hub.stop_paused_job(&job_id, &principal.id).await {
-            Ok(job) => Json(job).into_response(),
+            Ok(job) => Json(redacted_record_response(&job)).into_response(),
             Err(error) => {
                 pause_action_rejection(&hub, &job_id, "job.stop", &principal.id, error).await
             }
@@ -285,7 +308,7 @@ pub(super) async fn hub_job_action(
                 .update_job_desired_state_as(&job_id, state, current.generation, &principal.id)
                 .await
             {
-                Ok(Some(job)) => Json(job).into_response(),
+                Ok(Some(job)) => Json(redacted_record_response(&job)).into_response(),
                 Ok(None) => problem(
                     StatusCode::NOT_FOUND,
                     "job_not_found",
@@ -766,7 +789,7 @@ pub(super) async fn hub_job_upgrade(
                     "upgrade_id": record.upgrade_id,
                     "state": record.phase,
                     "savepoint_id": serde_json::Value::Null,
-                    "job": current,
+                    "job": redacted_record_response(&current),
                 })),
             )
                 .into_response(),
@@ -898,7 +921,7 @@ pub(super) async fn hub_job_upgrade(
                 "upgrade_id": format!("upgrade-{}", hub::now_ms_for_metrics()),
                 "state": "pending_recovery",
                 "savepoint_id": checkpoint.checkpoint_id,
-                "job": job,
+                "job": redacted_record_response(&job),
             })),
         )
             .into_response(),
@@ -1075,7 +1098,7 @@ pub(super) async fn hub_job_upgrade_rollback(
         .update_job_with_expected_generation_as(restored, current.generation, &principal.id)
         .await
     {
-        Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Ok(job) => (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response(),
         Err(hub::HubError::GenerationConflict { expected, current }) => problem(
             StatusCode::PRECONDITION_FAILED,
             "generation_conflict",
@@ -1175,7 +1198,9 @@ pub(super) async fn hub_job_upgrade_action(
         )
         .await
     {
-        Ok(record) if record.job_id == job_id => Json(record).into_response(),
+        Ok(record) if record.job_id == job_id => {
+            Json(redacted_record_response(&record)).into_response()
+        }
         Ok(_) => problem(
             StatusCode::NOT_FOUND,
             "job_upgrade_not_found",
@@ -1265,7 +1290,7 @@ pub(super) async fn hub_job_recovery_artifact(
                 ),
             )
             .await;
-            (StatusCode::ACCEPTED, Json(job)).into_response()
+            (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response()
         }
         Ok(None) => problem(
             StatusCode::NOT_FOUND,
@@ -1342,7 +1367,7 @@ pub(super) async fn hub_create_job(
         paused_by: None,
     };
     match hub.upsert_job_as(job, &principal.id).await {
-        Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Ok(job) => (StatusCode::ACCEPTED, Json(redacted_record_response(&job))).into_response(),
         Err(error) => hub_problem(error),
     }
 }
@@ -1403,7 +1428,7 @@ pub(super) async fn hub_job_desired_state(
     };
     if let Some((action, outcome)) = paused_action {
         return match outcome {
-            Ok(job) => Json(job).into_response(),
+            Ok(job) => Json(redacted_record_response(&job)).into_response(),
             Err(error) => pause_action_rejection(&hub, &job_id, action, &principal.id, error).await,
         };
     }
@@ -1416,7 +1441,7 @@ pub(super) async fn hub_job_desired_state(
         )
         .await;
     match result {
-        Ok(Some(job)) => Json(job).into_response(),
+        Ok(Some(job)) => Json(redacted_record_response(&job)).into_response(),
         Ok(None) => problem(
             StatusCode::NOT_FOUND,
             "job_not_found",
@@ -1490,6 +1515,33 @@ mod tests {
         restore_masked_secrets(&mut submitted, &stored);
         assert_eq!(submitted["operators"][0]["password"], "secret-b");
         assert_eq!(submitted["operators"][1]["password"], "secret-a");
+    }
+
+    /// Sources and sinks carry no `id` of their own — they are keyed by
+    /// `operator_id`. A masked credential inside a source/sink config must
+    /// restore through that identity, or the unedited echo-back would be
+    /// rejected as a persistent mask (`credentials_masked`).
+    #[test]
+    fn source_and_sink_masks_restore_via_operator_id() {
+        let stored = serde_json::json!({
+            "sources": [
+                {"operator_id": "src", "config": {"apiKey": "key-source"}},
+            ],
+            "sinks": [
+                {"operator_id": "sink", "config": {"accessKey": "key-sink"}},
+            ],
+        });
+        let mut submitted = serde_json::json!({
+            "sources": [
+                {"operator_id": "src", "config": {"apiKey": "******"}},
+            ],
+            "sinks": [
+                {"operator_id": "sink", "config": {"accessKey": "******"}},
+            ],
+        });
+        restore_masked_secrets(&mut submitted, &stored);
+        assert_eq!(submitted["sources"][0]["config"]["apiKey"], "key-source");
+        assert_eq!(submitted["sinks"][0]["config"]["accessKey"], "key-sink");
     }
 
     /// A masked value in an array without stable ids cannot be matched: it

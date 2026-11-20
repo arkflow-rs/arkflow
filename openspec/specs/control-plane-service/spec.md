@@ -1,9 +1,7 @@
 ## Purpose
 
 Define the dedicated ArkFlow control-plane service boundary, resource API, runtime operations, and transport security behavior.
-
 ## Requirements
-
 ### Requirement: Dedicated control-plane service boundary
 
 The system SHALL expose control-plane HTTP transport from arkflow-server through a domain facade, and arkflow-core::Engine SHALL remain usable without constructing an HTTP Router. Health, readiness, and liveness endpoints SHALL remain available for compatibility.
@@ -18,23 +16,27 @@ The system SHALL expose control-plane HTTP transport from arkflow-server through
 
 ### Requirement: Resource-oriented system API
 
-The API SHALL expose versioned resources for system identity, runtime nodes, Streams, components, configuration, operations, events, and metrics. Collection responses SHALL provide stable envelopes and pagination metadata where applicable. `GET /api/v1/nodes` SHALL return a paginated node collection in both local and Hub mode, and every node-owned resource SHALL preserve `node_id`. Metrics SHALL be reachable under the same configured versioned prefix as the other control resources.
+The API SHALL expose versioned resources for system identity, runtime nodes, Streams, Jobs, rollouts, configuration approvals, components, configuration, operations, events, and metrics. Collection responses SHALL provide stable envelopes and pagination metadata where applicable. `GET /api/v1/nodes` SHALL return a paginated node collection in both local and Hub mode, and every node-owned resource SHALL preserve `node_id`. The Job, rollout, and configuration-approval collections SHALL accept `page`/`page_size` and return the same envelope shape as the other collections. Metrics SHALL be reachable under the same configured versioned prefix as the other control resources.
 
 #### Scenario: Discover the control-plane resources
+
 - **WHEN** a client requests /api/v1/system and /api/v1/nodes
 - **THEN** it receives node identity, version, capabilities, health state, and runtime summary
 
 #### Scenario: List many Streams
+
 - **WHEN** a client requests /api/v1/streams?page=2&page_size=20
 - **THEN** it receives only the requested page plus total and page metadata
 
-#### Scenario: Read local nodes as a collection
-- **WHEN** a client requests /api/v1/nodes against a local Engine
-- **THEN** it receives one local node resource inside a paginated collection, rather than a singleton response
+#### Scenario: Page through many Jobs
 
-#### Scenario: Read metrics through the versioned API
-- **WHEN** a client requests /api/v1/metrics
-- **THEN** it receives aggregate and per-node metrics using the same authentication, correlation, and routing rules as other control resources
+- **WHEN** a client requests /api/v1/jobs?page=2&page_size=20
+- **THEN** it receives only the requested page plus total and page metadata, and omitting the parameters returns the first page with the default page size
+
+#### Scenario: Page through rollouts and approvals
+
+- **WHEN** a client requests the rollout or configuration-approval collection with pagination parameters
+- **THEN** it receives the same envelope shape with total and page metadata
 
 ### Requirement: Desired and observed lifecycle state
 
@@ -258,3 +260,4 @@ reconcile 循环对 Job 的 plan 编译结果 SHALL 以 (job id, spec 内容哈�
 #### Scenario: 清扫失败可感知
 - **WHEN** 某周期清扫任务的存储调用返回错误
 - **THEN** 该错误以带任务名的 warn/error 日志记录，而非被静默丢弃
+

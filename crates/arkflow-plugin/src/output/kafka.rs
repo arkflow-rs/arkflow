@@ -389,8 +389,16 @@ impl Output for KafkaOutput {
                 error!("Kafka output close observed a delivery failure: {e}");
             }
 
-            // Wait for all messages to be sent
-            producer.flush(Duration::from_secs(30)).map_err(|e| {
+            // Wait for all messages to be sent — on the blocking pool: the
+            // flush can block for up to 30s against a slow broker and must
+            // not park a tokio worker for that long during close.
+            let flush_result =
+                tokio::task::spawn_blocking(move || producer.flush(Duration::from_secs(30)))
+                    .await
+                    .map_err(|e| {
+                        Error::Connection(format!("Kafka close flush task failed: {e}"))
+                    })?;
+            flush_result.map_err(|e| {
                 Error::Connection(format!(
                     "Failed to refresh the message when the Kafka producer is disabled: {}",
                     e
