@@ -33,7 +33,9 @@ use arkflow_core::config::EngineConfig;
 use arkflow_core::executor::run_job;
 use arkflow_core::executor::stream_adapter::StreamJobAdapter;
 use arkflow_core::executor::stream_compiler::compile_stream;
-use arkflow_core::processor::{register_processor_builder, Processor, ProcessorBuilder};
+use arkflow_core::processor::{
+    register_processor_builder, Processor, ProcessorBuilder, ProcessorConfig,
+};
 use arkflow_core::state::RedbStateBackend;
 use arkflow_core::state::StateBackend as _;
 use arkflow_core::{Bytes, Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
@@ -452,6 +454,199 @@ async fn avro_decode_w100(count: usize) -> Result<ScenarioResult, Error> {
     .await
 }
 
+/// Window journaled persistence (#25 anchor): a stream whose tumbling
+/// window compiles through the production path into the journaled window
+/// operator (ephemeral redb state → journal; graph.rs builds journaled
+/// operators whenever a stream carries a state section). The 1h window
+/// never fires during a run, so every delivered batch pays the steady-state
+/// cost: keyed row assignment + journal persist (full buffers clone +
+/// backend scan).
+///
+/// Key cardinality comes from the generate template: generate replicates a
+/// STATIC template per read, so `keys` distinct sensor rows go into the
+/// template and `batch_size` tiles it — every tier reads ~1000 rows per
+/// batch with `keys` distinct live keys. Read counts are scaled so every
+/// tier delivers roughly the same row budget and cross-tier wall growth
+/// isolates the per-batch persist cost (plus the EOF fire, which commits
+/// one journal transaction per key — itself O(keys)).
+///
+/// `max_pending_transactions` scales with the key count: the journaled
+/// operator stages one transaction per open window group, and the 4_096
+/// default would fail the 10k tier on the first batch.
+fn window_journal_workload(count: usize, keys: usize) -> String {
+    let (template_rows, batch_size) = match keys {
+        1 => (1, 1000),
+        100 => (100, 10),
+        _ => (keys, 1),
+    };
+    let max_txns = keys.saturating_mul(2) + 64;
+    let mut template = String::with_capacity(template_rows * 40);
+    for i in 0..template_rows {
+        template.push_str(&format!(
+            "        {{\"value\":10,\"sensor\":\"sensor_{:06}\"}}\n",
+            i
+        ));
+    }
+    format!(
+        r#"
+streams:
+  - id: benchmark-window
+    input:
+      type: "generate"
+      context: |
+{template}      interval: 1ns
+      batch_size: {batch_size}
+      count: {count}
+      codec:
+        type: "json"
+    pipeline:
+      thread_num: 1
+      processors:
+        - type: "__benchmark_count_rows"
+    buffer:
+      type: "tumbling_window"
+      interval: "1h"
+      key_field: "sensor"
+    state:
+      backend: "embedded_kv"
+      durability: "ephemeral"
+      max_pending_transactions: {max_txns}
+    output:
+      type: "drop"
+"#
+    )
+}
+
+async fn window_journal(
+    name: &'static str,
+    description: &'static str,
+    keys: usize,
+    count: usize,
+) -> Result<ScenarioResult, Error> {
+    // `count` is the generate read quota (reads × batch_size); rows delivered
+    // = count × template_rows, so dividing by the template size keeps the
+    // row budget comparable across tiers.
+    let reads = (count / keys).max(1);
+    let config: EngineConfig = serde_yaml::from_str(&window_journal_workload(reads, keys))
+        .map_err(|e| Error::Config(format!("benchmark workload invalid: {e}")))?;
+    let (wall, operations) = run_stream(&config).await?;
+    Ok(ScenarioResult {
+        name,
+        description,
+        unit: "rows",
+        operations,
+        wall,
+    })
+}
+
+/// Window journaled persist, 1 live key (the per-batch baseline: the persist
+/// cost is the fixed full-scan + bookkeeping floor).
+async fn window_journal_n1(count: usize) -> Result<ScenarioResult, Error> {
+    window_journal(
+        "window-journal-n1",
+        "tumbling window → journaled persist, 1 live key (1000-row reads, never fires)",
+        1,
+        count,
+    )
+    .await
+}
+
+/// Window journaled persist, 100 live keys.
+async fn window_journal_n100(count: usize) -> Result<ScenarioResult, Error> {
+    window_journal(
+        "window-journal-n100",
+        "tumbling window → journaled persist, 100 live keys (1000-row reads, never fires)",
+        100,
+        count,
+    )
+    .await
+}
+
+/// Window journaled persist, 1k live keys (per-batch cost grows with the
+/// whole live-key set: full buffers clone + backend scan per batch; the EOF
+/// fire commits one journal transaction per key, which is itself an O(N)
+/// journaled-window cost this tier makes visible).
+async fn window_journal_n1k(count: usize) -> Result<ScenarioResult, Error> {
+    window_journal(
+        "window-journal-n1k",
+        "tumbling window → journaled persist, 1k live keys (1000-row reads, never fires until EOF)",
+        1_000,
+        count,
+    )
+    .await
+}
+
+/// SQL processor steady state with every plan cache hit (#26 anchor): the
+/// end-to-end SQL scenarios dilute the per-batch `ctx.state()` clone behind
+/// generate/decode work, so this scenario times `process` directly. Two
+/// untimed warm-up batches build the analyzed/optimized/physical plan cache
+/// for the schema; the measured loop then replays the same-schema batch, so
+/// the reported wall is the cache-hit path — the per-batch fixed overhead
+/// the state clone adds.
+async fn sql_hot_cache(count: usize) -> Result<ScenarioResult, Error> {
+    let iterations = (count / 100).clamp(20, 2_000);
+    let config = ProcessorConfig {
+        processor_type: "sql".to_string(),
+        name: None,
+        config: Some(serde_json::json!({
+            "query": "SELECT sum(value) as total FROM flow"
+        })),
+    };
+    let resource = Resource {
+        temporary: HashMap::new(),
+        input_names: std::cell::RefCell::new(Vec::new()),
+    };
+    let processor = config.build(&resource)?;
+    let batch = Arc::new(sample_batch()?);
+    // Untimed: plan caches are keyed by schema; two batches leave the
+    // three-level cache fully warm.
+    processor.process(Arc::clone(&batch)).await?;
+    processor.process(Arc::clone(&batch)).await?;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        processor.process(Arc::clone(&batch)).await?;
+    }
+    let wall = started.elapsed();
+    Ok(ScenarioResult {
+        name: "sql-hot-cache",
+        description: "sql processor steady state, plan cache fully warm (1000-row batches)",
+        unit: "batches",
+        operations: iterations as u64,
+        wall,
+    })
+}
+
+/// JSON decode, 200-field wide records (#27 anchor, wide variant): the
+/// narrow `json-decode` scenario under-weights schema inference (per-field
+/// cost is small against the fixed decoder overhead); wide records stress
+/// the per-field keyed lookups and make the per-batch inference cost — the
+/// "no schema cache" gap — visible. Load shape taken from the
+/// `json_decode_timing` oracle test (component/json.rs).
+async fn json_decode_w200(count: usize) -> Result<ScenarioResult, Error> {
+    // Wide rows cost far more per batch than the narrow ones; scale the
+    // iteration count down to keep the tier's time budget comparable.
+    let iterations = (count / 800).clamp(3, 30);
+    let fields: Vec<String> = (0..200).map(|f| format!(r#""f{f:03}":{f}"#)).collect();
+    let row = format!("{{{}}}", fields.join(","));
+    let mut content = Vec::with_capacity(row.len() * 1000);
+    for _ in 0..1000 {
+        content.extend_from_slice(row.as_bytes());
+        content.push(b'\n');
+    }
+    let started = Instant::now();
+    for _ in 0..iterations {
+        let _ = crate::component::json::try_to_arrow(&content, None)?;
+    }
+    let wall = started.elapsed();
+    Ok(ScenarioResult {
+        name: "json-decode-w200",
+        description: "NDJSON → Arrow batch decode (1000-row × 200-field buffers, decode only)",
+        unit: "batches",
+        operations: iterations as u64,
+        wall,
+    })
+}
+
 /// Runs every scenario once (helper for measurement loops).
 async fn run_each(count: usize) -> Result<Vec<ScenarioResult>, Error> {
     Ok(vec![
@@ -464,6 +659,11 @@ async fn run_each(count: usize) -> Result<Vec<ScenarioResult>, Error> {
         avro_decode_w5(count).await?,
         avro_decode_w25(count).await?,
         avro_decode_w100(count).await?,
+        window_journal_n1(count).await?,
+        window_journal_n100(count).await?,
+        window_journal_n1k(count).await?,
+        sql_hot_cache(count).await?,
+        json_decode_w200(count).await?,
     ])
 }
 
@@ -560,7 +760,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn tiny_suite_completes_with_positive_throughput() {
         let results = run_suite(2_000, 0, 1).await.expect("suite completes");
-        assert_eq!(results.len(), 9);
+        assert_eq!(results.len(), 14);
         for result in &results {
             assert!(result.operations > 0, "{} missing workload", result.name);
             assert!(result.per_second() > 0.0, "{} zero throughput", result.name);
@@ -585,6 +785,11 @@ mod tests {
             "avro-decode-w5",
             "avro-decode-w25",
             "avro-decode-w100",
+            "window-journal-n1",
+            "window-journal-n100",
+            "window-journal-n1k",
+            "sql-hot-cache",
+            "json-decode-w200",
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }

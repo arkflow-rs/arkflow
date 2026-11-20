@@ -33,8 +33,12 @@ cargo run -p arkflow --release --example benchmark
 | `groupby-sql` | generate → JSON 解码 → SQL 按键聚合(有状态 GROUP BY)→ drop | rows/s |
 | `filter-project-sql` | generate → JSON 解码 → SQL 过滤 + 投影 → drop | rows/s |
 | `codec-json` | Arrow 批次 → NDJSON → Arrow 批次往返(1000 行/批) | batches/s |
+| `json-decode` | 仅 NDJSON → Arrow 批次解码(1000 行缓冲;schema 推断逐批执行,无缓存) | batches/s |
 | `state-backend` | redb 状态后端持久化 put + get(逐写提交) | ops/s |
 | `avro-decode-w5` / `avro-decode-w25` / `avro-decode-w100` | schema-registry Avro 解码(Confluent wire format,1000 消息/批,5/25/100 字段 schema) | rows/s |
+| `window-journal-n1` / `window-journal-n100` / `window-journal-n1k` | tumbling window 经生产编译路径构建为 journaled 窗口 operator(ephemeral redb 状态),1/100/1k 个不同存活键;窗口在运行期不触发,每批都付按键分配 + journal 持久化成本,EOF fire 时每键提交一个 journal 事务 | rows/s |
+| `sql-hot-cache` | SQL 处理器稳态,analyzed/optimized/physical 三级 plan 缓存全命中(两批不计时预热,然后同 schema 1000 行批) | batches/s |
+| `json-decode-w200` | 仅 NDJSON → Arrow 批次解码,200 字段宽记录(1000 行缓冲) | batches/s |
 
 流式场景走引擎自身的公开入口(`compile_stream` + `run_job`),测的就是生产执行路径,而非专用测试台。Avro 场景同样走真实的 `schema_registry` codec(内存版 schema resolver)——消息在(不计时的)setup 阶段预编码,测量轮命中按 id 的 schema 缓存,即生产稳态路径。
 
