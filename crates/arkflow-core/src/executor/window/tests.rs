@@ -5161,3 +5161,115 @@ async fn aborted_ack_keeps_stale_entry_discoverable_for_the_retry() {
         "the retried acknowledgement deletes the stale entry"
     );
 }
+
+/// An explicit abort() discards the staged transaction AND releases the
+/// operation lock — the operator survives. The armed gate drives a new scan
+/// on the next persist, and when the watermark passes every replacement's
+/// lateness deadline the expired buffers are removed too, so the scan's
+/// immediate cleanup deletes the stale backend entry with no fired
+/// transaction to own it (nothing can still recreate the key).
+#[tokio::test]
+async fn explicit_abort_then_expiry_cleans_stale_entry_via_armed_scan() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        WindowOperatorConfig {
+            kind: WindowKind::Tumbling { size_ms: 1_000 },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec!["value".into()],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 5_000,
+            legacy_payload: false,
+            max_buffered_keys: 2,
+        },
+        backend.clone(),
+        journal,
+        "window-abort-expiry-test",
+    );
+
+    // W(0,"a") fires and commits; the 2-key cap then evicts it while
+    // W(1000,"a") stays live (the deferred case, gate armed).
+    op.process_with_ack(
+        batch(vec![(100, "a", 1), (1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(1100).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("W(0,a) should fire at watermark 1100");
+    };
+    fired_ack.ack().await.unwrap();
+    let state_key = {
+        let mut key = 0i64.to_be_bytes().to_vec();
+        key.extend_from_slice(b"a");
+        key
+    };
+    assert!(
+        backend
+            .inner
+            .get("window-abort-expiry-test", &state_key)
+            .unwrap()
+            .is_some()
+    );
+    op.process_with_ack(
+        batch(vec![(2100, "b", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+
+    // The replacement fires with a failing source ack; the test then ABORTS
+    // explicitly: the staged delete is discarded and the operation lock is
+    // RELEASED (the operator survives, gate still armed from the episode).
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(FailOnceAck {
+            fail: AtomicBool::new(true),
+        }),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(2500).await.unwrap();
+    let ProcessResult::SingleWithAck(_, output_ack) = fired else {
+        panic!("W(1000,a) should fire at watermark 2500");
+    };
+    assert!(output_ack.ack().await.is_err());
+    output_ack.abort().await.unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-abort-expiry-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "the abort discards the staged delete; the stale entry survives"
+    );
+
+    // A new persist runs (gate armed) and re-detects the stale entry. The
+    // replacement windows fire (their outputs stay unacknowledged), and one
+    // watermark later they expire past the lateness deadline: both buffers
+    // are removed, nothing can recreate key "a", and the scan's immediate
+    // cleanup deletes the stale backend entry with no fired transaction.
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    op.on_watermark(18000).await.unwrap();
+    op.on_watermark(23000).await
+        .unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-abort-expiry-test", &state_key)
+            .unwrap()
+            .is_none(),
+        "abort → armed rescan → expiry cleanup deletes the stale entry"
+    );
+}
