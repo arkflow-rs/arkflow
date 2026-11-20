@@ -336,7 +336,7 @@ fn append_vector_column(
     // mid-batch). Building the FixedSizeList from the first vector's dim
     // used to misalign the flat buffer and panic — fail with both dims
     // named instead.
-    if let Some((_, other)) = vectors.iter().enumerate().find(|(_, v)| v.len() != dim) {
+    if let Some(other) = vectors.iter().find(|v| v.len() != dim) {
         return Err(Error::Process(format!(
             "embedding processor: inconsistent vector dimensions ({dim} and {})",
             other.len()

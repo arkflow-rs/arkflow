@@ -421,14 +421,12 @@ impl ColumnarWindowOperator {
             self.rollback_window_txn(&victim);
             evicted_keys.insert(victim);
         }
-        if !evicted_keys.is_empty() {
-            // The evicted buffers may have committed backend entries; the next
-            // journaled persist must run the stale-key scan to clean them.
-            self.stale_scan_pending.store(true, AtomicOrdering::SeqCst);
-        }
         if evicted_keys.is_empty() {
             return evicted_keys;
         }
+        // The evicted buffers may have committed backend entries; the next
+        // journaled persist must run the stale-key scan to clean them.
+        self.stale_scan_pending.store(true, AtomicOrdering::SeqCst);
         let mut log = self.eviction_log.lock().unwrap();
         let suppressed = log.1 + evicted_keys.len() as u64;
         let now = std::time::Instant::now();
@@ -2319,8 +2317,8 @@ impl ColumnarWindowOperator {
                 .into_iter()
                 .filter_map(|(key, raw)| (!live_keys.contains(&key)).then_some(raw))
                 .collect::<Vec<_>>();
-            self.stale_scan_pending.store(false, AtomicOrdering::SeqCst);
             if stale_keys.is_empty() {
+                self.stale_scan_pending.store(false, AtomicOrdering::SeqCst);
                 return Ok(());
             }
             // A stale key created by a session re-key must be deleted by the
@@ -2379,11 +2377,22 @@ impl ColumnarWindowOperator {
                 // replacement output fires. Keeping an old value is safe and
                 // replayable; deleting it here would make a later source-ack
                 // failure irreversible.
+                //
+                // Keep stale_scan_pending SET: the deferred contract is
+                // resolution by the replacement's firing, and a firing that
+                // removes no buffer would otherwise skip the scan entirely
+                // (event-time windows are retained for lateness) and strand
+                // the entry until the replacement is itself removed — or a
+                // restart reloads it as a live buffer. Rescan until every
+                // deferred key has been attached to its replacement's fired
+                // transaction.
                 tracing::debug!(
                     namespace = %self.namespace,
                     count = deferred,
                     "deferring stale window-state cleanup until the replacement acknowledgement"
                 );
+            } else {
+                self.stale_scan_pending.store(false, AtomicOrdering::SeqCst);
             }
             return Ok(());
         }

@@ -238,8 +238,9 @@ async fn codec_json(count: usize) -> Result<ScenarioResult, Error> {
 }
 
 /// JSON decode only (NDJSON buffer → Arrow batch via `try_to_arrow`). Each
-/// iteration decodes a fixed 1000-row buffer, isolating the decode/inference
-/// cost that `codec-json` reports bundled with the encode step.
+/// iteration decodes the SAME 1000-row buffer, so from the second iteration
+/// the exact-content schema cache serves it — this reports the cache-hit
+/// decode path (the fixed-template steady state).
 async fn json_decode(count: usize) -> Result<ScenarioResult, Error> {
     let iterations = (count / 100).clamp(20, 2_000);
     let row = r#"{"value":10,"sensor":"temp_1"}"#;
@@ -459,26 +460,28 @@ async fn avro_decode_w100(count: usize) -> Result<ScenarioResult, Error> {
 /// operator (ephemeral redb state → journal; graph.rs builds journaled
 /// operators whenever a stream carries a state section). The 1h window
 /// never fires during a run, so every delivered batch pays the steady-state
-/// cost: keyed row assignment + journal persist (full buffers clone +
-/// backend scan).
+/// cost: keyed row assignment + journal staging for every touched key.
+/// (The whole-map clone and per-batch stale scan this anchor originally
+/// exercised were removed by the per-batch-cost fix — persist no longer
+/// grows with the open-window count, so the remaining cross-tier growth is
+/// the necessary per-dirty-key staging plus the EOF fire's one-commit-per-key.)
 ///
 /// Key cardinality comes from the generate template: generate replicates a
 /// STATIC template per read, so `keys` distinct sensor rows go into the
 /// template and `batch_size` tiles it — every tier reads ~1000 rows per
 /// batch with `keys` distinct live keys. Read counts are scaled so every
 /// tier delivers roughly the same row budget and cross-tier wall growth
-/// isolates the per-batch persist cost (plus the EOF fire, which commits
+/// tracks the per-key cost (plus the EOF fire, which commits
 /// one journal transaction per key — itself O(keys)).
 ///
 /// `max_pending_transactions` scales with the key count: the journaled
 /// operator stages one transaction per open window group, and the 4_096
-/// default would fail the 10k tier on the first batch.
+/// default would fail the 1k tier on the first batch.
 fn window_journal_workload(count: usize, keys: usize) -> String {
-    let (template_rows, batch_size) = match keys {
-        1 => (1, 1000),
-        100 => (100, 10),
-        _ => (keys, 1),
-    };
+    // Uniform ~1000-row reads at every tier: the template carries the keys
+    // (generate replicates a static template) and batch_size tiles it.
+    let template_rows = keys;
+    let batch_size = (1000 / keys).max(1);
     let max_txns = keys.saturating_mul(2) + 64;
     let mut template = String::with_capacity(template_rows * 40);
     for i in 0..template_rows {
@@ -562,10 +565,10 @@ async fn window_journal_n100(count: usize) -> Result<ScenarioResult, Error> {
     .await
 }
 
-/// Window journaled persist, 1k live keys (per-batch cost grows with the
-/// whole live-key set: full buffers clone + backend scan per batch; the EOF
-/// fire commits one journal transaction per key, which is itself an O(N)
-/// journaled-window cost this tier makes visible).
+/// Window journaled persist, 1k live keys (the EOF fire commits one journal
+/// transaction per key — an O(N) journaled-window cost this tier makes
+/// visible; per-batch persist itself no longer grows with the key set after
+/// the per-batch-cost fix).
 async fn window_journal_n1k(count: usize) -> Result<ScenarioResult, Error> {
     window_journal(
         "window-journal-n1k",
@@ -616,12 +619,13 @@ async fn sql_hot_cache(count: usize) -> Result<ScenarioResult, Error> {
     })
 }
 
-/// JSON decode, 200-field wide records (#27 anchor, wide variant): the
-/// narrow `json-decode` scenario under-weights schema inference (per-field
-/// cost is small against the fixed decoder overhead); wide records stress
-/// the per-field keyed lookups and make the per-batch inference cost — the
-/// "no schema cache" gap — visible. Load shape taken from the
-/// `json_decode_timing` oracle test (component/json.rs).
+/// JSON decode, 200-field wide records: the narrow `json-decode` scenario
+/// under-weights per-field decode work (small against the fixed decoder
+/// overhead); wide records stress the per-field keyed lookups. Each
+/// iteration decodes the SAME buffer, so from the second iteration the
+/// exact-content schema cache serves it — this reports the wide-record
+/// cache-hit decode path. Load shape taken from the `json_decode_timing`
+/// oracle test (component/json.rs).
 async fn json_decode_w200(count: usize) -> Result<ScenarioResult, Error> {
     // Wide rows cost far more per batch than the narrow ones; scale the
     // iteration count down to keep the tier's time budget comparable.

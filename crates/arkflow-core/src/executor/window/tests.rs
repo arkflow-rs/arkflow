@@ -4920,3 +4920,103 @@ async fn expired_window_removal_schedules_backend_cleanup() {
         "the expired window's backend entry must be cleaned up (no restart resurrection)"
     );
 }
+
+/// A stale entry with a LIVE replacement window is deferred until the
+/// replacement fires — and that firing removes no buffer, so the stale-scan
+/// gate must stay armed across it: the replacement's own persist must rescan
+/// and attach the delete to its fired transaction (a restart must not reload
+/// the old aggregate as a live buffer).
+#[tokio::test]
+async fn deferred_stale_cleanup_resolves_at_the_replacements_firing() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        WindowOperatorConfig {
+            kind: WindowKind::Tumbling { size_ms: 1_000 },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec!["value".into()],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 5_000,
+            legacy_payload: false,
+            max_buffered_keys: 2,
+        },
+        backend.clone(),
+        journal,
+        "window-deferred-cleanup-test",
+    );
+
+    // Two windows of key "a"; the watermark fires W(0,"a") only (retained for
+    // the 5s lateness). Acking the fired output commits its entry.
+    op.process_with_ack(
+        batch(vec![(100, "a", 1), (1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(1100).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("W(0,a) should fire at watermark 1100");
+    };
+    fired_ack.ack().await.unwrap();
+    let state_key = {
+        let mut key = 0i64.to_be_bytes().to_vec();
+        key.extend_from_slice(b"a");
+        key
+    };
+    assert!(
+        backend
+            .inner
+            .get("window-deferred-cleanup-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "W(0,a) aggregate committed"
+    );
+
+    // A third buffer overflows the 2-key cap: W(0,"a") (acks settled) is
+    // evicted while W(1000,"a") stays live. The eviction schedules a scan;
+    // the scan finds the committed entry with a live replacement and no
+    // fired transaction for "a" this round — DEFERRED, and the gate must
+    // STAY ARMED.
+    op.process_with_ack(
+        batch(vec![(2100, "b", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-deferred-cleanup-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "deferred entry stays until the replacement fires"
+    );
+
+    // The replacement W(1000,"a") fires — a firing that removes NO buffer.
+    // Its persist must rescan (gate still armed) and attach W(0,a)'s delete
+    // to its fired transaction, which the ack below commits.
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(2500).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("W(1000,a) should fire at watermark 2500");
+    };
+    fired_ack.ack().await.unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-deferred-cleanup-test", &state_key)
+            .unwrap()
+            .is_none(),
+        "the deferred entry is deleted by the replacement's fired acknowledgement (no restart resurrection)"
+    );
+}

@@ -241,11 +241,12 @@ impl HttpOutput {
 
             retry_count += 1;
             if retry_count <= self.config.retry_count {
-                // Index backoff retry
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    100 * 2u64.pow(retry_count - 1),
-                ))
-                .await;
+                // Index backoff retry. Saturating: `retry_count` is a config
+                // value with no upper bound, and 100 * 2^(n-1) overflows u64
+                // from n=58 on — a plain multiply panicked (debug) or wrapped
+                // to a garbage delay (release) on what is just a retry.
+                let backoff_ms = 100u64.saturating_mul(2u64.saturating_pow(retry_count - 1));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
         }
 
