@@ -5253,12 +5253,20 @@ async fn explicit_abort_then_expiry_cleans_stale_entry_via_armed_scan() {
     // watermark later they expire past the lateness deadline: both buffers
     // are removed, nothing can recreate key "a", and the scan's immediate
     // cleanup deletes the stale backend entry with no fired transaction.
+    // Assert the rescan happens HERE — expiry re-arms the gate anyway, so
+    // the final deletion alone would not prove the gate survived the abort.
+    let post_abort_baseline = backend.scan_count();
     op.process_with_ack(
         batch(vec![(1100, "a", 1)], None),
         Arc::new(crate::input::NoopAck),
     )
     .await
     .unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        post_abort_baseline + 1,
+        "the armed gate rescans after the abort, before expiry re-arms it"
+    );
     op.on_watermark(18000).await.unwrap();
     op.on_watermark(23000).await.unwrap();
     assert!(
