@@ -4772,7 +4772,8 @@ impl crate::state::StateBackend for CountingBackend {
         ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<(), Error> {
-        self.inner.put_with_ttl(namespace, key, value, ttl_ms, now_ms)
+        self.inner
+            .put_with_ttl(namespace, key, value, ttl_ms, now_ms)
     }
     fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
         self.inner.update_i64(namespace, key, delta)

@@ -407,7 +407,10 @@ mod schema_cache_tests {
         let first = try_to_arrow(&base, None).expect("base decode");
         let second = try_to_arrow(&extended, None).expect("extended decode");
         assert!(first.column_by_name("extra").is_none());
-        assert!(second.column_by_name("extra").is_some(), "new field inferred");
+        assert!(
+            second.column_by_name("extra").is_some(),
+            "new field inferred"
+        );
 
         // Re-decoding the base must still yield the base schema (no bleed).
         let again = try_to_arrow(&base, None).expect("base decode again");

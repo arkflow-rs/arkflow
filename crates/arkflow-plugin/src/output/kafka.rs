@@ -257,7 +257,8 @@ async fn run_flush_loop(output_p: Arc<InnerKafkaOutput>, token: CancellationToke
 /// submission order. `write` propagates the error so the kernel withholds
 /// the ack and replays the batch (at-least-once); the background flush and
 /// close paths log it as best-effort observation of stragglers.
-async fn observe_delivery_futures(pending: Vec<DeliveryFuture>) -> Result<(), Error> {    let results = futures::future::join_all(pending).await;
+async fn observe_delivery_futures(pending: Vec<DeliveryFuture>) -> Result<(), Error> {
+    let results = futures::future::join_all(pending).await;
     let mut first_error: Option<Error> = None;
     for (index, result) in results.into_iter().enumerate() {
         match result {

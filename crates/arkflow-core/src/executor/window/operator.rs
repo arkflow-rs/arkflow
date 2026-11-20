@@ -424,8 +424,7 @@ impl ColumnarWindowOperator {
         if !evicted_keys.is_empty() {
             // The evicted buffers may have committed backend entries; the next
             // journaled persist must run the stale-key scan to clean them.
-            self.stale_scan_pending
-                .store(true, AtomicOrdering::SeqCst);
+            self.stale_scan_pending.store(true, AtomicOrdering::SeqCst);
         }
         if evicted_keys.is_empty() {
             return evicted_keys;

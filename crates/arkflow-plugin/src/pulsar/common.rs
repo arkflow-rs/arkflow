@@ -745,7 +745,7 @@ mod retry_backoff_tests {
 
 #[cfg(test)]
 mod tls_config_tests {
-    use super::{PulsarTlsConfig, reject_removed_ca_file};
+    use super::{reject_removed_ca_file, PulsarTlsConfig};
 
     #[test]
     fn defaults_apply_when_fields_omitted() {

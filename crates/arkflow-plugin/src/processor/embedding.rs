@@ -569,9 +569,8 @@ mod tests {
     #[test]
     fn append_vector_column_keeps_consistent_vectors_aligned() {
         let batch = text_batch(vec![Some("a"), Some("b")]);
-        let out =
-            append_vector_column(&batch, "embedding", &[vec![1.0, 2.0], vec![3.0, 4.0]])
-                .expect("consistent dimensions succeed");
+        let out = append_vector_column(&batch, "embedding", &[vec![1.0, 2.0], vec![3.0, 4.0]])
+            .expect("consistent dimensions succeed");
         let (dim, vectors) = vector_column(&out, "embedding");
         assert_eq!(dim, 2);
         assert_eq!(vectors, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
