@@ -192,6 +192,7 @@ impl ColumnarWindowOperator {
     /// whole-map snapshot restore would: every slot the operation mutated
     /// has an image, and untouched slots were never modified.
     pub(crate) fn restore_runtime(&self, snapshot: &TouchedSnapshot) {
+        let mut removed_buffers = false;
         {
             let mut buffers = self.buffers.lock().unwrap();
             for (key, image) in &snapshot.slots {
@@ -201,9 +202,17 @@ impl ColumnarWindowOperator {
                     }
                     None => {
                         buffers.remove(key);
+                        removed_buffers = true;
                     }
                 }
             }
+        }
+        if removed_buffers {
+            // A rollback removal is a buffer removal like an eviction or an
+            // expiry: if backend compensation for this operation ever fails,
+            // a committed entry can outlive its buffer, and the next persist
+            // must rescan instead of trusting the gate.
+            self.stale_scan_pending.store(true, AtomicOrdering::SeqCst);
         }
         *self.watermark_ms.lock().unwrap() = snapshot.watermark_ms;
         *self.last_processing_trigger_ms.lock().unwrap() = snapshot.last_processing_trigger_ms;

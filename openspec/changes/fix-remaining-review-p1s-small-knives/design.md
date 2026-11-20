@@ -28,7 +28,7 @@
 **D4 #19：键改长度前缀编码。** 每个字段渲染为 `{name_len}:{name}:{type_len}:{type_render}`，全 schema 拼接后接 `\u{0}{expr_str}`。任意字节级字段名（含 `,`、`:`、`:Int64,` 形态）编码唯一。备选：转义分隔符（转义逻辑本身易错）、对键取哈希（丢失调试可读性，出问题无法人工比对）。钉扎测试：单字段名 `x:Int64,y`(Utf8) 与两字段 `x`(Int64)+`y`(Utf8) 必须产生不同键且各自按正确 schema 求值。
 *风险：键格式变化使旧缓存失效——缓存为进程内存态，冷启动无影响。*
 
-**D5 #20：移除字段 + builder 显式拒绝。** `ca_file` 从 config struct、schema 元数据、文档（EN+zh-Hans）中移除；builder 在 raw `serde_json::Value` 上检测该键存在即报错（serde 对未知键默认静默丢弃，仅删字段不足以暴露问题），错误信息指名"驱动无自定义 CA API，请移除该字段"。备选：保留字段仅 build 期报错（schema 仍宣告一个"只会报错"的字段，违反 component-config-honesty 的"仅声明真实接受的面"）；接入独立 ca_file 实现（驱动无该 API，不可行；certificate_chain_file 即信任锚通道）。
+**D5 #20：移除字段 + builder 显式拒绝。** `ca_file` 从 config struct、schema 元数据、文档（EN+zh-Hans）中移除；builder 在 raw `serde_json::Value` 上检测该键存在即报错（serde 对未知键默认静默丢弃，仅删字段不足以暴露问题），错误信息指名"驱动无独立 `ca_file` 设置，私有 CA 信任锚经 `tls.certificate_chain_file` 提供，请改用或移除该字段"。备选：保留字段仅 build 期报错（schema 仍宣告一个"只会报错"的字段，违反 component-config-honesty 的"仅声明真实接受的面"）；接入独立 ca_file 实现（驱动无该独立 API，不可行；certificate_chain_file 即驱动侧的信任锚通道）。
 **BREAKING**：字段从未生效，依赖者本就未获保护——从"静默无效"变"显式报错"是修复而非回归。同步更新 schema 快照（inventory 测试）。
 
 **D6 #30：workflows 路径过滤加 `examples/**`。** 与既有 docs 路径并列加入 `paths`。AGENTS.md 声明的"未注册示例挂 CI"由此在 CI 层闭合。本地验证：yaml 语法 + `git diff` 审阅；CI 行为随首次示例变更 PR 验证。

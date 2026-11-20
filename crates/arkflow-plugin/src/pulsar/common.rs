@@ -772,7 +772,9 @@ mod tls_config_tests {
     }
 
     /// Regression (2026-11 review P1 #20): `tls.ca_file` was parsed, tested,
-    /// and documented but never consumed — the driver has no custom-CA API,
+    /// and documented but never consumed — the driver has no separate
+    /// `ca_file` setting (the private-CA trust anchor is
+    /// `tls.certificate_chain_file`),
     /// so users believed they had a private trust anchor while connections
     /// used the system store. The key must fail the build loudly.
     #[test]
