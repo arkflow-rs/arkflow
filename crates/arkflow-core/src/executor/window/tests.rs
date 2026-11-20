@@ -5051,10 +5051,12 @@ async fn deferred_stale_cleanup_resolves_at_the_replacements_firing() {
 }
 
 /// An aborted acknowledgement compensates the journal apply, discarding the
-/// staged stale-key delete — but the entry stays discoverable: the gate was
-/// left armed by the scan that staged it, and retrying the acknowledgement
-/// re-applies the transaction so the delete lands. The stale key survives
-/// the abort in the backend and is deleted by the successful retry; it is
+/// staged stale-key delete — but the entry stays discoverable: the aborted
+/// ack retains the operation lock for retry-in-place (the journal overlays
+/// including the staged delete stay intact), and retrying the SAME
+/// acknowledgement re-applies them so the delete lands. A restart reaches a
+/// fresh scan through the new operator's restore safety net. The stale key
+/// survives the abort in the backend and is deleted by the retry; it is
 /// never stranded with a cleared gate.
 #[tokio::test]
 async fn aborted_ack_keeps_stale_entry_discoverable_for_the_retry() {
@@ -5141,9 +5143,14 @@ async fn aborted_ack_keeps_stale_entry_discoverable_for_the_retry() {
         "the abort discards the staged delete; the stale entry survives"
     );
 
-    // Retrying the same acknowledgement re-applies the transaction (journal
-    // overlays stay staged across the abort) and the successful source
-    // commit makes the delete durable.
+    // The retry is the SAME composite acknowledgement: an aborted ack
+    // retains the operation lock by design (retry-in-place), so an in-process
+    // replayed batch would deadlock on the retained guard instead of running.
+    // Production reaches a fresh scan through attempt restart (the operator —
+    // and the retained guard with it — is dropped; the new operator's restore
+    // safety net arms the scan). Retrying re-applies the journal overlays
+    // (the staged delete among them) and the successful source commit makes
+    // the delete durable.
     output_ack.ack().await.unwrap();
     assert!(
         backend
@@ -5151,6 +5158,6 @@ async fn aborted_ack_keeps_stale_entry_discoverable_for_the_retry() {
             .get("window-abort-retry-test", &state_key)
             .unwrap()
             .is_none(),
-        "the successful retry deletes the stale entry"
+        "the retried acknowledgement deletes the stale entry"
     );
 }
