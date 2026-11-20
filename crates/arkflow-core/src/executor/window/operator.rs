@@ -185,12 +185,16 @@ impl ColumnarWindowOperator {
     }
 
     /// Roll the in-memory runtime back after a failed accumulation or
-    /// firing. Journal transactions stay staged — their overlays are
-    /// idempotent across a retry — but the working buffers and watermark
-    /// must not keep partially applied rows, or a replay would aggregate
-    /// them twice. Applying the touched-slot images restores exactly what a
-    /// whole-map snapshot restore would: every slot the operation mutated
-    /// has an image, and untouched slots were never modified.
+    /// firing. Journal transactions for buffers that SURVIVE the rollback
+    /// stay staged — their overlays are idempotent across a retry — but the
+    /// working buffers and watermark must not keep partially applied rows,
+    /// or a replay would aggregate them twice. Transactions for buffers the
+    /// rollback REMOVES (created by the failed operation) are discarded:
+    /// nothing in memory owns them any more, and committing their staged
+    /// puts would resurrect rows the runtime already rolled back. Applying
+    /// the touched-slot images restores exactly what a whole-map snapshot
+    /// restore would: every slot the operation mutated has an image, and
+    /// untouched slots were never modified.
     pub(crate) fn restore_runtime(&self, snapshot: &TouchedSnapshot) {
         let mut removed_buffers = false;
         {
@@ -202,6 +206,14 @@ impl ColumnarWindowOperator {
                     }
                     None => {
                         buffers.remove(key);
+                        // The buffer was created by the failed operation and
+                        // is now gone: its staged transactions must never be
+                        // committed (a later commit_all_window_txns would
+                        // write the rolled-back partial rows into the
+                        // backend, and a restart would emit them). Discard
+                        // them — a replay re-stages idempotently through a
+                        // fresh transaction.
+                        self.rollback_window_txn(key);
                         removed_buffers = true;
                     }
                 }
