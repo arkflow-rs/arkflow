@@ -2398,23 +2398,19 @@ impl ColumnarWindowOperator {
                 // replacement output fires. Keeping an old value is safe and
                 // replayable; deleting it here would make a later source-ack
                 // failure irreversible.
-                //
-                // Keep stale_scan_pending SET: the deferred contract is
-                // resolution by the replacement's firing, and a firing that
-                // removes no buffer would otherwise skip the scan entirely
-                // (event-time windows are retained for lateness) and strand
-                // the entry until the replacement is itself removed — or a
-                // restart reloads it as a live buffer. Rescan until every
-                // deferred key has been attached to its replacement's fired
-                // transaction.
                 tracing::debug!(
                     namespace = %self.namespace,
                     count = deferred,
                     "deferring stale window-state cleanup until the replacement acknowledgement"
                 );
-            } else {
-                self.stale_scan_pending.store(false, AtomicOrdering::SeqCst);
             }
+            // stale_scan_pending STAYS SET in every non-empty-scan outcome:
+            // deletes staged into a fired transaction are not durable until
+            // that transaction's acknowledgement commits — an aborted ack
+            // discards them (journal rollback), and the replayed persist must
+            // rescan and re-stage rather than trust a cleared gate. Each
+            // stale episode therefore rescans until a scan comes back clean;
+            // only the empty branch above ends it.
             return Ok(());
         }
         // Legacy direct-persist mode writes every buffer every time, so the

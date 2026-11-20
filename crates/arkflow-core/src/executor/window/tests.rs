@@ -5019,4 +5019,33 @@ async fn deferred_stale_cleanup_resolves_at_the_replacements_firing() {
             .is_none(),
         "the deferred entry is deleted by the replacement's fired acknowledgement (no restart resurrection)"
     );
+
+    // The episode settles: the gate stayed armed after the staged delete (an
+    // aborted acknowledgement would have discarded it), so the next persist
+    // rescans, finds the backend clean, and only THEN clears the gate. Rows
+    // for the already-tracked key keep the buffer count at the cap, so no
+    // eviction cascades into the settle assertions.
+    let baseline = backend.scan_count();
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        baseline + 1,
+        "the armed gate rescans after the cleanup committed"
+    );
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        baseline + 1,
+        "a clean scan clears the gate; steady state is scan-free again"
+    );
 }
