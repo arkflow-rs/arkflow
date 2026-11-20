@@ -5049,3 +5049,108 @@ async fn deferred_stale_cleanup_resolves_at_the_replacements_firing() {
         "a clean scan clears the gate; steady state is scan-free again"
     );
 }
+
+/// An aborted acknowledgement compensates the journal apply, discarding the
+/// staged stale-key delete — but the entry stays discoverable: the gate was
+/// left armed by the scan that staged it, and retrying the acknowledgement
+/// re-applies the transaction so the delete lands. The stale key survives
+/// the abort in the backend and is deleted by the successful retry; it is
+/// never stranded with a cleared gate.
+#[tokio::test]
+async fn aborted_ack_keeps_stale_entry_discoverable_for_the_retry() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        WindowOperatorConfig {
+            kind: WindowKind::Tumbling { size_ms: 1_000 },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec!["value".into()],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 5_000,
+            legacy_payload: false,
+            max_buffered_keys: 2,
+        },
+        backend.clone(),
+        journal,
+        "window-abort-retry-test",
+    );
+
+    // W(0,"a") fires and its acknowledgement commits the aggregate.
+    op.process_with_ack(
+        batch(vec![(100, "a", 1), (1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(1100).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("W(0,a) should fire at watermark 1100");
+    };
+    fired_ack.ack().await.unwrap();
+    let state_key = {
+        let mut key = 0i64.to_be_bytes().to_vec();
+        key.extend_from_slice(b"a");
+        key
+    };
+    assert!(backend
+        .inner
+        .get("window-abort-retry-test", &state_key)
+        .unwrap()
+        .is_some());
+
+    // The 2-key cap evicts the ack-settled W(0,"a") while W(1000,"a") stays
+    // live: the scan finds the committed entry, has a live replacement, and
+    // defers — the gate stays armed.
+    op.process_with_ack(
+        batch(vec![(2100, "b", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+
+    // The replacement fires with a FAILING source ack: the delete for
+    // W(0,"a") is staged into the fired transaction, the journal applies it,
+    // and the abort compensates — the backend entry survives.
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(FailOnceAck {
+            fail: AtomicBool::new(true),
+        }),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(2500).await.unwrap();
+    let ProcessResult::SingleWithAck(_, output_ack) = fired else {
+        panic!("W(1000,a) should fire at watermark 2500");
+    };
+    assert!(
+        output_ack.ack().await.is_err(),
+        "the failing source ack aborts the composite acknowledgement"
+    );
+    assert!(
+        backend
+            .inner
+            .get("window-abort-retry-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "the abort discards the staged delete; the stale entry survives"
+    );
+
+    // Retrying the same acknowledgement re-applies the transaction (journal
+    // overlays stay staged across the abort) and the successful source
+    // commit makes the delete durable.
+    output_ack.ack().await.unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-abort-retry-test", &state_key)
+            .unwrap()
+            .is_none(),
+        "the successful retry deletes the stale entry"
+    );
+}
