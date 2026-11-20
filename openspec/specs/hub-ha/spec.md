@@ -3,9 +3,7 @@
 ## Purpose
 
 Hub 高可用：`architecture.md` 是选项调研（选主机制、存储后端、Agent 重连、迁移路径），`postgres-storage-design.md` 是阶段 1（存储迁移）的实施蓝图，需求正文覆盖阶段 1 的双后端契约与阶段 2 的租约选主（多实例共享 PostgreSQL、standby 门控、晋升重恢复、让位语义）。存储级写围栏已随租约 fencing epoch 落地（见租约需求的围栏段落）；阶段 3（Agent 多 Hub 候选发现与故障转移、租约行携带 leader 广播地址、standby 503 的 leader 提示）已随 `add-agent-multi-hub-discovery` 落地。
-
 ## Requirements
-
 ### Requirement: HA 架构设计文档
 
 SHALL 产出架构设计文档，覆盖 leader election 机制对比（Raft / 外部协调服务 / DB 租约）、存储后端选项（SQLite WAL / PostgreSQL / etcd）、Agent 重连策略、数据面不受影响的保证。
@@ -60,7 +58,6 @@ The server binary SHALL provide a `migrate` subcommand (`--from sqlite:<path> --
 
 - **WHEN** the source contains config versions or intents whose self-reference targets a later-scanned row of the same table
 - **THEN** the migration orders parents ahead of children and the copy completes without foreign-key violations
-
 
 ### Requirement: Storage contract tests SHALL run against both backends
 
@@ -162,7 +159,7 @@ standby 取得租约后 SHALL 在开放服务前：清空并重载持久化控�
 
 ### Requirement: leader SHALL 周期续约并在丢失时让位
 
-leader SHALL 以不超过 TTL/3 的周期续约；续约返回 Lost 或存储不可达时 SHALL 立即让位为 standby（周期任务在下一 tick 停摆、readiness 转未就绪、路由回到 503 门控）。整个故障接管窗口 SHALL 有界于租约 TTL 加一个探测周期。leader 优雅关停时 SHALL 尽力主动释放租约，使 standby 无需等待 TTL 过期即可接管。
+leader SHALL 以不超过 TTL/3 的周期续约；续约返回 Lost 或存储不可达时 SHALL 立即让位为 standby（周期任务在下一 tick 停摆、readiness 转未就绪、路由回到 503 门控）。整个故障接管窗口 SHALL 有界于租约 TTL 加一个探测周期。leader 优雅关停时 SHALL 尽力主动释放租约，使 standby 无需等待 TTL 过期即可接管。续约的 epoch 读取与条件写入 SHALL 原子完成：一次条件 UPDATE SHALL 同时返回生效后的 epoch，任何后端实现 SHALL NOT 在条件写入成功后另行读取 epoch 而留下可观察的不一致窗口。两个存储后端 SHALL 对同一续约契约测试（含并发续约）表现一致。
 
 #### Scenario: 续约丢失立即让位
 
@@ -178,6 +175,11 @@ leader SHALL 以不超过 TTL/3 的周期续约；续约返回 Lost 或存储不
 
 - **WHEN** leader 收到关停信号正常退出
 - **THEN** 租约被立即释放，standby 的下一次 `try_acquire` 即可成功
+
+#### Scenario: 续约原子返回 epoch
+
+- **WHEN** 任一后端执行一次成功的续约（条件 UPDATE 命中）
+- **THEN** 返回的 Renewed epoch 来自同一条条件写入，且并发续约场景下每个成功续约方读到的 epoch 与其写入生效时的租约状态一致（契约测试在两后端上钉扎）
 
 ### Requirement: 启用 HA 的 Hub SHALL 要求持久存储
 
@@ -273,3 +275,4 @@ Agent 模式的 `hub_urls` SHALL 为 Hub 候选地址列表（YAML 序列；空�
 #### Scenario: migrate 校验并转移版本
 - **WHEN** `arkflow-server migrate` 从源库复制到目标库
 - **THEN** 源库版本新于二进制时迁移以显式错误失败；否则复制完成后目标库版本戳等于二进制支持的 schema 版本
+
