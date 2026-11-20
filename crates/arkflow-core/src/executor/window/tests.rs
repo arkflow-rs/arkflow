@@ -5210,13 +5210,11 @@ async fn explicit_abort_then_expiry_cleans_stale_entry_via_armed_scan() {
         key.extend_from_slice(b"a");
         key
     };
-    assert!(
-        backend
-            .inner
-            .get("window-abort-expiry-test", &state_key)
-            .unwrap()
-            .is_some()
-    );
+    assert!(backend
+        .inner
+        .get("window-abort-expiry-test", &state_key)
+        .unwrap()
+        .is_some());
     op.process_with_ack(
         batch(vec![(2100, "b", 1)], None),
         Arc::new(crate::input::NoopAck),
@@ -5262,8 +5260,7 @@ async fn explicit_abort_then_expiry_cleans_stale_entry_via_armed_scan() {
     .await
     .unwrap();
     op.on_watermark(18000).await.unwrap();
-    op.on_watermark(23000).await
-        .unwrap();
+    op.on_watermark(23000).await.unwrap();
     assert!(
         backend
             .inner
