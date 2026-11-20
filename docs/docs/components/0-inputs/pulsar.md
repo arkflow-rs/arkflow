@@ -47,7 +47,6 @@ The Pulsar input subscribes to an Apache Pulsar topic and supports four subscrip
 |-------|------|----------|---------|-------------|
 | certificate_chain_file | string | no | — | Path to the client certificate chain (PEM) for mTLS. |
 | hostname_verification | boolean | no | `true` | Verify the broker certificate hostname. |
-| ca_file | string | no | — | Accepted for schema compatibility but **not applied today** — the underlying driver offers no custom-root API, so the system trust store is used regardless. Do not rely on it as a private trust anchor. |
 
 ## Examples
 

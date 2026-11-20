@@ -133,13 +133,16 @@ impl Output for HttpOutput {
 
 impl HttpOutput {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
-        let client_arc = self.client.clone();
-        let client_arc_guard = client_arc.lock().await;
-        if !self.connected.load(Ordering::SeqCst) || client_arc_guard.is_none() {
-            return Err(Error::Connection("The output is not connected".to_string()));
-        }
-
-        let client = client_arc_guard.as_ref().unwrap();
+        // Clone the client out under a short critical section and release the
+        // lock before any await: holding this mutex across the send+retry
+        // loop serialized every concurrent write behind one in-flight request.
+        let client = {
+            let guard = self.client.lock().await;
+            if !self.connected.load(Ordering::SeqCst) || guard.is_none() {
+                return Err(Error::Connection("The output is not connected".to_string()));
+            }
+            guard.as_ref().unwrap().clone()
+        };
         // Build the request
         let mut request_builder = match self.config.method.to_uppercase().as_str() {
             "GET" => client.get(&self.config.url),

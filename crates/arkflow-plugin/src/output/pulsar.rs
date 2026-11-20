@@ -310,6 +310,7 @@ impl OutputBuilder for PulsarOutputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
+        crate::pulsar::common::reject_removed_ca_file(config)?;
         let config: PulsarOutputConfig = parse_config(config, "PulsarOutput input")?;
 
         // Validate configuration during build
@@ -363,6 +364,36 @@ mod tests {
     use arkflow_core::MessageBatch;
     use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    /// Regression (2026-11 review P1 #20): a config still carrying the
+    /// removed `tls.ca_file` key must fail the build loudly, not silently
+    /// drop it (serde drops unknown keys).
+    #[test]
+    fn build_rejects_removed_ca_file_key() {
+        fn resource() -> Resource {
+            Resource {
+                temporary: Default::default(),
+                input_names: std::cell::RefCell::new(Default::default()),
+            }
+        }
+        let error = match PulsarOutputBuilder.build(
+            None,
+            &Some(serde_json::json!({
+                "service_url": "pulsar://localhost:6650",
+                "topic": {"type": "value", "value": "t"},
+                "tls": {"ca_file": "/etc/ca.pem"}
+            })),
+            None,
+            &resource(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("removed key must fail the build"),
+        };
+        assert!(
+            error.to_string().contains("ca_file"),
+            "error must name the key: {error}"
+        );
+    }
 
     fn utf8_batch(rows: Vec<Option<&str>>) -> MessageBatchRef {
         let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));

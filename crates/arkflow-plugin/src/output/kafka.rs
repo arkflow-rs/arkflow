@@ -129,6 +129,8 @@ struct KafkaOutput {
     /// the paired input's frontier rewinds (an undo) — re-committing lower
     /// offsets would churn replay loops.
     last_sent_offsets: Arc<std::sync::Mutex<std::collections::HashMap<i32, i64>>>,
+    /// Guards the periodic flush loop's one-time spawn in `connect`.
+    flusher_started: std::sync::atomic::AtomicBool,
 }
 
 struct InnerKafkaOutput {
@@ -207,26 +209,13 @@ impl KafkaOutput {
         codec: Option<Arc<dyn Codec>>,
         offset_committer_claim: Option<Arc<()>>,
     ) -> Result<Self, Error> {
+        // No task is spawned here: construction happens in the (sync) builder,
+        // which may run outside async context, and an output dropped before
+        // `connect` would leak a never-cancelled flusher. `connect` spawns it.
         let cancellation_token = CancellationToken::new();
         let inner_kafka_output = Arc::new(InnerKafkaOutput {
             producer: Arc::new(RwLock::new(None)),
             send_futures: Arc::new(std::sync::Mutex::new(vec![])),
-        });
-
-        let output_p = Arc::clone(&inner_kafka_output);
-        let cancellation_token_clone = CancellationToken::clone(&cancellation_token);
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = time::sleep(Duration::from_secs(1)) => {
-                        output_p.flush().await;
-                        debug!("Kafka output flushed");
-                    },
-                    _ = cancellation_token_clone.cancelled()=>{
-                        break;
-                    }
-                }
-            }
         });
 
         Ok(Self {
@@ -236,7 +225,27 @@ impl KafkaOutput {
             codec,
             _offset_committer_claim: offset_committer_claim,
             last_sent_offsets: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            flusher_started: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+}
+
+/// Periodic flush loop for the installed producer. Spawned by `connect`
+/// (never at construction: the builder runs outside async context, and an
+/// output dropped before connect must not leave an orphaned task behind).
+/// The token fires on `close` and on `Drop`. `flush` with no producer
+/// installed is a no-op, so ticks before a successful connect are harmless.
+async fn run_flush_loop(output_p: Arc<InnerKafkaOutput>, token: CancellationToken) {
+    loop {
+        tokio::select! {
+            _ = time::sleep(Duration::from_secs(1)) => {
+                output_p.flush().await;
+                debug!("Kafka output flushed");
+            },
+            _ = token.cancelled() => {
+                break;
+            }
+        }
     }
 }
 
@@ -248,8 +257,7 @@ impl KafkaOutput {
 /// submission order. `write` propagates the error so the kernel withholds
 /// the ack and replays the batch (at-least-once); the background flush and
 /// close paths log it as best-effort observation of stragglers.
-async fn observe_delivery_futures(pending: Vec<DeliveryFuture>) -> Result<(), Error> {
-    let results = futures::future::join_all(pending).await;
+async fn observe_delivery_futures(pending: Vec<DeliveryFuture>) -> Result<(), Error> {    let results = futures::future::join_all(pending).await;
     let mut first_error: Option<Error> = None;
     for (index, result) in results.into_iter().enumerate() {
         match result {
@@ -292,6 +300,16 @@ impl InnerKafkaOutput {
     }
 }
 
+impl Drop for KafkaOutput {
+    fn drop(&mut self) {
+        // An output dropped without `close` (error paths, early teardown)
+        // must not leave the flusher looping forever: nothing else cancels
+        // the token on that path. `close` already cancels — cancel is
+        // idempotent, so the normal lifecycle is unaffected.
+        self.cancellation_token.cancel();
+    }
+}
+
 #[async_trait]
 impl Output for KafkaOutput {
     async fn connect(&self) -> Result<(), Error> {
@@ -323,6 +341,19 @@ impl Output for KafkaOutput {
             .lock()
             .expect("kafka last_sent lock poisoned")
             .clear();
+
+        // Start the periodic flush loop once, on first connect. Construction
+        // must not spawn: builders run outside async context, and an output
+        // dropped before connect would leak the task (nothing cancelled it).
+        if !self
+            .flusher_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            tokio::spawn(run_flush_loop(
+                Arc::clone(&self.inner_kafka_output),
+                self.cancellation_token.clone(),
+            ));
+        }
 
         Ok(())
     }
@@ -1586,6 +1617,39 @@ mod tests {
         )
         .unwrap();
         Arc::new(MessageBatch::new_arrow(rb))
+    }
+
+    /// Regression (2026-11 review P1 #14 remainder): the flusher task is
+    /// spawned by `connect`, never at construction, and `Drop` cancels the
+    /// token — a build-then-drop output (error paths, early teardown) used to
+    /// leak a never-cancelled flush loop forever.
+    #[tokio::test]
+    async fn drop_without_close_cancels_flusher_token() {
+        let output = KafkaOutput::new(output_config(base_output_config()), None).unwrap();
+        let token = output.cancellation_token.clone();
+        assert!(!token.is_cancelled());
+        drop(output);
+        assert!(token.is_cancelled());
+    }
+
+    /// The flush loop is a pure lifecycle unit: with no producer installed,
+    /// flush is a no-op, so the loop needs no broker — it runs until the
+    /// token fires and exits promptly after.
+    #[tokio::test]
+    async fn flush_loop_runs_until_cancelled_without_producer() {
+        let inner = Arc::new(InnerKafkaOutput {
+            producer: Arc::new(RwLock::new(None)),
+            send_futures: Arc::new(std::sync::Mutex::new(vec![])),
+        });
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_flush_loop(Arc::clone(&inner), token.clone()));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(!task.is_finished());
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("flush loop must exit on cancellation")
+            .expect("task join");
     }
 
     /// connect() creates the producer offline (librdkafka connects lazily),
