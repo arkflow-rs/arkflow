@@ -20,7 +20,7 @@
 
 ## 5. Pulsar ca_file 移除（#20，BREAKING）
 
-- [x] 5.1 `pulsar/common.rs` config struct 移除 `ca_file` 字段与相关测试；builder 在 raw `serde_json::Value` 上检测 `ca_file` 键存在即报错（信息指名驱动无自定义 CA API、指导移除）
+- [x] 5.1 `pulsar/common.rs` config struct 移除 `ca_file` 字段与相关测试；builder 在 raw `serde_json::Value` 上检测 `ca_file` 键存在即报错（信息指名驱动无独立 `ca_file` 设置、指导改用 `tls.certificate_chain_file` 或移除）
 - [x] 5.2 schema/inventory 快照同步（`arkflow components show`/`arkflow schema` 输出不含 `ca_file`）；测试断言含 `ca_file` 的配置构建报错、schema 无该字段
 - [x] 5.3 docs 任务：移除 docs/docs/（EN）与 zh-Hans 对应文档页中的 `ca_file` 配置项及示例，CHANGELOG/发布说明标注 BREAKING
 

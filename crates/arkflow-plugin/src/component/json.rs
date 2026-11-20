@@ -34,10 +34,11 @@ pub(crate) type RecordObject<'de> = infer::ObjMap<Cow<'de, str>, CowValue<'de>>;
 /// plus the projection set. Schema inference is a deterministic function of
 /// the content, so an exact-byte hit cannot produce a different schema — the
 /// hit path skips the whole inference pass (the extra whole-buffer parse the
-/// decode pass doesn't need). Variable payloads simply miss and pay the same
-/// inference as before, so this is a pure win for fixed-template workloads
-/// (templated IoT/heartbeat payloads, replayed fixtures) and a no-op
-/// elsewhere. Bounded FIFO of small entries; `DefaultHasher::new()` is
+/// decode pass doesn't need). Variable payloads miss and pay the same
+/// inference as before plus one linear hash of the content (cheap against
+/// the parse — see `schema_cache_key`), so this is a pure win for
+/// fixed-template workloads (templated IoT/heartbeat payloads, replayed
+/// fixtures) and near-neutral elsewhere. Bounded FIFO of small entries; `DefaultHasher::new()` is
 /// deterministic within a process, which is all a process-local cache needs.
 /// A hash collision would reuse a wrong schema for one batch — astronomically
 /// unlikely at 64 bits and bounded cache size, and it degrades to a bad
@@ -74,11 +75,16 @@ pub(crate) fn try_to_arrow(
     fields_to_include: Option<&HashSet<String>>,
 ) -> Result<RecordBatch, Error> {
     let cache_key = schema_cache_key(content, fields_to_include);
-    {
+    // Clone the schema Arc out of the lock scope: decode_with_schema is the
+    // expensive part, and this is a process-global mutex — holding it across
+    // a hit's parse/allocation would serialize concurrent decodes (json and
+    // Debezium alike) even when they use different cache keys.
+    let cached_schema = {
         let cache = SCHEMA_CACHE.lock().unwrap();
-        if let Some(schema) = cache.entries.get(&cache_key) {
-            return decode_with_schema(content, schema.clone());
-        }
+        cache.entries.get(&cache_key).cloned()
+    };
+    if let Some(schema) = cached_schema {
+        return decode_with_schema(content, schema);
     }
 
     // Infer the schema from ALL records in the batch. The streaming inferrer

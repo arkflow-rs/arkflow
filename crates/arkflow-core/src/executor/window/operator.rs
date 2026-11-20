@@ -2226,7 +2226,12 @@ impl ColumnarWindowOperator {
     /// window's output acknowledgement commits them — a checkpoint therefore
     /// never observes a buffer whose input acknowledgements are still pending.
     #[cfg(test)]
-    pub fn persist_buffers(&self) -> Result<(), Error> {
+    pub async fn persist_buffers(&self) -> Result<(), Error> {
+        // Serialize the snapshot-to-clear interval through operation_lock like
+        // every production entrypoint: a concurrent removal could otherwise
+        // set stale_scan_pending after the keys-only snapshot, and the scan's
+        // clear would discard that signal until some later trigger.
+        let _guard = self.operation_lock.clone().lock_owned().await;
         self.persist_buffers_for_fired(&[])
     }
 

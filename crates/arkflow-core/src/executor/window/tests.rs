@@ -386,7 +386,7 @@ async fn state_persist_and_restore_reproduces_aggregates() {
     op.process(batch(vec![(1_000, "a", 4)], None))
         .await
         .unwrap();
-    op.persist_buffers().unwrap();
+    op.persist_buffers().await.unwrap();
 
     let restored = operator(WindowTrigger::Watermark, backend);
     assert_eq!(restored.restore_buffers().unwrap(), 1);

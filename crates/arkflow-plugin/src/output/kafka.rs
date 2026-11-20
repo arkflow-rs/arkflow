@@ -1902,6 +1902,13 @@ mod tests {
             None,
         )
         .unwrap();
+        // connect() spawns the real run_flush_loop (producer creation is
+        // offline — librdkafka connects lazily), so the ticks below exercise
+        // the actual task lifecycle rather than an idle runtime.
+        output
+            .connect()
+            .await
+            .expect("producer creation is offline");
         // Two+ flush ticks fire (the queue is empty; flush drains nothing).
         tokio::time::sleep(Duration::from_millis(2500)).await;
         output.close().await.expect("close without producer");

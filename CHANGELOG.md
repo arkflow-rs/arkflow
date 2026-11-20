@@ -246,9 +246,11 @@ rather than listed commit-by-commit.
 - DataFusion upgraded from 47 to 54 (Arrow/API surface refresh). (#1187)
 - **BREAKING**: Pulsar `tls.ca_file` is rejected at build time and removed
   from the configuration surface. The field was parsed and documented but
-  never applied — the pulsar driver offers no custom-root API, so
-  connections always used the system trust store. Configs still carrying
-  the key now fail startup with an error naming it; remove the field.
+  never applied — the driver has no separate `ca_file` setting; a private-CA
+  trust anchor is provided via `tls.certificate_chain_file`, which the
+  driver installs to authenticate the server. Configs still carrying the
+  key now fail startup with an error naming it and pointing at the
+  supported option.
 - Stream-level `codec:` is now rejected at build time for file, SQL, and
   Modbus inputs (the setting never worked); use component-level codecs. (#1284)
 - `hub_url` became a list `hub_urls` for agent multi-Hub discovery. (#1289)

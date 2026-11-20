@@ -33,7 +33,7 @@ cargo run -p arkflow --release --example benchmark
 | `groupby-sql` | generate → JSON 解码 → SQL 按键聚合(有状态 GROUP BY)→ drop | rows/s |
 | `filter-project-sql` | generate → JSON 解码 → SQL 过滤 + 投影 → drop | rows/s |
 | `codec-json` | Arrow 批次 → NDJSON → Arrow 批次往返(1000 行/批) | batches/s |
-| `json-decode` | 仅 NDJSON → Arrow 批次解码(1000 行缓冲;schema 推断逐批执行,无缓存) | batches/s |
+| `json-decode` | 仅 NDJSON → Arrow 批次解码(1000 行相同缓冲;精确内容 schema 缓存在首轮后命中,测量的是缓存命中解码路径) | batches/s |
 | `state-backend` | redb 状态后端持久化 put + get(逐写提交) | ops/s |
 | `avro-decode-w5` / `avro-decode-w25` / `avro-decode-w100` | schema-registry Avro 解码(Confluent wire format,1000 消息/批,5/25/100 字段 schema) | rows/s |
 | `window-journal-n1` / `window-journal-n100` / `window-journal-n1k` | tumbling window 经生产编译路径构建为 journaled 窗口 operator(ephemeral redb 状态),1/100/1k 个不同存活键;窗口在运行期不触发,每批都付按键分配 + journal 持久化成本,EOF fire 时每键提交一个 journal 事务 | rows/s |

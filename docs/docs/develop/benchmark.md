@@ -39,7 +39,7 @@ throughput.
 | `groupby-sql` | generate → JSON decode → SQL keyed aggregation (stateful GROUP BY) → drop | rows/s |
 | `filter-project-sql` | generate → JSON decode → SQL filter + projection → drop | rows/s |
 | `codec-json` | Arrow batch → NDJSON → Arrow batch round trips (1000-row batches) | batches/s |
-| `json-decode` | NDJSON → Arrow batch decode only (1000-row buffers; schema inference runs per batch, uncached) | batches/s |
+| `json-decode` | NDJSON → Arrow batch decode only (1000-row identical buffers; the exact-content schema cache serves every iteration after the first, so this measures the cache-hit decode path) | batches/s |
 | `state-backend` | redb state backend durable put + get (per-write commit) | ops/s |
 | `avro-decode-w5` / `avro-decode-w25` / `avro-decode-w100` | schema-registry Avro decode (Confluent wire format, 1000-message batches, 5/25/100-field schemas) | rows/s |
 | `window-journal-n1` / `window-journal-n100` / `window-journal-n1k` | tumbling window compiled to the journaled window operator (ephemeral redb state), 1/100/1k distinct live keys; the window never fires during the run, so every batch pays keyed assignment + journal persist, and the EOF fire commits one journal transaction per key | rows/s |

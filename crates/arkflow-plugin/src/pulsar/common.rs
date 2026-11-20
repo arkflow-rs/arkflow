@@ -186,8 +186,9 @@ fn default_hostname_verification() -> Option<bool> {
 }
 
 /// Rejects `tls.ca_file`, removed from the configuration surface: the pulsar
-/// driver exposes no custom-CA API, so the field never took effect
-/// (connections always used the system trust store). serde silently drops
+/// driver has no separate `ca_file` setting — a private-CA trust anchor is
+/// provided via `tls.certificate_chain_file`, which the driver installs to
+/// authenticate the server, so `ca_file` never took effect. serde silently drops
 /// unknown keys, so removing the field alone would keep carrying the key
 /// invisibly — failing loudly keeps the removal honest (spec:
 /// component-config-honesty, 从配置面移除的键 SHALL 在存量配置中显式拒绝).
@@ -195,9 +196,11 @@ pub(crate) fn reject_removed_ca_file(config: &Option<serde_json::Value>) -> Resu
     if let Some(tls) = config.as_ref().and_then(|config| config.get("tls")) {
         if tls.get("ca_file").is_some() {
             return Err(Error::Config(
-                "pulsar: `tls.ca_file` is not supported: the pulsar driver does not expose \
-                 custom CA material and the field never took effect (connections always \
-                 used the system trust store). Remove `tls.ca_file` from the configuration."
+                "pulsar: `tls.ca_file` is not supported: the driver has no separate \
+                 `ca_file` setting, so the field never took effect. A private-CA trust \
+                 anchor is provided via `tls.certificate_chain_file` (the driver installs \
+                 that chain to authenticate the server). Remove `tls.ca_file` from the \
+                 configuration."
                     .to_string(),
             ));
         }

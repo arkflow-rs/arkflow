@@ -10,7 +10,7 @@
 | 14 | Kafka output 构造期即 `tokio::spawn` 1s flusher 循环：构造要求 runtime 上下文；build 后未 close 即 drop → 任务永久泄漏（无 `impl Drop`） | `crates/arkflow-plugin/src/output/kafka.rs:218`（spawn）、:371（仅 close() 取消） |
 | 15 | embedding `append_vector_column` 取首向量 dim，跨响应维度不一致 → `FixedSizeListArray::new` panic（远程服务可打崩 AI 路径） | `crates/arkflow-plugin/src/processor/embedding.rs:333`、:344；:218 的响应内校验不覆盖跨响应拼接 |
 | 19 | EXPR_CACHE 缓存键字段名混叠：单字段名 `x:Int64,y`（类型 Utf8）与两字段 `x: Int64` + `y: Utf8` 渲染出相同键 `x:Int64,y:Utf8` → 缓存的物理表达式按错误 schema 求值，路由错值 | `crates/arkflow-plugin/src/expr/mod.rs:122-124`（逗号 join 无转义/长度前缀） |
-| 20 | Pulsar `ca_file` 被解析、进 schema 与测试，驱动侧静默丢弃——用户以为配置了私有 CA 信任锚，实际用系统根 | `crates/arkflow-plugin/src/pulsar/common.rs:178`（字段定义），全文件无消费点 |
+| 20 | Pulsar `ca_file` 被解析、进 schema 与测试，驱动侧静默丢弃——驱动无独立 `ca_file` 设置，私有 CA 信任锚实际经 `tls.certificate_chain_file`（驱动将其安装为服务器认证锚）提供 | `crates/arkflow-plugin/src/pulsar/common.rs:178`（字段定义），全文件无消费点 |
 | 30 | docs-check.yml 路径过滤不含 `examples/**`：AGENTS.md 声明"未注册示例挂 CI"，但示例文件变更不触发 docs-check，CI 层可绕过 | `.github/workflows/docs-check.yml`（全文件无 examples 引用） |
 
 ## What Changes
