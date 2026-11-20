@@ -15,9 +15,12 @@ use arkflow_core::Error;
 use arrow_json::ReaderBuilder;
 use datafusion::arrow;
 use datafusion::arrow::record_batch::RecordBatch;
+use once_cell::sync::Lazy;
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 mod infer;
 mod values;
@@ -27,10 +30,57 @@ pub(crate) use infer::CowValue;
 /// A parsed record object in the value domain (see [`infer`]'s `CowValue`).
 pub(crate) type RecordObject<'de> = infer::ObjMap<Cow<'de, str>, CowValue<'de>>;
 
+/// Process-level cache of inferred schemas keyed by the EXACT input bytes
+/// plus the projection set. Schema inference is a deterministic function of
+/// the content, so an exact-byte hit cannot produce a different schema — the
+/// hit path skips the whole inference pass (the extra whole-buffer parse the
+/// decode pass doesn't need). Variable payloads simply miss and pay the same
+/// inference as before, so this is a pure win for fixed-template workloads
+/// (templated IoT/heartbeat payloads, replayed fixtures) and a no-op
+/// elsewhere. Bounded FIFO of small entries; `DefaultHasher::new()` is
+/// deterministic within a process, which is all a process-local cache needs.
+/// A hash collision would reuse a wrong schema for one batch — astronomically
+/// unlikely at 64 bits and bounded cache size, and it degrades to a bad
+/// decode, never to unsound memory.
+static SCHEMA_CACHE: Lazy<Mutex<SchemaCache>> = Lazy::new(|| Mutex::new(SchemaCache::default()));
+
+const SCHEMA_CACHE_CAPACITY: usize = 128;
+
+#[derive(Default)]
+struct SchemaCache {
+    entries: HashMap<u64, Arc<arrow::datatypes::Schema>>,
+    order: VecDeque<u64>,
+}
+
+fn schema_cache_key(content: &[u8], fields_to_include: Option<&HashSet<String>>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    match fields_to_include {
+        None => 0u8.hash(&mut hasher),
+        Some(set) => {
+            1u8.hash(&mut hasher);
+            let mut names: Vec<&String> = set.iter().collect();
+            names.sort();
+            for name in names {
+                name.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
 pub(crate) fn try_to_arrow(
     content: &[u8],
     fields_to_include: Option<&HashSet<String>>,
 ) -> Result<RecordBatch, Error> {
+    let cache_key = schema_cache_key(content, fields_to_include);
+    {
+        let cache = SCHEMA_CACHE.lock().unwrap();
+        if let Some(schema) = cache.entries.get(&cache_key) {
+            return decode_with_schema(content, schema.clone());
+        }
+    }
+
     // Infer the schema from ALL records in the batch. The streaming inferrer
     // produces the byte-equal result of arrow-json's full-record
     // `infer_json_schema` (union across records: Int64+Float64 widen to
@@ -49,6 +99,18 @@ pub(crate) fn try_to_arrow(
     }
 
     let inferred_schema = Arc::new(inferred_schema);
+    {
+        let mut cache = SCHEMA_CACHE.lock().unwrap();
+        if !cache.entries.contains_key(&cache_key) {
+            if cache.entries.len() >= SCHEMA_CACHE_CAPACITY {
+                if let Some(oldest) = cache.order.pop_front() {
+                    cache.entries.remove(&oldest);
+                }
+            }
+            cache.order.push_back(cache_key);
+            cache.entries.insert(cache_key, inferred_schema.clone());
+        }
+    }
     decode_with_schema(content, inferred_schema)
 }
 
@@ -297,5 +359,77 @@ mod tests {
             };
             time(&format!("old path ({label})"), &mut oracle_path);
         }
+    }
+}
+
+#[cfg(test)]
+mod schema_cache_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn sample_ndjson(rows: usize) -> Vec<u8> {
+        let mut content = Vec::new();
+        for i in 0..rows {
+            content.extend_from_slice(format!(r#"{{"v":{i},"tag":"t{i}"}}"#).as_bytes());
+            content.push(b'\n');
+        }
+        content
+    }
+
+    /// Same bytes decode identically on the cache-hit path and the inference
+    /// path: the hit cannot produce a different schema (determinism of
+    /// inference over identical input).
+    #[test]
+    fn cache_hit_path_is_byte_identical_to_inference_path() {
+        let content = sample_ndjson(50);
+        let first = try_to_arrow(&content, None).expect("cold decode");
+        let second = try_to_arrow(&content, None).expect("warm decode");
+        assert!(
+            first.schema() == second.schema(),
+            "schemas match through the cache"
+        );
+        assert_eq!(first.num_columns(), second.num_columns());
+        for (a, b) in first.columns().iter().zip(second.columns()) {
+            assert_eq!(a, b, "column data must be identical through the cache");
+        }
+    }
+
+    /// Different content infers its own schema even under the same cache: an
+    /// added field appears (exact-byte keys cannot cross-contaminate).
+    #[test]
+    fn different_content_infers_its_own_schema() {
+        let base = sample_ndjson(10);
+        // Same first 9 records; the 10th carries an extra field.
+        let mut extended = sample_ndjson(9);
+        extended.extend_from_slice(br#"{"v":9,"tag":"t9","extra":1}"#);
+        extended.push(b'\n');
+
+        let first = try_to_arrow(&base, None).expect("base decode");
+        let second = try_to_arrow(&extended, None).expect("extended decode");
+        assert!(first.column_by_name("extra").is_none());
+        assert!(second.column_by_name("extra").is_some(), "new field inferred");
+
+        // Re-decoding the base must still yield the base schema (no bleed).
+        let again = try_to_arrow(&base, None).expect("base decode again");
+        assert!(again.column_by_name("extra").is_none());
+    }
+
+    /// The projection set participates in the cache key: the same content
+    /// with and without `fields_to_include` must not share an entry.
+    #[test]
+    fn projection_set_is_part_of_the_cache_key() {
+        let content = sample_ndjson(5);
+        let full = try_to_arrow(&content, None).expect("full decode");
+        let mut set = HashSet::new();
+        set.insert("v".to_string());
+        let projected = try_to_arrow(&content, Some(&set)).expect("projected decode");
+        assert_eq!(full.num_columns(), 2, "v + tag");
+        assert_eq!(projected.num_columns(), 1, "projection took effect");
+        assert!(projected.column_by_name("v").is_some());
+        assert!(projected.column_by_name("tag").is_none());
+
+        // And the full-shape entry survived alongside the projected one.
+        let full_again = try_to_arrow(&content, None).expect("full decode again");
+        assert_eq!(full_again.num_columns(), 2);
     }
 }

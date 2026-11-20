@@ -4735,3 +4735,187 @@ async fn failed_fired_ack_rewinds_only_fire_touched_windows() {
     // Compensation via touched images equals the whole-map snapshot restore.
     assert_eq!(*buffers, whole_map_before);
 }
+
+/// State backend wrapper counting namespace scans so the stale-scan gating in
+/// journaled persist is observable (spec: journaled persist cost SHALL NOT
+/// grow with open-window count — steady-state batches must not rescan).
+struct CountingBackend {
+    inner: crate::state::InMemoryStateBackend,
+    scans: AtomicUsize,
+}
+
+impl CountingBackend {
+    fn new() -> Result<Self, Error> {
+        Ok(Self {
+            inner: crate::state::InMemoryStateBackend::new(1)?,
+            scans: AtomicUsize::new(0),
+        })
+    }
+
+    fn scan_count(&self) -> usize {
+        self.scans.load(Ordering::SeqCst)
+    }
+}
+
+impl crate::state::StateBackend for CountingBackend {
+    fn format_version(&self) -> u32 {
+        self.inner.format_version()
+    }
+    fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.inner.get(namespace, key)
+    }
+    fn put_with_ttl(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), Error> {
+        self.inner.put_with_ttl(namespace, key, value, ttl_ms, now_ms)
+    }
+    fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+        self.inner.update_i64(namespace, key, delta)
+    }
+    fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+        self.inner.delete(namespace, key)
+    }
+    fn purge_expired(&self, now_ms: u64) -> Result<u64, Error> {
+        self.inner.purge_expired(now_ms)
+    }
+    fn scan(&self, namespace: &str) -> Result<Vec<crate::state::StateEntry>, Error> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        self.inner.scan(namespace)
+    }
+    fn snapshot_at(&self, now_ms: u64) -> Result<crate::state::StateSnapshot, Error> {
+        self.inner.snapshot_at(now_ms)
+    }
+    fn restore(&self, snapshot: &crate::state::StateSnapshot) -> Result<(), Error> {
+        self.inner.restore(snapshot)
+    }
+    fn metrics(&self) -> Result<crate::state::StateMetrics, Error> {
+        self.inner.metrics()
+    }
+    fn close(&self) -> Result<(), Error> {
+        self.inner.close()
+    }
+}
+
+/// The restore safety net scans once, then steady-state batches (mutations
+/// into existing windows, no removals) skip the whole-namespace scan entirely.
+#[tokio::test]
+async fn steady_state_journaled_persist_skips_stale_scan() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        eviction_config(default_max_buffered_keys()),
+        backend.clone(),
+        journal,
+        "window-scan-gating-test",
+    );
+
+    // First batch: the restore itself loads through a namespace scan, and the
+    // safety net runs the stale scan once — two scans, then none.
+    op.process_with_ack(
+        batch(vec![(100, "a", 10)], Some(100)),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        2,
+        "restore load scan + one safety-net stale scan"
+    );
+
+    // Steady state: the same window keeps receiving rows, nothing is removed —
+    // no batch may rescan the namespace.
+    for _ in 0..5 {
+        op.process_with_ack(
+            batch(vec![(100, "a", 1)], Some(100)),
+            Arc::new(crate::input::NoopAck),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        backend.scan_count(),
+        2,
+        "steady-state persists must not rescan the namespace"
+    );
+}
+
+/// A fired-and-expired buffer is removed; the next persist must scan and
+/// delete its backend entry, so a restart cannot resurrect the expired window.
+#[tokio::test]
+async fn expired_window_removal_schedules_backend_cleanup() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        eviction_config(default_max_buffered_keys()),
+        backend.clone(),
+        journal,
+        "window-stale-cleanup-test",
+    );
+
+    // Buffer the window (persist #1 = restore load scan + safety-net scan).
+    op.process_with_ack(
+        batch(vec![(100, "a", 10)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let state_key = {
+        let mut key = 0i64.to_be_bytes().to_vec();
+        key.extend_from_slice(b"a");
+        key
+    };
+    assert_eq!(backend.scan_count(), 2);
+
+    // Fire the window through the watermark and commit the fired output's
+    // acknowledgement: the aggregate lands in the backend. No buffer was
+    // removed, so no additional stale scan may run.
+    let fired = op.on_watermark(1500).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("the window should fire at watermark 1500");
+    };
+    fired_ack.ack().await.unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        2,
+        "a firing without removals skips the scan"
+    );
+    assert!(
+        backend
+            .inner
+            .get("window-stale-cleanup-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "the fired window's aggregate is committed to the backend"
+    );
+
+    // Past the lateness deadline (allowed_lateness_ms = 0): the emitted buffer
+    // is removed. This watermark fires nothing of its own, so the persist work
+    // here is exactly the stale scan plus the backend cleanup.
+    assert!(matches!(
+        op.on_watermark(3500).await.unwrap(),
+        ProcessResult::None
+    ));
+    assert_eq!(
+        backend.scan_count(),
+        3,
+        "buffer removal schedules exactly one stale scan"
+    );
+    assert!(
+        backend
+            .inner
+            .get("window-stale-cleanup-test", &state_key)
+            .unwrap()
+            .is_none(),
+        "the expired window's backend entry must be cleaned up (no restart resurrection)"
+    );
+}

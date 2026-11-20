@@ -23,6 +23,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 /// Field-name union across batches (first-seen order). Restored legacy
@@ -120,6 +121,13 @@ pub(crate) struct ColumnarWindowOperator {
     pub(crate) last_processing_trigger_ms: Arc<Mutex<Option<i64>>>,
     pub(crate) last_processing_activity_ms: Arc<Mutex<Option<i64>>>,
     loaded: Arc<Mutex<bool>>,
+    /// Journaled persist only: whether the stale-key backend scan has work to
+    /// do. In-process staleness comes only from buffer removals (evictions,
+    /// expired/dropped firings), and a restore loads every backend entry into
+    /// `buffers` (nothing can be stale right after one), so the whole-namespace
+    /// scan runs only when this flag is set instead of on every batch —
+    /// per-batch persist cost no longer grows with committed state.
+    stale_scan_pending: Arc<AtomicBool>,
     /// Non-journal persistence only: raw state keys -> prior backend bytes
     /// (None = key absent) captured before the direct backend writes, so a
     /// failed fired acknowledgement can rewind them. Journal-backed operators
@@ -290,6 +298,7 @@ impl ColumnarWindowOperator {
             last_processing_trigger_ms: Arc::new(Mutex::new(None)),
             last_processing_activity_ms: Arc::new(Mutex::new(None)),
             loaded: Arc::new(Mutex::new(false)),
+            stale_scan_pending: Arc::new(AtomicBool::new(false)),
             persist_undo: Arc::new(Mutex::new(BTreeMap::new())),
             operation_lock: Arc::new(tokio::sync::Mutex::new(())),
             eviction_log: Mutex::new((None, 0)),
@@ -411,6 +420,12 @@ impl ColumnarWindowOperator {
             buffers.remove(&victim);
             self.rollback_window_txn(&victim);
             evicted_keys.insert(victim);
+        }
+        if !evicted_keys.is_empty() {
+            // The evicted buffers may have committed backend entries; the next
+            // journaled persist must run the stale-key scan to clean them.
+            self.stale_scan_pending
+                .store(true, AtomicOrdering::SeqCst);
         }
         if evicted_keys.is_empty() {
             return evicted_keys;
@@ -1193,6 +1208,11 @@ impl ColumnarWindowOperator {
             buffers.remove(key);
             self.rollback_window_txn(key);
         }
+        if !dropped_keys.is_empty() {
+            // Removed buffers may have committed backend entries; the next
+            // journaled persist must run the stale-key scan to clean them.
+            self.stale_scan_pending.store(true, AtomicOrdering::SeqCst);
+        }
         let ready = buffers
             .iter_mut()
             .filter(|((start, _), buffer)| {
@@ -1231,6 +1251,9 @@ impl ColumnarWindowOperator {
                 // dropped set, or the source frontier strands here forever.
                 buffers.remove(&(start, key.clone()));
                 self.rollback_window_txn(&(start, key.clone()));
+                // The removed buffer may have a committed backend entry; the
+                // next journaled persist must run the stale-key scan.
+                self.stale_scan_pending.store(true, AtomicOrdering::SeqCst);
                 dropped_keys.push((start, key.clone()));
                 continue;
             }
@@ -2109,6 +2132,11 @@ impl ColumnarWindowOperator {
             return Ok(());
         }
         self.restore_buffers_inner()?;
+        // Safety net: a restore loads every backend entry into `buffers`, so
+        // nothing should be stale right after one — but any path that could
+        // leave the backend ahead of the in-memory map is covered by running
+        // the stale scan once after a restore. Steady-state batches skip it.
+        self.stale_scan_pending.store(true, AtomicOrdering::SeqCst);
         *loaded = true;
         Ok(())
     }
@@ -2208,13 +2236,6 @@ impl ColumnarWindowOperator {
     /// committed independently: a source acknowledgement failure has to be
     /// able to roll back a session re-key or an expired-window deletion.
     fn persist_buffers_for_fired(&self, fired_keys: &[WindowKey]) -> Result<(), Error> {
-        let current = self
-            .buffers
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|((window_start, key), buffer)| ((*window_start, key.clone()), buffer.clone()))
-            .collect::<BTreeMap<_, _>>();
         if let Some(journal) = &self.journal {
             // Only transactions created by a mutation or by `fire_ready` are
             // dirty. An emitted buffer retained for allowed lateness has
@@ -2229,7 +2250,17 @@ impl ColumnarWindowOperator {
                 .map(|(key, txn)| (key.clone(), *txn))
                 .collect::<Vec<_>>();
             for ((window_start, key), txn) in dirty {
-                let Some(buffer) = current.get(&(window_start, key.clone())) else {
+                // Targeted lookup: building a snapshot of the whole buffer map
+                // here grew per-batch persist cost with the open-window count
+                // even when only a few keys were dirty — the same cost bound
+                // the compensation images already follow.
+                let buffer = self
+                    .buffers
+                    .lock()
+                    .unwrap()
+                    .get(&(window_start, key.clone()))
+                    .cloned();
+                let Some(buffer) = buffer else {
                     // `fire_ready` may have staged a delete for a legacy
                     // one-shot buffer. Leave that mutation intact so the
                     // fired acknowledgement can apply it.
@@ -2239,7 +2270,7 @@ impl ColumnarWindowOperator {
                     txn,
                     &self.namespace,
                     &Self::state_key(window_start, &key),
-                    encode_buffer(buffer)?,
+                    encode_buffer(&buffer)?,
                     None,
                 )?;
             }
@@ -2247,16 +2278,44 @@ impl ColumnarWindowOperator {
             // deadline.  In journaled mode the old implementation returned
             // here before deleting the corresponding committed backend
             // entries, so a restart could resurrect already-expired windows.
+            // The scan is what deletes those entries, but it reads the whole
+            // namespace — running it on every batch made persist cost grow
+            // with the committed state regardless of traffic. In-process
+            // staleness comes only from buffer removals (evictions, expired/
+            // dropped firings), and a restore loads every backend entry into
+            // `buffers` (nothing can be stale right after one), so the scan
+            // runs only when removals happened, plus once after a restore as
+            // a safety net.
+            //
             // Cleanup is safe to commit immediately: an expired emitted
             // window can no longer receive a valid late Update.
+            if !self.stale_scan_pending.load(AtomicOrdering::SeqCst) {
+                return Ok(());
+            }
+            // Keys-only snapshots for the stale filters: which exact keys are
+            // live (entry deletion filter) and which logical keys have any
+            // live window (session re-key replacement check). The buffer
+            // values — the heavy part of the old whole-map clone — are never
+            // copied here.
+            let (live_keys, live_logical) = {
+                let buffers = self.buffers.lock().unwrap();
+                (
+                    buffers.keys().cloned().collect::<BTreeSet<_>>(),
+                    buffers
+                        .keys()
+                        .map(|(_, key)| key.clone())
+                        .collect::<BTreeSet<_>>(),
+                )
+            };
             let existing = self.backend.scan(&self.namespace)?;
             let stale_keys = existing
                 .into_iter()
                 .map(|entry| Self::decode_state_key(&entry.key).map(|key| (key, entry.key)))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
-                .filter_map(|(key, raw)| (!current.contains_key(&key)).then_some(raw))
+                .filter_map(|(key, raw)| (!live_keys.contains(&key)).then_some(raw))
                 .collect::<Vec<_>>();
+            self.stale_scan_pending.store(false, AtomicOrdering::SeqCst);
             if stale_keys.is_empty() {
                 return Ok(());
             }
@@ -2278,7 +2337,7 @@ impl ColumnarWindowOperator {
             let mut deferred = 0usize;
             for raw in stale_keys {
                 let stale_key = Self::decode_state_key(&raw)?;
-                let has_replacement = current.keys().any(|(_, key)| key == &stale_key.1);
+                let has_replacement = live_logical.contains(&stale_key.1);
                 let transaction_key =
                     fired_by_logical_key
                         .get(&*stale_key.1)
@@ -2324,6 +2383,15 @@ impl ColumnarWindowOperator {
             }
             return Ok(());
         }
+        // Legacy direct-persist mode writes every buffer every time, so the
+        // whole-map snapshot is intrinsic here (journal mode above skips it).
+        let current = self
+            .buffers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((window_start, key), buffer)| ((*window_start, key.clone()), buffer.clone()))
+            .collect::<BTreeMap<_, _>>();
         let existing = self.backend.scan(&self.namespace)?;
         // Capture the pre-persist backend image so a failed fired
         // acknowledgement can rewind these direct writes. Deleted stale keys
