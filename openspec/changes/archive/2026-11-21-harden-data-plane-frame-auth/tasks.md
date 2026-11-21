@@ -25,4 +25,4 @@
 - [x] 4.1 remote 87/87、server agent 120/120、two_node 4/4、workspace 全量、clippy 0 warning、fmt clean；两处前置竞态测试顺手加固（failure_reporting 去掉 spawn 竞态、disconnect 注册宽限 10s→200ms）
 - [x] 4.2 `auth_frame_roundtrip_timing`（#[ignore]，25 MiB×2 方向 / 400 帧）：release 实测明文 5.1ms vs 密封 84.4ms（sealed/plain ≈ 16.6×，密封路径有效吞吐 ≈ 600 MB/s——RustCrypto 标量 SHA-256，无 ARM SHA-NI）。64KiB 帧 ≈ 0.11ms/帧、1 MiB 帧 ≈ 1.7ms，相对网络与 Arrow 编解码占比 <2%；如 profile 显示成为瓶颈，后续可换 aws-lc-rs 的 SHA-NI 哈希（已在树）。debug 下 HMAC 失真 ~100×，勿以 debug 数字评估。
 - [x] 4.3 docs en/zh deploy 页新增「数据面认证与秘密」段（v2 协议、BREAKING 秘密配置、升级窗口、5 变量表）+ CHANGELOG（Added 数据面认证/调优/零拷贝 + Changed 三条 BREAKING/行为修订）；`pnpm docs:check` 通过（145 页）
-- [ ] 4.4 `openspec validate --changes` 与归档前核验（7 项 delta 逐一落库核实）
+- [x] 4.4 `openspec validate --changes` 与归档前核验（7 项 delta 逐一落库核实）
