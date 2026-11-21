@@ -30,7 +30,7 @@ datafusion-table-providers = { version = "0.13", features = [
     "duckdb",
     "sqlite",
 ], default-features = false }
-ballista = { version = "54.0" }
+ballista = { version = "55.0" }
 duckdb = { version = "1.4", package = "spiceai_duckdb_fork" }
 arrow-json = { workspace = true }
 arrow-pyarrow = { workspace = true }
