@@ -3,7 +3,6 @@
 ## Purpose
 
 规定 SQL processor 快路径的物理计划复用行为：表扫描以懒数据源实现（规划期不捕获批数据，执行期读换入的当前批），物理计划按池化上下文与 schema 缓存并在复用前刷新携带一次性执行态的算子节点；时间折叠查询与递归 CTE 排除在缓存外，输出与逐批独立重规划逐字节等价。
-
 ## Requirements
 ### Requirement: SQL processor SHALL reuse the physical plan while the batch schema is unchanged
 
@@ -47,3 +46,15 @@ The execution-time scan source SHALL read the processor's current batch when its
 
 - **WHEN** (defensively) the scan source opens with a batch whose schema differs from its planning-time schema
 - **THEN** the execution returns an error naming the schema mismatch and no partial or column-shifted output is produced
+
+### Requirement: The cached fast path SHALL NOT deep-clone the session state per batch
+On the fully-cached fast path (analyzed/optimized/physical plan caches all hit for the batch schema, query not time-dependent), the SQL processor SHALL NOT call `SessionContext::state()` — a full `SessionState` deep clone in DataFusion 54 — per batch; execution SHALL reuse the existing physical plan with the context's task context. Session-state cloning SHALL happen only on cache misses and on time-dependent queries that re-optimize per batch (where the refreshed execution start time keeps folded timestamps current), including the temporary-table path. Output SHALL be identical to the per-batch-clone behavior for the same input batch.
+
+#### Scenario: Cached batches skip the session-state clone
+- **WHEN** a same-schema batch is processed repeatedly with all plan caches warm and the query is not time-dependent
+- **THEN** no session-state clone occurs on those batches and the outputs are identical to the per-batch-clone behavior
+
+#### Scenario: Time-dependent queries keep fresh folded timestamps
+- **WHEN** a query folding `now`/`current_date`/`current_time`/`current_timestamp` is processed repeatedly
+- **THEN** the query still re-optimizes per batch with a refreshed execution start time (excluded from plan reuse by the existing reuse requirement), unaffected by this change
+
