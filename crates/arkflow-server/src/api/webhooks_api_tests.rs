@@ -267,7 +267,7 @@ async fn webhook_test_delivery_reports_outcome_with_signature() {
     assert_eq!(requests[0].event_type, "webhook.test");
     let signature = requests[0].signature.as_deref().expect("signature header");
     let expected = {
-        use hmac::Mac;
+        use hmac::{KeyInit, Mac};
         type HmacSha256 = hmac::Hmac<sha2::Sha256>;
         let mut mac = HmacSha256::new_from_slice(b"shared-secret").unwrap();
         mac.update(&requests[0].body);
