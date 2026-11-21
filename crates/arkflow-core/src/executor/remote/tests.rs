@@ -7,7 +7,7 @@ const TEST_PROPAGATION_BUDGET: std::time::Duration = std::time::Duration::from_s
 
 use super::*;
 use crate::input::Ack as _;
-use datafusion::arrow::array::{DictionaryArray, Int64Array};
+use datafusion::arrow::array::{DictionaryArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 
@@ -302,6 +302,23 @@ async fn auth_frame_roundtrip_timing() {
 
 #[tokio::test]
 async fn max_frame_len_rejects_oversized_frames_on_the_send_side() {
+    // The oversized payload must be comfortably above MIN_FRAME_LEN under
+    // ANY arrow patch release: a 3-row int64/dictionary batch encoded to
+    // ~1.1 KiB, and arrow-rs 58.4.2's IPC buffer fixes shrank it below the
+    // 1024 floor (921 bytes), silently bypassing the guard this test pins.
+    // A 64 KiB string column keeps the frame oversized independent of
+    // upstream encoding tweaks.
+    let blob = "x".repeat(64 * 1024);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("blob", DataType::Utf8, false),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![1])),
+        Arc::new(StringArray::from(vec![blob.as_str()])),
+    ];
+    let oversized =
+        MessageBatch::new_arrow(RecordBatch::try_new(schema, columns).expect("valid batch"));
     let quad = quad_a_to_b();
     let config = NetworkManagerConfig {
         max_frame_len: MIN_FRAME_LEN,
@@ -313,7 +330,7 @@ async fn max_frame_len_rejects_oversized_frames_on_the_send_side() {
     let (writer, _reader) = tokio::io::duplex(64 * 1024);
     let (tx, rx) = flume::bounded::<Envelope>(4);
     tx.send_async(Envelope::Data(
-        Arc::new(dictionary_batch(None)),
+        Arc::new(oversized),
         Arc::new(RecordingAck::default()),
     ))
     .await
@@ -1876,12 +1893,15 @@ fn generate_fleet_material() -> (Vec<(String, String)>, String) {
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_key = KeyPair::generate().unwrap();
     let ca = ca_params.self_signed(&ca_key).unwrap();
+    // rcgen 0.14: the issuer carries the CA params and key, not the built
+    // certificate; built once outside the loop so the params move once.
+    let ca_issuer = rcgen::Issuer::new(ca_params, &ca_key);
     let mut nodes = Vec::new();
     for _ in 0..2 {
         let node_params =
             CertificateParams::new(vec![super::DATA_PLANE_TLS_SERVER_NAME.to_owned()]).unwrap();
         let node_key = KeyPair::generate().unwrap();
-        let node = node_params.signed_by(&node_key, &ca, &ca_key).unwrap();
+        let node = node_params.signed_by(&node_key, &ca_issuer).unwrap();
         nodes.push((node.pem(), node_key.serialize_pem()));
     }
     (nodes, ca.pem())

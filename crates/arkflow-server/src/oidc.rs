@@ -1005,7 +1005,7 @@ mod tests {
 
         // HS256 is outside the asymmetric allowlist: rejected before any
         // key material is consulted.
-        let hmac_key = EncodingKey::from_secret(b"shared-secret");
+        let hmac_key = EncodingKey::from_secret(b"shared-secret").unwrap();
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some(TEST_KID.to_string());
         let hmac = encode(&header, &claims("u7", json!(["admin"]), 600), &hmac_key).unwrap();

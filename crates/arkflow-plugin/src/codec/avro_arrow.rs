@@ -508,9 +508,11 @@ impl AvroArrowAccumulator {
 }
 
 fn decimal_metadata(d: &apache_avro::schema::DecimalSchema, name: &str) -> Result<(u8, i8), Error> {
-    let precision = d.precision;
+    // apache-avro 0.23 types precision as NonZero<usize> (the Avro spec
+    // forbids precision 0), so only the upper bound still needs checking.
+    let precision = d.precision.get();
     let scale = d.scale;
-    if precision == 0 || precision > 38 {
+    if precision > 38 {
         return Err(Error::Process(format!(
             "Avro decimal for field '{}' has precision {} out of decimal128 range (1..=38)",
             name, precision
@@ -813,7 +815,7 @@ mod tests {
             &schema,
             Value::Record(vec![(
                 "amount".into(),
-                Value::Decimal(Decimal::from(vec![0x30, 0x39])),
+                Value::Decimal(Decimal::new(vec![0x30, 0x39]).unwrap()),
             )]),
         );
         let batch = avro_to_arrow(&schema, &payload).unwrap();
