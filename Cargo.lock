@@ -270,10 +270,12 @@ name = "arkflow-core"
 version = "0.6.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "clap",
  "datafusion",
  "flume",
  "futures",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "humantime",
  "lazy_static",

@@ -199,6 +199,29 @@ rather than listed commit-by-commit.
 - Bounded buffering and timeouts across the reliability path: window buffer
   entry caps, checkpoint round deadlines, sink write and snapshot timeouts,
   watermark stall unfreezing on idle inputs. (#1275, #1278, #1301)
+- Data-plane frame authentication (wire protocol v2): the session handshake
+  exchanges fresh nonces in both directions and derives per-connection,
+  per-direction session keys via HKDF-SHA256; every post-handshake frame
+  (data, signal, receipt) carries a truncated HMAC tag over its header,
+  payload, and a connection-level monotonic sequence number, verified
+  before any payload parsing. Forged, modified, or replayed frames fail
+  closed as deterministic protocol errors.
+- Data-plane determinism hardening: authentication/protocol errors
+  (forged or malformed frames, credential mismatch, nonce replay, quad
+  mismatch) fail the attempt immediately instead of consuming the reconnect
+  budget, and a batch whose Arrow memory alone exceeds the pending-replay
+  byte budget fails the edge instead of livelocking abort-and-redeliver on a
+  rewinding source.
+- Data-plane resource/SLO tuning for agents: `ARKFLOW_DATA_PLANE_MAX_CONNECTIONS`,
+  `ARKFLOW_DATA_PLANE_RECONNECT_ATTEMPTS`, `ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS`,
+  `ARKFLOW_DATA_PLANE_REGISTRATION_GRACE_MS`, and
+  `ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES` (all optional, defaults unchanged);
+  connection rejections are surfaced through a bounded counter with a
+  throttled warning instead of an unconsumed channel.
+- Data-frame IPC bodies decode without the intermediate full-body copy
+  (shared-ownership `Bytes` buffers carry the IPC body into Arrow), removing
+  the per-frame whole-body second copy; Arrow may still copy individual
+  array buffers when alignment requires it.
 
 ### Added — Components
 
@@ -243,6 +266,18 @@ rather than listed commit-by-commit.
 
 ### Changed
 
+- **BREAKING**: cross-node shuffle frames are authenticated (wire protocol
+  v2, not interoperable with v1). A mixed-version fleet fails the data-plane
+  handshake fail-closed — stop distributed jobs, upgrade every Agent in the
+  same window, then restart.
+- **BREAKING**: the data-plane shared secret no longer falls back to the
+  fleet-shared `node_token`. Network shuffle now requires an explicit
+  `ARKFLOW_DATA_PLANE_SECRET` on every participating node; a node without
+  one runs colocated-only (with a startup warning). Deployments relying on
+  the fallback must set the variable before upgrading.
+- Pending-receipt budget overflows fail the single delivery (branch aborted,
+  at-least-once redelivery) instead of tearing the edge down, so transient
+  congestion no longer escalates into reconnect or attempt failures.
 - DataFusion upgraded from 47 to 54 (Arrow/API surface refresh). (#1187)
 - **BREAKING**: Pulsar `tls.ca_file` is rejected at build time and removed
   from the configuration surface. The field was parsed and documented but

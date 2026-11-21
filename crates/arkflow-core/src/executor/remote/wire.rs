@@ -13,6 +13,16 @@ pub(crate) const MAX_FRAME_LEN: u32 = 1 << 28;
 /// Fixed frame header length: six little-endian `u32`s.
 pub(crate) const FRAME_HEADER_LEN: usize = 24;
 
+/// Authentication tag length appended after every post-handshake frame
+/// payload (protocol v2): a truncated HMAC-SHA256 over header, payload, and
+/// the connection-level sequence number.
+pub(crate) const FRAME_TAG_LEN: usize = 16;
+
+/// Lower bound for the configurable per-frame payload cap: the v2 handshake
+/// JSON (two 32-byte nonces, identity fields, and the MAC) needs several
+/// hundred bytes, and a cap below this cannot carry any protocol traffic.
+pub(crate) const MIN_FRAME_LEN: u32 = 1024;
+
 /// Routing identity of one (upstream task subtask → downstream subtask)
 /// channel. All frames on the wire address a quad; one TCP connection serves
 /// one quad.
@@ -69,12 +79,28 @@ impl FrameHeader {
     }
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         out.reserve(FRAME_HEADER_LEN);
-        out.extend_from_slice(&self.quad.src_op.to_le_bytes());
-        out.extend_from_slice(&self.quad.src_subtask.to_le_bytes());
-        out.extend_from_slice(&self.quad.dst_op.to_le_bytes());
-        out.extend_from_slice(&self.quad.dst_subtask.to_le_bytes());
-        out.extend_from_slice(&self.len.to_le_bytes());
-        out.extend_from_slice(&(self.kind as u32).to_le_bytes());
+        // Single encoder: the wire header and the frame-MAC input must never
+        // drift apart when a field changes.
+        out.extend_from_slice(&self.encode_fixed());
+    }
+
+    /// Encodes into a fixed 24-byte buffer without allocation — the frame
+    /// authenticator computes MACs over exactly these bytes.
+    pub(crate) fn encode_fixed(&self) -> [u8; FRAME_HEADER_LEN] {
+        let mut bytes = [0u8; FRAME_HEADER_LEN];
+        let mut cursor = 0;
+        for value in [
+            self.quad.src_op,
+            self.quad.src_subtask,
+            self.quad.dst_op,
+            self.quad.dst_subtask,
+            self.len,
+            self.kind as u32,
+        ] {
+            bytes[cursor..cursor + 4].copy_from_slice(&value.to_le_bytes());
+            cursor += 4;
+        }
+        bytes
     }
 
     pub fn decode_with_max(bytes: &[u8], max_frame_len: u32) -> Result<Self, Error> {
@@ -174,7 +200,7 @@ pub(crate) struct WireDataMeta {
 /// dead-peer-idle timeout that raced a pending-batch registration and may be
 /// retried under the long budget without corrupting the byte stream.
 pub(crate) enum TieredFrame {
-    Frame((FrameHeader, Vec<u8>)),
+    Frame((FrameHeader, bytes::Bytes)),
     /// The short (empty-pending) budget elapsed with zero bytes consumed,
     /// and a registration appeared during the wait — restart the read; the
     /// next pass uses the receipt-wait budget.

@@ -4263,6 +4263,10 @@ async fn agent_session_reports_and_delivers_job_observations() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn data_plane_setup_advertises_or_degrades_gracefully() {
     let _guard = ENV_LOCK.lock().await;
+    // The explicit-only secret contract: the listener setup below requires
+    // ARKFLOW_DATA_PLANE_SECRET (the node_token fallback is gone). Case (5)
+    // then pins the unconfigured-secret degradation itself.
+    unsafe { std::env::set_var("ARKFLOW_DATA_PLANE_SECRET", "shuffle-secret") };
     let _ = arkflow_plugin::initialize();
     let (hub, hub_url, hub_cancel, hub_server) = spawned_hub().await;
 
@@ -4375,6 +4379,31 @@ async fn data_plane_setup_advertises_or_degrades_gracefully() {
     .await;
     stop_agent(agent, cancel).await;
     drop(held);
+
+    // (5) no explicit secret: the node MUST stay colocated-only even with a
+    // routable host and a free port — the fleet registration token is no
+    // longer borrowed as the data-plane secret.
+    unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_SECRET") };
+    let (agent, cancel) = run_agent(
+        hub_url.clone(),
+        "node-dp-e",
+        Some(0),
+        Some("127.0.0.1".into()),
+    );
+    wait_for(Duration::from_secs(15), || {
+        let hub = hub.clone();
+        async move {
+            hub.nodes()
+                .await
+                .iter()
+                .any(|node| node.id == "node-dp-e" && node.data_address.is_none())
+        }
+    })
+    .await;
+    stop_agent(agent, cancel).await;
+    // Scoped restoration: a leaked secret would turn the missing-secret
+    // contract tests below into accidental listener setups.
+    unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_SECRET") };
 
     hub_cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), hub_server).await;
@@ -5172,6 +5201,9 @@ async fn remote_context_uses_the_full_task_map_and_degrades_without_ports() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pre_cancelled_agent_shuts_its_data_plane_down() {
     let _guard = ENV_LOCK.lock().await;
+    // The explicit-only secret contract: provide the secret so the agent
+    // actually binds the data plane this test tears down.
+    unsafe { std::env::set_var("ARKFLOW_DATA_PLANE_SECRET", "shuffle-secret") };
     let cancel = CancellationToken::new();
     cancel.cancel();
     let outcome = run(
@@ -6275,6 +6307,9 @@ async fn terminal_acknowledgement_prevents_execution() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pre_cancelled_agent_without_a_secret_skips_the_data_plane() {
     let _guard = ENV_LOCK.lock().await;
+    // Establish the precondition explicitly: earlier tests may have left the
+    // variable set (see the scoped-restoration note in the setup test).
+    unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_SECRET") };
     let cancel = CancellationToken::new();
     cancel.cancel();
     let outcome = run(
@@ -6296,4 +6331,69 @@ async fn pre_cancelled_agent_without_a_secret_skips_the_data_plane() {
     )
     .await;
     assert!(outcome.is_ok(), "{outcome:?}");
+}
+
+// ---------- data-plane secret sourcing and env limits (protocol v2) ----------
+
+#[test]
+fn data_plane_env_limits_are_optional_and_override_only_present_keys() {
+    use super::resources::apply_data_plane_limits_from;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    // No variables at all: the library defaults are preserved bit for bit.
+    let mut config = arkflow_core::executor::remote::NetworkManagerConfig::default();
+    apply_data_plane_limits_from(&mut config, |_| None).unwrap();
+    let defaults = arkflow_core::executor::remote::NetworkManagerConfig::default();
+    assert_eq!(config.max_connections, defaults.max_connections);
+    assert_eq!(config.reconnect_attempts, defaults.reconnect_attempts);
+    assert_eq!(config.reconnect_grace, defaults.reconnect_grace);
+    assert_eq!(config.registration_grace, defaults.registration_grace);
+    assert_eq!(config.max_frame_len, defaults.max_frame_len);
+
+    // Every variable overrides exactly its own field.
+    let mut config = arkflow_core::executor::remote::NetworkManagerConfig::default();
+    let env: HashMap<&str, String> = [
+        ("ARKFLOW_DATA_PLANE_MAX_CONNECTIONS", "512"),
+        ("ARKFLOW_DATA_PLANE_RECONNECT_ATTEMPTS", "9"),
+        ("ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS", "45000"),
+        ("ARKFLOW_DATA_PLANE_REGISTRATION_GRACE_MS", "30000"),
+        ("ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES", "16777216"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k, v.to_string()))
+    .collect();
+    apply_data_plane_limits_from(&mut config, |name| env.get(name).cloned()).unwrap();
+    assert_eq!(config.max_connections, 512);
+    assert_eq!(config.reconnect_attempts, 9);
+    assert_eq!(config.reconnect_grace, Duration::from_millis(45_000));
+    assert_eq!(config.registration_grace, Duration::from_millis(30_000));
+    assert_eq!(config.max_frame_len, 16 * 1024 * 1024);
+    // The enlarged config still validates against the manager contract.
+    config.validate().expect("overridden config is in range");
+}
+
+#[test]
+fn data_plane_env_limits_fail_loud_on_malformed_values() {
+    use super::resources::apply_data_plane_limits_from;
+    use std::collections::HashMap;
+
+    let env: HashMap<&str, String> = [("ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS", "soon")]
+        .into_iter()
+        .map(|(k, v)| (k, v.to_string()))
+        .collect();
+    let mut config = arkflow_core::executor::remote::NetworkManagerConfig::default();
+    let error = apply_data_plane_limits_from(&mut config, |name| env.get(name).cloned())
+        .expect_err("a typoed SLO must fail, not degrade");
+    assert!(
+        error.contains("ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS"),
+        "{error}"
+    );
+    // Blank values are treated as unset, not as errors.
+    let env: HashMap<&str, String> = [("ARKFLOW_DATA_PLANE_MAX_CONNECTIONS", "  ")]
+        .into_iter()
+        .map(|(k, v)| (k, v.to_string()))
+        .collect();
+    let mut config = arkflow_core::executor::remote::NetworkManagerConfig::default();
+    apply_data_plane_limits_from(&mut config, |name| env.get(name).cloned()).unwrap();
 }
