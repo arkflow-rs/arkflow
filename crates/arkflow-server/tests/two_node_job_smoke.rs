@@ -162,6 +162,7 @@ fn two_component_job(id: JobId, checkpoint_uri: String, state_root: String) -> J
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         }),
         checkpoint: Some(CheckpointSpec {

@@ -163,6 +163,23 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deliberately excluded from backup/restore so recovery never resurrects a
   login.
 
+### Added — Engine
+
+- `state.max_staged_bytes` caps the state journal's uncommitted staged
+  mutations per Job (default 64MB). Raise it when rarely-firing
+  high-cardinality windows stage more uncommitted state than the default
+  allows; the benchmark window tiers do exactly that alongside their
+  `max_pending_transactions` raise.
+
+### Fixed — Engine and control plane
+
+- The in-memory Hub no longer lets a settled Job observation roll a
+  concurrent desired-state mutation back: `observe_job` and `update_job`
+  re-inserted a stale Job-record clone outside the write lock after their
+  compare-and-set, which could resurrect an older generation and misattribute
+  the generation's lifecycle operations to the previous mutation's actor (the
+  `volatile_reconcile_pairs_each_generation_with_its_actor` flake on main).
+
 ## [0.6.0] — 2026-10-16
 
 Everything below landed between v0.5.0 (2025-10-19) and this release. Entries

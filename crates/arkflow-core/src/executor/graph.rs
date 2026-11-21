@@ -479,17 +479,18 @@ impl ExecutionGraphBuilder {
         // and version maps, allowing an older rollback to overwrite a later
         // commit.  Namespaces keep their state isolated while the journal
         // serializes the apply/ack/undo boundary across the graph.
-        let journal_limits = plan
-            .spec
-            .state
-            .as_ref()
-            .and_then(|state| state.max_pending_transactions)
-            .map(
-                |max_pending_transactions| super::state_journal::JournalLimits {
-                    max_pending_transactions,
-                    ..super::state_journal::JournalLimits::default()
-                },
-            );
+        let journal_limits =
+            plan.spec
+                .state
+                .as_ref()
+                .map(|state| super::state_journal::JournalLimits {
+                    max_pending_transactions: state.max_pending_transactions.unwrap_or_else(|| {
+                        super::state_journal::JournalLimits::default().max_pending_transactions
+                    }),
+                    max_staged_bytes: state.max_staged_bytes.unwrap_or_else(|| {
+                        super::state_journal::JournalLimits::default().max_staged_bytes
+                    }),
+                });
         let shared_journal = state_backend.clone().map(|backend| match journal_limits {
             Some(limits) => Arc::new(super::state_journal::StateJournal::with_limits(
                 backend, limits,

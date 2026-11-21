@@ -345,6 +345,7 @@ fn spec(operators: Vec<OperatorSpec>, edges: Vec<EdgeSpec>, parallelism: u32) ->
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         }),
         checkpoint: None,
@@ -464,6 +465,7 @@ fn stateful_operator_job() -> JobSpec {
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_staged_bytes: None,
         max_bytes: None,
     });
     job
@@ -661,6 +663,7 @@ async fn window_operator_runs_inside_compiled_execution_graph_and_flushes_eos() 
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         }),
         checkpoint: None,
@@ -1565,6 +1568,7 @@ async fn partitioned_edge_routes_by_key_hash() {
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_staged_bytes: None,
         max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
@@ -2738,6 +2742,7 @@ fn stateful_operator_wrapped_with_task_namespace() {
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_staged_bytes: None,
         max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
@@ -2803,6 +2808,7 @@ fn stateful_operator_without_backend_is_rejected() {
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_staged_bytes: None,
         max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
@@ -2866,6 +2872,7 @@ fn rejects_unpartitioned_source_when_job_is_parallel_migrated() {
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_staged_bytes: None,
         max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
@@ -3078,6 +3085,7 @@ async fn multi_input_barrier_seals_one_acknowledged_cut() {
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         }),
         checkpoint: None,
@@ -3424,6 +3432,7 @@ async fn barrier_waits_for_pre_cut_state_transactions() {
         ttl_ms: None,
         format_version: 1,
         max_pending_transactions: None,
+        max_staged_bytes: None,
         max_bytes: None,
     });
     let plan = JobPlan::compile(job).unwrap();
@@ -4010,6 +4019,7 @@ fn window_stream_config(id: &str, thread_num: u32) -> crate::stream::StreamConfi
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         }),
         temporary: None,
