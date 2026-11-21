@@ -3,9 +3,7 @@
 ## Purpose
 
 Define the configuration, batching semantics, Arrow vector column typing, error semantics, and authentication of the AI vector-ingestion components: the `embedding` processor (OpenAI-compatible embeddings API) and the `qdrant` output (REST upsert), which together form the minimal streaming RAG / semantic-search ingestion pipeline. (Purpose derived from the `add-ai-vector-ingestion` change; refine as the capability evolves.)
-
 ## Requirements
-
 ### Requirement: embedding processor 的配置与请求语义
 
 `embedding` processor SHALL 接受配置 `api_base`（必填）、`model`（必填）、`api_key`（可选，支持 secret 引用）、`field`（必填，输入文本列名）、`target_field`（可选，默认 `embedding`）、`batch_size`（可选，默认 32）、`timeout_ms`（可选，默认 30000）与 `headers`（可选 map）。processor SHALL 把输入 batch 的 `field` 列按 `batch_size` 分块，逐块调用 `POST {api_base}/embeddings`（body `{"model": model, "input": [texts]}`），并对每行把响应中的向量追加为 `target_field` 列，类型 `FixedSizeList(Float32, dim)`。
@@ -105,3 +103,15 @@ Define the configuration, batching semantics, Arrow vector column typing, error 
 
 - **WHEN** 流式响应以两个 arguments 分片（同一 index）传递 tool call
 - **THEN** tool_calls 列为合并后参数完整 JSON 的数组文本
+
+### Requirement: embedding 输出列构建 SHALL 对向量维度不一致显式失败
+`embedding` processor 在把向量集合构建为 `FixedSizeList` 列前 SHALL 校验全部向量维度一致（以首向量为准），不一致时 SHALL 返回指名两个维度值的显式错误，MUST NOT panic、MUST NOT 静默错位写列。该校验 SHALL 覆盖跨 API 响应拼接的向量来源，而不限于单响应内部。
+
+#### Scenario: 跨响应维度不一致报错不 panic
+- **WHEN** 向量集合中存在维度与首向量不同的向量（如 128 与 64）
+- **THEN** 处理器返回显式错误且错误信息同时包含两个维度值，进程不 panic
+
+#### Scenario: 一致向量集行为不变
+- **WHEN** 向量集合全部维度一致
+- **THEN** 列构建行为与既有版本一致
+

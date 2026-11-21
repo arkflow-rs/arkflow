@@ -3,9 +3,7 @@
 ## Purpose
 
 Defines the per-row destination (topic/key/subject/channel/field) evaluation contract of the shared `Expr` evaluator: `EvaluateResult::Vec` stays index-aligned with the batch rows, null values fail loud with a named error, and consumers of the result must never silently skip rows or panic on index access.
-
 ## Requirements
-
 ### Requirement: 逐行表达式求值结果 SHALL 与行按索引对齐
 `Expr::evaluate_expr` 对列式（数组）结果的求值 SHALL 产出长度等于批次行数的 `EvaluateResult::Vec`：任何一行对应的结果单元存在且仅对应该行。结果单元为 null（表达式对该行求值为 NULL）时 MUST 返回显式错误，错误信息 SHALL 指名表达式文本与 null 所在行号；MUST NOT 通过丢弃 null 单元缩短结果向量。标量（Scalar）路径遇 NULL 沿用既有报错语义。
 
@@ -23,3 +21,15 @@ Defines the per-row destination (topic/key/subject/channel/field) evaluation con
 #### Scenario: kafka topic 结果短于行数时报错不 panic
 - **WHEN** kafka output 的 topic 表达式求值结果长度小于载荷行数（防御性场景：不变量被未来回归破坏）
 - **THEN** write 返回指名 topic 与行号的错误，进程不 panic
+
+### Requirement: 表达式计划缓存键 SHALL 对任意字段名无歧义
+`expr` 处理器的物理表达式计划缓存（EXPR_CACHE）SHALL 使用对字段名内容无歧义的编码：键 SHALL 由 schema 的每个字段（名称与渲染类型）经长度前缀等可唯一解析的编码拼接而成，使任意两个不同的（字段名集合, 类型集合）组合不可能产生相同键；缓存命中 MUST NOT 导致物理表达式按与构建时不一致的 schema 求值（路由错值）。恶意或意外的字段名（含 `,`、`:` 等分隔符或形如 `名:类型` 的字面量）MUST NOT 触发键混叠。
+
+#### Scenario: 混叠字段名不产生相同键
+- **WHEN** 一个 schema 仅含单字段 `x:Int64,y`（类型 `Utf8`），另一个 schema 含两字段 `x`（类型 `Int64`）与 `y`（类型 `Utf8`）
+- **THEN** 两个 schema 在同一表达式文本下产生不同的缓存键，各自按正确的 schema 构建并求值
+
+#### Scenario: 含分隔符字段的批次路由结果正确
+- **WHEN** 批次含名为 `a,b` 的列且查询按列名引用该列
+- **THEN** 求值按该列的真实位置对齐，结果与无缓存路径一致
+
