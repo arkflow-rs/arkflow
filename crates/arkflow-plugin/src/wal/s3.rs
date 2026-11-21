@@ -1675,6 +1675,21 @@ mod tests {
     }
 
     fn build_local_store_in(dir: &std::path::Path) -> (Arc<S3Store>, std::path::PathBuf) {
+        build_local_store_with_segment_caps(dir, 4, 1024)
+    }
+
+    /// Segment-cap override for tests whose assertions must not depend on
+    /// the IPC-encoded payload size: arrow patch releases shift it
+    /// (58.4.2's IPC buffer fixes shrank a 1-row Int64 batch from 524 to
+    /// 460 bytes), which moves where the byte-threshold seal fires and can
+    /// strand later entries in the active segment. Tests that pin a
+    /// specific sealed layout should make the byte cap unreachable and let
+    /// `max_entries` trigger the seals deterministically.
+    fn build_local_store_with_segment_caps(
+        dir: &std::path::Path,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> (Arc<S3Store>, std::path::PathBuf) {
         let client: Arc<dyn object_store::ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
         let runtime = Runtime::new().unwrap();
@@ -1691,8 +1706,8 @@ mod tests {
                 allow_http: false,
             },
             segment: SegmentConfig {
-                max_entries: 4,
-                max_bytes: 1024,
+                max_entries,
+                max_bytes,
                 flush_interval: std::time::Duration::from_millis(50),
             },
             cursor: CursorFlushConfig {
@@ -4189,10 +4204,15 @@ mod tests {
     #[test]
     fn read_after_pages_the_backlog_and_reuses_cached_segment_ranges() {
         let dir = tempdir();
-        let (store, _) = build_local_store_in(&dir);
+        // max_bytes is unreachable so seals fire only on max_entries = 4:
+        // eight appends seal exactly two segments and every entry lands on
+        // the object store. The byte cap would otherwise seal on payload
+        // size — arrow 58.4.2 shrank the sample payload from 524 to 460
+        // bytes, which silently moved which entries got sealed (the active
+        // buffer is in memory only, so unsealed entries are invisible to
+        // read_after).
+        let (store, _) = build_local_store_with_segment_caps(&dir, 4, usize::MAX);
         let payload = sample_payload(None);
-        // max_entries = 4: eight appends seal two segments, so every entry is
-        // on the object store (the active buffer is in memory only).
         for seq in 1..=8u64 {
             store.append_batch(vec![(seq, payload.clone())]).unwrap();
         }

@@ -7,7 +7,7 @@ const TEST_PROPAGATION_BUDGET: std::time::Duration = std::time::Duration::from_s
 
 use super::*;
 use crate::input::Ack as _;
-use datafusion::arrow::array::{DictionaryArray, Int64Array};
+use datafusion::arrow::array::{DictionaryArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 
@@ -302,6 +302,24 @@ async fn auth_frame_roundtrip_timing() {
 
 #[tokio::test]
 async fn max_frame_len_rejects_oversized_frames_on_the_send_side() {
+    // The oversized payload must be comfortably above MIN_FRAME_LEN under
+    // ANY arrow patch release: a 3-row int64/dictionary batch encoded to
+    // ~1.1 KiB, and arrow-rs 58.4.2's IPC buffer fixes shrank it below the
+    // 1024 floor (921 bytes), silently bypassing the guard this test pins.
+    // A 64 KiB string column keeps the frame oversized independent of
+    // upstream encoding tweaks.
+    let blob = "x".repeat(64 * 1024);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("blob", DataType::Utf8, false),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![1])),
+        Arc::new(StringArray::from(vec![blob.as_str()])),
+    ];
+    let oversized = MessageBatch::new_arrow(
+        RecordBatch::try_new(schema, columns).expect("valid batch"),
+    );
     let quad = quad_a_to_b();
     let config = NetworkManagerConfig {
         max_frame_len: MIN_FRAME_LEN,
@@ -313,7 +331,7 @@ async fn max_frame_len_rejects_oversized_frames_on_the_send_side() {
     let (writer, _reader) = tokio::io::duplex(64 * 1024);
     let (tx, rx) = flume::bounded::<Envelope>(4);
     tx.send_async(Envelope::Data(
-        Arc::new(dictionary_batch(None)),
+        Arc::new(oversized),
         Arc::new(RecordingAck::default()),
     ))
     .await
