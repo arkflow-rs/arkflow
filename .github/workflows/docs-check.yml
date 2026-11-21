@@ -8,6 +8,7 @@ on:
       - 'README_zh.md'
       - 'crates/arkflow-core/src/component/**'
       - 'crates/arkflow-plugin/**'
+      - 'examples/**'
       - '.github/workflows/docs-check.yml'
   push:
     branches: [main]
@@ -17,6 +18,7 @@ on:
       - 'README_zh.md'
       - 'crates/arkflow-core/src/component/**'
       - 'crates/arkflow-plugin/**'
+      - 'examples/**'
 
 jobs:
   docs-check:

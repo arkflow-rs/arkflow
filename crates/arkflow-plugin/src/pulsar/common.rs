@@ -173,9 +173,6 @@ impl RetryUtils {
 /// TLS configuration for Pulsar connections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulsarTlsConfig {
-    /// CA certificate file path (PEM format)
-    #[serde(default)]
-    pub ca_file: Option<String>,
     /// Client certificate chain file path (PEM format, for mTLS)
     #[serde(default)]
     pub certificate_chain_file: Option<String>,
@@ -186,6 +183,29 @@ pub struct PulsarTlsConfig {
 
 fn default_hostname_verification() -> Option<bool> {
     Some(true)
+}
+
+/// Rejects `tls.ca_file`, removed from the configuration surface: the pulsar
+/// driver has no separate `ca_file` setting — a private-CA trust anchor is
+/// provided via `tls.certificate_chain_file`, which the driver installs to
+/// authenticate the server, so `ca_file` never took effect. serde silently drops
+/// unknown keys, so removing the field alone would keep carrying the key
+/// invisibly — failing loudly keeps the removal honest (spec:
+/// component-config-honesty, 从配置面移除的键 SHALL 在存量配置中显式拒绝).
+pub(crate) fn reject_removed_ca_file(config: &Option<serde_json::Value>) -> Result<(), Error> {
+    if let Some(tls) = config.as_ref().and_then(|config| config.get("tls")) {
+        if tls.get("ca_file").is_some() {
+            return Err(Error::Config(
+                "pulsar: `tls.ca_file` is not supported: the driver has no separate \
+                 `ca_file` setting, so the field never took effect. A private-CA trust \
+                 anchor is provided via `tls.certificate_chain_file` (the driver installs \
+                 that chain to authenticate the server). Remove `tls.ca_file` from the \
+                 configuration."
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub struct PulsarConfigValidator;
@@ -728,12 +748,11 @@ mod retry_backoff_tests {
 
 #[cfg(test)]
 mod tls_config_tests {
-    use super::PulsarTlsConfig;
+    use super::{reject_removed_ca_file, PulsarTlsConfig};
 
     #[test]
     fn defaults_apply_when_fields_omitted() {
         let config: PulsarTlsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(config.ca_file.is_none());
         assert!(config.certificate_chain_file.is_none());
         assert_eq!(config.hostname_verification, Some(true));
     }
@@ -741,16 +760,42 @@ mod tls_config_tests {
     #[test]
     fn explicit_fields_are_parsed() {
         let config: PulsarTlsConfig = serde_json::from_value(serde_json::json!({
-            "ca_file": "/etc/ca.pem",
             "certificate_chain_file": "/etc/cert.pem",
             "hostname_verification": false
         }))
         .unwrap();
-        assert_eq!(config.ca_file.as_deref(), Some("/etc/ca.pem"));
         assert_eq!(
             config.certificate_chain_file.as_deref(),
             Some("/etc/cert.pem")
         );
         assert_eq!(config.hostname_verification, Some(false));
+    }
+
+    /// Regression (2026-11 review P1 #20): `tls.ca_file` was parsed, tested,
+    /// and documented but never consumed — the driver has no separate
+    /// `ca_file` setting (the private-CA trust anchor is
+    /// `tls.certificate_chain_file`),
+    /// so users believed they had a private trust anchor while connections
+    /// used the system store. The key must fail the build loudly.
+    #[test]
+    fn removed_ca_file_key_is_rejected_loudly() {
+        let err = reject_removed_ca_file(&Some(serde_json::json!({
+            "service_url": "pulsar://localhost:6650",
+            "tls": {"ca_file": "/etc/ca.pem"}
+        })))
+        .expect_err("removed key must fail the build");
+        let msg = err.to_string();
+        assert!(msg.contains("ca_file"), "error must name the key: {msg}");
+
+        reject_removed_ca_file(&Some(serde_json::json!({
+            "service_url": "pulsar://localhost:6650",
+            "tls": {"certificate_chain_file": "/etc/cert.pem"}
+        })))
+        .expect("surviving sibling keys stay accepted");
+        reject_removed_ca_file(&None).expect("absent config passes");
+        reject_removed_ca_file(&Some(serde_json::json!({
+            "service_url": "pulsar://localhost:6650"
+        })))
+        .expect("config without a tls block passes");
     }
 }

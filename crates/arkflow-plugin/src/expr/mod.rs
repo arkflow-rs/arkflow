@@ -13,6 +13,7 @@
  */
 use arkflow_core::Error;
 use datafusion::arrow::array::{Array, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_plan::PhysicalExpr;
@@ -105,6 +106,26 @@ impl Expr<String> {
     }
 }
 
+/// Unambiguous cache key for one (schema, expression) pair. The physical
+/// expression binds columns by INDEX at plan time, so the key must include
+/// the schema; and it must include it unambiguously — the old separator
+/// join (`name:Type` entries joined by `,`) let a single column literally
+/// named `x:Int64,y` (Utf8) render identically to the two columns
+/// `x`(Int64) + `y`(Utf8), so one schema could reuse the other's cached
+/// physical plan and silently route values to the wrong columns.
+/// Length-prefixing each element makes every byte sequence parse uniquely.
+fn cache_key_for(schema: &SchemaRef, expr_str: &str) -> String {
+    let mut key = String::new();
+    for field in schema.fields() {
+        let name = field.name();
+        let ty = format!("{:?}", field.data_type());
+        key.push_str(&format!("{}:{}:{}:{};", name.len(), name, ty.len(), ty));
+    }
+    key.push('\u{0}');
+    key.push_str(expr_str);
+    key
+}
+
 pub async fn evaluate_expr(
     expr_str: &str,
     batch: &RecordBatch,
@@ -112,17 +133,8 @@ pub async fn evaluate_expr(
     let df_schema = DFSchema::try_from(batch.schema())?;
 
     // The physical expression binds columns by INDEX at plan time, so the
-    // cache key must include the schema: a text-only key made a reordered or
-    // retyped schema reuse the first plan and silently route values to the
-    // wrong columns.
-    let schema_key = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| format!("{}:{:?}", field.name(), field.data_type()))
-        .collect::<Vec<_>>()
-        .join(",");
-    let cache_key = format!("{schema_key}\u{0}{expr_str}");
+    // cache key must include the schema — unambiguously, see `cache_key_for`.
+    let cache_key = cache_key_for(&batch.schema(), expr_str);
 
     {
         if let Some(expr) = EXPR_CACHE.read().await.get(&cache_key) {
@@ -151,6 +163,7 @@ pub async fn evaluate_expr(
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::ScalarValue;
     use std::sync::Arc;
 
@@ -288,6 +301,52 @@ mod tests {
                 assert_eq!(v, vec!["a", "b", "c"]);
             }
             _ => panic!("Expected vector result"),
+        }
+    }
+
+    /// Regression (2026-11 review P1 #19 remainder): the old `name:Type`
+    /// comma join rendered a single field literally named `x:Int64,y` (Utf8)
+    /// identically to the two fields `x`(Int64) + `y`(Utf8), letting one
+    /// schema reuse the other's cached physical plan (plans bind columns by
+    /// INDEX) and route values to the wrong columns. Length-prefixed keys
+    /// must distinguish every byte sequence.
+    #[test]
+    fn cache_key_distinguishes_field_name_that_shadows_type_separator() {
+        let aliased = Schema::new(vec![Field::new("x:Int64,y", DataType::Utf8, true)]);
+        let expanded = Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("y", DataType::Utf8, true),
+        ]);
+        assert_ne!(
+            cache_key_for(&Arc::new(aliased), "expr"),
+            cache_key_for(&Arc::new(expanded), "expr"),
+            "a field name containing separator/type-like text must not alias another schema"
+        );
+    }
+
+    /// A batch with a comma/colon-bearing column evaluates by its real
+    /// column position, and the second evaluation (cache hit) matches the
+    /// uncached first one.
+    #[tokio::test]
+    async fn separator_bearing_column_evaluates_row_aligned_through_cache() {
+        let batch = RecordBatch::try_from_iter([(
+            "a,b:Int64",
+            Arc::new(StringArray::from(vec![Some("r0"), Some("r1")])) as _,
+        )])
+        .unwrap();
+
+        let expr = Expr::Expr {
+            expr: "\"a,b:Int64\"".to_string(),
+        };
+        let expected = vec!["r0".to_string(), "r1".to_string()];
+        let first = expr.evaluate_expr(&batch).await.unwrap();
+        let second = expr.evaluate_expr(&batch).await.unwrap();
+        match (first, second) {
+            (EvaluateResult::Vec(a), EvaluateResult::Vec(b)) => {
+                assert_eq!(a, expected);
+                assert_eq!(b, expected, "cache hit must match the uncached path");
+            }
+            _ => panic!("Expected vector results"),
         }
     }
 }

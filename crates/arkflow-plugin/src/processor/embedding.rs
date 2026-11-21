@@ -330,7 +330,19 @@ fn append_vector_column(
     target_field: &str,
     vectors: &[Vec<f32>],
 ) -> Result<MessageBatch, Error> {
-    let dim = vectors.first().map(|v| v.len()).unwrap_or(0) as i32;
+    let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
+    // Vectors may be concatenated across API responses; the per-response
+    // check above cannot see a cross-response mix (a model change
+    // mid-batch). Building the FixedSizeList from the first vector's dim
+    // used to misalign the flat buffer and panic — fail with both dims
+    // named instead.
+    if let Some(other) = vectors.iter().find(|v| v.len() != dim) {
+        return Err(Error::Process(format!(
+            "embedding processor: inconsistent vector dimensions ({dim} and {})",
+            other.len()
+        )));
+    }
+    let dim = dim as i32;
     let mut flat: Vec<Option<f32>> = Vec::with_capacity(vectors.len() * dim as usize);
     for vector in vectors {
         for value in vector {
@@ -536,6 +548,32 @@ mod tests {
             );
         }
         (dim, vectors)
+    }
+
+    /// Regression (2026-11 review P1 #15 remainder): vectors concatenated
+    /// across API responses can mix dimensions; building the FixedSizeList
+    /// from the first vector's dim used to misalign the flat buffer and
+    /// panic. Must fail with both dims named instead.
+    #[test]
+    fn append_vector_column_fails_on_cross_response_dimension_mix() {
+        let batch = text_batch(vec![Some("a"), Some("b")]);
+        let err = append_vector_column(&batch, "embedding", &[vec![0.0; 128], vec![0.0; 64]])
+            .expect_err("mixed dimensions must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("128") && msg.contains("64"),
+            "both dims named: {msg}"
+        );
+    }
+
+    #[test]
+    fn append_vector_column_keeps_consistent_vectors_aligned() {
+        let batch = text_batch(vec![Some("a"), Some("b")]);
+        let out = append_vector_column(&batch, "embedding", &[vec![1.0, 2.0], vec![3.0, 4.0]])
+            .expect("consistent dimensions succeed");
+        let (dim, vectors) = vector_column(&out, "embedding");
+        assert_eq!(dim, 2);
+        assert_eq!(vectors, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
     }
 
     #[tokio::test]

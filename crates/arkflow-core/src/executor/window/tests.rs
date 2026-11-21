@@ -386,7 +386,7 @@ async fn state_persist_and_restore_reproduces_aggregates() {
     op.process(batch(vec![(1_000, "a", 4)], None))
         .await
         .unwrap();
-    op.persist_buffers().unwrap();
+    op.persist_buffers().await.unwrap();
 
     let restored = operator(WindowTrigger::Watermark, backend);
     assert_eq!(restored.restore_buffers().unwrap(), 1);
@@ -4734,4 +4734,547 @@ async fn failed_fired_ack_rewinds_only_fire_touched_windows() {
     );
     // Compensation via touched images equals the whole-map snapshot restore.
     assert_eq!(*buffers, whole_map_before);
+}
+
+/// State backend wrapper counting namespace scans so the stale-scan gating in
+/// journaled persist is observable (spec: journaled persist cost SHALL NOT
+/// grow with open-window count — steady-state batches must not rescan).
+struct CountingBackend {
+    inner: crate::state::InMemoryStateBackend,
+    scans: AtomicUsize,
+}
+
+impl CountingBackend {
+    fn new() -> Result<Self, Error> {
+        Ok(Self {
+            inner: crate::state::InMemoryStateBackend::new(1)?,
+            scans: AtomicUsize::new(0),
+        })
+    }
+
+    fn scan_count(&self) -> usize {
+        self.scans.load(Ordering::SeqCst)
+    }
+}
+
+impl crate::state::StateBackend for CountingBackend {
+    fn format_version(&self) -> u32 {
+        self.inner.format_version()
+    }
+    fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.inner.get(namespace, key)
+    }
+    fn put_with_ttl(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), Error> {
+        self.inner
+            .put_with_ttl(namespace, key, value, ttl_ms, now_ms)
+    }
+    fn update_i64(&self, namespace: &str, key: &[u8], delta: i64) -> Result<i64, Error> {
+        self.inner.update_i64(namespace, key, delta)
+    }
+    fn delete(&self, namespace: &str, key: &[u8]) -> Result<bool, Error> {
+        self.inner.delete(namespace, key)
+    }
+    fn purge_expired(&self, now_ms: u64) -> Result<u64, Error> {
+        self.inner.purge_expired(now_ms)
+    }
+    fn scan(&self, namespace: &str) -> Result<Vec<crate::state::StateEntry>, Error> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        self.inner.scan(namespace)
+    }
+    fn snapshot_at(&self, now_ms: u64) -> Result<crate::state::StateSnapshot, Error> {
+        self.inner.snapshot_at(now_ms)
+    }
+    fn restore(&self, snapshot: &crate::state::StateSnapshot) -> Result<(), Error> {
+        self.inner.restore(snapshot)
+    }
+    fn metrics(&self) -> Result<crate::state::StateMetrics, Error> {
+        self.inner.metrics()
+    }
+    fn close(&self) -> Result<(), Error> {
+        self.inner.close()
+    }
+}
+
+/// The restore safety net scans once, then steady-state batches (mutations
+/// into existing windows, no removals) skip the whole-namespace scan entirely.
+#[tokio::test]
+async fn steady_state_journaled_persist_skips_stale_scan() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        eviction_config(default_max_buffered_keys()),
+        backend.clone(),
+        journal,
+        "window-scan-gating-test",
+    );
+
+    // First batch: the restore itself loads through a namespace scan, and the
+    // safety net runs the stale scan once — two scans, then none.
+    op.process_with_ack(
+        batch(vec![(100, "a", 10)], Some(100)),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        2,
+        "restore load scan + one safety-net stale scan"
+    );
+
+    // Steady state: the same window keeps receiving rows, nothing is removed —
+    // no batch may rescan the namespace.
+    for _ in 0..5 {
+        op.process_with_ack(
+            batch(vec![(100, "a", 1)], Some(100)),
+            Arc::new(crate::input::NoopAck),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        backend.scan_count(),
+        2,
+        "steady-state persists must not rescan the namespace"
+    );
+}
+
+/// A fired-and-expired buffer is removed; the next persist must scan and
+/// delete its backend entry, so a restart cannot resurrect the expired window.
+#[tokio::test]
+async fn expired_window_removal_schedules_backend_cleanup() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        eviction_config(default_max_buffered_keys()),
+        backend.clone(),
+        journal,
+        "window-stale-cleanup-test",
+    );
+
+    // Buffer the window (persist #1 = restore load scan + safety-net scan).
+    op.process_with_ack(
+        batch(vec![(100, "a", 10)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let state_key = {
+        let mut key = 0i64.to_be_bytes().to_vec();
+        key.extend_from_slice(b"a");
+        key
+    };
+    assert_eq!(backend.scan_count(), 2);
+
+    // Fire the window through the watermark and commit the fired output's
+    // acknowledgement: the aggregate lands in the backend. No buffer was
+    // removed, so no additional stale scan may run.
+    let fired = op.on_watermark(1500).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("the window should fire at watermark 1500");
+    };
+    fired_ack.ack().await.unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        2,
+        "a firing without removals skips the scan"
+    );
+    assert!(
+        backend
+            .inner
+            .get("window-stale-cleanup-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "the fired window's aggregate is committed to the backend"
+    );
+
+    // Past the lateness deadline (allowed_lateness_ms = 0): the emitted buffer
+    // is removed. This watermark fires nothing of its own, so the persist work
+    // here is exactly the stale scan plus the backend cleanup.
+    assert!(matches!(
+        op.on_watermark(3500).await.unwrap(),
+        ProcessResult::None
+    ));
+    assert_eq!(
+        backend.scan_count(),
+        3,
+        "buffer removal schedules exactly one stale scan"
+    );
+    assert!(
+        backend
+            .inner
+            .get("window-stale-cleanup-test", &state_key)
+            .unwrap()
+            .is_none(),
+        "the expired window's backend entry must be cleaned up (no restart resurrection)"
+    );
+}
+
+/// A stale entry with a LIVE replacement window is deferred until the
+/// replacement fires — and that firing removes no buffer, so the stale-scan
+/// gate must stay armed across it: the replacement's own persist must rescan
+/// and attach the delete to its fired transaction (a restart must not reload
+/// the old aggregate as a live buffer).
+#[tokio::test]
+async fn deferred_stale_cleanup_resolves_at_the_replacements_firing() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        WindowOperatorConfig {
+            kind: WindowKind::Tumbling { size_ms: 1_000 },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec!["value".into()],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 5_000,
+            legacy_payload: false,
+            max_buffered_keys: 2,
+        },
+        backend.clone(),
+        journal,
+        "window-deferred-cleanup-test",
+    );
+
+    // Two windows of key "a"; the watermark fires W(0,"a") only (retained for
+    // the 5s lateness). Acking the fired output commits its entry.
+    op.process_with_ack(
+        batch(vec![(100, "a", 1), (1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(1100).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("W(0,a) should fire at watermark 1100");
+    };
+    fired_ack.ack().await.unwrap();
+    let state_key = {
+        let mut key = 0i64.to_be_bytes().to_vec();
+        key.extend_from_slice(b"a");
+        key
+    };
+    assert!(
+        backend
+            .inner
+            .get("window-deferred-cleanup-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "W(0,a) aggregate committed"
+    );
+
+    // A third buffer overflows the 2-key cap: W(0,"a") (acks settled) is
+    // evicted while W(1000,"a") stays live. The eviction schedules a scan;
+    // the scan finds the committed entry with a live replacement and no
+    // fired transaction for "a" this round — DEFERRED, and the gate must
+    // STAY ARMED.
+    op.process_with_ack(
+        batch(vec![(2100, "b", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-deferred-cleanup-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "deferred entry stays until the replacement fires"
+    );
+
+    // The replacement W(1000,"a") fires — a firing that removes NO buffer.
+    // Its persist must rescan (gate still armed) and attach W(0,a)'s delete
+    // to its fired transaction, which the ack below commits.
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(2500).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("W(1000,a) should fire at watermark 2500");
+    };
+    fired_ack.ack().await.unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-deferred-cleanup-test", &state_key)
+            .unwrap()
+            .is_none(),
+        "the deferred entry is deleted by the replacement's fired acknowledgement (no restart resurrection)"
+    );
+
+    // The episode settles: the gate stayed armed after the staged delete (an
+    // aborted acknowledgement would have discarded it), so the next persist
+    // rescans, finds the backend clean, and only THEN clears the gate. Rows
+    // for the already-tracked key keep the buffer count at the cap, so no
+    // eviction cascades into the settle assertions.
+    let baseline = backend.scan_count();
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        baseline + 1,
+        "the armed gate rescans after the cleanup committed"
+    );
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        baseline + 1,
+        "a clean scan clears the gate; steady state is scan-free again"
+    );
+}
+
+/// An aborted acknowledgement compensates the journal apply, discarding the
+/// staged stale-key delete — but the entry stays discoverable: the aborted
+/// ack retains the operation lock for retry-in-place (the journal overlays
+/// including the staged delete stay intact), and retrying the SAME
+/// acknowledgement re-applies them so the delete lands. A restart reaches a
+/// fresh scan through the new operator's restore safety net. The stale key
+/// survives the abort in the backend and is deleted by the retry; it is
+/// never stranded with a cleared gate.
+#[tokio::test]
+async fn aborted_ack_keeps_stale_entry_discoverable_for_the_retry() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        WindowOperatorConfig {
+            kind: WindowKind::Tumbling { size_ms: 1_000 },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec!["value".into()],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 5_000,
+            legacy_payload: false,
+            max_buffered_keys: 2,
+        },
+        backend.clone(),
+        journal,
+        "window-abort-retry-test",
+    );
+
+    // W(0,"a") fires and its acknowledgement commits the aggregate.
+    op.process_with_ack(
+        batch(vec![(100, "a", 1), (1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(1100).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("W(0,a) should fire at watermark 1100");
+    };
+    fired_ack.ack().await.unwrap();
+    let state_key = {
+        let mut key = 0i64.to_be_bytes().to_vec();
+        key.extend_from_slice(b"a");
+        key
+    };
+    assert!(backend
+        .inner
+        .get("window-abort-retry-test", &state_key)
+        .unwrap()
+        .is_some());
+
+    // The 2-key cap evicts the ack-settled W(0,"a") while W(1000,"a") stays
+    // live: the scan finds the committed entry, has a live replacement, and
+    // defers — the gate stays armed.
+    op.process_with_ack(
+        batch(vec![(2100, "b", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+
+    // The replacement fires with a FAILING source ack: the delete for
+    // W(0,"a") is staged into the fired transaction, the journal applies it,
+    // and the abort compensates — the backend entry survives.
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(FailOnceAck {
+            fail: AtomicBool::new(true),
+        }),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(2500).await.unwrap();
+    let ProcessResult::SingleWithAck(_, output_ack) = fired else {
+        panic!("W(1000,a) should fire at watermark 2500");
+    };
+    assert!(
+        output_ack.ack().await.is_err(),
+        "the failing source ack aborts the composite acknowledgement"
+    );
+    assert!(
+        backend
+            .inner
+            .get("window-abort-retry-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "the abort discards the staged delete; the stale entry survives"
+    );
+
+    // The retry is the SAME composite acknowledgement: an aborted ack
+    // retains the operation lock by design (retry-in-place), so an in-process
+    // replayed batch would deadlock on the retained guard instead of running.
+    // Production reaches a fresh scan through attempt restart (the operator —
+    // and the retained guard with it — is dropped; the new operator's restore
+    // safety net arms the scan). Retrying re-applies the journal overlays
+    // (the staged delete among them) and the successful source commit makes
+    // the delete durable.
+    output_ack.ack().await.unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-abort-retry-test", &state_key)
+            .unwrap()
+            .is_none(),
+        "the retried acknowledgement deletes the stale entry"
+    );
+}
+
+/// An explicit abort() discards the staged transaction AND releases the
+/// operation lock — the operator survives. The armed gate drives a new scan
+/// on the next persist, and when the watermark passes every replacement's
+/// lateness deadline the expired buffers are removed too, so the scan's
+/// immediate cleanup deletes the stale backend entry with no fired
+/// transaction to own it (nothing can still recreate the key).
+#[tokio::test]
+async fn explicit_abort_then_expiry_cleans_stale_entry_via_armed_scan() {
+    let backend = Arc::new(CountingBackend::new().unwrap());
+    let journal = Arc::new(super::super::state_journal::StateJournal::new(
+        backend.clone() as Arc<dyn crate::state::StateBackend>,
+    ));
+    let op = ColumnarWindowOperator::with_journal(
+        WindowOperatorConfig {
+            kind: WindowKind::Tumbling { size_ms: 1_000 },
+            timestamp_field: "ts".into(),
+            key_field: "key".into(),
+            value_fields: vec!["value".into()],
+            trigger: WindowTrigger::Watermark,
+            trigger_interval_ms: 1_000,
+            watermark_field: "__watermark_ms".into(),
+            allowed_lateness_ms: 5_000,
+            legacy_payload: false,
+            max_buffered_keys: 2,
+        },
+        backend.clone(),
+        journal,
+        "window-abort-expiry-test",
+    );
+
+    // W(0,"a") fires and commits; the 2-key cap then evicts it while
+    // W(1000,"a") stays live (the deferred case, gate armed).
+    op.process_with_ack(
+        batch(vec![(100, "a", 1), (1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(1100).await.unwrap();
+    let ProcessResult::SingleWithAck(_, fired_ack) = fired else {
+        panic!("W(0,a) should fire at watermark 1100");
+    };
+    fired_ack.ack().await.unwrap();
+    let state_key = {
+        let mut key = 0i64.to_be_bytes().to_vec();
+        key.extend_from_slice(b"a");
+        key
+    };
+    assert!(backend
+        .inner
+        .get("window-abort-expiry-test", &state_key)
+        .unwrap()
+        .is_some());
+    op.process_with_ack(
+        batch(vec![(2100, "b", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+
+    // The replacement fires with a failing source ack; the test then ABORTS
+    // explicitly: the staged delete is discarded and the operation lock is
+    // RELEASED (the operator survives, gate still armed from the episode).
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(FailOnceAck {
+            fail: AtomicBool::new(true),
+        }),
+    )
+    .await
+    .unwrap();
+    let fired = op.on_watermark(2500).await.unwrap();
+    let ProcessResult::SingleWithAck(_, output_ack) = fired else {
+        panic!("W(1000,a) should fire at watermark 2500");
+    };
+    assert!(output_ack.ack().await.is_err());
+    output_ack.abort().await.unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-abort-expiry-test", &state_key)
+            .unwrap()
+            .is_some(),
+        "the abort discards the staged delete; the stale entry survives"
+    );
+
+    // A new persist runs (gate armed) and re-detects the stale entry. The
+    // replacement windows fire (their outputs stay unacknowledged), and one
+    // watermark later they expire past the lateness deadline: both buffers
+    // are removed, nothing can recreate key "a", and the scan's immediate
+    // cleanup deletes the stale backend entry with no fired transaction.
+    // Assert the rescan happens HERE — expiry re-arms the gate anyway, so
+    // the final deletion alone would not prove the gate survived the abort.
+    let post_abort_baseline = backend.scan_count();
+    op.process_with_ack(
+        batch(vec![(1100, "a", 1)], None),
+        Arc::new(crate::input::NoopAck),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend.scan_count(),
+        post_abort_baseline + 1,
+        "the armed gate rescans after the abort, before expiry re-arms it"
+    );
+    op.on_watermark(18000).await.unwrap();
+    op.on_watermark(23000).await.unwrap();
+    assert!(
+        backend
+            .inner
+            .get("window-abort-expiry-test", &state_key)
+            .unwrap()
+            .is_none(),
+        "abort → armed rescan → expiry cleanup deletes the stale entry"
+    );
 }

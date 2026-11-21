@@ -627,13 +627,20 @@ impl SqlProcessor {
                 .map(|(_, plan)| plan.clone())
         };
 
-        // `ctx.state()` refreshes the query execution start time per call, so
-        // optimization below sees the current batch's time, not a stale one.
-        let state = ctx.state();
+        // `ctx.state()` deep-clones the whole SessionState (DataFusion returns
+        // it by value and refreshes the execution start time). The fully
+        // cached fast path — analyzed/optimized/physical all hit for this
+        // schema on a non-time-dependent query — never needs it, so it is
+        // taken lazily: cache misses and time-dependent queries (which
+        // re-optimize per batch so folded timestamps stay current) still get
+        // a fresh state, and `get_or_insert_with` guarantees at most one
+        // clone per batch.
+        let mut state: Option<datafusion::execution::session_state::SessionState> = None;
 
         let analyzed = match cached_analyzed {
             Some(plan) => plan,
             None => {
+                let state = state.get_or_insert_with(|| ctx.state());
                 let plan = state
                     .statement_to_plan(self.statement.clone())
                     .await
@@ -667,6 +674,7 @@ impl SqlProcessor {
         let plan = match cached_optimized {
             Some(plan) => plan,
             None => {
+                let state = state.get_or_insert_with(|| ctx.state());
                 let optimized = Arc::new(
                     state
                         .optimize(&analyzed)
@@ -708,9 +716,10 @@ impl SqlProcessor {
             None => {
                 self.physical_plan_builds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let state = state.get_or_insert_with(|| ctx.state());
                 let physical = state
                     .query_planner()
-                    .create_physical_plan(&plan, &state)
+                    .create_physical_plan(&plan, state)
                     .await
                     .map_err(|e| Error::Process(format!("Physical planning error: {}", e)))?;
                 if cacheable {

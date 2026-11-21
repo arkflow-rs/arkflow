@@ -47,7 +47,6 @@ Pulsar 输入(Input)订阅 Apache Pulsar 主题(Topic),支持四种订阅(Subscr
 |-------|------|----------|---------|-------------|
 | certificate_chain_file | string | no | — | 客户端证书链路径(PEM),用于 mTLS。 |
 | hostname_verification | boolean | no | `true` | 是否校验 broker 证书主机名。 |
-| ca_file | string | no | — | 为 schema 兼容而接受,但当前**不会生效**——底层驱动没有自定义根证书 API,无论是否设置都使用系统信任库。不要把它当作私有信任锚。 |
 
 ## 示例
 

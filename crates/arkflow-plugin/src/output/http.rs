@@ -133,13 +133,16 @@ impl Output for HttpOutput {
 
 impl HttpOutput {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
-        let client_arc = self.client.clone();
-        let client_arc_guard = client_arc.lock().await;
-        if !self.connected.load(Ordering::SeqCst) || client_arc_guard.is_none() {
-            return Err(Error::Connection("The output is not connected".to_string()));
-        }
-
-        let client = client_arc_guard.as_ref().unwrap();
+        // Clone the client out under a short critical section and release the
+        // lock before any await: holding this mutex across the send+retry
+        // loop serialized every concurrent write behind one in-flight request.
+        let client = {
+            let guard = self.client.lock().await;
+            if !self.connected.load(Ordering::SeqCst) || guard.is_none() {
+                return Err(Error::Connection("The output is not connected".to_string()));
+            }
+            guard.as_ref().unwrap().clone()
+        };
         // Build the request
         let mut request_builder = match self.config.method.to_uppercase().as_str() {
             "GET" => client.get(&self.config.url),
@@ -238,11 +241,12 @@ impl HttpOutput {
 
             retry_count += 1;
             if retry_count <= self.config.retry_count {
-                // Index backoff retry
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    100 * 2u64.pow(retry_count - 1),
-                ))
-                .await;
+                // Index backoff retry. Saturating: `retry_count` is a config
+                // value with no upper bound, and 100 * 2^(n-1) overflows u64
+                // from n=58 on — a plain multiply panicked (debug) or wrapped
+                // to a garbage delay (release) on what is just a retry.
+                let backoff_ms = 100u64.saturating_mul(2u64.saturating_pow(retry_count - 1));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
         }
 
