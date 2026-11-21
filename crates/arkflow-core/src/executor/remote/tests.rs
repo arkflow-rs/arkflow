@@ -317,9 +317,8 @@ async fn max_frame_len_rejects_oversized_frames_on_the_send_side() {
         Arc::new(Int64Array::from(vec![1])),
         Arc::new(StringArray::from(vec![blob.as_str()])),
     ];
-    let oversized = MessageBatch::new_arrow(
-        RecordBatch::try_new(schema, columns).expect("valid batch"),
-    );
+    let oversized =
+        MessageBatch::new_arrow(RecordBatch::try_new(schema, columns).expect("valid batch"));
     let quad = quad_a_to_b();
     let config = NetworkManagerConfig {
         max_frame_len: MIN_FRAME_LEN,
