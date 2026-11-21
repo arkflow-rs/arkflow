@@ -12,7 +12,8 @@ use super::transport::{
     DataPlaneTlsConfig, EdgeTransport, RemoteStream,
 };
 use super::wire::{
-    FrameHeader, FrameKind, Quad, ReceiptFrame, ReceiptKind, TieredFrame, WireSignal, MAX_FRAME_LEN,
+    FrameHeader, FrameKind, Quad, ReceiptFrame, ReceiptKind, TieredFrame, WireSignal,
+    MAX_FRAME_LEN, MIN_FRAME_LEN,
 };
 use crate::executor::envelope::Envelope;
 use crate::Error;
@@ -111,6 +112,23 @@ impl NetworkManagerConfig {
         if self.max_frame_len > MAX_FRAME_LEN {
             return Err(Error::Config(format!(
                 "network shuffle max_frame_len must not exceed {MAX_FRAME_LEN}"
+            )));
+        }
+        // The v2 handshake JSON (two 32-byte nonces, identity fields, MAC)
+        // needs several hundred bytes; a smaller cap advertises shuffle and
+        // then fails every handshake.
+        if self.max_frame_len < MIN_FRAME_LEN {
+            return Err(Error::Config(format!(
+                "network shuffle max_frame_len must be at least {MIN_FRAME_LEN} to carry the protocol handshake"
+            )));
+        }
+        // Tokio panics when a Semaphore is created above MAX_PERMITS; keep the
+        // failure in validation so the agent gets the configuration error and
+        // its colocated-only fallback instead of a panic.
+        if self.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(Error::Config(format!(
+                "network shuffle max_connections must not exceed {}",
+                tokio::sync::Semaphore::MAX_PERMITS
             )));
         }
         if self
@@ -257,6 +275,14 @@ impl PendingReceipts {
     #[cfg(test)]
     pub(crate) fn new(max_entries: usize) -> Self {
         Self::with_byte_budget(max_entries, u64::MAX)
+    }
+
+    /// Whether a batch of this Arrow memory size can never fit the byte
+    /// budget regardless of what is currently retained: such a batch is
+    /// permanently undeliverable and must fail the edge instead of looping
+    /// through abort-and-redeliver.
+    pub(crate) fn never_fits(&self, batch_bytes: u64) -> bool {
+        batch_bytes > self.max_pending_bytes
     }
 
     pub(crate) fn with_byte_budget(max_entries: usize, max_pending_bytes: u64) -> Self {
@@ -1439,8 +1465,13 @@ impl NetworkManager {
                         // Either the pump hit a wire failure or the read half
                         // dropped the connection; both are stream-level. Retry
                         // within the budget when a redial handle exists and the
-                        // session is still live.
-                        let retry = reconnectable
+                        // session is still live — but deterministic protocol
+                        // and authentication errors recur with the same bytes
+                        // on every redial, so reconnecting only delays the
+                        // honest terminal failure (and could mask it if a
+                        // later connection briefly succeeds).
+                        let retry = !is_deterministic_protocol_error(&error)
+                            && reconnectable
                             && attempts_left > 0
                             && !manager.shutdown.is_cancelled()
                             && manager
@@ -2229,6 +2260,39 @@ impl HandshakeGate {
 /// supervisor: the branches must stay registered so a reconnect can replay
 /// them, and the supervisor aborts them if recovery does not succeed.
 #[allow(clippy::too_many_arguments)]
+/// Deterministic protocol/authentication failures recur on every reconnect
+/// with the same bytes: forged or malformed frames, credential mismatch,
+/// replayed nonces, quad/generation mismatches. Transparent reconnect cannot
+/// repair them and would only delay (or, if a later connection briefly
+/// succeeds, mask) the honest terminal failure. Transport-level faults —
+/// EOF, idle timeouts, resets — deliberately stay retriable.
+pub(crate) fn is_deterministic_protocol_error(error: &Error) -> bool {
+    let Error::Process(message) = error else {
+        return false;
+    };
+    const DETERMINISTIC: [&str; 12] = [
+        // FrameCrypto::open (v2 per-frame authentication)
+        "remote edge frame authentication failed",
+        "remote edge frame authentication tag has the wrong length",
+        // handshake MAC / replay / identity gates
+        "remote edge handshake credential mismatch",
+        "remote edge handshake nonce was replayed",
+        "remote edge handshake protocol or identity mismatch",
+        "remote edge handshake acknowledgement identity mismatch",
+        // frame-layer protocol gates
+        "remote edge frame has unknown kind",
+        "remote edge frame declares ",
+        "duplicate remote edge handshake",
+        "does not match authenticated quad",
+        "remote edge frame arrived before handshake",
+        "frame on a receipt channel",
+    ];
+    DETERMINISTIC
+        .iter()
+        .any(|fragment| message.contains(fragment))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_edge_connection(
     stream: Box<dyn RemoteStream>,
     quad: Quad,
@@ -2573,13 +2637,21 @@ pub(crate) async fn pump_edge(
                         ) {
                             Ok(seq) => seq,
                             Err(error) => {
-                                // Budget exceeded is a DELIVERY-level failure,
-                                // never an attempt failure: abort the branch so
-                                // the upstream compensates and re-delivers
-                                // (at-least-once), then keep serving the
-                                // channel. Tearing the connection down here
-                                // would escalate transient congestion into a
-                                // reconnect/fail-closed cycle.
+                                // A batch whose Arrow memory alone exceeds the
+                                // byte budget can NEVER fit, even with the map
+                                // empty: abort-and-redeliver would livelock a
+                                // rewinding source with no terminal error. That
+                                // case fails the edge (same outcome as an
+                                // oversized frame); everything else is
+                                // DELIVERY-level transient congestion — abort
+                                // the branch for upstream redelivery
+                                // (at-least-once) and keep serving the channel.
+                                let batch_bytes =
+                                    batch.record_batch().get_array_memory_size() as u64;
+                                if pending.never_fits(batch_bytes) {
+                                    result = Err(error);
+                                    break;
+                                }
                                 if let Some(abort_error) = branch.abort().await.err() {
                                     // The branch could not be rewound, so the
                                     // edge cannot continue honestly: the

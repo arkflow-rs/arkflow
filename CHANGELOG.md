@@ -206,14 +206,22 @@ rather than listed commit-by-commit.
   payload, and a connection-level monotonic sequence number, verified
   before any payload parsing. Forged, modified, or replayed frames fail
   closed as deterministic protocol errors.
+- Data-plane determinism hardening: authentication/protocol errors
+  (forged or malformed frames, credential mismatch, nonce replay, quad
+  mismatch) fail the attempt immediately instead of consuming the reconnect
+  budget, and a batch whose Arrow memory alone exceeds the pending-replay
+  byte budget fails the edge instead of livelocking abort-and-redeliver on a
+  rewinding source.
 - Data-plane resource/SLO tuning for agents: `ARKFLOW_DATA_PLANE_MAX_CONNECTIONS`,
   `ARKFLOW_DATA_PLANE_RECONNECT_ATTEMPTS`, `ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS`,
   `ARKFLOW_DATA_PLANE_REGISTRATION_GRACE_MS`, and
   `ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES` (all optional, defaults unchanged);
   connection rejections are surfaced through a bounded counter with a
   throttled warning instead of an unconsumed channel.
-- Data-frame IPC bodies decode zero-copy (shared-ownership `Bytes` buffers
-  end to end), removing the per-frame full-payload second copy.
+- Data-frame IPC bodies decode without the intermediate full-body copy
+  (shared-ownership `Bytes` buffers carry the IPC body into Arrow), removing
+  the per-frame whole-body second copy; Arrow may still copy individual
+  array buffers when alignment requires it.
 
 ### Added — Components
 

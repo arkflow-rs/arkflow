@@ -98,7 +98,7 @@ openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
 
 跨节点 shuffle 帧在应用层独立于 TLS 认证(线协议 v2):会话握手双向交换新鲜 nonce,并由共享秘密派生每连接、每方向的会话密钥;此后每一帧(数据、信号、回执)都携带截断 HMAC tag,覆盖其帧头、负载与连接级单调序号,并在任何负载解析之前验证。伪造、篡改或重放的帧一律以确定性协议错误 fail-closed。mTLS(上文)仍是机密性的 opt-in 层;帧认证始终开启。
 
-**秘密配置(BREAKING)。**共享秘密只来自 `ARKFLOW_DATA_PLANE_SECRET`。此前回退到舰队共享 `node_token` 的行为已移除——单节点失陷不得升级为全舰队数据面失陷。未显式配置秘密的节点以 colocated-only 运行(启动告警,不监听数据面端口)。请为每个参与 shuffle 的节点设置同一秘密,并视其为独立凭证(支持 `${secret:...}` secret 引用)。
+**秘密配置(BREAKING)。**共享秘密只来自 `ARKFLOW_DATA_PLANE_SECRET`。此前回退到舰队共享 `node_token` 的行为已移除:泄露的注册令牌不再同时泄露 shuffle 秘密。未显式配置秘密的节点以 colocated-only 运行(启动告警,不监听数据面端口)。请为每个参与 shuffle 的节点设置同一秘密。该值**按字面使用**——`${secret:...}`/`${env:...}` 引用只在配置文件中解析,对此环境变量不生效。注意这**不**构成如下信任边界:每个参与 Agent 都持有同一 shuffle 秘密,被攻陷的 shuffle Agent 依然持有它——一旦怀疑泄露,轮换共享秘密(所有 Agent 以新值重启)。
 
 **升级窗口。**v2 线格式与 v1 不互通:混合版本舰队的数据面握手 fail-closed。请先停止分布式 Job,同窗口升级全部 Agent 后再重启。若此前依赖 `node_token` 回退,升级前先在每个节点配置 `ARKFLOW_DATA_PLANE_SECRET`。
 
@@ -110,9 +110,9 @@ openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
 | `ARKFLOW_DATA_PLANE_RECONNECT_ATTEMPTS` | `5` | 每条失败边的透明重连次数;`0` = 立即 fail-closed。 |
 | `ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS` | `10000` | 下游边丢失后等待重注册再报失败的窗口。 |
 | `ARKFLOW_DATA_PLANE_REGISTRATION_GRACE_MS` | `10000` | 每条已认证入站连接的路由注册预算。 |
-| `ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES` | `268435456` | 单帧负载上限(256 MiB),发送与接收两侧同时强制。 |
+| `ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES` | `268435456` | 单帧负载上限(256 MiB),发送与接收两侧同时强制。须落在 `1024..=268435456`——协议握手需要数百字节,更小的上限无法承载任何流量。 |
 
-畸形值(非整数)使 Agent 启动失败;越界值(如帧上限超过协议天花板)使节点降级为 colocated-only 并告警。
+这些变量仅在配置了数据端口且存在显式秘密时被读取(该路径才会构造 manager)。畸形值(非整数,或超过 `u32` 帧上限天花板的整数如 `4294967296`)使 Agent 启动失败。可解析但未通过 manager 校验的值(帧上限低于 `1024` 或高于 `268435456` 如 `268435457`,连接数超过 Tokio 许可上限)使节点降级为 colocated-only 并告警。
 
 ### 限速
 

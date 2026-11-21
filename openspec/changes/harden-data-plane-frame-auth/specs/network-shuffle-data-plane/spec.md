@@ -71,7 +71,7 @@
 
 ### Requirement: Ack 三态镜像回执
 
-数据 Envelope 跨远程边传输时，其源 ack SHALL 延迟至**所有**下游副本的回执齐备后才完成；下游的持有语义 SHALL 忠实镜像回上游。上游聚合 SHALL 复用既有 fan-out 分支 ack 机制（分支计数、防重复、abort/undo 补偿），不得引入第二套聚合状态机。下游处理失败 abort 该交付时，接收端 SHALL 回发 `Failed(seq)` 回执；上游收到后 SHALL 立即移除对应 pending 条目并 abort 该分支（补偿），而不等待 barrier drain 超时——超时路径降级为 Failed 帧丢失时的兜底。重复 `Failed` 回执 SHALL 幂等（未知 seq 丢弃）。pending receipt 预算（条数或字节）超限时 SHALL 走单次交付的发送失败路径（abort 该分支、上游重投递），MUST NOT 升级为 attempt 或 Job 失败。
+数据 Envelope 跨远程边传输时，其源 ack SHALL 延迟至**所有**下游副本的回执齐备后才完成；下游的持有语义 SHALL 忠实镜像回上游。上游聚合 SHALL 复用既有 fan-out 分支 ack 机制（分支计数、防重复、abort/undo 补偿），不得引入第二套聚合状态机。下游处理失败 abort 该交付时，接收端 SHALL 回发 `Failed(seq)` 回执；上游收到后 SHALL 立即移除对应 pending 条目并 abort 该分支（补偿），而不等待 barrier drain 超时——超时路径降级为 Failed 帧丢失时的兜底。重复 `Failed` 回执 SHALL 幂等（未知 seq 丢弃）。pending receipt 预算（条数或字节）超限时 SHALL 走单次交付的发送失败路径（abort 该分支、上游重投递），MUST NOT 升级为 attempt 或 Job 失败——**但批次自身的 Arrow 内存单独超过字节预算时除外**：该批次永远无法进入重放缓存，abort-and-redeliver 对会回卷位点的源构成无进展活锁，SHALL 以显式错误终止该边（fail-closed）。
 
 #### Scenario: 全副本回执后源 ack 完成
 
@@ -90,8 +90,13 @@
 
 #### Scenario: pending 预算超限不升级为 Job 失败
 
-- **WHEN** 单次交付因 pending receipt 条数或字节预算超限而无法注册
+- **WHEN** 单次交付因 pending receipt 条数或字节预算超限而无法注册，且该批次的内存小于字节预算
 - **THEN** 仅该交付走发送失败路径（分支 abort、上游重投递），attempt 与 Job 不因此失败
+
+#### Scenario: 永久超过字节预算的批次终止该边
+
+- **WHEN** 一个批次的 Arrow 内存单独超过 `max_pending_bytes`（即使重放缓存为空也无法注册）
+- **THEN** 该边以显式错误 fail-closed，而非反复 abort-重投递形成无进展循环
 
 #### Scenario: Held 控制帧丢失安全降级
 
@@ -105,7 +110,7 @@
 
 ### Requirement: 远程边失败 fail-closed
 
-远程边连接断开、协议校验失败、认证失败、资源上限溢出或对端不可达时，内核 SHALL 使受影响的 Job attempt 失败并清理该边两端资源，MUST NOT 让链路停留在半开状态继续产出或丢弃数据——**但在重连预算内除外**：配置了 `reconnect_attempts > 0` 时，流级失败（任一半程的传输错误）SHALL 在预算次数内以退避重拨并重放全部未回执数据帧；预算耗尽、会话已移除或全局关停 SHALL 走 fail-closed 路径。确定性协议错误（非法帧、认证失败）重放必然复现，按预算耗尽处理。`reconnect_attempts = 0` SHALL 逐位保持立即 fail-closed 行为。重连预算与宽限 SHALL 可由运维配置（Agent 启动配置/环境变量），使断边恢复窗口这一隐式 SLO 显式可调；未配置时维持既有默认值。
+远程边连接断开、协议校验失败、认证失败、资源上限溢出或对端不可达时，内核 SHALL 使受影响的 Job attempt 失败并清理该边两端资源，MUST NOT 让链路停留在半开状态继续产出或丢弃数据——**但在重连预算内除外**：配置了 `reconnect_attempts > 0` 时，流级失败（任一半程的传输错误）SHALL 在预算次数内以退避重拨并重放全部未回执数据帧；预算耗尽、会话已移除或全局关停 SHALL 走 fail-closed 路径。确定性协议/认证错误（非法帧、认证/完整性校验失败、nonce 重放、quad/generation 不匹配）SHALL 立即 fail-closed 并终止 attempt，MUST NOT 消耗重连预算或被后续连接的成功掩盖；重连预算仅用于传输级瞬时故障（EOF、空闲超时、重置）。`reconnect_attempts = 0` SHALL 逐位保持立即 fail-closed 行为。重连预算与宽限 SHALL 可由运维配置（Agent 启动配置/环境变量），使断边恢复窗口这一隐式 SLO 显式可调；未配置时维持既有默认值。
 
 #### Scenario: 断链失败传播
 
@@ -121,6 +126,11 @@
 
 - **WHEN** 运维将 `reconnect_attempts` 与 `reconnect_grace` 配置为更大的值后发生一次 60 秒网络分区
 - **THEN** 受影响边在预算与宽限内透明恢复，不产生失败上报；配置未变时 30 秒分区按既有默认行为失败
+
+#### Scenario: 认证失败不进入重连
+
+- **WHEN** 一条可重连边收到帧认证失败（确定性协议错误）
+- **THEN** 该 attempt 立即 fail-closed 上报，重连预算不被消耗，也不会因后续连接碰巧成功而掩盖该错误
 
 #### Scenario: 预算耗尽 fail-closed
 

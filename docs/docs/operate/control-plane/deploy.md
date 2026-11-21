@@ -206,11 +206,15 @@ frame authentication is always on.
 
 **Secret configuration (BREAKING).** The shared secret comes exclusively
 from `ARKFLOW_DATA_PLANE_SECRET`. The previous fallback to the fleet-shared
-`node_token` was removed — a compromised node must not imply the compromise
-of the whole fleet's data plane. A node without an explicit secret runs
-colocated-only (startup warning, no data-plane listener). Set the same
-secret on every node that participates in shuffle, and treat it as a
-dedicated credential (secret reference `${secret:...}` supported).
+`node_token` was removed: a leaked registration token no longer reveals the
+shuffle secret. A node without an explicit secret runs colocated-only
+(startup warning, no data-plane listener). Set the same secret on every
+node that participates in shuffle. The value is used **as written** —
+`${secret:...}`/`${env:...}` references are resolved only in configuration
+files, never in this environment variable. Note the trust boundary this
+does NOT create: every participating Agent holds the same shuffle secret,
+so a compromised shuffle Agent still holds it — rotate the shared secret
+(restart all Agents with the new value) whenever it may be exposed.
 
 **Upgrade window.** The v2 wire format is not interoperable with v1: in a
 mixed-version fleet the data-plane handshake fails closed. Stop distributed
@@ -226,11 +230,15 @@ BEFORE upgrading.
 | `ARKFLOW_DATA_PLANE_RECONNECT_ATTEMPTS` | `5` | Transparent reconnect redials per failed edge; `0` = immediate fail-closed. |
 | `ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS` | `10000` | How long a lost downstream edge waits for re-registration before reporting failure. |
 | `ARKFLOW_DATA_PLANE_REGISTRATION_GRACE_MS` | `10000` | Route-registration budget per authenticated inbound connection. |
-| `ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES` | `268435456` | Single-frame payload cap (256 MiB), enforced on both the send and receive side. |
+| `ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES` | `268435456` | Single-frame payload cap (256 MiB), enforced on both the send and receive side. Must stay within `1024..=268435456` — the protocol handshake needs several hundred bytes, so smaller caps cannot carry any traffic. |
 
-Malformed values fail agent startup; out-of-range values (for example a
-frame cap above the protocol ceiling) degrade the node to colocated-only
-with a warning.
+These settings are read only when a data port is configured AND an explicit
+secret is present (the manager is constructed on that path). Malformed
+values (non-integers, or integers above the `u32` frame-cap ceiling such as
+`4294967296`) fail agent startup. Values that parse but fail manager
+validation (a frame cap below `1024` or above `268435456`, such as
+`268435457`, or a connection cap above Tokio's permit ceiling) degrade the
+node to colocated-only with a warning.
 
 ### Rate limiting
 

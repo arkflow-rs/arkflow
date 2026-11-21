@@ -18,6 +18,11 @@ pub(crate) const FRAME_HEADER_LEN: usize = 24;
 /// the connection-level sequence number.
 pub(crate) const FRAME_TAG_LEN: usize = 16;
 
+/// Lower bound for the configurable per-frame payload cap: the v2 handshake
+/// JSON (two 32-byte nonces, identity fields, and the MAC) needs several
+/// hundred bytes, and a cap below this cannot carry any protocol traffic.
+pub(crate) const MIN_FRAME_LEN: u32 = 1024;
+
 /// Routing identity of one (upstream task subtask → downstream subtask)
 /// channel. All frames on the wire address a quad; one TCP connection serves
 /// one quad.
@@ -74,12 +79,9 @@ impl FrameHeader {
     }
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         out.reserve(FRAME_HEADER_LEN);
-        out.extend_from_slice(&self.quad.src_op.to_le_bytes());
-        out.extend_from_slice(&self.quad.src_subtask.to_le_bytes());
-        out.extend_from_slice(&self.quad.dst_op.to_le_bytes());
-        out.extend_from_slice(&self.quad.dst_subtask.to_le_bytes());
-        out.extend_from_slice(&self.len.to_le_bytes());
-        out.extend_from_slice(&(self.kind as u32).to_le_bytes());
+        // Single encoder: the wire header and the frame-MAC input must never
+        // drift apart when a field changes.
+        out.extend_from_slice(&self.encode_fixed());
     }
 
     /// Encodes into a fixed 24-byte buffer without allocation — the frame

@@ -4401,6 +4401,9 @@ async fn data_plane_setup_advertises_or_degrades_gracefully() {
     })
     .await;
     stop_agent(agent, cancel).await;
+    // Scoped restoration: a leaked secret would turn the missing-secret
+    // contract tests below into accidental listener setups.
+    unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_SECRET") };
 
     hub_cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), hub_server).await;
@@ -6304,6 +6307,9 @@ async fn terminal_acknowledgement_prevents_execution() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pre_cancelled_agent_without_a_secret_skips_the_data_plane() {
     let _guard = ENV_LOCK.lock().await;
+    // Establish the precondition explicitly: earlier tests may have left the
+    // variable set (see the scoped-restoration note in the setup test).
+    unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_SECRET") };
     let cancel = CancellationToken::new();
     cancel.cancel();
     let outcome = run(

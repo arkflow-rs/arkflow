@@ -70,7 +70,9 @@ pub(crate) use auth::{
 #[cfg(test)]
 pub(crate) use codec::{read_piece, DataDecoder, DataEncoder, Piece};
 #[cfg(test)]
-pub(crate) use manager::{pump_edge, run_edge_connection, PendingReceipts, RemoteAck};
+pub(crate) use manager::{
+    is_deterministic_protocol_error, pump_edge, run_edge_connection, PendingReceipts, RemoteAck,
+};
 #[cfg(test)]
 pub(crate) use transport::{
     read_exact_with_idle, read_frame, read_frame_with_limits, write_frame, write_frame_sealed,
@@ -79,7 +81,7 @@ pub(crate) use transport::{
 #[cfg(test)]
 pub(crate) use wire::{
     FrameHeader, FrameKind, ReceiptFrame, ReceiptKind, WireDataMeta, WireSignal, FRAME_HEADER_LEN,
-    MAX_FRAME_LEN,
+    MAX_FRAME_LEN, MIN_FRAME_LEN,
 };
 
 // Bindings the extracted `tests` module reaches through `use super::*`,

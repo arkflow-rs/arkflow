@@ -216,9 +216,11 @@ async fn connection_overflow_is_counted_as_a_bounded_resource_rejection() {
 }
 
 /// Auth-overhead quantification (ignored: developer-run timing, not a CI
-/// gate — the benchmark contract forbids performance assertions). Sealed vs
-/// plaintext frame roundtrips over an in-memory duplex, same payloads and
-/// flush points, so the delta isolates the HMAC tag cost.
+/// gate — the benchmark contract forbids performance assertions). One-way
+/// measurement: sealed writes versus plaintext writes over an in-memory
+/// duplex with a raw byte reader (no tag verification on the read side).
+/// The ratio includes the 16-byte tags and transport overhead, not only the
+/// HMAC computation.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "timing benchmark; run explicitly with --ignored"]
 async fn auth_frame_roundtrip_timing() {
@@ -293,7 +295,7 @@ async fn auth_frame_roundtrip_timing() {
 
     let megabytes = (FRAMES * payload_len) as f64 / 1_048_576.0;
     println!(
-        "auth frame roundtrip timing: plain {plain:?} vs sealed {sealed:?} for {megabytes:.0} MiB x2 directions ({FRAMES} frames); sealed/plain = {:.2}",
+        "auth frame write timing (one-way, raw reader): plain {plain:?} vs sealed {sealed:?} for {megabytes:.0} MiB ({FRAMES} frames); sealed/plain = {:.2} (includes tag bytes and transport overhead, not just HMAC)",
         sealed.as_secs_f64() / plain.as_secs_f64()
     );
 }
@@ -302,10 +304,12 @@ async fn auth_frame_roundtrip_timing() {
 async fn max_frame_len_rejects_oversized_frames_on_the_send_side() {
     let quad = quad_a_to_b();
     let config = NetworkManagerConfig {
-        max_frame_len: 64,
+        max_frame_len: MIN_FRAME_LEN,
         ..Default::default()
     };
-    config.validate().expect("small cap is a valid config");
+    config
+        .validate()
+        .expect("the minimum cap is a valid config");
     let (writer, _reader) = tokio::io::duplex(64 * 1024);
     let (tx, rx) = flume::bounded::<Envelope>(4);
     tx.send_async(Envelope::Data(
@@ -331,7 +335,126 @@ async fn max_frame_len_rejects_oversized_frames_on_the_send_side() {
     .await
     .unwrap_err();
     assert!(
-        error.to_string().contains("exceeds the 64 limit"),
+        error
+            .to_string()
+            .contains(&format!("exceeds the {MIN_FRAME_LEN} limit")),
+        "{error}"
+    );
+}
+
+#[test]
+fn network_manager_config_rejects_unusable_caps_and_permit_overflow() {
+    // A cap below the protocol floor advertises shuffle and then fails every
+    // handshake: rejected in validation, not at the first edge.
+    let config = NetworkManagerConfig {
+        max_frame_len: MIN_FRAME_LEN - 1,
+        ..Default::default()
+    };
+    let error = config.validate().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("must be at least 1024 to carry the protocol handshake"),
+        "{error}"
+    );
+    // Tokio panics when a Semaphore exceeds MAX_PERMITS; validation must catch
+    // it so the agent gets the configuration error and its fallback.
+    let config = NetworkManagerConfig {
+        max_connections: usize::MAX,
+        ..Default::default()
+    };
+    let error = config.validate().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("max_connections must not exceed"),
+        "{error}"
+    );
+    // The defaults remain valid.
+    NetworkManagerConfig::default().validate().unwrap();
+}
+
+#[test]
+fn deterministic_protocol_errors_are_classified_for_no_reconnect() {
+    // Classified (terminal on first occurrence, no reconnect budget spent).
+    for message in [
+        "remote edge frame authentication failed",
+        "remote edge frame authentication tag has the wrong length",
+        "remote edge handshake credential mismatch",
+        "remote edge handshake nonce was replayed",
+        "remote edge handshake protocol or identity mismatch",
+        "remote edge handshake acknowledgement identity mismatch",
+        "remote edge frame has unknown kind 9",
+        "remote edge frame declares 99 bytes, above the 64 limit",
+        "duplicate remote edge handshake",
+        "remote edge frame quad Quad { .. } does not match authenticated quad Quad { .. }",
+        "remote edge frame arrived before handshake",
+        "unexpected Data frame on a receipt channel",
+    ] {
+        let error = Error::Process(message.into());
+        assert!(
+            is_deterministic_protocol_error(&error),
+            "must classify: {message}"
+        );
+    }
+    // Transport-level faults stay retriable.
+    for message in [
+        "remote edge closed while reading header: early eof",
+        "remote edge closed while reading header: read idle timeout",
+        "remote edge write failed: connection reset",
+        "remote edge connect to 127.0.0.1:1 failed after 5 attempts",
+    ] {
+        let error = Error::Process(message.into());
+        assert!(
+            !is_deterministic_protocol_error(&error),
+            "must stay retriable: {message}"
+        );
+    }
+    // Non-Process errors are transport/config-shaped, never deterministic.
+    assert!(!is_deterministic_protocol_error(&Error::Config("x".into())));
+}
+
+#[tokio::test]
+async fn pending_receipts_never_fitting_batch_fails_the_edge() {
+    // A batch whose Arrow memory alone exceeds the byte budget can never fit
+    // the replay cache even when it is empty: abort-and-redeliver would
+    // livelock a rewinding source, so the edge fails closed instead.
+    let quad = quad_a_to_b();
+    let config = NetworkManagerConfig {
+        max_pending_bytes: 1,
+        ..Default::default()
+    };
+    let (writer, _reader) = tokio::io::duplex(64 * 1024);
+    let (tx, rx) = flume::bounded::<Envelope>(4);
+    let batch = Arc::new(MessageBatch::new_arrow(large_batch(16)));
+    assert!(
+        batch.record_batch().get_array_memory_size() as u64 > 1,
+        "the fixture batch must exceed the 1-byte budget"
+    );
+    tx.send_async(Envelope::Data(batch, Arc::new(RecordingAck::default())))
+        .await
+        .unwrap();
+    drop(tx);
+    // The byte budget guards the RETAINED replay batches, so the pump runs
+    // reconnectable here (the same shape that makes abort-and-redeliver
+    // livelock a rewinding source).
+    let error = pump_edge(
+        rx,
+        writer,
+        quad,
+        Arc::new(PendingReceipts::with_byte_budget(64, 1)),
+        tokio_util::sync::CancellationToken::new(),
+        config,
+        None,
+        true,
+        None,
+        false,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("pending replay byte budget"),
         "{error}"
     );
 }
@@ -1401,6 +1524,14 @@ async fn disconnect_aborts_pending_and_closes_edge() {
     downstream.spawn();
     let failures = upstream.failure_receiver();
 
+    // Register the route and wait until the delivery is served end to end
+    // BEFORE killing the manager: otherwise shutdown can win the race against
+    // the accept loop (the stream is queued but never served, its write half
+    // is never dropped, and the upstream waits forever for an EOF). A served
+    // frame proves the connection is live, so the disconnect below lands
+    // under the pending receipt deterministically.
+    let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+    downstream.register_inbound(quad, input_tx);
     let (client_side, server_side) = tokio::io::duplex(64 * 1024);
     downstream.accept_stream(Box::new(server_side));
     let edge = upstream.open_edge_with_stream(Box::new(client_side), quad);
@@ -1413,6 +1544,7 @@ async fn disconnect_aborts_pending_and_closes_edge() {
         ))
         .await
         .expect("send data");
+    let _ = next_envelope(&input_rx).await;
 
     // Kill the downstream manager: the connection dies under the pending
     // receipt. The pump fails (or the drain tick flush fails), the pending
@@ -1559,7 +1691,7 @@ async fn held_receipt_on_dead_edge_is_a_noop() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn failure_reporting_backpressures_instead_of_dropping() {
+async fn failure_reports_are_delivered_sequentially_through_the_global_channel() {
     let config = NetworkManagerConfig {
         max_failure_queue: 1,
         ..NetworkManagerConfig::default()
@@ -3090,18 +3222,38 @@ fn frame_tag_binds_header_payload_and_sequence() {
         "{error}"
     );
 
-    // The opposite direction's key cannot verify this direction's frames.
-    assert!(s2c.open(&header, payload, &tag1).is_err());
+    // The opposite direction's key cannot verify this direction's frames:
+    // tag0 keeps the expected sequence identical, so only the direction
+    // differs.
+    assert!(s2c.open(&header, payload, &tag0).is_err());
 
-    // Tampering with any covered byte fails closed.
+    // Tampering with any covered byte fails closed. Each mutation gets a
+    // FRESH verifier (so the expected sequence matches the tag's), and the
+    // unmodified frame verifies first — the rejection then demonstrates
+    // authentication of the changed field, not a sequence mismatch.
     let mut tampered_header = header;
     tampered_header.len += 1;
-    assert!(c2s_recv.open(&tampered_header, payload, &tag1).is_err());
+    let (mut header_verifier, _) = auth.frame_crypto_client(&ack).unwrap();
+    header_verifier
+        .open(&header, payload, &tag0)
+        .expect("unmodified frame verifies");
+    assert!(header_verifier
+        .open(&tampered_header, payload, &tag0)
+        .is_err());
     let tampered_payload = b"frame tag payloaD".as_slice();
-    assert!(c2s_recv.open(&header, tampered_payload, &tag1).is_err());
-    let mut wrong_length_tag = tag1.clone();
+    let (mut payload_verifier, _) = auth.frame_crypto_client(&ack).unwrap();
+    payload_verifier
+        .open(&header, payload, &tag0)
+        .expect("unmodified frame verifies");
+    assert!(payload_verifier
+        .open(&header, tampered_payload, &tag0)
+        .is_err());
+    let mut wrong_length_tag = tag0.clone();
     wrong_length_tag.pop();
-    assert!(c2s_recv.open(&header, payload, &wrong_length_tag).is_err());
+    let (mut length_verifier, _) = auth.frame_crypto_client(&ack).unwrap();
+    assert!(length_verifier
+        .open(&header, payload, &wrong_length_tag)
+        .is_err());
 }
 
 #[test]
@@ -3110,7 +3262,7 @@ fn a_frame_sealed_under_one_session_fails_under_another() {
     let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
     let auth = credentials.session("node-b", "replay-job", 1, quad);
     let (_ack_a, mut c2s_session_a, _) = fabricate_ack_and_derive(&auth);
-    let (_ack_b, _, mut s2c_session_b) = fabricate_ack_and_derive(&auth);
+    let (_ack_b, mut c2s_session_b, _) = fabricate_ack_and_derive(&auth);
     let payload = b"captured frame".as_slice();
     let header = FrameHeader {
         quad,
@@ -3120,8 +3272,9 @@ fn a_frame_sealed_under_one_session_fails_under_another() {
     let mut captured_tag = vec![0u8; 16];
     c2s_session_a.seal(&header, payload, &mut captured_tag);
     // A new handshake produced new nonces and therefore new keys: the
-    // captured frame cannot be replayed onto the fresh session.
-    let error = s2c_session_b
+    // captured frame cannot be replayed onto the fresh session. The
+    // verifier is the same direction (c2s), so only the session differs.
+    let error = c2s_session_b
         .open(&header, payload, &captured_tag)
         .unwrap_err();
     assert!(
@@ -4250,29 +4403,71 @@ async fn pending_receipts_budget_exceeded_fails_delivery_not_attempt() {
     };
     let pending = Arc::new(PendingReceipts::new(1));
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let (writer, _reader) = tokio::io::duplex(64 * 1024);
+    let (writer, mut reader) = tokio::io::duplex(256 * 1024);
     let (tx, rx) = flume::bounded::<Envelope>(4);
+    let (failures_tx, _failures_rx) = flume::unbounded::<Error>();
     let accepted_branch = Arc::new(RecordingAck::default());
     let rejected_branch = Arc::new(RecordingAck::default());
+    let third_branch = Arc::new(RecordingAck::default());
+    // The pump runs CONCURRENTLY and the sender stays open: the overflow is
+    // observed mid-stream, not by a pump that already drained.
+    let pump = tokio::spawn(pump_edge(
+        rx,
+        writer,
+        quad,
+        pending.clone(),
+        shutdown,
+        config,
+        None,
+        false,
+        None,
+        false,
+        false,
+    ));
     tx.send_async(Envelope::Data(
         Arc::new(dictionary_batch(None)),
         accepted_branch.clone(),
     ))
     .await
     .unwrap();
+    // Let the pump register seq 0 (the entry budget is 1).
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     tx.send_async(Envelope::Data(
         Arc::new(dictionary_batch(None)),
         rejected_branch.clone(),
     ))
     .await
     .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The attempt survived the budget overflow — and KEPT SERVING: freeing
+    // the slot lets a third delivery reach the peer over the same pump.
+    pending.apply(
+        ReceiptFrame {
+            kind: ReceiptKind::Acked,
+            seq: 0,
+        },
+        &failures_tx,
+    );
+    // The branch ack is applied off the read loop (spawned); poll for it.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !accepted_branch
+            .acked
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the receipt completes the first branch");
+    tx.send_async(Envelope::Data(
+        Arc::new(dictionary_batch(None)),
+        third_branch.clone(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     drop(tx);
-    let result = pump_edge(
-        rx, writer, quad, pending, shutdown, config, None, false, None, false, false,
-    )
-    .await;
-    // The attempt survived the budget overflow.
-    result.expect("a budget-exceeded delivery must not fail the pump");
+    pump.await.unwrap().expect("the pump drains cleanly");
     assert!(
         rejected_branch
             .aborted
@@ -4291,6 +4486,14 @@ async fn pending_receipts_budget_exceeded_fails_delivery_not_attempt() {
             .load(std::sync::atomic::Ordering::SeqCst),
         "the delivery that fit the budget is untouched"
     );
+    // Exactly two data frames reached the peer: the accepted first and the
+    // third after the slot freed — the over-budget batch never hit the wire.
+    let mut data_frames = 0;
+    while let Ok((header, _payload)) = read_frame(&mut reader).await {
+        assert_eq!(header.kind, FrameKind::Data);
+        data_frames += 1;
+    }
+    assert_eq!(data_frames, 2, "first and third deliveries reach the peer");
 }
 
 #[tokio::test(flavor = "multi_thread")]
