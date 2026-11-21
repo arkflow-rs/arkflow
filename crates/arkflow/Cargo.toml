@@ -23,3 +23,6 @@ tempfile = { workspace = true }
 arkflow-core = { workspace = true }
 arkflow-plugin = { workspace = true }
 arkflow-server = { workspace = true }
+
+[lints]
+workspace = true

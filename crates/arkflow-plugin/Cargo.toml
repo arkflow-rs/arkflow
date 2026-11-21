@@ -86,7 +86,7 @@ async-nats = "0.50"
 
 # Pulsar
 pulsar = "6.6"
-rand = "0.10"
+rand = { workspace = true }
 
 
 # modbus
@@ -115,3 +115,6 @@ mockall = { workspace = true }
 serial_test = "4.0.1"
 testcontainers = "0.28.0"
 wiremock = "0.6"
+
+[lints]
+workspace = true
