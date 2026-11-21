@@ -192,6 +192,46 @@ during a rolling enable, plaintext and TLS nodes cannot talk to each other
 (connections fail closed). Certificate rotation means restarting the
 process (automatic renewal is out of scope).
 
+### Data plane authentication and secrets
+
+Cross-node shuffle frames are authenticated at the application layer (wire
+protocol v2) independently of TLS: the session handshake exchanges fresh
+nonces in both directions and derives per-connection, per-direction session
+keys from the shared secret; every subsequent frame (data, signal, receipt)
+carries a truncated HMAC tag over its header, payload, and a
+connection-level monotonic sequence number, verified before any payload
+parsing. Forged, modified, or replayed frames fail closed as deterministic
+protocol errors. mTLS (above) stays the opt-in layer for confidentiality;
+frame authentication is always on.
+
+**Secret configuration (BREAKING).** The shared secret comes exclusively
+from `ARKFLOW_DATA_PLANE_SECRET`. The previous fallback to the fleet-shared
+`node_token` was removed — a compromised node must not imply the compromise
+of the whole fleet's data plane. A node without an explicit secret runs
+colocated-only (startup warning, no data-plane listener). Set the same
+secret on every node that participates in shuffle, and treat it as a
+dedicated credential (secret reference `${secret:...}` supported).
+
+**Upgrade window.** The v2 wire format is not interoperable with v1: in a
+mixed-version fleet the data-plane handshake fails closed. Stop distributed
+jobs, upgrade every Agent, and restart. If you previously relied on the
+`node_token` fallback, configure `ARKFLOW_DATA_PLANE_SECRET` on every node
+BEFORE upgrading.
+
+**Optional tuning** — every variable is optional; unset keeps the default:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ARKFLOW_DATA_PLANE_MAX_CONNECTIONS` | `256` | Inbound connection cap per node; overflow is counted and warned (throttled). |
+| `ARKFLOW_DATA_PLANE_RECONNECT_ATTEMPTS` | `5` | Transparent reconnect redials per failed edge; `0` = immediate fail-closed. |
+| `ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS` | `10000` | How long a lost downstream edge waits for re-registration before reporting failure. |
+| `ARKFLOW_DATA_PLANE_REGISTRATION_GRACE_MS` | `10000` | Route-registration budget per authenticated inbound connection. |
+| `ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES` | `268435456` | Single-frame payload cap (256 MiB), enforced on both the send and receive side. |
+
+Malformed values fail agent startup; out-of-range values (for example a
+frame cap above the protocol ceiling) degrade the node to colocated-only
+with a warning.
+
 ### Rate limiting
 
 Both control planes rate-limit requests per credential over the versioned API

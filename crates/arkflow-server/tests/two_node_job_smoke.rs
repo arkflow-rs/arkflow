@@ -565,7 +565,10 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     // in-memory transport used by core unit tests. Ports are allocated from
     // the OS: fixed numbers collide with another checkout (or a leftover
     // process) running the same test binary.
+    // The shared secret is explicit-only (protocol v2): the fleet
+    // registration token is no longer borrowed as the data-plane secret.
     let data_plane_secret = "split-data-plane-secret".to_string();
+    unsafe { std::env::set_var("ARKFLOW_DATA_PLANE_SECRET", &data_plane_secret) };
     let cancel_a = CancellationToken::new();
     let cancel_b = CancellationToken::new();
     let port_a = free_port();
@@ -733,6 +736,7 @@ async fn split_job_runs_across_nodes_and_aggregates_checkpoint() {
     let _ = tokio::time::timeout(Duration::from_secs(5), reconcile_task).await;
     hub_cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+    unsafe { std::env::remove_var("ARKFLOW_DATA_PLANE_SECRET") };
 }
 
 async fn pause_resume_diagnostics(hub: &Hub, job_id: &str, fixture: &ReplayFixture) -> String {

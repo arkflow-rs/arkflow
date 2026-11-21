@@ -2,13 +2,14 @@
 //! session-scoped receipt routing, and the per-connection pumps.
 
 use super::auth::{
-    verify_handshake_mac, DataPlaneCredentials, EdgeSessionKey, HandshakePayload, JobSessionKey,
-    PeerExpectation, SessionAuth, DATA_PLANE_PROTOCOL_VERSION, HANDSHAKE_NONCE_LEN,
+    verify_handshake_mac, DataPlaneCredentials, EdgeSessionKey, FrameCrypto, HandshakePayload,
+    JobSessionKey, PeerExpectation, SessionAuth, DATA_PLANE_PROTOCOL_VERSION, HANDSHAKE_NONCE_LEN,
 };
 use super::codec::{DataDecoder, DataEncoder};
 use super::transport::{
-    connect_backoff, read_frame_with_limits, read_receipt_frame, write_frame_with_limit,
-    AcceptedQueue, ConnectionFailure, DataPlaneTlsConfig, EdgeTransport, RemoteStream,
+    connect_backoff, read_dispatch, read_frame_with_limits, read_receipt_frame, write_frame_sealed,
+    write_frame_with_limit, write_sealed_or_plain, AcceptedQueue, ConnectionFailure,
+    DataPlaneTlsConfig, EdgeTransport, RemoteStream,
 };
 use super::wire::{
     FrameHeader, FrameKind, Quad, ReceiptFrame, ReceiptKind, TieredFrame, WireSignal, MAX_FRAME_LEN,
@@ -509,6 +510,11 @@ pub struct NetworkManager {
     accepted: AcceptedQueue,
     config: NetworkManagerConfig,
     active_connections: std::sync::atomic::AtomicUsize,
+    /// Cumulative count of connections rejected by the bounded-resource
+    /// limits (connection cap, accepted-queue full, TLS-handshake permits).
+    /// The global failure channel has no production consumer, so this
+    /// counter plus a throttled warning are the observable surface.
+    rejected_connections: std::sync::atomic::AtomicU64,
     /// Bounds UNAUTHENTICATED work: TLS handshakes run off the accept loop,
     /// and without a cap one attacker with idle TCP connections holds
     /// unbounded tasks and sockets (the active_connections limit only counts
@@ -680,6 +686,7 @@ impl NetworkManager {
             session_registrations: std::sync::Mutex::new(BTreeMap::new()),
             accepted,
             active_connections: std::sync::atomic::AtomicUsize::new(0),
+            rejected_connections: std::sync::atomic::AtomicU64::new(0),
             handshake_permits,
             config,
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -943,6 +950,30 @@ impl NetworkManager {
         Ok(())
     }
 
+    /// Records one bounded-resource rejection: a bounded counter plus a
+    /// throttled warning (first hit, then every 100th) — the global failure
+    /// channel has no production consumer, so this is the observable surface.
+    fn count_rejection(&self, reason: &str) {
+        let count = self
+            .rejected_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if count == 1 || count.is_multiple_of(100) {
+            tracing::warn!(
+                total_rejections = count,
+                reason,
+                "data-plane connection rejected by a bounded-resource limit"
+            );
+        }
+    }
+
+    /// Cumulative bounded-resource rejection count (tests and future
+    /// metrics wiring).
+    pub fn rejected_connections(&self) -> u64 {
+        self.rejected_connections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Injects an accepted stream (server side). The TCP listener task calls
     /// this per `TcpStream`; tests inject duplex halves.
     pub fn accept_stream(&self, stream: Box<dyn RemoteStream>) {
@@ -952,6 +983,7 @@ impl NetworkManager {
             |count| (count < self.config.max_connections).then_some(count + 1),
         );
         if current.is_err() {
+            self.count_rejection("accepted-connection limit reached");
             self.report_failure(Error::Process(format!(
                 "remote edge accepted-connection limit {} reached",
                 self.config.max_connections
@@ -961,6 +993,7 @@ impl NetworkManager {
         if self.accepted.0.try_send(stream).is_err() {
             self.active_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.count_rejection("accepted-connection queue full");
             self.report_failure(Error::Process(
                 "remote edge accepted-connection queue is full".into(),
             ));
@@ -1043,6 +1076,7 @@ impl NetworkManager {
                                 let Ok(permit) =
                                     manager.handshake_permits.clone().try_acquire_owned()
                                 else {
+                                    manager.count_rejection("TLS handshake permit limit reached");
                                     manager.report_failure(Error::Process(format!(
                                         "remote edge TLS handshake limit {} reached",
                                         manager.config.max_connections
@@ -1517,6 +1551,11 @@ impl NetworkManager {
         let mut writer_slots_installed: Vec<(EdgeSessionKey, flume::Sender<(Quad, ReceiptFrame)>)> =
             Vec::new();
         let mut authenticated_session = None;
+        // Direction-scoped frame authenticators (protocol v2): c2s protects
+        // inbound data/signal frames, s2c protects outbound receipts. `None`
+        // keeps the legacy (credential-less, test-only) plaintext path.
+        let mut inbound_crypto: Option<FrameCrypto> = None;
+        let mut receipt_crypto: Option<FrameCrypto> = None;
         let mut failure_sender = self.failures.clone();
         let connection_cancel = self.shutdown.child_token();
 
@@ -1571,6 +1610,19 @@ impl NetworkManager {
                     error: Error::Process(format!("remote edge handshake flush failed: {error}")),
                 });
             }
+            // Both nonces are now pinned: derive the per-direction session
+            // keys. Frames in either direction are authenticated from here on.
+            let (c2s_crypto, s2c_crypto) = session
+                .frame_crypto_server(&request, &response)
+                .map_err(|error| {
+                    self.remove_inbound_session(&session_key);
+                    ConnectionFailure {
+                        job: Some(job.clone()),
+                        error,
+                    }
+                })?;
+            inbound_crypto = Some(c2s_crypto);
+            receipt_crypto = Some(s2c_crypto);
             if wait_for_route(
                 &self.inbound,
                 &mut served_quads,
@@ -1600,6 +1652,7 @@ impl NetworkManager {
         let receipt_writer_failed_task = receipt_writer_failed.clone();
         let receipt_writer_handle = tokio::spawn(async move {
             let mut writer = tokio::io::BufWriter::with_capacity(16 * 1024, writer);
+            let mut crypto = receipt_crypto;
             let result: Result<(), Error> = loop {
                 let send = tokio::select! {
                     _ = receipt_cancel.cancelled() => {
@@ -1618,15 +1671,30 @@ impl NetworkManager {
                         )))
                     }
                 };
-                if let Err(error) = write_frame_with_limit(
-                    &mut writer,
-                    quad,
-                    FrameKind::Receipt,
-                    &payload,
-                    receipt_config.max_frame_len,
-                )
-                .await
-                {
+                let write = match crypto.as_mut() {
+                    Some(crypto) => {
+                        write_frame_sealed(
+                            &mut writer,
+                            quad,
+                            FrameKind::Receipt,
+                            &payload,
+                            receipt_config.max_frame_len,
+                            crypto,
+                        )
+                        .await
+                    }
+                    None => {
+                        write_frame_with_limit(
+                            &mut writer,
+                            quad,
+                            FrameKind::Receipt,
+                            &payload,
+                            receipt_config.max_frame_len,
+                        )
+                        .await
+                    }
+                };
+                if let Err(error) = write {
                     break Err(Error::Process(format!(
                         "remote edge receipt write failed: {error}"
                     )));
@@ -1654,10 +1722,11 @@ impl NetworkManager {
         let failure_reason: Result<(), Error> = loop {
             let frame = tokio::select! {
                 _ = connection_cancel.cancelled() => break Ok(()),
-                frame = read_frame_with_limits(
+                frame = read_dispatch(
                     &mut reader,
                     self.config.max_frame_len,
                     Some(self.config.read_idle_timeout),
+                    inbound_crypto.as_mut(),
                 ) => frame,
             };
             match frame {
@@ -1706,7 +1775,7 @@ impl NetworkManager {
                     writer_slots_installed.push((route_key.clone(), ours));
                     match header.kind {
                         FrameKind::Data => {
-                            let (batch, seq) = match decoder.decode(&payload) {
+                            let (batch, seq) = match decoder.decode(payload) {
                                 Ok(decoded) => decoded,
                                 Err(error) => {
                                     break Err(Error::Process(format!(
@@ -2083,14 +2152,34 @@ const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[derive(Default)]
 pub(crate) struct HandshakeGate {
     confirmed: std::sync::atomic::AtomicBool,
+    /// The outbound (c2s) frame authenticator, deposited by the receipt half
+    /// once the server's handshake acknowledgement verified. The pump picks
+    /// it up after `wait` returns so both halves seal frames with the same
+    /// derived session key.
+    crypto: std::sync::Mutex<Option<FrameCrypto>>,
     notify: tokio::sync::Notify,
 }
 
 impl HandshakeGate {
-    fn confirm(&self) {
+    fn confirm(&self, crypto: FrameCrypto) {
+        if let Ok(mut slot) = self.crypto.lock() {
+            *slot = Some(crypto);
+        }
         self.confirmed
             .store(true, std::sync::atomic::Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    /// Takes the outbound frame authenticator deposited by `confirm`. Only
+    /// call after `wait` returned; an authenticated session without a
+    /// deposited crypto is an internal invariant breach.
+    fn take_crypto(&self) -> Result<FrameCrypto, Error> {
+        let mut slot = self
+            .crypto
+            .lock()
+            .map_err(|_| Error::Process("remote edge handshake gate poisoned".into()))?;
+        slot.take()
+            .ok_or_else(|| Error::Process("remote edge handshake gate missing frame crypto".into()))
     }
 
     async fn wait(
@@ -2185,6 +2274,9 @@ pub(crate) async fn run_edge_connection(
         let cancelled = receipt_cancel.clone();
         let mut first_frame = true;
         let mut failure: Option<Error> = None;
+        // s2c frame authenticator, derived once the server's acknowledgement
+        // verified; the handshake-ack frame itself is read unauthenticated.
+        let mut recv_crypto: Option<FrameCrypto> = None;
         loop {
             tokio::select! {
                 _ = cancelled.cancelled() => break,
@@ -2194,6 +2286,7 @@ pub(crate) async fn run_edge_connection(
                     config.read_idle_timeout,
                     config.receipt_wait_timeout,
                     &receipt_pending,
+                    recv_crypto.as_mut(),
                 ) => match frame {
                     Ok(TieredFrame::RacedIdleRestart) => {
                         // A pending registration raced the dead-peer timer;
@@ -2207,22 +2300,33 @@ pub(crate) async fn run_edge_connection(
                             let Some(auth) = receipt_auth.as_ref() else {
                                 unreachable!()
                             };
-                            let result = if header.kind == FrameKind::Handshake
+                            let verified = if header.kind == FrameKind::Handshake
                                 && header.quad == auth.quad
                             {
                                 serde_json::from_slice::<HandshakePayload>(&payload)
                                     .map_err(|error| Error::Process(format!("remote edge handshake acknowledgement malformed: {error}")))
-                                    .and_then(|payload| auth.verify_server_ack(&payload))
+                                    .and_then(|payload| {
+                                        auth.verify_server_ack(&payload)?;
+                                        // Both nonces are pinned: derive the
+                                        // per-direction session keys. s2c
+                                        // authenticates receipts from here
+                                        // on; c2s is handed to the pump.
+                                        auth.frame_crypto_client(&payload)
+                                    })
                             } else {
                                 Err(Error::Process("remote edge receipt arrived before handshake acknowledgement".into()))
                             };
-                            if let Err(error) = result {
-                                failure = Some(error);
-                                break;
-                            }
-                            // Authenticated: the data half may open the tap.
-                            if let Some(gate) = receipt_gate.as_ref() {
-                                gate.confirm();
+                            match verified {
+                                Ok((c2s_crypto, s2c_crypto)) => {
+                                    recv_crypto = Some(s2c_crypto);
+                                    if let Some(gate) = receipt_gate.as_ref() {
+                                        gate.confirm(c2s_crypto);
+                                    }
+                                }
+                                Err(error) => {
+                                    failure = Some(error);
+                                    break;
+                                }
                             }
                         } else if header.kind == FrameKind::Receipt {
                             first_frame = false;
@@ -2400,6 +2504,13 @@ pub(crate) async fn pump_edge(
             gate.wait(config.receipt_wait_timeout, &shutdown).await?;
         }
     }
+    // The receipt half deposited the derived c2s authenticator in the gate
+    // when the server's acknowledgement verified; every data/signal frame
+    // this pump writes is sealed with it from here on.
+    let mut send_crypto: Option<FrameCrypto> = match handshake_gate.as_ref() {
+        Some(gate) if auth.is_some() => Some(gate.take_crypto()?),
+        _ => None,
+    };
     drop(auth);
     if replay_pending {
         // Replay the unacknowledged frames with their ORIGINAL sequence
@@ -2409,12 +2520,13 @@ pub(crate) async fn pump_edge(
         // a peer that never authenticated.
         for (seq, batch) in pending.replay_snapshot() {
             let payload = encoder.encode(&batch, seq)?;
-            write_frame_with_limit(
+            write_sealed_or_plain(
                 &mut writer,
                 quad,
                 FrameKind::Data,
                 &payload,
                 config.max_frame_len,
+                send_crypto.as_mut(),
             )
             .await?;
         }
@@ -2461,15 +2573,28 @@ pub(crate) async fn pump_edge(
                         ) {
                             Ok(seq) => seq,
                             Err(error) => {
-                                let abort_error = branch.abort().await.err();
-                                if let Some(abort_error) = abort_error {
+                                // Budget exceeded is a DELIVERY-level failure,
+                                // never an attempt failure: abort the branch so
+                                // the upstream compensates and re-delivers
+                                // (at-least-once), then keep serving the
+                                // channel. Tearing the connection down here
+                                // would escalate transient congestion into a
+                                // reconnect/fail-closed cycle.
+                                if let Some(abort_error) = branch.abort().await.err() {
+                                    // The branch could not be rewound, so the
+                                    // edge cannot continue honestly: the
+                                    // delivery outcome is unknowable.
                                     result = Err(Error::Process(format!(
                                         "{error}; failed to abort batch rejected by pending receipt limit: {abort_error}"
                                     )));
                                     break;
                                 }
-                                result = Err(error);
-                                break;
+                                tracing::warn!(
+                                    quad = ?quad,
+                                    error = %error,
+                                    "remote edge pending receipt budget exceeded; delivery aborted for redelivery"
+                                );
+                                continue;
                             }
                         };
                         let payload = match encoder.encode(&batch, seq) {
@@ -2479,12 +2604,13 @@ pub(crate) async fn pump_edge(
                                 break;
                             }
                         };
-                        if let Err(error) = write_frame_with_limit(
+                        if let Err(error) = write_sealed_or_plain(
                             &mut writer,
                             quad,
                             FrameKind::Data,
                             &payload,
                             config.max_frame_len,
+                            send_crypto.as_mut(),
                         )
                         .await
                         {
@@ -2509,12 +2635,13 @@ pub(crate) async fn pump_edge(
                         };
                         // Control elements broadcast on every quad of the edge;
                         // each pump owns exactly one quad, so one frame each.
-                        if let Err(error) = write_frame_with_limit(
+                        if let Err(error) = write_sealed_or_plain(
                             &mut writer,
                             quad,
                             FrameKind::Signal,
                             &payload,
                             config.max_frame_len,
+                            send_crypto.as_mut(),
                         )
                         .await
                         {

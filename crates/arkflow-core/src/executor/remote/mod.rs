@@ -64,15 +64,17 @@ pub(crate) use transport::TcpEdgeTransport;
 // support), reached through `use super::*`; they are compiled out of the
 // non-test library build.
 #[cfg(test)]
-pub(crate) use auth::{EdgeSessionKey, SessionAuth, DATA_PLANE_PROTOCOL_VERSION};
+pub(crate) use auth::{
+    EdgeSessionKey, FrameCrypto, HandshakePayload, SessionAuth, DATA_PLANE_PROTOCOL_VERSION,
+};
 #[cfg(test)]
 pub(crate) use codec::{read_piece, DataDecoder, DataEncoder, Piece};
 #[cfg(test)]
 pub(crate) use manager::{pump_edge, run_edge_connection, PendingReceipts, RemoteAck};
 #[cfg(test)]
 pub(crate) use transport::{
-    read_exact_with_idle, read_frame, read_frame_with_limits, write_frame, write_frame_with_limit,
-    DATA_PLANE_TLS_SERVER_NAME,
+    read_exact_with_idle, read_frame, read_frame_with_limits, write_frame, write_frame_sealed,
+    write_frame_with_limit, DATA_PLANE_TLS_SERVER_NAME,
 };
 #[cfg(test)]
 pub(crate) use wire::{

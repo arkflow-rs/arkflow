@@ -1,12 +1,14 @@
 //! Frame framing over async sockets: fixed-header frame reads and writes with
-//! payload and idle limits, plus the TCP/TLS edge transport.
+//! payload and idle limits, authenticated (protocol v2) frame variants, and
+//! the TCP/TLS edge transport.
 
-use super::auth::JobSessionKey;
+use super::auth::{FrameCrypto, JobSessionKey};
 use super::manager::PendingReceipts;
 #[cfg(test)]
 use super::wire::MAX_FRAME_LEN;
-use super::wire::{FrameHeader, FrameKind, Quad, TieredFrame, FRAME_HEADER_LEN};
+use super::wire::{FrameHeader, FrameKind, Quad, TieredFrame, FRAME_HEADER_LEN, FRAME_TAG_LEN};
 use crate::Error;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
@@ -30,17 +32,19 @@ pub(crate) async fn write_frame(
 #[cfg(test)]
 pub(crate) async fn read_frame(
     reader: &mut (impl AsyncRead + Unpin),
-) -> Result<(FrameHeader, Vec<u8>), Error> {
+) -> Result<(FrameHeader, Bytes), Error> {
     read_frame_with_limits(reader, MAX_FRAME_LEN, None).await
 }
 
 /// Reads a frame while applying the configured payload and per-read idle
-/// limits.  The header is decoded before allocating the payload buffer.
+/// limits.  The header is decoded before allocating the payload buffer; the
+/// payload is handed back as shared-ownership [`Bytes`] so downstream
+/// zero-copy slicing stays possible.
 pub(crate) async fn read_frame_with_limits(
     reader: &mut (impl AsyncRead + Unpin),
     max_frame_len: u32,
     idle_timeout: Option<std::time::Duration>,
-) -> Result<(FrameHeader, Vec<u8>), Error> {
+) -> Result<(FrameHeader, Bytes), Error> {
     let mut header_bytes = vec![0u8; FRAME_HEADER_LEN];
     read_exact_with_idle(reader, &mut header_bytes, idle_timeout)
         .await
@@ -48,13 +52,130 @@ pub(crate) async fn read_frame_with_limits(
             Error::Process(format!("remote edge closed while reading header: {error}"))
         })?;
     let header = FrameHeader::decode_with_max(&header_bytes, max_frame_len)?;
-    let mut payload = vec![0u8; header.len as usize];
+    let payload = read_payload_with_idle(reader, header.len as usize, idle_timeout).await?;
+    Ok((header, payload))
+}
+
+/// Allocates and reads exactly `len` payload bytes as [`Bytes`]: one
+/// allocation, shared ownership, no copy on hand-off.
+async fn read_payload_with_idle(
+    reader: &mut (impl AsyncRead + Unpin),
+    len: usize,
+    idle_timeout: Option<std::time::Duration>,
+) -> Result<Bytes, Error> {
+    let mut payload = BytesMut::with_capacity(len);
+    payload.resize(len, 0);
     read_exact_with_idle(reader, &mut payload, idle_timeout)
         .await
         .map_err(|error| {
             Error::Process(format!("remote edge closed while reading payload: {error}"))
         })?;
+    Ok(payload.freeze())
+}
+
+/// Writes one authenticated (protocol v2) frame: header, payload, then the
+/// 16-byte truncated HMAC tag computed by `crypto` over header, payload, and
+/// the connection-level monotonic sequence number.
+pub(crate) async fn write_frame_sealed(
+    writer: &mut (impl AsyncWrite + Unpin),
+    quad: Quad,
+    kind: FrameKind,
+    payload: &[u8],
+    max_frame_len: u32,
+    crypto: &mut FrameCrypto,
+) -> Result<(), Error> {
+    if (payload.len() as u64) > u64::from(max_frame_len) {
+        return Err(Error::Process(format!(
+            "remote edge frame payload of {} bytes exceeds the {} limit",
+            payload.len(),
+            max_frame_len
+        )));
+    }
+    let header = FrameHeader {
+        quad,
+        len: payload.len() as u32,
+        kind,
+    };
+    let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + payload.len() + FRAME_TAG_LEN);
+    header.encode_into(&mut bytes);
+    bytes.extend_from_slice(payload);
+    let tag_offset = bytes.len();
+    bytes.resize(tag_offset + FRAME_TAG_LEN, 0);
+    crypto.seal(&header, payload, &mut bytes[tag_offset..]);
+    writer
+        .write_all(&bytes)
+        .await
+        .map_err(|error| Error::Process(format!("remote edge write failed: {error}")))?;
+    Ok(())
+}
+
+/// Reads one authenticated frame and verifies its tag and sequence number
+/// BEFORE the payload is handed back for parsing: a forged, modified, or
+/// replayed frame never reaches the payload consumers.
+pub(crate) async fn read_frame_sealed(
+    reader: &mut (impl AsyncRead + Unpin),
+    max_frame_len: u32,
+    idle_timeout: Option<std::time::Duration>,
+    crypto: &mut FrameCrypto,
+) -> Result<(FrameHeader, Bytes), Error> {
+    let mut header_bytes = vec![0u8; FRAME_HEADER_LEN];
+    read_exact_with_idle(reader, &mut header_bytes, idle_timeout)
+        .await
+        .map_err(|error| {
+            Error::Process(format!("remote edge closed while reading header: {error}"))
+        })?;
+    let header = FrameHeader::decode_with_max(&header_bytes, max_frame_len)?;
+    let payload = read_payload_with_idle(reader, header.len as usize, idle_timeout).await?;
+    let mut tag = [0u8; FRAME_TAG_LEN];
+    read_exact_with_idle(reader, &mut tag, idle_timeout)
+        .await
+        .map_err(|error| {
+            Error::Process(format!(
+                "remote edge closed while reading frame tag: {error}"
+            ))
+        })?;
+    crypto.open(&header, &payload, &tag)?;
     Ok((header, payload))
+}
+
+/// Dispatches one frame write to the authenticated or plaintext variant
+/// depending on whether a session authenticator is present.
+pub(crate) async fn write_sealed_or_plain(
+    writer: &mut (impl AsyncWrite + Unpin),
+    quad: Quad,
+    kind: FrameKind,
+    payload: &[u8],
+    max_frame_len: u32,
+    crypto: Option<&mut FrameCrypto>,
+) -> Result<(), Error> {
+    match crypto {
+        Some(crypto) => {
+            write_frame_sealed(writer, quad, kind, payload, max_frame_len, crypto).await
+        }
+        None => write_frame_with_limit(writer, quad, kind, payload, max_frame_len).await,
+    }
+}
+
+/// The boxed future returned by [`read_dispatch`] (type-complexity alias).
+pub(crate) type ReadDispatchFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(FrameHeader, Bytes), Error>> + Send + 'a>,
+>;
+
+/// Dispatches one frame read to the authenticated or plaintext variant
+/// depending on whether a session authenticator is present (select-arm
+/// friendly: exactly one future, no in-arm awaits).
+pub(crate) fn read_dispatch<'a>(
+    reader: &'a mut (impl AsyncRead + Unpin + Send),
+    max_frame_len: u32,
+    idle_timeout: Option<std::time::Duration>,
+    crypto: Option<&'a mut FrameCrypto>,
+) -> ReadDispatchFuture<'a> {
+    Box::pin(async move {
+        match crypto {
+            Some(crypto) => read_frame_sealed(reader, max_frame_len, idle_timeout, crypto).await,
+            None => read_frame_with_limits(reader, max_frame_len, idle_timeout).await,
+        }
+    })
 }
 
 /// Receipt-channel frame read with a two-level idle budget: a connection
@@ -62,12 +183,16 @@ pub(crate) async fn read_frame_with_limits(
 /// and gets the long budget; an idle one keeps fast dead-peer discovery.
 /// Zero bytes are consumed on the restart path, so retrying is framing-safe;
 /// after the first byte the frame always completes under the long budget.
+/// `crypto` authenticates the frame before the payload is handed back; the
+/// handshake-acknowledgement frame on an authenticated connection arrives
+/// with `None` (it precedes the session keys).
 pub(crate) async fn read_receipt_frame(
     reader: &mut (impl AsyncRead + Unpin),
     max_frame_len: u32,
     short_idle: std::time::Duration,
     receipt_wait: std::time::Duration,
     pending: &PendingReceipts,
+    crypto: Option<&mut FrameCrypto>,
 ) -> Result<TieredFrame, Error> {
     let had_pending = !pending.is_empty();
     let budget = if had_pending {
@@ -103,12 +228,18 @@ pub(crate) async fn read_receipt_frame(
             Error::Process(format!("remote edge closed while reading header: {error}"))
         })?;
     let header = FrameHeader::decode_with_max(&header_bytes, max_frame_len)?;
-    let mut payload = vec![0u8; header.len as usize];
-    read_exact_with_idle(reader, &mut payload, Some(receipt_wait))
-        .await
-        .map_err(|error| {
-            Error::Process(format!("remote edge closed while reading payload: {error}"))
-        })?;
+    let payload = read_payload_with_idle(reader, header.len as usize, Some(receipt_wait)).await?;
+    if let Some(crypto) = crypto {
+        let mut tag = [0u8; FRAME_TAG_LEN];
+        read_exact_with_idle(reader, &mut tag, Some(receipt_wait))
+            .await
+            .map_err(|error| {
+                Error::Process(format!(
+                    "remote edge closed while reading frame tag: {error}"
+                ))
+            })?;
+        crypto.open(&header, &payload, &tag)?;
+    }
     Ok(TieredFrame::Frame((header, payload)))
 }
 

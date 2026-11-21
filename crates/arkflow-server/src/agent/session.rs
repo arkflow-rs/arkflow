@@ -6,7 +6,8 @@ use super::config::{agent_capabilities, NodeAgentConfig};
 use super::kernel::JobRuntime;
 use super::now_ms;
 use super::resources::{
-    data_plane_tls_from_env, merge_resource_gauges, spawn_resource_sampler, ResourceSampler,
+    apply_data_plane_env_limits, data_plane_tls_from_env, merge_resource_gauges,
+    spawn_resource_sampler, ResourceSampler,
 };
 use crate::hub::{
     AgentAuth, AgentCommand, CommandResult, HeartbeatRequest, NodeReport, RegisterRequest,
@@ -40,43 +41,55 @@ pub async fn run(
     // Cross-node shuffle data plane: one listener per Agent process. A bind
     // failure degrades to the co-location contract (warn, no listener) rather
     // than blocking node startup — observability and placement still work.
+    // The shared secret is EXPLICIT-ONLY: falling back to the fleet-shared
+    // registration token would make one compromised node the compromise of
+    // the whole fleet's data plane, so an unconfigured secret keeps the node
+    // colocated-only (warn) instead of borrowing a credential.
     let mut data_address: Option<String> = None;
     if let Some(port) = config.data_port {
         let data_secret = std::env::var("ARKFLOW_DATA_PLANE_SECRET")
             .ok()
-            .filter(|secret| !secret.is_empty())
-            .or_else(|| (!config.node_token.is_empty()).then(|| config.node_token.clone()));
+            .filter(|secret| !secret.is_empty());
         let data_plane_tls = data_plane_tls_from_env()?;
-        let manager = data_secret
-            .and_then(|data_secret| {
+        let manager = match data_secret {
+            None => {
+                warn!(
+                    node_id = %config.node_id,
+                    "ARKFLOW_DATA_PLANE_SECRET is not set; network shuffle disabled, running colocated-only"
+                );
+                None
+            }
+            Some(data_secret) => {
                 match arkflow_core::executor::remote::DataPlaneCredentials::new(
                     config.node_id.clone(),
                     data_secret,
                 ) {
-                    Ok(credentials) => Some(credentials),
                     Err(error) => {
                         warn!(node_id = %config.node_id, %error, "invalid data-plane credentials; running colocated-only");
                         None
                     }
-                }
-            })
-            .and_then(|credentials| {
-                let manager_config = arkflow_core::executor::remote::NetworkManagerConfig {
-                    credentials: Some(credentials),
-                    channel_capacity: 1024,
-                    tls: data_plane_tls.clone(),
-                    .. arkflow_core::executor::remote::NetworkManagerConfig::default()
-                };
-                match arkflow_core::executor::remote::NetworkManager::with_config(
-                    manager_config,
-                ) {
-                    Ok(manager) => Some(manager),
-                    Err(error) => {
-                        warn!(node_id = %config.node_id, %error, "invalid data-plane resource configuration; running colocated-only");
-                        None
+                    Ok(credentials) => {
+                        let mut manager_config =
+                            arkflow_core::executor::remote::NetworkManagerConfig {
+                                credentials: Some(credentials),
+                                channel_capacity: 1024,
+                                tls: data_plane_tls.clone(),
+                                ..arkflow_core::executor::remote::NetworkManagerConfig::default()
+                            };
+                        apply_data_plane_env_limits(&mut manager_config)?;
+                        match arkflow_core::executor::remote::NetworkManager::with_config(
+                            manager_config,
+                        ) {
+                            Ok(manager) => Some(manager),
+                            Err(error) => {
+                                warn!(node_id = %config.node_id, %error, "invalid data-plane resource configuration; running colocated-only");
+                                None
+                            }
+                        }
                     }
                 }
-            });
+            }
+        };
         if let Some(manager) = manager {
             manager.spawn();
             match config

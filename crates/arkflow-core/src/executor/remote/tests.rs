@@ -126,7 +126,9 @@ fn data_frames_roundtrip_with_dictionary_and_schema_cache() {
     let mut decoder = DataDecoder::new();
 
     let payload_a = encoder.encode(&first, 7).expect("encode first");
-    let (decoded_a, seq_a) = decoder.decode(&payload_a).expect("decode first");
+    let (decoded_a, seq_a) = decoder
+        .decode(bytes::Bytes::from(payload_a))
+        .expect("decode first");
     assert_eq!(seq_a, 7);
     assert_eq!(decoded_a.get_input_name(), Some("kafka-in".to_owned()));
     assert_eq!(decoded_a.record_batch(), first.record_batch());
@@ -134,7 +136,9 @@ fn data_frames_roundtrip_with_dictionary_and_schema_cache() {
     // Second frame with the same schema reuses the cached schema and
     // dictionaries (the encoder emits neither again).
     let payload_b = encoder.encode(&second, 8).expect("encode second");
-    let (decoded_b, seq_b) = decoder.decode(&payload_b).expect("decode second");
+    let (decoded_b, seq_b) = decoder
+        .decode(bytes::Bytes::from(payload_b))
+        .expect("decode second");
     assert_eq!(seq_b, 8);
     assert_eq!(decoded_b.get_input_name(), None);
     assert_eq!(decoded_b.record_batch(), second.record_batch());
@@ -154,21 +158,182 @@ fn decoder_rejects_frames_before_any_schema() {
     corrupted.extend_from_slice(&(rewritten.len() as u32).to_le_bytes());
     corrupted.extend_from_slice(&rewritten);
     corrupted.extend_from_slice(&payload[4 + meta_len..]);
-    assert!(decoder.decode(&corrupted).is_err());
+    assert!(decoder.decode(bytes::Bytes::from(corrupted)).is_err());
 }
 
 #[test]
 fn ipc_body_bounds_are_checked_without_panicking() {
     let piece = Piece {
-        bytes: &[0; 8],
+        bytes: bytes::Bytes::from_static(&[0; 8]),
         flatbuf_len: 0,
     };
     let result = std::panic::catch_unwind(|| piece.body(1));
     assert!(result.is_ok(), "malformed IPC body must not panic");
     assert!(result.unwrap().is_err());
 
-    let truncated = vec![4, 0, 0, 0, 8, 0, 0, 0, 1, 2, 3, 4];
+    let truncated = bytes::Bytes::from_static(&[4, 0, 0, 0, 8, 0, 0, 0, 1, 2, 3, 4]);
     assert!(read_piece(&truncated, 0).is_err());
+}
+
+#[test]
+fn ipc_body_buffer_shares_the_frame_payload_memory() {
+    // Zero-copy contract: the decoded body buffer is a shared-ownership
+    // slice of the received payload, not a copied region.
+    let body_content: Vec<u8> = (0..64u8).collect();
+    let mut piece_bytes = Vec::new();
+    piece_bytes.extend_from_slice(&((8 + body_content.len()) as u32).to_le_bytes()); // total
+    piece_bytes.extend_from_slice(&0u32.to_le_bytes()); // flatbuf_len
+    piece_bytes.extend_from_slice(&body_content);
+    let payload = bytes::Bytes::from(piece_bytes);
+    let (piece, _next) = read_piece(&payload, 0).expect("piece");
+    let buffer = piece.body(body_content.len()).expect("body");
+    let start = payload.as_ptr() as usize;
+    let end = start + payload.len();
+    let body_ptr = buffer.as_ptr() as usize;
+    assert!(
+        body_ptr >= start && body_ptr < end,
+        "body buffer must alias the received payload, not a copy"
+    );
+}
+
+#[tokio::test]
+async fn connection_overflow_is_counted_as_a_bounded_resource_rejection() {
+    // The accepted-connection cap is 1: the second stream is rejected and
+    // must show up in the bounded rejection counter (the observable surface
+    // replacing the old unconsumed-channel-only path).
+    let config = NetworkManagerConfig {
+        max_connections: 1,
+        ..Default::default()
+    };
+    let manager = NetworkManager::with_config(config).unwrap();
+    assert_eq!(manager.rejected_connections(), 0);
+    let (_client1, server1) = tokio::io::duplex(1024);
+    manager.accept_stream(Box::new(server1));
+    assert_eq!(manager.rejected_connections(), 0);
+    let (_client2, server2) = tokio::io::duplex(1024);
+    manager.accept_stream(Box::new(server2));
+    assert_eq!(manager.rejected_connections(), 1);
+}
+
+/// Auth-overhead quantification (ignored: developer-run timing, not a CI
+/// gate — the benchmark contract forbids performance assertions). Sealed vs
+/// plaintext frame roundtrips over an in-memory duplex, same payloads and
+/// flush points, so the delta isolates the HMAC tag cost.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "timing benchmark; run explicitly with --ignored"]
+async fn auth_frame_roundtrip_timing() {
+    use tokio::io::AsyncReadExt;
+    let quad = quad_a_to_b();
+    let payload = bytes::Bytes::from(vec![7u8; 64 * 1024]);
+    let payload_len = payload.len();
+    const FRAMES: usize = 400;
+
+    let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+    let auth = credentials.session("node-b", "timing-job", 1, quad);
+    let (ack_payload, mut c2s, mut s2c) = fabricate_ack_and_derive(&auth);
+
+    let run_plain = async {
+        let payload = payload.clone();
+        let (mut client, mut server) = tokio::io::duplex(1024 * 1024);
+        let writer = tokio::spawn(async move {
+            for _ in 0..FRAMES {
+                write_frame(&mut client, quad, FrameKind::Data, &payload)
+                    .await
+                    .unwrap();
+            }
+            client.flush().await.unwrap();
+        });
+        let mut read_buf = vec![0u8; payload_len + 24];
+        let mut read_total = 0usize;
+        while read_total < FRAMES * (payload_len + 24) {
+            let n = server.read(&mut read_buf).await.unwrap();
+            assert!(n > 0);
+            read_total += n;
+        }
+        writer.await.unwrap();
+    };
+
+    let run_sealed = async {
+        let payload = payload.clone();
+        let (mut client, mut server) = tokio::io::duplex(1024 * 1024);
+        let writer = tokio::spawn(async move {
+            for _ in 0..FRAMES {
+                write_frame_sealed(
+                    &mut client,
+                    quad,
+                    FrameKind::Data,
+                    &payload,
+                    MAX_FRAME_LEN,
+                    &mut c2s,
+                )
+                .await
+                .unwrap();
+            }
+            client.flush().await.unwrap();
+        });
+        let frame_len = payload_len + 24 + 16;
+        let mut read_buf = vec![0u8; frame_len];
+        let mut read_total = 0usize;
+        while read_total < FRAMES * frame_len {
+            let n = server.read(&mut read_buf).await.unwrap();
+            assert!(n > 0);
+            read_total += n;
+        }
+        writer.await.unwrap();
+    };
+    let _ = (&ack_payload, &mut s2c);
+
+    let plain_start = std::time::Instant::now();
+    run_plain.await;
+    let plain = plain_start.elapsed();
+
+    let sealed_start = std::time::Instant::now();
+    run_sealed.await;
+    let sealed = sealed_start.elapsed();
+
+    let megabytes = (FRAMES * payload_len) as f64 / 1_048_576.0;
+    println!(
+        "auth frame roundtrip timing: plain {plain:?} vs sealed {sealed:?} for {megabytes:.0} MiB x2 directions ({FRAMES} frames); sealed/plain = {:.2}",
+        sealed.as_secs_f64() / plain.as_secs_f64()
+    );
+}
+
+#[tokio::test]
+async fn max_frame_len_rejects_oversized_frames_on_the_send_side() {
+    let quad = quad_a_to_b();
+    let config = NetworkManagerConfig {
+        max_frame_len: 64,
+        ..Default::default()
+    };
+    config.validate().expect("small cap is a valid config");
+    let (writer, _reader) = tokio::io::duplex(64 * 1024);
+    let (tx, rx) = flume::bounded::<Envelope>(4);
+    tx.send_async(Envelope::Data(
+        Arc::new(dictionary_batch(None)),
+        Arc::new(RecordingAck::default()),
+    ))
+    .await
+    .unwrap();
+    drop(tx);
+    let error = pump_edge(
+        rx,
+        writer,
+        quad,
+        Arc::new(PendingReceipts::new(64)),
+        tokio_util::sync::CancellationToken::new(),
+        config,
+        None,
+        false,
+        None,
+        false,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("exceeds the 64 limit"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -186,7 +351,7 @@ async fn frames_roundtrip_over_async_buffers() {
     let (header, payload) = read_frame(&mut server).await.expect("read frame");
     assert_eq!(header.quad, quad);
     assert_eq!(header.kind, FrameKind::Receipt);
-    assert_eq!(payload, b"stub");
+    assert_eq!(payload.as_ref(), b"stub");
 }
 
 #[tokio::test]
@@ -811,20 +976,20 @@ async fn pending_receipt_limit_aborts_the_rejected_batch() {
     })
     .await
     .expect("the batch rejected by the pending limit must be aborted");
-    tokio::time::timeout(TEST_PROPAGATION_BUDGET, async {
-        while !first.aborted.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the already pending batch must be aborted with the edge");
-    let failure = tokio::time::timeout(TEST_PROPAGATION_BUDGET, failures.recv_async())
-        .await
-        .expect("pending limit failure within timeout")
-        .unwrap();
+    // Delivery-level failure contract: the over-budget delivery is aborted
+    // for upstream redelivery while the edge keeps serving — the in-budget
+    // delivery stays pending and no edge failure is reported.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(
-        failure.to_string().contains("pending receipt limit"),
-        "{failure}"
+        !first.aborted.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-budget delivery must stay pending; the edge did not fail"
+    );
+    let leaked = tokio::time::timeout(std::time::Duration::from_millis(500), failures.recv_async())
+        .await
+        .is_err();
+    assert!(
+        leaked,
+        "pending-budget overflow must not surface as an edge failure"
     );
 
     upstream.shutdown();
@@ -1222,9 +1387,13 @@ async fn disconnect_aborts_pending_and_closes_edge() {
         reconnect_attempts: 0,
         ..NetworkManagerConfig::default()
     };
+    // A short registration grace: this edge never registers a route, so the
+    // rejection fires quickly and deterministically instead of stalling on
+    // the 10s default under parallel load.
     let upstream = NetworkManager::with_config(offline).unwrap();
     let downstream = NetworkManager::with_config(NetworkManagerConfig {
         reconnect_attempts: 0,
+        registration_grace: std::time::Duration::from_millis(200),
         ..NetworkManagerConfig::default()
     })
     .unwrap();
@@ -1397,15 +1566,14 @@ async fn failure_reporting_backpressures_instead_of_dropping() {
     };
     let manager = NetworkManager::with_config(config).unwrap();
     let failures = manager.failure_receiver();
+    // Deterministic drain order: consume the first report BEFORE the second
+    // is sent, so the bounded queue never races its own consumer (a report
+    // hitting a full queue is dropped by contract, which would make an
+    // order-dependent spawn here flaky under load).
     manager.report_failure(Error::Process("first failure".into()));
-
-    let reporter = manager.clone();
-    let second = tokio::spawn(async move {
-        reporter.report_failure(Error::Process("second failure".into()));
-    });
     let first = failures.recv_async().await.unwrap();
     assert!(first.to_string().contains("first failure"), "{first}");
-    second.await.unwrap();
+    manager.report_failure(Error::Process("second failure".into()));
     let second = tokio::time::timeout(std::time::Duration::from_secs(1), failures.recv_async())
         .await
         .expect("second failure must remain queued")
@@ -1896,7 +2064,9 @@ fn wire_signal_ignores_data_envelopes_and_default_encoder_matches_new() {
     let payload_default = via_default.encode(&sample, 1).expect("default encode");
     let payload_new = via_new.encode(&sample, 1).expect("new encode");
     let mut decoder = DataDecoder::new();
-    let (decoded, seq) = decoder.decode(&payload_default).expect("default decode");
+    let (decoded, seq) = decoder
+        .decode(bytes::Bytes::from(payload_default.clone()))
+        .expect("default decode");
     assert_eq!(seq, 1);
     assert_eq!(decoded.get_input_name(), Some("default".to_owned()));
     // Both encoders emit byte-identical payloads for the same input.
@@ -1934,7 +2104,9 @@ fn decoder_rejects_schema_id_mismatch_and_unparsable_schema() {
         .encode(&dictionary_batch(None), 0)
         .expect("encode A");
     let mut decoder = DataDecoder::new();
-    decoder.decode(&payload_a).expect("learn schema A");
+    decoder
+        .decode(bytes::Bytes::from(payload_a))
+        .expect("learn schema A");
 
     // A second schema encoded by a fresh encoder, with its schema piece
     // stripped and the meta forced to `has_schema=false`, declares an id
@@ -1944,9 +2116,10 @@ fn decoder_rejects_schema_id_mismatch_and_unparsable_schema() {
     let payload_b = encoder_b.encode(&plain, 1).expect("encode B");
     let (mut corrupted, cursor) = rewrite_meta(&payload_b, false);
     // Skip B's schema piece: parse and drop it.
-    let (_, after_schema) = read_piece(&payload_b, cursor).expect("schema piece");
+    let (_, after_schema) =
+        read_piece(&bytes::Bytes::from(payload_b.clone()), cursor).expect("schema piece");
     corrupted.extend_from_slice(&payload_b[after_schema..]);
-    let error = decoder.decode(&corrupted).unwrap_err();
+    let error = decoder.decode(bytes::Bytes::from(corrupted)).unwrap_err();
     assert!(
         error.to_string().contains("does not match declared id"),
         "{error}"
@@ -1957,7 +2130,9 @@ fn decoder_rejects_schema_id_mismatch_and_unparsable_schema() {
     let (mut garbage, _) = rewrite_meta(&payload_b, true);
     garbage.extend_from_slice(&craft_piece(&[0xde, 0xad, 0xbe, 0xef, 0xba, 0xad]));
     let mut fresh_decoder = DataDecoder::new();
-    let error = fresh_decoder.decode(&garbage).unwrap_err();
+    let error = fresh_decoder
+        .decode(bytes::Bytes::from(garbage))
+        .unwrap_err();
     assert!(
         error.to_string().contains("schema decode failed"),
         "{error}"
@@ -1976,19 +2151,21 @@ fn decoder_rejects_invalid_ipc_messages_and_stray_schema_messages() {
     let mut encoder = DataEncoder::new();
     let payload = encoder.encode(&dictionary_batch(None), 0).expect("encode");
     let mut decoder = DataDecoder::new();
-    decoder.decode(&payload).expect("prime the schema cache");
+    decoder
+        .decode(bytes::Bytes::from(payload.clone()))
+        .expect("prime the schema cache");
 
     // A payload whose trailing piece is not a valid IPC message.
     let (mut garbage, _) = rewrite_meta(&payload, false);
     garbage.extend_from_slice(&craft_piece(&[0x11, 0x22, 0x33, 0x44, 0x55]));
-    let error = decoder.decode(&garbage).unwrap_err();
+    let error = decoder.decode(bytes::Bytes::from(garbage)).unwrap_err();
     assert!(error.to_string().contains("IPC message invalid"), "{error}");
 
     // A schema message arriving without `has_schema` set is a protocol
     // error: keep the original pieces (schema first) but claim no schema.
     let (mut stray, _) = rewrite_meta(&payload, false);
     stray.extend_from_slice(&payload[4 + meta_len_of(&payload)..]);
-    let error = decoder.decode(&stray).unwrap_err();
+    let error = decoder.decode(bytes::Bytes::from(stray)).unwrap_err();
     assert!(
         error.to_string().contains("unexpected schema message"),
         "{error}"
@@ -2010,7 +2187,8 @@ fn decoder_rejects_truncated_dictionary_and_record_batch_bodies() {
     let mut pieces = Vec::new();
     let mut cursor = 4 + meta_len;
     while cursor < payload.len() {
-        let (piece, next) = read_piece(&payload, cursor).expect("piece");
+        let (piece, next) =
+            read_piece(&bytes::Bytes::from(payload.clone()), cursor).expect("piece");
         pieces.push((cursor, next, piece.flatbuf_len));
         cursor = next;
     }
@@ -2023,7 +2201,9 @@ fn decoder_rejects_truncated_dictionary_and_record_batch_bodies() {
 
     // Prime a decoder with the intact frame so the schema is cached.
     let mut primed = DataDecoder::new();
-    primed.decode(&payload).expect("prime the schema cache");
+    primed
+        .decode(bytes::Bytes::from(payload.clone()))
+        .expect("prime the schema cache");
 
     // Corrupting the body of the dictionary piece (index 1) or the
     // record batch piece (last) must fail the decode instead of yielding
@@ -2053,7 +2233,7 @@ fn decoder_rejects_truncated_dictionary_and_record_batch_bodies() {
             }
             rebuilt.extend_from_slice(&bytes);
         }
-        let error = primed.decode(&rebuilt).unwrap_err();
+        let error = primed.decode(bytes::Bytes::from(rebuilt)).unwrap_err();
         assert!(
             error.to_string().contains("decode failed")
                 || error.to_string().contains("IPC body exceeds IPC piece"),
@@ -2069,7 +2249,7 @@ fn read_piece_rejects_flatbuf_exceeding_the_piece_length() {
     bytes.extend_from_slice(&12u32.to_le_bytes());
     bytes.extend_from_slice(&100u32.to_le_bytes());
     bytes.extend_from_slice(&[1, 2, 3, 4]);
-    let error = match read_piece(&bytes, 0) {
+    let error = match read_piece(&bytes::Bytes::from(bytes), 0) {
         Err(error) => error,
         Ok(_) => panic!("a flatbuf longer than its piece must be rejected"),
     };
@@ -2754,15 +2934,20 @@ async fn receipt_channel_rejects_protocol_violations() {
     // (b) A malformed receipt after a valid acknowledgement.
     {
         let (client, mut server) = tokio::io::duplex(64 * 1024);
-        let request = auth.client_handshake().unwrap();
-        let ack = auth.server_ack(&request, "node-b");
-        let ack_payload = serde_json::to_vec(&ack).unwrap();
+        let (ack_payload, _c2s, mut s2c) = fabricate_ack_and_derive(&auth);
         write_frame(&mut server, quad, FrameKind::Handshake, &ack_payload)
             .await
             .unwrap();
-        write_frame(&mut server, quad, FrameKind::Receipt, b"not json")
-            .await
-            .unwrap();
+        write_frame_sealed(
+            &mut server,
+            quad,
+            FrameKind::Receipt,
+            b"not json",
+            MAX_FRAME_LEN,
+            &mut s2c,
+        )
+        .await
+        .unwrap();
         let (_pump, read) =
             run_receipt_harness(Box::new(client), quad, Some(auth.clone()), config.clone()).await;
         drop(server);
@@ -2776,15 +2961,20 @@ async fn receipt_channel_rejects_protocol_violations() {
     // (c) A data frame on the receipt channel.
     {
         let (client, mut server) = tokio::io::duplex(64 * 1024);
-        let request = auth.client_handshake().unwrap();
-        let ack = auth.server_ack(&request, "node-b");
-        let ack_payload = serde_json::to_vec(&ack).unwrap();
+        let (ack_payload, _c2s, mut s2c) = fabricate_ack_and_derive(&auth);
         write_frame(&mut server, quad, FrameKind::Handshake, &ack_payload)
             .await
             .unwrap();
-        write_frame(&mut server, quad, FrameKind::Data, b"stray")
-            .await
-            .unwrap();
+        write_frame_sealed(
+            &mut server,
+            quad,
+            FrameKind::Data,
+            b"stray",
+            MAX_FRAME_LEN,
+            &mut s2c,
+        )
+        .await
+        .unwrap();
         let (_pump, read) = run_receipt_harness(Box::new(client), quad, Some(auth), config).await;
         drop(server);
         let error = read.unwrap_err();
@@ -2834,6 +3024,212 @@ async fn run_receipt_harness(
     .expect("connection harness settles within timeout")
 }
 
+// ---------- frame authentication (protocol v2) ----------
+
+#[test]
+fn session_keys_are_direction_and_session_isolated() {
+    // Keys are not directly inspectable; compare them through the tags they
+    // produce for the same (header, payload).
+    let tag_of = |crypto: &mut FrameCrypto| {
+        let header = FrameHeader {
+            quad: quad_a_to_b(),
+            len: 4,
+            kind: FrameKind::Signal,
+        };
+        let mut tag = vec![0u8; 16];
+        crypto.seal(&header, b"key!", &mut tag);
+        tag
+    };
+    let quad = quad_a_to_b();
+    let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+    let auth = credentials.session("node-b", "key-job", 1, quad);
+    let (_ack_a, mut c2s_a, mut s2c_a) = fabricate_ack_and_derive(&auth);
+    let (_ack_b, mut c2s_b, mut s2c_b) = fabricate_ack_and_derive(&auth);
+    // Fresh nonces every handshake: no two sessions share a direction key.
+    assert_ne!(tag_of(&mut c2s_a), tag_of(&mut c2s_b));
+    assert_ne!(tag_of(&mut s2c_a), tag_of(&mut s2c_b));
+    // The two directions within ONE session are independent keys.
+    assert_ne!(tag_of(&mut c2s_a), tag_of(&mut s2c_a));
+}
+
+#[test]
+fn frame_tag_binds_header_payload_and_sequence() {
+    let quad = quad_a_to_b();
+    let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+    let auth = credentials.session("node-b", "tag-job", 1, quad);
+    // One handshake, two derivations: sender and receiver of the SAME
+    // direction share the key; the opposite direction is an independent key.
+    let request = auth.client_handshake().unwrap();
+    let ack = auth.server_ack(&request, "node-b");
+    let (mut c2s_send, mut s2c) = auth.frame_crypto_client(&ack).unwrap();
+    let (mut c2s_recv, _) = auth.frame_crypto_client(&ack).unwrap();
+    let payload = b"frame tag payload".as_slice();
+    let header = FrameHeader {
+        quad,
+        len: payload.len() as u32,
+        kind: FrameKind::Signal,
+    };
+
+    // Roundtrip on one direction: seq 0 then seq 1, in order.
+    let mut tag0 = vec![0u8; 16];
+    c2s_send.seal(&header, payload, &mut tag0);
+    c2s_recv
+        .open(&header, payload, &tag0)
+        .expect("first frame verifies");
+    let mut tag1 = vec![0u8; 16];
+    c2s_send.seal(&header, payload, &mut tag1);
+    assert_ne!(tag0, tag1, "the sequence number must feed the tag");
+    c2s_recv
+        .open(&header, payload, &tag1)
+        .expect("second frame verifies");
+
+    // Out-of-order frames are rejected: the receiver expects seq 2 next.
+    let error = c2s_recv.open(&header, payload, &tag0).unwrap_err();
+    assert!(
+        error.to_string().contains("frame authentication failed"),
+        "{error}"
+    );
+
+    // The opposite direction's key cannot verify this direction's frames.
+    assert!(s2c.open(&header, payload, &tag1).is_err());
+
+    // Tampering with any covered byte fails closed.
+    let mut tampered_header = header;
+    tampered_header.len += 1;
+    assert!(c2s_recv.open(&tampered_header, payload, &tag1).is_err());
+    let tampered_payload = b"frame tag payloaD".as_slice();
+    assert!(c2s_recv.open(&header, tampered_payload, &tag1).is_err());
+    let mut wrong_length_tag = tag1.clone();
+    wrong_length_tag.pop();
+    assert!(c2s_recv.open(&header, payload, &wrong_length_tag).is_err());
+}
+
+#[test]
+fn a_frame_sealed_under_one_session_fails_under_another() {
+    let quad = quad_a_to_b();
+    let credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+    let auth = credentials.session("node-b", "replay-job", 1, quad);
+    let (_ack_a, mut c2s_session_a, _) = fabricate_ack_and_derive(&auth);
+    let (_ack_b, _, mut s2c_session_b) = fabricate_ack_and_derive(&auth);
+    let payload = b"captured frame".as_slice();
+    let header = FrameHeader {
+        quad,
+        len: payload.len() as u32,
+        kind: FrameKind::Data,
+    };
+    let mut captured_tag = vec![0u8; 16];
+    c2s_session_a.seal(&header, payload, &mut captured_tag);
+    // A new handshake produced new nonces and therefore new keys: the
+    // captured frame cannot be replayed onto the fresh session.
+    let error = s2c_session_b
+        .open(&header, payload, &captured_tag)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("frame authentication failed"),
+        "{error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_frame_from_wrong_credentials_is_rejected_end_to_end() {
+    let quad = quad_a_to_b();
+    let downstream = authenticated_manager("node-b", "the-real-secret");
+    downstream.spawn();
+    let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+    downstream
+        .register_inbound_for_session(
+            quad,
+            input_tx,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "forge-job".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    downstream.accept_stream(Box::new(server));
+    // The attacker holds a DIFFERENT secret: its handshake MAC fails at the
+    // gate, the connection is torn down, and no attacker-controlled byte
+    // ever reaches the registered pipeline (the failure surfaces on the
+    // manager's unauthenticated queue, not the Job channel — the session
+    // was never established).
+    let attacker_credentials = DataPlaneCredentials::new("node-a", "attacker-secret").unwrap();
+    let attacker_auth = attacker_credentials.session("node-b", "forge-job", 1, quad);
+    let request = serde_json::to_vec(&attacker_auth.client_handshake().unwrap()).unwrap();
+    write_frame(&mut client, quad, FrameKind::Handshake, &request)
+        .await
+        .unwrap();
+    // The server answers by closing the connection: the attacker's next
+    // read hits EOF instead of an acknowledgement.
+    let mut probe = [0u8; 1];
+    let eof = tokio::time::timeout(
+        TEST_PROPAGATION_BUDGET,
+        tokio::io::AsyncReadExt::read(&mut client, &mut probe),
+    )
+    .await;
+    match eof {
+        Ok(Ok(0)) => {}
+        Ok(Ok(_)) => panic!("the server must not acknowledge a failed handshake"),
+        Ok(Err(error)) => panic!("unexpected read error: {error}"),
+        Err(_) => panic!("the server must close a connection whose handshake MAC failed"),
+    }
+    let leaked =
+        tokio::time::timeout(std::time::Duration::from_millis(300), input_rx.recv_async()).await;
+    assert!(
+        leaked.is_err(),
+        "no attacker-controlled envelope may reach the pipeline"
+    );
+    downstream.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_captured_from_another_session_is_rejected_end_to_end() {
+    let quad = quad_a_to_b();
+    let downstream = authenticated_manager("node-b", "shuffle-secret");
+    downstream.spawn();
+    let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+    downstream
+        .register_inbound_for_session(
+            quad,
+            input_tx,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "xsession-job".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+    let failures = downstream.failure_receiver_for_job("xsession-job", 1);
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    downstream.accept_stream(Box::new(server));
+    let auth = DataPlaneCredentials::new("node-a", "shuffle-secret")
+        .unwrap()
+        .session("node-b", "xsession-job", 1, quad);
+    let (_c2s_real, _s2c_real) = handshake_and_derive(&mut client, &auth, quad).await;
+    // A frame sealed under a DIFFERENT handshake's keys (attacker replays a
+    // capture from an earlier session) must fail the fresh session's check.
+    let stale_credentials = DataPlaneCredentials::new("node-a", "shuffle-secret").unwrap();
+    let stale_auth = stale_credentials.session("node-b", "xsession-job", 1, quad);
+    let (_stale_ack, mut stale_c2s, _) = fabricate_ack_and_derive(&stale_auth);
+    let payload = b"captured batch".as_slice();
+    write_frame_sealed(
+        &mut client,
+        quad,
+        FrameKind::Data,
+        payload,
+        MAX_FRAME_LEN,
+        &mut stale_c2s,
+    )
+    .await
+    .unwrap();
+    let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
+    assert!(failure.contains("frame authentication failed"), "{failure}");
+    downstream.shutdown();
+}
+
 // ---------- inbound serve-loop error coverage ----------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2861,15 +3257,18 @@ async fn duplicate_handshake_and_quad_mismatch_fail_closed() {
     // A second handshake frame on an authenticated connection.
     let (mut client1, server1) = tokio::io::duplex(64 * 1024);
     downstream.accept_stream(Box::new(server1));
-    let request = serde_json::to_vec(&auth.client_handshake().unwrap()).unwrap();
-    write_frame(&mut client1, quad, FrameKind::Handshake, &request)
-        .await
-        .unwrap();
-    // Drain the server's acknowledgement before sending the duplicate.
-    let (_ack_header, _ack_payload) = read_frame(&mut client1).await.unwrap();
-    write_frame(&mut client1, quad, FrameKind::Handshake, &request)
-        .await
-        .unwrap();
+    let (mut c2s1, _s2c1) = handshake_and_derive(&mut client1, &auth, quad).await;
+    write_frame_sealed(
+        &mut client1,
+        quad,
+        FrameKind::Handshake,
+        // Payload content is irrelevant: the duplicate KIND is the violation.
+        b"{}",
+        MAX_FRAME_LEN,
+        &mut c2s1,
+    )
+    .await
+    .unwrap();
     let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
     assert!(
         failure
@@ -2886,16 +3285,14 @@ async fn duplicate_handshake_and_quad_mismatch_fail_closed() {
     let (mut client2, server2) = tokio::io::duplex(64 * 1024);
     downstream.accept_stream(Box::new(server2));
     // A fresh handshake: the server's nonce cache rejects replayed ones.
-    let fresh_request = serde_json::to_vec(&auth.client_handshake().unwrap()).unwrap();
-    write_frame(&mut client2, quad, FrameKind::Handshake, &fresh_request)
-        .await
-        .unwrap();
-    let (_ack_header, _ack_payload) = read_frame(&mut client2).await.unwrap();
-    write_frame(
+    let (mut c2s2, _s2c2) = handshake_and_derive(&mut client2, &auth, quad).await;
+    write_frame_sealed(
         &mut client2,
         wrong_quad,
         FrameKind::Signal,
         serde_json::to_vec(&WireSignal::Eos).unwrap().as_slice(),
+        MAX_FRAME_LEN,
+        &mut c2s2,
     )
     .await
     .unwrap();
@@ -3462,6 +3859,36 @@ fn raw_handshake(node: &str, job: &str, generation: u64, quad: Quad) -> (FrameHe
     (header, payload)
 }
 
+/// Completes the client side of an authenticated handshake against a live
+/// manager socket and returns both direction cryptos derived from the
+/// manager's REAL acknowledgement: `(c2s, s2c)` — the socket under test
+/// sends with c2s and receives with s2c.
+async fn handshake_and_derive(
+    client: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    auth: &SessionAuth,
+    quad: Quad,
+) -> (FrameCrypto, FrameCrypto) {
+    let request = serde_json::to_vec(&auth.client_handshake().unwrap()).unwrap();
+    write_frame(client, quad, FrameKind::Handshake, &request)
+        .await
+        .unwrap();
+    let (_ack_header, ack_bytes) = read_frame(client).await.unwrap();
+    let ack: HandshakePayload = serde_json::from_slice(&ack_bytes).unwrap();
+    auth.frame_crypto_client(&ack).unwrap()
+}
+
+/// Fabricates a server-side acknowledgement for THIS auth's handshake and
+/// derives both direction cryptos from it — for tests that simulate the
+/// serving peer over a duplex. The client reader derives its keys from the
+/// same fabricated ack, so both ends agree; returns `(ack_payload, c2s, s2c)`.
+fn fabricate_ack_and_derive(auth: &SessionAuth) -> (Vec<u8>, FrameCrypto, FrameCrypto) {
+    let request = auth.client_handshake().unwrap();
+    let ack = auth.server_ack(&request, "node-b");
+    let payload = serde_json::to_vec(&ack).unwrap();
+    let (c2s, s2c) = auth.frame_crypto_client(&ack).unwrap();
+    (payload, c2s, s2c)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn authenticated_protocol_violation_reports_through_the_job_channel() {
     let quad = quad_a_to_b();
@@ -3484,16 +3911,22 @@ async fn authenticated_protocol_violation_reports_through_the_job_channel() {
     let failures = downstream.failure_receiver_for_job("job-pv", 1);
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     downstream.accept_stream(Box::new(server));
-    let (_header, payload) = raw_handshake("node-a", "job-pv", 1, quad);
-    write_frame(&mut client, quad, FrameKind::Handshake, &payload)
-        .await
-        .unwrap();
-    let (_ack_header, _ack_payload) = read_frame(&mut client).await.unwrap();
+    let auth = DataPlaneCredentials::new("node-a", "shuffle-secret")
+        .unwrap()
+        .session("node-b", "job-pv", 1, quad);
+    let (mut c2s, _s2c) = handshake_and_derive(&mut client, &auth, quad).await;
     // A malformed signal frame after authentication is a connection
     // failure routed through the Job's registered failure channel.
-    write_frame(&mut client, quad, FrameKind::Signal, b"garbage")
-        .await
-        .unwrap();
+    write_frame_sealed(
+        &mut client,
+        quad,
+        FrameKind::Signal,
+        b"garbage",
+        MAX_FRAME_LEN,
+        &mut c2s,
+    )
+    .await
+    .unwrap();
     let failure = recv_within(&failures, TEST_PROPAGATION_BUDGET).await;
     assert!(
         failure.contains("inbound signal frame malformed"),
@@ -3602,23 +4035,36 @@ async fn late_connection_error_after_job_removal_is_swallowed() {
         .unwrap();
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     downstream.accept_stream(Box::new(server));
-    let (_header, payload) = raw_handshake("node-a", "job-late", 1, quad);
-    write_frame(&mut client, quad, FrameKind::Handshake, &payload)
-        .await
-        .unwrap();
-    let (_ack_header, _ack_payload) = read_frame(&mut client).await.unwrap();
+    let auth = DataPlaneCredentials::new("node-a", "shuffle-secret")
+        .unwrap()
+        .session("node-b", "job-late", 1, quad);
+    let (mut c2s, _s2c) = handshake_and_derive(&mut client, &auth, quad).await;
     let mut encoder = DataEncoder::new();
     let data = encoder.encode(&dictionary_batch(None), 0).unwrap();
-    write_frame(&mut client, quad, FrameKind::Data, &data)
-        .await
-        .unwrap();
+    write_frame_sealed(
+        &mut client,
+        quad,
+        FrameKind::Data,
+        &data,
+        MAX_FRAME_LEN,
+        &mut c2s,
+    )
+    .await
+    .unwrap();
     let _ = next_envelope(&input_rx).await;
     // The Job is torn down, then the connection fails: reporting the
     // error must not recreate the removed Job's state.
     downstream.remove_job_session("job-late", 1);
-    write_frame(&mut client, quad, FrameKind::Signal, b"garbage")
-        .await
-        .unwrap();
+    write_frame_sealed(
+        &mut client,
+        quad,
+        FrameKind::Signal,
+        b"garbage",
+        MAX_FRAME_LEN,
+        &mut c2s,
+    )
+    .await
+    .unwrap();
     let global_failures = downstream.failure_receiver();
     assert!(
         tokio::time::timeout(
@@ -3792,7 +4238,11 @@ async fn authorize_inbound_requires_configured_credentials() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pump_register_rejection_with_a_clean_abort_reports_the_limit() {
+async fn pending_receipts_budget_exceeded_fails_delivery_not_attempt() {
+    // Pins the delivery-level failure contract: when the pending receipt
+    // budget is exceeded, the EXCESS delivery is aborted for upstream
+    // redelivery (at-least-once) and the pump keeps serving the channel —
+    // the attempt does NOT fail on transient congestion.
     let quad = quad_a_to_b();
     let config = NetworkManagerConfig {
         max_pending_receipts: 1,
@@ -3802,33 +4252,44 @@ async fn pump_register_rejection_with_a_clean_abort_reports_the_limit() {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let (writer, _reader) = tokio::io::duplex(64 * 1024);
     let (tx, rx) = flume::bounded::<Envelope>(4);
+    let accepted_branch = Arc::new(RecordingAck::default());
+    let rejected_branch = Arc::new(RecordingAck::default());
     tx.send_async(Envelope::Data(
         Arc::new(dictionary_batch(None)),
-        Arc::new(RecordingAck::default()),
+        accepted_branch.clone(),
     ))
     .await
     .unwrap();
     tx.send_async(Envelope::Data(
         Arc::new(dictionary_batch(None)),
-        Arc::new(RecordingAck::default()),
+        rejected_branch.clone(),
     ))
     .await
     .unwrap();
     drop(tx);
-    let error = pump_edge(
+    let result = pump_edge(
         rx, writer, quad, pending, shutdown, config, None, false, None, false, false,
     )
-    .await
-    .unwrap_err();
+    .await;
+    // The attempt survived the budget overflow.
+    result.expect("a budget-exceeded delivery must not fail the pump");
     assert!(
-        error
-            .to_string()
-            .contains("pending receipt limit 1 reached"),
-        "{error}"
+        rejected_branch
+            .aborted
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the over-budget delivery must be aborted for upstream redelivery"
     );
     assert!(
-        !error.to_string().contains("failed to abort"),
-        "a clean abort must not decorate the limit error: {error}"
+        !rejected_branch
+            .acked
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "an aborted delivery must never complete its source ack"
+    );
+    assert!(
+        !accepted_branch
+            .aborted
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the delivery that fit the budget is untouched"
     );
 }
 

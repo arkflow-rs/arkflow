@@ -71,6 +71,61 @@ impl ResourceSampler {
 
 /// Merge a fresh snapshot into the report's metrics map under the fixed
 /// `node_*` vocabulary; the CPU gauge is skipped until it has a real window.
+/// Applies the optional data-plane resource/SLO tuning variables onto a
+/// [`NetworkManagerConfig`]: `ARKFLOW_DATA_PLANE_MAX_CONNECTIONS`,
+/// `ARKFLOW_DATA_PLANE_RECONNECT_ATTEMPTS`,
+/// `ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS`,
+/// `ARKFLOW_DATA_PLANE_REGISTRATION_GRACE_MS`, and
+/// `ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES`. Every variable is optional;
+/// unset keeps the library default, so existing deployments are unaffected.
+/// A malformed value fails agent startup: a typoed SLO must not silently
+/// degrade the node to colocated-only. Range validation (for instance a
+/// frame cap above the protocol ceiling) stays with
+/// `NetworkManagerConfig::validate` at manager construction.
+pub(super) fn apply_data_plane_env_limits(
+    config: &mut arkflow_core::executor::remote::NetworkManagerConfig,
+) -> Result<(), String> {
+    apply_data_plane_limits_from(config, |name| std::env::var(name).ok())
+}
+
+/// The injectable form of [`apply_data_plane_env_limits`]; the lookup
+/// indirection keeps the tests free of process-global environment mutation.
+pub(super) fn apply_data_plane_limits_from(
+    config: &mut arkflow_core::executor::remote::NetworkManagerConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    let unsigned = |name: &str| -> Result<Option<u64>, String> {
+        match lookup(name) {
+            Some(raw) if !raw.trim().is_empty() => raw
+                .trim()
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|error| format!("{name}: expected an unsigned integer ({error})")),
+            _ => Ok(None),
+        }
+    };
+    let limit = |value: u64, name: &str| -> Result<usize, String> {
+        usize::try_from(value).map_err(|_| format!("{name}: value too large"))
+    };
+    if let Some(value) = unsigned("ARKFLOW_DATA_PLANE_MAX_CONNECTIONS")? {
+        config.max_connections = limit(value, "ARKFLOW_DATA_PLANE_MAX_CONNECTIONS")?;
+    }
+    if let Some(value) = unsigned("ARKFLOW_DATA_PLANE_RECONNECT_ATTEMPTS")? {
+        config.reconnect_attempts = limit(value, "ARKFLOW_DATA_PLANE_RECONNECT_ATTEMPTS")?;
+    }
+    if let Some(ms) = unsigned("ARKFLOW_DATA_PLANE_RECONNECT_GRACE_MS")? {
+        config.reconnect_grace = std::time::Duration::from_millis(ms);
+    }
+    if let Some(ms) = unsigned("ARKFLOW_DATA_PLANE_REGISTRATION_GRACE_MS")? {
+        config.registration_grace = std::time::Duration::from_millis(ms);
+    }
+    if let Some(bytes) = unsigned("ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES")? {
+        config.max_frame_len = u32::try_from(bytes)
+            .map_err(|_| "ARKFLOW_DATA_PLANE_MAX_FRAME_LEN_BYTES: value too large".to_string())?;
+    }
+    Ok(())
+}
+
 /// Build the data-plane mTLS material from `ARKFLOW_DATA_PLANE_TLS_CERT`,
 /// `_KEY`, and `_CA` (PEM file paths). All three or none: a partial set is
 /// an explicit configuration error (a half-loaded TLS config must fail, not

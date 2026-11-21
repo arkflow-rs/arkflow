@@ -4,6 +4,7 @@
 use super::wire::WireDataMeta;
 use crate::Error;
 use crate::MessageBatch;
+use bytes::Bytes;
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::buffer::Buffer;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
@@ -113,9 +114,12 @@ impl DataDecoder {
         Self::default()
     }
 
-    pub fn decode(&mut self, payload: &[u8]) -> Result<(MessageBatch, u64), Error> {
+    /// Decodes one data frame. The payload is shared-ownership [`Bytes`]: the
+    /// decoded batch's IPC body buffer slices it without copying, so a frame
+    /// is allocated exactly once (at read time) end to end.
+    pub fn decode(&mut self, payload: Bytes) -> Result<(MessageBatch, u64), Error> {
         let mut cursor = 0usize;
-        let meta_len = read_u32(payload, &mut cursor)? as usize;
+        let meta_len = read_u32(&payload, &mut cursor)? as usize;
         let meta_end = cursor
             .checked_add(meta_len)
             .ok_or_else(|| Error::Process("data frame meta length overflows".into()))?;
@@ -128,7 +132,7 @@ impl DataDecoder {
         cursor = meta_end;
 
         if meta.has_schema {
-            let (piece, next) = read_piece(payload, cursor)?;
+            let (piece, next) = read_piece(&payload, cursor)?;
             let schema = try_schema_from_flatbuffer_bytes(piece.flatbuf()).map_err(|error| {
                 Error::Process(format!("data frame schema decode failed: {error}"))
             })?;
@@ -153,7 +157,7 @@ impl DataDecoder {
 
         let mut decoded_batch = None;
         while cursor < payload.len() {
-            let (piece, next) = read_piece(payload, cursor)?;
+            let (piece, next) = read_piece(&payload, cursor)?;
             cursor = next;
             let message = root_as_message(piece.flatbuf()).map_err(|error| {
                 Error::Process(format!("data frame IPC message invalid: {error}"))
@@ -215,17 +219,20 @@ impl DataDecoder {
 }
 
 /// One length-prefixed IPC piece inside a data payload:
-/// `[u32 total][u32 flatbuf_len][flatbuf][body..]`.
-pub(crate) struct Piece<'a> {
-    pub(crate) bytes: &'a [u8],
+/// `[u32 total][u32 flatbuf_len][flatbuf][body..]`. The bytes are a
+/// shared-ownership slice of the frame payload — slicing never copies.
+pub(crate) struct Piece {
+    pub(crate) bytes: Bytes,
     pub(crate) flatbuf_len: usize,
 }
 
-impl<'a> Piece<'a> {
-    fn flatbuf(&self) -> &'a [u8] {
+impl Piece {
+    fn flatbuf(&self) -> &[u8] {
         &self.bytes[8..8 + self.flatbuf_len]
     }
 
+    /// The IPC body as a zero-copy view: the returned buffer shares the
+    /// frame payload's memory instead of copying `body_len` bytes out.
     pub(crate) fn body(&self, body_len: usize) -> Result<Buffer, Error> {
         let start = 8 + self.flatbuf_len;
         let end = start
@@ -235,7 +242,7 @@ impl<'a> Piece<'a> {
             .bytes
             .get(start..end)
             .ok_or_else(|| Error::Process("IPC body exceeds IPC piece".into()))?;
-        Ok(Buffer::from_vec(body.to_vec()))
+        Ok(Buffer::from(self.bytes.slice_ref(body)))
     }
 }
 
@@ -251,10 +258,7 @@ fn write_piece(out: &mut Vec<u8>, encoded: &EncodedData) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn read_piece<'a>(
-    payload: &'a [u8],
-    cursor: usize,
-) -> Result<(Piece<'a>, usize), Error> {
+pub(crate) fn read_piece(payload: &Bytes, cursor: usize) -> Result<(Piece, usize), Error> {
     let total = peek_u32(payload, cursor)? as usize;
     if total < 8 {
         return Err(Error::Process("IPC piece length underflows".into()));
@@ -274,7 +278,16 @@ pub(crate) fn read_piece<'a>(
             "IPC piece flatbuf exceeds piece length".into(),
         ));
     }
-    Ok((Piece { bytes, flatbuf_len }, end))
+    // A shared-ownership slice: no copy, and the receiver-side piece keeps
+    // exactly this range alive for the zero-copy body buffer.
+    let piece_bytes = payload.slice(cursor..end);
+    Ok((
+        Piece {
+            bytes: piece_bytes,
+            flatbuf_len,
+        },
+        end,
+    ))
 }
 
 fn peek_u32(payload: &[u8], offset: usize) -> Result<u32, Error> {

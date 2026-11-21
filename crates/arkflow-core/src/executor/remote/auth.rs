@@ -1,7 +1,8 @@
 //! Authenticated data-plane sessions: shared credentials, per-edge session
-//! identity, and the HMAC handshake payloads.
+//! identity, the HMAC handshake payloads, and the v2 per-frame authentication
+//! derived from the session key agreement.
 
-use super::wire::Quad;
+use super::wire::{FrameHeader, Quad, FRAME_TAG_LEN};
 use crate::Error;
 use hmac::{Hmac, Mac};
 use rand::Rng;
@@ -12,8 +13,15 @@ use subtle::ConstantTimeEq;
 
 /// Version of the authenticated data-plane handshake.  A version mismatch
 /// is a protocol error rather than a best-effort downgrade.
-pub(crate) const DATA_PLANE_PROTOCOL_VERSION: u16 = 1;
+///
+/// v2: the handshake exchanges BOTH nonces and derives per-connection,
+/// per-direction session keys; every post-handshake frame carries a
+/// truncated HMAC tag over header, payload, and a connection-level
+/// monotonic sequence number. v1 frames carry no authentication.
+pub(crate) const DATA_PLANE_PROTOCOL_VERSION: u16 = 2;
 pub(crate) const HANDSHAKE_NONCE_LEN: usize = 32;
+/// Session keys are 32-byte HMAC-SHA256 keys, one per direction.
+pub(crate) const SESSION_KEY_LEN: usize = 32;
 
 /// Credentials shared by the two Agents participating in a data-plane
 /// session.  The secret is never serialized into a Job command or logged.
@@ -143,7 +151,17 @@ pub(crate) struct HandshakePayload {
     pub(crate) job_id: String,
     pub(crate) generation: u64,
     pub(crate) quad: Quad,
+    /// The sender's fresh nonce. The acknowledgement echoes the request's
+    /// nonce here (anti-replay, see `SessionAuth::sent_nonce`) and carries
+    /// its own fresh nonce in `server_nonce` — both sides contribute
+    /// entropy to the session key derivation.
     pub(crate) nonce: Vec<u8>,
+    /// The acknowledging side's fresh nonce; empty on the client request.
+    /// Together with the client nonce it salts the per-connection session
+    /// keys, so every handshake produces independent keys even with the
+    /// same long-lived shared secret.
+    #[serde(default)]
+    pub(crate) server_nonce: Vec<u8>,
     pub(crate) acknowledgement: bool,
     mac: Vec<u8>,
 }
@@ -166,6 +184,7 @@ impl SessionAuth {
             generation: self.generation,
             quad: self.quad,
             nonce,
+            server_nonce: Vec::new(),
             acknowledgement: false,
             mac: Vec::new(),
         };
@@ -183,6 +202,8 @@ impl SessionAuth {
         request: &HandshakePayload,
         local_node: &str,
     ) -> HandshakePayload {
+        let mut server_nonce = vec![0; HANDSHAKE_NONCE_LEN];
+        rand::rng().fill(server_nonce.as_mut_slice());
         let mut response = HandshakePayload {
             protocol_version: DATA_PLANE_PROTOCOL_VERSION,
             source_node: local_node.to_owned(),
@@ -191,6 +212,7 @@ impl SessionAuth {
             generation: request.generation,
             quad: request.quad,
             nonce: request.nonce.clone(),
+            server_nonce,
             acknowledgement: true,
             mac: Vec::new(),
         };
@@ -214,6 +236,7 @@ impl SessionAuth {
             || payload.generation != self.generation
             || payload.quad != self.quad
             || !payload.acknowledgement
+            || payload.server_nonce.len() != HANDSHAKE_NONCE_LEN
             || expected_nonce
                 .as_deref()
                 .is_none_or(|sent| payload.nonce != sent)
@@ -224,6 +247,155 @@ impl SessionAuth {
         }
         verify_handshake_mac(&self.shared_secret, payload, b"server")
     }
+
+    /// Derives this connection's frame cryptos from the verified server
+    /// acknowledgement: the send key protects frames this side writes (c2s
+    /// for the client), the receive key protects frames it reads (s2c).
+    /// Must only be called after `verify_server_ack` accepted the payload.
+    pub(crate) fn frame_crypto_client(
+        &self,
+        ack: &HandshakePayload,
+    ) -> Result<(FrameCrypto, FrameCrypto), Error> {
+        let client_nonce = self
+            .sent_nonce
+            .lock()
+            .map(|sent| sent.clone().unwrap_or_default())
+            .unwrap_or_default();
+        derive_session_keys(
+            &self.shared_secret,
+            &client_nonce,
+            &ack.server_nonce,
+            &self.job_id,
+            self.generation,
+            &self.quad,
+        )
+    }
+
+    /// Server-side counterpart: derives both direction cryptos from the
+    /// verified request and the ack about to be sent.
+    pub(crate) fn frame_crypto_server(
+        &self,
+        request: &HandshakePayload,
+        response: &HandshakePayload,
+    ) -> Result<(FrameCrypto, FrameCrypto), Error> {
+        derive_session_keys(
+            &self.shared_secret,
+            &request.nonce,
+            &response.server_nonce,
+            &request.job_id,
+            request.generation,
+            &request.quad,
+        )
+    }
+}
+
+/// Per-connection, per-direction frame authenticator (protocol v2). The send
+/// side stamps every frame with a truncated HMAC over the encoded header,
+/// payload, and its monotonic sequence counter; the receive side verifies
+/// the tag and enforces strictly-increasing sequence numbers, so captured
+/// frames cannot be replayed and any modified byte fails closed.
+#[derive(Debug)]
+pub(crate) struct FrameCrypto {
+    key: [u8; SESSION_KEY_LEN],
+    /// Send side: sequence number of the NEXT frame to seal. Receive side:
+    /// sequence number expected next (first post-handshake frame is 0).
+    next_seq: u64,
+}
+
+impl FrameCrypto {
+    pub(crate) fn new(key: [u8; SESSION_KEY_LEN]) -> Self {
+        Self { key, next_seq: 0 }
+    }
+
+    /// Computes the authentication tag for one outgoing frame and advances
+    /// the sequence counter.
+    pub(crate) fn seal(&mut self, header: &FrameHeader, payload: &[u8], tag_out: &mut [u8]) {
+        let seq = self.next_seq;
+        self.next_seq = seq.wrapping_add(1);
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC accepts every key length");
+        mac.update(&header.encode_fixed());
+        mac.update(payload);
+        mac.update(&seq.to_le_bytes());
+        let tag = mac.finalize().into_bytes();
+        tag_out.copy_from_slice(&tag[..FRAME_TAG_LEN]);
+    }
+
+    /// Verifies one incoming frame's tag and sequence number before any
+    /// payload parsing; a mismatch is a deterministic protocol error.
+    pub(crate) fn open(
+        &mut self,
+        header: &FrameHeader,
+        payload: &[u8],
+        tag: &[u8],
+    ) -> Result<(), Error> {
+        if tag.len() != FRAME_TAG_LEN {
+            return Err(Error::Process(
+                "remote edge frame authentication tag has the wrong length".into(),
+            ));
+        }
+        let expected_seq = self.next_seq;
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC accepts every key length");
+        mac.update(&header.encode_fixed());
+        mac.update(payload);
+        mac.update(&expected_seq.to_le_bytes());
+        let expected = mac.finalize().into_bytes();
+        if !bool::from(expected[..FRAME_TAG_LEN].ct_eq(tag)) {
+            return Err(Error::Process(
+                "remote edge frame authentication failed".into(),
+            ));
+        }
+        self.next_seq = expected_seq.wrapping_add(1);
+        Ok(())
+    }
+}
+
+/// Derives the two per-direction session keys for one connection from the
+/// long-lived shared secret and BOTH handshake nonces. The nonce pair salts
+/// HKDF so every handshake yields independent keys; the identity info binds
+/// the keys to this exact job/generation/quad so a key cannot be replayed
+/// onto a different edge.
+fn derive_session_keys(
+    shared_secret: &[u8],
+    client_nonce: &[u8],
+    server_nonce: &[u8],
+    job_id: &str,
+    generation: u64,
+    quad: &Quad,
+) -> Result<(FrameCrypto, FrameCrypto), Error> {
+    if client_nonce.len() != HANDSHAKE_NONCE_LEN || server_nonce.len() != HANDSHAKE_NONCE_LEN {
+        return Err(Error::Process(
+            "remote edge handshake nonces are missing or malformed".into(),
+        ));
+    }
+    let mut info = Vec::with_capacity(128);
+    info.extend_from_slice(b"arkflow-data-plane/v2");
+    info.extend_from_slice(&(job_id.len() as u64).to_le_bytes());
+    info.extend_from_slice(job_id.as_bytes());
+    info.extend_from_slice(&generation.to_le_bytes());
+    info.extend_from_slice(&quad.src_op.to_le_bytes());
+    info.extend_from_slice(&quad.src_subtask.to_le_bytes());
+    info.extend_from_slice(&quad.dst_op.to_le_bytes());
+    info.extend_from_slice(&quad.dst_subtask.to_le_bytes());
+    // The nonce pair salts the extract step so both sides' fresh entropy
+    // shapes every derived byte; the identity info above pins the keys to
+    // this exact job/generation/quad edge, and each direction expands its
+    // own key so the two keys are cryptographically independent.
+    let mut salt = Vec::with_capacity(2 * HANDSHAKE_NONCE_LEN);
+    salt.extend_from_slice(client_nonce);
+    salt.extend_from_slice(server_nonce);
+    let hk = hkdf::Hkdf::<Sha256>::new(Some(&salt), shared_secret);
+    let derive = |direction: &[u8]| -> Result<[u8; SESSION_KEY_LEN], Error> {
+        let mut keyed_info = info.clone();
+        keyed_info.extend_from_slice(&(direction.len() as u64).to_le_bytes());
+        keyed_info.extend_from_slice(direction);
+        let mut key = [0u8; SESSION_KEY_LEN];
+        hk.expand(&keyed_info, &mut key)
+            .map_err(|_| Error::Process("remote edge session key derivation failed".into()))?;
+        Ok(key)
+    };
+    let c2s = derive(b"c2s")?;
+    let s2c = derive(b"s2c")?;
+    Ok((FrameCrypto::new(c2s), FrameCrypto::new(s2c)))
 }
 
 fn handshake_mac(secret: &[u8], payload: &HandshakePayload, direction: &[u8]) -> Vec<u8> {
@@ -265,6 +437,8 @@ fn canonical_handshake_bytes(payload: &HandshakePayload, direction: &[u8]) -> Ve
     bytes.extend_from_slice(&payload.quad.dst_subtask.to_le_bytes());
     bytes.extend_from_slice(&(payload.nonce.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&payload.nonce);
+    bytes.extend_from_slice(&(payload.server_nonce.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&payload.server_nonce);
     bytes.push(u8::from(payload.acknowledgement));
     bytes.extend_from_slice(&(direction.len() as u64).to_le_bytes());
     bytes.extend_from_slice(direction);
