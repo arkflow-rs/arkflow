@@ -1455,7 +1455,19 @@ impl NetworkManager {
                 // Clean requires BOTH halves to end cleanly: the read loop
                 // already classifies a post-drain peer close as Ok, so any Err
                 // on either half is a stream-level failure.
-                let error = pump_result.err().or(read_result.err());
+                let pump_failure = pump_result.err();
+                let read_failure = read_result.err();
+                // A deterministic failure on EITHER half must terminate: an
+                // acknowledgement-verification failure cancels the connection
+                // and the pump's gate error would otherwise mask the reader's
+                // identity error as the surfaced cause.
+                let deterministic = pump_failure
+                    .as_ref()
+                    .is_some_and(is_deterministic_protocol_error)
+                    || read_failure
+                        .as_ref()
+                        .is_some_and(is_deterministic_protocol_error);
+                let error = pump_failure.or(read_failure);
                 match error {
                     None => {
                         clean_exit = true;
@@ -1470,7 +1482,7 @@ impl NetworkManager {
                         // on every redial, so reconnecting only delays the
                         // honest terminal failure (and could mask it if a
                         // later connection briefly succeeds).
-                        let retry = !is_deterministic_protocol_error(&error)
+                        let retry = !deterministic
                             && reconnectable
                             && attempts_left > 0
                             && !manager.shutdown.is_cancelled()
@@ -2270,7 +2282,7 @@ pub(crate) fn is_deterministic_protocol_error(error: &Error) -> bool {
     let Error::Process(message) = error else {
         return false;
     };
-    const DETERMINISTIC: [&str; 12] = [
+    const DETERMINISTIC: [&str; 15] = [
         // FrameCrypto::open (v2 per-frame authentication)
         "remote edge frame authentication failed",
         "remote edge frame authentication tag has the wrong length",
@@ -2286,6 +2298,12 @@ pub(crate) fn is_deterministic_protocol_error(error: &Error) -> bool {
         "does not match authenticated quad",
         "remote edge frame arrived before handshake",
         "frame on a receipt channel",
+        // correctly sealed but semantically invalid payloads after a valid
+        // handshake: reconnecting replays the same bytes
+        "remote edge receipt frame malformed",
+        "remote edge handshake acknowledgement malformed",
+        // the terminal never-fits outcome of the pump (below)
+        "pending replay budget cannot fit the batch",
     ];
     DETERMINISTIC
         .iter()
@@ -2649,7 +2667,24 @@ pub(crate) async fn pump_edge(
                                 let batch_bytes =
                                     batch.record_batch().get_array_memory_size() as u64;
                                 if pending.never_fits(batch_bytes) {
-                                    result = Err(error);
+                                    // The batch was never inserted into the
+                                    // pending map, so abort_all cannot reach
+                                    // it: settle the branch here or its source
+                                    // ack stays outstanding until the drain
+                                    // fallback stalls. The result carries a
+                                    // deterministic-classified message so the
+                                    // supervisor does NOT retry — a reconnect
+                                    // would replay without this batch and
+                                    // silently omit it.
+                                    if let Err(abort_error) = branch.abort().await {
+                                        result = Err(Error::Process(format!(
+                                            "{error}; failed to abort batch rejected by pending receipt limit: {abort_error}"
+                                        )));
+                                        break;
+                                    }
+                                    result = Err(Error::Process(format!(
+                                        "remote edge pending replay budget cannot fit the batch ({batch_bytes} bytes); the delivery can never fit: {error}"
+                                    )));
                                     break;
                                 }
                                 if let Some(abort_error) = branch.abort().await.err() {

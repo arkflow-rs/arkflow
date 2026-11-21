@@ -390,6 +390,9 @@ fn deterministic_protocol_errors_are_classified_for_no_reconnect() {
         "remote edge frame quad Quad { .. } does not match authenticated quad Quad { .. }",
         "remote edge frame arrived before handshake",
         "unexpected Data frame on a receipt channel",
+        "remote edge receipt frame malformed",
+        "remote edge handshake acknowledgement malformed",
+        "remote edge pending replay budget cannot fit the batch (2048 bytes); the delivery can never fit: remote edge pending replay byte budget 1 reached (0 bytes retained)",
     ] {
         let error = Error::Process(message.into());
         assert!(
@@ -4438,7 +4441,19 @@ async fn pending_receipts_budget_exceeded_fails_delivery_not_attempt() {
     ))
     .await
     .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait until the SECOND batch is actually rejected (proving the slot was
+    // still occupied) BEFORE freeing it — a plain sleep would let a correct
+    // implementation deliver the second batch into the freed slot.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !rejected_branch
+            .aborted
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the over-budget delivery is rejected while the slot is occupied");
     // The attempt survived the budget overflow — and KEPT SERVING: freeing
     // the slot lets a third delivery reach the peer over the same pump.
     pending.apply(
