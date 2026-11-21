@@ -487,7 +487,9 @@ fn window_journal_workload(reads: usize, keys: usize, row_budget: usize) -> Stri
     let template_rows = keys;
     let batch_size = (1000 / keys).max(1);
     let max_txns = keys.saturating_mul(2) + 64;
-    let max_staged_bytes = row_budget.saturating_mul(2048).saturating_add(64 * 1024 * 1024);
+    let max_staged_bytes = row_budget
+        .saturating_mul(2048)
+        .saturating_add(64 * 1024 * 1024);
     let mut template = String::with_capacity(template_rows * 40);
     for i in 0..template_rows {
         template.push_str(&format!(
