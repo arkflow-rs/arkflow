@@ -476,13 +476,20 @@ async fn avro_decode_w100(count: usize) -> Result<ScenarioResult, Error> {
 ///
 /// `max_pending_transactions` scales with the key count: the journaled
 /// operator stages one transaction per open window group, and the 4_096
-/// default would fail the 1k tier on the first batch.
-fn window_journal_workload(count: usize, keys: usize) -> String {
+/// default would fail the 1k tier on the first batch. `max_staged_bytes`
+/// scales with the row budget for the same reason: a never-firing window
+/// keeps every open group's latest snapshot staged until the EOF fire
+/// commits them, so the staged total tracks the buffered state size and
+/// the 64MB default would fail the tiers near the end of the run.
+fn window_journal_workload(reads: usize, keys: usize, row_budget: usize) -> String {
     // Uniform ~1000-row reads at every tier: the template carries the keys
     // (generate replicates a static template) and batch_size tiles it.
     let template_rows = keys;
     let batch_size = (1000 / keys).max(1);
     let max_txns = keys.saturating_mul(2) + 64;
+    let max_staged_bytes = row_budget
+        .saturating_mul(2048)
+        .saturating_add(64 * 1024 * 1024);
     let mut template = String::with_capacity(template_rows * 40);
     for i in 0..template_rows {
         template.push_str(&format!(
@@ -499,7 +506,7 @@ streams:
       context: |
 {template}      interval: 1ns
       batch_size: {batch_size}
-      count: {count}
+      count: {reads}
       codec:
         type: "json"
     pipeline:
@@ -514,6 +521,7 @@ streams:
       backend: "embedded_kv"
       durability: "ephemeral"
       max_pending_transactions: {max_txns}
+      max_staged_bytes: {max_staged_bytes}
     output:
       type: "drop"
 "#
@@ -530,8 +538,9 @@ async fn window_journal(
     // = count × template_rows, so dividing by the template size keeps the
     // row budget comparable across tiers.
     let reads = (count / keys).max(1);
-    let config: EngineConfig = serde_yaml::from_str(&window_journal_workload(reads, keys))
-        .map_err(|e| Error::Config(format!("benchmark workload invalid: {e}")))?;
+    let config: EngineConfig =
+        serde_yaml::from_str(&window_journal_workload(reads, keys, count))
+            .map_err(|e| Error::Config(format!("benchmark workload invalid: {e}")))?;
     let (wall, operations) = run_stream(&config).await?;
     Ok(ScenarioResult {
         name,

@@ -179,6 +179,14 @@ pub struct StateSpec {
     /// capacity planning.
     #[serde(default)]
     pub max_pending_transactions: Option<usize>,
+    /// Maximum bytes of uncommitted state mutations the journal may hold at
+    /// once across this Job. Staged bytes accumulate with the live window
+    /// state (each open window group's latest snapshot) until the fired
+    /// output acknowledges and commits them, so a high-cardinality window
+    /// that fires rarely needs a raise; the default bounds staged memory,
+    /// so pair a raise with realistic capacity planning.
+    #[serde(default)]
+    pub max_staged_bytes: Option<usize>,
     /// Optional live state-byte budget enforced by disk-backed state.
     #[serde(default)]
     pub max_bytes: Option<u64>,
@@ -577,6 +585,14 @@ impl JobSpec {
                 // where the operator can still fix the spec.
                 return Err(Error::Config(
                     "state.max_pending_transactions must be positive".into(),
+                ));
+            }
+            if state.max_staged_bytes == Some(0) {
+                // A zero byte bound fails the first staged mutation at
+                // runtime; reject it where the operator can still fix the
+                // spec.
+                return Err(Error::Config(
+                    "state.max_staged_bytes must be positive".into(),
                 ));
             }
         }
@@ -1715,6 +1731,7 @@ mod tests {
                 ttl_ms: None,
                 format_version: 1,
                 max_pending_transactions: None,
+                max_staged_bytes: None,
                 max_bytes: None,
             }),
             checkpoint: Some(CheckpointSpec {
@@ -1872,6 +1889,7 @@ mod tests {
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: Some(0),
+            max_staged_bytes: None,
             max_bytes: None,
         });
         let error = job.validate().unwrap_err().to_string();
@@ -1896,6 +1914,20 @@ mod tests {
         assert!(error.contains("max_bytes"), "{error}");
 
         job.state.as_mut().expect("base job state").max_bytes = Some(1);
+        job.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_a_zero_staged_byte_bound() {
+        let mut job = base_job();
+        job.state.as_mut().expect("base job state").max_staged_bytes = Some(0);
+        let error = job.validate().unwrap_err().to_string();
+        assert!(error.contains("max_staged_bytes"), "{error}");
+
+        // A positive bound and the default are accepted.
+        job.state.as_mut().expect("base job state").max_staged_bytes = Some(1024);
+        job.validate().unwrap();
+        job.state.as_mut().expect("base job state").max_staged_bytes = None;
         job.validate().unwrap();
     }
 

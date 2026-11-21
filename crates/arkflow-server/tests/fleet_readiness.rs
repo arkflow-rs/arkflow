@@ -194,6 +194,7 @@ fn fleet_job(job_id: &str, node_id: &str, checkpoint_uri: String, state_root: St
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         }),
         checkpoint: Some(CheckpointSpec {

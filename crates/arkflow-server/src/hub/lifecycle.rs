@@ -84,10 +84,17 @@ impl Hub {
             Some(job.clone())
         };
         if let Some(job) = &updated {
-            self.jobs
-                .write()
-                .await
-                .insert(job.job_id.clone(), job.clone());
+            // Cache the authoritative storage row. The in-memory branch has
+            // no separate cache: its compare-and-set above already wrote
+            // through under the write lock, and re-inserting the clone here
+            // would let a stale observation roll a concurrent mutation's
+            // newer generation back (see update_job_desired_state_as).
+            if self.storage.is_some() {
+                self.jobs
+                    .write()
+                    .await
+                    .insert(job.job_id.clone(), job.clone());
+            }
         }
         Ok(updated)
     }

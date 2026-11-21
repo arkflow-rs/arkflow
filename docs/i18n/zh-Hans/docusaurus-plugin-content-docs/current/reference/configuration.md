@@ -219,7 +219,7 @@ jobs:
 | `edges` | array&lt;object&gt; | 否 | `[]` | DAG 边:`id`、`from`、`to`、`partitioned`(按键组路由,而非同子任务)。 |
 | `sources` | array&lt;object&gt; | 否 | `[]` | 把组件输入附加到 `source` 算子:`operator_id`、`input_type`、`config`、`time`。 |
 | `sinks` | array&lt;object&gt; | 否 | `[]` | 把组件输出附加到 `sink` 算子:`operator_id`、`output_type`、`config`。 |
-| `state` | object | 否 | — | `backend`(例如 `embedded_kv`)、`durability`(默认 `durable`,或显式 `ephemeral`)、可选的稳定 `root`(或 `ARKFLOW_STATE_ROOT`)、`namespace`、`ttl_ms`、`format_version`、`max_pending_transactions`(正数;默认 4096;当窗口看到非常高的每窗口键基数时应调大,因为每个打开的窗口组或未确认的输出都会占用一个事务)、可选的正数 `max_bytes` 活动状态预算。有状态算子必需;持久状态还要求 `checkpoint`。 |
+| `state` | object | 否 | — | `backend`(例如 `embedded_kv`)、`durability`(默认 `durable`,或显式 `ephemeral`)、可选的稳定 `root`(或 `ARKFLOW_STATE_ROOT`)、`namespace`、`ttl_ms`、`format_version`、`max_pending_transactions`(正数;默认 4096;当窗口看到非常高的每窗口键基数时应调大,因为每个打开的窗口组或未确认的输出都会占用一个事务)、`max_staged_bytes`(正数;默认 64MB;当很少触发的高基数窗口暂存的未提交状态超过默认预算时应调大,因为暂存字节会随活动窗口状态增长,直到触发输出的确认提交)、可选的正数 `max_bytes` 活动状态预算。有状态算子必需;持久状态还要求 `checkpoint`。 |
 | `checkpoint` | object | 否 | — | `interval_ms`、`retention`、`object_store_uri`(例如 `file://...` 或 `s3://...`)。 |
 | `recovery` | string | 否 | `latest_checkpoint` | `latest_checkpoint`、`latest_savepoint` 或 `fail`。 |
 | `rescale` | boolean | 否 | `false` | 显式开启扩缩容恢复:恢复工件在不同并行度下写入时,键控状态按键组归属重分布到新任务集,而不是直接失败(参见[分布式作业](/zh-Hans/docs/build/distributed-jobs))。 |

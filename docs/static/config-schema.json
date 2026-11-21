@@ -11498,6 +11498,11 @@
               "minimum": 1,
               "description": "Maximum simultaneously staged state-journal transactions (one per open window group or unacknowledged output). Raise it with realistic capacity planning when a window sees very high per-window key cardinality."
             },
+            "max_staged_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum bytes of uncommitted state mutations the journal may hold at once. Raise it with realistic capacity planning when rarely-firing high-cardinality windows stage more uncommitted state than the default allows."
+            },
             "max_bytes": {
               "type": "integer",
               "minimum": 1,

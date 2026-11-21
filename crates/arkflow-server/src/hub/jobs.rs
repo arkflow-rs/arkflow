@@ -260,10 +260,15 @@ impl Hub {
             Some(job.clone())
         };
         if let Some(job) = &updated {
-            self.jobs
-                .write()
-                .await
-                .insert(job.job_id.clone(), job.clone());
+            // The in-memory branch already wrote through `get_mut` under the
+            // write lock; re-inserting the stale clone here would roll a
+            // concurrent mutation back (see update_job_desired_state_as).
+            if self.storage.is_some() {
+                self.jobs
+                    .write()
+                    .await
+                    .insert(job.job_id.clone(), job.clone());
+            }
             self.reconcile_job(job).await?;
         }
         Ok(updated)

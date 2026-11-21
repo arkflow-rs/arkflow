@@ -1832,6 +1832,7 @@ mod tests {
                 ttl_ms: None,
                 format_version: 1,
                 max_pending_transactions: None,
+                max_staged_bytes: None,
                 max_bytes: None,
             }),
             checkpoint: None,

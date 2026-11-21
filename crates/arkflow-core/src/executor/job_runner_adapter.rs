@@ -1437,6 +1437,7 @@ mod validation_tests {
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         });
         spec.operators = vec![
@@ -1803,6 +1804,7 @@ mod validation_tests {
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         });
         spec.checkpoint = Some(CheckpointSpec {
@@ -1832,6 +1834,7 @@ mod validation_tests {
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         });
         spec.checkpoint = None;
@@ -2523,6 +2526,7 @@ mod runner_tests {
                 ttl_ms: None,
                 format_version: 1,
                 max_pending_transactions: None,
+                max_staged_bytes: None,
                 max_bytes: None,
             });
             self
@@ -2541,6 +2545,7 @@ mod runner_tests {
                 ttl_ms: None,
                 format_version: 1,
                 max_pending_transactions: None,
+                max_staged_bytes: None,
                 max_bytes: None,
             });
             self.spec.checkpoint = Some(CheckpointSpec {
@@ -2689,6 +2694,7 @@ mod runner_tests {
             ttl_ms: None,
             format_version: 1,
             max_pending_transactions: None,
+            max_staged_bytes: None,
             max_bytes: None,
         });
         let adapter = adapter_with(Arc::new(OneBatchThenEofInput {
