@@ -101,7 +101,7 @@ jobs:
       - name: Generate coverage (lcov)
         run: |
           set -o pipefail
-          cargo llvm-cov --workspace --all-targets --no-clean \
+          cargo llvm-cov --locked --workspace --all-targets --no-clean \
             --lcov --output-path lcov.info | tee coverage-run.log
 
       - name: Coverage summary

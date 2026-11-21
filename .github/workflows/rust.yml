@@ -86,7 +86,7 @@ jobs:
       # same way a test failure does (this is the "lint before finishing"
       # contract from AGENTS.md, now enforced by CI instead of convention).
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   build-and-test:
     name: Build and Test (fast)
@@ -142,7 +142,7 @@ jobs:
           python3 -m pip install pyarrow || python3 -m pip install --break-system-packages pyarrow
 
       - name: Build (debug)
-        run: cargo build --workspace --all-targets --verbose
+        run: cargo build --locked --workspace --all-targets --verbose
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -170,5 +170,5 @@ jobs:
           # daemon is reachable.
           ARKFLOW_REQUIRE_DOCKER: "1"
         run: |
-          cargo nextest run --workspace --all-targets -E 'not package(arkflow-plugin)'
-          cargo test -p arkflow-plugin
+          cargo nextest run --locked --workspace --all-targets -E 'not package(arkflow-plugin)'
+          cargo test --locked -p arkflow-plugin

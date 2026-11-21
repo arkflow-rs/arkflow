@@ -63,7 +63,7 @@ jobs:
       # One measured run only: the summary table is rendered from the same
       # JSON that becomes the artifact, so the two never disagree.
       - name: Run benchmark suite
-        run: cargo run -p arkflow --release --example benchmark -- --json > benchmark.json
+        run: cargo run --locked -p arkflow --release --example benchmark -- --json > benchmark.json
 
       - name: Publish job summary
         run: |

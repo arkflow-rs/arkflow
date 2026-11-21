@@ -30,6 +30,18 @@
 //! cargo update -p async-compression --precise 0.4.42
 //! cargo update -p compression-codecs --precise 0.4.38
 //! ```
+//!
+//! `rand` is the known exception: three major versions (0.8/0.9/0.10)
+//! coexist because transitive dependencies pin incompatible ranges —
+//! `jsonwebtoken`/`nkeys`/`rsa` need ^0.8, `arrow-avro` (via datafusion)
+//! needs ^0.9, `apache-avro`/`ballista`/`async-nats` need ^0.10. None can
+//! be collapsed from this side without upstream releases, so a
+//! single-version assertion would be permanently red. What the workspace
+//! CAN guarantee is the centralization convention: no member crate
+//! declares `rand` outside `[workspace.dependencies]` (a direct `rand =
+//! "0.10"` next to a workspace `rand = "0.9"` is how the split grew a
+//! version of our own making). That is what
+//! [`workspace_crates_declare_rand_only_through_the_workspace`] pins.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -92,5 +104,72 @@ fn lockfile_keeps_arrow_datafusion_and_zstd_single_version() {
          `cargo update -p datafusion-federation --precise 0.5.5`\n\
          `cargo update -p async-compression --precise 0.4.42`\n\
          `cargo update -p compression-codecs --precise 0.4.38`"
+    );
+}
+
+/// Every workspace member's `[dependencies]`/`[dev-dependencies]` must
+/// reference `rand` through the workspace table (`rand = { workspace =
+/// true }`), never with a direct version requirement. A direct
+/// declaration is how the workspace grew a third rand generation of its
+/// own making (plugin `rand = "0.10"` next to workspace `rand = "0.9"`);
+/// version selection stays in `[workspace.dependencies]` where the whole
+/// graph can see it.
+#[test]
+fn workspace_crates_declare_rand_only_through_the_workspace() {
+    let members_dir = repo_root().join("crates");
+    let mut violations = Vec::new();
+
+    let mut entries: Vec<_> = std::fs::read_dir(&members_dir)
+        .expect("crates/ directory is readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("crates/ entries are readable");
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let manifest = entry.path().join("Cargo.toml");
+        if !manifest.is_file() {
+            // Skip non-crate entries (e.g. macOS .DS_Store) rather than
+            // failing on junk the workspace never declares.
+            continue;
+        }
+        let text = std::fs::read_to_string(&manifest).unwrap_or_else(|error| {
+            panic!(
+                "member manifest {} is readable: {error}",
+                manifest.display()
+            )
+        });
+
+        let mut in_dependencies = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_dependencies = trimmed == "[dependencies]" || trimmed == "[dev-dependencies]";
+                continue;
+            }
+            if !in_dependencies {
+                continue;
+            }
+            if trimmed.starts_with("rand") && trimmed[4..].trim_start().starts_with('=') {
+                let value = trimmed[trimmed.find('=').unwrap() + 1..].trim();
+                let is_workspace_ref =
+                    value == "{ workspace = true }" || value.starts_with("{ workspace = true,");
+                if !is_workspace_ref {
+                    violations.push(format!(
+                        "{}: `{trimmed}`",
+                        manifest
+                            .strip_prefix(repo_root())
+                            .unwrap_or(&manifest)
+                            .display()
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "workspace crates must declare `rand` through the workspace table, \
+         not with a direct version (that is how the third rand generation \
+         entered the lock):\n{violations:#?}"
     );
 }

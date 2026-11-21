@@ -17,6 +17,19 @@ members = [
 
 resolver = "2"
 
+# Codifies the CI clippy discipline (`cargo clippy --workspace --all-targets
+# -- -D warnings`) in the manifest, so the baseline follows the workspace
+# instead of living only in the CI command line. CI still denies warnings;
+# these entries keep local runs honest. Only lints that are clean across the
+# whole workspace are listed — anything noisier would break every build.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+
 [workspace.dependencies]
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
