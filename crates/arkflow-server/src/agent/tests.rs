@@ -1671,7 +1671,7 @@ async fn complete_tls_material_reads_files_and_loads_pem() {
     let key_path = directory.path().join("key.pem");
     let ca_path = directory.path().join("ca.pem");
     std::fs::write(&cert_path, certificate.cert.pem()).unwrap();
-    std::fs::write(&key_path, certificate.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, certificate.signing_key.serialize_pem()).unwrap();
     std::fs::write(&ca_path, certificate.cert.pem()).unwrap();
     unsafe {
         std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CERT", &cert_path);

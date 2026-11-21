@@ -1894,12 +1894,15 @@ fn generate_fleet_material() -> (Vec<(String, String)>, String) {
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_key = KeyPair::generate().unwrap();
     let ca = ca_params.self_signed(&ca_key).unwrap();
+    // rcgen 0.14: the issuer carries the CA params and key, not the built
+    // certificate; built once outside the loop so the params move once.
+    let ca_issuer = rcgen::Issuer::new(ca_params, &ca_key);
     let mut nodes = Vec::new();
     for _ in 0..2 {
         let node_params =
             CertificateParams::new(vec![super::DATA_PLANE_TLS_SERVER_NAME.to_owned()]).unwrap();
         let node_key = KeyPair::generate().unwrap();
-        let node = node_params.signed_by(&node_key, &ca, &ca_key).unwrap();
+        let node = node_params.signed_by(&node_key, &ca_issuer).unwrap();
         nodes.push((node.pem(), node_key.serialize_pem()));
     }
     (nodes, ca.pem())

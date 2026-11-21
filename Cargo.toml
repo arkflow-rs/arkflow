@@ -51,7 +51,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["std", "fmt", "json", "env-filter"] }
 prometheus = "0.14"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
-apache-avro = { version = "0.22", default-features = false }
+apache-avro = { version = "0.23", default-features = false }
 datafusion = { version = "54.1", features = ["avro"] }
 datafusion-functions-json = "0.54.2"
 arrow-json = "58.4"
@@ -68,7 +68,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
 # rust_crypto keeps the ring backend from v9 (arkflow-core's TLS stack also
 # uses ring); v10+ cannot auto-pick a provider when none/both features are set.
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 opentelemetry = "0.33"
 opentelemetry-otlp = { version = "0.33", features = ["http-json", "reqwest-client"] }
 opentelemetry_sdk = "0.33"
@@ -79,10 +79,10 @@ clap = { version = "4.5", features = ["derive"] }
 flume = "=0.11"
 smallvec = "1"
 subtle = "2.6"
-hmac = "0.12"
-hkdf = "0.12"
-base64 = "0.22"
-sha2 = "0.10"
+hmac = "0.13"
+hkdf = "0.13"
+base64 = "0.23"
+sha2 = "0.11"
 rand = "0.9"
 dashmap = "6.1"
 mongodb = { version = "3.2", default-features = false, features = ["rustls-tls", "compat-3-0-0"] }
@@ -93,7 +93,7 @@ rusqlite = "0.37"
 
 tempfile = "3.24.0"
 mockall = "0.15"
-redb = "4"
+redb = "5"
 object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 bytes = "1"
 arkflow-core = { path = "crates/arkflow-core", version = "0.6.0" }

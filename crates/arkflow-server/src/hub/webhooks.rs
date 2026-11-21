@@ -13,7 +13,7 @@ use super::wire::HubEvent;
 use super::{now_ms, Hub};
 use crate::storage::{WebhookSetMutation, WebhookSubscription};
 use arkflow_core::control::ControlEvent;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -713,7 +713,7 @@ mod tests {
         let body = br#"{"event_type":"rollout.failed"}"#;
         let signature = compute_signature("secret", body);
         let expected = {
-            let mut mac = <HmacSha256 as Mac>::new_from_slice(b"secret").unwrap();
+            let mut mac = <HmacSha256 as KeyInit>::new_from_slice(b"secret").unwrap();
             mac.update(body);
             mac.finalize().into_bytes()
         };

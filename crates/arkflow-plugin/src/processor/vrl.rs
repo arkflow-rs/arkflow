@@ -162,13 +162,28 @@ fn downcast_failure(
 /// output batch, so this is checked per row up front: a non-object result in
 /// the middle of a batch must fail loudly (D4) rather than decay into an
 /// all-null row after the first row has fixed the field set.
-fn require_row_object(v: VrlValue) -> Result<VrlValue, Error> {
+fn require_row_object(mut v: VrlValue) -> Result<VrlValue, Error> {
+    normalize_vrl_strings(&mut v);
     match v {
         VrlValue::Object(_) => Ok(v),
         other => Err(Error::Process(format!(
             "VRL statement must return a row object (or an array of row objects) per row; got {}",
             other.kind_str()
         ))),
+    }
+}
+
+/// vrl 0.37 added `Value::String` (guaranteed-UTF-8 `ByteString`) next to
+/// `Value::Bytes`, and VRL string literals now produce it. The conversion
+/// pipeline (dtype inference, Utf8/Binary extraction) keys on `Value::Bytes`,
+/// so collapse the new variant back into `Bytes` at the evaluation boundary —
+/// for the arrow conversion the distinction carries no information.
+fn normalize_vrl_strings(value: &mut VrlValue) {
+    match value {
+        VrlValue::String(s) => *value = VrlValue::Bytes(s.as_bytes().to_vec().into()),
+        VrlValue::Array(items) => items.iter_mut().for_each(normalize_vrl_strings),
+        VrlValue::Object(map) => map.values_mut().for_each(normalize_vrl_strings),
+        _ => {}
     }
 }
 
@@ -203,7 +218,11 @@ fn message_batch_to_vrl_values(message_batch: &MessageBatch) -> Result<Vec<VrlVa
                         VrlValue::Null
                     } else {
                         let value = col.value(i);
-                        VrlValue::from(value.to_owned())
+                        // Explicit Bytes, not `VrlValue::from(String)`: vrl
+                        // 0.37 maps `String` to the new guaranteed-UTF-8
+                        // `Value::String` variant, and the conversion
+                        // pipeline keys on `Value::Bytes`.
+                        VrlValue::Bytes(value.to_owned().into())
                     };
                     insert(i, &mut vrl_values, name, vrl_value)
                 }
