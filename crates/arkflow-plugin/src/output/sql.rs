@@ -34,6 +34,8 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{Connection, MySqlConnection, PgConnection, QueryBuilder};
 
+use super::codec_helper::classify_sqlx_error_ctx;
+
 #[derive(Debug, Clone, PartialEq)]
 enum SqlValue {
     String(String),
@@ -58,6 +60,16 @@ enum DatabaseConnection {
     // Sqlite(SqliteConnection),
 }
 
+/// Runtime connect failure classification (connector-recovery-contract):
+/// reaching the server failed → `Connection`; the connection string itself
+/// is invalid → `Config` (retrying cannot help, the user's URI is broken).
+fn map_connect_error(prefix: &'static str) -> impl Fn(sqlx::Error) -> Error {
+    move |e| match e {
+        sqlx::Error::Configuration(_) => Error::Config(format!("{prefix}: {e}")),
+        other => Error::Connection(format!("{prefix}: {other}")),
+    }
+}
+
 impl DatabaseConnection {
     /// Closes the underlying connection explicitly (rather than waiting
     /// for the object to drop). Consumes the connection: sqlx `close` takes
@@ -67,10 +79,11 @@ impl DatabaseConnection {
             DatabaseConnection::Mysql(conn) => conn
                 .close()
                 .await
-                .map_err(|e| Error::Process(format!("Failed to close MySQL connection: {}", e))),
-            DatabaseConnection::Postgres(conn) => conn.close().await.map_err(|e| {
-                Error::Process(format!("Failed to close PostgreSQL connection: {}", e))
-            }),
+                .map_err(|e| classify_sqlx_error_ctx(&e, "Failed to close MySQL connection")),
+            DatabaseConnection::Postgres(conn) => conn
+                .close()
+                .await
+                .map_err(|e| classify_sqlx_error_ctx(&e, "Failed to close PostgreSQL connection")),
         }
     }
 
@@ -91,7 +104,7 @@ impl DatabaseConnection {
                         .execute(&mut *conn)
                         .await
                         .map_err(|e| {
-                            Error::Process(format!("Failed to execute MySQL query: {}", e))
+                            classify_sqlx_error_ctx(&e, "Failed to execute MySQL query")
                         })?;
                 }
                 Ok(())
@@ -103,7 +116,7 @@ impl DatabaseConnection {
                         .execute(&mut *conn)
                         .await
                         .map_err(|e| {
-                            Error::Process(format!("Failed to execute PostgresSQL query: {}", e))
+                            classify_sqlx_error_ctx(&e, "Failed to execute PostgresSQL query")
                         })?;
                 }
                 Ok(())
@@ -146,7 +159,7 @@ async fn execute_insert_transactional(
             let mut transaction = conn
                 .begin()
                 .await
-                .map_err(|e| Error::Process(format!("Failed to begin MySQL transaction: {}", e)))?;
+                .map_err(|e| classify_sqlx_error_ctx(&e, "Failed to begin MySQL transaction"))?;
             for (columns, rows) in batches {
                 for chunk in chunk_rows_for_insert(columns.len(), rows) {
                     build_mysql_insert(output_config, columns, chunk)
@@ -154,19 +167,20 @@ async fn execute_insert_transactional(
                         .execute(&mut *transaction)
                         .await
                         .map_err(|e| {
-                            Error::Process(format!("Failed to execute MySQL query: {}", e))
+                            classify_sqlx_error_ctx(&e, "Failed to execute MySQL query")
                         })?;
                 }
             }
             transaction
                 .commit()
                 .await
-                .map_err(|e| Error::Process(format!("Failed to commit MySQL transaction: {}", e)))
+                .map_err(|e| classify_sqlx_error_ctx(&e, "Failed to commit MySQL transaction"))
         }
         DatabaseConnection::Postgres(conn) => {
-            let mut transaction = conn.begin().await.map_err(|e| {
-                Error::Process(format!("Failed to begin Postgres transaction: {}", e))
-            })?;
+            let mut transaction = conn
+                .begin()
+                .await
+                .map_err(|e| classify_sqlx_error_ctx(&e, "Failed to begin Postgres transaction"))?;
             for (columns, rows) in batches {
                 for chunk in chunk_rows_for_insert(columns.len(), rows) {
                     build_postgres_insert(output_config, columns, chunk)
@@ -174,13 +188,14 @@ async fn execute_insert_transactional(
                         .execute(&mut *transaction)
                         .await
                         .map_err(|e| {
-                            Error::Process(format!("Failed to execute PostgresSQL query: {}", e))
+                            classify_sqlx_error_ctx(&e, "Failed to execute PostgresSQL query")
                         })?;
                 }
             }
-            transaction.commit().await.map_err(|e| {
-                Error::Process(format!("Failed to commit Postgres transaction: {}", e))
-            })
+            transaction
+                .commit()
+                .await
+                .map_err(|e| classify_sqlx_error_ctx(&e, "Failed to commit Postgres transaction"))
         }
     }
 }
@@ -597,7 +612,9 @@ impl Output for SqlOutput {
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         let mut conn_guard = self.conn_lock.lock().await;
-        let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
+        let conn = conn_guard
+            .as_mut()
+            .ok_or_else(|| Error::Connection("SQL output is not connected".into()))?;
         // SQL writes consume typed columns; a codec is rejected at build time.
         self.insert_row(conn, &msg).await?;
         Ok(())
@@ -608,7 +625,9 @@ impl Output for SqlOutput {
         // at all. Per-message `write` (the trait default) would leave a
         // partial-write window the replay then duplicates visibly.
         let mut conn_guard = self.conn_lock.lock().await;
-        let conn = conn_guard.as_mut().ok_or(Error::Disconnection)?;
+        let conn = conn_guard
+            .as_mut()
+            .ok_or_else(|| Error::Connection("SQL output is not connected".into()))?;
         let mut batches = Vec::with_capacity(msgs.len());
         for msg in msgs {
             // A batch with no rows has nothing to insert; binding it anyway
@@ -685,11 +704,11 @@ impl SqlOutput {
             let opts = ssl.generate_mysql_ssl_opts(config).await?;
             MySqlConnection::connect_with(&opts)
                 .await
-                .map_err(|e| Error::Config(format!("Failed to connect to MySQL with SSL: {}", e)))?
+                .map_err(map_connect_error("Failed to connect to MySQL with SSL"))?
         } else {
             MySqlConnection::connect(&config.uri)
                 .await
-                .map_err(|e| Error::Config(format!("Failed to connect to MySQL: {}", e)))?
+                .map_err(map_connect_error("Failed to connect to MySQL"))?
         };
         Ok(DatabaseConnection::Mysql(mysql_conn))
     }
@@ -700,13 +719,15 @@ impl SqlOutput {
     ) -> Result<DatabaseConnection, Error> {
         let postgres_conn = if let Some(ssl) = &config.ssl {
             let opts = ssl.generate_postgres_ssl_opts(config).await?;
-            PgConnection::connect_with(&opts).await.map_err(|e| {
-                Error::Config(format!("Failed to connect to PostgreSQL with SSL: {}", e))
-            })?
+            PgConnection::connect_with(&opts)
+                .await
+                .map_err(map_connect_error(
+                    "Failed to connect to PostgreSQL with SSL",
+                ))?
         } else {
             PgConnection::connect(&config.uri)
                 .await
-                .map_err(|e| Error::Config(format!("Failed to connect to PostgreSQL: {}", e)))?
+                .map_err(map_connect_error("Failed to connect to PostgreSQL"))?
         };
         Ok(DatabaseConnection::Postgres(postgres_conn))
     }
@@ -1683,22 +1704,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_and_write_batch_before_connect_report_disconnection() {
+    async fn write_and_write_batch_before_connect_report_connection_error() {
         let output = SqlOutput::new(postgres_config(false, None)).unwrap();
         let err = output.write(typed_batch()).await.unwrap_err();
-        assert!(matches!(err, Error::Disconnection), "{err:?}");
+        assert!(matches!(err, Error::Connection(_)), "{err:?}");
         let err = output.write_batch(&[typed_batch()]).await.unwrap_err();
-        assert!(matches!(err, Error::Disconnection), "{err:?}");
+        assert!(matches!(err, Error::Connection(_)), "{err:?}");
         // close stays a no-op success whether or not a connection existed
         assert!(output.close().await.is_ok());
     }
 
     #[tokio::test]
-    async fn empty_batches_are_skipped_without_masking_disconnection() {
+    async fn empty_batches_are_skipped_without_masking_missing_connection() {
         // A zero-row batch has nothing to insert (binding it would generate
         // `INSERT ... VALUES` with no tuples — invalid SQL), so the write
         // paths skip it. The skip must NOT mask a missing connection: an
-        // unconnected output still reports Disconnection.
+        // unconnected output still reports `Connection` (the not-connected
+        // guard variant per connector-recovery-contract).
         let empty = MessageBatch::new_arrow(datafusion::arrow::array::RecordBatch::new_empty(
             Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
                 datafusion::arrow::datatypes::Field::new("id", DataType::Int64, true),
@@ -1706,12 +1728,12 @@ mod tests {
         ));
         let output = SqlOutput::new(postgres_config(false, None)).unwrap();
         let err = output.write(Arc::new(empty.clone())).await.unwrap_err();
-        assert!(matches!(err, Error::Disconnection), "{err:?}");
+        assert!(matches!(err, Error::Connection(_)), "{err:?}");
         let err = output
             .write_batch(&[Arc::new(empty.clone()), Arc::new(empty)])
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Disconnection), "{err:?}");
+        assert!(matches!(err, Error::Connection(_)), "{err:?}");
     }
 
     #[test]

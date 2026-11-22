@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RedisOutputConfig {
@@ -167,10 +168,12 @@ impl Output for RedisOutput {
             }
         }
 
-        pipeline
-            .query_async::<()>(&mut cli)
-            .await
-            .map_err(|e| Error::Process(format!("Failed to publish to Redis: {}", e)))?;
+        pipeline.query_async::<()>(&mut cli).await.map_err(|e| {
+            // Transient transport failure (connector-recovery-contract):
+            // `Disconnection`, not `Process`.
+            error!("Failed to publish to Redis: {}", e);
+            Error::Disconnection
+        })?;
         Ok(())
     }
 

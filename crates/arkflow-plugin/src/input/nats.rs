@@ -398,11 +398,15 @@ impl Input for NatsInput {
                     Ok(Delivery::Data(batch, ack)) => Ok((batch, ack)),
                     Ok(Delivery::Err(e)) => Err(e),
                     Err(_) => {
+                        // contract-eof: teardown — the channel closes only on
+                        // shutdown; abnormal stream ends arrive as
+                        // Delivery::Err and keep their own variant.
                         Err(Error::EOF)
                     }
                 }
             },
             _ = cancellation_token.cancelled() => {
+                // contract-eof: teardown
                 Err(Error::EOF)
             }
         }

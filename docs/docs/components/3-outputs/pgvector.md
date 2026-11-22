@@ -96,3 +96,11 @@ real Postgres with the pgvector extension:
 docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg16
 cargo test -p arkflow-plugin --lib output::pgvector -- --ignored
 ```
+
+## Error behavior
+
+Write failures follow the same classification as the SQL output: transient
+transport failures (connection loss, SQLSTATE classes `08`/`40`/`57`, too
+many connections) surface as `Disconnection`; deterministic failures
+(syntax, constraints, vector/id extraction) surface as `Process`. A
+runtime connection failure reports `Connection`.

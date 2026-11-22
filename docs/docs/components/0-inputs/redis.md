@@ -83,3 +83,7 @@ Both modes use a no-op acknowledgement, which caps delivery at **at-most-once**:
 - **Subscribe** mode is fire-and-forget by Redis semantics: messages published while the consumer is down or reconnecting are never delivered.
 
 The cancellation-safety guarantee above only protects an already-decoded message from being lost by a *drop of the pending read* — it does not make the source replayable. For durable consumption, front Redis with a replayable source (e.g. Kafka), or enable stream-level WAL durability with a source that supports replay.
+
+## Error behavior
+
+Transient failures (connection loss, timeouts, IO) surface as `Disconnection` and the engine reconnects with backoff. Deterministic rejections — authentication, permission, unknown command — are fatal. The temporary/permanent judgment is structural (the driver's error kind and the exact protocol code, e.g. `NOAUTH`/`WRONGPASS`/`NOPERM`), never message wording: a message merely containing "invalid" does not turn an otherwise transient error into a fatal one.

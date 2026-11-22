@@ -116,3 +116,4 @@ output:
 - 标识符引用遵循各自方言:MySQL 使用反引号,PostgreSQL 使用双引号。
 - `upsert: true` 要求 `upsert_keys` 列表非空且无重复;违规会在配置加载时、流(Stream)启动之前被拒绝。
 - `upsert_keys` 列必须存在于传入批次(Batch)模式中,否则写入失败并报错。
+- 错误行为:写入失败会被分类——暂态传输失败(连接断开,SQLSTATE 类 `08`/`40`/`57`,连接数超限,MySQL 错误号 2006/2013)以 `Disconnection` 上报;确定性失败(语法、约束、类型错误)以 `Process` 上报。运行期连接失败上报 `Connection`;连接串本身非法仍上报 `Config`。

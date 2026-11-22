@@ -96,7 +96,16 @@ pub enum Error {
     #[error("Connection error: {0}")]
     Connection(String),
 
-    /// Reconnection should be attempted after a connection loss.
+    /// An established session's receive failed and reconnecting can help.
+    ///
+    /// Contract (see `openspec/specs/connector-recovery-contract`): on the
+    /// source read path this is the only variant the kernel reconnects on
+    /// (`Input::connect` is called again). On the sink path every error is
+    /// fatal, so an output's `Disconnection` is documentation-grade: it
+    /// means a transient transport failure where a fresh connection could
+    /// succeed. Source receive-path "not connected" guards also stay
+    /// `Disconnection`; build/connect-time and output guards use
+    /// [`Error::Connection`].
     #[error("Connection lost")]
     Disconnection,
 
@@ -106,6 +115,16 @@ pub enum Error {
     #[error("Unknown error: {0}")]
     Unknown(String),
 
+    /// A bounded source exhausted naturally — graceful end of stream.
+    ///
+    /// Contract (see `openspec/specs/connector-recovery-contract`): legal
+    /// only for bounded inputs (file/sql/memory/multiple) completing their
+    /// dataset. Unbounded (subscription) sources MUST surface abnormal
+    /// stream end as [`Error::Disconnection`] instead; outputs MUST NOT
+    /// return `EOF` at all. Teardown paths (receiver closed / cancelled) in
+    /// unbounded sources may use `EOF` but must carry a
+    /// `// contract-eof: teardown` source marker pinned by the
+    /// connector consistency test.
     #[error("EOF")]
     EOF,
 

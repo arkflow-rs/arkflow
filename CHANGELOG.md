@@ -171,6 +171,38 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   allows; the benchmark window tiers do exactly that alongside their
   `max_pending_transactions` raise.
 
+### Changed — Connector error contract
+
+The kernel's error-variant semantics (EOF = graceful end of a bounded
+source, Disconnection = reconnect, everything else = fatal) are now a
+normative spec (`connector-recovery-contract`) pinned by a
+cross-connector consistency test; the following connector mappings were
+aligned to it, two of which change runtime behavior:
+
+- **Pulsar input**: a subscription stream ending (`Ok(None)`) no longer
+  maps to `EOF`, which silently ended the whole Job as if the data had
+  legitimately ended; it now maps to `Disconnection` and the engine
+  reconnects. Teardown paths (receiver closed / cancelled) keep `EOF`.
+- **Multiple inputs**: an interior channel closing while a child source is
+  reconnecting no longer re-wraps into a fatal `Process` string; it now
+  surfaces as `InputChannelClosed`, which the kernel handles structurally
+  (the surviving chain drains instead of the Job dying).
+- SQL/pgvector outputs: write-path failures are now classified — transient
+  transport failures (connection loss, SQLSTATE `08xxx`/`40xxx`/`57xxx`,
+  MySQL 2006/2013) report `Disconnection`; deterministic failures (syntax,
+  constraints, type errors) stay `Process`. Runtime connection failures
+  report `Connection` instead of `Config` (an invalid connection string
+  still reports `Config`).
+- NATS/Redis outputs: a publish transport failure reports `Disconnection`
+  instead of `Process` (aligned with the MQTT/Kafka siblings; deterministic
+  failures are unchanged).
+- Redis input: the temporary/permanent error classifier is now structural
+  (driver error kinds and exact protocol codes). A message merely
+  containing "invalid" no longer flips an otherwise transient error to
+  permanent (which killed the Job instead of reconnecting).
+- MongoDB output: the not-connected guard reports `Connection(msg)` instead
+  of a bare `Disconnection`, consistent with the other outputs.
+
 ### Fixed — Engine and control plane
 
 - The in-memory Hub no longer lets a settled Job observation roll a

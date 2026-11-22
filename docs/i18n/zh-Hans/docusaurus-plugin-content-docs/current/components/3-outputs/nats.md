@@ -87,3 +87,6 @@ output:
 使用 `tls://` URL scheme 以 TLS 连接(例如 `tls://nats.example.com:4422`);
 async-nats 对 `tls://` URL 原生协商 TLS,并要求服务端支持 TLS。
 
+## 错误行为
+
+发布时的传输失败以 `Disconnection` 上报(引擎按输出失败处理;消息不会被静默丢弃)。逐行 subject 向量短于负载数量时,会在首次发布前以带计数的 `Process` 错误失败;表达式求值失败同样是确定性的。

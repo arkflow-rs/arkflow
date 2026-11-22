@@ -88,3 +88,10 @@ Use a `tls://` URL scheme to connect over TLS (for example
 `tls://nats.example.com:4422`); async-nats negotiates TLS natively for
 `tls://` URLs and requires the server to support TLS.
 
+## Error behavior
+
+A publish transport failure surfaces as `Disconnection` (the engine treats
+it like any sink failure; the message is never silently dropped). A
+per-row subject vector shorter than the payload count fails before the
+first publish with a counting `Process` error; expression-evaluation
+failures are also deterministic.

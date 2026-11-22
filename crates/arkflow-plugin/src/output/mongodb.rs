@@ -135,7 +135,11 @@ impl Output for MongoDBOutput {
 
     async fn write(&self, msg: MessageBatchRef) -> Result<(), Error> {
         let collection = self.collection.lock().await;
-        let collection = collection.as_ref().ok_or(Error::Disconnection)?;
+        // Not-connected guard: `Connection(msg)` per connector-recovery-
+        // contract (a bare `Disconnection` here carries no context).
+        let collection = collection
+            .as_ref()
+            .ok_or_else(|| Error::Connection("MongoDB output is not connected".into()))?;
         let documents = Self::documents(&msg)?;
         if documents.is_empty() {
             return Ok(());
@@ -580,7 +584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_before_connect_reports_disconnection() {
+    async fn write_before_connect_reports_connection_error() {
         let output = MongoDBOutput::new(MongoDBOutputConfig {
             uri: "mongodb://127.0.0.1:27017".to_string(),
             database: "db".to_string(),
@@ -593,10 +597,12 @@ mod tests {
         )]);
         assert!(matches!(
             output.write(Arc::new(msg)).await,
-            Err(Error::Disconnection)
+            Err(Error::Connection(_))
         ));
 
-        // close() drops the collection handle; writes afterwards disconnect.
+        // close() drops the collection handle; writes afterwards report the
+        // not-connected guard (`Connection(msg)` per connector-recovery-
+        // contract).
         output.close().await.unwrap();
         let msg = batch(vec![(
             "value",
@@ -604,7 +610,7 @@ mod tests {
         )]);
         assert!(matches!(
             output.write(Arc::new(msg)).await,
-            Err(Error::Disconnection)
+            Err(Error::Connection(_))
         ));
     }
 

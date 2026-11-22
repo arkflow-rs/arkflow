@@ -204,11 +204,10 @@ impl Output for NatsOutput {
                         .publish(subject_str.to_string(), payload.into())
                         .await
                     {
+                        // Transient transport failure (connector-recovery-
+                        // contract): `Disconnection`, not `Process`.
                         error!("Failed to publish message to NATS: {}", e);
-                        return Err(Error::Process(format!(
-                            "Failed to publish message to NATS: {}",
-                            e
-                        )));
+                        return Err(Error::Disconnection);
                     }
                 }
                 Mode::JetStream { .. } => {
@@ -222,10 +221,7 @@ impl Output for NatsOutput {
                             .await
                         {
                             error!("Failed to publish message to JetStream: {}", e);
-                            return Err(Error::Process(format!(
-                                "Failed to publish message to JetStream: {}",
-                                e
-                            )));
+                            return Err(Error::Disconnection);
                         }
                     }
                 }
