@@ -23,6 +23,16 @@
 //! * R-CHANNEL — `src/input/multiple_inputs.rs` must surface interior
 //!   channel closure as `Error::InputChannelClosed`, not a `Process`
 //!   re-wrap.
+//! * R-POW — no integer `.pow(`-family backoff math in `src/output/` or
+//!   `src/input/` production code (variant-proof: underscore and
+//!   saturating/checked/wrapping spellings all flag; a non-backoff pow
+//!   needs `// contract-allow: pow`).
+//! * R-RETRY-ADOPTER — every shared-retry adopter file (`RETRY_ADOPTERS`)
+//!   must reference `crate::retry` in its production code.
+//!
+//! The capacity rule (delivery channels must use the shared
+//! `DELIVERY_CHANNEL_CAPACITY` constant) lives below for historical
+//! reasons; normatively it belongs to `connector-resilience`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -388,21 +398,115 @@ fn input_delivery_channels_use_the_shared_capacity() {
     );
 }
 
+/// Backoff-shaped `pow` calls: any `.pow(` / `.checked_pow(` /
+/// `.saturating_pow(` / `.wrapping_pow(` method call. Matching the METHOD
+/// shape (not a `2u64.pow` literal receiver) is variant-proof:
+/// `2_u64.pow`, `2u64.saturating_pow`, `base.checked_pow` all flag.
+const POW_NEEDLES: &[&str] = &[
+    ".pow(",
+    ".checked_pow(",
+    ".saturating_pow(",
+    ".wrapping_pow(",
+];
+
 #[test]
-fn outputs_must_not_hand_roll_power_backoff() {
+fn connectors_must_not_hand_roll_power_backoff() {
+    // Match the METHOD-call shape, not a literal receiver: the original
+    // `2u64.pow` substring needle was bypassed by `2_u64.pow` (underscore)
+    // and `2u64.saturating_pow` — both shipped in real output code while
+    // this test stayed green. Any integer `.pow(` family call in
+    // connector production code is a backoff schedule; a non-backoff
+    // integer pow needs an explicit `// contract-allow: pow` line marker
+    // (same precedent as the teardown marker above).
+    const ALLOW_MARKER: &str = "contract-allow: pow";
+
     let mut report = Vec::new();
-    for (file, source) in rust_files(&plugin_src_dir("output")) {
-        for (idx, line) in production_section(&source).lines().enumerate() {
-            if line.contains("2u64.pow") {
-                report.push(format!("{}:{}: {}", file, idx + 1, line.trim()));
+    for subdir in ["input", "output"] {
+        for (file, source) in rust_files(&plugin_src_dir(subdir)) {
+            for (idx, line) in production_section(&source).lines().enumerate() {
+                if POW_NEEDLES.iter().any(|needle| line.contains(needle))
+                    && !line.contains(ALLOW_MARKER)
+                {
+                    report.push(format!("{subdir}/{file}:{}: {}", idx + 1, line.trim()));
+                }
             }
         }
     }
     assert!(
         report.is_empty(),
-        "outputs must use the shared RetryUtils backoff (capped, \
-         overflow-safe) instead of hand-rolled 2u64.pow schedules. \
+        "connectors must use the shared RetryUtils backoff (capped, \
+         overflow-safe) instead of hand-rolled pow schedules; \
+         non-backoff integer pows need a `// {ALLOW_MARKER}` marker. \
          Violations:\n{}",
+        report.join("\n")
+    );
+}
+
+#[test]
+fn pow_needles_catch_the_historical_bypass_shapes() {
+    // Both bypass shapes shipped in real output code (influxdb's
+    // `2_u64.pow`, http's `saturating_pow`) while the old literal needle
+    // stayed green — these fixtures pin the regression.
+    for line in [
+        "100 * 2_u64.pow(attempt)",
+        "100u64.saturating_mul(2u64.saturating_pow(n - 1))",
+        "let x = base.checked_pow(exp).unwrap();",
+        "let y = v.wrapping_pow(2);",
+    ] {
+        assert!(
+            POW_NEEDLES.iter().any(|needle| line.contains(needle)),
+            "must flag: {line}"
+        );
+    }
+    for line in [
+        "flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY)",
+        "let z = x + y;",
+    ] {
+        assert!(
+            !POW_NEEDLES.iter().any(|needle| line.contains(needle)),
+            "must pass: {line}"
+        );
+    }
+}
+
+/// Shared-retry adopters (connector-resilience contract): each file's
+/// production code must reference `crate::retry`. A connector that starts
+/// retrying without the shared implementation must join this list — and
+/// then the pow/loop pins above apply to it too.
+const RETRY_ADOPTERS: &[&str] = &[
+    "input/kafka.rs",
+    "input/pulsar.rs",
+    "output/http.rs",
+    "output/influxdb.rs",
+    "output/milvus.rs",
+    "output/mqtt.rs",
+    "output/qdrant.rs",
+    "processor/embedding.rs",
+    "processor/llm.rs",
+    "processor/milvus_search.rs",
+    "processor/vector_search.rs",
+];
+
+#[test]
+fn connector_retry_adopters_use_the_shared_implementation() {
+    let mut report = Vec::new();
+    for entry in RETRY_ADOPTERS {
+        let (subdir, file) = entry
+            .split_once('/')
+            .expect("adopter paths are subdir/file");
+        let sources = rust_files(&plugin_src_dir(subdir));
+        let (_, source) = sources
+            .iter()
+            .find(|(name, _)| name == file)
+            .unwrap_or_else(|| panic!("adopter file missing: {entry}"));
+        if !production_section(source).contains("crate::retry") {
+            report.push(entry.to_string());
+        }
+    }
+    assert!(
+        report.is_empty(),
+        "every shared-retry adopter must reference crate::retry in its \
+         production code (connector-resilience contract). Missing:\n{}",
         report.join("\n")
     );
 }

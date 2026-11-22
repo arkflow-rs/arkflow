@@ -19,7 +19,11 @@
 //! siblings — qdrant/milvus outputs kept two copy-pasted backoff loops with
 //! an unbounded `2u64.pow` delay, and the AI processors had no retry at all.
 //! Components must use this implementation instead of writing their own
-//! loops (pinned by the connector skeleton hygiene test).
+//! loops — pinned structurally by `tests/connector_error_contract.rs`
+//! (`connectors_must_not_hand_roll_power_backoff` flags any hand-rolled
+//! `.pow(` backoff in `output/` + `input/`;
+//! `connector_retry_adopters_use_the_shared_implementation` requires every
+//! adopter file to reference this module).
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -58,9 +62,6 @@ impl Default for RetryConfig {
 /// Whether an HTTP status code is worth retrying (connector-resilience
 /// contract): 429 (rate limited) and 5xx (server-side/availability) are
 /// transient; every other 4xx is a deterministic client rejection.
-// Adopters wire this in the same change (qdrant/milvus outputs, AI
-// processors); remove the allow once they land.
-#[allow(dead_code)]
 pub(crate) fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }

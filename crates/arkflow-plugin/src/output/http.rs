@@ -40,6 +40,12 @@ enum AuthType {
     Bearer { token: String },
 }
 
+/// Default value for [`HttpOutputConfig::retry_count`], aligned with the
+/// qdrant output and the AI processors ("retries", not total attempts).
+fn default_retry_count() -> u32 {
+    3
+}
+
 /// HTTP output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HttpOutputConfig {
@@ -50,6 +56,7 @@ struct HttpOutputConfig {
     /// Timeout Period (ms)
     timeout_ms: u64,
     /// Number of retries
+    #[serde(default = "default_retry_count")]
     retry_count: u32,
     /// Request header
     headers: Option<std::collections::HashMap<String, String>>,
@@ -194,63 +201,107 @@ impl HttpOutput {
             request_builder = request_builder.header(header::CONTENT_TYPE, "application/json");
         }
 
-        // Send a request
-        let mut retry_count = 0;
-        let mut last_error = None;
+        // Send a request through the shared classified retry: transport
+        // failures and 429/5xx statuses are transient; other statuses are
+        // the endpoint's deterministic answer and fail on the first
+        // attempt (connector-resilience contract).
+        //
+        // `retry_count` names the RETRIES, so max_attempts is one more than
+        // it (the shared RetryUtils bound counts the initial attempt).
+        let retry_config = crate::retry::RetryConfig {
+            max_attempts: self.config.retry_count.saturating_add(1),
+            ..Default::default()
+        };
 
-        while retry_count <= self.config.retry_count {
-            match request_builder.try_clone().unwrap().send().await {
-                Ok(mut response) => {
-                    if response.status().is_success() {
-                        return Ok(());
-                    } else {
-                        let status = response.status();
-                        // Bound the captured error body: a broken or hostile
-                        // endpoint must not stream unbounded bytes into
-                        // memory (the text also reaches logs/status via the
-                        // error string).
-                        const MAX_ERROR_BODY: usize = 64 * 1024;
-                        let mut raw: Vec<u8> = Vec::new();
-                        let mut truncated = false;
-                        while raw.len() < MAX_ERROR_BODY {
-                            match response.chunk().await {
-                                Ok(Some(chunk)) => {
-                                    let remaining = MAX_ERROR_BODY - raw.len();
-                                    let take = chunk.len().min(remaining);
-                                    raw.extend_from_slice(&chunk[..take]);
-                                    truncated |= take < chunk.len();
-                                }
-                                Ok(None) => break,
-                                Err(_) => break, // best-effort capture
-                            }
-                        }
-                        let mut body = String::from_utf8_lossy(&raw).to_string();
-                        if truncated {
-                            body.push_str("…(truncated)");
-                        }
-                        last_error = Some(Error::Process(format!(
-                            "HTTP Request Failed: Status code {}, response: {}",
-                            status, body
-                        )));
-                    }
+        // Failure payload keeps the transport/server distinction so the
+        // final Error variant and message match the pre-consolidation
+        // texts ("HTTP request error: …" / "HTTP Request Failed: Status
+        // code …, response: …").
+        enum Fail {
+            Transport(String),
+            // `StatusCode` (not `u16`) keeps the reason phrase in the
+            // returned message byte-identical to the pre-retry single-shot
+            // path ("Status code 404 Not Found, response: …").
+            Status(reqwest::StatusCode, String),
+        }
+        impl std::fmt::Display for Fail {
+            // Retry-log safety: intermediate attempts may be followed by a
+            // success, so the per-attempt warning must not carry the
+            // response body (it can echo submitted records). Only the
+            // FINAL returned error exposes the body, via `map_err` below.
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Fail::Transport(e) => write!(f, "{e}"),
+                    Fail::Status(code, _) => write!(f, "status {code}"),
                 }
-                Err(e) => {
-                    last_error = Some(Error::Connection(format!("HTTP request error: {}", e)));
-                }
-            }
-
-            retry_count += 1;
-            if retry_count <= self.config.retry_count {
-                // Index backoff retry. Saturating: `retry_count` is a config
-                // value with no upper bound, and 100 * 2^(n-1) overflows u64
-                // from n=58 on — a plain multiply panicked (debug) or wrapped
-                // to a garbage delay (release) on what is just a retry.
-                let backoff_ms = 100u64.saturating_mul(2u64.saturating_pow(retry_count - 1));
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
         }
 
-        Err(last_error.unwrap_or_else(|| Error::Unknown("Unknown HTTP error".to_string())))
+        crate::retry::RetryUtils::retry_with_backoff_classified(
+            || {
+                let request = request_builder.try_clone();
+                async move {
+                    let request = match request {
+                        Some(request) => request,
+                        None => {
+                            return Err(crate::retry::OperationError {
+                                error: Fail::Transport("request is not cloneable".into()),
+                                retryable: false,
+                            });
+                        }
+                    };
+                    match request.send().await {
+                        Ok(mut response) => {
+                            let status = response.status();
+                            if status.is_success() {
+                                return Ok(());
+                            }
+                            // Bound the captured error body: a broken or hostile
+                            // endpoint must not stream unbounded bytes into
+                            // memory (the text also reaches logs/status via the
+                            // error string).
+                            const MAX_ERROR_BODY: usize = 64 * 1024;
+                            let mut raw: Vec<u8> = Vec::new();
+                            let mut truncated = false;
+                            while raw.len() < MAX_ERROR_BODY {
+                                match response.chunk().await {
+                                    Ok(Some(chunk)) => {
+                                        let remaining = MAX_ERROR_BODY - raw.len();
+                                        let take = chunk.len().min(remaining);
+                                        raw.extend_from_slice(&chunk[..take]);
+                                        truncated |= take < chunk.len();
+                                    }
+                                    Ok(None) => break,
+                                    Err(_) => break, // best-effort capture
+                                }
+                            }
+                            let mut body = String::from_utf8_lossy(&raw).to_string();
+                            if truncated {
+                                body.push_str("…(truncated)");
+                            }
+                            Err(crate::retry::OperationError {
+                                error: Fail::Status(status, body),
+                                retryable: crate::retry::is_retryable_status(status.as_u16()),
+                            })
+                        }
+                        Err(e) => Err(crate::retry::OperationError {
+                            error: Fail::Transport(e.to_string()),
+                            retryable: true,
+                        }),
+                    }
+                }
+            },
+            &retry_config,
+            "http output send",
+        )
+        .await
+        .map_err(|fail| match fail {
+            Fail::Transport(e) => Error::Connection(format!("HTTP request error: {}", e)),
+            Fail::Status(code, body) => Error::Process(format!(
+                "HTTP Request Failed: Status code {}, response: {}",
+                code, body
+            )),
+        })
     }
 }
 pub(crate) struct HttpOutputBuilder;
@@ -280,7 +331,7 @@ pub fn init() -> Result<(), Error> {
                 "url": {"type": "string", "description": "Destination URL."},
                 "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"], "default": "POST", "description": "HTTP method."},
                 "timeout_ms": {"type": "integer", "minimum": 1, "description": "Request timeout in milliseconds."},
-                "retry_count": {"type": "integer", "minimum": 0, "description": "Number of retry attempts on failure."},
+                "retry_count": {"type": "integer", "minimum": 0, "default": 3, "description": "Number of retry attempts on failure."},
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Custom HTTP headers."},
                 "body_field": {"type": "string", "description": "Record field that holds the request body."},
                 "auth": {"type": "object", "description": "Authentication configuration."}
@@ -476,6 +527,33 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(err.to_string().contains("503"), "{err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deterministic_client_error_fails_on_the_first_attempt() -> Result<(), Error> {
+        // A 4xx (other than 429) is the endpoint's deterministic answer:
+        // no retry, the failure surfaces immediately even with retry
+        // budget left (connector-resilience contract).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rejected"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = base_config(format!("{}/rejected", server.uri()));
+        config["retry_count"] = serde_json::json!(5);
+        let output = build(config)?;
+        output.connect().await?;
+        let err = output.write(batch()).await.unwrap_err();
+        // Reason phrase included, byte-identical to the single-shot path.
+        assert!(err.to_string().contains("404 Not Found"), "{err}");
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1,
+            "a deterministic 4xx must not be retried"
+        );
         Ok(())
     }
 

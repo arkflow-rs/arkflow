@@ -287,13 +287,16 @@ impl Input for NatsInput {
                                 }
                                 Err(e) => {
                                     error!("Failed to get JetStream message: {}", e);
+                                    // One Disconnection surfaces the dead
+                                    // consumer to the engine (which owns
+                                    // reconnection); further messages of
+                                    // this batch are not delivered either.
                                     if let Err(e) =
                                         sender.send_async(Delivery::Err(Error::Disconnection)).await
                                     {
                                         error!("Failed to send error to channel: {}", e);
                                     }
-                                    // Short pause before retrying
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    break;
                                 }
                             }
                         }
@@ -304,8 +307,6 @@ impl Input for NatsInput {
                         {
                             error!("Failed to send error to channel: {}", e);
                         }
-                        // Short pause before retrying
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
 

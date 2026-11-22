@@ -5,7 +5,7 @@ description: 通过行协议把时间序列行写入 InfluxDB 2.x,每个输入�
 
 # InfluxDB
 
-InfluxDB 输出(Output)使用行协议(Line Protocol)将时间序列数据写入 InfluxDB 2.x。它将列映射为 tag 与 field,把每个输入批次作为一次行协议请求写入 InfluxDB,并在失败时按指数退避重试。
+InfluxDB 输出(Output)使用行协议(Line Protocol)将时间序列数据写入 InfluxDB 2.x。它将列映射为 tag 与 field,把每个输入批次作为一次行协议请求写入 InfluxDB;暂态失败(传输错误、`429`、`5xx`)按封顶指数退避重试,确定性 `4xx` 拒绝立即失败且缓冲行保留。
 
 ## 配置
 
@@ -22,7 +22,7 @@ InfluxDB 输出(Output)使用行协议(Line Protocol)将时间序列数据写入
 | timestamp_field | string | no | — | 数据点时间戳(纳秒)的源列。默认为当前时间。 |
 | batch_size | integer | no | — | 为兼容性接受,但当前**无效**:每个输入批次都会同步刷新为一次请求,批次从不拆分。唯一被校验的规则是拒绝 `0`。 |
 | flush_interval | integer | no | — | **当前未被使用**——schema 中有定义,但实现从不读取。 |
-| retry_count | integer | no | `3` | 失败时的重试次数。 |
+| retry_count | integer | no | `3` | 每次刷新的 HTTP 尝试总次数(总尝试数,非重试次数)。 |
 | timeout_ms | integer | no | `5000` | HTTP 请求超时时间(毫秒)。 |
 
 ### tags[]
@@ -115,4 +115,5 @@ output:
 
 - measurement、tag 与 field 标识符会自动按行协议规则转义。
 - 省略 `field_type` 时,该字段按字符串 field 处理。
-- 重试采用指数退避,起始间隔 100 毫秒。
+- 重试采用共享的封顶指数退避,起始间隔 100 毫秒(延迟封顶 5 秒;任意 `retry_count` 配置都不会溢出)。
+- 暂态失败——传输错误、`429`、`5xx` 响应——会被重试;其他 `4xx` 响应(token 错误、bucket 不存在等)首次尝试即失败且缓冲行保留,确定性拒绝不消耗重试预算。

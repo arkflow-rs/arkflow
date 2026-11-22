@@ -381,9 +381,12 @@ impl InfluxDBOutput {
         }
 
         let client_guard = self.client.lock().await;
+        // Clone the client out so the retry closure can own a handle per
+        // call (reqwest clients are cheap Arc-backed handles).
         let client = client_guard
             .as_ref()
-            .ok_or_else(|| Error::Connection("InfluxDB client not initialized".to_string()))?;
+            .ok_or_else(|| Error::Connection("InfluxDB client not initialized".to_string()))?
+            .clone();
 
         // Build URL
         let url = format!("{}/api/v2/write", self.config.url.trim_end_matches('/'));
@@ -391,55 +394,89 @@ impl InfluxDBOutput {
         // Join lines with newline
         let body = buffer.join("\n");
 
-        // Retry logic
-        let retry_count = self.config.retry_count.unwrap_or(3);
-        let mut last_error = None;
+        // `retry_count` names the TOTAL HTTP attempts per flush (the schema
+        // documents it) — keep that meaning, no +1 remap.
+        let retry_config = crate::retry::RetryConfig {
+            max_attempts: self.config.retry_count.unwrap_or(3).max(1),
+            ..Default::default()
+        };
 
-        let attempts = retry_count.max(1);
-        for attempt in 0..attempts {
-            let response = client
-                .post(&url)
-                .query(&[
-                    ("org", self.config.org.as_str()),
-                    ("bucket", self.config.bucket.as_str()),
-                    ("precision", "ns"),
-                ])
-                .header("Authorization", format!("Token {}", self.config.token))
-                .header("Content-Type", "text/plain")
-                .body(body.clone())
-                .send()
-                .await;
-
-            match response {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        buffer.clear();
-                        *self.last_flush.lock().await = Instant::now();
-                        return Ok(());
-                    } else {
-                        let status = resp.status();
-                        let error_body = resp.text().await.unwrap_or_default();
-                        last_error = Some(Error::Connection(format!(
-                            "InfluxDB write failed: {} - {}",
-                            status, error_body
-                        )));
-                    }
+        // Failure payload keeps the transport/server distinction so the
+        // final Error variant and message match the pre-consolidation texts.
+        enum Fail {
+            Transport(String),
+            // `StatusCode` (not `u16`) keeps the reason phrase in the
+            // returned message byte-identical to the pre-retry single-shot
+            // path ("InfluxDB write failed: 401 Unauthorized - …").
+            Status(reqwest::StatusCode, String),
+        }
+        impl std::fmt::Display for Fail {
+            // Retry-log safety: intermediate attempts may be followed by a
+            // success, so the per-attempt warning must not carry the
+            // response body (it can echo submitted line-protocol data).
+            // Only the FINAL returned error exposes the body, via
+            // `map_err` below.
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Fail::Transport(e) => write!(f, "{e}"),
+                    Fail::Status(code, _) => write!(f, "status {code}"),
                 }
-                Err(e) => {
-                    last_error = Some(Error::Connection(format!("InfluxDB request failed: {}", e)));
-                }
-            }
-
-            // Exponential backoff
-            if attempt + 1 < attempts {
-                tokio::time::sleep(std::time::Duration::from_millis(100 * 2_u64.pow(attempt)))
-                    .await;
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            Error::Connection("InfluxDB write failed after retries".to_string())
-        }))
+        crate::retry::RetryUtils::retry_with_backoff_classified(
+            || {
+                let request = client
+                    .post(&url)
+                    .query(&[
+                        ("org", self.config.org.as_str()),
+                        ("bucket", self.config.bucket.as_str()),
+                        ("precision", "ns"),
+                    ])
+                    .header("Authorization", format!("Token {}", self.config.token))
+                    .header("Content-Type", "text/plain")
+                    .body(body.clone());
+                async move {
+                    match request.send().await {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            if status.is_success() {
+                                return Ok(());
+                            }
+                            let error_body = resp.text().await.unwrap_or_default();
+                            // Shared classifier (connector-resilience
+                            // contract): 429/5xx transient, other 4xx
+                            // deterministic — a bad token or wrong bucket
+                            // must fail on the first attempt, not burn the
+                            // retry budget.
+                            let retryable = crate::retry::is_retryable_status(status.as_u16());
+                            Err(crate::retry::OperationError {
+                                error: Fail::Status(status, error_body),
+                                retryable,
+                            })
+                        }
+                        Err(e) => Err(crate::retry::OperationError {
+                            error: Fail::Transport(e.to_string()),
+                            retryable: true,
+                        }),
+                    }
+                }
+            },
+            &retry_config,
+            "influxdb write",
+        )
+        .await
+        .map_err(|fail| match fail {
+            Fail::Transport(e) => Error::Connection(format!("InfluxDB request failed: {}", e)),
+            Fail::Status(code, body) => {
+                Error::Connection(format!("InfluxDB write failed: {} - {}", code, body))
+            }
+        })?;
+
+        // Only a confirmed write clears the buffer.
+        buffer.clear();
+        *self.last_flush.lock().await = Instant::now();
+        Ok(())
     }
 }
 
@@ -1190,6 +1227,37 @@ mod tests {
         assert!(error.to_string().contains("500"), "{error}");
         assert!(error.to_string().contains("boom"), "{error}");
         assert_eq!(output.batch_buffer.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_deterministic_error_fails_immediately() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A 401 (bad token) is the endpoint's deterministic answer: exactly
+        // one attempt even with retry budget left, buffered lines retained
+        // (connector-resilience contract).
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = typed_config(server.uri(), 1);
+        config.retry_count = Some(5);
+        let output = InfluxDBOutput::new(config).unwrap();
+        output.connect().await.unwrap();
+        let error = output.write(Arc::new(typed_batch())).await.unwrap_err();
+        // Reason phrase included, byte-identical to the single-shot path.
+        assert!(error.to_string().contains("401 Unauthorized"), "{error}");
+        assert!(error.to_string().contains("unauthorized"), "{error}");
+        assert_eq!(output.batch_buffer.lock().await.len(), 1);
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1,
+            "a deterministic 4xx must not be retried"
+        );
     }
 
     #[tokio::test]

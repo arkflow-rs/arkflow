@@ -5,7 +5,7 @@ description: Writes time-series rows to InfluxDB 2.x via Line Protocol, one requ
 
 # InfluxDB
 
-The InfluxDB output writes time-series data to InfluxDB 2.x using the Line Protocol. It maps columns to tags and fields, writes each incoming batch to InfluxDB as a single Line Protocol request, and retries failures with exponential backoff.
+The InfluxDB output writes time-series data to InfluxDB 2.x using the Line Protocol. It maps columns to tags and fields, writes each incoming batch to InfluxDB as a single Line Protocol request, and retries transient failures (transport errors, `429`, `5xx`) with capped exponential backoff — deterministic `4xx` rejections fail immediately with the buffered lines retained.
 
 ## Configuration
 
@@ -22,7 +22,7 @@ The InfluxDB output writes time-series data to InfluxDB 2.x using the Line Proto
 | timestamp_field | string | no | — | Source column for the point timestamp (nanoseconds). Defaults to current time. |
 | batch_size | integer | no | — | Accepted for compatibility but **currently inert**: every incoming batch is flushed synchronously as one request and batches are never split. The only validated value rule is that `0` is rejected. |
 | flush_interval | integer | no | — | **Currently unused** — defined in the schema but never read by the implementation. |
-| retry_count | integer | no | `3` | Number of retry attempts on failure. |
+| retry_count | integer | no | `3` | Number of HTTP attempts per flush (total tries, not retries). |
 | timeout_ms | integer | no | `5000` | HTTP request timeout in milliseconds. |
 
 ### tags[]
@@ -115,4 +115,5 @@ output:
 
 - Measurement, tag, and field identifiers are escaped per Line Protocol rules automatically.
 - When `field_type` is omitted it is treated as a string field.
-- Retries use exponential backoff starting at 100 ms.
+- Retries use the shared capped exponential backoff starting at 100 ms (delays cap at 5 s; any configured `retry_count` is overflow-safe).
+- Transient failures — transport errors, `429`, and `5xx` responses — are retried; other `4xx` responses (bad token, wrong bucket, …) fail on the first attempt with the buffered lines retained, so deterministic rejections don't burn the retry budget.

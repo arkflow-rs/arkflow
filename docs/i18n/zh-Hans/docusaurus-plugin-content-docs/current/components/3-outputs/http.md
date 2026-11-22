@@ -5,7 +5,7 @@ description: ArkFlow 文档页面。
 
 # HTTP
 
-HTTP 输出(Output)将每条消息(Message)作为 HTTP 请求发送到配置的 URL。它支持自定义请求头、指数退避重试,以及 Basic 或 Bearer 认证。
+HTTP 输出(Output)将每条消息(Message)作为 HTTP 请求发送到配置的 URL。它支持自定义请求头、对暂态失败(传输错误、`429`、`5xx`)的封顶指数退避重试——其他 `4xx` 响应首次尝试即失败——以及 Basic 或 Bearer 认证。
 
 ## 配置
 
@@ -15,7 +15,7 @@ HTTP 输出(Output)将每条消息(Message)作为 HTTP 请求发送到配置的 
 | url | string | yes | — | 目标 URL。 |
 | method | string | yes | — | HTTP 方法:`GET`、`POST`、`PUT`、`DELETE`、`PATCH`。 |
 | timeout_ms | integer | yes | — | 请求超时时间(毫秒)。 |
-| retry_count | integer | yes | — | 失败时的重试次数。 |
+| retry_count | integer | no | `3` | 失败时的重试次数。仅暂态失败(传输错误、`429`、`5xx`)会被重试;其他 `4xx` 响应立即失败。 |
 | headers | `map<string, string>` | no | — | 自定义 HTTP 请求头。 |
 | body_field | string | no | — | 其值用作请求体的记录字段。 |
 | auth | object | no | — | 认证配置(见下文)。 |

@@ -235,14 +235,45 @@ impl KafkaInput {
         // partition behind a gap that can no longer close, and no
         // redelivery retries it (the tombstone is not forwarded).
         tokio::spawn(async move {
-            for attempt in 0..4 {
+            // Shared backoff schedule (connector-resilience contract),
+            // pulsar-style: the loop shape and the pre-sleep cancellation
+            // check stay (a detached task must not sleep past close) while
+            // the delay math comes from the shared implementation —
+            // exponential 200ms→5s cap replaces the old linear
+            // 200/400/600/800.
+            let retry_config = crate::retry::RetryConfig {
+                max_attempts: 4,
+                initial_delay_ms: 200,
+                max_delay_ms: 5000,
+                backoff_multiplier: 2.0,
+                jitter: 0.0,
+            };
+            let mut backoff_base_ms = retry_config.initial_delay_ms as f64;
+            for attempt in 1..=retry_config.max_attempts {
                 if let Ok(()) = ack.ack().await {
                     return;
                 }
                 if close_for_retry.is_cancelled() {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+                // Sleep only BETWEEN attempts: after the final failure the
+                // task is done — lingering in a backoff tail delay would
+                // just postpone the exhaustion warning.
+                if attempt == retry_config.max_attempts {
+                    break;
+                }
+                tokio::time::sleep(crate::retry::sleep_duration(
+                    backoff_base_ms,
+                    &retry_config,
+                    || rand::Rng::random(&mut rand::rng()),
+                ))
+                .await;
+                // Close may have fired during the backoff: do not start
+                // another acknowledgement past shutdown.
+                if close_for_retry.is_cancelled() {
+                    return;
+                }
+                backoff_base_ms = crate::retry::advance_backoff(backoff_base_ms, &retry_config);
             }
             tracing::warn!(
                 "Kafka tombstone settlement failed after retries; the frontier fence reports it to the next acknowledgement"
@@ -1076,7 +1107,18 @@ impl Input for KafkaInput {
                     let topic = position.topic.as_deref().unwrap_or_default();
                     let partition = position.partition as i32;
                     let deadline = tokio::time::Instant::now() + KAFKA_ASSIGNMENT_WAIT;
-                    let mut attempt = 0_u32;
+                    // Shared backoff schedule (connector-resilience
+                    // contract) for the seek retries: exponential 200ms
+                    // capped at 1s. The loop stays deadline-shaped — the
+                    // retry bound is the wall clock, not an attempt count.
+                    let seek_backoff = crate::retry::RetryConfig {
+                        max_attempts: u32::MAX,
+                        initial_delay_ms: 200,
+                        max_delay_ms: 1000,
+                        backoff_multiplier: 2.0,
+                        jitter: 0.0,
+                    };
+                    let mut backoff_base_ms = seek_backoff.initial_delay_ms as f64;
                     loop {
                         if !KafkaAck::partition_assigned(consumer, topic, partition) {
                             if tokio::time::Instant::now() >= deadline {
@@ -1086,6 +1128,15 @@ impl Input for KafkaInput {
                                 )));
                             }
                             tokio::time::sleep(Duration::from_millis(200)).await;
+                            // The wait can straddle the deadline: re-check
+                            // before the loop may start a seek with a fresh
+                            // 5s timeout past the restore budget.
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(Error::Process(format!(
+                                    "restore Kafka position for {topic}-{partition}: partition was not assigned within {}s",
+                                    KAFKA_ASSIGNMENT_WAIT.as_secs()
+                                )));
+                            }
                             continue;
                         }
                         match consumer.seek(
@@ -1096,16 +1147,35 @@ impl Input for KafkaInput {
                         ) {
                             Ok(()) => break,
                             Err(error) if tokio::time::Instant::now() < deadline => {
-                                attempt += 1;
                                 tracing::warn!(
                                     %error, topic, partition,
                                     "Kafka restore seek failed; waiting for group assignment"
                                 );
-                                tokio::time::sleep(
-                                    Duration::from_millis(200 * attempt as u64)
-                                        .min(Duration::from_secs(1)),
-                                )
-                                .await;
+                                // Never oversleep past the restore deadline:
+                                // a wait clamped to the remaining budget
+                                // plus a deadline re-check after waking
+                                // keeps a fresh 5s seek from starting while
+                                // the wall-clock retry budget is spent.
+                                let wait = crate::retry::sleep_duration(
+                                    backoff_base_ms,
+                                    &seek_backoff,
+                                    || rand::Rng::random(&mut rand::rng()),
+                                );
+                                let remaining = deadline
+                                    .checked_duration_since(tokio::time::Instant::now())
+                                    .unwrap_or_default();
+                                tokio::time::sleep(wait.min(remaining)).await;
+                                backoff_base_ms =
+                                    crate::retry::advance_backoff(backoff_base_ms, &seek_backoff);
+                                if tokio::time::Instant::now() >= deadline {
+                                    // The wall-clock retry budget expired
+                                    // during the wait: surface the last
+                                    // seek failure instead of starting
+                                    // another seek.
+                                    return Err(Error::Process(format!(
+                                        "restore Kafka position for {topic}-{partition}: {error}"
+                                    )));
+                                }
                             }
                             Err(error) => {
                                 return Err(Error::Process(format!(
