@@ -102,6 +102,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # `appVersion` must track the engine release tag (the
+      # `kubernetes-helm-chart` spec's publication requirement). A forgotten
+      # bump would ship a chart pinned to stale images; fail before anything
+      # is pushed, naming all three values.
+      - name: Fail if appVersion drifted from the engine release
+        run: |
+          set -eu
+          APP_VERSION="$(grep -m1 '^appVersion:' deploy/charts/arkflow/Chart.yaml | cut -d' ' -f2 | tr -d '"')"
+          WORKSPACE_VERSION="$(awk -F'"' '/^\[workspace.package\]/{in_pkg=1} in_pkg && /^version *=/{print $2; exit}' Cargo.toml)"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "appVersion: ${APP_VERSION}, workspace: ${WORKSPACE_VERSION}, tag: ${TAG_VERSION}"
+          if [ "${APP_VERSION}" != "${WORKSPACE_VERSION}" ] || [ "${APP_VERSION}" != "${TAG_VERSION}" ]; then
+            echo "::error::Chart appVersion '${APP_VERSION}' does not track the engine release (workspace '${WORKSPACE_VERSION}', tag '${TAG_VERSION}'). Bump appVersion in deploy/charts/arkflow/Chart.yaml, commit, then re-tag."
+            exit 1
+          fi
+
       - name: Package and push chart as OCI artifact
         run: |
           chart_version="$(grep -m1 '^version:' deploy/charts/arkflow/Chart.yaml | cut -d' ' -f2 | tr -d '"')"
