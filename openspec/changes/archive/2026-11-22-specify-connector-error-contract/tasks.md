@@ -5,8 +5,8 @@
 
 ## 2. 一致性钉扎测试（先行落地，红灯驱动修复）
 
-- [ ] 2.1 新建 `crates/arkflow-plugin/tests/connector_error_contract.rs`：实现三条结构规则（input EOF allowlist+teardown 标记、output EOF 禁止、output Disconnection allowlist、multiple_inputs 含 `InputChannelClosed`），违规输出文件:行清单；临时忽略当前已知违规以便分步修复（或接受先红后绿的顺序，任务内注明）
-- [ ] 2.2 给 teardown 路径补 `// contract-eof: teardown` 标记：mqtt.rs、nats.rs、websocket.rs、pulsar.rs 的 receiver 关闭/取消分支（行号见 design Context）
+- [x] 2.1 新建 `crates/arkflow-plugin/tests/connector_error_contract.rs`：实现三条结构规则（input EOF allowlist+teardown 标记、output EOF 禁止、output Disconnection allowlist、multiple_inputs 含 `InputChannelClosed`），违规输出文件:行清单；临时忽略当前已知违规以便分步修复（或接受先红后绿的顺序，任务内注明）
+- [x] 2.2 给 teardown 路径补 `// contract-eof: teardown` 标记：mqtt.rs、nats.rs、websocket.rs、pulsar.rs 的 receiver 关闭/取消分支（行号见 design Context）
 
 ## 3. 修复 input 错位
 
