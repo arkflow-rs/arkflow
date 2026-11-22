@@ -429,6 +429,7 @@ mod retry_config_tests {
             initial_delay_ms: 100,
             max_delay_ms: 5000,
             backoff_multiplier: 2.0,
+            jitter: 0.0,
         }
     }
 
@@ -609,6 +610,7 @@ mod retry_backoff_tests {
             initial_delay_ms: 1,
             max_delay_ms: 2,
             backoff_multiplier: 2.0,
+            jitter: 0.0,
         }
     }
 
