@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # HTTP
 
-The HTTP output sends each message as an HTTP request to a configured URL. It supports custom headers, retry with exponential backoff, and Basic or Bearer authentication.
+The HTTP output sends each message as an HTTP request to a configured URL. It supports custom headers, retry of transient failures (transport errors, `429`, `5xx`) with capped exponential backoff — other `4xx` responses fail on the first attempt — and Basic or Bearer authentication.
 
 ## Configuration
 
@@ -15,7 +15,7 @@ The HTTP output sends each message as an HTTP request to a configured URL. It su
 | url | string | yes | — | Destination URL. |
 | method | string | yes | — | HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`. |
 | timeout_ms | integer | yes | — | Request timeout in milliseconds. |
-| retry_count | integer | yes | — | Number of retry attempts on failure. |
+| retry_count | integer | no | `3` | Number of retry attempts on failure. Only transient failures (transport errors, `429`, `5xx`) are retried; other `4xx` responses fail immediately. |
 | headers | `map<string, string>` | no | — | Custom HTTP headers. |
 | body_field | string | no | — | Record field whose value is used as the request body. |
 | auth | object | no | — | Authentication configuration (see below). |

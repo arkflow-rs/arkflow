@@ -70,7 +70,7 @@ const RECONNECT_ATTEMPTS: u32 = 3;
 /// rumqttc client opens no network connection until the eventloop polls,
 /// so "created" must not be reported as "connected": without this gate the
 /// write-path reconnect succeeds instantly against a dead broker and the
-/// 1s/2s/4s backoff can never trigger in production.
+/// 1s/2s backoff can never trigger in production.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// MQTT output component
@@ -185,29 +185,32 @@ impl<T: MqttClient> MqttOutput<T> {
     }
 
     /// Bounded lazy reconnect used by the write path: 3 attempts with
-    /// exponential backoff (1s, 2s, 4s), then the error is surfaced.
+    /// exponential backoff (1s, then 2s — the 4s cap is never reached
+    /// within 3 attempts), then the error is surfaced.
     async fn reconnect(&self) -> Result<(), Error> {
-        let mut delay = std::time::Duration::from_secs(1);
-        for attempt in 1..=RECONNECT_ATTEMPTS {
-            match self.establish_connection().await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if attempt == RECONNECT_ATTEMPTS {
-                        return Err(Error::Connection(format!(
-                            "MQTT output reconnect failed after {} attempts: last error: {}",
-                            RECONNECT_ATTEMPTS, e
-                        )));
-                    }
-                    warn!(
-                        "MQTT output reconnect attempt {}/{} failed: {}; retrying in {:?}",
-                        attempt, RECONNECT_ATTEMPTS, e, delay
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-            }
-        }
-        unreachable!("reconnect loop always returns inside the loop")
+        // The constants reproduce the previous hand-written `delay *= 2`
+        // schedule byte-identically (sleeps of 1s then 2s); the shared
+        // implementation supplies the same capped, overflow-safe schedule
+        // as every other connector (connector-resilience contract).
+        let retry_config = crate::retry::RetryConfig {
+            max_attempts: RECONNECT_ATTEMPTS,
+            initial_delay_ms: 1000,
+            max_delay_ms: 4000,
+            backoff_multiplier: 2.0,
+            jitter: 0.0,
+        };
+        crate::retry::RetryUtils::retry_with_backoff(
+            || self.establish_connection(),
+            &retry_config,
+            "mqtt output reconnect",
+        )
+        .await
+        .map_err(|e| {
+            Error::Connection(format!(
+                "MQTT output reconnect failed after {} attempts: last error: {}",
+                RECONNECT_ATTEMPTS, e
+            ))
+        })
     }
 }
 

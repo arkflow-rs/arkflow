@@ -51,6 +51,7 @@ pub fn init() -> Result<(), Error> {
                 "concurrency": {"type": "integer", "description": "Maximum in-flight requests. Defaults to 4."},
                 "api_key": {"type": "string", "description": "API key sent as 'Authorization: Bearer'; supports secret references."},
                 "timeout_ms": {"type": "integer", "description": "HTTP request timeout in milliseconds. Defaults to 30000."},
+                "retry_count": {"type": "integer", "description": "Retries for transient failures (429/5xx/transport). Defaults to 3; 0 disables retrying."},
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra HTTP headers."}
             },
             "required": ["url", "collection"]

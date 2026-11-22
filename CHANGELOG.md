@@ -222,6 +222,33 @@ aligned to it, two of which change runtime behavior:
   of 1024 (kernel edge-channel capacity) instead of per-file `1000`
   magic numbers.
 
+### Changed — Connector resilience (retry adoption sweep)
+
+- The InfluxDB and HTTP outputs now classify failures through the shared
+  retry implementation: transport errors, `429`, and `5xx` are retried
+  with capped exponential backoff (delays cap at 5 s), while other `4xx`
+  responses fail on the **first attempt** with the error message
+  unchanged. Previously every non-success status (a bad token, a wrong
+  path) was retried until the budget ran out. The InfluxDB backoff also
+  loses its last-surviving overflow hazard (`100 * 2^attempt` panicked
+  for `retry_count >= 63`; every configured value is now safe).
+- The HTTP output's `retry_count` is now optional (default `3`,
+  matching the qdrant output and the AI processors); it was previously a
+  required field. The InfluxDB `retry_count` keeps its existing
+  "total HTTP attempts per flush" meaning (documented in its schema).
+- The MQTT output's lazy reconnect uses the shared backoff schedule with
+  byte-identical delays (1 s, 2 s) — no behavior change, one less
+  hand-rolled loop.
+- The Kafka input's tombstone-settlement retry now uses the shared
+  exponential schedule (200 ms, 400 ms, 800 ms, 1.6 s — capped at 5 s)
+  instead of a linear 200/400/600/800 ms; the restore-seek retry shares
+  the same scheduling. Cancellation and at-least-once semantics are
+  unchanged.
+- NATS input: the JetStream pre-warm path no longer sleeps 100 ms after
+  reporting a `Disconnection` (no retry followed the sleep — the engine
+  owns reconnection), and a batch with a decode failure now surfaces one
+  `Disconnection` instead of one per undecodable message.
+
 ### Fixed — Engine and control plane
 
 - The in-memory Hub no longer lets a settled Job observation roll a

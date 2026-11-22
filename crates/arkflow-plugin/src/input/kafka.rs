@@ -235,14 +235,34 @@ impl KafkaInput {
         // partition behind a gap that can no longer close, and no
         // redelivery retries it (the tombstone is not forwarded).
         tokio::spawn(async move {
-            for attempt in 0..4 {
+            // Shared backoff schedule (connector-resilience contract),
+            // pulsar-style: the loop shape and the pre-sleep cancellation
+            // check stay (a detached task must not sleep past close) while
+            // the delay math comes from the shared implementation —
+            // exponential 200ms→5s cap replaces the old linear
+            // 200/400/600/800.
+            let retry_config = crate::retry::RetryConfig {
+                max_attempts: 4,
+                initial_delay_ms: 200,
+                max_delay_ms: 5000,
+                backoff_multiplier: 2.0,
+                jitter: 0.0,
+            };
+            let mut backoff_base_ms = retry_config.initial_delay_ms as f64;
+            for _ in 0..retry_config.max_attempts {
                 if let Ok(()) = ack.ack().await {
                     return;
                 }
                 if close_for_retry.is_cancelled() {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+                tokio::time::sleep(crate::retry::sleep_duration(
+                    backoff_base_ms,
+                    &retry_config,
+                    || rand::Rng::random(&mut rand::rng()),
+                ))
+                .await;
+                backoff_base_ms = crate::retry::advance_backoff(backoff_base_ms, &retry_config);
             }
             tracing::warn!(
                 "Kafka tombstone settlement failed after retries; the frontier fence reports it to the next acknowledgement"
@@ -1076,7 +1096,18 @@ impl Input for KafkaInput {
                     let topic = position.topic.as_deref().unwrap_or_default();
                     let partition = position.partition as i32;
                     let deadline = tokio::time::Instant::now() + KAFKA_ASSIGNMENT_WAIT;
-                    let mut attempt = 0_u32;
+                    // Shared backoff schedule (connector-resilience
+                    // contract) for the seek retries: exponential 200ms
+                    // capped at 1s. The loop stays deadline-shaped — the
+                    // retry bound is the wall clock, not an attempt count.
+                    let seek_backoff = crate::retry::RetryConfig {
+                        max_attempts: u32::MAX,
+                        initial_delay_ms: 200,
+                        max_delay_ms: 1000,
+                        backoff_multiplier: 2.0,
+                        jitter: 0.0,
+                    };
+                    let mut backoff_base_ms = seek_backoff.initial_delay_ms as f64;
                     loop {
                         if !KafkaAck::partition_assigned(consumer, topic, partition) {
                             if tokio::time::Instant::now() >= deadline {
@@ -1096,16 +1127,18 @@ impl Input for KafkaInput {
                         ) {
                             Ok(()) => break,
                             Err(error) if tokio::time::Instant::now() < deadline => {
-                                attempt += 1;
                                 tracing::warn!(
                                     %error, topic, partition,
                                     "Kafka restore seek failed; waiting for group assignment"
                                 );
-                                tokio::time::sleep(
-                                    Duration::from_millis(200 * attempt as u64)
-                                        .min(Duration::from_secs(1)),
-                                )
+                                tokio::time::sleep(crate::retry::sleep_duration(
+                                    backoff_base_ms,
+                                    &seek_backoff,
+                                    || rand::Rng::random(&mut rand::rng()),
+                                ))
                                 .await;
+                                backoff_base_ms =
+                                    crate::retry::advance_backoff(backoff_base_ms, &seek_backoff);
                             }
                             Err(error) => {
                                 return Err(Error::Process(format!(

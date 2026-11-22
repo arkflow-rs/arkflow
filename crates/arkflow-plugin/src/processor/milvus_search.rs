@@ -57,6 +57,7 @@ pub fn init() -> Result<(), Error> {
                 "top_k": {"type": "integer", "description": "Number of neighbors per row. Defaults to 5."},
                 "api_key": {"type": "string", "description": "API key sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."},
                 "timeout_ms": {"type": "integer", "description": "HTTP request timeout in milliseconds. Defaults to 30000."},
+                "retry_count": {"type": "integer", "description": "Retries for transient failures (429/5xx/transport). Defaults to 3; 0 disables retrying."},
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra HTTP headers."}
             },
             "required": ["url", "collection"]
