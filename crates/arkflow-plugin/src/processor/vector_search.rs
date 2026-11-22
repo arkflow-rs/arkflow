@@ -162,10 +162,9 @@ impl VectorSearchProcessor {
     }
 
     async fn search(&self, vector: Vec<f32>) -> Result<String, Error> {
-        let url = format!(
-            "{}/collections/{}/points/search",
-            self.config.url.trim_end_matches('/'),
-            self.config.collection
+        let url = crate::http_util::join_url_base(
+            &self.config.url,
+            &format!("collections/{}/points/search", self.config.collection),
         );
         let mut body = json!({
             "vector": vector,
@@ -180,11 +179,7 @@ impl VectorSearchProcessor {
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
         }
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-        }
+        let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
 
         let response = request.send().await.map_err(|e| {
             error!("Vector search request failed: {}", e);
@@ -199,7 +194,7 @@ impl VectorSearchProcessor {
             return Err(Error::Process(format!(
                 "Vector search returned {}: {}",
                 status,
-                vector_util::truncate_body(&body)
+                crate::http_util::truncate_body(&body)
             )));
         }
 
@@ -256,7 +251,7 @@ impl ProcessorBuilder for VectorSearchProcessorBuilder {
                 "vector_search processor: 'concurrency' must be at least 1".to_string(),
             ));
         }
-        let client = vector_util::build_http_client(config.timeout_ms, &config.url)?;
+        let client = crate::http_util::build_http_client(config.timeout_ms, &config.url)?;
         Ok(Arc::new(VectorSearchProcessor { config, client }))
     }
 }

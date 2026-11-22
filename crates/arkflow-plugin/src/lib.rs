@@ -18,6 +18,7 @@ pub mod codec;
 pub mod component;
 pub mod context_pool;
 pub mod expr;
+pub mod http_util;
 pub mod input;
 pub mod kafka_security;
 pub mod kafka_txn;

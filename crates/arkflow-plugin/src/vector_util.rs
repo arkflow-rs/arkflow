@@ -17,7 +17,6 @@
 //! messages keep their per-component prefix.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use arkflow_core::{Error, MessageBatch, MessageBatchRef};
 use datafusion::arrow::array::{
@@ -25,7 +24,6 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use reqwest::Client;
 
 /// Reads a Float32 vector column (FixedSizeList(Float32) or List(Float32))
 /// into per-row vectors. Null rows and null inner elements are rejected with
@@ -192,32 +190,6 @@ pub(crate) fn append_column(
     let record_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| Error::Process(format!("{component}: batch rebuild failed: {e}")))?;
     Ok(MessageBatch::new_arrow(record_batch))
-}
-
-/// Truncates an HTTP response body for inclusion in error messages.
-pub(crate) fn truncate_body(body: &str) -> &str {
-    match body.char_indices().nth(512) {
-        Some((index, _)) => &body[..index],
-        None => body,
-    }
-}
-
-/// Builds the shared HTTP client: total timeout from the component config,
-/// and loopback endpoints (local dev instances, tests) bypass a system
-/// proxy — proxying localhost is never what a user means.
-pub(crate) fn build_http_client(timeout_ms: u64, base_url: &str) -> Result<Client, Error> {
-    let is_loopback = reqwest::Url::parse(&format!("{}/", base_url.trim_end_matches('/')))
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-        .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]")
-        .unwrap_or(false);
-    let mut builder = Client::builder().timeout(Duration::from_millis(timeout_ms));
-    if is_loopback {
-        builder = builder.no_proxy();
-    }
-    builder
-        .build()
-        .map_err(|e| Error::Config(format!("Unable to create HTTP client: {e}")))
 }
 
 /// Quotes a SQL identifier and escapes embedded double quotes (`"` → `""`)

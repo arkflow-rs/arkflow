@@ -212,10 +212,7 @@ impl MilvusSearchProcessor {
     }
 
     async fn search(&self, vector: Vec<f32>) -> Result<String, Error> {
-        let url = format!(
-            "{}/v2/vectordb/entities/search",
-            self.config.url.trim_end_matches('/')
-        );
+        let url = crate::http_util::join_url_base(&self.config.url, "v2/vectordb/entities/search");
         let output_fields: Vec<String> = self.output_fields();
         let mut body = json!({
             "collectionName": self.config.collection,
@@ -236,11 +233,7 @@ impl MilvusSearchProcessor {
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
         }
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-        }
+        let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
 
         let response = request.send().await.map_err(|e| {
             error!("Milvus search request failed: {}", e);
@@ -255,7 +248,7 @@ impl MilvusSearchProcessor {
             return Err(Error::Process(format!(
                 "Milvus search returned {}: {}",
                 status,
-                vector_util::truncate_body(&body)
+                crate::http_util::truncate_body(&body)
             )));
         }
 
@@ -272,7 +265,7 @@ impl MilvusSearchProcessor {
                 return Err(Error::Process(format!(
                     "Milvus search failed with code {}: {}",
                     code,
-                    vector_util::truncate_body(message)
+                    crate::http_util::truncate_body(message)
                 )));
             }
         }
@@ -345,7 +338,7 @@ impl ProcessorBuilder for MilvusSearchProcessorBuilder {
                 "milvus_search processor: 'concurrency' must be at least 1".to_string(),
             ));
         }
-        let client = vector_util::build_http_client(config.timeout_ms, &config.url)?;
+        let client = crate::http_util::build_http_client(config.timeout_ms, &config.url)?;
         Ok(Arc::new(MilvusSearchProcessor { config, client }))
     }
 }

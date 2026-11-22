@@ -163,10 +163,7 @@ impl Output for MilvusOutput {
 
 impl MilvusOutput {
     async fn upsert(&self, data: &[Value]) -> Result<(), Error> {
-        let url = format!(
-            "{}/v2/vectordb/entities/upsert",
-            self.config.url.trim_end_matches('/')
-        );
+        let url = crate::http_util::join_url_base(&self.config.url, "v2/vectordb/entities/upsert");
         let mut request = self
             .client
             .post(&url)
@@ -174,11 +171,7 @@ impl MilvusOutput {
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
         }
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-        }
+        let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
 
         let mut attempt = 0u32;
         loop {
@@ -220,7 +213,7 @@ impl MilvusOutput {
                                 return Err(Error::Process(format!(
                                     "Milvus upsert failed with code {}: {}",
                                     code,
-                                    crate::vector_util::truncate_body(message)
+                                    crate::http_util::truncate_body(message)
                                 )));
                             }
                         }
@@ -230,21 +223,21 @@ impl MilvusOutput {
                         return Err(Error::Process(format!(
                             "Milvus returned {}: {}",
                             status,
-                            crate::vector_util::truncate_body(&body)
+                            crate::http_util::truncate_body(&body)
                         )));
                     }
                     error!(
                         "Milvus upsert attempt {} failed: {} {}",
                         attempt + 1,
                         status,
-                        crate::vector_util::truncate_body(&body)
+                        crate::http_util::truncate_body(&body)
                     );
                     if attempt >= self.config.retry_count {
                         return Err(Error::Process(format!(
                             "Milvus returned {} after {} attempts: {}",
                             status,
                             attempt + 1,
-                            crate::vector_util::truncate_body(&body)
+                            crate::http_util::truncate_body(&body)
                         )));
                     }
                 }
@@ -436,22 +429,7 @@ impl OutputBuilder for MilvusOutputBuilder {
                     .to_string(),
             ));
         }
-        // Loopback endpoints (local Milvus dev instances, tests) bypass a
-        // system proxy — proxying localhost is never what a user means.
-        let is_loopback = reqwest::Url::parse(&format!("{}/", config.url.trim_end_matches('/')))
-            .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-            .map(|host| {
-                host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
-            })
-            .unwrap_or(false);
-        let mut builder = Client::builder().timeout(Duration::from_millis(config.timeout_ms));
-        if is_loopback {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|e| Error::Config(format!("Unable to create HTTP client: {}", e)))?;
+        let client = crate::http_util::build_http_client(config.timeout_ms, &config.url)?;
         Ok(Arc::new(MilvusOutput { config, client }))
     }
 }

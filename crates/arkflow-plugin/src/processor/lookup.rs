@@ -465,7 +465,7 @@ impl LookupBackend for HttpBackend {
             key.to_string()
         };
         let url = self.config.url.replace("{{key}}", &substituted);
-        let mut request = match self.config.method.to_ascii_uppercase().as_str() {
+        let request = match self.config.method.to_ascii_uppercase().as_str() {
             "GET" => self.client.get(&url),
             "POST" => self.client.post(&url),
             "PUT" => self.client.put(&url),
@@ -476,11 +476,7 @@ impl LookupBackend for HttpBackend {
                 )))
             }
         };
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-        }
+        let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
         let response = request.send().await.map_err(|e| {
             Error::Process(format!("lookup processor: request for key failed: {e}"))
         })?;
@@ -518,7 +514,7 @@ impl LookupBackend for HttpBackend {
             };
             return Err(Error::Process(format!(
                 "lookup processor: backend returned {status} for key: {}",
-                truncate_body(&body)
+                crate::http_util::truncate_body(&body)
             )));
         }
         let body = response
@@ -924,27 +920,7 @@ impl ProcessorBuilder for LookupProcessorBuilder {
                     ));
                 }
                 let probe = http.url.replace("{{key}}", "probe");
-                // Loopback endpoints (local dimension services, tests)
-                // bypass a system proxy — proxying localhost is never what a
-                // user means.
-                let is_loopback = reqwest::Url::parse(&probe)
-                    .ok()
-                    .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-                    .map(|host| {
-                        host == "localhost"
-                            || host == "127.0.0.1"
-                            || host == "::1"
-                            || host == "[::1]"
-                    })
-                    .unwrap_or(false);
-                let mut builder =
-                    Client::builder().timeout(Duration::from_millis(config.timeout_ms));
-                if is_loopback {
-                    builder = builder.no_proxy();
-                }
-                let client = builder
-                    .build()
-                    .map_err(|e| Error::Config(format!("Unable to create HTTP client: {e}")))?;
+                let client = crate::http_util::build_http_client(config.timeout_ms, &probe)?;
                 Arc::new(HttpBackend {
                     config: http.clone(),
                     client,
@@ -961,13 +937,6 @@ impl ProcessorBuilder for LookupProcessorBuilder {
             backend,
             cache,
         }))
-    }
-}
-
-fn truncate_body(body: &str) -> &str {
-    match body.char_indices().nth(512) {
-        Some((index, _)) => &body[..index],
-        None => body,
     }
 }
 

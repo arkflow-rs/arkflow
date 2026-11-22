@@ -162,20 +162,15 @@ impl Output for QdrantOutput {
 
 impl QdrantOutput {
     async fn upsert(&self, points: &[Value]) -> Result<(), Error> {
-        let url = format!(
-            "{}/collections/{}/points?wait=true",
-            self.config.url.trim_end_matches('/'),
-            self.config.collection
+        let url = crate::http_util::join_url_base(
+            &self.config.url,
+            &format!("collections/{}/points?wait=true", self.config.collection),
         );
         let mut request = self.client.put(&url).json(&json!({ "points": points }));
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
         }
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-        }
+        let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
 
         let mut attempt = 0u32;
         loop {
@@ -199,21 +194,21 @@ impl QdrantOutput {
                         return Err(Error::Process(format!(
                             "Qdrant returned {}: {}",
                             status,
-                            crate::vector_util::truncate_body(&body)
+                            crate::http_util::truncate_body(&body)
                         )));
                     }
                     error!(
                         "Qdrant upsert attempt {} failed: {} {}",
                         attempt + 1,
                         status,
-                        crate::vector_util::truncate_body(&body)
+                        crate::http_util::truncate_body(&body)
                     );
                     if attempt >= self.config.retry_count {
                         return Err(Error::Process(format!(
                             "Qdrant returned {} after {} attempts: {}",
                             status,
                             attempt + 1,
-                            crate::vector_util::truncate_body(&body)
+                            crate::http_util::truncate_body(&body)
                         )));
                     }
                 }
@@ -425,7 +420,7 @@ impl OutputBuilder for QdrantOutputBuilder {
                 "qdrant output: 'collection' must not be empty".to_string(),
             ));
         }
-        let client = crate::vector_util::build_http_client(config.timeout_ms, &config.url)?;
+        let client = crate::http_util::build_http_client(config.timeout_ms, &config.url)?;
         Ok(Arc::new(QdrantOutput { config, client }))
     }
 }

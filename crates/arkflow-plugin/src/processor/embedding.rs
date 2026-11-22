@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -148,11 +147,7 @@ impl EmbeddingProcessor {
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
         }
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-        }
+        let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
 
         let response = request.send().await.map_err(|e| {
             error!("Embedding API request failed: {}", e);
@@ -167,7 +162,7 @@ impl EmbeddingProcessor {
             return Err(Error::Process(format!(
                 "Embedding API returned {}: {}",
                 status,
-                truncate_body(&body)
+                crate::http_util::truncate_body(&body)
             )));
         }
 
@@ -255,23 +250,7 @@ impl ProcessorBuilder for EmbeddingProcessorBuilder {
                 "embedding processor: 'batch_size' must be at least 1".to_string(),
             ));
         }
-        // Loopback endpoints (local vLLM/Ollama/TEI, tests) bypass a system
-        // proxy — proxying localhost is never what a user means.
-        let is_loopback =
-            reqwest::Url::parse(&format!("{}/", config.api_base.trim_end_matches('/')))
-                .ok()
-                .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-                .map(|host| {
-                    host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
-                })
-                .unwrap_or(false);
-        let mut builder = Client::builder().timeout(Duration::from_millis(config.timeout_ms));
-        if is_loopback {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|e| Error::Config(format!("Unable to create HTTP client: {}", e)))?;
+        let client = crate::http_util::build_http_client(config.timeout_ms, &config.api_base)?;
         Ok(Arc::new(EmbeddingProcessor { config, client }))
     }
 }
@@ -378,13 +357,6 @@ fn append_vector_column(
     let record_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| Error::Process(format!("embedding processor: batch rebuild failed: {e}")))?;
     Ok(MessageBatch::new_arrow(record_batch))
-}
-
-fn truncate_body(body: &str) -> &str {
-    match body.char_indices().nth(512) {
-        Some((index, _)) => &body[..index],
-        None => body,
-    }
 }
 
 #[cfg(test)]
@@ -722,7 +694,7 @@ mod tests {
     #[test]
     fn body_truncation_is_char_safe() {
         let long = "é".repeat(1000);
-        assert_eq!(truncate_body(&long).chars().count(), 512);
-        assert_eq!(truncate_body("short"), "short");
+        assert_eq!(crate::http_util::truncate_body(&long).chars().count(), 512);
+        assert_eq!(crate::http_util::truncate_body("short"), "short");
     }
 }
