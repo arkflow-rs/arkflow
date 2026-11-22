@@ -26,6 +26,7 @@ pub mod output;
 pub mod processor;
 pub mod pulsar;
 pub mod rate_limiter;
+pub mod retry;
 pub mod temporary;
 pub mod time;
 pub mod udf;
