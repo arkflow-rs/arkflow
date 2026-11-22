@@ -40,7 +40,9 @@ Pulsar 输入(Input)订阅 Apache Pulsar 主题(Topic),支持四种订阅(Subscr
 | initial_delay_ms | integer | yes | — | 初始退避延迟(毫秒) |
 | max_delay_ms | integer | yes | — | 最大退避延迟(毫秒) |
 | backoff_multiplier | number | yes | — | 指数退避乘数 |
+| jitter | number | no | `0` | 去相关抖动,占延迟的比例(0-1);实际等待不超过未加抖动的退避值 |
 
+配置的策略治理接收重试循环(次数、延迟与 5s 延迟封顶);退避等待期间的取消会立即中断等待。
 ### tls
 
 | Field | Type | Required | Default | 描述 |

@@ -203,6 +203,25 @@ aligned to it, two of which change runtime behavior:
 - MongoDB output: the not-connected guard reports `Connection(msg)` instead
   of a bare `Disconnection`, consistent with the other outputs.
 
+### Changed — Connector resilience (shared retry skeleton)
+
+- The four AI processors (`embedding`, `llm`, `vector_search`,
+  `milvus_search`) now retry transient failures (429/5xx/transport) with
+  capped exponential backoff by default. New optional `retry_count`
+  config field (default 3, 0 = single attempt, matching the qdrant/milvus
+  outputs' field semantics). Previously a single 429/5xx failed the whole
+  batch immediately. Error messages and deterministic-failure behavior
+  (4xx, validation errors) are unchanged.
+- Qdrant/Milvus outputs and the Pulsar input's receive backoff now use one
+  shared retry implementation (`retry` module) instead of hand-rolled
+  loops. The qdrant/milvus hand-rolled delay `100 * 2^attempt` had no cap:
+  any `retry_count >= 64` overflowed (debug panic). Delays are now capped
+  at 5s for any configured count, and `RetryConfig` gains optional
+  `jitter`. Default retry counts are unchanged (qdrant 3, milvus 0).
+- Input components' internal delivery channels align on a shared capacity
+  of 1024 (kernel edge-channel capacity) instead of per-file `1000`
+  magic numbers.
+
 ### Fixed — Engine and control plane
 
 - The in-memory Hub no longer lets a settled Job observation roll a

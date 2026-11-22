@@ -25,6 +25,7 @@ It pairs naturally with [SQL](/docs/components/processors/sql) (prepare the prom
 | concurrency | integer | no | `4` | Maximum in-flight requests; results are always filled back in row order. |
 | api_key | string | no | — | Sent as `Authorization: Bearer`. Supports [secret references](/docs/reference/configuration#secret-references). |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
+| retry_count | integer | no | `3` | Retries for transient failures (429/5xx/transport). `0` disables retrying. |
 | headers | map | no | — | Extra HTTP headers (e.g. Azure's `api-key`). |
 | stream | boolean | no | `false` | Request SSE streaming and assemble the deltas into the row's final completion text. Useful behind providers or gateways that time out non-streaming long completions. The processor still emits one complete text per row. |
 | tools | array | no | — | OpenAI [tools definition](https://platform.openai.com/docs/guides/function-calling) passed through verbatim for function calling. |
@@ -37,6 +38,10 @@ rather than awaited — and the batch flows to `error_output` as a whole. The pr
 LLM calls; size `concurrency` and upstream batches to stay within rate
 limits. Requests to loopback endpoints always bypass the system proxy.
 :::
+
+Transient HTTP failures (429, 5xx, connection errors) are retried with
+capped exponential backoff (`retry_count`, default 3); 4xx rejections and
+parse/validation failures fail immediately without retrying.
 
 ## Example
 

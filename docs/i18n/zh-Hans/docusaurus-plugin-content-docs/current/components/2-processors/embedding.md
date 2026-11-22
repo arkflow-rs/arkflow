@@ -21,6 +21,7 @@ description: ArkFlow Embedding 处理器组件。
 | target_field | string | no | `embedding` | 追加的向量列名称。 |
 | batch_size | integer | no | `32` | 每个 HTTP 请求的最大行数。 |
 | timeout_ms | integer | no | `30000` | HTTP 请求超时。 |
+| retry_count | integer | no | `3` | 暂态失败(429/5xx/传输错误)的重试次数。`0` 表示不重试。 |
 | headers | map | no | — | 额外的 HTTP 头(如 Azure 的 `api-key`)。 |
 
 :::note
@@ -28,6 +29,8 @@ description: ArkFlow Embedding 处理器组件。
 :::
 
 ## 错误语义
+
+暂态 HTTP 失败(429、5xx、连接错误)会按封顶指数退避重试(`retry_count`,默认 3);认证与其他 4xx 拒绝立即失败,解析/校验失败从不重试。
 
 API 调用失败(非 2xx)或响应不一致(向量数量或维度不匹配、输入文本为 null)都会以处理错误的形式暴露,因此在配置了 `error_output` 的流中,该批次会流向 `error_output`。该处理器不会重试嵌入请求——重试会使 API 开销成倍增加;请改用 `error_output` 或上游重投递。
 

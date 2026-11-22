@@ -21,6 +21,7 @@ description: ArkFlow Vector Search 处理器组件。
 | concurrency | integer | no | `4` | 最大并发请求数;结果始终按行序回填。 |
 | api_key | string | no | — | 以 `Authorization: Bearer` 形式发送。支持 [Secret 引用](/zh-Hans/docs/reference/configuration#secret-references)。 |
 | timeout_ms | integer | no | `30000` | HTTP 请求超时。 |
+| retry_count | integer | no | `3` | 暂态失败(429/5xx/传输错误)的重试次数。`0` 表示不重试。 |
 | headers | map | no | — | 额外的 HTTP 头。 |
 
 ## 结果形状
@@ -41,6 +42,8 @@ Qdrant 的 `id`、`score` 与 `payload`:
 失败并流向 `error_output`。该处理器不会重试;请合理设置 `concurrency`
 以保持在速率限制之内。发往回环(loopback)端点的请求始终绕过系统代理。
 :::
+
+暂态 HTTP 失败(429、5xx、连接错误)会按封顶指数退避重试(`retry_count`,默认 3);4xx 拒绝与解析/校验失败立即失败,不重试。
 
 ## 示例
 

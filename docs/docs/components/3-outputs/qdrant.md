@@ -60,3 +60,7 @@ streams:
       vector_field: "embedding"
       id_field: "doc_id"
 ```
+
+## Notes
+
+- Retries for 429/5xx/transport failures run through the shared bounded-backoff retry implementation (delays cap at 5s for any configured `retry_count`).
