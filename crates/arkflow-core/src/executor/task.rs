@@ -5654,6 +5654,68 @@ mod task_loop_tests {
         assert!(probe.aborts.load(Ordering::SeqCst) >= 1);
     }
 
+    /// A multi-input vertex handles one input channel closing while a
+    /// barrier is in flight and the other inputs keep the round open: the
+    /// closure contributes exactly one implicit EOS (buffered until the
+    /// round completes), the closed channel's reader is never re-registered
+    /// (the branch consumes it and continues), and the chain settles cleanly
+    /// when the survivors end. PA-P0-01's busy-spin refutation guard: any
+    /// refactor that lets the closed branch fall through to the tail
+    /// re-registration would re-poll a dead channel forever.
+    #[tokio::test(start_paused = true)]
+    async fn channel_close_during_in_flight_barrier_stays_idle_and_settles() {
+        let (mut chain, mut senders) = interior_chain(1, vec![], 3);
+        chain.task_ids = vec!["join".into()];
+        let (fail_tx, mut fail_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ChainHooks {
+            checkpoint: CheckpointHook {
+                failure_reporter: Some(fail_tx),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_chain(chain, hook, token.clone()));
+
+        // Barrier in flight: only input 1 received it (slots after the
+        // removal below: [survivor = input 1, silent = input 2]).
+        senders[1].send_async(barrier("c-1", 1)).await.unwrap();
+        // Input 0's producer dies mid-alignment while input 2 stays open and
+        // silent, so the round cannot complete from input 0's EOS alone.
+        senders.remove(0);
+        for value in 0..8 {
+            senders[0]
+                .send_async(Envelope::Data(
+                    ts_batch(value),
+                    Arc::new(ProbeAck::default()),
+                ))
+                .await
+                .unwrap();
+        }
+        // Under a busy spin the loop never idles, time cannot auto-advance,
+        // and this wait would hang instead of returning promptly.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Input 2's barrier completes the round (input 0's buffered EOS is
+        // released with it), then both survivors end; the chain must settle
+        // cleanly and promptly.
+        senders[1].send_async(barrier("c-1", 1)).await.unwrap();
+        senders[0].send_async(barrier("c-2", 1)).await.unwrap();
+        senders[0].send_async(Envelope::Eos).await.unwrap();
+        senders[1].send_async(Envelope::Eos).await.unwrap();
+        senders.clear();
+        let result = settle(task).await;
+        assert!(
+            result.is_ok(),
+            "the chain must terminate cleanly: {result:?}"
+        );
+        if let Ok((_, failure)) = fail_rx.try_recv() {
+            panic!("a clean round must not report a checkpoint failure: {failure}");
+        }
+        token.cancel();
+    }
+
     /// Cancellation while a worker sits on a gated delivery: the shutdown
     /// path's `cancel_and_join` observes the fatal failure recorded just
     /// before the worker exits, and the queued-but-unsubmitted delivery's
