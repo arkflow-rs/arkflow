@@ -16,6 +16,7 @@
 //!
 //! Receive data from HTTP endpoints
 
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -35,7 +36,6 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
-use crate::DELIVERY_CHANNEL_CAPACITY;
 
 /// HTTP input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

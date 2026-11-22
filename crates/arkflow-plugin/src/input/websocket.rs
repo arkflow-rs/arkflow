@@ -23,6 +23,7 @@ use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -39,7 +40,6 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use url::Url;
-use crate::DELIVERY_CHANNEL_CAPACITY;
 
 /// WebSocket input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

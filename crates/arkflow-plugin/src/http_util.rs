@@ -56,7 +56,59 @@ pub(crate) fn build_http_client(timeout_ms: u64, base_url: &str) -> Result<Clien
 /// trailing slash, the path gains exactly one. `join_url_base("http://h/",
 /// "/x")` and `join_url_base("http://h", "x")` both yield `http://h/x`.
 pub(crate) fn join_url_base(base: &str, path: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+/// Sends a prepared request with the shared retry policy: transport and
+/// read failures and 429/5xx statuses are transient (retried up to the
+/// config's bounds); other non-success statuses and everything after the
+/// body is read are the caller's deterministic domain. Returns the
+/// buffered body text; error messages are byte-identical to the
+/// pre-retry single-shot paths ("{component} request failed: …" /
+/// "{component} returned {status}: {body}").
+pub(crate) async fn send_with_retry(
+    build: impl Fn() -> reqwest::RequestBuilder,
+    retry_config: &crate::retry::RetryConfig,
+    operation_name: &str,
+    component: &str,
+) -> Result<String, Error> {
+    crate::retry::RetryUtils::retry_with_backoff_classified(
+        || {
+            let request = build();
+            async move {
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|e| crate::retry::OperationError {
+                        error: format!("{component} request failed: {e}"),
+                        retryable: true,
+                    })?;
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .map_err(|e| crate::retry::OperationError {
+                        error: format!("{component} response read failed: {e}"),
+                        retryable: true,
+                    })?;
+                if !status.is_success() {
+                    return Err(crate::retry::OperationError {
+                        error: format!("{component} returned {}: {}", status, truncate_body(&body)),
+                        retryable: crate::retry::is_retryable_status(status.as_u16()),
+                    });
+                }
+                Ok(body)
+            }
+        },
+        retry_config,
+        operation_name,
+    )
+    .await
+    .map_err(Error::Process)
 }
 
 /// Applies the component's optional custom headers to a request. All

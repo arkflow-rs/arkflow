@@ -41,7 +41,6 @@ pub mod wal;
 /// hygiene test (`connector skeleton`) bans independent magic numbers.
 pub(crate) const DELIVERY_CHANNEL_CAPACITY: usize = 1024;
 
-
 use arkflow_core::Error;
 use std::sync::Mutex;
 

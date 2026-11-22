@@ -108,11 +108,9 @@ fn next_delay(current_ms: f64, config: &RetryConfig, rng: impl Fn() -> f64) -> D
 /// during the sleep) and therefore cannot wrap their whole attempt in
 /// [`RetryUtils`]: same cap/jitter schedule as the shared implementations.
 pub(crate) fn backoff_after(current: Duration, config: &RetryConfig) -> Duration {
-    next_delay(
-        current.as_millis() as f64,
-        config,
-        || rand::Rng::random(&mut rand::rng()),
-    )
+    next_delay(current.as_millis() as f64, config, || {
+        rand::Rng::random(&mut rand::rng())
+    })
 }
 
 /// Retry utility for retrying components.

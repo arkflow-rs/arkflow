@@ -26,7 +26,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-
 use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
@@ -476,7 +475,6 @@ impl OutputBuilder for MilvusOutputBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use super::*;
     use crate::vector_util::test_support::MockApi as MockMilvus;
     use arkflow_core::MessageBatch;
@@ -485,6 +483,7 @@ mod tests {
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
+    use std::time::Duration;
 
     fn test_resource() -> Resource {
         Resource {

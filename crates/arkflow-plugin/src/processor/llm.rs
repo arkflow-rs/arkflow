@@ -59,6 +59,7 @@ pub fn init() -> Result<(), Error> {
                 "timeout_ms": {"type": "integer", "description": "HTTP request timeout in milliseconds. Defaults to 30000."},
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra HTTP headers."},
                 "stream": {"type": "boolean", "description": "Request SSE streaming (`stream: true`) and assemble the deltas into the row's final completion text. Useful behind providers or gateways that time out non-streaming long completions."},
+                "retry_count": {"type": "integer", "description": "Retries for transient failures (429/5xx/transport). Defaults to 3; 0 disables retrying."},
                 "tools": {"description": "OpenAI tools definition passed through verbatim to the request body for function calling."},
                 "tool_calls_column": {"type": "string", "description": "When set, appends this column with the response's tool_calls as JSON text (empty string when the response has none). Streamed tool_call deltas are merged by index."}
             },
@@ -101,12 +102,19 @@ struct LlmProcessorConfig {
     headers: Option<HashMap<String, String>>,
     #[serde(default)]
     stream: bool,
+    /// Retries for transient failures (429/5xx/transport). 0 = single
+    /// attempt.
+    #[serde(default = "default_retry_count")]
+    retry_count: u32,
     #[serde(default)]
     tools: Option<Value>,
     #[serde(default)]
     tool_calls_column: Option<String>,
 }
 
+fn default_retry_count() -> u32 {
+    3
+}
 fn default_target_field() -> String {
     "response".to_string()
 }
@@ -216,28 +224,23 @@ impl LlmProcessor {
             "{}/chat/completions",
             self.config.api_base.trim_end_matches('/')
         );
-        let mut request = self.client.post(&url).json(&body);
-        if let Some(key) = &self.config.api_key {
-            request = request.bearer_auth(key);
-        }
-        let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
-
-        let response = request.send().await.map_err(|e| {
-            error!("LLM API request failed: {}", e);
-            Error::Process(format!("LLM API request failed: {}", e))
-        })?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::Process(format!("LLM API response read failed: {}", e)))?;
-        if !status.is_success() {
-            return Err(Error::Process(format!(
-                "LLM API returned {}: {}",
-                status,
-                crate::http_util::truncate_body(&body)
-            )));
-        }
+        let retry_config = crate::retry::RetryConfig {
+            max_attempts: self.config.retry_count.saturating_add(1),
+            ..Default::default()
+        };
+        let body = crate::http_util::send_with_retry(
+            || {
+                let mut request = self.client.post(&url).json(&body);
+                if let Some(key) = &self.config.api_key {
+                    request = request.bearer_auth(key);
+                }
+                crate::http_util::apply_headers(request, self.config.headers.as_ref())
+            },
+            &retry_config,
+            "llm completion",
+            "LLM API",
+        )
+        .await?;
 
         if self.config.stream {
             // SSE framing is parsed from the buffered response; the processor
@@ -609,6 +612,42 @@ mod tests {
             obj.insert(key.clone(), value.clone());
         }
         config
+    }
+
+    #[tokio::test]
+    async fn transient_429_is_retried_then_succeeds() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mock = MockApi::spawn(move |_body| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                (429, r#"{"error":"rate limited"}"#.to_string())
+            } else {
+                (200, completion_body("ok"))
+            }
+        });
+        let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
+        let result = processor.process(text_batch(vec![Some("hello")])).await;
+        assert!(
+            result.is_ok(),
+            "429s must be retried to success: {result:?}"
+        );
+        assert_eq!(mock.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn deterministic_4xx_is_not_retried() {
+        let mock = MockApi::spawn(|_body| (400, r#"{"error":"bad request"}"#.to_string()));
+        let processor = build_processor(base_config(mock.addr, serde_json::json!({})));
+        processor
+            .process(text_batch(vec![Some("hello")]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "4xx rejections must not be retried"
+        );
     }
 
     #[tokio::test]

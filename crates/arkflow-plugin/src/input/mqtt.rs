@@ -23,6 +23,7 @@ use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, Publish, QoS};
@@ -31,7 +32,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
-use crate::DELIVERY_CHANNEL_CAPACITY;
 /// MQTT input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MqttInputConfig {

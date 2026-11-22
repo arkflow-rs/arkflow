@@ -452,7 +452,6 @@ impl OutputBuilder for QdrantOutputBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use super::*;
     use arkflow_core::MessageBatch;
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
@@ -460,6 +459,7 @@ mod tests {
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
+    use std::time::Duration;
 
     fn test_resource() -> Resource {
         Resource {

@@ -17,6 +17,7 @@
 //! Receive data from a NATS subject
 
 use crate::input::codec_helper::Delivery;
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -33,7 +34,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
-use crate::DELIVERY_CHANNEL_CAPACITY;
 
 /// NATS input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

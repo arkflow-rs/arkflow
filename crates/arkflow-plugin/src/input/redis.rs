@@ -22,6 +22,7 @@ use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
@@ -34,7 +35,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
-use crate::DELIVERY_CHANNEL_CAPACITY;
 
 /// Redis input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

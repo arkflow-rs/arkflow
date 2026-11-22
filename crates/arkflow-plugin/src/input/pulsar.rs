@@ -20,6 +20,7 @@ use crate::input::codec_helper::Delivery;
 use crate::pulsar::{
     PulsarAuth, PulsarClientUtils, PulsarConfigValidator, RetryConfig, SubscriptionType,
 };
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -34,7 +35,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
-use crate::DELIVERY_CHANNEL_CAPACITY;
 
 /// How long the consumer task may hold the shared consumer mutex while
 /// waiting for the next message. `PulsarAck::ack` needs the same mutex
