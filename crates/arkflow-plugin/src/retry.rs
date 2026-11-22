@@ -102,13 +102,16 @@ pub(crate) fn advance_backoff(base_ms: f64, config: &RetryConfig) -> f64 {
     (base_ms * config.backoff_multiplier).min(config.max_delay_ms as f64)
 }
 
-/// The sleep duration for a backoff base: jitter applied, floored at zero.
+/// The sleep duration for a backoff base: the base is clamped to
+/// `max_delay_ms` (so an oversized `initial_delay_ms` still respects the
+/// cap), jitter applied, floored at zero.
 pub(crate) fn sleep_duration(
     base_ms: f64,
     config: &RetryConfig,
     rng: impl Fn() -> f64,
 ) -> Duration {
-    Duration::from_millis(apply_jitter(base_ms, config.jitter, rng).max(0.0) as u64)
+    let base = base_ms.min(config.max_delay_ms as f64);
+    Duration::from_millis(apply_jitter(base, config.jitter, rng).max(0.0) as u64)
 }
 
 /// Retry utility for retrying components.
@@ -394,6 +397,46 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "transient failures retry up to max_attempts"
+        );
+    }
+
+    #[test]
+    fn oversized_initial_delay_respects_the_cap() {
+        let config = RetryConfig {
+            max_attempts: 3,
+            initial_delay_ms: 10_000,
+            max_delay_ms: 100,
+            backoff_multiplier: 2.0,
+            jitter: 0.0,
+        };
+        // The single choke point clamps any base at max_delay_ms, so a
+        // misconfigured oversized initial delay still sleeps <= cap.
+        assert_eq!(sleep_duration(10_000.0, &config, || 0.0).as_millis(), 100);
+    }
+
+    #[tokio::test]
+    async fn oversized_initial_delay_loops_respect_the_cap() {
+        let config = RetryConfig {
+            max_attempts: 2,
+            initial_delay_ms: 10_000,
+            max_delay_ms: 100,
+            backoff_multiplier: 2.0,
+            jitter: 0.0,
+        };
+        let start = std::time::Instant::now();
+        let result: Result<(), String> = RetryUtils::retry_with_backoff(
+            || std::future::ready(Err("down".to_string())),
+            &config,
+            "cap probe",
+        )
+        .await;
+        assert!(result.is_err());
+        // Two attempts => one 100ms sleep; without the clamp this would
+        // wait 10s.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(2_000),
+            "oversized initial delay must be capped: {:?}",
+            start.elapsed()
         );
     }
 

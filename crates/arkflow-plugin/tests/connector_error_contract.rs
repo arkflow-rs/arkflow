@@ -258,33 +258,63 @@ async fn redis_output_write_before_connect_is_connection_error() {
 // ---------------------------------------------------------------------------
 // Connector-skeleton hygiene pins (consolidate-connector-skeleton).
 
+/// Whether a `flume::bounded` call's capacity argument is a numeric
+/// literal. Works on whitespace-normalized text (newlines collapsed) so
+/// multi-line calls are covered; `1_024` separators are stripped, so any
+/// numeric form fails while `DELIVERY_CHANNEL_CAPACITY` passes.
+fn numeric_capacity_literal(normalized_call: &str) -> bool {
+    let arg = normalized_call
+        .split('(')
+        .nth(1)
+        .unwrap_or("")
+        .split(')')
+        .next()
+        .unwrap_or("")
+        .replace('_', "");
+    let arg = arg.trim();
+    !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit())
+}
+
+#[test]
+fn numeric_capacity_literal_shapes() {
+    // Negative fixtures (violations must be detected).
+    for call in [
+        "flume::bounded::<Delivery>(1000)",
+        "flume::bounded::<Delivery>(1_024)",
+        "flume::bounded(512)",
+        "flume::bounded(1024)",
+        "flume::bounded::<Vec<u8>>( 1000 )",
+    ] {
+        assert!(numeric_capacity_literal(call), "must flag: {call}");
+    }
+    // Positive fixtures (shared constant must pass). Even the "right"
+    // numeric value fails by design — the constant is the single source.
+    for call in [
+        "flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY)",
+        "flume::bounded::<Delivery>( crate::DELIVERY_CHANNEL_CAPACITY )",
+    ] {
+        assert!(!numeric_capacity_literal(call), "must pass: {call}");
+    }
+}
+
 #[test]
 fn input_delivery_channels_use_the_shared_capacity() {
     // Reject any `flume::bounded::<T>(<literal>)` — the capacity must come
     // from the shared DELIVERY_CHANNEL_CAPACITY constant, whatever the
-    // literal's value.
-    fn literal_capacity(line: &str) -> bool {
-        let Some(start) = line.find("bounded") else {
-            return false;
-        };
-        let after = &line[start..];
-        let Some(open) = after.find('(') else {
-            return false;
-        };
-        let rest = &after[open + 1..];
-        let arg = rest.split([')', ',']).next().unwrap_or("");
-        let arg = arg.trim();
-        // `::<T>(1000)` style puts the turbofish before the paren; the
-        // paren argument here is the capacity itself.
-        !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit())
-    }
-
+    // literal's value or line layout. The production section is
+    // newline-normalized first so multi-line calls are covered.
     let mut report = Vec::new();
     for (file, source) in rust_files(&plugin_src_dir("input")) {
-        for (idx, line) in production_section(&source).lines().enumerate() {
-            if line.contains("flume::bounded") && literal_capacity(line) {
-                report.push(format!("{}:{}: {}", file, idx + 1, line.trim()));
+        let section = production_section(&source).replace(['\n', '\r'], " ");
+        let mut idx = 0;
+        while let Some(found) = section[idx..].find("flume::bounded") {
+            let start = idx + found;
+            let call: String = section[start..].chars().take_while(|c| *c != ';').collect();
+            if numeric_capacity_literal(&call) {
+                let line_no = section[..start].matches('\n').count() + 1;
+                report.push(format!("{file}:~{line_no}: {call}"));
             }
+            idx = start + "flume::bounded".len();
         }
     }
     assert!(

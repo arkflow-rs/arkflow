@@ -171,6 +171,12 @@ impl MilvusOutput {
             request = request.bearer_auth(key);
         }
         let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
+        // Materialize construction errors (e.g. an invalid header value)
+        // before the retry loop: try_clone on an error-state builder
+        // returns None, which would mask the real reason.
+        let built = request
+            .build()
+            .map_err(|e| Error::Connection(format!("Milvus request failed: {e}")))?;
 
         // `retry_count` names the RETRIES (default 0 = single attempt), so
         // max_attempts is one more than it.
@@ -193,7 +199,7 @@ impl MilvusOutput {
 
         crate::retry::RetryUtils::retry_with_backoff_classified(
             || {
-                let cloned = request.try_clone();
+                let cloned = built.try_clone();
                 async move {
                     let request = match cloned {
                         Some(request) => request,
@@ -204,13 +210,31 @@ impl MilvusOutput {
                             });
                         }
                     };
-                    match request.send().await {
+                    match self.client.execute(request).await {
                         Ok(response) => {
                             let status = response.status();
-                            let body = response
-                                .text()
-                                .await
-                                .unwrap_or_else(|_| "<unreadable body>".to_string());
+                            // A read failure on a 2xx means the write is
+                            // unconfirmed: retry it. Non-2xx bodies only
+                            // carry the error text.
+                            let body = if status.is_success() {
+                                match response.text().await {
+                                    Ok(body) => body,
+                                    Err(e) => {
+                                        error!("Milvus upsert body read failed: {e}");
+                                        return Err(crate::retry::OperationError {
+                                            error: Fail::Transport(format!(
+                                                "response body read failed: {e}"
+                                            )),
+                                            retryable: true,
+                                        });
+                                    }
+                                }
+                            } else {
+                                response
+                                    .text()
+                                    .await
+                                    .unwrap_or_else(|_| "<unreadable body>".to_string())
+                            };
                             if status.is_success() {
                                 // Milvus reports failures as HTTP 200 with a
                                 // non-zero `code`; those are deterministic, so
