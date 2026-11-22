@@ -20,6 +20,7 @@ use crate::input::codec_helper::Delivery;
 use crate::pulsar::{
     PulsarAuth, PulsarClientUtils, PulsarConfigValidator, RetryConfig, SubscriptionType,
 };
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -111,7 +112,7 @@ impl PulsarInput {
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
-        let (sender, receiver) = flume::bounded::<Delivery>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY);
         Ok(Self {
             input_name: name.map(str::to_string),
             config,
@@ -154,8 +155,6 @@ impl Input for PulsarInput {
         if let Some(ref retry_config) = self.config.retry_config {
             PulsarConfigValidator::validate_retry_config(retry_config)?;
         }
-
-        let _retry_config = self.config.retry_config.clone().unwrap_or_default();
 
         // Connect to Pulsar
         let client = builder
@@ -250,6 +249,11 @@ impl Input for PulsarInput {
                                 // observes no message is NOT a stream end:
                                 // keep polling without consuming an attempt.
                                 let mut attempts = 0u32;
+                                // Backoff BASE (capped, unjittered) tracked
+                                // separately from the jittered sleep so a
+                                // shrunk sleep never compounds into later
+                                // waits.
+                                let mut backoff_base_ms = retry_config.initial_delay_ms as f64;
                                 let mut delay = std::time::Duration::from_millis(
                                     retry_config.initial_delay_ms,
                                 );
@@ -328,11 +332,19 @@ impl Input for PulsarInput {
                                                 }
                                                 _ = tokio::time::sleep(delay) => {}
                                             }
-                                            delay = std::time::Duration::from_millis(
-                                                (delay.as_millis() as f64
-                                                    * retry_config.backoff_multiplier)
-                                                    .min(retry_config.max_delay_ms as f64)
-                                                    as u64,
+                                            // Shared backoff schedule
+                                            // (cap + optional jitter) —
+                                            // the receive loop itself stays
+                                            // select-aware for cancellation
+                                            // and the idle lock budget.
+                                            backoff_base_ms = crate::retry::advance_backoff(
+                                                backoff_base_ms,
+                                                &retry_config,
+                                            );
+                                            delay = crate::retry::sleep_duration(
+                                                backoff_base_ms,
+                                                &retry_config,
+                                                || rand::Rng::random(&mut rand::rng()),
                                             );
                                         }
                                         Err(_lock_budget_elapsed) => {

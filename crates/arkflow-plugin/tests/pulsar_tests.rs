@@ -92,6 +92,7 @@ mod pulsar_tests {
             initial_delay_ms: 100,
             max_delay_ms: 5000,
             backoff_multiplier: 2.0,
+            jitter: 0.0,
         };
         assert!(PulsarConfigValidator::validate_retry_config(&config).is_ok());
     }
@@ -104,6 +105,7 @@ mod pulsar_tests {
             initial_delay_ms: 100,
             max_delay_ms: 5000,
             backoff_multiplier: 2.0,
+            jitter: 0.0,
         };
         assert!(PulsarConfigValidator::validate_retry_config(&config).is_err());
 
@@ -112,6 +114,7 @@ mod pulsar_tests {
             initial_delay_ms: 0,
             max_delay_ms: 5000,
             backoff_multiplier: 2.0,
+            jitter: 0.0,
         };
         assert!(PulsarConfigValidator::validate_retry_config(&config).is_err());
 
@@ -120,6 +123,7 @@ mod pulsar_tests {
             initial_delay_ms: 100,
             max_delay_ms: 50,
             backoff_multiplier: 2.0,
+            jitter: 0.0,
         };
         assert!(PulsarConfigValidator::validate_retry_config(&config).is_err());
 
@@ -128,6 +132,7 @@ mod pulsar_tests {
             initial_delay_ms: 100,
             max_delay_ms: 5000,
             backoff_multiplier: 0.5,
+            jitter: 0.0,
         };
         assert!(PulsarConfigValidator::validate_retry_config(&config).is_err());
     }

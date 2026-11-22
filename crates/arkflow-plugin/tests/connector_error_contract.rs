@@ -254,3 +254,155 @@ async fn redis_output_write_before_connect_is_connection_error() {
     .await;
     assert!(matches!(err, Error::Connection(_)), "{err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Connector-skeleton hygiene pins (consolidate-connector-skeleton).
+
+/// Whether a `flume::bounded` call's capacity argument is a numeric
+/// literal. Works on whitespace-normalized text (newlines collapsed) so
+/// multi-line calls are covered; `1_024` separators are stripped, so any
+/// numeric form fails while `DELIVERY_CHANNEL_CAPACITY` passes.
+fn numeric_capacity_literal(normalized_call: &str) -> bool {
+    let stripped = normalized_call.replace('_', "");
+    let arg = stripped
+        .split('(')
+        .nth(1)
+        .unwrap_or("")
+        .split(')')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(',')
+        .trim();
+    let ty_suffix_ok = |suffix: &str| {
+        matches!(
+            suffix,
+            "" | "usize"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+        )
+    };
+    // Decimal, hex (0x), binary (0b) and octal (0o) literals with an
+    // optional type suffix (1024usize, 0x200usize, …).
+    let (digits, suffix) = if let Some(rest) = arg.strip_prefix("0x") {
+        let end = rest
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len());
+        (&rest[..end], rest[end..].trim())
+    } else if let Some(rest) = arg.strip_prefix("0b") {
+        let end = rest
+            .find(|c: char| c != '0' && c != '1')
+            .unwrap_or(rest.len());
+        (&rest[..end], rest[end..].trim())
+    } else if let Some(rest) = arg.strip_prefix("0o") {
+        let end = rest
+            .find(|c: char| !('0'..='7').contains(&c))
+            .unwrap_or(rest.len());
+        (&rest[..end], rest[end..].trim())
+    } else {
+        let end = arg.find(|c: char| !c.is_ascii_digit()).unwrap_or(arg.len());
+        (&arg[..end], arg[end..].trim())
+    };
+    !digits.is_empty() && ty_suffix_ok(suffix)
+}
+
+#[test]
+fn numeric_capacity_literal_shapes() {
+    // Negative fixtures (violations must be detected).
+    for call in [
+        "flume::bounded::<Delivery>(1000)",
+        "flume::bounded::<Delivery>(1_024)",
+        "flume::bounded(512)",
+        "flume::bounded(1024)",
+        "flume::bounded::<Vec<u8>>( 1000 )",
+        "flume::bounded::<Delivery>(512,)",
+        "flume::bounded::<Delivery>(1024usize)",
+        "flume::bounded::<Delivery>(\n 1000,\n)",
+        "flume::bounded::<Delivery>(0x200)",
+        "flume::bounded::<Delivery>(0b100_0000_0000)",
+        "flume::bounded(0o2000)",
+        "flume::bounded::<Delivery>(0x200usize)",
+    ] {
+        assert!(numeric_capacity_literal(call), "must flag: {call}");
+    }
+    // Positive fixtures (shared constant must pass). Even the "right"
+    // numeric value fails by design — the constant is the single source.
+    for call in [
+        "flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY)",
+        "flume::bounded::<Delivery>( crate::DELIVERY_CHANNEL_CAPACITY )",
+    ] {
+        assert!(!numeric_capacity_literal(call), "must pass: {call}");
+    }
+}
+
+#[test]
+fn input_delivery_channels_use_the_shared_capacity() {
+    // Reject any `flume::bounded::<T>(<literal>)` — the capacity must come
+    // from the shared DELIVERY_CHANNEL_CAPACITY constant, whatever the
+    // literal's value or line layout. The production section is
+    // newline-normalized first so multi-line calls are covered.
+    let mut report = Vec::new();
+    for (file, source) in rust_files(&plugin_src_dir("input")) {
+        // Normalize newlines to spaces but remember each original line's
+        // offset in the normalized text so violations report real lines.
+        let section = production_section(&source);
+        let mut normalized = String::with_capacity(section.len());
+        let mut line_starts: Vec<usize> = Vec::new();
+        for line in section.split_inclusive('\n') {
+            line_starts.push(normalized.len());
+            normalized.push_str(line.trim_end_matches('\n'));
+            normalized.push(' ');
+        }
+        let mut idx = 0;
+        while let Some(found) = normalized[idx..].find("flume::bounded") {
+            let start = idx + found;
+            let call: String = normalized[start..]
+                .chars()
+                .take_while(|c| *c != ';')
+                .collect();
+            if numeric_capacity_literal(&call) {
+                let line_no = line_starts
+                    .iter()
+                    .rposition(|off| *off <= start)
+                    .map_or(1, |pos| pos + 1);
+                report.push(format!("{file}:{line_no}: {}", call.trim()));
+            }
+            idx = start + "flume::bounded".len();
+        }
+    }
+    assert!(
+        report.is_empty(),
+        "input delivery channels must use DELIVERY_CHANNEL_CAPACITY (1024, \
+         kernel-aligned) instead of a numeric-literal capacity. \
+         Violations:\n{}",
+        report.join("\n")
+    );
+}
+
+#[test]
+fn outputs_must_not_hand_roll_power_backoff() {
+    let mut report = Vec::new();
+    for (file, source) in rust_files(&plugin_src_dir("output")) {
+        for (idx, line) in production_section(&source).lines().enumerate() {
+            if line.contains("2u64.pow") {
+                report.push(format!("{}:{}: {}", file, idx + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        report.is_empty(),
+        "outputs must use the shared RetryUtils backoff (capped, \
+         overflow-safe) instead of hand-rolled 2u64.pow schedules. \
+         Violations:\n{}",
+        report.join("\n")
+    );
+}

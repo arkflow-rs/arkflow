@@ -22,6 +22,7 @@ description: ArkFlow Milvus Search 处理器组件。
 | top_k | integer | no | `5` | 每行的邻居数量。 |
 | api_key | string | no | — | 以 `Authorization: Bearer` 形式发送(Milvus 约定:`<user>:<password>`)。支持 [Secret 引用](/zh-Hans/docs/reference/configuration#secret-references)。 |
 | timeout_ms | integer | no | `30000` | HTTP 请求超时。 |
+| retry_count | integer | no | `3` | 暂态失败(429/5xx/传输错误)的重试次数。`0` 表示不重试。 |
 | concurrency | integer | no | `4` | 最大并发搜索请求数。 |
 | headers | map | no | — | 额外的 HTTP 头。 |
 
@@ -36,8 +37,10 @@ description: ArkFlow Milvus Search 处理器组件。
 
 :::note
 失败情形(HTTP 错误、Milvus `code != 0`、结果分组数与输入行数不一致、查询向量为
-null/空)会使整个批次失败并进入 `error_output`。该处理器不会重试。发往回环(loopback)端点的请求始终绕过系统代理。
+null/空)会使整个批次失败并进入 `error_output`。暂态失败按 `retry_count` 重试(默认 3),`retry_count: 0` 关闭重试。发往回环(loopback)端点的请求始终绕过系统代理。
 :::
+
+暂态 HTTP 失败(429、5xx、连接错误)会按封顶指数退避重试(`retry_count`,默认 3);4xx 拒绝与解析/校验失败立即失败,不重试。
 
 ## 示例
 

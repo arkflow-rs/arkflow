@@ -37,7 +37,6 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tracing::error;
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("milvus_search", Arc::new(MilvusSearchProcessorBuilder))?;
@@ -97,6 +96,14 @@ struct MilvusSearchProcessorConfig {
     timeout_ms: u64,
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
+    /// Retries for transient failures (429/5xx/transport). 0 = single
+    /// attempt.
+    #[serde(default = "default_retry_count")]
+    retry_count: u32,
+}
+
+fn default_retry_count() -> u32 {
+    3
 }
 
 fn default_vector_field() -> String {
@@ -212,10 +219,7 @@ impl MilvusSearchProcessor {
     }
 
     async fn search(&self, vector: Vec<f32>) -> Result<String, Error> {
-        let url = format!(
-            "{}/v2/vectordb/entities/search",
-            self.config.url.trim_end_matches('/')
-        );
+        let url = crate::http_util::join_url_base(&self.config.url, "v2/vectordb/entities/search");
         let output_fields: Vec<String> = self.output_fields();
         let mut body = json!({
             "collectionName": self.config.collection,
@@ -232,32 +236,23 @@ impl MilvusSearchProcessor {
             body["outputFields"] = json!(output_fields);
         }
 
-        let mut request = self.client.post(&url).json(&body);
-        if let Some(key) = &self.config.api_key {
-            request = request.bearer_auth(key);
-        }
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-        }
-
-        let response = request.send().await.map_err(|e| {
-            error!("Milvus search request failed: {}", e);
-            Error::Process(format!("Milvus search request failed: {}", e))
-        })?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::Process(format!("Milvus search response read failed: {}", e)))?;
-        if !status.is_success() {
-            return Err(Error::Process(format!(
-                "Milvus search returned {}: {}",
-                status,
-                vector_util::truncate_body(&body)
-            )));
-        }
+        let retry_config = crate::retry::RetryConfig {
+            max_attempts: self.config.retry_count.saturating_add(1),
+            ..Default::default()
+        };
+        let body = crate::http_util::send_with_retry(
+            || {
+                let mut request = self.client.post(&url).json(&body);
+                if let Some(key) = &self.config.api_key {
+                    request = request.bearer_auth(key);
+                }
+                crate::http_util::apply_headers(request, self.config.headers.as_ref())
+            },
+            &retry_config,
+            "milvus search",
+            "Milvus search",
+        )
+        .await?;
 
         let parsed: Value = serde_json::from_str(&body)
             .map_err(|e| Error::Process(format!("Milvus search response parse failed: {}", e)))?;
@@ -272,7 +267,7 @@ impl MilvusSearchProcessor {
                 return Err(Error::Process(format!(
                     "Milvus search failed with code {}: {}",
                     code,
-                    vector_util::truncate_body(message)
+                    crate::http_util::truncate_body(message)
                 )));
             }
         }
@@ -345,7 +340,7 @@ impl ProcessorBuilder for MilvusSearchProcessorBuilder {
                 "milvus_search processor: 'concurrency' must be at least 1".to_string(),
             ));
         }
-        let client = vector_util::build_http_client(config.timeout_ms, &config.url)?;
+        let client = crate::http_util::build_http_client(config.timeout_ms, &config.url)?;
         Ok(Arc::new(MilvusSearchProcessor { config, client }))
     }
 }
@@ -622,5 +617,40 @@ mod tests {
                 "config must be rejected"
             );
         }
+    }
+    #[tokio::test]
+    async fn transient_429_is_retried_then_succeeds() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mock = MockMilvus::spawn(move |_body| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                (429, r#"{"message":"rate limited"}"#.to_string())
+            } else {
+                (200, r#"{"code":0,"data":[]}"#.to_string())
+            }
+        });
+        let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
+        let result = processor.process(vector_batch(vec![vec![1.0]])).await;
+        assert!(
+            result.is_ok(),
+            "429s must be retried to success: {result:?}"
+        );
+        assert_eq!(mock.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn deterministic_4xx_is_not_retried() {
+        let mock = MockMilvus::spawn(|_body| (400, r#"{"message":"bad request"}"#.to_string()));
+        let processor = build_processor(base_config(mock.addr(), serde_json::json!({})));
+        processor
+            .process(vector_batch(vec![vec![1.0]]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "4xx rejections must not be retried"
+        );
     }
 }

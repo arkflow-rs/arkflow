@@ -22,6 +22,7 @@ The `milvus_search` processor searches a [Milvus](https://milvus.io/) collection
 | top_k | integer | no | `5` | Number of neighbors per row. |
 | api_key | string | no | — | Sent as `Authorization: Bearer` (Milvus convention: `<user>:<password>`). Supports [secret references](/docs/reference/configuration#secret-references). |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
+| retry_count | integer | no | `3` | Retries for transient failures (429/5xx/transport). `0` disables retrying. |
 | concurrency | integer | no | `4` | Maximum in-flight search requests. |
 | headers | map | no | — | Extra HTTP headers. |
 
@@ -38,9 +39,14 @@ and `payload` (the configured field's object):
 :::note
 Failures (HTTP errors, Milvus `code != 0`, result groups not matching the
 input row count, null/empty query vectors) fail the batch into
-`error_output`. The processor does not retry. Requests to loopback
-endpoints always bypass the system proxy.
+`error_output`. Transient failures retry per `retry_count` (default 3;
+`retry_count: 0` disables retrying). Requests to loopback endpoints
+always bypass the system proxy.
 :::
+
+Transient HTTP failures (429, 5xx, connection errors) are retried with
+capped exponential backoff (`retry_count`, default 3); 4xx rejections and
+parse/validation failures fail immediately without retrying.
 
 ## Example
 

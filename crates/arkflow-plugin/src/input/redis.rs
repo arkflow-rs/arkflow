@@ -22,6 +22,7 @@ use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
@@ -223,8 +224,8 @@ impl RedisInput {
         config: RedisInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<Delivery>(1000);
-        let (cluster_raw_tx, cluster_raw_rx) = flume::bounded::<Vec<u8>>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY);
+        let (cluster_raw_tx, cluster_raw_rx) = flume::bounded::<Vec<u8>>(DELIVERY_CHANNEL_CAPACITY);
         let cancellation_token = CancellationToken::new();
         match &config.mode {
             ModeConfig::Cluster { urls, .. } => {

@@ -17,6 +17,7 @@
 //! Receive data from a NATS subject
 
 use crate::input::codec_helper::Delivery;
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -102,7 +103,7 @@ impl NatsInput {
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
-        let (sender, receiver) = flume::bounded::<Delivery>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY);
         Ok(Self {
             input_name: name.map(str::to_string),
             config,

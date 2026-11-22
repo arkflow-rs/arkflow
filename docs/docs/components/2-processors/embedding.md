@@ -21,6 +21,7 @@ It pairs with the [Qdrant output](../3-outputs/qdrant.md) to form a streaming RA
 | target_field | string | no | `embedding` | Name of the appended vector column. |
 | batch_size | integer | no | `32` | Maximum rows per HTTP request. |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
+| retry_count | integer | no | `3` | Retries for transient failures (429/5xx/transport). `0` disables retrying. |
 | headers | map | no | — | Extra HTTP headers (e.g. Azure's `api-key`). |
 
 :::note
@@ -30,7 +31,12 @@ always bypass the system proxy.
 
 ## Error semantics
 
-A failed API call (non-2xx), an inconsistent response (vector count or dimension mismatch, null input text) surfaces as a processing error, so the batch flows to the stream's `error_output` when configured. The processor does not retry embedding requests — retries would multiply API spend; rely on `error_output` or upstream redelivery instead.
+Transient HTTP failures (429, 5xx, connection errors) are retried with
+capped exponential backoff (`retry_count`, default 3); authentication and
+other 4xx rejections fail immediately, and parse/validation failures are
+not retried.
+
+A failed API call after retries are exhausted (non-2xx), an inconsistent response (vector count or dimension mismatch, null input text) surfaces as a processing error, so the batch flows to the stream's `error_output` when configured. Set `retry_count: 0` when you need single-attempt behavior without API-spend multiplication.
 
 ## Example
 

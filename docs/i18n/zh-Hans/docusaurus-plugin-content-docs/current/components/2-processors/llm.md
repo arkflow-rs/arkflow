@@ -25,14 +25,17 @@ description: ArkFlow LLM 处理器组件。
 | concurrency | integer | no | `4` | 最大并发请求数;结果始终按行序回填。 |
 | api_key | string | no | — | 以 `Authorization: Bearer` 形式发送。支持 [Secret 引用](/zh-Hans/docs/reference/configuration#secret-references)。 |
 | timeout_ms | integer | no | `30000` | HTTP 请求超时。 |
+| retry_count | integer | no | `3` | 暂态失败(429/5xx/传输错误)的重试次数。`0` 表示不重试。 |
 | headers | map | no | — | 额外的 HTTP 头(如 Azure 的 `api-key`)。 |
 | stream | boolean | no | `false` | 请求 SSE 流式传输,并将增量(delta)组装为该行的最终补全文本。适用于会对长补全的非流式请求超时的提供商或网关。处理器仍为每行输出一段完整文本。 |
 | tools | array | no | — | 原样透传的 OpenAI [tools 定义](https://platform.openai.com/docs/guides/function-calling),用于函数调用。 |
 | tool_calls_column | string | no | — | 设置后追加该列,以 JSON 文本填充响应中的工具调用(没有时为空字符串)。流式工具调用增量按索引合并。 |
 
 :::note
-每一行对应一个请求(聊天协议没有批量形式)。第一行失败即短路整个批次——飞行中的请求会被丢弃而非等待完成——整个批次(Batch)作为整体流向 `error_output`。该处理器不会重试 LLM 调用;请合理设置 `concurrency` 与上游批次大小,以保持在速率限制之内。发往回环(loopback)端点的请求始终绕过系统代理。
+每一行对应一个请求(聊天协议没有批量形式)。某行的确定性失败(4xx、解析错误,重试耗尽后亦然)会短路整个批次——飞行中的请求会被丢弃而非等待完成——整个批次(Batch)作为整体流向 `error_output`。请合理设置 `concurrency` 与上游批次大小,以保持在速率限制之内。发往回环(loopback)端点的请求始终绕过系统代理。
 :::
+
+暂态 HTTP 失败(429、5xx、连接错误)会按封顶指数退避重试(`retry_count`,默认 3);4xx 拒绝与解析/校验失败立即失败,不重试。
 
 ## 示例
 

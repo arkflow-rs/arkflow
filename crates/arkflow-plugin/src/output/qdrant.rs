@@ -22,7 +22,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -162,70 +161,116 @@ impl Output for QdrantOutput {
 
 impl QdrantOutput {
     async fn upsert(&self, points: &[Value]) -> Result<(), Error> {
-        let url = format!(
-            "{}/collections/{}/points?wait=true",
-            self.config.url.trim_end_matches('/'),
-            self.config.collection
+        let url = crate::http_util::join_url_base(
+            &self.config.url,
+            &format!("collections/{}/points?wait=true", self.config.collection),
         );
         let mut request = self.client.put(&url).json(&json!({ "points": points }));
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
         }
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
+        let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
+        // Materialize construction errors (e.g. an invalid header value)
+        // before the retry loop: try_clone on an error-state builder
+        // returns None, which would mask the real reason.
+        let built = request
+            .build()
+            .map_err(|e| Error::Connection(format!("Qdrant request failed: {e}")))?;
+
+        // `retry_count` names the RETRIES, so max_attempts is one more than
+        // it (the shared RetryUtils bound counts the initial attempt).
+        let retry_config = crate::retry::RetryConfig {
+            max_attempts: self.config.retry_count.saturating_add(1),
+            ..Default::default()
+        };
+        // Failure payload keeps the transport/server distinction so the
+        // final Error variant matches the pre-consolidation mapping.
+        enum Fail {
+            Transport(String),
+            Status(u16, String),
+        }
+        impl std::fmt::Display for Fail {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Fail::Transport(e) => write!(f, "{e}"),
+                    Fail::Status(code, body) => write!(f, "{code}: {body}"),
+                }
             }
         }
 
-        let mut attempt = 0u32;
-        loop {
-            match request
-                .try_clone()
-                .expect("request body is JSON")
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    let status = response.status();
-                    if status.is_success() {
-                        return Ok(());
-                    }
-                    let body = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<unreadable body>".to_string());
-                    // Client errors are deterministic: retrying cannot help.
-                    if status.is_client_error() {
-                        return Err(Error::Process(format!(
-                            "Qdrant returned {}: {}",
-                            status,
-                            crate::vector_util::truncate_body(&body)
-                        )));
-                    }
-                    error!(
-                        "Qdrant upsert attempt {} failed: {} {}",
-                        attempt + 1,
-                        status,
-                        crate::vector_util::truncate_body(&body)
-                    );
-                    if attempt >= self.config.retry_count {
-                        return Err(Error::Process(format!(
-                            "Qdrant returned {} after {} attempts: {}",
-                            status,
-                            attempt + 1,
-                            crate::vector_util::truncate_body(&body)
-                        )));
+        crate::retry::RetryUtils::retry_with_backoff_classified(
+            || {
+                let cloned = built.try_clone();
+                async move {
+                    let request = match cloned {
+                        Some(request) => request,
+                        None => {
+                            return Err(crate::retry::OperationError {
+                                error: Fail::Transport("request is not cloneable".into()),
+                                retryable: false,
+                            });
+                        }
+                    };
+                    match self.client.execute(request).await {
+                        Ok(response) => {
+                            let status = response.status();
+                            // A read failure on a 2xx means the write is
+                            // unconfirmed: retry it. Non-2xx bodies only
+                            // carry the error text.
+                            let body = if status.is_success() {
+                                match response.text().await {
+                                    Ok(body) => body,
+                                    Err(e) => {
+                                        error!("Qdrant upsert body read failed: {e}");
+                                        return Err(crate::retry::OperationError {
+                                            error: Fail::Transport(format!(
+                                                "response body read failed: {e}"
+                                            )),
+                                            retryable: true,
+                                        });
+                                    }
+                                }
+                            } else {
+                                response
+                                    .text()
+                                    .await
+                                    .unwrap_or_else(|_| "<unreadable body>".to_string())
+                            };
+                            if status.is_success() {
+                                return Ok(());
+                            }
+                            let body = crate::http_util::truncate_body(&body).to_string();
+                            // Shared classifier (connector-resilience
+                            // contract): 429/5xx transient, other 4xx
+                            // deterministic.
+                            let retryable = crate::retry::is_retryable_status(status.as_u16());
+                            if !retryable {
+                                error!("Qdrant upsert rejected: {status} {body}");
+                            } else {
+                                error!("Qdrant upsert attempt failed: {status} {body}");
+                            }
+                            Err(crate::retry::OperationError {
+                                error: Fail::Status(status.as_u16(), body),
+                                retryable,
+                            })
+                        }
+                        Err(e) => Err(crate::retry::OperationError {
+                            error: Fail::Transport(e.to_string()),
+                            retryable: true,
+                        }),
                     }
                 }
-                Err(e) => {
-                    if attempt >= self.config.retry_count {
-                        return Err(Error::Connection(format!("Qdrant request failed: {}", e)));
-                    }
-                }
+            },
+            &retry_config,
+            "qdrant upsert",
+        )
+        .await
+        .map_err(|fail| match fail {
+            Fail::Transport(e) => Error::Connection(format!("Qdrant request failed: {}", e)),
+            Fail::Status(code, body) => {
+                Error::Process(format!("Qdrant returned {}: {}", code, body))
             }
-            attempt += 1;
-            tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
-        }
+        })
     }
 }
 
@@ -425,7 +470,7 @@ impl OutputBuilder for QdrantOutputBuilder {
                 "qdrant output: 'collection' must not be empty".to_string(),
             ));
         }
-        let client = crate::vector_util::build_http_client(config.timeout_ms, &config.url)?;
+        let client = crate::http_util::build_http_client(config.timeout_ms, &config.url)?;
         Ok(Arc::new(QdrantOutput { config, client }))
     }
 }
@@ -439,6 +484,7 @@ mod tests {
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
+    use std::time::Duration;
 
     fn test_resource() -> Resource {
         Resource {

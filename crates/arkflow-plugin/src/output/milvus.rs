@@ -25,7 +25,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arkflow_core::component::{register_output_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -163,10 +162,7 @@ impl Output for MilvusOutput {
 
 impl MilvusOutput {
     async fn upsert(&self, data: &[Value]) -> Result<(), Error> {
-        let url = format!(
-            "{}/v2/vectordb/entities/upsert",
-            self.config.url.trim_end_matches('/')
-        );
+        let url = crate::http_util::join_url_base(&self.config.url, "v2/vectordb/entities/upsert");
         let mut request = self
             .client
             .post(&url)
@@ -174,90 +170,151 @@ impl MilvusOutput {
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
         }
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
+        let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
+        // Materialize construction errors (e.g. an invalid header value)
+        // before the retry loop: try_clone on an error-state builder
+        // returns None, which would mask the real reason.
+        let built = request
+            .build()
+            .map_err(|e| Error::Connection(format!("Milvus request failed: {e}")))?;
+
+        // `retry_count` names the RETRIES (default 0 = single attempt), so
+        // max_attempts is one more than it.
+        let retry_config = crate::retry::RetryConfig {
+            max_attempts: self.config.retry_count.saturating_add(1),
+            ..Default::default()
+        };
+        enum Fail {
+            Transport(String),
+            Status(u16, String),
+        }
+        impl std::fmt::Display for Fail {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Fail::Transport(e) => write!(f, "{e}"),
+                    Fail::Status(code, body) => write!(f, "{code}: {body}"),
+                }
             }
         }
 
-        let mut attempt = 0u32;
-        loop {
-            match request
-                .try_clone()
-                .expect("request body is JSON")
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    let status = response.status();
-                    let body = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<unreadable body>".to_string());
-                    if status.is_success() {
-                        // Milvus reports failures as HTTP 200 with a
-                        // non-zero `code`; those are deterministic, so no
-                        // retry.
-                        let parsed: Value = serde_json::from_str(&body).map_err(|e| {
-                            Error::Process(format!("Milvus response parse failed: {}", e))
-                        })?;
-                        match parsed.get("code") {
-                            // A response without the confirmation code is not
-                            // proof of a write: proxies/error routes return
-                            // generic JSON too. Require the explicit success
-                            // code.
-                            None => {
-                                return Err(Error::Process(
-                                    "Milvus response lacks a confirmation code".into(),
-                                ))
-                            }
-                            Some(code) if code.as_i64() == Some(0) => return Ok(()),
-                            Some(code) => {
-                                let message = parsed
-                                    .get("message")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("<no message>");
-                                return Err(Error::Process(format!(
-                                    "Milvus upsert failed with code {}: {}",
-                                    code,
-                                    crate::vector_util::truncate_body(message)
-                                )));
+        crate::retry::RetryUtils::retry_with_backoff_classified(
+            || {
+                let cloned = built.try_clone();
+                async move {
+                    let request = match cloned {
+                        Some(request) => request,
+                        None => {
+                            return Err(crate::retry::OperationError {
+                                error: Fail::Transport("request is not cloneable".into()),
+                                retryable: false,
+                            });
+                        }
+                    };
+                    match self.client.execute(request).await {
+                        Ok(response) => {
+                            let status = response.status();
+                            // A read failure on a 2xx means the write is
+                            // unconfirmed: retry it. Non-2xx bodies only
+                            // carry the error text.
+                            let body = if status.is_success() {
+                                match response.text().await {
+                                    Ok(body) => body,
+                                    Err(e) => {
+                                        error!("Milvus upsert body read failed: {e}");
+                                        return Err(crate::retry::OperationError {
+                                            error: Fail::Transport(format!(
+                                                "response body read failed: {e}"
+                                            )),
+                                            retryable: true,
+                                        });
+                                    }
+                                }
+                            } else {
+                                response
+                                    .text()
+                                    .await
+                                    .unwrap_or_else(|_| "<unreadable body>".to_string())
+                            };
+                            if status.is_success() {
+                                // Milvus reports failures as HTTP 200 with a
+                                // non-zero `code`; those are deterministic, so
+                                // no retry.
+                                let parsed: Value = serde_json::from_str(&body).map_err(|e| {
+                                    crate::retry::OperationError {
+                                        error: Fail::Status(
+                                            status.as_u16(),
+                                            format!("response parse failed: {e}"),
+                                        ),
+                                        retryable: false,
+                                    }
+                                })?;
+                                match parsed.get("code") {
+                                    // A response without the confirmation code
+                                    // is not proof of a write: proxies/error
+                                    // routes return generic JSON too. Require
+                                    // the explicit success code.
+                                    None => Err(crate::retry::OperationError {
+                                        error: Fail::Status(
+                                            status.as_u16(),
+                                            "response lacks a confirmation code".into(),
+                                        ),
+                                        retryable: false,
+                                    }),
+                                    Some(code) if code.as_i64() == Some(0) => Ok(()),
+                                    Some(code) => {
+                                        let message = parsed
+                                            .get("message")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("<no message>");
+                                        error!(
+                                            "Milvus upsert failed with code {}: {}",
+                                            code,
+                                            crate::http_util::truncate_body(message)
+                                        );
+                                        Err(crate::retry::OperationError {
+                                            error: Fail::Status(
+                                                status.as_u16(),
+                                                format!("upsert code {code}: {message}"),
+                                            ),
+                                            retryable: false,
+                                        })
+                                    }
+                                }
+                            } else {
+                                let body = crate::http_util::truncate_body(&body).to_string();
+                                // Shared classifier (connector-resilience
+                                // contract): 429/5xx transient, other 4xx
+                                // deterministic.
+                                let retryable = crate::retry::is_retryable_status(status.as_u16());
+                                if retryable {
+                                    error!("Milvus upsert attempt failed: {status} {body}");
+                                }
+                                Err(crate::retry::OperationError {
+                                    error: Fail::Status(status.as_u16(), body),
+                                    retryable,
+                                })
                             }
                         }
-                    }
-                    // Client errors are deterministic: retrying cannot help.
-                    if status.is_client_error() {
-                        return Err(Error::Process(format!(
-                            "Milvus returned {}: {}",
-                            status,
-                            crate::vector_util::truncate_body(&body)
-                        )));
-                    }
-                    error!(
-                        "Milvus upsert attempt {} failed: {} {}",
-                        attempt + 1,
-                        status,
-                        crate::vector_util::truncate_body(&body)
-                    );
-                    if attempt >= self.config.retry_count {
-                        return Err(Error::Process(format!(
-                            "Milvus returned {} after {} attempts: {}",
-                            status,
-                            attempt + 1,
-                            crate::vector_util::truncate_body(&body)
-                        )));
+                        Err(e) => {
+                            error!("Milvus request failed: {}", e);
+                            Err(crate::retry::OperationError {
+                                error: Fail::Transport(e.to_string()),
+                                retryable: true,
+                            })
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("Milvus request failed: {}", e);
-                    if attempt >= self.config.retry_count {
-                        return Err(Error::Connection(format!("Milvus request failed: {}", e)));
-                    }
-                }
+            },
+            &retry_config,
+            "milvus upsert",
+        )
+        .await
+        .map_err(|fail| match fail {
+            Fail::Transport(e) => Error::Connection(format!("Milvus request failed: {}", e)),
+            Fail::Status(code, body) => {
+                Error::Process(format!("Milvus returned {}: {}", code, body))
             }
-            attempt += 1;
-            tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
-        }
+        })
     }
 }
 
@@ -436,22 +493,7 @@ impl OutputBuilder for MilvusOutputBuilder {
                     .to_string(),
             ));
         }
-        // Loopback endpoints (local Milvus dev instances, tests) bypass a
-        // system proxy — proxying localhost is never what a user means.
-        let is_loopback = reqwest::Url::parse(&format!("{}/", config.url.trim_end_matches('/')))
-            .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-            .map(|host| {
-                host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
-            })
-            .unwrap_or(false);
-        let mut builder = Client::builder().timeout(Duration::from_millis(config.timeout_ms));
-        if is_loopback {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|e| Error::Config(format!("Unable to create HTTP client: {}", e)))?;
+        let client = crate::http_util::build_http_client(config.timeout_ms, &config.url)?;
         Ok(Arc::new(MilvusOutput { config, client }))
     }
 }

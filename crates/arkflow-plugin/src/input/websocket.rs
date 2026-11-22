@@ -23,6 +23,7 @@ use arkflow_core::error_helpers::parse_config;
 use arkflow_core::input::{register_input_builder, Ack, Input, InputBuilder, NoopAck};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -74,7 +75,7 @@ impl WebSocketInput {
         config: WebSocketInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<Delivery>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.map(str::to_string),

@@ -18,6 +18,7 @@ pub mod codec;
 pub mod component;
 pub mod context_pool;
 pub mod expr;
+pub mod http_util;
 pub mod input;
 pub mod kafka_security;
 pub mod kafka_txn;
@@ -26,11 +27,19 @@ pub mod output;
 pub mod processor;
 pub mod pulsar;
 pub mod rate_limiter;
+pub mod retry;
 pub mod temporary;
 pub mod time;
 pub mod udf;
 pub mod vector_util;
 pub mod wal;
+
+/// Capacity of input components' internal delivery channels, aligned with
+/// the kernel edge-channel capacity (`arkflow_core::executor::graph`
+/// `DEFAULT_CHANNEL_CAPACITY`, 1024). Component-internal channels use the
+/// same bound so backpressure depth is uniform across the pipeline; the
+/// hygiene test (`connector skeleton`) bans independent magic numbers.
+pub(crate) const DELIVERY_CHANNEL_CAPACITY: usize = 1024;
 
 use arkflow_core::Error;
 use std::sync::Mutex;

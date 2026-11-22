@@ -84,3 +84,7 @@ streams:
       vector_field: "embedding"
       id_field: "doc_id"
 ```
+
+## 注意事项
+
+- 429/5xx/传输失败的重试走共享的封顶退避重试实现(`retry_count`,默认 0;任意配置下延迟封顶 5s)。

@@ -21,6 +21,7 @@ The `vector_search` processor searches a [Qdrant](https://qdrant.tech/) collecti
 | concurrency | integer | no | `4` | Maximum in-flight requests; results are always filled back in row order. |
 | api_key | string | no | — | Sent as `Authorization: Bearer`. Supports [secret references](/docs/reference/configuration#secret-references). |
 | timeout_ms | integer | no | `30000` | HTTP request timeout. |
+| retry_count | integer | no | `3` | Retries for transient failures (429/5xx/transport). `0` disables retrying. |
 | headers | map | no | — | Extra HTTP headers. |
 
 ## Result shape
@@ -38,11 +39,16 @@ feeds directly into an [LLM processor](/docs/components/processors/llm)
 into any downstream JSON tooling.
 
 :::note
-Failures (non-2xx, missing result array, null/empty query vector) fail the
-batch into `error_output`. The processor does not retry; size
-`concurrency` to stay within rate limits. Requests to loopback endpoints
+Failures after retries are exhausted (non-2xx, missing result array,
+null/empty query vector) fail the batch into `error_output`. Transient
+failures retry per `retry_count` (default 3; `retry_count: 0` disables
+retrying); size `concurrency` to stay within rate limits. Requests to loopback endpoints
 always bypass the system proxy.
 :::
+
+Transient HTTP failures (429, 5xx, connection errors) are retried with
+capped exponential backoff (`retry_count`, default 3); 4xx rejections and
+parse/validation failures fail immediately without retrying.
 
 ## Example
 

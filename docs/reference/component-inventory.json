@@ -2364,6 +2364,10 @@
             "type": "integer",
             "description": "HTTP request timeout in milliseconds. Defaults to 30000."
           },
+          "retry_count": {
+            "type": "integer",
+            "description": "Retries for transient failures (429/5xx/transport). Defaults to 3; 0 disables retrying."
+          },
           "headers": {
             "type": "object",
             "additionalProperties": {
@@ -2472,6 +2476,10 @@
           "stream": {
             "type": "boolean",
             "description": "Request SSE streaming (`stream: true`) and assemble the deltas into the row's final completion text. Useful behind providers or gateways that time out non-streaming long completions."
+          },
+          "retry_count": {
+            "type": "integer",
+            "description": "Retries for transient failures (429/5xx/transport). Defaults to 3; 0 disables retrying."
           },
           "tools": {
             "description": "OpenAI tools definition passed through verbatim to the request body for function calling."

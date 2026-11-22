@@ -16,6 +16,7 @@
 //!
 //! Receive data from HTTP endpoints
 
+use crate::DELIVERY_CHANNEL_CAPACITY;
 use arkflow_core::codec::Codec;
 use arkflow_core::component::{register_input_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -108,7 +109,7 @@ impl HttpInput {
         config: HttpInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<MessageBatch>(1000);
+        let (sender, receiver) = flume::bounded::<MessageBatch>(DELIVERY_CHANNEL_CAPACITY);
         let auth = config.auth.clone();
 
         Ok(Self {

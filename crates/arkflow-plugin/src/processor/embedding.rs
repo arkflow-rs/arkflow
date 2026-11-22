@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arkflow_core::component::{register_processor_metadata, ComponentMetadata};
 use arkflow_core::error_helpers::parse_config;
@@ -34,7 +33,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::error;
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("embedding", Arc::new(EmbeddingProcessorBuilder))?;
@@ -52,6 +50,7 @@ pub fn init() -> Result<(), Error> {
                 "target_field": {"type": "string", "description": "Name of the appended vector column. Defaults to 'embedding'."},
                 "batch_size": {"type": "integer", "description": "Maximum rows per HTTP request. Defaults to 32."},
                 "timeout_ms": {"type": "integer", "description": "HTTP request timeout in milliseconds. Defaults to 30000."},
+                "retry_count": {"type": "integer", "description": "Retries for transient failures (429/5xx/transport). Defaults to 3; 0 disables retrying."},
                 "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra HTTP headers, e.g. Azure's 'api-key'."}
             },
             "required": ["api_base", "model", "field"]
@@ -80,8 +79,16 @@ struct EmbeddingProcessorConfig {
     batch_size: usize,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
+    /// Retries for transient failures (429/5xx/transport). 0 = single
+    /// attempt.
+    #[serde(default = "default_retry_count")]
+    retry_count: u32,
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
+}
+
+fn default_retry_count() -> u32 {
+    3
 }
 
 fn default_target_field() -> String {
@@ -141,35 +148,28 @@ impl EmbeddingProcessor {
 
     async fn embed_chunk(&self, chunk: &[&str]) -> Result<Vec<Vec<f32>>, Error> {
         let url = format!("{}/embeddings", self.config.api_base.trim_end_matches('/'));
-        let mut request = self.client.post(&url).json(&serde_json::json!({
-            "model": self.config.model,
-            "input": chunk,
-        }));
-        if let Some(key) = &self.config.api_key {
-            request = request.bearer_auth(key);
-        }
-        if let Some(headers) = &self.config.headers {
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-        }
-
-        let response = request.send().await.map_err(|e| {
-            error!("Embedding API request failed: {}", e);
-            Error::Process(format!("Embedding API request failed: {}", e))
-        })?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::Process(format!("Embedding API response read failed: {}", e)))?;
-        if !status.is_success() {
-            return Err(Error::Process(format!(
-                "Embedding API returned {}: {}",
-                status,
-                truncate_body(&body)
-            )));
-        }
+        let retry_config = crate::retry::RetryConfig {
+            max_attempts: self.config.retry_count.saturating_add(1),
+            ..Default::default()
+        };
+        // send/read/status share the classified retry (429/5xx + transport
+        // are transient); parsing/validation below is deterministic.
+        let body = crate::http_util::send_with_retry(
+            || {
+                let mut request = self.client.post(&url).json(&serde_json::json!({
+                    "model": self.config.model,
+                    "input": chunk,
+                }));
+                if let Some(key) = &self.config.api_key {
+                    request = request.bearer_auth(key);
+                }
+                crate::http_util::apply_headers(request, self.config.headers.as_ref())
+            },
+            &retry_config,
+            "embedding batch",
+            "Embedding API",
+        )
+        .await?;
 
         let parsed: EmbeddingsResponse = serde_json::from_str(&body)
             .map_err(|e| Error::Process(format!("Embedding API response parse failed: {}", e)))?;
@@ -255,23 +255,7 @@ impl ProcessorBuilder for EmbeddingProcessorBuilder {
                 "embedding processor: 'batch_size' must be at least 1".to_string(),
             ));
         }
-        // Loopback endpoints (local vLLM/Ollama/TEI, tests) bypass a system
-        // proxy — proxying localhost is never what a user means.
-        let is_loopback =
-            reqwest::Url::parse(&format!("{}/", config.api_base.trim_end_matches('/')))
-                .ok()
-                .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-                .map(|host| {
-                    host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
-                })
-                .unwrap_or(false);
-        let mut builder = Client::builder().timeout(Duration::from_millis(config.timeout_ms));
-        if is_loopback {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|e| Error::Config(format!("Unable to create HTTP client: {}", e)))?;
+        let client = crate::http_util::build_http_client(config.timeout_ms, &config.api_base)?;
         Ok(Arc::new(EmbeddingProcessor { config, client }))
     }
 }
@@ -378,13 +362,6 @@ fn append_vector_column(
     let record_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| Error::Process(format!("embedding processor: batch rebuild failed: {e}")))?;
     Ok(MessageBatch::new_arrow(record_batch))
-}
-
-fn truncate_body(body: &str) -> &str {
-    match body.char_indices().nth(512) {
-        Some((index, _)) => &body[..index],
-        None => body,
-    }
 }
 
 #[cfg(test)]
@@ -637,6 +614,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_429_is_retried_then_succeeds() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let api = MockApi::spawn_fn(move |_body| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                (429, r#"{"error":"rate limited"}"#.to_string())
+            } else {
+                (200, embeddings_body(4, 1))
+            }
+        });
+        let processor = build_processor(base_config(api.addr, serde_json::json!({})));
+        let result = processor.process(text_batch(vec![Some("a")])).await;
+        assert!(
+            result.is_ok(),
+            "429s must be retried to success: {result:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn deterministic_401_is_not_retried() {
+        let api = MockApi::spawn(401, r#"{"error":"bad key"}"#.to_string());
+        let processor = build_processor(base_config(api.addr, serde_json::json!({})));
+        processor
+            .process(text_batch(vec![Some("a")]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            api.request_count().await,
+            1,
+            "4xx rejections must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_count_zero_disables_retrying() {
+        let api = MockApi::spawn_fn(|_body| (503, "down".to_string()));
+        let processor =
+            build_processor(base_config(api.addr, serde_json::json!({"retry_count": 0})));
+        processor
+            .process(text_batch(vec![Some("a")]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            api.request_count().await,
+            1,
+            "retry_count: 0 must send exactly one request"
+        );
+    }
+
+    #[tokio::test]
     async fn inconsistent_dimensions_error() {
         let body = r#"{"data": [{"index": 0, "embedding": [1.0, 2.0]}, {"index": 1, "embedding": [1.0]}]}"#;
         let api = MockApi::spawn(200, body.to_string());
@@ -722,7 +751,7 @@ mod tests {
     #[test]
     fn body_truncation_is_char_safe() {
         let long = "é".repeat(1000);
-        assert_eq!(truncate_body(&long).chars().count(), 512);
-        assert_eq!(truncate_body("short"), "short");
+        assert_eq!(crate::http_util::truncate_body(&long).chars().count(), 512);
+        assert_eq!(crate::http_util::truncate_body("short"), "short");
     }
 }
