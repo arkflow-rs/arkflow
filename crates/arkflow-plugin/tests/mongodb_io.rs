@@ -325,7 +325,7 @@ async fn output_writes_documents_verified_by_client() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn write_after_close_reports_disconnection() {
+async fn write_after_close_reports_connection_error() {
     let Some(_lease) = server_lease().await else {
         skip_without_docker("mongodb write after close");
         return;
@@ -335,9 +335,11 @@ async fn write_after_close_reports_disconnection() {
     let output = build_output(&database, &collection).await;
     output.close().await.expect("close");
 
+    // Not-connected guard after close: `Connection(msg)` per connector-
+    // recovery-contract (a bare `Disconnection` carries no context).
     assert!(matches!(
         output.write(typed_batch()).await,
-        Err(arkflow_core::Error::Disconnection)
+        Err(arkflow_core::Error::Connection(_))
     ));
 }
 

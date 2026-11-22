@@ -116,3 +116,4 @@ Conflict detection relies on the primary key / unique index of the target table 
 - Identifier quoting follows each dialect: backticks for MySQL, double quotes for PostgreSQL.
 - `upsert: true` requires a non-empty `upsert_keys` list without duplicates; violations are rejected at configuration load, before the stream starts.
 - `upsert_keys` columns must exist in the incoming batch schema; otherwise the write fails with an error.
+- Error behavior: write failures are classified — transient transport failures (connection lost, SQLSTATE classes `08`/`40`/`57`, too many connections, MySQL error numbers 2006/2013) surface as `Disconnection`; deterministic failures (syntax, constraints, type errors) surface as `Process`. A runtime connection failure reports `Connection`; an invalid connection string still reports `Config`.

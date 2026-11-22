@@ -153,3 +153,7 @@ output:
       type: "value"
       value: "logs"
 ```
+
+## 错误行为
+
+写入时的传输失败(连接断开、服务不可用)以 `Disconnection` 上报。key/field 表达式求值失败是确定性的 `Process` 错误——问题出在数据形状而非连接。

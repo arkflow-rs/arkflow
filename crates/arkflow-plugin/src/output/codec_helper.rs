@@ -60,6 +60,69 @@ pub fn ensure_row_aligned(payloads: &[Bytes], rows: usize, output: &str) -> Resu
     Ok(())
 }
 
+/// Classify a sqlx write-path failure per `connector-recovery-contract`
+/// (output errors are documentation-grade for the kernel — sinks are fatal
+/// — but the variant must be truthful): transient transport/availability
+/// failures map to [`Error::Disconnection`] (a fresh connection could
+/// succeed); deterministic failures (SQL syntax, constraint violations,
+/// type/decode errors, driver configuration) map to [`Error::Process`].
+///
+/// Server errors are decided by SQLSTATE class through the driver-agnostic
+/// [`sqlx::error::DatabaseError::code`] (uniform for MySQL/Postgres).
+/// MySQL additionally reports transport loss through error numbers 2006
+/// ("server has gone away") and 2013 ("lost connection") under the generic
+/// `HY000` class, so the classifier downcasts for those before falling
+/// back to the SQLSTATE.
+pub(crate) fn classify_sqlx_error(error: &sqlx::Error) -> Error {
+    match error {
+        sqlx::Error::Io(_) => Error::Disconnection,
+        sqlx::Error::Tls(_) => Error::Disconnection,
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::WorkerCrashed => {
+            Error::Disconnection
+        }
+        // A failed BEGIN is almost always a broken/idle-closed connection.
+        sqlx::Error::BeginFailed => Error::Disconnection,
+        sqlx::Error::Database(db) => {
+            if db
+                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                .is_some_and(|mysql| matches!(mysql.number(), 2006 | 2013))
+            {
+                return Error::Disconnection;
+            }
+            match db.code().as_deref().map(str::trim) {
+                Some(code) if sqlstate_is_transient(code) => Error::Disconnection,
+                _ => Error::Process(format!(
+                    "SQL write failed deterministically (retrying cannot help): {error}"
+                )),
+            }
+        }
+        // Configuration/type/decode/etc. are deterministic given the batch.
+        _ => Error::Process(format!(
+            "SQL write failed deterministically (retrying cannot help): {error}"
+        )),
+    }
+}
+
+/// Whether retrying on a fresh connection can succeed for this SQLSTATE:
+/// `08` connection exception, `40` transaction rollback (serialization
+/// failure / deadlock — a retry of the whole transaction may pass),
+/// `57` operator intervention (server shutdown / admin cancel),
+/// `53300` too many connections. Everything else (syntax `42xxx`,
+/// constraint `23xxx`, data exceptions `22xxx`) is deterministic.
+fn sqlstate_is_transient(code: &str) -> bool {
+    code.starts_with("08") || code.starts_with("40") || code.starts_with("57") || code == "53300"
+}
+
+/// [`classify_sqlx_error`] with a deterministic-failure context: the
+/// transient `Disconnection` carries no payload (its Display is
+/// "Connection lost"), so only the `Process` arm gets the component prefix.
+pub(crate) fn classify_sqlx_error_ctx(error: &sqlx::Error, context: &str) -> Error {
+    match classify_sqlx_error(error) {
+        Error::Process(_) => Error::Process(format!("{context}: {error}")),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +196,99 @@ mod tests {
 
         let err = apply_codec_encode(&msg_ref, &codec).await.unwrap_err();
         assert!(format!("{err}").contains("encode boom"), "{err}");
+    }
+
+    /// Test double standing in for a driver `DatabaseError`: carries a
+    /// SQLSTATE `code()` like both the MySQL and Postgres drivers do
+    /// through the trait method.
+    #[derive(Debug)]
+    struct FakeDbError {
+        code: Option<String>,
+    }
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake database error")
+        }
+    }
+    impl std::error::Error for FakeDbError {}
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            "fake database error"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.as_deref().map(std::borrow::Cow::Borrowed)
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+    }
+
+    fn db_error(code: Option<&str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError {
+            code: code.map(str::to_string),
+        }))
+    }
+
+    #[test]
+    fn classify_sqlx_error_transients() {
+        use crate::output::codec_helper::classify_sqlx_error;
+        // Transport family.
+        for error in [
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+            sqlx::Error::BeginFailed,
+            // Connection-exception SQLSTATE class (08): PG 08006, MySQL 08S01.
+            db_error(Some("08006")),
+            db_error(Some("08S01")),
+            // Transaction rollback class (40): serialization / deadlock.
+            db_error(Some("40001")),
+            db_error(Some("40P01")),
+            // Operator intervention (57): server shutdown / cancel.
+            db_error(Some("57P01")),
+            // Too many connections.
+            db_error(Some("53300")),
+        ] {
+            assert!(
+                matches!(classify_sqlx_error(&error), Error::Disconnection),
+                "should be transient: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_sqlx_error_deterministic() {
+        use crate::output::codec_helper::classify_sqlx_error;
+        // Syntax (42xxx), constraint (23xxx), data exceptions (22xxx) and
+        // the generic class without a transport number.
+        for error in [
+            db_error(Some("42601")),
+            db_error(Some("23505")),
+            db_error(Some("22012")),
+            db_error(Some("HY000")),
+            db_error(None),
+            // Non-database errors are deterministic given the batch.
+            sqlx::Error::Configuration("bad config".into()),
+            sqlx::Error::ColumnNotFound("col".into()),
+            sqlx::Error::Protocol("protocol violation".into()),
+        ] {
+            assert!(
+                matches!(classify_sqlx_error(&error), Error::Process(_)),
+                "should be deterministic: {error}"
+            );
+        }
     }
 }

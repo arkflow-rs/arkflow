@@ -176,17 +176,6 @@ impl Input for PulsarInput {
         // Configure consumer
         let subscription_type = self.config.subscription_type.clone().unwrap_or_default();
 
-        let _consumer_builder = client
-            .consumer()
-            .with_topic(&self.config.topic)
-            .with_subscription(&self.config.subscription_name)
-            .with_subscription_type(match subscription_type {
-                SubscriptionType::Exclusive => SubType::Exclusive,
-                SubscriptionType::Shared => SubType::Shared,
-                SubscriptionType::Failover => SubType::Failover,
-                SubscriptionType::KeyShared => SubType::KeyShared,
-            });
-
         // Create consumer
         let consumer = client
             .consumer()
@@ -288,13 +277,21 @@ impl Input for PulsarInput {
                                             break;
                                         }
                                         Ok(None) => {
-                                            // The stream really ended.
+                                            // The stream really ended. This is
+                                            // an unbounded subscription source:
+                                            // classify as Disconnection so the
+                                            // kernel reconnects instead of
+                                            // ending the whole job as if the
+                                            // data had legitimately ended
+                                            // (connector-recovery-contract).
                                             if let Err(e) = sender_clone
-                                                .send_async(Delivery::Err(Error::EOF))
+                                                .send_async(Delivery::Err(
+                                                    Error::Disconnection,
+                                                ))
                                                 .await
                                             {
                                                 error!(
-                                                    "Failed to send EOF to channel: {}",
+                                                    "Failed to send stream-end error to channel: {}",
                                                     e
                                                 );
                                             }
@@ -348,9 +345,15 @@ impl Input for PulsarInput {
                                 }
                             }
                             Ok(None) => {
-                                // Stream ended
-                                if let Err(e) = sender_clone.send_async(Delivery::Err(Error::EOF)).await {
-                                    error!("Failed to send EOF to channel: {}", e);
+                                // Stream ended: unbounded subscription source —
+                                // Disconnection, not EOF (connector-recovery-
+                                // contract); EOF would broadcast EOS and end
+                                // the whole job silently.
+                                if let Err(e) = sender_clone
+                                    .send_async(Delivery::Err(Error::Disconnection))
+                                    .await
+                                {
+                                    error!("Failed to send stream-end error to channel: {}", e);
                                 }
                                 break;
                             }
@@ -390,11 +393,15 @@ impl Input for PulsarInput {
                     Ok(Delivery::Data(batch, ack)) => Ok((batch, ack)),
                     Ok(Delivery::Err(e)) => Err(e),
                     Err(_) => {
+                        // contract-eof: teardown — the channel closes only on
+                        // shutdown; abnormal stream ends arrive as
+                        // Delivery::Err and keep their own variant.
                         Err(Error::EOF)
                     }
                 }
             },
             _ = cancellation_token.cancelled() => {
+                // contract-eof: teardown
                 Err(Error::EOF)
             }
         }
@@ -542,6 +549,38 @@ mod tests {
         assert!(
             error.to_string().contains("ca_file"),
             "error must name the key: {error}"
+        );
+    }
+
+    /// Spec: connector-recovery-contract — 无界源的异常终止 SHALL 归类为
+    /// Disconnection 而非 EOF。Structural pin (nats.rs precedent): both
+    /// `Ok(None)` stream-end branches must send Disconnection to the
+    /// delivery channel — an ended Pulsar subscription used to map to EOF,
+    /// which made the kernel broadcast EOS and silently end the whole job.
+    /// Production code only, bounded to each branch.
+    #[test]
+    fn subscription_stream_end_sends_disconnection_not_eof() {
+        let source = include_str!("pulsar.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code precedes the test module");
+        let occurrences: Vec<usize> = production
+            .match_indices("unbounded subscription source")
+            .filter(|(idx, _)| {
+                // Both branches carry the marker comment; pin each one.
+                let branch = &production[*idx..];
+                let branch_end = branch.find("break").expect("loop break present");
+                let branch = &branch[..branch_end];
+                branch.contains("Error::Disconnection") && !branch.contains("Error::EOF")
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        assert!(
+            occurrences.len() >= 2,
+            "expected both Ok(None) stream-end branches to send Disconnection \
+             (found {} pinned); EOF here silently ends the whole job",
+            occurrences.len()
         );
     }
 }

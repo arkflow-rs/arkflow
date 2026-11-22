@@ -822,6 +822,11 @@ async fn run_source_chain(
                 // hide a broken Job and wedge shutdown.  Kafka and the other
                 // reconnecting connectors normalize transient receive errors
                 // to Disconnection before reaching this loop.
+                // This three-way contract (EOF = graceful end of a bounded
+                // source, Disconnection = reconnect, everything else =
+                // fatal) is normative in
+                // openspec/specs/connector-recovery-contract and pinned by
+                // arkflow-plugin's connector_error_contract test.
                 Err(Error::Disconnection) => {
                     if let Some(metrics) = &hook.metrics {
                         metrics

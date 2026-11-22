@@ -98,10 +98,12 @@ impl Input for MultipleInputs {
             }
             for msg in retained {
                 // The queue was just drained below its capacity, so this
-                // send cannot block.
-                self.sender.send(msg).map_err(|_| {
-                    Error::Process("multiple-inputs channel closed during reconnect".into())
-                })?;
+                // send cannot block. Interior channel closure surfaces as
+                // `InputChannelClosed` (the kernel handles it structurally);
+                // a `Process` re-wrap here would kill the Job as fatal.
+                self.sender
+                    .send(msg)
+                    .map_err(|_| Error::InputChannelClosed)?;
             }
         }
 

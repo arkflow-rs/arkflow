@@ -95,3 +95,4 @@ input:
 
 - No metadata columns are attached today: the Pulsar input forwards decoded payloads without adding `__meta_*` columns.
 - Subscription types: `exclusive` (single consumer, ordered), `shared` (round-robin, unordered), `failover` (primary/standby, ordered), `key_shared` (routed by key, ordered within the same key).
+- Error behavior: an ended subscription stream (the consumer returning no more messages) surfaces as `Disconnection` and the engine reconnects — it does not end the job as if the data had legitimately ended. Receiver closure during shutdown keeps graceful-end semantics.

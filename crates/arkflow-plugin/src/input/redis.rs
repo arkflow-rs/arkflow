@@ -92,26 +92,67 @@ enum Cli {
 // pair the (noop) acknowledgement before claiming a slot, so `read()` is a
 // single await point and a dropped read future loses nothing
 // (Input::read cancellation-safety contract).
-/// Check if a Redis error is temporary (should retry) or permanent (should not retry)
+/// Check if a Redis error is temporary (should retry) or permanent (should
+/// not retry).
 ///
-/// Temporary errors include: connection issues, timeouts, I/O errors
-/// Permanent errors include: authentication failures, permission errors, invalid configuration
-fn is_temporary_redis_error<E: std::fmt::Display>(err: &E) -> bool {
-    let err_str = err.to_string().to_lowercase();
-
-    // Permanent errors - these should not trigger infinite reconnection
-    if err_str.contains("noauth")
-        || err_str.contains("wrongpass")
-        || err_str.contains("noperm")
-        || err_str.contains("not allowed")
-        || err_str.contains("unknown command")
-        || err_str.contains("invalid")
-    {
-        return false;
+/// Structural classification per `connector-recovery-contract`: retrying a
+/// transport/availability failure on a fresh connection can help
+/// (temporary → `Disconnection`); deterministic rejections cannot
+/// (permanent → fatal `Connection`). Server replies are judged by
+/// `kind()`/exact protocol code — never by generic message words, so a text
+/// merely containing "invalid" no longer flips an otherwise transient error
+/// to permanent (2026-11 review). When in doubt, classify as temporary:
+/// the kernel's reconnect loop has backoff, a misjudged permanent error
+/// kills the Job. Shared with the Redis output's write-path classification.
+pub(crate) fn is_temporary_redis_error(err: &redis::RedisError) -> bool {
+    use redis::ErrorKind;
+    match err.kind() {
+        // Transport / availability: a fresh connection can help.
+        ErrorKind::Io
+        | ErrorKind::ClusterConnectionNotFound
+        | ErrorKind::MasterNameNotFoundBySentinel
+        | ErrorKind::NoValidReplicasFoundBySentinel
+        | ErrorKind::EmptySentinelList => true,
+        // Deterministic client/protocol failures: retrying cannot help.
+        ErrorKind::Parse
+        | ErrorKind::AuthenticationFailed
+        | ErrorKind::UnexpectedReturnType
+        | ErrorKind::InvalidClientConfig
+        | ErrorKind::Client
+        | ErrorKind::RESP3NotSupported => false,
+        // Server replies: known protocol codes carry their own semantics
+        // (mirrors the crate's own `RetryMethod` mapping).
+        ErrorKind::Server(kind) => match kind {
+            redis::ServerErrorKind::BusyLoading
+            | redis::ServerErrorKind::TryAgain
+            | redis::ServerErrorKind::Moved
+            | redis::ServerErrorKind::Ask
+            | redis::ServerErrorKind::ClusterDown
+            | redis::ServerErrorKind::MasterDown
+            | redis::ServerErrorKind::ReadOnly
+            | redis::ServerErrorKind::NoScript => true,
+            redis::ServerErrorKind::ResponseError
+            | redis::ServerErrorKind::ExecAbort
+            | redis::ServerErrorKind::CrossSlot
+            | redis::ServerErrorKind::NotBusy
+            | redis::ServerErrorKind::NoSub
+            | redis::ServerErrorKind::NoPerm => false,
+            // `#[non_exhaustive]`: unknown future codes default to temporary.
+            _ => true,
+        },
+        // Unrecognized server codes (NOAUTH/WRONGPASS arrive here): judge by
+        // the exact protocol code only.
+        ErrorKind::Extension => {
+            let code = err.code().unwrap_or_default().to_ascii_uppercase();
+            !matches!(
+                code.as_str(),
+                "NOAUTH" | "WRONGPASS" | "NOPERM" | "EXECABORT"
+            )
+        }
+        // Feature-gated or future kinds default to temporary (recovering via
+        // reconnect beats a wedged fatal Job).
+        _ => true,
     }
-
-    // Most other errors (connection issues, timeouts, etc.) are temporary
-    true
 }
 
 /// Forwards cluster pub/sub pushes into a bounded raw queue. The push
@@ -350,8 +391,20 @@ impl RedisInput {
                                         continue;
                                     }
                                     Err(e) => {
+                                        // Classify like the subscribe path does:
+                                        // a deterministic rejection (auth,
+                                        // permission, unknown command) must not
+                                        // be retried forever as a "transient"
+                                        // Disconnection every 5s.
                                         error!("Error retrieving from Redis list: {}", e);
-                                        if let Err(e) = sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
+                                        let error = if is_temporary_redis_error(&e) {
+                                            Error::Disconnection
+                                        } else {
+                                            Error::Connection(format!(
+                                                "Redis list poll failed permanently: {e}"
+                                            ))
+                                        };
+                                        if let Err(e) = sender_clone.send_async(Delivery::Err(error)).await {
                                             error!("{}", e);
                                         }
                                         break;
@@ -499,8 +552,20 @@ impl RedisInput {
                                         continue;
                                     }
                                     Err(e) => {
+                                        // Classify like the subscribe path does:
+                                        // a deterministic rejection (auth,
+                                        // permission, unknown command) must not
+                                        // be retried forever as a "transient"
+                                        // Disconnection every 5s.
                                         error!("Error retrieving from Redis list: {}", e);
-                                        if let Err(e) = sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
+                                        let error = if is_temporary_redis_error(&e) {
+                                            Error::Disconnection
+                                        } else {
+                                            Error::Connection(format!(
+                                                "Redis list poll failed permanently: {e}"
+                                            ))
+                                        };
+                                        if let Err(e) = sender_clone.send_async(Delivery::Err(error)).await {
                                             error!("{}", e);
                                         }
                                         break;
@@ -541,6 +606,9 @@ impl Input for RedisInput {
         match self.receiver.recv_async().await {
             Ok(Delivery::Data(batch, ack)) => Ok((batch, ack)),
             Ok(Delivery::Err(e)) => Err(e),
+            // contract-eof: teardown — the channel closes only on shutdown;
+            // abnormal producer ends arrive as Delivery::Err (e.g. the list
+            // poller forwards Disconnection before exiting).
             Err(_) => Err(Error::EOF),
         }
     }
@@ -782,31 +850,44 @@ mod tests {
 
     #[test]
     fn temporary_error_classification() {
-        // Permanent: auth/permission/unknown-command/invalid text.
-        for text in [
-            "NOAUTH Authentication required",
-            "WRONGPASS invalid username-password pair",
-            "NOPERM this user has no permissions",
-            "User is not allowed",
-            "unknown command 'BLPOPP'",
-            "invalid port specifier",
+        use redis::ErrorKind;
+
+        // Permanent: deterministic rejections — retrying cannot help.
+        for err in [
+            redis::make_extension_error("NOAUTH".into(), Some("Authentication required.".into())),
+            redis::make_extension_error(
+                "WRONGPASS".into(),
+                Some("invalid username-password pair".into()),
+            ),
+            redis::make_extension_error("NOPERM".into(), Some("no permissions".into())),
+            redis::RedisError::from((ErrorKind::AuthenticationFailed, "authentication failed")),
+            redis::RedisError::from((ErrorKind::InvalidClientConfig, "bad url")),
+            redis::RedisError::from((ErrorKind::Parse, "parse failure")),
         ] {
             assert!(
-                !is_temporary_redis_error(&text),
-                "should be permanent: {text}"
+                !is_temporary_redis_error(&err),
+                "should be permanent: {err}"
             );
         }
-        // Temporary: connection/timeout/io wording falls through.
-        for text in [
-            "connection reset by peer",
-            "IO timeout while reading",
-            "cluster is down",
+
+        // Temporary: transport/availability — a fresh connection can help.
+        for err in [
+            redis::RedisError::from(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+            redis::RedisError::from((ErrorKind::Io, "IO timeout while reading")),
+            // Unknown server codes default to temporary.
+            redis::make_extension_error("SOMENEWCODE".into(), Some("cluster is down".into())),
         ] {
-            assert!(
-                is_temporary_redis_error(&text),
-                "should be temporary: {text}"
-            );
+            assert!(is_temporary_redis_error(&err), "should be temporary: {err}");
         }
+
+        // Spec: connector-recovery-contract — 分类器 MUST 基于结构判定而非
+        // 过宽子串：含 "invalid" 一词但类别为暂态时 MUST 判暂态。
+        let transient_with_invalid_word =
+            redis::RedisError::from((ErrorKind::Io, "invalid state while reconnecting"));
+        assert!(is_temporary_redis_error(&transient_with_invalid_word));
     }
 
     fn builder() -> RedisInputBuilder {

@@ -30,6 +30,8 @@ use arkflow_core::error_helpers::parse_config;
 use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
 use arkflow_core::{Error, MessageBatchRef, Resource};
 use async_trait::async_trait;
+
+use super::codec_helper::classify_sqlx_error_ctx;
 use datafusion::arrow::array::{
     Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray, ListArray,
     StringArray,
@@ -196,7 +198,7 @@ impl Output for PgVectorOutput {
         let mut transaction = pool
             .begin()
             .await
-            .map_err(|e| Error::Process(format!("pgvector output: begin failed: {e}")))?;
+            .map_err(|e| classify_sqlx_error_ctx(&e, "pgvector output: begin failed"))?;
         let binds_per_row = usize::from(self.config.id_field.is_some())
             + 1
             + usize::from(!self.config.payload_field.is_empty());
@@ -206,12 +208,12 @@ impl Output for PgVectorOutput {
                 .build()
                 .execute(&mut *transaction)
                 .await
-                .map_err(|e| Error::Process(format!("pgvector output: insert failed: {}", e)))?;
+                .map_err(|e| classify_sqlx_error_ctx(&e, "pgvector output: insert failed"))?;
         }
         transaction
             .commit()
             .await
-            .map_err(|e| Error::Process(format!("pgvector output: commit failed: {e}")))?;
+            .map_err(|e| classify_sqlx_error_ctx(&e, "pgvector output: commit failed"))?;
         Ok(())
     }
 

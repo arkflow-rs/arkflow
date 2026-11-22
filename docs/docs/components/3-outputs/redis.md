@@ -153,3 +153,7 @@ output:
       type: "value"
       value: "logs"
 ```
+
+## Error behavior
+
+A transport failure while writing (connection lost, server unavailable) surfaces as `Disconnection`. Failures in the key/field expressions are deterministic `Process` errors — the data shape, not the connection, is the problem.

@@ -91,3 +91,7 @@ streams:
 docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg16
 cargo test -p arkflow-plugin --lib output::pgvector -- --ignored
 ```
+
+## 错误行为
+
+写入失败与 SQL 输出遵循同一分类:暂态传输失败(连接断开,SQLSTATE 类 `08`/`40`/`57`,连接数超限)以 `Disconnection` 上报;确定性失败(语法、约束、向量/id 抽取)以 `Process` 上报。运行期连接失败上报 `Connection`。

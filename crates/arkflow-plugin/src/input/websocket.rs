@@ -188,10 +188,13 @@ impl Input for WebSocketInput {
                 match result {
                     Ok(Delivery::Data(batch, ack)) => Ok((batch, ack)),
                     Ok(Delivery::Err(e)) => Err(e),
+                    // contract-eof: teardown — the channel closes only on
+                    // shutdown; abnormal reader ends arrive as Delivery::Err.
                     Err(_) => Err(Error::EOF),
                 }
             },
             _ = cancellation_token.cancelled() => {
+                // contract-eof: teardown
                 Err(Error::EOF)
             }
         }

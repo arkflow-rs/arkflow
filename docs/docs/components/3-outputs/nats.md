@@ -88,3 +88,16 @@ Use a `tls://` URL scheme to connect over TLS (for example
 `tls://nats.example.com:4422`); async-nats negotiates TLS natively for
 `tls://` URLs and requires the server to support TLS.
 
+## Error behavior
+
+In regular (core NATS) mode, a send/transport failure surfaces as
+`Disconnection`; local rejections (payload too large, invalid subject) are
+deterministic `Process` errors — reconnecting cannot fix them. A per-row
+subject vector shorter than the payload count fails before the first
+publish with a counting `Process` error; expression-evaluation failures
+are also deterministic.
+
+Note on JetStream mode: `write` awaits only the send, not the server's
+publish acknowledgment (the ack future is not held), so a message the
+server later rejects is not reported by `write`. Applications that need
+server-confirmed delivery should treat JetStream mode accordingly.

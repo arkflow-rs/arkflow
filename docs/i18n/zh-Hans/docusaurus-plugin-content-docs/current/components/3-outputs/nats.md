@@ -87,3 +87,8 @@ output:
 使用 `tls://` URL scheme 以 TLS 连接(例如 `tls://nats.example.com:4422`);
 async-nats 对 `tls://` URL 原生协商 TLS,并要求服务端支持 TLS。
 
+## 错误行为
+
+常规(核心 NATS)模式下,发送/传输失败以 `Disconnection` 上报;本地拒绝(负载超限、非法 subject)是确定性的 `Process` 错误——重连无法修复。逐行 subject 向量短于负载数量时,会在首次发布前以带计数的 `Process` 错误失败;表达式求值失败同样是确定性的。
+
+关于 JetStream 模式:`write` 只等待发送本身,不等待服务端的发布确认(不持有 ack future),因此服务端稍后才拒绝的消息不会由 `write` 上报。需要服务端确认投递的应用请据此对待 JetStream 模式。
