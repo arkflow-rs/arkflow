@@ -4,7 +4,7 @@
 >
 > **快照**：`main` @ `c6ff539b`（2026-11-22 20:24）。分析期间另有会话在推进 `complete-connector-retry-adoption`，工作树存在未提交改动；涉及插件层的结论以该快照为准。
 >
-> **验证边界**：本次实测 `cargo check -p arkflow-core --locked` 通过、`console` 108 个前端测试全绿；未运行全量 Rust 测试、未做分布式压力测试、未运行时复现 PA-P0-01（仅复核代码路径）。
+> **验证边界**：本次实测 `cargo check -p arkflow-core --locked` 通过、`console` 108 个前端测试全绿；未运行全量 Rust 测试、未做分布式压力测试、未运行时复现 PA-P0-01（仅复核代码路径）。**2026-11-22 后续**：PA-P0-01 已深入复核否证并补回归测试，见 3.1。
 
 ---
 
@@ -25,7 +25,7 @@ ArkFlow 的真实形态已经超出 `CLAUDE.md` 的“三 crate 单机 YAML 引�
 | 维度 | 评级 | 主要依据 |
 | --- | --- | --- |
 | 架构设计 | **A** | 统一执行内核、链融合、三种配置层级共用 JobSpec |
-| 内核正确性 | **A-** | 连续 ack、barrier 对齐、state journal 不变量扎实；发现 1 个 EOS 缺陷 |
+| 内核正确性 | **A-** | 连续 ack、barrier 对齐、state journal 不变量扎实；此前登记的 1 个 EOS 缺陷已于 2026-11-22 复核否证（见 3.1） |
 | 可靠性 | **A-** | WAL/S3、checkpoint/savepoint、EOS L2/L3；恢复边界诚实 |
 | 控制面 | **A-** | HA 选主、审批、pause/resume、backup/restore 完整；节点身份偏弱 |
 | 安全 | **B** | 凭据分层好；共享节点信任、审计 best-effort、无 mTLS |
@@ -94,31 +94,26 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 > 状态标记：`已复核` = 本次直接读代码确认；`代理发现` = 深潜代理报告且关键路径已抽查；`待运行复现` = 仅有代码路径证据。每项给出建议 OpenSpec change 名与可验证的验收标准。
 
-### 3.1 P0（立即处理）
+### 3.1 P0（立即处理）—— 已清空：唯一登记项已否证（2026-11-22）
 
-#### PA-P0-01 多输入链 EOS 忙循环 · 已复核（未运行复现）
+#### PA-P0-01 多输入链 EOS 忙循环 · 已否证（2026-11-22 深入复核 + 回归测试）
 
-**现象**：join/merge 多输入链中，一条输入通道关闭时，内核会反复重注册已关闭的 reader，并在 barrier 对齐中反复 push EOS，形成满核空转与无界缓冲增长。
+**结论**：登记的"反复重注册已关闭 reader + buffered 无界增长"机制在当前代码中不存在，不构成缺陷，原 `fix-multi-input-eos-spin` 提案取消。
 
-**证据**：
-- `InputChannelClosed` 分支调用 `aligner.observe(index, Eos)` 后直接 `continue`，未写入 `ended_inputs`（[task.rs:1534](crates/arkflow-core/src/executor/task.rs:1534)）。
-- 循环尾部只要 `ended_inputs` 不含该 index 就重新注册 reader（[task.rs:1663](crates/arkflow-core/src/executor/task.rs:1663)）。
-- `Aligner::observe` 的 EOS 分支每次追加一个 Eos，且该路径没有 `max_buffered` 检查（[barrier.rs:114](crates/arkflow-core/src/executor/barrier.rs:114)）。
+**否证依据**：
+- `InputChannelClosed` 分支消费该通道的 reader 后经 `continue`（[task.rs:1574](crates/arkflow-core/src/executor/task.rs:1574)）直接回到循环顶部，**跳过**了循环尾部的重注册（[task.rs:1665](crates/arkflow-core/src/executor/task.rs:1665)）——原登记误以为关闭分支会落到尾部重注册（原引用行号 1534/1663 处代码片段描述属实，但控制流组装错误）。
+- 尾部重注册仅在 `Ok(envelope)` 路径可达；已关闭的通道永远不会再产生 `Ok` 事件。故每通道关闭事件 ≤ 1 次，reader 只减不增，循环必然收敛（reader 耗尽 → 干净 `finish_chain` 退出）。
+- `buffered` 中 EOS 每输入至多 2 条（显式 `Envelope::Eos` + 关闭合成的隐式 EOS），有界；数据/水位缓冲已有 `max_buffered` 上界与显式轮次失败路径。
 
-**触发条件**：join/merge 链 + 有界源结束 + checkpoint barrier 在飞（或其它输入数据仍在 `buffered`）。
+**语义本身正确**：EOS 是隐式 barrier，补齐对齐、`active_inputs` 剔除已结束输入，`Aligner` 行为与 checkpoint 语义一致。
 
-**影响**：CPU 打满、`buffered` 无界增长，最终 checkpoint 伪失败或 OOM。属“会打挂进程”的缺陷。
+**实证**：回归测试 `channel_close_during_in_flight_barrier_stays_idle_and_settles`（[task.rs](crates/arkflow-core/src/executor/task.rs) `task_loop_tests`，3 输入 + barrier 在飞 + 一通道关闭 + 幸存输入补齐对齐）锁定该语义。
 
-**动作**：
-1. channel-closed 分支立即把 `index` 写入 `ended_inputs` 并停止重注册；
-2. `Aligner` 按 `(index)` 幂等处理 EOS（重复 EOS 直接忽略）；
-3. EOS 路径补 `max_buffered` 上界与明确错误。
+**残留低危观察（降级 P2，不立项）**：
+- `Aligner::observe` EOS 分支非幂等（重复 EOS 重复入 `buffered`）且无 `max_buffered` 检查（[barrier.rs:114](crates/arkflow-core/src/executor/barrier.rs:114)）；实践中每输入 ≤2，无 OOM 风险。
+- `stale duplicate barrier` 拒绝路径不设 `failed_barrier`（[barrier.rs:148](crates/arkflow-core/src/executor/barrier.rs:148)）→ 该轮失败经 `failure_reporter` 上报为 `(None, error)`、不可归因；仅协议违规（重发已完成 checkpoint id）时触发。
 
-**验收**：
-- 新增回归测试：双输入链、一条通道在 barrier in-flight 时关闭、另一条延迟发送；断言循环有限、无 OOM、checkpoint 失败可归因。
-- 在 `cargo test -p arkflow-core` 全绿；无新增 clippy 告警。
-
-**建议 change**：`fix-multi-input-eos-spin`（可直接 propose）。
+**动作**：无代码动作；迭代 1 由 PA-P1-02 领头。
 
 ---
 
@@ -335,14 +330,15 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 **目标**：消除已知“会打挂进程”的缺陷，让文档/元数据重新说真话。
 
+**2026-11-22 更新**：原第 1 顺位 PA-P0-01 已复核否证（见 3.1，回归测试已随否证入库），本轮由 PA-P1-02 领头。
+
 | 顺序 | 事项 | 验收 | 产出 |
 | --- | --- | --- | --- |
-| 1 | PA-P0-01 EOS 忙循环 | 回归测试 + core 全绿 | `fix-multi-input-eos-spin` |
-| 2 | PA-P1-02 文档真相 | CLAUDE.md/插件指南/Helm 一致 | `fix-docs-truth-2026-11` |
-| 3 | PA-P1-03 元数据一致性 | conformance 测试红/绿可控 | `add-component-metadata-conformance` |
-| 4 | PA-P1-04 SQL 标识符 | 注入用例通过 | `harden-sql-output-identifiers` |
+| 1 | PA-P1-02 文档真相 | CLAUDE.md/插件指南/Helm 一致 | `fix-docs-truth-2026-11` |
+| 2 | PA-P1-03 元数据一致性 | conformance 测试红/绿可控 | `add-component-metadata-conformance` |
+| 3 | PA-P1-04 SQL 标识符 | 注入用例通过 | `harden-sql-output-identifiers` |
 
-**退出标准**：以上 4 项归档；`cargo test --workspace --all-targets`、`pnpm docs:check`、console 五件套全绿；CHANGELOG 更新。
+**退出标准**：以上 3 项归档；`cargo test --workspace --all-targets`、`pnpm docs:check`、console 五件套全绿；CHANGELOG 更新。
 
 ### 迭代 2：产品化（1-2 个月）
 
@@ -377,9 +373,9 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 ## 5. 在飞工作与“已修复，勿重复”
 
-### 在飞（截至 2026-11-22 20:24）
+### 在飞（2026-11-22 更新）
 
-- **`complete-connector-retry-adoption`**（未提交工作树）：HTTP/InfluxDB/MQTT output 与 Kafka input 的重试收编、NATS 死 sleep 清理、共享退避封顶、`vector_search`/`milvus_search` 元数据补 `retry_count`、卫生测试钉扎扩展。**本文件不重复登记这些项**；PA-P1-03 只保留“系统性 conformance”部分。
+- 无在飞 change。`complete-connector-retry-adoption` 已随 #1388 实施、#1390 归档（HTTP/InfluxDB/MQTT output 与 Kafka input 重试收编、NATS 死 sleep 清理、共享退避封顶、`vector_search`/`milvus_search` 元数据补 `retry_count` 等已全部落地 main）；PA-P1-03 只保留“系统性 conformance”部分。
 - `consolidate-connector-skeleton` 已归档（#1386）。
 
 ### 已在当前代码中修复（不要按旧评审重复立项）
@@ -428,7 +424,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 | 依赖 | `Cargo.lock` 包数、重复 arrow/datafusion/zstd | 1,021 包；已有单版本门禁 | feature 化后 default 锁包数下降并留档 |
 | 文档 | CLAUDE.md 一致性、插件指南可编译、Helm 版本一致 | 3 处漂移 | 3 条 CI 检查全绿 |
 | 元数据 | serde 字段 ⊆ metadata schema ⊆ inventory | 已知 2 处漂移 | conformance 测试全绿 |
-| 可靠性 | EOS 忙循环回归、checkpoint 失败归因 | 未覆盖 | 回归测试入库 |
+| 可靠性 | EOS 忙循环回归、checkpoint 失败归因 | 回归测试已入库（2026-11-22，见 3.1，缺陷本身已否证） | 无 |
 | 安全 | 节点身份冒用测试、审计失败可观测、会话撤销 | 未覆盖 | 攻击/故障注入测试入库 |
 | 控制面 | 驱逐不伤 Running、rollout 目标上限 | 未覆盖 | 测试入库 |
 | 数据面 | 超限 placement 明确失败、拒绝计数导出 | 仅 warn | plan 期校验 + metrics |
@@ -459,6 +455,6 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 ## 附录 B：待运行复现 / 待确认
 
-- PA-P0-01 的实际运行时表现（CPU/内存曲线、checkpoint 失败日志）尚未复现；修复前建议先写一个最小 join + 有界源 + checkpoint 的集成测试。
+- ~~PA-P0-01 的实际运行时表现（CPU/内存曲线、checkpoint 失败日志）尚未复现~~ 已于 2026-11-22 复核否证（见 3.1）；最小触发场景的回归测试已入库（`channel_close_during_in_flight_barrier_stays_idle_and_settles`）。
 - 分布式长稳与规模上限（连接数、每 quad 预算）未在本机压测；PA-P1-11 的 sizing 公式需要真实 16×16/32×32 exchange 数据。
 - 本机全量 Rust 测试受 DuckDB/本地 C++ 构建与 Docker 依赖限制；相关结论以 CI 为准。
