@@ -32,7 +32,6 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::error;
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("vector_search", Arc::new(VectorSearchProcessorBuilder))?;

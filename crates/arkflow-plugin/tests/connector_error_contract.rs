@@ -254,3 +254,44 @@ async fn redis_output_write_before_connect_is_connection_error() {
     .await;
     assert!(matches!(err, Error::Connection(_)), "{err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Connector-skeleton hygiene pins (consolidate-connector-skeleton).
+
+#[test]
+fn input_delivery_channels_use_the_shared_capacity() {
+    let mut report = Vec::new();
+    for (file, source) in rust_files(&plugin_src_dir("input")) {
+        for (idx, line) in production_section(&source).lines().enumerate() {
+            if line.contains("bounded(1000)") {
+                report.push(format!("{}:{}: {}", file, idx + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        report.is_empty(),
+        "input delivery channels must use DELIVERY_CHANNEL_CAPACITY (1024, \
+         kernel-aligned) instead of the bounded(1000) magic number. \
+         Violations:\n{}",
+        report.join("\n")
+    );
+}
+
+#[test]
+fn outputs_must_not_hand_roll_power_backoff() {
+    let mut report = Vec::new();
+    for (file, source) in rust_files(&plugin_src_dir("output")) {
+        for (idx, line) in production_section(&source).lines().enumerate() {
+            if line.contains("2u64.pow") {
+                report.push(format!("{}:{}: {}", file, idx + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        report.is_empty(),
+        "outputs must use the shared RetryUtils backoff (capped, \
+         overflow-safe) instead of hand-rolled 2u64.pow schedules. \
+         Violations:\n{}",
+        report.join("\n")
+    );
+}

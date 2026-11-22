@@ -37,7 +37,6 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tracing::error;
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("milvus_search", Arc::new(MilvusSearchProcessorBuilder))?;

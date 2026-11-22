@@ -196,7 +196,7 @@ impl QdrantOutput {
             || {
                 let cloned = request.try_clone();
                 async move {
-                    let mut request = match cloned {
+                    let request = match cloned {
                         Some(request) => request,
                         None => {
                             return Err(crate::retry::OperationError {

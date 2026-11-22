@@ -33,7 +33,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::error;
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("embedding", Arc::new(EmbeddingProcessorBuilder))?;

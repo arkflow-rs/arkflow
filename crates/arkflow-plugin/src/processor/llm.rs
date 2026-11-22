@@ -35,7 +35,6 @@ use futures_util::TryStreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::error;
 
 pub fn init() -> Result<(), Error> {
     register_processor_builder("llm", Arc::new(LlmProcessorBuilder))?;

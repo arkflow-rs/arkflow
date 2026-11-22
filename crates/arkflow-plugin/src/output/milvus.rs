@@ -195,7 +195,7 @@ impl MilvusOutput {
             || {
                 let cloned = request.try_clone();
                 async move {
-                    let mut request = match cloned {
+                    let request = match cloned {
                         Some(request) => request,
                         None => {
                             return Err(crate::retry::OperationError {
@@ -483,7 +483,6 @@ mod tests {
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::cell::RefCell;
-    use std::time::Duration;
 
     fn test_resource() -> Resource {
         Resource {
