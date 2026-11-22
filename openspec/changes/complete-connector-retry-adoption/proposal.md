@@ -12,7 +12,7 @@
 ## What Changes
 
 - **influxdb output `flush()` 收编共享重试**：qdrant 式 `retry_with_backoff_classified`（自定义分类包装，既有错误文案逐字节不变）：429/5xx/传输错误重试，4xx 确定性立即失败（**行为变化**）；退避封顶 `max_delay_ms`（消灭最后一个 pow 溢出点）；`retry_count` 保持既有「总尝试数」语义与默认 3。
-- **http output `send()` 收编共享重试**：同上 classified 收编（既有错误文案与 64KiB 截断保留，4xx 不再重试为**行为变化**）；`retry_count` 增 `#[serde(default)]` 默认 3（原必填变可选，非破坏）。
+- **http output `send()` 收编共享重试**：同上 classified 收编（既有错误文案与 64KiB 截断保留，4xx 不再重试为**行为变化**）；`retry_count` 增 `#[serde(default = "default_retry_count")]` 默认 3（原必填变可选，非破坏）。
 - **mqtt output `reconnect()` 收编**：`retry_with_backoff` + 常量 `RetryConfig{3, 1000, 4000, 2.0}`——调度逐字节复现（1s/2s），零行为变化；修正失真注释。
 - **kafka input 两处收编（pulsar 式保循环）**：`settle_tombstone` 保留「sleep 前取消检查」循环形态，延迟调度换共享 `advance_backoff`/`sleep_duration`；线性 200ms×4 → 指数 200ms 起 ×2 封顶 5s（**行为变化**，常量保持硬编码、不加配置面）。restore seek 的手写公式换共享调度（deadline 循环形态不变）。
 - **nats input 清理**：删除两处死 sleep；批内逐条错误重复发 Disconnection 收敛为单次。

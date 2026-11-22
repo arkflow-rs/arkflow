@@ -1128,6 +1128,15 @@ impl Input for KafkaInput {
                                 )));
                             }
                             tokio::time::sleep(Duration::from_millis(200)).await;
+                            // The wait can straddle the deadline: re-check
+                            // before the loop may start a seek with a fresh
+                            // 5s timeout past the restore budget.
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(Error::Process(format!(
+                                    "restore Kafka position for {topic}-{partition}: partition was not assigned within {}s",
+                                    KAFKA_ASSIGNMENT_WAIT.as_secs()
+                                )));
+                            }
                             continue;
                         }
                         match consumer.seek(
