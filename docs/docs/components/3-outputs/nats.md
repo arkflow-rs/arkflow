@@ -90,8 +90,14 @@ Use a `tls://` URL scheme to connect over TLS (for example
 
 ## Error behavior
 
-A publish transport failure surfaces as `Disconnection` (the engine treats
-it like any sink failure; the message is never silently dropped). A
-per-row subject vector shorter than the payload count fails before the
-first publish with a counting `Process` error; expression-evaluation
-failures are also deterministic.
+In regular (core NATS) mode, a send/transport failure surfaces as
+`Disconnection`; local rejections (payload too large, invalid subject) are
+deterministic `Process` errors — reconnecting cannot fix them. A per-row
+subject vector shorter than the payload count fails before the first
+publish with a counting `Process` error; expression-evaluation failures
+are also deterministic.
+
+Note on JetStream mode: `write` awaits only the send, not the server's
+publish acknowledgment (the ack future is not held), so a message the
+server later rejects is not reported by `write`. Applications that need
+server-confirmed delivery should treat JetStream mode accordingly.

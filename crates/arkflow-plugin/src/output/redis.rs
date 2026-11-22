@@ -107,9 +107,10 @@ impl Output for RedisOutput {
         crate::output::codec_helper::ensure_row_aligned(&data, msg.num_rows(), "redis")?;
         let client_lock = self.client.lock().await;
         let Some(cli) = client_lock.as_ref() else {
-            return Err(Error::Process(
-                "Failed to get connection from Redis".to_string(),
-            ));
+            // Not-connected guard: `Connection(msg)` per connector-recovery-
+            // contract (a `Process` here would misreport a link problem as
+            // a data problem).
+            return Err(Error::Connection("Redis output is not connected".into()));
         };
 
         let mut cli = cli.clone();
@@ -169,10 +170,17 @@ impl Output for RedisOutput {
         }
 
         pipeline.query_async::<()>(&mut cli).await.map_err(|e| {
-            // Transient transport failure (connector-recovery-contract):
-            // `Disconnection`, not `Process`.
-            error!("Failed to publish to Redis: {}", e);
-            Error::Disconnection
+            // Classify with the same structural judgment as the input:
+            // transport/availability failures (IO, cluster down, try-again)
+            // are reconnect-worthy `Disconnection`; server rejections
+            // (WRONGTYPE, NOAUTH, …) are deterministic `Process` and must
+            // keep their reason.
+            if crate::input::redis::is_temporary_redis_error(&e) {
+                error!("Failed to publish to Redis: {}", e);
+                Error::Disconnection
+            } else {
+                Error::Process(format!("Failed to publish to Redis: {}", e))
+            }
         })?;
         Ok(())
     }

@@ -204,10 +204,20 @@ impl Output for NatsOutput {
                         .publish(subject_str.to_string(), payload.into())
                         .await
                     {
-                        // Transient transport failure (connector-recovery-
-                        // contract): `Disconnection`, not `Process`.
-                        error!("Failed to publish message to NATS: {}", e);
-                        return Err(Error::Disconnection);
+                        // Local rejections (payload too large, invalid
+                        // subject) are deterministic — reconnecting cannot
+                        // fix them. Only a send/transport failure is
+                        // reconnect-worthy (connector-recovery-contract).
+                        return Err(match e.kind() {
+                            async_nats::client::PublishErrorKind::Send => {
+                                error!("Failed to publish message to NATS: {}", e);
+                                Error::Disconnection
+                            }
+                            kind => {
+                                error!("NATS publish rejected: {kind}: {e}");
+                                Error::Process(format!("nats publish rejected: {kind}"))
+                            }
+                        });
                     }
                 }
                 Mode::JetStream { .. } => {

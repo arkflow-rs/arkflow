@@ -103,8 +103,8 @@ enum Cli {
 /// merely containing "invalid" no longer flips an otherwise transient error
 /// to permanent (2026-11 review). When in doubt, classify as temporary:
 /// the kernel's reconnect loop has backoff, a misjudged permanent error
-/// kills the Job.
-fn is_temporary_redis_error(err: &redis::RedisError) -> bool {
+/// kills the Job. Shared with the Redis output's write-path classification.
+pub(crate) fn is_temporary_redis_error(err: &redis::RedisError) -> bool {
     use redis::ErrorKind;
     match err.kind() {
         // Transport / availability: a fresh connection can help.
@@ -391,8 +391,20 @@ impl RedisInput {
                                         continue;
                                     }
                                     Err(e) => {
+                                        // Classify like the subscribe path does:
+                                        // a deterministic rejection (auth,
+                                        // permission, unknown command) must not
+                                        // be retried forever as a "transient"
+                                        // Disconnection every 5s.
                                         error!("Error retrieving from Redis list: {}", e);
-                                        if let Err(e) = sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
+                                        let error = if is_temporary_redis_error(&e) {
+                                            Error::Disconnection
+                                        } else {
+                                            Error::Connection(format!(
+                                                "Redis list poll failed permanently: {e}"
+                                            ))
+                                        };
+                                        if let Err(e) = sender_clone.send_async(Delivery::Err(error)).await {
                                             error!("{}", e);
                                         }
                                         break;
@@ -540,8 +552,20 @@ impl RedisInput {
                                         continue;
                                     }
                                     Err(e) => {
+                                        // Classify like the subscribe path does:
+                                        // a deterministic rejection (auth,
+                                        // permission, unknown command) must not
+                                        // be retried forever as a "transient"
+                                        // Disconnection every 5s.
                                         error!("Error retrieving from Redis list: {}", e);
-                                        if let Err(e) = sender_clone.send_async(Delivery::Err(Error::Disconnection)).await {
+                                        let error = if is_temporary_redis_error(&e) {
+                                            Error::Disconnection
+                                        } else {
+                                            Error::Connection(format!(
+                                                "Redis list poll failed permanently: {e}"
+                                            ))
+                                        };
+                                        if let Err(e) = sender_clone.send_async(Delivery::Err(error)).await {
                                             error!("{}", e);
                                         }
                                         break;

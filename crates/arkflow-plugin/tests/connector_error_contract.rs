@@ -24,7 +24,10 @@
 //!   channel closure as `Error::InputChannelClosed`, not a `Process`
 //!   re-wrap.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, Resource};
 
 /// Bounded sources: natural exhaustion (`Error::EOF`) is their normal end.
 const BOUNDED_EOF_INPUT: &[&str] = &[
@@ -187,4 +190,67 @@ fn r_multiple_inputs_uses_input_channel_closed() {
          `Error::InputChannelClosed` (the kernel handles it structurally), not \
          re-wrap it into `Error::Process`."
     );
+}
+
+// ---------------------------------------------------------------------------
+// Behavioral pins for the not-connected guards of allowlisted outputs.
+//
+// R-GUARD-OUTPUT above is file-granular: a "not connected" guard regressing
+// to `Error::Disconnection` inside an allowlisted file would slip through.
+// These pins close that gap (spec: guards map to `Connection(msg)`).
+
+fn resource() -> Resource {
+    Resource {
+        temporary: HashMap::new(),
+        input_names: std::cell::RefCell::new(vec![]),
+    }
+}
+
+async fn guard_error(output_type: &str, config: serde_json::Value) -> Error {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        arkflow_plugin::output::init().expect("plugin output init");
+    });
+    let out = arkflow_core::output::OutputConfig {
+        output_type: output_type.into(),
+        name: None,
+        codec: None,
+        config: Some(config),
+    };
+    let output = out.build(&resource()).expect("build output");
+    let batch: MessageBatchRef =
+        std::sync::Arc::new(MessageBatch::new_binary(vec![b"x".to_vec()]).unwrap());
+    output
+        .write(batch)
+        .await
+        .expect_err("write must fail before connect")
+}
+
+#[tokio::test]
+async fn nats_output_write_before_connect_is_connection_error() {
+    let err = guard_error(
+        "nats",
+        serde_json::json!({
+            "url": "nats://127.0.0.1:1",
+            "mode": {"type": "regular", "subject": {"type": "value", "value": "s"}},
+            "value_field": null,
+        }),
+    )
+    .await;
+    assert!(matches!(err, Error::Connection(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn redis_output_write_before_connect_is_connection_error() {
+    let err = guard_error(
+        "redis",
+        serde_json::json!({
+            "mode": {"type": "single", "url": "redis://127.0.0.1:1"},
+            "redis_type": {"type": "publish", "channel": {"type": "value", "value": "ch"}},
+            "value_field": null,
+        }),
+    )
+    .await;
+    assert!(matches!(err, Error::Connection(_)), "{err:?}");
 }
