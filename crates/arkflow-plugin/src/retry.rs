@@ -103,6 +103,18 @@ fn next_delay(current_ms: f64, config: &RetryConfig, rng: impl Fn() -> f64) -> D
     Duration::from_millis(jittered.max(0.0) as u64)
 }
 
+/// Next backoff delay for loops that must stay select-aware (e.g. the
+/// Pulsar receive loop keeps cancellation and idle-budget branches alive
+/// during the sleep) and therefore cannot wrap their whole attempt in
+/// [`RetryUtils`]: same cap/jitter schedule as the shared implementations.
+pub(crate) fn backoff_after(current: Duration, config: &RetryConfig) -> Duration {
+    next_delay(
+        current.as_millis() as f64,
+        config,
+        || rand::Rng::random(&mut rand::rng()),
+    )
+}
+
 /// Retry utility for retrying components.
 pub struct RetryUtils;
 

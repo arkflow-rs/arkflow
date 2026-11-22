@@ -31,6 +31,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
+use crate::DELIVERY_CHANNEL_CAPACITY;
 /// MQTT input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MqttInputConfig {
@@ -80,7 +81,7 @@ impl MqttInput {
         config: MqttInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<Delivery>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.map(str::to_string),

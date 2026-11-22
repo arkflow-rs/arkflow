@@ -39,6 +39,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use url::Url;
+use crate::DELIVERY_CHANNEL_CAPACITY;
 
 /// WebSocket input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +75,7 @@ impl WebSocketInput {
         config: WebSocketInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<Delivery>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY);
         let cancellation_token = CancellationToken::new();
         Ok(Self {
             input_name: name.map(str::to_string),

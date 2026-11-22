@@ -34,6 +34,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+use crate::DELIVERY_CHANNEL_CAPACITY;
 
 /// Redis input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,8 +224,8 @@ impl RedisInput {
         config: RedisInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<Delivery>(1000);
-        let (cluster_raw_tx, cluster_raw_rx) = flume::bounded::<Vec<u8>>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY);
+        let (cluster_raw_tx, cluster_raw_rx) = flume::bounded::<Vec<u8>>(DELIVERY_CHANNEL_CAPACITY);
         let cancellation_token = CancellationToken::new();
         match &config.mode {
             ModeConfig::Cluster { urls, .. } => {

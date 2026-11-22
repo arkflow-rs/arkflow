@@ -34,6 +34,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
+use crate::DELIVERY_CHANNEL_CAPACITY;
 
 /// How long the consumer task may hold the shared consumer mutex while
 /// waiting for the next message. `PulsarAck::ack` needs the same mutex
@@ -111,7 +112,7 @@ impl PulsarInput {
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
         let cancellation_token = CancellationToken::new();
-        let (sender, receiver) = flume::bounded::<Delivery>(1000);
+        let (sender, receiver) = flume::bounded::<Delivery>(DELIVERY_CHANNEL_CAPACITY);
         Ok(Self {
             input_name: name.map(str::to_string),
             config,
@@ -154,8 +155,6 @@ impl Input for PulsarInput {
         if let Some(ref retry_config) = self.config.retry_config {
             PulsarConfigValidator::validate_retry_config(retry_config)?;
         }
-
-        let _retry_config = self.config.retry_config.clone().unwrap_or_default();
 
         // Connect to Pulsar
         let client = builder
@@ -328,11 +327,14 @@ impl Input for PulsarInput {
                                                 }
                                                 _ = tokio::time::sleep(delay) => {}
                                             }
-                                            delay = std::time::Duration::from_millis(
-                                                (delay.as_millis() as f64
-                                                    * retry_config.backoff_multiplier)
-                                                    .min(retry_config.max_delay_ms as f64)
-                                                    as u64,
+                                            // Shared backoff schedule
+                                            // (cap + optional jitter) —
+                                            // the receive loop itself stays
+                                            // select-aware for cancellation
+                                            // and the idle lock budget.
+                                            delay = crate::retry::backoff_after(
+                                                delay,
+                                                &retry_config,
                                             );
                                         }
                                         Err(_lock_budget_elapsed) => {

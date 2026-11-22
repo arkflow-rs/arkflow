@@ -35,6 +35,7 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
+use crate::DELIVERY_CHANNEL_CAPACITY;
 
 /// HTTP input configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +109,7 @@ impl HttpInput {
         config: HttpInputConfig,
         codec: Option<Arc<dyn Codec>>,
     ) -> Result<Self, Error> {
-        let (sender, receiver) = flume::bounded::<MessageBatch>(1000);
+        let (sender, receiver) = flume::bounded::<MessageBatch>(DELIVERY_CHANNEL_CAPACITY);
         let auth = config.auth.clone();
 
         Ok(Self {
