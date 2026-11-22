@@ -274,26 +274,45 @@ fn numeric_capacity_literal(normalized_call: &str) -> bool {
         .trim()
         .trim_end_matches(',')
         .trim();
-    let digits_end = arg.find(|c: char| !c.is_ascii_digit()).unwrap_or(arg.len());
-    if digits_end == 0 {
-        return false;
-    }
-    // Numeric literal with an optional type suffix (1024usize etc.).
-    matches!(
-        &arg[digits_end..],
-        "" | "usize"
-            | "isize"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-    )
+    let ty_suffix_ok = |suffix: &str| {
+        matches!(
+            suffix,
+            "" | "usize"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+        )
+    };
+    // Decimal, hex (0x), binary (0b) and octal (0o) literals with an
+    // optional type suffix (1024usize, 0x200usize, …).
+    let (digits, suffix) = if let Some(rest) = arg.strip_prefix("0x") {
+        let end = rest
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len());
+        (&rest[..end], rest[end..].trim())
+    } else if let Some(rest) = arg.strip_prefix("0b") {
+        let end = rest
+            .find(|c: char| c != '0' && c != '1')
+            .unwrap_or(rest.len());
+        (&rest[..end], rest[end..].trim())
+    } else if let Some(rest) = arg.strip_prefix("0o") {
+        let end = rest
+            .find(|c: char| !('0'..='7').contains(&c))
+            .unwrap_or(rest.len());
+        (&rest[..end], rest[end..].trim())
+    } else {
+        let end = arg.find(|c: char| !c.is_ascii_digit()).unwrap_or(arg.len());
+        (&arg[..end], arg[end..].trim())
+    };
+    !digits.is_empty() && ty_suffix_ok(suffix)
 }
 
 #[test]
@@ -308,6 +327,10 @@ fn numeric_capacity_literal_shapes() {
         "flume::bounded::<Delivery>(512,)",
         "flume::bounded::<Delivery>(1024usize)",
         "flume::bounded::<Delivery>(\n 1000,\n)",
+        "flume::bounded::<Delivery>(0x200)",
+        "flume::bounded::<Delivery>(0b100_0000_0000)",
+        "flume::bounded(0o2000)",
+        "flume::bounded::<Delivery>(0x200usize)",
     ] {
         assert!(numeric_capacity_literal(call), "must flag: {call}");
     }
