@@ -1,13 +1,13 @@
 ## 1. output 侧收编（机械替换保文案）
 
 - [x] 1.1 `output/influxdb.rs`：`flush()` 换 `retry_with_backoff_classified`（qdrant 式分类闭包：transport/429/5xx→retryable，其余 4xx→deterministic），错误文案逐字符不变，`max_attempts = retry_count.max(1)`（语义不变），消灭 `2_u64.pow` 溢出点；`test_flush_retries_then_succeeds`/`test_flush_server_error_retains_buffered_lines` 保绿
-- [x] 1.2 `output/http.rs`：`send()` 换 `retry_with_backoff_classified`（同上分类），错误文案与 64KiB 截断不变；`retry_count` 加 `#[serde(default)]` 默认 3（schema 同步）；`server_error_is_retried_then_reported` 保绿
+- [x] 1.2 `output/http.rs`：`send()` 换 `retry_with_backoff_classified`（同上分类），错误文案与 64KiB 截断不变；`retry_count` 加 `#[serde(default = "default_retry_count")]` 默认 3（与 D3 一致，schema 同步）；`server_error_is_retried_then_reported` 保绿
 - [x] 1.3 `output/mqtt.rs`：`reconnect()` 换 `retry_with_backoff` + 常量 `RetryConfig{3, 1000, 4000, 2.0}`（调度逐字节复现 1s/2s），`RECONNECT_ATTEMPTS` 与最终错误文案保留，修正 188 行 "1s, 2s, 4s" 失真注释
 
 ## 2. input 侧收编（pulsar 式保循环）
 
-- [x] 2.1 `input/kafka.rs`：`settle_tombstone` 保循环形态与取消检查、自定义 `warn!` 不变，延迟换共享 `advance_backoff`/`sleep_duration` + 常量 `RetryConfig{4, 200, 5000, 2.0}`（曲线 200/400/800/1600）
-- [x] 2.2 `input/kafka.rs`：restore seek 的手写 `(200ms×attempt).min(1s)` 换共享 `sleep_duration`（本地常量 `RetryConfig{initial 200, cap 1000, ×2.0}`），deadline 循环形态不变
+- [x] 2.1 `input/kafka.rs`：`settle_tombstone` 保循环形态与取消检查（sleep 后追加复查）、自定义 `warn!` 不变，延迟换共享 `advance_backoff`/`sleep_duration` + 常量 `RetryConfig{4, 200, 5000, 2.0}`（尝试间退避 200/400/800，末次失败不再空睡）
+- [x] 2.2 `input/kafka.rs`：restore seek 的手写 `(200ms×attempt).min(1s)` 换共享 `sleep_duration`（本地常量 `RetryConfig{initial 200, cap 1000, ×2.0}`），deadline 循环形态不变；等待钳制到剩余预算、醒后复查 deadline（超则透传末次 seek 错误）
 - [x] 2.3 `input/nats.rs`：删除 296/308 两处死 sleep 与失真注释；批内逐条错误分支改「单发 `Delivery::Err(Disconnection)` 后 break」，对齐 spawned loop 形态；`jetstream_fetch_loop_pins_a_bounded_expires` 保绿
 
 ## 3. 骨架卫生

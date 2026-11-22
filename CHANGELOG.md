@@ -246,8 +246,11 @@ aligned to it, two of which change runtime behavior:
   unchanged.
 - NATS input: the JetStream pre-warm path no longer sleeps 100 ms after
   reporting a `Disconnection` (no retry followed the sleep — the engine
-  owns reconnection), and a batch with a decode failure now surfaces one
-  `Disconnection` instead of one per undecodable message.
+  owns reconnection), and a JetStream **receive error** now stops the
+  pre-warm batch after surfacing one `Disconnection` instead of one per
+  failed message. Codec decode failures keep their original behavior: the
+  codec error is queued per message and the batch continues, so operators
+  can tell a bad payload from a connection failure.
 
 ### Fixed — Engine and control plane
 

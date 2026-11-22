@@ -26,7 +26,7 @@
 
 ### D5 — kafka `settle_tombstone` 走 pulsar 式保循环（D4 教训的镜像）
 
-该循环的「sleep 前 `close.is_cancelled()` 检查」是 detached 任务的取消安全语义，整体 `retry_with_backoff` 包裹会丢失它（close 后多睡一轮）。保留 `for` 循环形态与自定义 `warn!`，仅把手写 `200*(attempt+1)` 换成共享 `advance_backoff`/`sleep_duration` + 常量 `RetryConfig { max_attempts: 4, initial_delay_ms: 200, backoff_multiplier: 2.0, max_delay_ms: 5000 }`——延迟序列 200/400/600/800 → 200/400/800/1600（**行为变化，spec 声明**）。**否决**整体包裹（丢取消检查）与新增配置字段（内部结算细节，配置面收益低——Non-goal）。
+该循环的「sleep 前 `close.is_cancelled()` 检查」是 detached 任务的取消安全语义，整体 `retry_with_backoff` 包裹会丢失它（close 后多睡一轮）。保留 `for` 循环形态与自定义 `warn!`，仅把手写 `200*(attempt+1)` 换成共享 `advance_backoff`/`sleep_duration` + 常量 `RetryConfig { max_attempts: 4, initial_delay_ms: 200, backoff_multiplier: 2.0, max_delay_ms: 5000 }`——尝试间退避 200/400/800（**实施修订（CodeRabbit 评审）**：末次失败后不再空睡一拍再告警——旧线性循环的尾睡眠本就无意义，指数化只会放大它；且 sleep 醒来后追加取消复查，close 不再触发第五次语义上的 ack 尝试）。**否决**整体包裹（丢取消检查）与新增配置字段（内部结算细节，配置面收益低——Non-goal）。
 
 ### D6 — kafka restore seek：只换延迟公式，不动 deadline 形态
 

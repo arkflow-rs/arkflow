@@ -219,13 +219,20 @@ impl HttpOutput {
         // code …, response: …").
         enum Fail {
             Transport(String),
-            Status(u16, String),
+            // `StatusCode` (not `u16`) keeps the reason phrase in the
+            // returned message byte-identical to the pre-retry single-shot
+            // path ("Status code 404 Not Found, response: …").
+            Status(reqwest::StatusCode, String),
         }
         impl std::fmt::Display for Fail {
+            // Retry-log safety: intermediate attempts may be followed by a
+            // success, so the per-attempt warning must not carry the
+            // response body (it can echo submitted records). Only the
+            // FINAL returned error exposes the body, via `map_err` below.
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
                     Fail::Transport(e) => write!(f, "{e}"),
-                    Fail::Status(code, body) => write!(f, "Status code {code}, response: {body}"),
+                    Fail::Status(code, _) => write!(f, "status {code}"),
                 }
             }
         }
@@ -273,7 +280,7 @@ impl HttpOutput {
                                 body.push_str("…(truncated)");
                             }
                             Err(crate::retry::OperationError {
-                                error: Fail::Status(status.as_u16(), body),
+                                error: Fail::Status(status, body),
                                 retryable: crate::retry::is_retryable_status(status.as_u16()),
                             })
                         }
@@ -540,7 +547,8 @@ mod tests {
         let output = build(config)?;
         output.connect().await?;
         let err = output.write(batch()).await.unwrap_err();
-        assert!(err.to_string().contains("404"), "{err}");
+        // Reason phrase included, byte-identical to the single-shot path.
+        assert!(err.to_string().contains("404 Not Found"), "{err}");
         assert_eq!(
             server.received_requests().await.unwrap_or_default().len(),
             1,

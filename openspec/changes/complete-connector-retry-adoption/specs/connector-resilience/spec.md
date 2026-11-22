@@ -10,7 +10,7 @@
 
 #### Scenario: 小次数退避间隔与既有场景一致
 - **WHEN** 组件配置 `retry_count: 2` 且第二次尝试即成功
-- **THEN** 两次尝试的间隔按指数退避（约 100ms、200ms），与既有「瞬时失败按退避重试」场景兼容
+- **THEN** 两次尝试之间恰有一次约 100ms 的指数退避等待，与既有「瞬时失败按退避重试」场景兼容
 
 #### Scenario: 4xx 确定性失败不重试
 - **WHEN** HTTP 组件收到 400/401/404 类响应
@@ -26,7 +26,7 @@
 
 #### Scenario: 采用方文件必须引用共享实现
 - **WHEN** 检查共享重试采用方清单（qdrant/milvus/http/influxdb/mqtt output、kafka/pulsar input、AI 四处理器）的源码
-- **THEN** 每个文件的 production 段含 `crate::retry` 引用，清单外文件出现手写退避循环时卫生测试失败
+- **THEN** 每个文件的 production 段含 `crate::retry` 引用；清单外文件由 pow 族检测与既有错误变体钉扎覆盖——通用手写循环检测被 D8 明确否决（轮询/ticker 误报不可接受），不在此场景承诺范围内
 
 #### Scenario: 长驻循环经共享调度保取消安全
 - **WHEN** mqtt output 懒重连、kafka input tombstone 结算或 restore seek 执行重试等待
