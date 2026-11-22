@@ -32,7 +32,7 @@ description: ArkFlow Embedding 处理器组件。
 
 暂态 HTTP 失败(429、5xx、连接错误)会按封顶指数退避重试(`retry_count`,默认 3);认证与其他 4xx 拒绝立即失败,解析/校验失败从不重试。
 
-API 调用失败(非 2xx)或响应不一致(向量数量或维度不匹配、输入文本为 null)都会以处理错误的形式暴露,因此在配置了 `error_output` 的流中,该批次会流向 `error_output`。该处理器不会重试嵌入请求——重试会使 API 开销成倍增加;请改用 `error_output` 或上游重投递。
+重试耗尽后的 API 调用失败(非 2xx)或响应不一致(向量数量或维度不匹配、输入文本为 null)都会以处理错误的形式暴露,因此在配置了 `error_output` 的流中,该批次会流向 `error_output`。需要单次尝试、不放大 API 开销时,设置 `retry_count: 0` 即可。
 
 ## 示例
 

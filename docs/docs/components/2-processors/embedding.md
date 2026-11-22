@@ -34,9 +34,9 @@ always bypass the system proxy.
 Transient HTTP failures (429, 5xx, connection errors) are retried with
 capped exponential backoff (`retry_count`, default 3); authentication and
 other 4xx rejections fail immediately, and parse/validation failures are
-never retried.
+not retried.
 
-A failed API call (non-2xx), an inconsistent response (vector count or dimension mismatch, null input text) surfaces as a processing error, so the batch flows to the stream's `error_output` when configured. The processor does not retry embedding requests — retries would multiply API spend; rely on `error_output` or upstream redelivery instead.
+A failed API call after retries are exhausted (non-2xx), an inconsistent response (vector count or dimension mismatch, null input text) surfaces as a processing error, so the batch flows to the stream's `error_output` when configured. Set `retry_count: 0` when you need single-attempt behavior without API-spend multiplication.
 
 ## Example
 

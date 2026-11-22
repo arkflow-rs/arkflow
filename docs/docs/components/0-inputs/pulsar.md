@@ -42,9 +42,10 @@ The Pulsar input subscribes to an Apache Pulsar topic and supports four subscrip
 | backoff_multiplier | number | yes | — | Exponential backoff multiplier |
 | jitter | number | no | `0` | De-correlation jitter as a fraction of the delay (0-1); the sleep never exceeds the un-jittered backoff |
 
-The configured policy governs the receive retry loop (attempts, delays and
-the 5s delay cap); cancellation during a backoff wait interrupts the wait
-immediately.
+The configured policy governs the receive retry loop (attempt count,
+delays, and the delay cap — `max_delay_ms` defaults to 5s but any value is
+valid, e.g. a 6s initial delay with a 12s cap); cancellation during a
+backoff wait interrupts the wait immediately.
 
 ### tls
 

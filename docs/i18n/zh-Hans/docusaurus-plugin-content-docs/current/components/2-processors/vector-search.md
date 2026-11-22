@@ -39,7 +39,7 @@ Qdrant 的 `id`、`score` 与 `payload`:
 
 :::note
 失败(非 2xx、缺少结果数组、查询向量为 null 或空)会使整个批次(Batch)
-失败并流向 `error_output`。该处理器不会重试;请合理设置 `concurrency`
+重试耗尽后失败并流向 `error_output`。暂态失败按 `retry_count` 重试(默认 3,`retry_count: 0` 关闭重试);请合理设置 `concurrency`
 以保持在速率限制之内。发往回环(loopback)端点的请求始终绕过系统代理。
 :::
 

@@ -92,25 +92,23 @@ fn apply_jitter(delay_ms: f64, jitter: f64, rng: impl Fn() -> f64) -> f64 {
     delay_ms * (1.0 - fraction)
 }
 
-/// Next backoff delay: exponential growth capped at `max_delay_ms`, then
-/// jittered. Multiplicative float arithmetic means no power overflow for
-/// any attempt count — arbitrary user-configured `max_attempts` values are
-/// safe (connector-resilience contract).
-fn next_delay(current_ms: f64, config: &RetryConfig, rng: impl Fn() -> f64) -> Duration {
-    let grown = current_ms * config.backoff_multiplier;
-    let capped = grown.min(config.max_delay_ms as f64);
-    let jittered = apply_jitter(capped, config.jitter, rng);
-    Duration::from_millis(jittered.max(0.0) as u64)
+/// Advance the backoff BASE after a sleep: exponential growth capped at
+/// `max_delay_ms`. Multiplicative float arithmetic means no power overflow
+/// for any attempt count — arbitrary user-configured `max_attempts` values
+/// are safe (connector-resilience contract). The base is tracked
+/// separately from the (possibly jittered) sleep duration so jitter can
+/// never compound into later delays.
+pub(crate) fn advance_backoff(base_ms: f64, config: &RetryConfig) -> f64 {
+    (base_ms * config.backoff_multiplier).min(config.max_delay_ms as f64)
 }
 
-/// Next backoff delay for loops that must stay select-aware (e.g. the
-/// Pulsar receive loop keeps cancellation and idle-budget branches alive
-/// during the sleep) and therefore cannot wrap their whole attempt in
-/// [`RetryUtils`]: same cap/jitter schedule as the shared implementations.
-pub(crate) fn backoff_after(current: Duration, config: &RetryConfig) -> Duration {
-    next_delay(current.as_millis() as f64, config, || {
-        rand::Rng::random(&mut rand::rng())
-    })
+/// The sleep duration for a backoff base: jitter applied, floored at zero.
+pub(crate) fn sleep_duration(
+    base_ms: f64,
+    config: &RetryConfig,
+    rng: impl Fn() -> f64,
+) -> Duration {
+    Duration::from_millis(apply_jitter(base_ms, config.jitter, rng).max(0.0) as u64)
 }
 
 /// Retry utility for retrying components.
@@ -139,7 +137,7 @@ impl RetryUtils {
             rand::Rng::random(&mut rand::rng())
         };
         let mut attempt = 0;
-        let mut current_ms = config.initial_delay_ms as f64;
+        let mut base_ms = config.initial_delay_ms as f64;
 
         loop {
             attempt += 1;
@@ -157,8 +155,11 @@ impl RetryUtils {
                         return Err(e);
                     }
 
-                    let delay = next_delay(current_ms, config, rng);
-                    current_ms = delay.as_millis() as f64;
+                    // The FIRST wait is exactly initial_delay_ms; jitter
+                    // applies to this sleep only and never compounds into
+                    // later delays (the base advances independently).
+                    let delay = sleep_duration(base_ms, config, rng);
+                    base_ms = advance_backoff(base_ms, config);
 
                     tracing::warn!(
                         "Attempt {} for {} failed, retrying in {:?}: {}",
@@ -197,7 +198,7 @@ impl RetryUtils {
             rand::Rng::random(&mut rand::rng())
         };
         let mut attempt = 0;
-        let mut current_ms = config.initial_delay_ms as f64;
+        let mut base_ms = config.initial_delay_ms as f64;
 
         loop {
             attempt += 1;
@@ -229,8 +230,11 @@ impl RetryUtils {
                         return Err(error);
                     }
 
-                    let delay = next_delay(current_ms, config, rng);
-                    current_ms = delay.as_millis() as f64;
+                    // The FIRST wait is exactly initial_delay_ms; jitter
+                    // applies to this sleep only and never compounds into
+                    // later delays (the base advances independently).
+                    let delay = sleep_duration(base_ms, config, rng);
+                    base_ms = advance_backoff(base_ms, config);
 
                     tracing::warn!(
                         "Attempt {} for {} failed, retrying in {:?}: {}",
@@ -264,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn backoff_delay_caps_and_never_overflows() {
+    fn backoff_base_caps_and_never_overflows() {
         let config = RetryConfig {
             max_attempts: 10_000,
             initial_delay_ms: 100,
@@ -272,14 +276,40 @@ mod tests {
             backoff_multiplier: 2.0,
             jitter: 0.0,
         };
-        // Walk the recurrence far past any sane attempt count: the delay
+        // Walk the recurrence far past any sane attempt count: the base
         // saturates at max_delay_ms and the u64 conversion cannot overflow.
-        let mut current = config.initial_delay_ms as f64;
+        let mut base = config.initial_delay_ms as f64;
         for _ in 0..100 {
-            current = next_delay(current, &config, || 0.0).as_millis() as f64;
-            assert!(current <= 5_000.0);
+            base = advance_backoff(base, &config);
+            assert!(base <= 5_000.0);
         }
-        assert_eq!(current, 5_000.0);
+        assert_eq!(base, 5_000.0);
+    }
+
+    #[test]
+    fn first_sleep_is_the_initial_delay_and_jitter_never_compounds() {
+        let config = RetryConfig {
+            max_attempts: 10,
+            initial_delay_ms: 100,
+            max_delay_ms: 5_000,
+            backoff_multiplier: 2.0,
+            jitter: 1.0,
+        };
+        // Sleep 1 is exactly the initial delay…
+        // (0.5 keeps the float math exact: 100 x (1 - 0.5) = 50)
+        assert_eq!(
+            sleep_duration(config.initial_delay_ms as f64, &config, || 0.5).as_millis(),
+            50
+        );
+        // …and a shrunk sleep never shrinks the next base: an unlucky 0 ms
+        // draw cannot collapse the whole remaining schedule.
+        let base_after_sleep = advance_backoff(100.0, &config);
+        assert_eq!(base_after_sleep, 200.0);
+        assert_eq!(
+            sleep_duration(base_after_sleep, &config, || 0.999).as_millis(),
+            0
+        );
+        assert_eq!(advance_backoff(base_after_sleep, &config), 400.0);
     }
 
     #[test]

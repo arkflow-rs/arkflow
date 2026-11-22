@@ -170,6 +170,12 @@ impl QdrantOutput {
             request = request.bearer_auth(key);
         }
         let request = crate::http_util::apply_headers(request, self.config.headers.as_ref());
+        // Materialize construction errors (e.g. an invalid header value)
+        // before the retry loop: try_clone on an error-state builder
+        // returns None, which would mask the real reason.
+        let built = request
+            .build()
+            .map_err(|e| Error::Connection(format!("Qdrant request failed: {e}")))?;
 
         // `retry_count` names the RETRIES, so max_attempts is one more than
         // it (the shared RetryUtils bound counts the initial attempt).
@@ -194,7 +200,7 @@ impl QdrantOutput {
 
         crate::retry::RetryUtils::retry_with_backoff_classified(
             || {
-                let cloned = request.try_clone();
+                let cloned = built.try_clone();
                 async move {
                     let request = match cloned {
                         Some(request) => request,
@@ -205,20 +211,39 @@ impl QdrantOutput {
                             });
                         }
                     };
-                    match request.send().await {
+                    match self.client.execute(request).await {
                         Ok(response) => {
                             let status = response.status();
-                            let body = response
-                                .text()
-                                .await
-                                .unwrap_or_else(|_| "<unreadable body>".to_string());
-                            let body = crate::http_util::truncate_body(&body).to_string();
+                            // A read failure on a 2xx means the write is
+                            // unconfirmed: retry it. Non-2xx bodies only
+                            // carry the error text.
+                            let body = if status.is_success() {
+                                match response.text().await {
+                                    Ok(body) => body,
+                                    Err(e) => {
+                                        error!("Qdrant upsert body read failed: {e}");
+                                        return Err(crate::retry::OperationError {
+                                            error: Fail::Transport(format!(
+                                                "response body read failed: {e}"
+                                            )),
+                                            retryable: true,
+                                        });
+                                    }
+                                }
+                            } else {
+                                response
+                                    .text()
+                                    .await
+                                    .unwrap_or_else(|_| "<unreadable body>".to_string())
+                            };
                             if status.is_success() {
                                 return Ok(());
                             }
-                            // Client errors are deterministic: retrying
-                            // cannot help (connector-resilience contract).
-                            let retryable = !status.is_client_error();
+                            let body = crate::http_util::truncate_body(&body).to_string();
+                            // Shared classifier (connector-resilience
+                            // contract): 429/5xx transient, other 4xx
+                            // deterministic.
+                            let retryable = crate::retry::is_retryable_status(status.as_u16());
                             if !retryable {
                                 error!("Qdrant upsert rejected: {status} {body}");
                             } else {

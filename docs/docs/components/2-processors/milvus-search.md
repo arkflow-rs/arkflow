@@ -39,8 +39,9 @@ and `payload` (the configured field's object):
 :::note
 Failures (HTTP errors, Milvus `code != 0`, result groups not matching the
 input row count, null/empty query vectors) fail the batch into
-`error_output`. The processor does not retry. Requests to loopback
-endpoints always bypass the system proxy.
+`error_output`. Transient failures retry per `retry_count` (default 3;
+`retry_count: 0` disables retrying). Requests to loopback endpoints
+always bypass the system proxy.
 :::
 
 Transient HTTP failures (429, 5xx, connection errors) are retried with

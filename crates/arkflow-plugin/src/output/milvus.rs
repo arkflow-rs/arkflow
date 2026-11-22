@@ -258,9 +258,10 @@ impl MilvusOutput {
                                 }
                             } else {
                                 let body = crate::http_util::truncate_body(&body).to_string();
-                                // Client errors are deterministic: retrying
-                                // cannot help (connector-resilience contract).
-                                let retryable = !status.is_client_error();
+                                // Shared classifier (connector-resilience
+                                // contract): 429/5xx transient, other 4xx
+                                // deterministic.
+                                let retryable = crate::retry::is_retryable_status(status.as_u16());
                                 if retryable {
                                     error!("Milvus upsert attempt failed: {status} {body}");
                                 }

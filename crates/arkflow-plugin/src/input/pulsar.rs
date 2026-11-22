@@ -249,6 +249,11 @@ impl Input for PulsarInput {
                                 // observes no message is NOT a stream end:
                                 // keep polling without consuming an attempt.
                                 let mut attempts = 0u32;
+                                // Backoff BASE (capped, unjittered) tracked
+                                // separately from the jittered sleep so a
+                                // shrunk sleep never compounds into later
+                                // waits.
+                                let mut backoff_base_ms = retry_config.initial_delay_ms as f64;
                                 let mut delay = std::time::Duration::from_millis(
                                     retry_config.initial_delay_ms,
                                 );
@@ -332,9 +337,14 @@ impl Input for PulsarInput {
                                             // the receive loop itself stays
                                             // select-aware for cancellation
                                             // and the idle lock budget.
-                                            delay = crate::retry::backoff_after(
-                                                delay,
+                                            backoff_base_ms = crate::retry::advance_backoff(
+                                                backoff_base_ms,
                                                 &retry_config,
+                                            );
+                                            delay = crate::retry::sleep_duration(
+                                                backoff_base_ms,
+                                                &retry_config,
+                                                || rand::Rng::random(&mut rand::rng()),
                                             );
                                         }
                                         Err(_lock_budget_elapsed) => {

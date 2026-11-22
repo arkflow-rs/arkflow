@@ -33,10 +33,12 @@ It pairs naturally with [SQL](/docs/components/processors/sql) (prepare the prom
 
 :::note
 Each row is one request (the chat protocol has no batch form). The first
-row failure short-circuits the batch — in-flight requests are dropped
-rather than awaited — and the batch flows to `error_output` as a whole. The processor does not retry
-LLM calls; size `concurrency` and upstream batches to stay within rate
-limits. Requests to loopback endpoints always bypass the system proxy.
+deterministic row failure (4xx, parse errors — or retries exhausted)
+short-circuits the batch — in-flight requests are dropped
+rather than awaited — and the batch flows to `error_output` as a whole.
+Transient failures retry per `retry_count` (default 3; `retry_count: 0`
+disables retrying); size `concurrency` and upstream batches to stay
+within rate limits. Requests to loopback endpoints always bypass the system proxy.
 :::
 
 Transient HTTP failures (429, 5xx, connection errors) are retried with
