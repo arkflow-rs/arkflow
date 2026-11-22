@@ -263,16 +263,37 @@ async fn redis_output_write_before_connect_is_connection_error() {
 /// multi-line calls are covered; `1_024` separators are stripped, so any
 /// numeric form fails while `DELIVERY_CHANNEL_CAPACITY` passes.
 fn numeric_capacity_literal(normalized_call: &str) -> bool {
-    let arg = normalized_call
+    let stripped = normalized_call.replace('_', "");
+    let arg = stripped
         .split('(')
         .nth(1)
         .unwrap_or("")
         .split(')')
         .next()
         .unwrap_or("")
-        .replace('_', "");
-    let arg = arg.trim();
-    !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit())
+        .trim()
+        .trim_end_matches(',')
+        .trim();
+    let digits_end = arg.find(|c: char| !c.is_ascii_digit()).unwrap_or(arg.len());
+    if digits_end == 0 {
+        return false;
+    }
+    // Numeric literal with an optional type suffix (1024usize etc.).
+    matches!(
+        &arg[digits_end..],
+        "" | "usize"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+    )
 }
 
 #[test]
@@ -284,6 +305,9 @@ fn numeric_capacity_literal_shapes() {
         "flume::bounded(512)",
         "flume::bounded(1024)",
         "flume::bounded::<Vec<u8>>( 1000 )",
+        "flume::bounded::<Delivery>(512,)",
+        "flume::bounded::<Delivery>(1024usize)",
+        "flume::bounded::<Delivery>(\n 1000,\n)",
     ] {
         assert!(numeric_capacity_literal(call), "must flag: {call}");
     }
@@ -305,14 +329,29 @@ fn input_delivery_channels_use_the_shared_capacity() {
     // newline-normalized first so multi-line calls are covered.
     let mut report = Vec::new();
     for (file, source) in rust_files(&plugin_src_dir("input")) {
-        let section = production_section(&source).replace(['\n', '\r'], " ");
+        // Normalize newlines to spaces but remember each original line's
+        // offset in the normalized text so violations report real lines.
+        let section = production_section(&source);
+        let mut normalized = String::with_capacity(section.len());
+        let mut line_starts: Vec<usize> = Vec::new();
+        for line in section.split_inclusive('\n') {
+            line_starts.push(normalized.len());
+            normalized.push_str(line.trim_end_matches('\n'));
+            normalized.push(' ');
+        }
         let mut idx = 0;
-        while let Some(found) = section[idx..].find("flume::bounded") {
+        while let Some(found) = normalized[idx..].find("flume::bounded") {
             let start = idx + found;
-            let call: String = section[start..].chars().take_while(|c| *c != ';').collect();
+            let call: String = normalized[start..]
+                .chars()
+                .take_while(|c| *c != ';')
+                .collect();
             if numeric_capacity_literal(&call) {
-                let line_no = section[..start].matches('\n').count() + 1;
-                report.push(format!("{file}:~{line_no}: {call}"));
+                let line_no = line_starts
+                    .iter()
+                    .rposition(|off| *off <= start)
+                    .map_or(1, |pos| pos + 1);
+                report.push(format!("{file}:{line_no}: {}", call.trim()));
             }
             idx = start + "flume::bounded".len();
         }

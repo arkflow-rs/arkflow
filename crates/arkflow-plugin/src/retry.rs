@@ -441,6 +441,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classified_loop_oversized_initial_delay_respects_the_cap() {
+        let config = RetryConfig {
+            max_attempts: 2,
+            initial_delay_ms: 10_000,
+            max_delay_ms: 100,
+            backoff_multiplier: 2.0,
+            jitter: 0.0,
+        };
+        let start = std::time::Instant::now();
+        let result: Result<(), String> = RetryUtils::retry_with_backoff_classified(
+            || {
+                std::future::ready(Err(crate::retry::OperationError {
+                    error: "503".to_string(),
+                    retryable: true,
+                }))
+            },
+            &config,
+            "classified cap probe",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(2_000),
+            "classified loop must clamp the oversized initial delay: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn any_attempt_count_is_safe_from_overflow() {
         // Spec: retry_count: 64 (or any value) must not panic or wrap.
         let config = RetryConfig {
