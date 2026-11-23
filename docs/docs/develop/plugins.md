@@ -162,6 +162,10 @@ these pass:
    This refreshes `docs/reference/component-inventory.json` and
    `docs/static/config-schema.json` from your `ComponentMetadata` (description,
    config schema, config example), so keep them meaningful.
+   The schema itself is checked: `metadata_conformance.rs` compares it
+   with the config struct your builder deserializes (fields, `required`,
+   `default`, enum values), so add a `CONFIG_TYPES` row there for a new
+   component and keep the schema equal to what serde accepts.
 2. **Declare page ownership** — add or update a page under
    `docs/docs/components/` with front matter naming your component:
    ```text
@@ -183,6 +187,7 @@ these pass:
 - [ ] Trait implemented (`async_trait`, `MessageBatch` in/out).
 - [ ] Builder parses config defensively; errors name the field.
 - [ ] Registered with the exact YAML `type:` name + metadata with description, schema, example.
+- [ ] `CONFIG_TYPES` row in `crates/arkflow-plugin/tests/metadata_conformance.rs`: the schema matches the config struct (fields, `required`, `default`, enum values).
 - [ ] `init()` listed in the kind's `register_components()` (e.g. `crates/arkflow-plugin/src/output/mod.rs`).
 - [ ] Inventory regenerated (`ARKFLOW_REGENERATE_DOCS=1 ...`).
 - [ ] Component page with `components:` ownership front matter.

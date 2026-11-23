@@ -272,6 +272,66 @@ aligned to it, two of which change runtime behavior:
   naming all three values, when `appVersion`, the workspace version, and
   the release tag diverge.
 
+### Added — Component metadata
+
+- A conformance gate (`crates/arkflow-plugin/tests/metadata_conformance.rs`)
+  checks every registered component schema against the config struct its
+  builder deserializes: field coverage in both directions, `required`,
+  `default`, and string-enum values, following `#[serde(flatten)]`, nested
+  objects and arrays, and serde's externally, internally, and untagged enum
+  layouts. The struct is read from source, so the field list cannot go
+  stale; every component with a schema must be mapped, and the two exemption
+  lists (`HIDDEN_FIELDS`, `BUILDER_REQUIRED`) fail the gate once an entry is
+  no longer needed.
+
+### Changed — Component metadata
+
+The gate found drift in ten components; the IDE-facing schema and the
+committed inventory now match what serde accepts:
+
+- `kafka` input: `transactional_offsets` is in the schema (the IDE no longer
+  rejects it), and omitting `start_from_latest` now means `false` — the
+  default the schema always advertised — instead of failing with a
+  missing-field error.
+- `pulsar` input and output: the `tls` block (`certificate_chain_file`,
+  `hostname_verification`) is in the schema. The input's
+  `subscription_type` lists the values serde accepts (`exclusive`, `shared`,
+  `failover`, `key_shared`; the capitalized spellings it listed were
+  rejected at runtime).
+- `milvus_search`: `concurrency` is in the schema.
+- `http` input: the schema no longer documents `method` and `interval` —
+  the polling client mode does not exist — and a config carrying either key
+  now fails at build with an explanatory error instead of being silently
+  ignored while the input runs as a server.
+- `http` output: omitting `method` means `POST` (the advertised default);
+  `timeout_ms` is marked required, as serde requires it.
+- `kafka` output: `compression` no longer offers `zstd`, which the enum
+  never accepted. `nats` output: the `jet_stream` mode no longer documents
+  a required `stream` key that nothing reads.
+- The `session_window` and `tumbling_window` buffers mark the `join`
+  block's `query` and `codec` as required; the `schema_registry` codec marks
+  `auth.type` as required. The `redis` input description no longer claims
+  stream consumer groups, and the `http` input description no longer
+  advertises polling.
+
+### Security — SQL output
+
+- Every identifier the `sql` output writes into SQL text is quoted for the
+  target dialect with embedded quotes doubled: column names, `upsert_keys`,
+  conflict assignments, and the table. Column names come from the batch
+  schema and may be inferred from data; a name containing quotes, backticks,
+  or `); DROP TABLE …; --` is written as that single identifier instead of
+  being able to change the statement.
+- `table_name` is quoted one dot-separated part at a time, so
+  `analytics.events` keeps working: a bare part resolves exactly like the
+  unquoted identifier it replaces (folded to lower case on PostgreSQL), and
+  a part already written in the dialect's quotes is kept verbatim. A
+  malformed name (empty part, unclosed quote, text after a closing quote,
+  NUL byte) fails when the output is built, so `--validate` reports it. A
+  column name containing a NUL byte fails the write.
+- The pgvector output and `pgvector_search` share the same implementation;
+  their generated SQL is unchanged.
+
 ### Fixed — Engine and control plane
 
 - The in-memory Hub no longer lets a settled Job observation roll a

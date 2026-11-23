@@ -90,6 +90,7 @@ fn init() -> Result<(), Error> {
    ARKFLOW_REGENERATE_DOCS=1 cargo test -p arkflow-plugin --test docs_inventory_snapshot
    ```
    这会依据你的 `ComponentMetadata`(描述、配置 schema、配置示例)刷新 `docs/reference/component-inventory.json` 与 `docs/static/config-schema.json`,所以请让它们保持有意义。
+   schema 本身也会被校验:`metadata_conformance.rs` 会把它与你的 builder 反序列化的配置结构体逐项比对(字段、`required`、`default`、枚举取值),因此新增组件时请在那里加一行 `CONFIG_TYPES`,并让 schema 与 serde 实际接受的内容保持一致。
 2. **声明页面归属** —— 在 `docs/docs/components/` 下新增或更新页面,并在 front matter 中声明你的组件:
    ```text
    ---
@@ -105,6 +106,7 @@ fn init() -> Result<(), Error> {
 - [ ] trait 已实现(`async_trait`,输入输出为 `MessageBatch`)。
 - [ ] builder 防御性地解析配置;错误信息指明字段。
 - [ ] 以准确的 YAML `type:` 名称注册 + 带描述、schema、示例的元数据。
+- [ ] 已在 `crates/arkflow-plugin/tests/metadata_conformance.rs` 添加 `CONFIG_TYPES` 行:schema 与配置结构体一致(字段、`required`、`default`、枚举取值)。
 - [ ] `init()` 已列入该类别的 `register_components()` 列表(如 `crates/arkflow-plugin/src/output/mod.rs`)。
 - [ ] 清单已重新生成(`ARKFLOW_REGENERATE_DOCS=1 ...`)。
 - [ ] 组件页面带 `components:` 归属 front matter。

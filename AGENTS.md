@@ -54,6 +54,7 @@ CI requires the protobuf compiler (`protoc` on PATH). Rust 1.97+ (`rust-version`
 2. Register via `register_*_builder()` in the plugin's `init()`.
 3. Call that `init()` from the kind's `init()` in the plugin's `mod.rs` (wired from `crates/arkflow/src/main.rs`).
 4. Add an example YAML under `examples/` **and register it in `docs/reference/example-manifest.json`**, add the component docs page with `components:` front matter, and add the type-name bullet to both READMEs' `README_COMPONENTS:<kind>` lists; all of these are CI-checked.
+5. Add a `CONFIG_TYPES` row in `crates/arkflow-plugin/tests/metadata_conformance.rs`: that gate checks the registered schema against the config struct the builder deserializes (fields, `required`, `default`, enum values), so a hand-written schema cannot drift from serde.
 
 ## Conventions
 

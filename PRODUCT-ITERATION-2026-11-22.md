@@ -157,7 +157,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 **建议 change**：`fix-docs-truth-2026-11`。
 
-#### PA-P1-03 组件元数据与 serde 字段漂移 · 已复核
+#### PA-P1-03 组件元数据与 serde 字段漂移 · ✅ 已实施并归档（`add-component-metadata-conformance`，2026-11-23）
 
 **现象**：
 - Kafka input 的 `transactional_offsets`（L3 核心开关）不在自身 metadata schema 中，而 schema 是 `additionalProperties: false`，IDE 会拒绝合法字段（[kafka.rs:1539](crates/arkflow-plugin/src/input/kafka.rs:1539)）。
@@ -177,7 +177,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 **建议 change**：`add-component-metadata-conformance`。
 
-#### PA-P1-04 SQL output 标识符未转义 · 已复核
+#### PA-P1-04 SQL output 标识符未转义 · ✅ 已实施并归档（`harden-sql-output-identifiers`，2026-11-23）
 
 **现象**：MySQL 用反引号、Postgres 用双引号包裹列名，但不转义内嵌引号；表名直接拼接。列名可来自 JSON 推断（潜在不可信输入）。pgvector 已有 `escape_identifier`，SQL output 未复用（[output/sql.rs:242](crates/arkflow-plugin/src/output/sql.rs:242)、[vector_util.rs:197](crates/arkflow-plugin/src/vector_util.rs:197)）。
 
@@ -335,10 +335,12 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 | 顺序 | 事项 | 验收 | 产出 |
 | --- | --- | --- | --- |
 | ~~1~~ | ~~PA-P1-02 文档真相~~ ✅ 已实施（PR #1392）：CLAUDE.md 指针化、插件指南 doctest 门禁、Helm appVersion 门禁 | CLAUDE.md/插件指南/Helm 一致 | `fix-docs-truth-2026-11` |
-| 2 | PA-P1-03 元数据一致性 | conformance 测试红/绿可控 | `add-component-metadata-conformance` |
-| 3 | PA-P1-04 SQL 标识符 | 注入用例通过 | `harden-sql-output-identifiers` |
+| ~~2~~ | ~~PA-P1-03 元数据一致性~~ ✅ 已实施（change `add-component-metadata-conformance`）：注册表 schema 与 serde 配置结构体的机械门禁（字段双向覆盖、`required`、`default`、枚举取值），并修掉它在 10 个组件里查出的漂移 | conformance 测试红/绿可控（13 个真实突变场景逐一验证） | `add-component-metadata-conformance` |
+| ~~3~~ | ~~PA-P1-04 SQL 标识符~~ ✅ 已实施（change `harden-sql-output-identifiers`）：列名、upsert key、表名全部按方言加引号转义，表名逐段解析 | 注入用例通过（真实 PostgreSQL + MySQL 往返验证） | `harden-sql-output-identifiers` |
 
 **退出标准**：以上 3 项归档；`cargo test --workspace --all-targets`、`pnpm docs:check`、console 五件套全绿；CHANGELOG 更新。
+
+**2026-11-23 更新**：迭代 1 三项全部实施并归档。门禁落地后查出的漂移比原登记多——除 `transactional_offsets` 与 Redis 描述外，还有 pulsar input/output 的 `tls`、milvus_search 的 `concurrency`、http input 的幽灵键 `method`/`interval`、三处 serde 根本不接受的枚举取值、两处"名义默认值"、若干 `required` 漂移，全部已修。
 
 ### 迭代 2：产品化（1-2 个月）
 
@@ -423,7 +425,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 | 构建 | 冷构建时间、default/minimal 二进制体积、feature 矩阵 | 未测 | 建立基线；minimal 体积/时间显著下降 |
 | 依赖 | `Cargo.lock` 包数、重复 arrow/datafusion/zstd | 1,021 包；已有单版本门禁 | feature 化后 default 锁包数下降并留档 |
 | 文档 | CLAUDE.md 一致性、插件指南可编译、Helm 版本一致 | 3 处漂移 | 3 条 CI 检查全绿 |
-| 元数据 | serde 字段 ⊆ metadata schema ⊆ inventory | 已知 2 处漂移 | conformance 测试全绿 |
+| 元数据 | serde 字段 ⊆ metadata schema ⊆ inventory | 登记 2 处漂移；门禁实测 26 处，已全修 | conformance 测试全绿（2026-11-23 达成） |
 | 可靠性 | EOS 忙循环回归、checkpoint 失败归因 | 回归测试已入库（2026-11-22，见 3.1，缺陷本身已否证） | 无 |
 | 安全 | 节点身份冒用测试、审计失败可观测、会话撤销 | 未覆盖 | 攻击/故障注入测试入库 |
 | 控制面 | 驱逐不伤 Running、rollout 目标上限 | 未覆盖 | 测试入库 |

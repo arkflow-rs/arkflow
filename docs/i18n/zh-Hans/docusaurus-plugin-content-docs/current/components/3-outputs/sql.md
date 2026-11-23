@@ -13,7 +13,7 @@ SQL 输出(Output)将记录批量插入 MySQL 或 PostgreSQL 数据库。每一�
 |-------|------|----------|---------|-------------|
 | type  | string | yes | — | 固定值 `"sql"` |
 | output_type | object | yes | — | 数据库驱动与连接设置(见下文)。 |
-| table_name | string | yes | — | 目标表名。 |
+| table_name | string | yes | — | 目标表。可带模式限定(`analytics.events`);见「标识符引用」。 |
 | upsert | boolean | no | `false` | 使用 upsert 而非普通插入。 |
 | upsert_keys | string[] | yes (if `upsert`) | — | 用作 upsert 冲突目标的列。 |
 
@@ -45,6 +45,17 @@ SQL 输出(Output)将记录批量插入 MySQL 或 PostgreSQL 数据库。每一�
 | root_cert | string | no | — | 根 CA 证书路径。 |
 | client_cert | string | no | — | 客户端证书路径。 |
 | client_key | string | no | — | 客户端私钥路径。 |
+
+## 标识符引用
+
+输出会把列名、`upsert_keys` 与表名写入 SQL 文本,因此每一个都按目标方言加引号——MySQL 使用反引号,PostgreSQL 使用双引号——嵌入的引号字符翻倍转义。列名取自批次(Batch)模式,可能由数据推断而来:名为 `a"b` 或 ``a`b`` 的字段(或恰好含有 `); DROP TABLE …; --` 的字段)会作为该单独的(名字古怪的)列写入,绝不会改变语句结构。
+
+`table_name` 可以带模式限定(`analytics.events`);每个以点分隔的部分各自加引号:
+
+- 未加引号的部分与其所替代的未加引号标识符行为一致:在 PostgreSQL 上折叠为小写(`Events` 指向表 `events`),在 MySQL 上保留大小写。
+- 已用该方言引号字符写出的部分原样使用(PostgreSQL 上 `analytics."Events"` 指向名为 `Events` 的表)。
+
+无法按此方式解读的 `table_name`——空段(`a..b`)、未闭合的引号、闭合引号之后的文本或 NUL 字节——会在输出构建时失败,错误信息指名 `table_name`(因此 `--validate` 会报告它)。含 NUL 字节的列名会使写入失败,错误信息指名该列。
 
 ## 示例
 
@@ -113,7 +124,7 @@ output:
 - 支持的列类型:Utf8、Boolean;`Int8`/`Int16`/`Int32`/`Int64`(统一以 i64 绑定);`UInt8`/`UInt16`/`UInt32`/`UInt64`(统一以 u64 绑定);`Float32`/`Float64`(统一以 f64 绑定);`Date32`/`Date64`(ISO 日期字符串)与任意单位的 `Timestamp`(RFC3339 字符串)。其他 Arrow 类型会被拒绝,错误信息指明列名与类型。
 - 配置 `codec` 会在构建期被拒绝:SQL 写入按类型化列绑定参数,无法消费编码后的字节。(PostgreSQL 无无符号整数;`UInt64` 仍按既有方式经驱动的有符号通道传递。)
 - `close()` 显式关闭数据库连接,而不是留给对象析构。
-- 标识符引用遵循各自方言:MySQL 使用反引号,PostgreSQL 使用双引号。
+- 标识符引用遵循各自方言并转义嵌入的引号;见上文「标识符引用」。
 - `upsert: true` 要求 `upsert_keys` 列表非空且无重复;违规会在配置加载时、流(Stream)启动之前被拒绝。
 - `upsert_keys` 列必须存在于传入批次(Batch)模式中,否则写入失败并报错。
 - 错误行为:写入失败会被分类——暂态传输失败(连接断开,SQLSTATE 类 `08`/`40`/`57`,连接数超限,MySQL 错误号 2006/2013)以 `Disconnection` 上报;确定性失败(语法、约束、类型错误)以 `Process` 上报。运行期连接失败上报 `Connection`;连接串本身非法仍上报 `Config`。
