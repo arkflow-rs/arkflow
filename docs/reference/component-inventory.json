@@ -2200,7 +2200,7 @@
           },
           "table_name": {
             "type": "string",
-            "description": "Destination table."
+            "description": "Destination table. May be schema-qualified (`analytics.events`): each dot-separated part is quoted as one identifier, and a part that needs unusual characters — or exact case on PostgreSQL — can be written already quoted (`\"Events\"`)."
           },
           "upsert": {
             "type": "boolean",

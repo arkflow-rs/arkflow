@@ -374,7 +374,7 @@ fn batch_rows(
     // lexer: quoting cannot make it safe, so the statement would fail at the
     // server in a confusing way. Refuse it before the transaction opens,
     // with an error that names the column.
-    for name in columns.iter().filter(|name| name.contains('\0')) {
+    if let Some(name) = columns.iter().find(|name| name.contains('\0')) {
         return Err(Error::Process(format!(
             "column name {name:?} contains a NUL byte and cannot be written as a SQL identifier"
         )));
@@ -1133,8 +1133,7 @@ mod tests {
         .unwrap();
         let batch = MessageBatch::new_arrow(batch);
         let error = batch_rows(&postgres_config(false, None), &batch)
-            .err()
-            .expect("a NUL-bearing column name is refused");
+            .expect_err("a NUL-bearing column name is refused");
         assert!(error.to_string().contains("NUL"), "{error}");
     }
 

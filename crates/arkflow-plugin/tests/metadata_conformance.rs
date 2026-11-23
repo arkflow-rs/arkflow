@@ -1121,11 +1121,8 @@ impl Index {
         ];
         let mut t = ty.trim();
         let mut array = false;
-        loop {
-            let Some((prefix, is_array)) = PEEL.iter().find(|(prefix, _)| t.starts_with(*prefix))
-            else {
-                break;
-            };
+        while let Some((prefix, is_array)) = PEEL.iter().find(|(prefix, _)| t.starts_with(*prefix))
+        {
             if !t.ends_with('>') {
                 break;
             }

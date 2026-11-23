@@ -2,7 +2,7 @@
 
 ### Requirement: 注册表元数据 SHALL 通过 serde 字段一致性门禁
 
-注册表中每个带配置 schema 的组件 SHALL 由 CI 结构测试对照其真实配置结构体（含 `#[serde(flatten)]` 与嵌套类型）校验，测试从源码解析 serde 实际接受的字段名、必填性与默认属性，并按以下规则比对 schema：在声明 `additionalProperties: false` 的节点上，serde 接受的每个输入字段 MUST 出现在 `properties` 中；schema `properties` 中的每个键 MUST 是 serde 接受的字段（MUST NOT 宣告结构体不读取的键）；schema `required` 中的每个键 MUST 是 serde 自身必填的字段，或经带理由的豁免清单登记为"由 builder 强制"；serde 自身必填的每个字段 MUST 出现在 schema `required` 中；声明了 `default` 的属性 MUST 对应 serde 可省略的字段。每个注册组件 MUST 被该测试覆盖（无配置的 unit 组件除外）。豁免 SHALL 仅经显式清单（刻意隐藏的内部字段、builder 强制的必填字段），且豁免条目在其不再适用时 MUST 使测试失败。
+注册表中每个带配置 schema 的组件 SHALL 由 CI 结构测试对照其真实配置结构体（含 `#[serde(flatten)]` 与嵌套类型）校验，测试从源码解析 serde 实际接受的字段名、必填性与默认属性，并按以下规则比对 schema：在声明 `additionalProperties: false` 的节点上，serde 接受的每个输入字段 MUST 出现在 `properties` 中；schema `properties` 中的每个键 MUST 是 serde 接受的字段（MUST NOT 宣告结构体不读取的键）；schema `required` 中的每个键 MUST 是 serde 自身必填的字段，或经带理由的豁免清单登记为"由 builder 强制"；serde 自身必填的每个字段 MUST 出现在 schema `required` 中；声明了 `default` 的属性 MUST 对应 serde 可省略的字段；字符串枚举 schema 列出的取值 MUST 恰为 serde 接受的变体名，MUST NOT 列出 serde 拒绝的取值，也 MUST NOT 遗漏可接受的变体。每个注册组件 MUST 被该测试覆盖（无配置的 unit 组件除外）。豁免 SHALL 仅经显式清单（刻意隐藏的内部字段、builder 强制的必填字段），且豁免条目在其不再适用时 MUST 使测试失败。
 
 #### Scenario: 结构体新增字段未进 schema
 - **WHEN** 某组件配置结构体新增一个 serde 字段而注册 schema（`additionalProperties: false`）未声明该字段
@@ -20,6 +20,10 @@
 - **WHEN** schema 为某属性声明 `default` 而该字段在 serde 中不可省略
 - **THEN** 一致性测试失败，指名该字段
 
+#### Scenario: 枚举取值漂移
+- **WHEN** 字符串枚举 schema 列出 serde 不接受的取值（如大小写不符的 `Exclusive`）或遗漏某个可接受的变体
+- **THEN** 一致性测试失败，指名该取值或变体
+
 #### Scenario: 新组件未纳入门禁
 - **WHEN** 注册了一个带配置 schema 的新组件而未在一致性测试中登记其配置结构体
 - **THEN** 测试失败并列出未覆盖的组件，提示补登记
@@ -30,7 +34,7 @@
 
 #### Scenario: 修复后的注册表如实反映配置面
 - **WHEN** 查看 `kafka` input、`pulsar` input/output、`milvus_search` 的组件元数据
-- **THEN** schema 分别包含 `transactional_offsets`、`tls`、`concurrency`，且 `http` input schema 不含 `method`/`interval`
+- **THEN** schema 分别包含 `transactional_offsets`、`tls`、`concurrency`，`http` input schema 不含 `method`/`interval`，`pulsar` input 的 `subscription_type` 只列出 serde 接受的小写取值，`kafka` output 的 `compression` 不含 `zstd`
 
 ### Requirement: schema 承诺的默认值与移除键 SHALL 与实现一致
 
