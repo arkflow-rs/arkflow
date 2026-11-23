@@ -282,8 +282,17 @@ aligned to it, two of which change runtime behavior:
   layouts. The struct is read from source, so the field list cannot go
   stale; every component with a schema must be mapped, and the two exemption
   lists (`HIDDEN_FIELDS`, `BUILDER_REQUIRED`) fail the gate once an entry is
-  no longer needed. Generic field types such as `Expr<String>` are resolved
-  by name, so tagged-expression properties are checked too.
+  no longer needed, and a `BUILDER_REQUIRED` entry is probed through the
+  real builder (it must refuse a config without the key). Generic field
+  types such as `Expr<String>` are resolved by name, so tagged-expression
+  properties are checked too. An advertised default is compared with the
+  value serde produces (the type's zero, or the literal the default
+  function returns); a key demanded by only some `anyOf`/`oneOf` branches
+  does not count as required; a tag value that is not a decodable variant,
+  an untagged branch that demands less than any variant, a flattened type
+  the gate cannot read, and a mapped component with an opaque root schema
+  are all reported. serde's `rename_all` conversions — different for fields
+  and variants, and ASCII-only — are cross-checked against the real derive.
 - Example configs cover the newly documented fields: `pulsar_tls_example.yaml`
   (the Pulsar `tls` block on an input and an output) and `concurrency` in
   the `milvus_search` example.
@@ -296,7 +305,8 @@ committed inventory now match what serde accepts:
 - `kafka` input: `transactional_offsets` is in the schema (the IDE no longer
   rejects it), and omitting `start_from_latest` now means `false` — the
   default the schema always advertised — instead of failing with a
-  missing-field error.
+  missing-field error. A config that relies on this fails to build again on
+  the previous version: add `start_from_latest: false` before rolling back.
 - `pulsar` input and output: the `tls` block (`certificate_chain_file`,
   `hostname_verification`) is in the schema, and `certificate_chain_file` is
   described as what the driver does with it — the chain the broker
@@ -321,7 +331,9 @@ committed inventory now match what serde accepts:
   now fails at build with an explanatory error instead of being silently
   ignored while the input runs as a server.
 - `http` output: omitting `method` means `POST` (the advertised default);
-  `timeout_ms` is marked required, as serde requires it.
+  `timeout_ms` is marked required, as serde requires it. A config that
+  relies on this fails to build again on the previous version: add
+  `method: POST` before rolling back.
 - `kafka` output: `compression` no longer offers `zstd`, which the enum
   never accepted. `nats` output: the `jet_stream` mode no longer documents
   a required `stream` key that nothing reads.
