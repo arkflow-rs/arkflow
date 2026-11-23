@@ -335,8 +335,8 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 | 顺序 | 事项 | 验收 | 产出 |
 | --- | --- | --- | --- |
 | ~~1~~ | ~~PA-P1-02 文档真相~~ ✅ 已实施（PR #1392）：CLAUDE.md 指针化、插件指南 doctest 门禁、Helm appVersion 门禁 | CLAUDE.md/插件指南/Helm 一致 | `fix-docs-truth-2026-11` |
-| ~~2~~ | ~~PA-P1-03 元数据一致性~~ ✅ 已实施（change `add-component-metadata-conformance`）：注册表 schema 与 serde 配置结构体的机械门禁（字段双向覆盖、`required`、`default`、枚举取值），并修掉它在 10 个组件里查出的漂移 | conformance 测试红/绿可控（13 个真实突变场景逐一验证） | `add-component-metadata-conformance` |
-| ~~3~~ | ~~PA-P1-04 SQL 标识符~~ ✅ 已实施（change `harden-sql-output-identifiers`）：列名、upsert key、表名全部按方言加引号转义，表名逐段解析 | 注入用例通过（真实 PostgreSQL + MySQL 往返验证） | `harden-sql-output-identifiers` |
+| ~~2~~ | ~~PA-P1-03 元数据一致性~~ ✅ 已实施并归档（PR #1401，change `add-component-metadata-conformance`）：注册表 schema 与 serde 配置结构体的机械门禁（字段双向覆盖、`required`、`default`、枚举取值），并修掉它在 10 个组件里查出的漂移 | conformance 测试红/绿可控（13 个真实突变场景逐一验证） | `add-component-metadata-conformance` |
+| ~~3~~ | ~~PA-P1-04 SQL 标识符~~ ✅ 已实施并归档（PR #1401，change `harden-sql-output-identifiers`）：列名、upsert key、表名全部按方言加引号转义，表名逐段解析 | 注入用例通过（真实 PostgreSQL + MySQL 往返验证） | `harden-sql-output-identifiers` |
 
 **退出标准**：以上 3 项归档；`cargo test --workspace --all-targets`、`pnpm docs:check`、console 五件套全绿；CHANGELOG 更新。
 
