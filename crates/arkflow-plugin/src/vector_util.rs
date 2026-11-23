@@ -195,7 +195,7 @@ pub(crate) fn append_column(
 /// Quotes a SQL identifier and escapes embedded double quotes (`"` → `""`)
 /// so identifiers cannot break out of the quoting.
 pub(crate) fn escape_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    crate::sql_ident::QuoteStyle::DoubleQuote.quote(name)
 }
 
 #[cfg(test)]

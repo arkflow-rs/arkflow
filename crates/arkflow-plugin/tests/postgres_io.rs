@@ -339,14 +339,16 @@ async fn sql_output_pg_write_upsert_and_readback() {
     assert_eq!(count(&mut admin, &table).await, 4);
 
     // Close is idempotent-ish: closing twice stays Ok, writing after close
-    // reports the disconnection instead of silently dropping data.
+    // reports the not-connected guard instead of silently dropping data.
+    // The guard is `Connection` (connector-resilience contract: a not-
+    // connected output has nothing to disconnect from).
     output.close().await.expect("close");
     assert!(output.close().await.is_ok(), "second close must succeed");
     let err = output
         .write(events_batch(vec![(5, "epsilon", 1.0, true, None)]))
         .await
         .expect_err("write after close must fail");
-    assert!(matches!(err, arkflow_core::Error::Disconnection), "{err:?}");
+    assert!(matches!(err, arkflow_core::Error::Connection(_)), "{err:?}");
 
     exec(&mut admin, &format!("DROP TABLE IF EXISTS {table}")).await;
 }
@@ -432,6 +434,197 @@ async fn sql_output_pg_batch_rolls_back_on_failure() {
     output.close().await.expect("close");
     upsert_output.close().await.expect("close upsert output");
     exec(&mut admin, &format!("DROP TABLE IF EXISTS {table}")).await;
+}
+
+/// Quotes `name` as one PostgreSQL identifier.
+fn pg_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// One row `(key, quoted, backticked, value)` under column names that would
+/// end the column list or open a string if they were interpolated raw.
+fn hostile_identifier_batch(
+    key: &str,
+    quoted: &str,
+    backticked: &str,
+    k: i64,
+    value: i64,
+) -> MessageBatchRef {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(key, DataType::Int64, false),
+        Field::new(quoted, DataType::Int64, false),
+        Field::new(backticked, DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![k])),
+        Arc::new(Int64Array::from(vec![k + 1])),
+        Arc::new(Int64Array::from(vec![k + 2])),
+        Arc::new(Int64Array::from(vec![value])),
+    ];
+    Arc::new(MessageBatch::new_arrow(
+        RecordBatch::try_new(schema, columns).unwrap(),
+    ))
+}
+
+/// A one-column `v` batch holding a single row.
+fn value_batch(value: i64) -> MessageBatchRef {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    Arc::new(MessageBatch::new_arrow(
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap(),
+    ))
+}
+
+/// Spec "标识符 SHALL 按方言加引号转义" (sql-output): a table and columns whose
+/// names carry quotes, backticks, and semicolons are written as single
+/// identifiers, an upsert replay stays idempotent, a schema-qualified table
+/// resolves one part at a time, a malformed name fails the build, and
+/// nothing else in the database moves.
+#[tokio::test]
+async fn sql_output_pg_quotes_hostile_identifiers() {
+    ensure_init();
+    let case = "sql_output_pg_quotes_hostile_identifiers";
+    let uri = pg_uri();
+    let Some(mut admin) = try_connect(&uri, case).await else {
+        return;
+    };
+    let tag = unique_table("ident");
+    let bystander = format!("{tag}_bystander");
+    // The table name carries a complete second statement.
+    let table = format!("{tag}; DROP TABLE {bystander}; --");
+    // A bare PostgreSQL part folds to lower case: that is the table the
+    // generated statement addresses.
+    let table_sql = pg_ident(&table.to_lowercase());
+    let (key, quoted, backticked) = ("k\"ey", "a\"b", "a`b");
+
+    exec(&mut admin, &format!("DROP TABLE IF EXISTS {table_sql}")).await;
+    exec(&mut admin, &format!("DROP TABLE IF EXISTS {bystander}")).await;
+    exec(&mut admin, &format!("CREATE TABLE {bystander} (n BIGINT)")).await;
+    exec(&mut admin, &format!("INSERT INTO {bystander} VALUES (7)")).await;
+    exec(
+        &mut admin,
+        &format!(
+            "CREATE TABLE {table_sql} ({} BIGINT PRIMARY KEY, {} BIGINT, {} BIGINT, v BIGINT)",
+            pg_ident(key),
+            pg_ident(quoted),
+            pg_ident(backticked)
+        ),
+    )
+    .await;
+
+    let output = build_output(
+        "sql",
+        serde_json::json!({
+            "output_type": {"type": "postgres", "uri": uri},
+            "table_name": table,
+            "upsert": true,
+            "upsert_keys": [key]
+        }),
+    );
+    output.connect().await.expect("connect sql output");
+    output
+        .write(hostile_identifier_batch(key, quoted, backticked, 1, 10))
+        .await
+        .expect("write hostile identifiers");
+    output
+        .write(hostile_identifier_batch(key, quoted, backticked, 1, 20))
+        .await
+        .expect("upsert replay");
+    output.close().await.expect("close");
+
+    assert_eq!(
+        count(&mut admin, &table_sql).await,
+        1,
+        "the replay upserts instead of duplicating"
+    );
+    let (stored,): (i64,) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT v FROM {table_sql}")))
+            .fetch_one(&mut admin)
+            .await
+            .unwrap();
+    assert_eq!(stored, 20);
+    let (stored_key, stored_quoted, stored_backticked): (i64, i64, i64) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {}, {}, {} FROM {table_sql}",
+            pg_ident(key),
+            pg_ident(quoted),
+            pg_ident(backticked)
+        )))
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!((stored_key, stored_quoted, stored_backticked), (1, 2, 3));
+    // The statement smuggled into the table name never ran.
+    assert_eq!(count(&mut admin, &bystander).await, 1);
+
+    // Schema-qualified names resolve one part at a time: a quoted part keeps
+    // its case, a bare part folds the way the unquoted identifier did.
+    let schema = format!("{tag}_schema");
+    exec(
+        &mut admin,
+        &format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+    )
+    .await;
+    exec(&mut admin, &format!("CREATE SCHEMA {schema}")).await;
+    exec(
+        &mut admin,
+        &format!("CREATE TABLE {schema}.\"Events\" (v BIGINT)"),
+    )
+    .await;
+    exec(
+        &mut admin,
+        &format!("CREATE TABLE {schema}.events (v BIGINT)"),
+    )
+    .await;
+    for (configured, lands_in) in [
+        (
+            format!("{schema}.\"Events\""),
+            format!("{schema}.\"Events\""),
+        ),
+        (format!("{schema}.Events"), format!("{schema}.events")),
+    ] {
+        let output = build_output(
+            "sql",
+            serde_json::json!({
+                "output_type": {"type": "postgres", "uri": uri},
+                "table_name": configured
+            }),
+        );
+        output.connect().await.expect("connect sql output");
+        output.write(value_batch(1)).await.expect("qualified write");
+        output.close().await.expect("close");
+        assert_eq!(count(&mut admin, &lands_in).await, 1, "{configured}");
+    }
+    assert_eq!(count(&mut admin, &format!("{schema}.\"Events\"")).await, 1);
+    assert_eq!(count(&mut admin, &format!("{schema}.events")).await, 1);
+
+    // A malformed name is a build error, never a statement.
+    for malformed in ["a..b", "\"events", "\"events\"x", "a\0b"] {
+        let error = OutputConfig {
+            output_type: "sql".to_string(),
+            name: None,
+            codec: None,
+            config: Some(serde_json::json!({
+                "output_type": {"type": "postgres", "uri": uri},
+                "table_name": malformed
+            })),
+        }
+        .build(&resource())
+        .err()
+        .unwrap_or_else(|| panic!("{malformed:?} must fail the build"));
+        assert!(
+            error.to_string().contains("invalid `table_name`"),
+            "{malformed:?}: {error}"
+        );
+    }
+
+    exec(
+        &mut admin,
+        &format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+    )
+    .await;
+    exec(&mut admin, &format!("DROP TABLE IF EXISTS {table_sql}")).await;
+    exec(&mut admin, &format!("DROP TABLE IF EXISTS {bystander}")).await;
 }
 
 // ---------------------------------------------------------------------
