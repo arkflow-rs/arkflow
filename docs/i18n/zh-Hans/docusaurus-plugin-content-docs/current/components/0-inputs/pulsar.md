@@ -47,7 +47,7 @@ Pulsar 输入(Input)订阅 Apache Pulsar 主题(Topic),支持四种订阅(Subscr
 
 | Field | Type | Required | Default | 描述 |
 |-------|------|----------|---------|-------------|
-| certificate_chain_file | string | no | — | 客户端证书链路径(PEM),用于 mTLS。 |
+| certificate_chain_file | string | no | — | PEM 证书链文件,用于校验 broker 证书(私有 CA 的信任锚)。它不是客户端证书:驱动会把它加入信任库。 |
 | hostname_verification | boolean | no | `true` | 是否校验 broker 证书主机名。 |
 
 ## 示例

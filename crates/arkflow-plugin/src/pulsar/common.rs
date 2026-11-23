@@ -97,7 +97,9 @@ pub use crate::retry::{RetryConfig, RetryUtils};
 /// TLS configuration for Pulsar connections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulsarTlsConfig {
-    /// Client certificate chain file path (PEM format, for mTLS)
+    /// Certificate chain file (PEM) the broker certificate is verified
+    /// against: the trust anchor of a private CA. The driver adds it to
+    /// its trust store; it does not present a client identity.
     #[serde(default)]
     pub certificate_chain_file: Option<String>,
     /// Whether to enable hostname verification (defaults to true)

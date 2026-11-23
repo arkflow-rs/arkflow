@@ -27,21 +27,25 @@
 //! * R1 coverage — at a node with `additionalProperties: false`, every serde
 //!   input field appears in `properties`.
 //! * R2 no ghosts — every documented key is a serde input field.
-//! * R3 — every schema-`required` key is required by serde (or registered as
-//!   builder-enforced in [`BUILDER_REQUIRED`]).
+//! * R3 — every schema-`required` key is a field serde requires (or is
+//!   registered as builder-enforced in [`BUILDER_REQUIRED`]); a required key
+//!   nothing reads is reported too.
 //! * R4 — every serde-required field is schema-`required`.
-//! * R5 — a documented `default` belongs to a field serde lets the user omit.
-//! * R6 — a string-enum schema lists exactly the variants of a unit-variant
-//!   enum.
+//! * R5 — a documented `default` belongs to a field serde lets the user omit,
+//!   and — where the value is fixed — equals the value serde produces.
+//! * R6 — a string-enum schema lists exactly the variants serde decodes.
+//! * R0 — a referenced type the gate cannot read, or a bare name that is
+//!   ambiguous, is reported instead of silently skipped.
 //!
 //! `#[serde(flatten)]` fields are inlined, nested object/array properties are
-//! checked against their own types, and tagged-enum branches are matched to
-//! their variants. A schema node without `properties`/`required` is opaque
-//! (it accepts any key), so nothing is checked there.
+//! checked against their own types, generic types resolve by their name, and
+//! enums are read the way serde tags them. A schema node without
+//! `properties`/`required` that is not closed is opaque (it accepts any key),
+//! so nothing is checked there.
 //!
-//! Deliberate exceptions go through [`HIDDEN_FIELDS`] and [`BUILDER_REQUIRED`],
-//! and an exemption that is no longer needed fails the gate so the lists
-//! cannot rot.
+//! Deliberate exceptions go through [`HIDDEN_FIELDS`], [`BUILDER_REQUIRED`],
+//! and [`NO_CONFIG`], and an exemption that is no longer needed fails the
+//! gate so the lists cannot rot.
 
 use arkflow_core::component::{list_components, ComponentMetadata};
 use serde_json::Value;
@@ -55,7 +59,8 @@ type Exemptions = &'static [(&'static str, &'static str, &'static str, &'static 
 /// deserializes)` for every component with a configuration surface.
 ///
 /// Adding a component with a schema? Add a row — the completeness check below
-/// fails until you do.
+/// fails until you do, and the row is bound to the builder registered under
+/// that name (its `impl` block must deserialize the struct).
 const CONFIG_TYPES: &[(&str, &str, &str, &str)] = &[
     // inputs
     ("input", "file", "input/file.rs", "FileInputConfig"),
@@ -227,7 +232,7 @@ const CONFIG_TYPES: &[(&str, &str, &str, &str)] = &[
 /// schema: `(kind/name, config struct, field, reason)`.
 ///
 /// The field is exempt from R1 (coverage) and R4 (required). An entry stops
-/// being needed the moment the field shows up in the schema, and then fails
+/// being needed the moment the gate no longer relies on it, and then fails
 /// the gate — remove it.
 const HIDDEN_FIELDS: Exemptions = &[];
 
@@ -235,13 +240,23 @@ const HIDDEN_FIELDS: Exemptions = &[];
 /// omission, because the component builder enforces it with a
 /// domain-specific error: `(kind/name, config struct, field, reason)`.
 ///
-/// Exempt from R3 only. The entry must stay true (field in the schema's
-/// `required`, optional for serde) or it fails the gate as stale.
+/// Exempt from R3 only. The entry must stay true (the schema marks it
+/// required, serde lets the user omit it) or it fails the gate as stale.
 const BUILDER_REQUIRED: Exemptions = &[(
     "output/milvus",
     "MilvusOutputConfig",
     "id_field",
     "the builder rejects a missing id_field: the REST upsert API needs a primary key per row",
+)];
+
+/// Components whose schema is a closed object that documents nothing,
+/// because their builder reads no configuration: `(kind/name, reason)`.
+///
+/// They need no [`CONFIG_TYPES`] row. The schema must stay that way: once it
+/// documents a key, the entry is stale and the component needs a row.
+const NO_CONFIG: &[(&str, &str)] = &[(
+    "codec/debezium_json",
+    "the builder ignores its configuration object",
 )];
 
 // ---------------------------------------------------------------------------
@@ -254,6 +269,12 @@ fn is_ident_start(c: char) -> bool {
 
 fn is_ident_continue(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Whether the word `word` starts at `i`.
+fn word_at(s: &[char], i: usize, word: &str) -> bool {
+    let letters: Vec<char> = word.chars().collect();
+    s.len() >= i + letters.len() && s[i..i + letters.len()] == letters[..]
 }
 
 /// Index just past the identifier starting at `i` (or `i` when none does).
@@ -511,33 +532,37 @@ fn attrs_ending_at(s: &[char], end: usize) -> Vec<String> {
 }
 
 /// `#[…]` attributes on the item whose `struct`/`enum` keyword starts at
-/// `keyword`, skipping a directly preceding visibility.
+/// `keyword`, looking across a visibility (`pub`, `pub(crate)`,
+/// `pub(super)`, `pub(in path)`).
 fn item_attrs(s: &[char], keyword: usize) -> Vec<String> {
     let mut head = keyword;
-    let mut j = head;
+    let mut j = keyword;
     while j > 0 && s[j - 1].is_whitespace() {
         j -= 1;
     }
-    let is_pub =
-        j >= 3 && s[j - 3..j] == ['p', 'u', 'b'] && (j == 3 || !is_ident_continue(s[j - 4]));
-    if is_pub {
-        head = j - 3;
-        if head > 0 && s[head - 1] == ')' {
-            let mut depth = 0i32;
-            let mut k = head;
-            while k > 0 {
-                k -= 1;
-                if s[k] == ')' {
-                    depth += 1;
-                } else if s[k] == '(' {
+    // A visibility ends at `j`: `pub` followed by an optional `(…)`
+    // restriction.
+    let mut k = j;
+    if s.get(j.wrapping_sub(1)) == Some(&')') {
+        let mut depth = 0i32;
+        while k > 0 {
+            k -= 1;
+            match s[k] {
+                ')' => depth += 1,
+                '(' => {
                     depth -= 1;
                     if depth == 0 {
                         break;
                     }
                 }
+                _ => {}
             }
-            head = k;
         }
+    }
+    let is_pub =
+        k >= 3 && s[k - 3..k] == ['p', 'u', 'b'] && (k == 3 || !is_ident_continue(s[k - 4]));
+    if is_pub {
+        head = k - 3;
     }
     attrs_ending_at(s, head)
 }
@@ -549,7 +574,14 @@ fn item_attrs(s: &[char], keyword: usize) -> Vec<String> {
 #[derive(Debug, Clone, Default)]
 struct SerdeAttrs {
     rename: Option<String>,
+    /// `default` on its own: the field is `Default::default()` when omitted.
     default: bool,
+    /// `default = "path"`: a function supplies the value.
+    default_fn: Option<String>,
+    /// `deserialize_with = "…"` / `with = "…"`: runs only for a key that is
+    /// present, so an `Option` behind it is still required unless `default`
+    /// says otherwise.
+    custom_deserializer: bool,
     skip: bool,
     flatten: bool,
     rename_all: Option<String>,
@@ -590,7 +622,11 @@ fn parse_serde(attrs: &[String]) -> SerdeAttrs {
             };
             match key.as_str() {
                 "rename" => out.rename = value.map(|v| unquote(&v)),
-                "default" => out.default = true,
+                "default" => match value {
+                    Some(function) => out.default_fn = Some(unquote(&function)),
+                    None => out.default = true,
+                },
+                "deserialize_with" | "with" => out.custom_deserializer = true,
                 "skip" | "skip_deserializing" => out.skip = true,
                 "flatten" => out.flatten = true,
                 "rename_all" => out.rename_all = value.map(|v| unquote(&v)),
@@ -604,43 +640,126 @@ fn parse_serde(attrs: &[String]) -> SerdeAttrs {
     out
 }
 
-/// serde's `rename_all = "snake_case"` for a Rust identifier: a `_` goes
-/// before an upper-case letter that follows a lower-case letter or digit, or
-/// that ends an upper-case run, and everything is lower-cased.
-fn snake_case(name: &str) -> String {
-    let chars: Vec<char> = name.chars().collect();
-    let mut out = String::with_capacity(name.len() + 4);
-    for (i, c) in chars.iter().enumerate() {
-        if c.is_uppercase() && i > 0 {
-            let prev_lower = chars[i - 1].is_lowercase() || chars[i - 1].is_numeric();
-            let run_ends =
-                chars[i - 1].is_uppercase() && chars.get(i + 1).is_some_and(|n| n.is_lowercase());
-            if prev_lower || run_ends {
-                out.push('_');
-            }
-        }
-        out.extend(c.to_lowercase());
-    }
-    out
+/// serde's `rename_all` conventions, named as serde names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+enum RenameRule {
+    LowerCase,
+    UpperCase,
+    PascalCase,
+    CamelCase,
+    SnakeCase,
+    ScreamingSnakeCase,
+    KebabCase,
+    ScreamingKebabCase,
 }
 
-fn renamed(ident: &str, attrs: &SerdeAttrs, rename_all: Option<&str>) -> String {
+fn rename_rule(rule: &str) -> Option<RenameRule> {
+    Some(match rule {
+        "lowercase" => RenameRule::LowerCase,
+        "UPPERCASE" => RenameRule::UpperCase,
+        "PascalCase" => RenameRule::PascalCase,
+        "camelCase" => RenameRule::CamelCase,
+        "snake_case" => RenameRule::SnakeCase,
+        "SCREAMING_SNAKE_CASE" => RenameRule::ScreamingSnakeCase,
+        "kebab-case" => RenameRule::KebabCase,
+        "SCREAMING-KEBAB-CASE" => RenameRule::ScreamingKebabCase,
+        _ => return None,
+    })
+}
+
+impl RenameRule {
+    /// The name serde derives for `name`, character for character. The
+    /// [`tests::rename_rules_match_serde`] cross-check keeps this honest.
+    fn apply(self, name: &str) -> String {
+        match self {
+            RenameRule::LowerCase => name.to_lowercase(),
+            RenameRule::UpperCase => name.to_uppercase(),
+            RenameRule::PascalCase => name.to_string(),
+            // Only the first character is lowered; the rest is untouched.
+            RenameRule::CamelCase => {
+                let mut chars = name.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let mut out: String = first.to_lowercase().collect();
+                        out.push_str(chars.as_str());
+                        out
+                    }
+                    None => String::new(),
+                }
+            }
+            separated => {
+                let (separator, upper) = match separated {
+                    RenameRule::SnakeCase => ('_', false),
+                    RenameRule::ScreamingSnakeCase => ('_', true),
+                    RenameRule::KebabCase => ('-', false),
+                    _ => ('-', true),
+                };
+                let mut out = String::with_capacity(name.len() * 2);
+                for c in name.chars() {
+                    if c.is_uppercase() {
+                        // Every upper-case letter starts a word — an
+                        // acronym splits letter by letter (`XML` → `x_m_l`).
+                        if !out.is_empty() {
+                            out.push(separator);
+                        }
+                    } else if !c.is_lowercase() && !c.is_numeric() {
+                        // Any other character becomes a separator.
+                        out.push(separator);
+                        continue;
+                    }
+                    let folded: String = if upper {
+                        c.to_uppercase().collect()
+                    } else {
+                        c.to_lowercase().collect()
+                    };
+                    out.push_str(&folded);
+                }
+                out
+            }
+        }
+    }
+}
+
+/// The name serde reads a field or variant from.
+fn renamed(ident: &str, attrs: &SerdeAttrs, rule: Option<RenameRule>) -> String {
     if let Some(rename) = &attrs.rename {
         return rename.clone();
     }
-    match rename_all {
-        Some("snake_case") => snake_case(ident),
-        Some("lowercase") => ident.to_lowercase(),
-        Some("UPPERCASE") => ident.to_uppercase(),
-        // Conventions the config surface does not use are left verbatim:
-        // if one is ever adopted the mismatch shows up as drift.
-        _ => ident.to_string(),
+    match rule {
+        Some(rule) => rule.apply(ident),
+        None => ident.to_string(),
     }
 }
 
 fn type_is_option(ty: &str) -> bool {
     const PREFIXES: [&str; 3] = ["Option<", "std::option::Option<", "core::option::Option<"];
     ty.ends_with('>') && PREFIXES.iter().any(|p| ty.starts_with(p))
+}
+
+/// The value a plain `#[serde(default)]` produces for a type whose `Default`
+/// is fixed: `false`, `0`, `""`, `[]`. `None` when it is not known
+/// statically (`Option`, enums, maps, function-backed defaults).
+fn plain_default_value(ty: &str) -> Option<Value> {
+    let base = ty.strip_prefix("std::").unwrap_or(ty);
+    match base {
+        "bool" => Some(Value::Bool(false)),
+        "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize" => {
+            Some(Value::from(0))
+        }
+        "f32" | "f64" => Some(serde_json::json!(0.0)),
+        "String" => Some(Value::String(String::new())),
+        _ if base.starts_with("Vec<") => Some(serde_json::json!([])),
+        _ => None,
+    }
+}
+
+/// Whether two JSON values mean the same default (`0` and `0.0` agree).
+fn same_default(advertised: &Value, actual: &Value) -> bool {
+    match (advertised.as_f64(), actual.as_f64()) {
+        (Some(a), Some(b)) => a == b,
+        _ => advertised == actual,
+    }
 }
 
 /// Removes a leading visibility (`pub`, `pub(crate)`, `pub(super)`,
@@ -667,9 +786,12 @@ struct Field {
     name: String,
     /// Type text, whitespace-collapsed.
     ty: String,
-    /// `Option<_>`, `#[serde(default ...)]`, or the container has
-    /// `#[serde(default)]`.
+    /// Omitting the key is valid: `#[serde(default …)]`, a container
+    /// `#[serde(default)]`, or a plain `Option<_>` (not behind a custom
+    /// deserializer).
     optional: bool,
+    /// A plain `#[serde(default)]` whose value is known statically.
+    plain_default: bool,
     /// `#[serde(skip)]` / `#[serde(skip_deserializing)]`: not an input.
     skip: bool,
     /// `#[serde(flatten)]`: the target type's fields are inlined.
@@ -721,7 +843,7 @@ struct Def {
     fields: Vec<Field>,
     /// Variants (enums only).
     variants: Vec<Variant>,
-    /// `#[serde(tag = "...")]`: the tag key of an internally tagged enum.
+    /// `#[serde(tag = "…")]`: the tag key of an internally tagged enum.
     tag: Option<String>,
     layout: EnumLayout,
     file: String,
@@ -745,7 +867,7 @@ impl std::fmt::Debug for ParseError {
 fn parse_fields(
     body: &[char],
     container_default: bool,
-    rename_all: Option<&str>,
+    rule: Option<RenameRule>,
 ) -> Result<Vec<Field>, ParseError> {
     let mut fields = Vec::new();
     for part in split_top_level(body) {
@@ -769,14 +891,18 @@ fn parse_fields(
             )));
         };
         let ty = ty.split_whitespace().collect::<Vec<_>>().join(" ");
-        if ty.is_empty() || ty.contains(['{', '}', ';']) {
+        if ty.is_empty() || ty.contains(['{', '}']) {
             return Err(ParseError(format!(
                 "field `{name}` has an unreadable type `{ty}`"
             )));
         }
         fields.push(Field {
-            name: renamed(&name, &serde, rename_all),
-            optional: serde.default || container_default || type_is_option(&ty),
+            name: renamed(&name, &serde, rule),
+            optional: serde.default
+                || serde.default_fn.is_some()
+                || container_default
+                || (type_is_option(&ty) && !serde.custom_deserializer),
+            plain_default: serde.default || container_default,
             skip: serde.skip,
             flatten: serde.flatten,
             ty,
@@ -792,7 +918,6 @@ fn parse_def_body(
     file: &str,
     name: &str,
 ) -> Result<Def, ParseError> {
-    let rename_all = serde.rename_all.as_deref();
     let mut def = Def {
         kind,
         fields: Vec::new(),
@@ -810,9 +935,14 @@ fn parse_def_body(
         file: file.to_string(),
         name: name.to_string(),
     };
+    let rule = serde.rename_all.as_deref().and_then(rename_rule);
     match kind {
-        DefKind::Struct => def.fields = parse_fields(body, serde.default, rename_all)?,
+        DefKind::Struct => def.fields = parse_fields(body, serde.default, rule)?,
         DefKind::Enum => {
+            // An enum's `rename_all` renames its variants. The fields of a
+            // struct variant keep their names (serde 1.0.229 applies neither
+            // `rename_all_fields` nor a variant-level rule to them — checked
+            // by `tests::rename_rules_match_serde`).
             for part in split_top_level(body) {
                 let (attrs, rest) = leading_attrs(&part);
                 let vserde = parse_serde(&attrs);
@@ -830,7 +960,7 @@ fn parse_def_body(
                     .trim()
                     .to_string();
                 let mut variant = Variant {
-                    name: renamed(&vname, &vserde, rename_all),
+                    name: renamed(&vname, &vserde, rule),
                     kind: VariantKind::Other,
                     skip: vserde.skip,
                     fields: Vec::new(),
@@ -839,7 +969,7 @@ fn parse_def_body(
                 if after.starts_with('{') && after.ends_with('}') {
                     variant.kind = VariantKind::Struct;
                     let inner: Vec<char> = after[1..after.len() - 1].chars().collect();
-                    variant.fields = parse_fields(&inner, false, rename_all)?;
+                    variant.fields = parse_fields(&inner, false, None)?;
                 } else if after.starts_with('(') && after.ends_with(')') {
                     let types: Vec<char> = after[1..after.len() - 1].chars().collect();
                     let mut pieces = split_top_level(&types);
@@ -855,20 +985,25 @@ fn parse_def_body(
     Ok(def)
 }
 
+/// `Ok(None)` for a tuple or unit struct (no named fields to read),
+/// `Err` for a braced definition whose body does not parse.
 fn parse_def_at(
     s: &[char],
     keyword: usize,
     keyword_len: usize,
     kind: DefKind,
     file: &str,
-) -> Option<Def> {
+) -> Result<Option<Def>, ParseError> {
     // A keyword is followed by whitespace and the type name.
-    if !s.get(keyword + keyword_len)?.is_whitespace() {
-        return None;
+    let Some(after_keyword) = s.get(keyword + keyword_len) else {
+        return Ok(None);
+    };
+    if !after_keyword.is_whitespace() {
+        return Ok(None);
     }
     let name_start = skip_ws(s, keyword + keyword_len);
-    if !is_ident_start(*s.get(name_start)?) {
-        return None;
+    if !s.get(name_start).is_some_and(|c| is_ident_start(*c)) {
+        return Ok(None);
     }
     let name_end = ident_end(s, name_start);
     let name: String = s[name_start..name_end].iter().collect();
@@ -892,18 +1027,19 @@ fn parse_def_at(
         i += 1;
     }
     if s.get(i) != Some(&'{') {
-        // Tuple/unit struct or forward declaration: no named fields to read.
-        return None;
+        return Ok(None);
     }
     let serde = parse_serde(&item_attrs(s, keyword));
-    let end = matching(s, '{', '}', i).ok()?;
-    parse_def_body(kind, &s[i + 1..end - 1], &serde, file, &name).ok()
+    let end = matching(s, '{', '}', i)?;
+    parse_def_body(kind, &s[i + 1..end - 1], &serde, file, &name).map(Some)
 }
 
-/// Definitions in a comment-stripped source, in order of appearance.
-fn parse_defs(s: &[char], file: &str) -> Vec<Def> {
+/// Definitions in a comment-stripped source, in order of appearance, plus
+/// the braced definitions whose body could not be read: `(name, reason)`.
+fn parse_defs(s: &[char], file: &str) -> (Vec<Def>, Vec<(String, String)>) {
     const KEYWORDS: [(&str, DefKind); 2] = [("struct", DefKind::Struct), ("enum", DefKind::Enum)];
     let mut defs = Vec::new();
+    let mut unparsed = Vec::new();
     let mut i = 0;
     while i < s.len() {
         if let Some(end) = literal_end(s, i) {
@@ -914,8 +1050,12 @@ fn parse_defs(s: &[char], file: &str) -> Vec<Def> {
             let end = ident_end(s, i);
             let word: String = s[i..end].iter().collect();
             if let Some((keyword, kind)) = KEYWORDS.iter().find(|(kw, _)| *kw == word) {
-                if let Some(def) = parse_def_at(s, i, keyword.len(), *kind, file) {
-                    defs.push(def);
+                let name_start = skip_ws(s, end);
+                let name: String = s[name_start..ident_end(s, name_start)].iter().collect();
+                match parse_def_at(s, i, keyword.len(), *kind, file) {
+                    Ok(Some(def)) => defs.push(def),
+                    Ok(None) => {}
+                    Err(error) => unparsed.push((name, error.to_string())),
                 }
             }
             i = end;
@@ -923,17 +1063,36 @@ fn parse_defs(s: &[char], file: &str) -> Vec<Def> {
         }
         i += 1;
     }
-    defs
+    (defs, unparsed)
 }
 
 // ---------------------------------------------------------------------------
 // Type index
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct Resolved<'a> {
     def: &'a Def,
     /// The type was reached through a `Vec<…>` wrapper.
     array: bool,
+}
+
+/// What a field type refers to, once its wrappers are peeled.
+#[derive(Debug)]
+enum Resolution<'a> {
+    Resolved(Resolved<'a>),
+    /// A scalar or a type of another crate: nothing of ours to read.
+    Foreign,
+    /// A local definition whose body the parser could not read.
+    Unparsed {
+        name: String,
+        reason: String,
+    },
+    /// A bare name that several local definitions share.
+    Ambiguous {
+        name: String,
+        files: Vec<String>,
+    },
 }
 
 /// Parsed definitions of every source file under `src/`.
@@ -942,7 +1101,13 @@ struct Index {
     defs: BTreeMap<String, BTreeMap<String, Def>>,
     /// `type name → files defining it`.
     files_by_name: BTreeMap<String, Vec<String>>,
-    /// Comment-stripped text of each file, for the deserialization guard.
+    /// Braced definitions whose body did not parse: `(file, name) → reason`.
+    unparsed: BTreeMap<(String, String), String>,
+    /// `use` imports per file: `(local name, path as written)` in order.
+    imports: BTreeMap<String, Vec<(String, String)>>,
+    /// Glob imports per file (`use a::b::*;` → `a::b`), in order.
+    globs: BTreeMap<String, Vec<String>>,
+    /// Comment-stripped text of each file.
     cleaned: BTreeMap<String, Vec<char>>,
 }
 
@@ -959,6 +1124,112 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// Splits a path at `::` separators that are not nested in a group.
+fn split_path(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == ':' && chars.get(i + 1) == Some(&':') && depth <= 0 {
+            parts.push(std::mem::take(&mut current));
+            i += 2;
+            continue;
+        }
+        match c {
+            '{' | '(' | '[' | '<' => depth += 1,
+            '}' | ')' | ']' | '>' => depth -= 1,
+            _ => {}
+        }
+        current.push(c);
+        i += 1;
+    }
+    parts.push(current);
+    parts
+        .into_iter()
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// Records the named imports and glob prefixes of one `use` tree (the text
+/// between `use` and `;`), expanding nested groups.
+fn expand_use(tree: &str, named: &mut Vec<(String, String)>, globs: &mut Vec<String>) {
+    let segments = split_path(tree);
+    let mut path = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if let Some(group) = segment
+            .strip_prefix('{')
+            .and_then(|group| group.strip_suffix('}'))
+        {
+            // A group is the last segment; each item continues the path.
+            for item in split_top_level(&group.chars().collect::<Vec<_>>()) {
+                expand_use(&format!("{path}{item}"), named, globs);
+            }
+            return;
+        }
+        if index + 1 < segments.len() {
+            path.push_str(segment);
+            path.push_str("::");
+            continue;
+        }
+        if segment == "*" {
+            globs.push(path.trim_end_matches("::").to_string());
+            continue;
+        }
+        // A leaf: `name`, or `name as alias`.
+        let mut words = segment.split_whitespace();
+        let name = words.next().unwrap_or_default().to_string();
+        let alias = if words.next() == Some("as") {
+            words.next().unwrap_or(&name).to_string()
+        } else {
+            name.clone()
+        };
+        named.push((alias, path.clone() + &name));
+    }
+}
+
+/// The `use` items of a comment-stripped source.
+fn parse_uses(s: &[char]) -> (Vec<(String, String)>, Vec<String>) {
+    let (mut named, mut globs) = (Vec::new(), Vec::new());
+    let (mut depth, mut i) = (0i32, 0);
+    while i < s.len() {
+        if let Some(end) = literal_end(s, i) {
+            i = end;
+            continue;
+        }
+        match s[i] {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        let starts_word = is_ident_start(s[i]) && (i == 0 || !is_ident_continue(s[i - 1]));
+        if depth == 0 && starts_word && word_at(s, i, "use") {
+            let end = ident_end(s, i);
+            if end == i + 3 {
+                let (mut j, mut inner) = (end, 0i32);
+                while j < s.len() {
+                    match s[j] {
+                        '{' | '(' | '[' => inner += 1,
+                        '}' | ')' | ']' => inner -= 1,
+                        ';' if inner <= 0 => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let tree: String = s[end..j].iter().collect();
+                expand_use(&tree, &mut named, &mut globs);
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    (named, globs)
 }
 
 /// `dirs/mod.rs` for a module path (`lib.rs` for the crate root).
@@ -997,11 +1268,15 @@ impl Index {
         let mut index = Index {
             defs: BTreeMap::new(),
             files_by_name: BTreeMap::new(),
+            unparsed: BTreeMap::new(),
+            imports: BTreeMap::new(),
+            globs: BTreeMap::new(),
             cleaned: BTreeMap::new(),
         };
         for (file, source) in sources {
             let cleaned = strip_comments(source);
-            for def in parse_defs(&cleaned, file) {
+            let (defs, unparsed) = parse_defs(&cleaned, file);
+            for def in defs {
                 let first = index
                     .defs
                     .entry(file.clone())
@@ -1016,6 +1291,12 @@ impl Index {
                         .push(file.clone());
                 }
             }
+            for (name, reason) in unparsed {
+                index.unparsed.entry((file.clone(), name)).or_insert(reason);
+            }
+            let (named, globs) = parse_uses(&cleaned);
+            index.imports.insert(file.clone(), named);
+            index.globs.insert(file.clone(), globs);
             index.cleaned.insert(file.clone(), cleaned);
         }
         index
@@ -1052,62 +1333,56 @@ impl Index {
             .unwrap_or_default()
     }
 
-    /// The file declaring the module at `dirs`.
+    /// The file declaring the module at `dirs`, when the crate has one.
     fn module_file(&self, dirs: &[&str]) -> Option<String> {
         if dirs.is_empty() {
             return self
-                .defs
+                .cleaned
                 .contains_key("lib.rs")
                 .then(|| "lib.rs".to_string());
         }
         let base = dirs.join("/");
         [format!("{base}.rs"), format!("{base}/mod.rs")]
             .into_iter()
-            .find(|file| self.defs.contains_key(file))
+            .find(|file| self.cleaned.contains_key(file))
     }
 
-    /// Resolves a type path written in `from_file` to `(file, type name)`.
-    fn locate(&self, ty: &str, from_file: &str) -> Option<(String, String)> {
-        let segments: Vec<&str> = ty.split("::").collect();
-        let name = (*segments.last()?).to_string();
-        let mut candidates: Vec<String> = Vec::new();
+    /// The file a path written in `from_file` points at (its last segment is
+    /// the type name). `None` for another crate's path or a bare name.
+    fn path_file(&self, path: &str, from_file: &str) -> Option<String> {
+        let segments: Vec<&str> = path.split("::").collect();
         match segments[0] {
-            "crate" => {
-                if segments.len() == 2 {
-                    candidates.push("lib.rs".to_string());
-                } else {
-                    candidates.extend(self.module_file(&segments[1..segments.len() - 1]));
-                }
-            }
-            "self" => candidates.push(from_file.to_string()),
+            "crate" => self.module_file(&segments[1..segments.len() - 1]),
+            "self" => Some(from_file.to_string()),
             "super" => {
                 let supers = segments.iter().take_while(|s| **s == "super").count();
-                if supers == 0 {
-                    return None;
-                }
-                candidates.extend(parent_modules(from_file).into_iter().nth(supers - 1));
+                parent_modules(from_file).into_iter().nth(supers - 1)
             }
-            _ if segments.len() == 1 => {
-                // A bare name may arrive through a `use` we cannot see, so the
-                // enclosing modules and every definition of that name are
-                // tried after the current file.
-                candidates.push(from_file.to_string());
-                candidates.extend(parent_modules(from_file));
-                if let Some(files) = self.files_by_name.get(&name) {
-                    candidates.extend(files.iter().cloned());
-                }
-            }
-            // Another crate's path: nothing of ours to parse.
-            _ => return None,
+            _ => None,
         }
-        candidates
-            .into_iter()
-            .find_map(|file| self.get(&file, &name).map(|_| (file, name.clone())))
     }
 
-    /// The config shape behind a field type: wrappers (`Option`, `Vec`, …)
-    /// are peeled; scalars and foreign types resolve to `None`.
-    fn resolve(&self, ty: &str, from_file: &str) -> Option<Resolved<'_>> {
+    /// The definition `name` in `file`, when it is one of ours.
+    fn definition(&self, file: &str, name: &str, array: bool) -> Option<Resolution<'_>> {
+        if let Some(def) = self.get(file, name) {
+            return Some(Resolution::Resolved(Resolved { def, array }));
+        }
+        self.unparsed
+            .get(&(file.to_string(), name.to_string()))
+            .map(|reason| Resolution::Unparsed {
+                name: name.to_string(),
+                reason: reason.clone(),
+            })
+    }
+
+    /// What a field type refers to: wrappers (`Option`, `Vec`, …) are peeled
+    /// and a generic type is resolved by its name.
+    ///
+    /// A bare name is bound the way the file sees it — the file itself, its
+    /// `use` imports, its enclosing modules, its glob imports — and only then
+    /// by a crate-wide definition. A name several local definitions share is
+    /// reported instead of guessed.
+    fn resolve(&self, ty: &str, from_file: &str) -> Resolution<'_> {
         const PEEL: [(&str, bool); 9] = [
             ("Option<", false),
             ("std::option::Option<", false),
@@ -1129,12 +1404,74 @@ impl Index {
             t = t[prefix.len()..t.len() - 1].trim();
             array |= *is_array;
         }
-        if t.is_empty() || t.contains(['<', '>', '(', ')', '&', ' ']) {
-            return None;
+        let (base, generic) = match t.split_once('<') {
+            Some((base, _)) => (base.trim(), true),
+            None => (t, false),
+        };
+        if base.is_empty()
+            || base.contains(['(', ')', '&', ' '])
+            || (!generic && base.contains('>'))
+        {
+            return Resolution::Foreign;
         }
-        let (file, name) = self.locate(t, from_file)?;
-        let def = self.get(&file, &name)?;
-        Some(Resolved { def, array })
+        // 1. The file itself.
+        if let Some(resolution) = self.definition(from_file, base, array) {
+            return resolution;
+        }
+        // 2. What the file imports by that name.
+        if !base.contains(':') {
+            if let Some(imports) = self.imports.get(from_file) {
+                for (local, path) in imports {
+                    if local != base {
+                        continue;
+                    }
+                    // An alias renames the type: the path still names it.
+                    let target = path.rsplit("::").next().unwrap_or(path);
+                    if let Some(file) = self.path_file(path, from_file) {
+                        if let Some(resolution) = self.definition(&file, target, array) {
+                            return resolution;
+                        }
+                    }
+                }
+            }
+        } else if let Some(file) = self.path_file(base, from_file) {
+            let type_name = base.rsplit("::").next().unwrap_or(base);
+            if let Some(resolution) = self.definition(&file, type_name, array) {
+                return resolution;
+            }
+            return Resolution::Foreign;
+        }
+        // 3. The enclosing modules (`use super::*;`).
+        for file in parent_modules(from_file) {
+            if let Some(resolution) = self.definition(&file, base, array) {
+                return resolution;
+            }
+        }
+        // 4. Glob imports.
+        for glob in self.globs.get(from_file).into_iter().flatten() {
+            if let Some(file) = self.path_file(&format!("{glob}::{base}"), from_file) {
+                if let Some(resolution) = self.definition(&file, base, array) {
+                    return resolution;
+                }
+            }
+        }
+        // 5. A name defined once in the crate, through an import we cannot
+        //    see. Several definitions are an ambiguity, not a choice.
+        let files = self
+            .files_by_name
+            .get(base)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        match files {
+            [] => Resolution::Foreign,
+            [only] => self
+                .definition(only, base, array)
+                .unwrap_or(Resolution::Foreign),
+            many => Resolution::Ambiguous {
+                name: base.to_string(),
+                files: many.to_vec(),
+            },
+        }
     }
 }
 
@@ -1249,35 +1586,50 @@ fn branch_matches(branch: &Value, tag: Option<&str>, variant: &str, fields: &[Fi
     fields.iter().all(|field| entries.contains_key(&field.name))
 }
 
-/// Every name listed under `key` (`properties` keys or `required` entries)
-/// anywhere inside a schema.
-fn all_named(node: &Value, key: &str) -> BTreeSet<String> {
-    fn walk(value: &Value, key: &str, out: &mut BTreeSet<String>) {
-        match value {
-            Value::Object(map) => {
-                match map.get(key) {
-                    Some(Value::Object(entries)) => out.extend(entries.keys().cloned()),
-                    Some(Value::Array(names)) => {
-                        out.extend(names.iter().filter_map(Value::as_str).map(str::to_string))
-                    }
-                    _ => {}
-                }
-                for child in map.values() {
-                    walk(child, key, out);
-                }
-            }
-            Value::Array(items) => items.iter().for_each(|child| walk(child, key, out)),
-            _ => {}
-        }
-    }
-    let mut out = BTreeSet::new();
-    walk(node, key, &mut out);
-    out
+/// Whether a node says anything about the keys it accepts: documented
+/// properties or requirements, or a closed object — which rejects every key
+/// it does not list, even when it lists none.
+fn is_documented(node: &Value) -> bool {
+    has_docs(node) || is_strict(node)
+}
+
+/// The `default` a node advertises for `name`, from whichever schema mentions
+/// it.
+fn advertised_default<'a>(node: &'a Value, name: &str) -> Option<&'a Value> {
+    schemas(node)
+        .into_iter()
+        .find_map(|schema| schema.get("properties")?.get(name)?.get("default"))
+}
+
+/// How many of `fields` a branch documents.
+fn branch_overlap(branch: &Value, fields: &[Field]) -> usize {
+    let Some(entries) = branch.get("properties").and_then(Value::as_object) else {
+        return 0;
+    };
+    fields
+        .iter()
+        .filter(|field| entries.contains_key(&field.name))
+        .count()
 }
 
 // ---------------------------------------------------------------------------
 // The gate
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExemptionKind {
+    /// `HIDDEN_FIELDS`: exempt from R1 and R4.
+    Hidden,
+    /// `BUILDER_REQUIRED`: exempt from R3.
+    BuilderRequired,
+}
+
+/// The exemption entries the gate relied on: `(component, struct, field)`.
+#[derive(Debug, Default)]
+struct ExemptionUsage {
+    hidden: BTreeSet<(String, String, String)>,
+    builder_required: BTreeSet<(String, String, String)>,
+}
 
 struct Gate<'a> {
     index: &'a Index,
@@ -1285,6 +1637,9 @@ struct Gate<'a> {
     component: &'a str,
     hidden: Exemptions,
     builder_required: Exemptions,
+    /// Receives every exemption the gate relies on, so an entry nobody
+    /// needed is reported as stale.
+    usage: Option<&'a std::cell::RefCell<ExemptionUsage>>,
     problems: Vec<String>,
 }
 
@@ -1295,14 +1650,41 @@ impl<'a> Gate<'a> {
             component,
             hidden: HIDDEN_FIELDS,
             builder_required: BUILDER_REQUIRED,
+            usage: None,
             problems: Vec::new(),
         }
     }
 
-    fn exempt(&self, table: Exemptions, def: &str, field: &str) -> bool {
-        table.iter().any(|(component, owner, name, _)| {
-            *component == self.component && *owner == def && *name == field
-        })
+    /// Whether `kind` exempts `owner`.`field` for this component. Called only
+    /// where a finding is about to be reported, so a hit means the exemption
+    /// was needed.
+    fn exempt(&self, kind: ExemptionKind, owner: &str, field: &str) -> bool {
+        let table = match kind {
+            ExemptionKind::Hidden => self.hidden,
+            ExemptionKind::BuilderRequired => self.builder_required,
+        };
+        let hit = table.iter().any(|(component, name, field_name, _)| {
+            *component == self.component && *name == owner && *field_name == field
+        });
+        if hit {
+            if let Some(usage) = &self.usage {
+                let key = (
+                    self.component.to_string(),
+                    owner.to_string(),
+                    field.to_string(),
+                );
+                let mut usage = usage.borrow_mut();
+                match kind {
+                    ExemptionKind::Hidden => {
+                        usage.hidden.insert(key);
+                    }
+                    ExemptionKind::BuilderRequired => {
+                        usage.builder_required.insert(key);
+                    }
+                }
+            }
+        }
+        hit
     }
 
     fn problem(&mut self, def: &str, path: &str, message: String) {
@@ -1322,7 +1704,7 @@ impl<'a> Gate<'a> {
                 continue;
             }
             if field.flatten {
-                if let Some(target) = index.resolve(&field.ty, from_file) {
+                if let Resolution::Resolved(target) = index.resolve(&field.ty, from_file) {
                     if target.def.kind == DefKind::Struct {
                         out.extend(self.shape_fields(
                             &target.def.fields,
@@ -1339,43 +1721,85 @@ impl<'a> Gate<'a> {
     }
 
     fn check_def(&mut self, def: &'a Def, node: &Value, path: &str) {
-        if !has_docs(node) {
+        if !is_documented(node) {
             return;
         }
         match def.kind {
             DefKind::Struct => {
                 let fields = self.shape_fields(&def.fields, &def.file, 0);
                 self.check_shape(&def.name, &fields, node, path, true);
-                self.check_members(&def.fields, &def.file, node, path);
+                self.check_members(&def.name, &def.fields, &def.file, node, path);
             }
             DefKind::Enum => self.check_enum(def, node, path),
         }
     }
 
     /// Recurses into the nested types behind a shape's fields.
-    fn check_members(&mut self, fields: &'a [Field], from_file: &str, node: &Value, path: &str) {
+    fn check_members(
+        &mut self,
+        owner: &str,
+        fields: &'a [Field],
+        from_file: &str,
+        node: &Value,
+        path: &str,
+    ) {
         let index = self.index;
         for field in fields {
             if field.skip {
                 continue;
             }
             if field.flatten {
-                if let Some(target) = index.resolve(&field.ty, from_file) {
+                if let Resolution::Resolved(target) = index.resolve(&field.ty, from_file) {
                     if target.def.kind == DefKind::Struct {
-                        self.check_members(&target.def.fields, &target.def.file, node, path);
+                        self.check_members(owner, &target.def.fields, &target.def.file, node, path);
                     }
                 }
                 continue;
             }
-            self.check_property(field, node, path, from_file);
+            self.check_property(owner, field, node, path, from_file);
         }
     }
 
-    fn check_property(&mut self, field: &Field, node: &Value, path: &str, from_file: &str) {
+    fn check_property(
+        &mut self,
+        owner: &str,
+        field: &Field,
+        node: &Value,
+        path: &str,
+        from_file: &str,
+    ) {
         let index = self.index;
-        let Some(target) = index.resolve(&field.ty, from_file) else {
-            return;
+        let target = match index.resolve(&field.ty, from_file) {
+            Resolution::Resolved(target) => target,
+            Resolution::Foreign => return,
+            Resolution::Unparsed { name, reason } => {
+                self.problem(
+                    owner,
+                    path,
+                    format!(
+                        "R0 `{path}.{}` cannot be checked: the definition of `{name}` does not \
+                         parse ({reason})",
+                        field.name
+                    ),
+                );
+                return;
+            }
+            Resolution::Ambiguous { name, files } => {
+                let files: Vec<String> = files.iter().map(|file| format!("src/{file}")).collect();
+                self.problem(
+                    owner,
+                    path,
+                    format!(
+                        "R0 `{path}.{}` cannot be checked: the bare name `{name}` is defined in {} \
+                         — write the field type as a qualified path",
+                        field.name,
+                        files.join(" and ")
+                    ),
+                );
+                return;
+            }
         };
+        let def = target.def;
         let Some(mut sub) = find_prop(node, &field.name) else {
             return;
         };
@@ -1385,22 +1809,19 @@ impl<'a> Gate<'a> {
             };
             sub = items;
         }
-        let def = target.def;
         let sub_path = format!("{path}.{}", field.name);
-        let unit_enum = def.kind == DefKind::Enum
-            && !def.variants.is_empty()
+        let deserializable: Vec<&Variant> = def.variants.iter().filter(|v| !v.skip).collect();
+        let string_enum = def.kind == DefKind::Enum
             && def
                 .variants
                 .iter()
                 .all(|variant| variant.kind == VariantKind::Other);
-        if unit_enum {
+        if string_enum {
             if let Some(values) = string_values(sub) {
+                // Both directions look at the variants serde can decode: a
+                // skipped one is neither expected nor accepted.
                 for value in &values {
-                    if !def
-                        .variants
-                        .iter()
-                        .any(|variant| variant.name.as_str() == *value)
-                    {
+                    if !deserializable.iter().any(|variant| variant.name == *value) {
                         self.problem(
                             &def.name,
                             &sub_path,
@@ -1411,7 +1832,7 @@ impl<'a> Gate<'a> {
                         );
                     }
                 }
-                for variant in def.variants.iter().filter(|variant| !variant.skip) {
+                for variant in deserializable {
                     if !values.contains(variant.name.as_str()) {
                         self.problem(
                             &def.name,
@@ -1442,10 +1863,9 @@ impl<'a> Gate<'a> {
             .collect();
         if is_strict(node) {
             for field in fields {
-                if self.exempt(self.hidden, def, &field.name) {
-                    continue;
-                }
-                if !props.contains_key(field.name.as_str()) {
+                if !props.contains_key(field.name.as_str())
+                    && !self.exempt(ExemptionKind::Hidden, def, &field.name)
+                {
                     self.problem(
                         def,
                         path,
@@ -1475,8 +1895,20 @@ impl<'a> Gate<'a> {
             }
         }
         for name in &required {
+            // A merged view may list keys that belong to other variants.
+            if ghosts && !by_name.contains_key(name) {
+                self.problem(
+                    def,
+                    path,
+                    format!(
+                        "R3 the schema requires `{name}`, which the config struct never reads — no \
+                         configuration can satisfy it"
+                    ),
+                );
+                continue;
+            }
             if let Some(field) = by_name.get(name) {
-                if field.optional && !self.exempt(self.builder_required, def, name) {
+                if field.optional && !self.exempt(ExemptionKind::BuilderRequired, def, name) {
                     self.problem(
                         def,
                         path,
@@ -1490,10 +1922,9 @@ impl<'a> Gate<'a> {
             }
         }
         for field in fields.iter().filter(|field| !field.optional) {
-            if self.exempt(self.hidden, def, &field.name) {
-                continue;
-            }
-            if !required.contains(field.name.as_str()) {
+            if !required.contains(field.name.as_str())
+                && !self.exempt(ExemptionKind::Hidden, def, &field.name)
+            {
                 self.problem(
                     def,
                     path,
@@ -1507,17 +1938,10 @@ impl<'a> Gate<'a> {
             }
         }
         for (name, field) in &by_name {
-            if field.optional {
+            let Some(advertised) = advertised_default(node, name) else {
                 continue;
-            }
-            let advertised = schemas(node).iter().any(|schema| {
-                schema
-                    .get("properties")
-                    .and_then(|entries| entries.get(*name))
-                    .and_then(|sub| sub.get("default"))
-                    .is_some()
-            });
-            if advertised {
+            };
+            if !field.optional {
                 self.problem(
                     def,
                     path,
@@ -1526,6 +1950,20 @@ impl<'a> Gate<'a> {
                          field — add `#[serde(default …)]` or remove `default`"
                     ),
                 );
+            } else if field.plain_default {
+                // Only a default whose value is fixed can be compared.
+                if let Some(actual) = plain_default_value(&field.ty) {
+                    if !same_default(advertised, &actual) {
+                        self.problem(
+                            def,
+                            path,
+                            format!(
+                                "R5 the schema advertises `default: {advertised}` for `{name}`, but \
+                                 `#[serde(default)]` yields {actual}"
+                            ),
+                        );
+                    }
+                }
             }
         }
     }
@@ -1535,7 +1973,8 @@ impl<'a> Gate<'a> {
     /// property per variant, internally tagged ones one object per variant
     /// selected by the tag, untagged ones the variant's fields directly.
     /// Coverage is checked on the union of variants first, then each variant
-    /// against the branch that describes it.
+    /// with a decodable payload is checked against the branch that
+    /// describes it.
     fn check_enum(&mut self, def: &'a Def, node: &Value, path: &str) {
         struct Shape<'a> {
             name: String,
@@ -1545,6 +1984,9 @@ impl<'a> Gate<'a> {
             /// for recursion.
             own: &'a [Field],
             file: String,
+            /// A struct or struct-valued newtype variant has a field set to
+            /// check; unit and tuple variants do not.
+            checkable: bool,
         }
         // Adjacent tagging nests the fields under a content key: not modelled.
         if def.layout == EnumLayout::Adjacent {
@@ -1552,40 +1994,41 @@ impl<'a> Gate<'a> {
         }
         let index = self.index;
         let mut shapes: Vec<Shape<'a>> = Vec::new();
-        let mut simple = true;
         for variant in &def.variants {
             if variant.skip {
                 continue;
             }
-            let (own, file): (&'a [Field], &str) = match variant.kind {
-                VariantKind::Struct => (&variant.fields, def.file.as_str()),
+            let (mut checkable, mut own, mut file): (bool, &'a [Field], &str) =
+                (true, &[] as &[Field], "");
+            match variant.kind {
+                VariantKind::Struct => {
+                    own = &variant.fields;
+                    file = def.file.as_str();
+                }
                 VariantKind::Newtype => {
                     match variant
                         .inner
                         .as_deref()
-                        .and_then(|inner| index.resolve(inner, &def.file))
+                        .map(|inner| index.resolve(inner, &def.file))
                     {
-                        Some(target) if !target.array && target.def.kind == DefKind::Struct => {
-                            (&target.def.fields, target.def.file.as_str())
+                        Some(Resolution::Resolved(target))
+                            if !target.array && target.def.kind == DefKind::Struct =>
+                        {
+                            own = &target.def.fields;
+                            file = target.def.file.as_str();
                         }
-                        _ => {
-                            // A scalar or foreign payload: no field set to check.
-                            simple = false;
-                            (&[] as &[Field], "")
-                        }
+                        _ => checkable = false,
                     }
                 }
-                VariantKind::Other => {
-                    simple = false;
-                    (&[] as &[Field], "")
-                }
-            };
+                VariantKind::Other => checkable = false,
+            }
             let mut fields = self.shape_fields(own, file, 0);
             if def.layout == EnumLayout::Internal {
                 fields.push(Field {
                     name: def.tag.clone().unwrap_or_default(),
                     ty: "String".to_string(),
                     optional: false,
+                    plain_default: false,
                     skip: false,
                     flatten: false,
                 });
@@ -1595,6 +2038,7 @@ impl<'a> Gate<'a> {
                 fields,
                 own,
                 file: file.to_string(),
+                checkable,
             });
         }
         let props = props(node);
@@ -1612,7 +2056,7 @@ impl<'a> Gate<'a> {
                     );
                 }
             }
-            for shape in &shapes {
+            for shape in shapes.iter().filter(|shape| shape.checkable) {
                 let Some(sub) = find_prop(node, &shape.name) else {
                     if is_strict(node) {
                         self.problem(
@@ -1629,7 +2073,7 @@ impl<'a> Gate<'a> {
                 };
                 let variant_path = format!("{path}.{}", shape.name);
                 self.check_shape(&def.name, &shape.fields, sub, &variant_path, true);
-                self.check_members(shape.own, &shape.file, sub, path);
+                self.check_members(&def.name, shape.own, &shape.file, sub, path);
             }
             return;
         }
@@ -1644,7 +2088,7 @@ impl<'a> Gate<'a> {
         if is_strict(node) {
             for field in &union {
                 if !props.contains_key(field.name.as_str())
-                    && !self.exempt(self.hidden, &def.name, &field.name)
+                    && !self.exempt(ExemptionKind::Hidden, &def.name, &field.name)
                 {
                     self.problem(
                         &def.name,
@@ -1670,9 +2114,6 @@ impl<'a> Gate<'a> {
                 );
             }
         }
-        if !simple {
-            return;
-        }
         let tag = (def.layout == EnumLayout::Internal)
             .then_some(def.tag.as_deref())
             .flatten();
@@ -1681,27 +2122,40 @@ impl<'a> Gate<'a> {
         // A node without `oneOf` branches is a merged view of every variant:
         // its keys were already checked against the union.
         let merged = branches.len() == 1 && std::ptr::eq(branches[0], node);
-        for shape in &shapes {
-            let Some(branch) = branches
-                .iter()
-                .find(|branch| branch_matches(branch, tag, &shape.name, &shape.fields))
-            else {
-                if tag.is_some() {
-                    self.problem(
-                        &def.name,
-                        path,
-                        format!(
-                            "R1 tagged variant `{}` has no schema branch (no `oneOf` entry \
-                             whose `properties.{tag_name}.const` or `enum` selects it)",
-                            shape.name
-                        ),
-                    );
-                }
+        for shape in shapes.iter().filter(|shape| shape.checkable) {
+            let branch = match tag {
+                Some(_) => branches
+                    .iter()
+                    .find(|branch| branch_matches(branch, tag, &shape.name, &shape.fields)),
+                // Untagged: a branch that documents every field, else the one
+                // that documents the most, so a field the schema left out is
+                // still reported.
+                None => branches
+                    .iter()
+                    .find(|branch| branch_matches(branch, None, &shape.name, &shape.fields))
+                    .or_else(|| {
+                        branches
+                            .iter()
+                            .max_by_key(|branch| branch_overlap(branch, &shape.fields))
+                            .filter(|branch| branch_overlap(branch, &shape.fields) > 0)
+                    }),
+            };
+            let Some(branch) = branch else {
+                self.problem(
+                    &def.name,
+                    path,
+                    format!(
+                        "R1 variant `{}` has no schema branch that describes it (no `oneOf` entry \
+                         selecting it by `properties.{tag_name}.const` or `enum`, or listing its \
+                         fields)",
+                        shape.name
+                    ),
+                );
                 continue;
             };
             let variant_path = format!("{path}[{}]", shape.name);
             self.check_shape(&def.name, &shape.fields, branch, &variant_path, !merged);
-            self.check_members(shape.own, &shape.file, branch, path);
+            self.check_members(&def.name, shape.own, &shape.file, branch, path);
         }
     }
 }
@@ -1722,29 +2176,124 @@ fn registered_components() -> BTreeMap<String, Arc<ComponentMetadata>> {
         .collect()
 }
 
-const RULES: &str = "rules: R1 struct field missing from a strict schema · R2 schema key the \
-                     struct never reads · R3 schema-required but serde-optional · R4 \
-                     serde-required but not schema-required · R5 advertised default serde \
-                     never applies · R6 string enum vs. variants.\nExemptions are explicit: \
-                     HIDDEN_FIELDS (R1/R4) and BUILDER_REQUIRED (R3) in this file, each with a \
-                     reason.";
+/// Skips whitespace, then consumes `token` if it is next: an identifier
+/// (consumed to its boundary), a string literal, or punctuation.
+fn take_token(s: &[char], i: &mut usize, token: &str) -> bool {
+    *i = skip_ws(s, *i);
+    if !word_at(s, *i, token) {
+        return false;
+    }
+    let ends_in_ident = token.chars().last().is_some_and(is_ident_continue);
+    let next_is_ident = s
+        .get(*i + token.chars().count())
+        .is_some_and(|c| is_ident_continue(*c));
+    if ends_in_ident && next_is_ident {
+        return false;
+    }
+    *i += token.chars().count();
+    true
+}
 
-#[test]
-fn registered_schemas_match_config_structs() {
+/// The identifier starting after any whitespace at `i`.
+fn ident_after_ws(s: &[char], i: usize) -> Option<String> {
+    let start = skip_ws(s, i);
+    is_ident_start(*s.get(start)?).then(|| s[start..ident_end(s, start)].iter().collect())
+}
+
+/// The text of the `impl …Builder` block of the builder a component
+/// registers, when both are written in the usual shape:
+/// `register_<kind>_builder("<name>", Arc::new(XBuilder))`.
+fn builder_block(source: &[char], kind: &str, name: &str) -> Option<String> {
+    let trait_name = match kind {
+        "input" => "InputBuilder",
+        "output" => "OutputBuilder",
+        "processor" => "ProcessorBuilder",
+        "buffer" => "BufferBuilder",
+        "codec" => "CodecBuilder",
+        _ => "TemporaryBuilder",
+    };
+    let registration = format!("register_{kind}_builder");
+    let literal = format!("\"{name}\"");
+    let starts_word =
+        |i: usize| is_ident_start(source[i]) && (i == 0 || !is_ident_continue(source[i - 1]));
+
+    let mut builder = None;
+    let mut i = 0;
+    while i < source.len() {
+        if let Some(end) = literal_end(source, i) {
+            i = end;
+            continue;
+        }
+        if starts_word(i) && word_at(source, i, &registration) {
+            let mut j = i + registration.len();
+            if take_token(source, &mut j, "(")
+                && take_token(source, &mut j, &literal)
+                && take_token(source, &mut j, ",")
+                && take_token(source, &mut j, "Arc::new(")
+            {
+                builder = ident_after_ws(source, j);
+                if builder.is_some() {
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    let builder = builder?;
+
+    let mut i = 0;
+    while i < source.len() {
+        if let Some(end) = literal_end(source, i) {
+            i = end;
+            continue;
+        }
+        if starts_word(i) && word_at(source, i, "impl") {
+            let mut j = i + "impl".len();
+            if take_token(source, &mut j, trait_name)
+                && take_token(source, &mut j, "for")
+                && take_token(source, &mut j, &builder)
+            {
+                let open = skip_ws(source, j);
+                if source.get(open) == Some(&'{') {
+                    let end = matching(source, '{', '}', open).ok()?;
+                    return Some(source[open..end].iter().collect());
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether a text deserializes `config`: an annotated binding or a turbofish.
+fn reads_config(text: &[char], config: &str) -> bool {
+    let text: String = text.iter().collect();
+    text.contains(&format!(": {config} =")) || text.contains(&format!("::<{config}>"))
+}
+
+/// Runs the gate over the registered catalogue: every finding, plus the
+/// exemption entries it relied on.
+fn run_gate() -> (Vec<String>, ExemptionUsage) {
     let registered = registered_components();
     let index = Index::load();
+    let usage = std::cell::RefCell::new(ExemptionUsage::default());
     let mut problems = Vec::new();
+
     for (key, meta) in &registered {
         let mapped = CONFIG_TYPES
             .iter()
             .any(|(kind, name, ..)| row_key(kind, name) == *key);
-        if has_docs(&meta.config_schema) && !mapped {
+        let no_config = NO_CONFIG
+            .iter()
+            .any(|(component, _)| *component == key.as_str());
+        if is_documented(&meta.config_schema) && !mapped && !no_config {
             problems.push(format!(
                 "{key}: has a configuration schema but no CONFIG_TYPES row in this test — add \
                  `(kind, name, file, config struct)` so the schema is checked"
             ));
         }
     }
+
     for (kind, name, file, config) in CONFIG_TYPES {
         let key = row_key(kind, name);
         let Some(meta) = registered.get(&key) else {
@@ -1754,25 +2303,82 @@ fn registered_schemas_match_config_structs() {
             continue;
         };
         let Some(def) = index.get(file, config) else {
+            let why = match index.unparsed.get(&(file.to_string(), config.to_string())) {
+                Some(reason) => format!("whose definition does not parse ({reason})"),
+                None => "which does not exist — update the row".to_string(),
+            };
             problems.push(format!(
-                "{key}: CONFIG_TYPES points at `{config}` in `src/{file}`, which does not exist — \
-                 update the row"
+                "{key}: CONFIG_TYPES points at `{config}` in `src/{file}`, {why}"
             ));
             continue;
         };
+        // Bind the row to the builder registered under this name: that
+        // builder's own `impl` block must deserialize the struct. A
+        // registration written in another shape keeps the file-level check.
         let source = index.cleaned_text(file);
-        if !source.contains(&format!(": {config} =")) && !source.contains(&format!("::<{config}>"))
+        let source: Vec<char> = source.chars().collect();
+        match builder_block(&source, kind, name)
+            .map(|block| reads_config(&block.chars().collect::<Vec<_>>(), config))
         {
-            problems.push(format!(
-                "{key}: `{config}` is no longer deserialized in `src/{file}` — point \
-                 CONFIG_TYPES at the struct the builder reads"
-            ));
-            continue;
+            Some(true) => {}
+            Some(false) => {
+                problems.push(format!(
+                    "{key}: the builder registered as `{name}` no longer deserializes `{config}` \
+                     — point CONFIG_TYPES at the struct that builder reads"
+                ));
+                continue;
+            }
+            None if !reads_config(&source, config) => {
+                problems.push(format!(
+                    "{key}: `{config}` is no longer deserialized in `src/{file}` — point \
+                     CONFIG_TYPES at the struct the builder reads"
+                ));
+                continue;
+            }
+            None => {}
         }
-        let mut gate = Gate::new(&index, key.as_str());
+        let mut gate = Gate {
+            index: &index,
+            component: key.as_str(),
+            hidden: HIDDEN_FIELDS,
+            builder_required: BUILDER_REQUIRED,
+            usage: Some(&usage),
+            problems: Vec::new(),
+        };
         gate.check_def(def, &meta.config_schema, config);
         problems.append(&mut gate.problems);
     }
+
+    // A no-config exemption must still be earned: the schema stays a closed
+    // object that documents nothing.
+    for (component, reason) in NO_CONFIG {
+        match registered.get(*component) {
+            None => problems.push(format!(
+                "NO_CONFIG names `{component}`, which is not registered"
+            )),
+            Some(meta) if !(is_strict(&meta.config_schema) && !has_docs(&meta.config_schema)) => {
+                problems.push(format!(
+                    "stale NO_CONFIG entry `{component}` ({reason}): the schema documents keys \
+                     now — add a CONFIG_TYPES row"
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    (problems, usage.into_inner())
+}
+
+const RULES: &str = "rules: R0 a referenced type cannot be read or is ambiguous · R1 struct \
+                     field missing from a strict schema · R2 schema key the struct never reads \
+                     · R3 schema-required but serde-optional, or required key nothing reads · \
+                     R4 serde-required but not schema-required · R5 advertised default serde \
+                     never applies, or whose value differs · R6 string enum vs. variants.\n\
+                     Exemptions are explicit: HIDDEN_FIELDS (R1/R4), BUILDER_REQUIRED (R3), and \
+                     NO_CONFIG in this file, each with a reason.";
+
+#[test]
+fn registered_schemas_match_config_structs() {
+    let (problems, _) = run_gate();
     assert!(
         problems.is_empty(),
         "component metadata drifted from the config structs:\n{}\n{RULES}",
@@ -1780,80 +2386,31 @@ fn registered_schemas_match_config_structs() {
     );
 }
 
-fn exemption_target<'i>(
-    index: &'i Index,
-    registered: &'i BTreeMap<String, Arc<ComponentMetadata>>,
-    component: &str,
-    def_name: &str,
-) -> Result<(&'i Def, &'i Value), String> {
-    let Some((_, _, file, _)) = CONFIG_TYPES
-        .iter()
-        .find(|(kind, name, ..)| row_key(kind, name) == component)
-    else {
-        return Err(format!(
-            "names `{component}`, which has no CONFIG_TYPES row"
-        ));
-    };
-    let Some(def) = index.get(file, def_name) else {
-        return Err(format!(
-            "names `{def_name}`, which is not defined in `src/{file}`"
-        ));
-    };
-    let Some(meta) = registered.get(component) else {
-        return Err(format!("names `{component}`, which is not registered"));
-    };
-    Ok((def, &meta.config_schema))
-}
-
 #[test]
 fn exemptions_stay_accurate() {
-    let registered = registered_components();
-    let index = Index::load();
-    let mut problems = Vec::new();
-    for (component, def_name, field, reason) in HIDDEN_FIELDS {
-        match exemption_target(&index, &registered, component, def_name) {
-            Err(why) => problems.push(format!(
-                "HIDDEN_FIELDS entry `{component}` / `{def_name}.{field}` {why}"
-            )),
-            Ok((def, schema)) => {
-                let is_input = def.fields.iter().any(|f| f.name == *field && !f.skip);
-                if !is_input {
-                    problems.push(format!(
-                        "stale HIDDEN_FIELDS entry `{component}` / `{def_name}.{field}` \
-                         ({reason}): the struct has no such input field"
-                    ));
-                } else if all_named(schema, "properties").contains(*field) {
-                    problems.push(format!(
-                        "stale HIDDEN_FIELDS entry `{component}` / `{def_name}.{field}` \
-                         ({reason}): the schema documents the field now — remove the entry"
-                    ));
-                }
-            }
+    let (mut problems, usage) = run_gate();
+    let key = |component: &str, owner: &str, field: &str| {
+        (component.to_string(), owner.to_string(), field.to_string())
+    };
+    for (component, owner, field, reason) in HIDDEN_FIELDS {
+        if !usage.hidden.contains(&key(component, owner, field)) {
+            problems.push(format!(
+                "stale HIDDEN_FIELDS entry `{component}` / `{owner}.{field}` ({reason}): nothing \
+                 relied on it — the schema documents the field and marks it required where it \
+                 applies; remove the entry"
+            ));
         }
     }
-    for (component, def_name, field, reason) in BUILDER_REQUIRED {
-        match exemption_target(&index, &registered, component, def_name) {
-            Err(why) => problems.push(format!(
-                "BUILDER_REQUIRED entry `{component}` / `{def_name}.{field}` {why}"
-            )),
-            Ok((def, schema)) => match def.fields.iter().find(|f| f.name == *field && !f.skip) {
-                None => problems.push(format!(
-                    "stale BUILDER_REQUIRED entry `{component}` / `{def_name}.{field}` \
-                         ({reason}): the struct has no such input field"
-                )),
-                Some(field_def) if !field_def.optional => problems.push(format!(
-                    "stale BUILDER_REQUIRED entry `{component}` / `{def_name}.{field}` \
-                         ({reason}): serde requires the field now — remove the entry"
-                )),
-                Some(_) if !all_named(schema, "required").contains(*field) => {
-                    problems.push(format!(
-                        "stale BUILDER_REQUIRED entry `{component}` / \
-                             `{def_name}.{field}` ({reason}): the schema no longer lists the \
-                             field as required — remove the entry"
-                    ))
-                }
-                Some(_) => {}
-            },
+    for (component, owner, field, reason) in BUILDER_REQUIRED {
+        if !usage
+            .builder_required
+            .contains(&key(component, owner, field))
+        {
+            problems.push(format!(
+                "stale BUILDER_REQUIRED entry `{component}` / `{owner}.{field}` ({reason}): \
+                 nothing relied on it — the schema no longer marks it required or serde requires \
+                 it now; remove the entry"
+            ));
         }
     }
     assert!(
@@ -1872,7 +2429,6 @@ mod tests {
 /// Demo configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DemoConfig {
-    /// Brokers. A doc comment may quote `r#"struct Fake { a: u8 }"#`.
     pub brokers: Vec<String>,
     #[serde(default)]
     pub flag: bool,
@@ -1886,14 +2442,22 @@ pub struct DemoConfig {
     pub many: Vec<Extra>,
     pub mode: Mode,
     pub kind: Kind,
+    pub destination: Expr<String>,
     /// Commas and `->` inside the type must not split the field.
     pub handler: Option<fn(a: u8, b: u8) -> bool>,
+    /// A custom deserializer runs only for a key that is present.
+    #[serde(deserialize_with = "read_id")]
+    pub custom: Option<String>,
+    #[serde(flatten)]
+    pub(crate) crate_wide: Crate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Extra {
     pub host: String,
     pub port: Option<u16>,
+    /// A fixed-size array: its type text carries a `;`.
+    nonce: [u8; 16],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1908,6 +2472,45 @@ enum Mode {
 enum Kind {
     Fail,
     Skip,
+    #[serde(skip_deserializing)]
+    Legacy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Expr<T> {
+    Expr { expr: String },
+    Value { value: T },
+}
+
+/// A restricted visibility must not hide the container attributes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct Crate {
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WithUnit {
+    Off,
+    File { path: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Untagged {
+    File { path: String, format: String },
+    Socket { port: u16 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "UPPERCASE")]
+enum Upper {
+    File {
+        #[allow(non_snake_case)]
+        pathName: String,
+    },
 }
 
 struct Borrowed<'a> {
@@ -1934,8 +2537,11 @@ struct Unit;
         let extra = json!({
             "type": "object",
             "additionalProperties": false,
-            "properties": {"host": {"type": "string"}, "port": {"type": "integer"}},
-            "required": ["host"]
+            "properties": {
+                "host": {"type": "string"}, "port": {"type": "integer"},
+                "nonce": {"type": "array"}
+            },
+            "required": ["host", "nonce"]
         });
         json!({
             "type": "object",
@@ -1946,9 +2552,12 @@ struct Unit;
                 "renamed": {"type": "object"},
                 "host": {"type": "string"},
                 "port": {"type": "integer"},
+                "nonce": {"type": "array"},
                 "nested": extra,
                 "many": {"type": "array", "items": extra},
                 "handler": {},
+                "custom": {"type": "string"},
+                "enabled": {"type": "boolean", "default": false},
                 "mode": {"type": "object", "oneOf": [
                     {"properties": {"type": {"const": "cluster"}, "urls": {"type": "array"}},
                      "required": ["type", "urls"]},
@@ -1956,9 +2565,17 @@ struct Unit;
                                     "insecure": {"type": "boolean", "default": false}},
                      "required": ["type", "url"]}
                 ]},
-                "kind": {"type": "string", "enum": ["fail", "skip"]}
+                "kind": {"type": "string", "enum": ["fail", "skip"]},
+                "destination": {"type": "object", "oneOf": [
+                    {"properties": {"type": {"const": "expr"}, "expr": {"type": "string"}},
+                     "required": ["type", "expr"]},
+                    {"properties": {"type": {"const": "value"}, "value": {"type": "string"}},
+                     "required": ["type", "value"]}
+                ]}
             },
-            "required": ["brokers", "host", "many", "mode", "kind"]
+            // `flag`, `port`, and `enabled` are omitted: `enabled` through the
+            // container default of a `pub(crate)` struct.
+            "required": ["brokers", "host", "nonce", "many", "mode", "kind", "destination", "custom"]
         })
     }
 
@@ -1983,8 +2600,19 @@ struct Unit;
         assert_eq!(
             names,
             [
-                "brokers", "flag", "renamed", "internal", "extra", "nested", "many", "mode",
-                "kind", "handler",
+                "brokers",
+                "flag",
+                "renamed",
+                "internal",
+                "extra",
+                "nested",
+                "many",
+                "mode",
+                "kind",
+                "destination",
+                "handler",
+                "custom",
+                "crate_wide",
             ]
         );
         // Option<_> and #[serde(default …)] make a field optional; a bare
@@ -1992,9 +2620,21 @@ struct Unit;
         for name in ["flag", "renamed", "nested", "handler"] {
             assert!(field(demo, name).optional, "{name} is optional");
         }
-        for name in ["brokers", "extra", "many", "mode", "kind"] {
+        for name in [
+            "brokers",
+            "extra",
+            "many",
+            "mode",
+            "kind",
+            "destination",
+            "custom",
+        ] {
             assert!(!field(demo, name).optional, "{name} is required");
         }
+        // `deserialize_with` only runs for a key that is present.
+        assert_eq!(field(demo, "custom").ty, "Option<String>");
+        assert!(field(demo, "flag").plain_default);
+        assert!(!field(demo, "nested").plain_default);
         assert!(field(demo, "internal").skip);
         assert!(field(demo, "extra").flatten);
         assert_eq!(
@@ -2005,6 +2645,14 @@ struct Unit;
             field(demo, "renamed").ty,
             "Option<std::collections::HashMap<String, Vec<u8>>>"
         );
+        // A fixed-size array type is read like any other.
+        let extra = index.get("input/demo.rs", "Extra").unwrap();
+        assert_eq!(extra.fields[2].name, "nonce");
+        assert_eq!(extra.fields[2].ty, "[u8; 16]");
+        // The container attributes of a `pub(crate)` struct survive.
+        let crate_wide = index.get("input/demo.rs", "Crate").unwrap();
+        assert!(field(crate_wide, "enabled").optional);
+        assert!(field(crate_wide, "enabled").plain_default);
 
         let mode = index.get("input/demo.rs", "Mode").unwrap();
         assert_eq!(mode.kind, DefKind::Enum);
@@ -2013,11 +2661,7 @@ struct Unit;
         let names: Vec<&str> = mode.variants.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, ["cluster", "single"]);
         assert!(!mode.variants[1].fields[0].optional);
-        let insecure = &mode.variants[1].fields[1];
-        assert_eq!(
-            (insecure.name.as_str(), insecure.optional),
-            ("insecure", true)
-        );
+        assert!(mode.variants[1].fields[1].optional);
 
         let kind = index.get("input/demo.rs", "Kind").unwrap();
         assert_eq!(kind.layout, EnumLayout::External);
@@ -2026,7 +2670,18 @@ struct Unit;
                 .iter()
                 .map(|v| v.name.as_str())
                 .collect::<Vec<_>>(),
-            ["fail", "skip"]
+            ["fail", "skip", "legacy"]
+        );
+        assert!(kind.variants[2].skip);
+
+        // An enum's `rename_all` renames variants, never variant fields.
+        let upper = index.get("input/demo.rs", "Upper").unwrap();
+        assert_eq!(upper.variants[0].name, "FILE");
+        assert_eq!(upper.variants[0].fields[0].name, "pathName");
+
+        assert_eq!(
+            index.get("input/demo.rs", "Untagged").unwrap().layout,
+            EnumLayout::Untagged
         );
 
         let borrowed = index.get("input/demo.rs", "Borrowed").unwrap();
@@ -2059,16 +2714,123 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
     }
 
     #[test]
-    fn snake_case_follows_serde() {
-        for (rust, serde) in [
-            ("Cluster", "cluster"),
-            ("KeyShared", "key_shared"),
-            ("HTTPServer", "http_server"),
-            ("Field2Name", "field2_name"),
-            ("already_snake", "already_snake"),
-        ] {
-            assert_eq!(snake_case(rust), serde, "{rust}");
+    fn rename_rules_match_serde() {
+        macro_rules! rule_enum {
+            ($name:ident, $rule:expr) => {
+                #[derive(serde::Serialize)]
+                #[serde(rename_all = $rule)]
+                #[allow(non_camel_case_types, dead_code, clippy::enum_variant_names)]
+                enum $name {
+                    HTTPServer,
+                    KeyShared,
+                    Field2Name,
+                    ABc,
+                    AlreadySnake,
+                    Snake_Input,
+                    Kebab_Input,
+                    A,
+                }
+            };
         }
+        rule_enum!(Lower, "lowercase");
+        rule_enum!(Upper, "UPPERCASE");
+        rule_enum!(Pascal, "PascalCase");
+        rule_enum!(Camel, "camelCase");
+        rule_enum!(Snake, "snake_case");
+        rule_enum!(ScreamingSnake, "SCREAMING_SNAKE_CASE");
+        rule_enum!(Kebab, "kebab-case");
+        rule_enum!(ScreamingKebab, "SCREAMING-KEBAB-CASE");
+        let name_of = |value: serde_json::Value| value.as_str().unwrap().to_string();
+
+        for (rule, cases) in [
+            (
+                "lowercase",
+                vec![
+                    ("HTTPServer", name_of(json!(Lower::HTTPServer))),
+                    ("Snake_Input", name_of(json!(Lower::Snake_Input))),
+                    ("Kebab_Input", name_of(json!(Lower::Kebab_Input))),
+                ],
+            ),
+            (
+                "UPPERCASE",
+                vec![
+                    ("HTTPServer", name_of(json!(Upper::HTTPServer))),
+                    ("Snake_Input", name_of(json!(Upper::Snake_Input))),
+                    ("Kebab_Input", name_of(json!(Upper::Kebab_Input))),
+                ],
+            ),
+            (
+                "PascalCase",
+                vec![
+                    ("HTTPServer", name_of(json!(Pascal::HTTPServer))),
+                    ("Snake_Input", name_of(json!(Pascal::Snake_Input))),
+                ],
+            ),
+            (
+                "camelCase",
+                vec![
+                    ("HTTPServer", name_of(json!(Camel::HTTPServer))),
+                    ("Snake_Input", name_of(json!(Camel::Snake_Input))),
+                    ("Field2Name", name_of(json!(Camel::Field2Name))),
+                ],
+            ),
+            (
+                "snake_case",
+                vec![
+                    ("HTTPServer", name_of(json!(Snake::HTTPServer))),
+                    ("KeyShared", name_of(json!(Snake::KeyShared))),
+                    ("Field2Name", name_of(json!(Snake::Field2Name))),
+                    ("ABc", name_of(json!(Snake::ABc))),
+                    ("AlreadySnake", name_of(json!(Snake::AlreadySnake))),
+                    ("Snake_Input", name_of(json!(Snake::Snake_Input))),
+                    ("A", name_of(json!(Snake::A))),
+                ],
+            ),
+            (
+                "SCREAMING_SNAKE_CASE",
+                vec![
+                    ("HTTPServer", name_of(json!(ScreamingSnake::HTTPServer))),
+                    ("Snake_Input", name_of(json!(ScreamingSnake::Snake_Input))),
+                ],
+            ),
+            (
+                "kebab-case",
+                vec![
+                    ("HTTPServer", name_of(json!(Kebab::HTTPServer))),
+                    ("KeyShared", name_of(json!(Kebab::KeyShared))),
+                    ("Snake_Input", name_of(json!(Kebab::Snake_Input))),
+                ],
+            ),
+            (
+                "SCREAMING-KEBAB-CASE",
+                vec![
+                    ("HTTPServer", name_of(json!(ScreamingKebab::HTTPServer))),
+                    ("Snake_Input", name_of(json!(ScreamingKebab::Snake_Input))),
+                ],
+            ),
+        ] {
+            let rule = rename_rule(rule).unwrap();
+            for (rust, serde_name) in cases {
+                assert_eq!(rule.apply(rust), serde_name, "{rule:?} applied to {rust}");
+            }
+        }
+        assert!(rename_rule("Title Case").is_none());
+
+        // An enum's rule renames its variants only. Neither `rename_all_fields`
+        // nor a rule on the variant reaches the fields of a struct variant.
+        #[derive(serde::Serialize)]
+        #[serde(tag = "t", rename_all = "UPPERCASE", rename_all_fields = "kebab-case")]
+        #[allow(non_snake_case)]
+        enum VariantRules {
+            File { pathName: String },
+        }
+        assert_eq!(
+            serde_json::to_value(VariantRules::File {
+                pathName: "x".to_string()
+            })
+            .unwrap(),
+            json!({"t": "FILE", "pathName": "x"})
+        );
     }
 
     #[test]
@@ -2104,6 +2866,25 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
             "R3 the schema marks `port` required"
         ));
 
+        // A required key nothing reads can never be satisfied.
+        let mut schema = conforming();
+        schema["required"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("typo"));
+        assert!(reported(
+            &problems(&index, "DemoConfig", &schema),
+            "R3 the schema requires `typo`"
+        ));
+
+        // An `Option` behind a custom deserializer is still required.
+        let mut schema = conforming();
+        schema["required"].as_array_mut().unwrap().remove(7);
+        assert!(reported(
+            &problems(&index, "DemoConfig", &schema),
+            "R4 serde requires `custom`"
+        ));
+
         let mut schema = conforming();
         schema["required"].as_array_mut().unwrap().remove(0);
         assert!(reported(
@@ -2117,6 +2898,18 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
             &problems(&index, "DemoConfig", &schema),
             "R5 the schema advertises a default for `brokers`"
         ));
+
+        // An advertised default must be the value serde produces.
+        let mut schema = conforming();
+        schema["properties"]["flag"]["default"] = json!(true);
+        let found = problems(&index, "DemoConfig", &schema);
+        assert!(
+            reported(
+                &found,
+                "R5 the schema advertises `default: true` for `flag`"
+            ),
+            "{found:?}"
+        );
 
         let mut schema = conforming();
         schema["properties"]["kind"]["enum"] = json!(["fail"]);
@@ -2132,6 +2925,14 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
             "R6 the schema enum lists `bogus`"
         ));
 
+        // A variant serde skips is neither expected nor accepted.
+        let mut schema = conforming();
+        schema["properties"]["kind"]["enum"] = json!(["fail", "skip", "legacy"]);
+        assert!(reported(
+            &problems(&index, "DemoConfig", &schema),
+            "R6 the schema enum lists `legacy`"
+        ));
+
         // A flattened field is part of the root shape.
         let mut schema = conforming();
         schema["properties"].as_object_mut().unwrap().remove("host");
@@ -2139,6 +2940,18 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
             &problems(&index, "DemoConfig", &schema),
             "R1 field `host`"
         ));
+
+        // Losing the container default of a `pub(crate)` struct would make
+        // `enabled` required: the schema must then follow.
+        let mut schema = conforming();
+        schema["properties"]["enabled"]["default"] = json!(true);
+        assert!(
+            reported(
+                &problems(&index, "DemoConfig", &schema),
+                "R5 the schema advertises `default: true` for `enabled`"
+            ),
+            "the container `#[serde(default)]` of a `pub(crate)` struct is kept"
+        );
 
         // Nested nodes recurse, including through array `items`.
         let mut schema = conforming();
@@ -2166,6 +2979,244 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
             ),
             "{found:?}"
         );
+
+        // A generic type is resolved by its name, so a tagged expression
+        // typed `Expr<String>` is checked like any other enum.
+        let mut schema = conforming();
+        schema["properties"]["destination"] = json!({
+            "type": "object",
+            "properties": {"type": {"enum": ["expr", "value"]},
+                           "expr": {"type": "string"}, "value": {"type": "string"}},
+            "required": ["type"]
+        });
+        let found = problems(&index, "DemoConfig", &schema);
+        assert!(
+            reported(
+                &found,
+                "DemoConfig.destination[expr]: R4 serde requires `expr`"
+            ) && reported(
+                &found,
+                "DemoConfig.destination[value]: R4 serde requires `value`"
+            ),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn enum_edges_are_still_checked() {
+        let index = demo_index();
+        let check = |config: &str, schema: Value| {
+            let mut gate = Gate::new(&index, "input/demo");
+            gate.check_def(index.get("input/demo.rs", config).unwrap(), &schema, config);
+            gate.problems
+        };
+
+        // A unit sibling does not switch off the checks for the other variants.
+        let found = check(
+            "WithUnit",
+            json!({"oneOf": [
+                {"properties": {"type": {"const": "off"}}},
+                {"properties": {"type": {"const": "file"}, "path": {"type": "string"}},
+                 "required": ["type"]}
+            ]}),
+        );
+        assert!(
+            reported(&found, "WithUnit[file]: R4 serde requires `path`"),
+            "{found:?}"
+        );
+
+        // Untagged: a branch that documents most of a variant is still its
+        // branch, so the field it left out is reported.
+        let found = check(
+            "Untagged",
+            json!({"oneOf": [
+                {"properties": {"path": {"type": "string"}}, "required": ["path"]},
+                {"properties": {"port": {"type": "integer"}}, "required": ["port"]}
+            ]}),
+        );
+        assert!(
+            reported(&found, "Untagged[File]: R4 serde requires `format`"),
+            "{found:?}"
+        );
+        // A closed branch also reports the field it does not document.
+        let mut closed = json!({"oneOf": [
+            {"properties": {"path": {"type": "string"}}, "required": ["path", "format"],
+             "additionalProperties": false},
+            {"properties": {"port": {"type": "integer"}}, "required": ["port"]}
+        ]});
+        let found = check("Untagged", closed.clone());
+        assert!(
+            reported(&found, "Untagged[File]: R1 field `format`"),
+            "{found:?}"
+        );
+        closed["oneOf"][0]["properties"]["format"] = json!({"type": "string"});
+        let found = check("Untagged", closed);
+        assert!(found.is_empty(), "{found:?}");
+        let found = check(
+            "Untagged",
+            json!({"anyOf": [
+                {"properties": {"path": {"type": "string"}, "format": {"type": "string"}},
+                 "required": ["path", "format"]},
+                {"properties": {"port": {"type": "integer"}}, "required": ["port"]}
+            ]}),
+        );
+        assert!(found.is_empty(), "{found:?}");
+        // No branch describes a variant at all.
+        let found = check(
+            "Untagged",
+            json!({"anyOf": [
+                {"properties": {"port": {"type": "integer"}}, "required": ["port"]}
+            ]}),
+        );
+        assert!(
+            reported(&found, "Untagged: R1 variant `File` has no schema branch"),
+            "{found:?}"
+        );
+
+        // An enum's `rename_all` renames variants only: the discriminator is
+        // `FILE`, the field stays `pathName`.
+        let found = check(
+            "Upper",
+            json!({"oneOf": [{"properties": {"t": {"const": "FILE"}, "pathName": {"type": "string"}},
+                              "required": ["t", "pathName"]}]}),
+        );
+        assert!(found.is_empty(), "{found:?}");
+        let found = check(
+            "Upper",
+            json!({"oneOf": [{"properties": {"t": {"const": "FILE"}, "pathname": {"type": "string"}},
+                              "required": ["t", "pathname"]}]}),
+        );
+        assert!(
+            reported(&found, "Upper: R2 the schema documents key `pathname`")
+                && reported(&found, "Upper[FILE]: R3 the schema requires `pathname`")
+                && reported(&found, "Upper[FILE]: R4 serde requires `pathName`"),
+            "{found:?}"
+        );
+
+        // Without a tag the same enum is externally tagged: one property per
+        // variant, named by the (renamed) variant.
+        let index = Index::from_sources(&[(
+            "input/demo.rs".to_string(),
+            "#[serde(rename_all = \"UPPERCASE\")]\nenum Plain { File { pathName: String } }"
+                .to_string(),
+        )]);
+        let mut gate = Gate::new(&index, "input/demo");
+        let schema = json!({"properties": {"FILE": {"properties": {"pathName": {"type": "string"}},
+                                                    "required": ["pathName"]}}});
+        gate.check_def(
+            index.get("input/demo.rs", "Plain").unwrap(),
+            &schema,
+            "Plain",
+        );
+        assert!(gate.problems.is_empty(), "{:?}", gate.problems);
+
+        // A closed schema that documents nothing rejects every field: it is
+        // not the same as taking no configuration.
+        let found = check(
+            "Upper",
+            json!({"type": "object", "additionalProperties": false}),
+        );
+        assert!(
+            reported(&found, "R1 variant `FILE` has no schema branch"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn unreadable_and_ambiguous_types_are_reported_not_skipped() {
+        // A local definition whose body does not parse is reported where a
+        // documented field refers to it.
+        let index = Index::from_sources(&[(
+            "input/demo.rs".to_string(),
+            r#"
+struct Holder { broken: Option<Broken> }
+struct Broken { broken_field, }
+"#
+            .to_string(),
+        )]);
+        let mut gate = Gate::new(&index, "input/demo");
+        gate.check_def(
+            index.get("input/demo.rs", "Holder").unwrap(),
+            &json!({"type": "object", "properties": {"broken": {"type": "object", "properties": {"x": {}}}}}),
+            "Holder",
+        );
+        assert!(
+            reported(
+                &gate.problems,
+                "R0 `Holder.broken` cannot be checked: the definition of `Broken` does not parse"
+            ),
+            "{:?}",
+            gate.problems
+        );
+        assert!(index.get("input/demo.rs", "Broken").is_none());
+        assert!(index
+            .unparsed
+            .contains_key(&("input/demo.rs".to_string(), "Broken".to_string())));
+
+        // A bare name shared by two definitions is an ambiguity, not a choice.
+        let sources: Vec<(String, String)> = [
+            (
+                "a.rs".to_string(),
+                "pub struct Options { a: u8 }".to_string(),
+            ),
+            (
+                "z.rs".to_string(),
+                "pub struct Options { b: u8 }".to_string(),
+            ),
+            (
+                "input/demo.rs".to_string(),
+                "struct Holder { options: Options }".to_string(),
+            ),
+        ]
+        .to_vec();
+        let index = Index::from_sources(&sources);
+        let schema = json!({"type": "object", "properties": {"options": {"type": "object", "properties": {"b": {}},
+            "required": ["b"]}}, "required": ["options"]});
+        let mut gate = Gate::new(&index, "input/demo");
+        gate.check_def(
+            index.get("input/demo.rs", "Holder").unwrap(),
+            &schema,
+            "Holder",
+        );
+        assert!(
+            reported(&gate.problems, "is defined in src/a.rs and src/z.rs"),
+            "{:?}",
+            gate.problems
+        );
+
+        // A `use` import binds the name.
+        let mut sources = sources;
+        sources[2].1 = "use crate::z::Options;\nstruct Holder { options: Options }".to_string();
+        let index = Index::from_sources(&sources);
+        let mut gate = Gate::new(&index, "input/demo");
+        gate.check_def(
+            index.get("input/demo.rs", "Holder").unwrap(),
+            &schema,
+            "Holder",
+        );
+        assert!(gate.problems.is_empty(), "{:?}", gate.problems);
+
+        // `use` trees are expanded: groups, nested groups, and aliases.
+        let index = Index::from_sources(&[(
+            "lib.rs".to_string(),
+            "use a::b::{X, c::{Y, Z as W}};\nuse d::e::*;\nuse f::g::V as U;\nstruct S { v: u8 }"
+                .to_string(),
+        )]);
+        let named = &index.imports["lib.rs"];
+        for (local, path) in [
+            ("X", "a::b::X"),
+            ("Y", "a::b::c::Y"),
+            ("W", "a::b::c::Z"),
+            ("U", "f::g::V"),
+        ] {
+            assert!(
+                named
+                    .iter()
+                    .any(|(name, imported)| name == local && imported == path),
+                "{local} → {path} is imported ({named:?})"
+            );
+        }
+        assert_eq!(index.globs["lib.rs"], vec!["d::e".to_string()]);
     }
 
     #[test]
@@ -2262,12 +3313,18 @@ struct Ssl {
             "R2 the schema documents key `https`"
         ));
 
-        let mut renamed = conforming.clone();
-        renamed["oneOf"][0]["properties"]["http"]["required"] = json!(["url", "method"]);
+        let mut required = conforming.clone();
+        required["oneOf"][0]["properties"]["http"]["required"] = json!(["url", "method"]);
         assert!(reported(
-            &run(&renamed),
+            &run(&required),
             "R3 the schema marks `method` required"
         ));
+
+        // A function-backed default cannot be compared: `GET` is not
+        // second-guessed.
+        let mut other = conforming.clone();
+        other["oneOf"][0]["properties"]["http"]["properties"]["method"]["default"] = json!("POST");
+        assert!(run(&other).is_empty());
 
         // A tagged enum documented as one flat object selects the variant
         // through the tag's `enum`.
@@ -2288,44 +3345,87 @@ struct Ssl {
     }
 
     #[test]
+    fn a_row_is_bound_to_the_builder_registered_under_its_name() {
+        let source: Vec<char> = r#"
+struct OldConfig { a: u8 }
+struct NewConfig { b: u8 }
+fn helper() {
+    let config: OldConfig = parse_config(None, "elsewhere");
+    let _ = config;
+}
+pub struct DemoBuilder;
+impl InputBuilder for DemoBuilder {
+    fn build(&self) -> Result<(), ()> {
+        let config: NewConfig = parse_config(None, "demo")?;
+        let _ = config;
+        Ok(())
+    }
+}
+pub fn init() {
+    register_input_builder(
+        "demo",
+        Arc::new(DemoBuilder),
+    )?;
+    Ok(())
+}
+"#
+        .chars()
+        .collect();
+        // Both spellings appear in the file, so only the builder's own
+        // block can tell which struct it reads.
+        assert!(reads_config(&source, "OldConfig"));
+        let block: Vec<char> = builder_block(&source, "input", "demo")
+            .expect("the registration and the impl block are found")
+            .chars()
+            .collect();
+        assert!(!reads_config(&block, "OldConfig"));
+        assert!(reads_config(&block, "NewConfig"));
+        // A name that is not registered, or another kind, has no block.
+        assert!(builder_block(&source, "input", "other").is_none());
+        assert!(builder_block(&source, "output", "demo").is_none());
+    }
+
+    #[test]
     fn the_real_index_resolves_types_across_modules() {
         let index = Index::load();
-        let tls = index
-            .resolve("crate::pulsar::common::PulsarTlsConfig", "input/pulsar.rs")
-            .expect("crate paths resolve");
+        let resolved = |ty: &str, file: &str| match index.resolve(ty, file) {
+            Resolution::Resolved(inner) => {
+                (inner.def.file.clone(), inner.def.name.clone(), inner.array)
+            }
+            other => panic!("{ty} in {file} resolves, got {other:?}"),
+        };
         assert_eq!(
-            (tls.def.file.as_str(), tls.def.name.as_str()),
-            ("pulsar/common.rs", "PulsarTlsConfig")
+            resolved("crate::pulsar::common::PulsarTlsConfig", "input/pulsar.rs"),
+            (
+                "pulsar/common.rs".to_string(),
+                "PulsarTlsConfig".to_string(),
+                false
+            )
         );
-        assert!(!tls.array);
-
-        let temporaries = index
-            .resolve("Option<Vec<TemporaryConfig>>", "processor/sql.rs")
-            .expect("wrappers are peeled");
-        assert!(temporaries.array);
-        assert_eq!(temporaries.def.name, "TemporaryConfig");
-
+        assert_eq!(
+            resolved("Option<Vec<TemporaryConfig>>", "processor/sql.rs"),
+            (
+                "processor/sql.rs".to_string(),
+                "TemporaryConfig".to_string(),
+                true
+            )
+        );
+        assert_eq!(resolved("Expr<String>", "output/pulsar.rs").1, "Expr");
         // `MysqlConfig` exists in both the SQL input and output: the file the
         // type is written in wins.
-        assert_eq!(
-            index
-                .resolve("MysqlConfig", "output/sql.rs")
-                .unwrap()
-                .def
-                .file,
-            "output/sql.rs"
-        );
-        assert_eq!(
-            index
-                .resolve("MysqlConfig", "input/sql.rs")
-                .unwrap()
-                .def
-                .file,
-            "input/sql.rs"
-        );
-        assert!(index.resolve("String", "output/sql.rs").is_none());
-        assert!(index
-            .resolve("std::time::Duration", "output/sql.rs")
-            .is_none());
+        assert_eq!(resolved("MysqlConfig", "output/sql.rs").0, "output/sql.rs");
+        assert_eq!(resolved("MysqlConfig", "input/sql.rs").0, "input/sql.rs");
+        assert!(matches!(
+            index.resolve("String", "output/sql.rs"),
+            Resolution::Foreign
+        ));
+        assert!(matches!(
+            index.resolve("std::time::Duration", "output/sql.rs"),
+            Resolution::Foreign
+        ));
+        assert!(matches!(
+            index.resolve("HashMap<String, String>", "output/sql.rs"),
+            Resolution::Foreign
+        ));
     }
 }

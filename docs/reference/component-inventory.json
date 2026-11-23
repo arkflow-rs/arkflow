@@ -78,7 +78,7 @@
     {
       "kind": "input",
       "name": "http",
-      "description": "Receives data via HTTP: runs a server that accepts POST/PUT requests on `address` + `path` and forwards each request body into the stream.",
+      "description": "Receives data via HTTP: runs a server that accepts POST requests on `address` + `path` and forwards each request body into the stream.",
       "config_optional": false,
       "config_schema": {
         "type": "object",
@@ -657,7 +657,7 @@
             "properties": {
               "certificate_chain_file": {
                 "type": "string",
-                "description": "Client certificate chain file (PEM), for mTLS."
+                "description": "PEM certificate chain the broker certificate is verified against (the trust anchor of a private CA). It is not a client certificate."
               },
               "hostname_verification": {
                 "type": "boolean",
@@ -1743,23 +1743,39 @@
           "topic": {
             "type": "object",
             "description": "Destination topic expression: {\"type\":\"value\",\"value\":\"...\"} for a static topic or {\"type\":\"expr\",\"expr\":\"...\"} per message.",
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "value",
-                  "expr"
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "type": {
+                    "const": "value"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "value"
                 ]
               },
-              "value": {
-                "type": "string"
-              },
-              "expr": {
-                "type": "string"
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "type": {
+                    "const": "expr"
+                  },
+                  "expr": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "expr"
+                ]
               }
-            },
-            "required": [
-              "type"
             ]
           },
           "auth": {
@@ -1773,7 +1789,7 @@
             "properties": {
               "certificate_chain_file": {
                 "type": "string",
-                "description": "Client certificate chain file (PEM), for mTLS."
+                "description": "PEM certificate chain the broker certificate is verified against (the trust anchor of a private CA). It is not a client certificate."
               },
               "hostname_verification": {
                 "type": "boolean",
@@ -2958,13 +2974,40 @@
                 },
                 "key": {
                   "type": "object",
-                  "properties": {
-                    "value": {
-                      "type": "string"
+                  "description": "Key used to look up data in the temporary source.",
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "value"
+                        },
+                        "value": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "value"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "expr"
+                        },
+                        "expr": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "expr"
+                      ]
                     }
-                  },
-                  "required": [
-                    "value"
                   ]
                 }
               },

@@ -319,7 +319,7 @@ fn reject_removed_client_keys(config: &Option<serde_json::Value>) -> Result<(), 
         {
             return Err(Error::Config(format!(
                 "http input: `{key}` is not supported: the HTTP input only runs as a server that \
-                 accepts POST/PUT requests on `path` (the polling client mode no longer exists). \
+                 accepts POST requests on `path` (the polling client mode no longer exists). \
                  Remove `{key}` from the configuration."
             )));
         }
@@ -331,7 +331,7 @@ pub fn init() -> Result<(), Error> {
     register_input_builder("http", Arc::new(HttpInputBuilder))?;
     register_input_metadata(ComponentMetadata::with_schema(
         "http",
-        "Receives data via HTTP: runs a server that accepts POST/PUT requests on `address` + `path` and forwards each request body into the stream.",
+        "Receives data via HTTP: runs a server that accepts POST requests on `address` + `path` and forwards each request body into the stream.",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,

@@ -20,7 +20,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | codec | `schema_registry` | Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate. | [reference](../components/codecs/schema-registry) |
 | input | `file` | Reads records from local or remote object storage (S3, GCS, Azure, HDFS) in CSV/JSON/Parquet/Avro/Arrow formats. | [reference](../components/inputs/file) |
 | input | `generate` | Generates synthetic text messages on a fixed interval (useful for testing and load simulation). | [reference](../components/inputs/generate) |
-| input | `http` | Receives data via HTTP: runs a server that accepts POST/PUT requests on `address` + `path` and forwards each request body into the stream. | [reference](../components/inputs/http) |
+| input | `http` | Receives data via HTTP: runs a server that accepts POST requests on `address` + `path` and forwards each request body into the stream. | [reference](../components/inputs/http) |
 | input | `kafka` | Consumes messages from Apache Kafka topics with a consumer group. | [reference](../components/inputs/kafka) |
 | input | `memory` | In-memory input queue seeded with an initial list of messages. Primarily for tests and demos. | [reference](../components/inputs/memory) |
 | input | `modbus` | Polls Modbus TCP devices on a fixed interval, reading coils, discrete inputs, or registers. | [reference](../components/inputs/modbus) |

@@ -97,15 +97,11 @@ impl HttpOutput {
 #[async_trait]
 impl Output for HttpOutput {
     async fn connect(&self) -> Result<(), Error> {
-        // Create an HTTP client
-        let client_builder =
-            Client::builder().timeout(std::time::Duration::from_millis(self.config.timeout_ms));
-        let client_arc = self.client.clone();
-        client_arc.lock().await.replace(
-            client_builder.build().map_err(|e| {
-                Error::Connection(format!("Unable to create an HTTP client: {}", e))
-            })?,
-        );
+        // The shared client keeps the configured timeout and, like every
+        // other HTTP component, never sends a loopback URL through a system
+        // proxy (proxying localhost is never what a user means).
+        let client = crate::http_util::build_http_client(self.config.timeout_ms, &self.config.url)?;
+        self.client.lock().await.replace(client);
 
         self.connected.store(true, Ordering::SeqCst);
         Ok(())

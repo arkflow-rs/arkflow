@@ -335,7 +335,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 | 顺序 | 事项 | 验收 | 产出 |
 | --- | --- | --- | --- |
 | ~~1~~ | ~~PA-P1-02 文档真相~~ ✅ 已实施（PR #1392）：CLAUDE.md 指针化、插件指南 doctest 门禁、Helm appVersion 门禁 | CLAUDE.md/插件指南/Helm 一致 | `fix-docs-truth-2026-11` |
-| ~~2~~ | ~~PA-P1-03 元数据一致性~~ ✅ 已实施并归档（PR #1401，change `add-component-metadata-conformance`）：注册表 schema 与 serde 配置结构体的机械门禁（字段双向覆盖、`required`、`default`、枚举取值），并修掉它在 10 个组件里查出的漂移 | conformance 测试红/绿可控（13 个真实突变场景逐一验证） | `add-component-metadata-conformance` |
+| ~~2~~ | ~~PA-P1-03 元数据一致性~~ ✅ 已实施并归档（PR #1401，change `add-component-metadata-conformance`）：注册表 schema 与 serde 配置结构体的机械门禁（字段双向覆盖、`required`、`default`、枚举取值），并修掉它在 13 个组件里查出的漂移 | conformance 测试红/绿可控（13 个真实突变场景逐一验证） | `add-component-metadata-conformance` |
 | ~~3~~ | ~~PA-P1-04 SQL 标识符~~ ✅ 已实施并归档（PR #1401，change `harden-sql-output-identifiers`）：列名、upsert key、表名全部按方言加引号转义，表名逐段解析 | 注入用例通过（真实 PostgreSQL + MySQL 往返验证） | `harden-sql-output-identifiers` |
 
 **退出标准**：以上 3 项归档；`cargo test --workspace --all-targets`、`pnpm docs:check`、console 五件套全绿；CHANGELOG 更新。
@@ -425,7 +425,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 | 构建 | 冷构建时间、default/minimal 二进制体积、feature 矩阵 | 未测 | 建立基线；minimal 体积/时间显著下降 |
 | 依赖 | `Cargo.lock` 包数、重复 arrow/datafusion/zstd | 1,021 包；已有单版本门禁 | feature 化后 default 锁包数下降并留档 |
 | 文档 | CLAUDE.md 一致性、插件指南可编译、Helm 版本一致 | 3 处漂移 | 3 条 CI 检查全绿 |
-| 元数据 | serde 字段 ⊆ metadata schema ⊆ inventory | 登记 2 处漂移；门禁实测 26 处，已全修 | conformance 测试全绿（2026-11-23 达成） |
+| 元数据 | serde 字段 ⊆ metadata schema ⊆ inventory | 登记 2 处漂移；门禁实测 30 处，已全修 | conformance 测试全绿（2026-11-23 达成） |
 | 可靠性 | EOS 忙循环回归、checkpoint 失败归因 | 回归测试已入库（2026-11-22，见 3.1，缺陷本身已否证） | 无 |
 | 安全 | 节点身份冒用测试、审计失败可观测、会话撤销 | 未覆盖 | 攻击/故障注入测试入库 |
 | 控制面 | 驱逐不伤 Running、rollout 目标上限 | 未覆盖 | 测试入库 |

@@ -282,11 +282,15 @@ aligned to it, two of which change runtime behavior:
   layouts. The struct is read from source, so the field list cannot go
   stale; every component with a schema must be mapped, and the two exemption
   lists (`HIDDEN_FIELDS`, `BUILDER_REQUIRED`) fail the gate once an entry is
-  no longer needed.
+  no longer needed. Generic field types such as `Expr<String>` are resolved
+  by name, so tagged-expression properties are checked too.
+- Example configs cover the newly documented fields: `pulsar_tls_example.yaml`
+  (the Pulsar `tls` block on an input and an output) and `concurrency` in
+  the `milvus_search` example.
 
 ### Changed — Component metadata
 
-The gate found drift in ten components; the IDE-facing schema and the
+The gate found drift in thirteen components; the IDE-facing schema and the
 committed inventory now match what serde accepts:
 
 - `kafka` input: `transactional_offsets` is in the schema (the IDE no longer
@@ -294,13 +298,26 @@ committed inventory now match what serde accepts:
   default the schema always advertised — instead of failing with a
   missing-field error.
 - `pulsar` input and output: the `tls` block (`certificate_chain_file`,
-  `hostname_verification`) is in the schema. The input's
+  `hostname_verification`) is in the schema, and `certificate_chain_file` is
+  described as what the driver does with it — the chain the broker
+  certificate is verified against, not a client certificate for mTLS. The
+  component pages said the same wrong thing and are corrected.
+  The input's
   `subscription_type` lists the values serde accepts (`exclusive`, `shared`,
   `failover`, `key_shared`; the capitalized spellings it listed were
   rejected at runtime).
 - `milvus_search`: `concurrency` is in the schema.
+- `pulsar` output: the `topic` schema requires `value` with `type: value`
+  and `expr` with `type: expr`; the flat schema let the IDE pass an
+  expression object carrying no expression.
+- `sql` processor: the `temporary_list[].key` schema is the tagged
+  expression the docs and examples already use (`type: value` or
+  `type: expr`); it required `value` and omitted the tag, so the IDE
+  rejected the documented form.
 - `http` input: the schema no longer documents `method` and `interval` —
-  the polling client mode does not exist — and a config carrying either key
+  the polling client mode does not exist — the description no longer
+  promises `PUT` (the server routes `POST` only), and a config carrying
+  either key
   now fails at build with an explanatory error instead of being silently
   ignored while the input runs as a server.
 - `http` output: omitting `method` means `POST` (the advertised default);
@@ -313,6 +330,18 @@ committed inventory now match what serde accepts:
   `auth.type` as required. The `redis` input description no longer claims
   stream consumer groups, and the `http` input description no longer
   advertises polling.
+
+### Fixed — Connectors
+
+- The `http` output builds its client through the shared
+  `http_util::build_http_client`, so — like every other HTTP component — a
+  loopback URL (`localhost`, `127.0.0.1`, `::1`) bypasses the system proxy
+  instead of being forwarded to it. On a machine with a system proxy this
+  also made the refused-connection test fail intermittently with the
+  proxy's `502`.
+- The `sql` output rejects an empty quoted part in `table_name`
+  (`analytics.""`) when the output is built, instead of letting the
+  server reject the zero-length identifier on the first write.
 
 ### Security — SQL output
 

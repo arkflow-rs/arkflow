@@ -524,7 +524,7 @@ pub fn init() -> Result<(), Error> {
                     "additionalProperties": false,
                     "description": "TLS settings.",
                     "properties": {
-                        "certificate_chain_file": {"type": "string", "description": "Client certificate chain file (PEM), for mTLS."},
+                        "certificate_chain_file": {"type": "string", "description": "PEM certificate chain the broker certificate is verified against (the trust anchor of a private CA). It is not a client certificate."},
                         "hostname_verification": {"type": "boolean", "default": true, "description": "Verify the server hostname. Defaults to true."}
                     }
                 }

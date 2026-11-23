@@ -17,27 +17,30 @@ Constraints: no new dependency (`Cargo.lock` must stay untouched — the workspa
 
 - Auto-generating schemas from structs (schemars). The hand-written schemas stay the source of descriptive text; the gate only checks structural agreement.
 - Documenting the internals of opaque nested nodes (e.g. `file` input `input_type`, a bare `{"type": "object"}`): a schema node without `additionalProperties: false` accepts any key, so an undocumented nested field is a completeness gap, not a false rejection.
-- Per-variant `required` checking for internally tagged enums (`oneOf` branches): coverage is checked as a union; variant-level requiredness is not expressible that way.
+- Variant-level `required` when an internally tagged enum is documented as one merged object without `oneOf` branches: coverage is checked on the union, because nothing in such a schema says which key belongs to which variant. With `oneOf` branches every variant is checked against its own branch.
+- The *value* of a function-backed default (`default = "…"`) or of a type without a fixed `Default` (enums, maps, `Option`): the gate checks that the field may be omitted, not what the omitted value is. Defaults whose value is fixed (`bool`, numbers, `String`, `Vec`) are compared with the advertised one.
+- Adjacent tagging (`tag` plus `content`): not modelled, nothing is checked there.
 - Changing the `milvus` output `id_field` contract (optional on the struct, enforced by the builder with a domain-specific message).
 - The top-level engine configuration schema (`build_config_schema`, job snippets) — separate drift, tracked by the docs audit.
 
 ## Decisions
 
 **D1 — Source-scan gate with a std-only struct parser, no new dependency.**
-Alternatives: (a) `schemars` derive on every config struct — needs derives on all nested types plus overrides for external types, and adds a direct dependency; (b) `syn` as a dev-dependency — robust but adds a direct dependency and a `Cargo.lock` change; (c) hand-maintained field lists — the list itself drifts, which is the bug being fixed. The chosen approach follows the existing structural tests (`connector_error_contract.rs` reads `src/` under `CARGO_MANIFEST_DIR`): the gate reads each config struct from source, so the field list can never go stale. The parser handles what the config structs actually use — container/field `#[serde(...)]` attributes (`rename`, `default`, `skip`, `skip_deserializing`, `flatten`, `tag`, `rename_all`), `Option<_>` / default-annotated optionality, multi-line generic types, doc comments, string literals, raw strings and lifetimes — and is fail-closed: a field whose name is not identifier-shaped or whose type text contains a stray field definition is a test failure, never a silent skip. It carries its own unit tests plus mutation checks (each rule must fail when its target drift is introduced).
+Alternatives: (a) `schemars` derive on every config struct — needs derives on all nested types plus overrides for external types, and adds a direct dependency; (b) `syn` as a dev-dependency — robust but adds a direct dependency and a `Cargo.lock` change; (c) hand-maintained field lists — the list itself drifts, which is the bug being fixed. The chosen approach follows the existing structural tests (`connector_error_contract.rs` reads `src/` under `CARGO_MANIFEST_DIR`): the gate reads each config struct from source, so the field list can never go stale. The parser handles what the config structs actually use — container/field `#[serde(...)]` attributes (`rename`, `default`, `skip`, `skip_deserializing`, `flatten`, `tag`, `rename_all`), `Option<_>` / default-annotated optionality, multi-line generic types, doc comments, string literals, raw strings and lifetimes — and is fail-closed: a field whose name is not identifier-shaped or whose type text contains a stray field definition is a test failure, never a silent skip. A definition that does not parse, a bare name that several local definitions share, and a type the gate cannot read are reported (R0) where a documented field refers to them — never skipped. serde's `rename_all` conversions are reproduced character for character, and a unit test compares every rule with the real derive. It carries its own unit tests plus mutation checks (each rule must fail when its target drift is introduced).
 
 **D2 — Explicit `(kind, name) → (file, config struct)` table, guarded for completeness and staleness.**
-Deriving the mapping from builder code would need more free-text heuristics than it saves. The table is one line per component; the gate asserts (1) every registered component with a non-unit schema has a row and every row names a registered component, (2) the struct exists in the named file, and (3) the struct is still deserialized in that file (`let _: T = parse_config(..)` / `from_value::<T>`), so a builder switching types cannot leave a stale row behind. Unit components (`config_schema == {"type":"object"}`, e.g. `output/drop`) are exempt.
+Deriving the mapping from builder code would need more free-text heuristics than it saves. The table is one line per component; the gate asserts (1) every registered component whose schema documents keys has a row and every row names a registered component, (2) the struct exists in the named file, and (3) the struct is deserialized inside the `impl` block of the builder registered under that name (the whole file is the fallback when the registration is not written in the usual shape), so a builder switching types cannot leave a stale row behind. Components that take no configuration are exempt: a unit schema (`config_schema == {"type":"object"}`, e.g. `output/drop`) needs nothing, and a closed, empty schema for a builder that ignores its config (e.g. `codec/debezium_json`) is listed in `NO_CONFIG`.
 
-**D3 — Five rules, applied per schema node with JSON Schema semantics.**
+**D3 — Seven rules, applied per schema node with JSON Schema semantics.**
 
 | Rule | Applies at | Meaning |
 | --- | --- | --- |
+| R0 readable | every referenced type | a type the gate cannot read, or an ambiguous bare name, is reported |
 | R1 coverage | nodes with `additionalProperties: false` | every serde input field appears in `properties` |
 | R2 no ghosts | any node with `properties` | every documented key is a serde input field |
-| R3 required ⊆ serde-required | any node with `required` | the schema never rejects what serde accepts |
+| R3 required ⊆ serde-required | any node with `required` | the schema never rejects what serde accepts, and never requires a key nothing reads |
 | R4 serde-required ⊆ required | any node with `properties` | the schema never accepts what serde rejects |
-| R5 default ⇒ optional | any node with `properties` | an advertised default is real |
+| R5 default ⇒ optional | any node with `properties` | an advertised default is real and, where its value is fixed, equals the value serde produces |
 | R6 enum values | string-enum schema on a unit-variant enum | the listed values are exactly serde's variant names |
 
 `#[serde(flatten)]` fields contribute the flattened type's fields inline (recursively); `skip`/`skip_deserializing` fields are not inputs and are ignored. Nested object properties recurse into the nested type. R1 deliberately does not apply at permissive nodes: without `additionalProperties: false` an undocumented key is still accepted.
@@ -61,7 +64,7 @@ Schema-side when the struct is right: add missing fields (`kafka` input `transac
 
 ## Migration Plan
 
-No migration: the generated inventory/config schema are regenerated in the same change, and the docs pages already describe the corrected behavior (they are reviewed for the two fields that become real defaults). Rollback is a revert of the change.
+One existing configuration changes outcome: an `http` **input** config that still carries `method` or `interval` — keys of the polling client mode, which does not exist — now fails at build with an error naming the key. Remove them. (The `http` **output** `method` is unaffected and stays supported.) Configs that omit `kafka` input `start_from_latest` or `http` output `method` used to fail and now take the documented default, so they need nothing. Run `--validate` after upgrading: it reports the first case. The generated inventory and config schema are regenerated in the same change. Rollback is a revert of the change.
 
 ## Open Questions
 

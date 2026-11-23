@@ -119,6 +119,13 @@ impl QuoteStyle {
                         Some(_) => i += 1,
                     }
                 }
+                // `""` names nothing: the server rejects a zero-length
+                // identifier, so do it here.
+                if i - start == 2 {
+                    return Err(InvalidObjectName::EmptyPart {
+                        part: parts.len() + 1,
+                    });
+                }
                 parts.push(chars[start..i].iter().collect());
             } else {
                 let start = i;
@@ -350,6 +357,23 @@ mod tests {
                 .quote_qualified("\"a\"\"")
                 .unwrap_err(),
             InvalidObjectName::UnterminatedQuote { quote: '"' }
+        );
+        // An empty quoted part names nothing; a quoted quote is a name.
+        assert_eq!(
+            QuoteStyle::DoubleQuote.quote_qualified("analytics.\"\""),
+            Err(InvalidObjectName::EmptyPart { part: 2 })
+        );
+        assert_eq!(
+            QuoteStyle::Backtick.quote_qualified("``"),
+            Err(InvalidObjectName::EmptyPart { part: 1 })
+        );
+        assert_eq!(
+            QuoteStyle::DoubleQuote.quote_qualified("\"\"\"\"").unwrap(),
+            "\"\"\"\""
+        );
+        assert_eq!(
+            QuoteStyle::Backtick.quote_qualified("````").unwrap(),
+            "````"
         );
         let reason = QuoteStyle::DoubleQuote
             .quote_qualified(".a")

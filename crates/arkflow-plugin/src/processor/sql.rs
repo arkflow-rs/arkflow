@@ -848,7 +848,14 @@ pub fn init() -> Result<(), Error> {
                         "properties": {
                             "name": {"type": "string"},
                             "table_name": {"type": "string"},
-                            "key": {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]}
+                            "key": {
+                                "type": "object",
+                                "description": "Key used to look up data in the temporary source.",
+                                "oneOf": [
+                                    {"type": "object", "additionalProperties": false, "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"]},
+                                    {"type": "object", "additionalProperties": false, "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"]}
+                                ]
+                            }
                         },
                         "required": ["name", "table_name", "key"]
                     }
