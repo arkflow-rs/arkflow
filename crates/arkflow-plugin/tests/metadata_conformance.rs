@@ -585,6 +585,8 @@ struct SerdeAttrs {
     skip: bool,
     flatten: bool,
     rename_all: Option<String>,
+    /// An enum's rule for the fields of its struct variants.
+    rename_all_fields: Option<String>,
     tag: Option<String>,
     untagged: bool,
     content: bool,
@@ -630,6 +632,7 @@ fn parse_serde(attrs: &[String]) -> SerdeAttrs {
                 "skip" | "skip_deserializing" => out.skip = true,
                 "flatten" => out.flatten = true,
                 "rename_all" => out.rename_all = value.map(|v| unquote(&v)),
+                "rename_all_fields" => out.rename_all_fields = value.map(|v| unquote(&v)),
                 "tag" => out.tag = value.map(|v| unquote(&v)),
                 "untagged" => out.untagged = true,
                 "content" => out.content = true,
@@ -668,10 +671,28 @@ fn rename_rule(rule: &str) -> Option<RenameRule> {
     })
 }
 
+/// serde's `PascalCase` for a field: words are split at `_`, each word
+/// starts with an upper-case letter and keeps the rest as written.
+fn pascal_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut at_word_start = true;
+    for c in name.chars() {
+        if c == '_' {
+            at_word_start = true;
+        } else if at_word_start {
+            out.extend(c.to_uppercase());
+            at_word_start = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl RenameRule {
-    /// The name serde derives for `name`, character for character. The
+    /// The name serde derives for a *variant*, character for character. The
     /// [`tests::rename_rules_match_serde`] cross-check keeps this honest.
-    fn apply(self, name: &str) -> String {
+    fn apply_to_variant(self, name: &str) -> String {
         match self {
             RenameRule::LowerCase => name.to_lowercase(),
             RenameRule::UpperCase => name.to_uppercase(),
@@ -721,14 +742,48 @@ impl RenameRule {
     }
 }
 
-/// The name serde reads a field or variant from.
-fn renamed(ident: &str, attrs: &SerdeAttrs, rule: Option<RenameRule>) -> String {
-    if let Some(rename) = &attrs.rename {
-        return rename.clone();
+impl RenameRule {
+    /// The name serde derives for a *field*. serde treats the Rust
+    /// conventions as the identity and otherwise works on the `_` word
+    /// boundaries — unlike the per-letter rule it applies to variants.
+    fn apply_to_field(self, name: &str) -> String {
+        match self {
+            RenameRule::LowerCase | RenameRule::SnakeCase => name.to_string(),
+            RenameRule::UpperCase | RenameRule::ScreamingSnakeCase => name.to_ascii_uppercase(),
+            RenameRule::PascalCase => pascal_case(name),
+            RenameRule::CamelCase => {
+                let pascal = pascal_case(name);
+                let mut chars = pascal.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let mut out: String = first.to_lowercase().collect();
+                        out.push_str(chars.as_str());
+                        out
+                    }
+                    None => String::new(),
+                }
+            }
+            RenameRule::KebabCase => name.replace('_', "-"),
+            RenameRule::ScreamingKebabCase => name.to_ascii_uppercase().replace('_', "-"),
+        }
     }
-    match rule {
-        Some(rule) => rule.apply(ident),
-        None => ident.to_string(),
+}
+
+/// The name serde reads a field from.
+fn field_name(ident: &str, attrs: &SerdeAttrs, rule: Option<RenameRule>) -> String {
+    match (&attrs.rename, rule) {
+        (Some(rename), _) => rename.clone(),
+        (None, Some(rule)) => rule.apply_to_field(ident),
+        (None, None) => ident.to_string(),
+    }
+}
+
+/// The name serde reads a variant from.
+fn variant_name(ident: &str, attrs: &SerdeAttrs, rule: Option<RenameRule>) -> String {
+    match (&attrs.rename, rule) {
+        (Some(rename), _) => rename.clone(),
+        (None, Some(rule)) => rule.apply_to_variant(ident),
+        (None, None) => ident.to_string(),
     }
 }
 
@@ -897,12 +952,12 @@ fn parse_fields(
             )));
         }
         fields.push(Field {
-            name: renamed(&name, &serde, rule),
+            name: field_name(&name, &serde, rule),
             optional: serde.default
                 || serde.default_fn.is_some()
                 || container_default
                 || (type_is_option(&ty) && !serde.custom_deserializer),
-            plain_default: serde.default || container_default,
+            plain_default: serde.default,
             skip: serde.skip,
             flatten: serde.flatten,
             ty,
@@ -937,12 +992,16 @@ fn parse_def_body(
     };
     let rule = serde.rename_all.as_deref().and_then(rename_rule);
     match kind {
-        DefKind::Struct => def.fields = parse_fields(body, serde.default, rule)?,
+        // Either container default lets every key be omitted.
+        DefKind::Struct => {
+            let container_default = serde.default || serde.default_fn.is_some();
+            def.fields = parse_fields(body, container_default, rule)?;
+        }
         DefKind::Enum => {
             // An enum's `rename_all` renames its variants. The fields of a
-            // struct variant keep their names (serde 1.0.229 applies neither
-            // `rename_all_fields` nor a variant-level rule to them — checked
-            // by `tests::rename_rules_match_serde`).
+            // struct variant follow the variant's own `rename_all`, else the
+            // enum's `rename_all_fields` — checked by
+            // `tests::rename_rules_match_serde`.
             for part in split_top_level(body) {
                 let (attrs, rest) = leading_attrs(&part);
                 let vserde = parse_serde(&attrs);
@@ -960,7 +1019,7 @@ fn parse_def_body(
                     .trim()
                     .to_string();
                 let mut variant = Variant {
-                    name: renamed(&vname, &vserde, rule),
+                    name: variant_name(&vname, &vserde, rule),
                     kind: VariantKind::Other,
                     skip: vserde.skip,
                     fields: Vec::new(),
@@ -969,7 +1028,12 @@ fn parse_def_body(
                 if after.starts_with('{') && after.ends_with('}') {
                     variant.kind = VariantKind::Struct;
                     let inner: Vec<char> = after[1..after.len() - 1].chars().collect();
-                    variant.fields = parse_fields(&inner, false, None)?;
+                    let field_rule = vserde
+                        .rename_all
+                        .as_deref()
+                        .or(serde.rename_all_fields.as_deref())
+                        .and_then(rename_rule);
+                    variant.fields = parse_fields(&inner, false, field_rule)?;
                 } else if after.starts_with('(') && after.ends_with(')') {
                     let types: Vec<char> = after[1..after.len() - 1].chars().collect();
                     let mut pieces = split_top_level(&types);
@@ -2513,6 +2577,18 @@ enum Upper {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Camel {
+    retry_count: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default = "make_loud")]
+struct LoudContainer {
+    retries: u8,
+}
+
 struct Borrowed<'a> {
     value: &'a str,
 }
@@ -2652,7 +2728,17 @@ struct Unit;
         // The container attributes of a `pub(crate)` struct survive.
         let crate_wide = index.get("input/demo.rs", "Crate").unwrap();
         assert!(field(crate_wide, "enabled").optional);
-        assert!(field(crate_wide, "enabled").plain_default);
+        // The value of a container default is the struct's `Default`, which
+        // the gate cannot read: it is not compared with a zero.
+        assert!(!field(crate_wide, "enabled").plain_default);
+        // serde's field conversion differs from its variant conversion …
+        let camel = index.get("input/demo.rs", "Camel").unwrap();
+        assert_eq!(camel.fields[0].name, "retryCount");
+        // … and a function-backed container default lets every key be
+        // omitted just like a bare one.
+        let loud = index.get("input/demo.rs", "LoudContainer").unwrap();
+        assert!(field(loud, "retries").optional);
+        assert!(!field(loud, "retries").plain_default);
 
         let mode = index.get("input/demo.rs", "Mode").unwrap();
         assert_eq!(mode.kind, DefKind::Enum);
@@ -2811,25 +2897,171 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
         ] {
             let rule = rename_rule(rule).unwrap();
             for (rust, serde_name) in cases {
-                assert_eq!(rule.apply(rust), serde_name, "{rule:?} applied to {rust}");
+                assert_eq!(
+                    rule.apply_to_variant(rust),
+                    serde_name,
+                    "{rule:?} applied to the variant {rust}"
+                );
             }
         }
         assert!(rename_rule("Title Case").is_none());
 
-        // An enum's rule renames its variants only. Neither `rename_all_fields`
-        // nor a rule on the variant reaches the fields of a struct variant.
+        // Fields follow another conversion: serde treats the Rust conventions
+        // as the identity and works on `_` word boundaries for the rest.
+        macro_rules! rule_struct {
+            ($name:ident, $rule:expr) => {
+                #[derive(serde::Serialize)]
+                #[serde(rename_all = $rule)]
+                #[allow(non_snake_case, dead_code)]
+                struct $name {
+                    HTTPServer: u8,
+                    retry_count: u8,
+                    Snake_Input: u8,
+                    pathName: u8,
+                    a: u8,
+                }
+            };
+        }
+        rule_struct!(FieldLower, "lowercase");
+        rule_struct!(FieldUpper, "UPPERCASE");
+        rule_struct!(FieldPascal, "PascalCase");
+        rule_struct!(FieldCamel, "camelCase");
+        rule_struct!(FieldSnake, "snake_case");
+        rule_struct!(FieldScreamingSnake, "SCREAMING_SNAKE_CASE");
+        rule_struct!(FieldKebab, "kebab-case");
+        rule_struct!(FieldScreamingKebab, "SCREAMING-KEBAB-CASE");
+        let names = ["HTTPServer", "retry_count", "Snake_Input", "pathName", "a"];
+        // The key of the field whose value is `n`.
+        let key_of = |value: &serde_json::Value, n: u64| {
+            value
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, field)| field.as_u64() == Some(n))
+                .expect("every fixture field is serialized")
+                .0
+                .clone()
+        };
+        for (rule, value) in [
+            (
+                "lowercase",
+                json!(FieldLower {
+                    HTTPServer: 1,
+                    retry_count: 2,
+                    Snake_Input: 3,
+                    pathName: 4,
+                    a: 5
+                }),
+            ),
+            (
+                "UPPERCASE",
+                json!(FieldUpper {
+                    HTTPServer: 1,
+                    retry_count: 2,
+                    Snake_Input: 3,
+                    pathName: 4,
+                    a: 5
+                }),
+            ),
+            (
+                "PascalCase",
+                json!(FieldPascal {
+                    HTTPServer: 1,
+                    retry_count: 2,
+                    Snake_Input: 3,
+                    pathName: 4,
+                    a: 5
+                }),
+            ),
+            (
+                "camelCase",
+                json!(FieldCamel {
+                    HTTPServer: 1,
+                    retry_count: 2,
+                    Snake_Input: 3,
+                    pathName: 4,
+                    a: 5
+                }),
+            ),
+            (
+                "snake_case",
+                json!(FieldSnake {
+                    HTTPServer: 1,
+                    retry_count: 2,
+                    Snake_Input: 3,
+                    pathName: 4,
+                    a: 5
+                }),
+            ),
+            (
+                "SCREAMING_SNAKE_CASE",
+                json!(FieldScreamingSnake {
+                    HTTPServer: 1,
+                    retry_count: 2,
+                    Snake_Input: 3,
+                    pathName: 4,
+                    a: 5
+                }),
+            ),
+            (
+                "kebab-case",
+                json!(FieldKebab {
+                    HTTPServer: 1,
+                    retry_count: 2,
+                    Snake_Input: 3,
+                    pathName: 4,
+                    a: 5
+                }),
+            ),
+            (
+                "SCREAMING-KEBAB-CASE",
+                json!(FieldScreamingKebab {
+                    HTTPServer: 1,
+                    retry_count: 2,
+                    Snake_Input: 3,
+                    pathName: 4,
+                    a: 5
+                }),
+            ),
+        ] {
+            let rule = rename_rule(rule).unwrap();
+            for (index, rust) in names.iter().enumerate() {
+                assert_eq!(
+                    rule.apply_to_field(rust),
+                    key_of(&value, index as u64 + 1),
+                    "{rule:?} applied to the field {rust}"
+                );
+            }
+        }
+
+        // An enum's `rename_all` renames its variants. The fields of a
+        // struct variant follow the variant's own rule, else the enum's
+        // `rename_all_fields`.
         #[derive(serde::Serialize)]
         #[serde(tag = "t", rename_all = "UPPERCASE", rename_all_fields = "kebab-case")]
-        #[allow(non_snake_case)]
+        #[allow(dead_code)]
         enum VariantRules {
-            File { pathName: String },
+            File {
+                path_name: String,
+            },
+            #[serde(rename_all = "camelCase")]
+            Socket {
+                port_number: String,
+            },
         }
         assert_eq!(
             serde_json::to_value(VariantRules::File {
-                pathName: "x".to_string()
+                path_name: "x".to_string()
             })
             .unwrap(),
-            json!({"t": "FILE", "pathName": "x"})
+            json!({"t": "FILE", "path-name": "x"})
+        );
+        assert_eq!(
+            serde_json::to_value(VariantRules::Socket {
+                port_number: "x".to_string()
+            })
+            .unwrap(),
+            json!({"t": "SOCKET", "portNumber": "x"})
         );
     }
 
@@ -2942,16 +3174,24 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
         ));
 
         // Losing the container default of a `pub(crate)` struct would make
-        // `enabled` required: the schema must then follow.
+        // `enabled` required, and requiring it would then be correct: the
+        // gate must still object.
         let mut schema = conforming();
-        schema["properties"]["enabled"]["default"] = json!(true);
+        schema["required"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("enabled"));
         assert!(
             reported(
                 &problems(&index, "DemoConfig", &schema),
-                "R5 the schema advertises `default: true` for `enabled`"
+                "R3 the schema marks `enabled` required"
             ),
             "the container `#[serde(default)]` of a `pub(crate)` struct is kept"
         );
+        // A container default's value is not compared with a zero.
+        let mut schema = conforming();
+        schema["properties"]["enabled"]["default"] = json!(true);
+        assert!(problems(&index, "DemoConfig", &schema).is_empty());
 
         // Nested nodes recurse, including through array `items`.
         let mut schema = conforming();

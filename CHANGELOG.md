@@ -338,7 +338,8 @@ committed inventory now match what serde accepts:
   loopback URL (`localhost`, `127.0.0.1`, `::1`) bypasses the system proxy
   instead of being forwarded to it. On a machine with a system proxy this
   also made the refused-connection test fail intermittently with the
-  proxy's `502`.
+  proxy's `502`. The shared client now recognizes every loopback address
+  (`127.0.0.0/8`, `::1`), not only `127.0.0.1`.
 - The `sql` output rejects an empty quoted part in `table_name`
   (`analytics.""`) when the output is built, instead of letting the
   server reject the zero-length identifier on the first write.
