@@ -334,7 +334,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 | 顺序 | 事项 | 验收 | 产出 |
 | --- | --- | --- | --- |
-| 1 | PA-P1-02 文档真相 | CLAUDE.md/插件指南/Helm 一致 | `fix-docs-truth-2026-11` |
+| ~~1~~ | ~~PA-P1-02 文档真相~~ ✅ 已实施（PR #1392）：CLAUDE.md 指针化、插件指南 doctest 门禁、Helm appVersion 门禁 | CLAUDE.md/插件指南/Helm 一致 | `fix-docs-truth-2026-11` |
 | 2 | PA-P1-03 元数据一致性 | conformance 测试红/绿可控 | `add-component-metadata-conformance` |
 | 3 | PA-P1-04 SQL 标识符 | 注入用例通过 | `harden-sql-output-identifiers` |
 

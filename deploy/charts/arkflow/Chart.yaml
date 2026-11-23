@@ -4,8 +4,9 @@ description: High-performance Rust stream processing engine (Tokio + Apache Arro
 type: application
 # Chart version: bumps independently of the engine release.
 version: 0.1.0
-# appVersion tracks the engine release tag published to ghcr.io.
-appVersion: "0.5.0"
+# appVersion tracks the engine release tag published to ghcr.io; the helm.yml
+# publish job fails the release when this and the workspace version diverge.
+appVersion: "0.6.0"
 home: https://arkflow-rs.com
 sources:
   - https://github.com/arkflow-rs/arkflow

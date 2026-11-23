@@ -252,6 +252,26 @@ aligned to it, two of which change runtime behavior:
   codec error is queued per message and the batch continues, so operators
   can tell a bad payload from a connection failure.
 
+### Changed — Documentation, agent guidance, and chart
+
+- `CLAUDE.md` no longer restates workspace facts (it claimed Rust 1.88 vs
+  the required 1.97, three crates vs four, 12 inputs vs 13, and window
+  `buffer:` YAML the compiler rejects); it now defers to `AGENTS.md` as the
+  single checked-in agent authority, and the `documentation-accuracy` spec
+  forbids the agent instruction entry from duplicating facts that drift.
+- The plugin development guide's Rust snippets compile in CI: a
+  `#[cfg(doctest)]` marker in `arkflow-plugin` embeds
+  `docs/docs/develop/plugins.md` via `#[doc = include_str!]`, so
+  `cargo test --doc -p arkflow-plugin` compiles every Rust fence against
+  the real API (the drifted `Option<&String>` builder signature now fails
+  with E0053). The `src/mod.rs` wiring path is corrected to the real
+  `register_components()` / `lib.rs::initialize()` layout, and the zh-Hans
+  mirror is fixed in lockstep.
+- The Helm chart's `appVersion` (was `0.5.0` against workspace `0.6.0`) is
+  bumped to `0.6.0`, and the `helm.yml` publish job now fails the release,
+  naming all three values, when `appVersion`, the workspace version, and
+  the release tag diverge.
+
 ### Fixed — Engine and control plane
 
 - The in-memory Hub no longer lets a settled Job observation roll a

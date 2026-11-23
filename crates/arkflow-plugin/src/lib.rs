@@ -34,6 +34,18 @@ pub mod udf;
 pub mod vector_util;
 pub mod wal;
 
+/// Compile-check the Rust snippets in the plugin development guide.
+///
+/// Every `rust` fence in `docs/docs/develop/plugins.md` is compiled as a
+/// doctest against this crate's real public API (`cargo test --doc -p
+/// arkflow-plugin`), so a trait-signature or wiring change that invalidates a
+/// snippet fails the workspace test run instead of shipping silent drift.
+/// `#[cfg(doctest)]` keeps the marker out of normal builds and rustdoc output;
+/// it exists only for the doctest pass.
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/docs/develop/plugins.md")]
+pub struct PluginGuideDocTests;
+
 /// Capacity of input components' internal delivery channels, aligned with
 /// the kernel edge-channel capacity (`arkflow_core::executor::graph`
 /// `DEFAULT_CHANNEL_CAPACITY`, 1024). Component-internal channels use the

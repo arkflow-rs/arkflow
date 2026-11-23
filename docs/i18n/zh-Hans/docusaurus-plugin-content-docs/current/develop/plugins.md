@@ -48,7 +48,7 @@ struct DropOutputBuilder;
 impl OutputBuilder for DropOutputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         _: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
@@ -65,7 +65,7 @@ impl OutputBuilder for DropOutputBuilder {
 注册发生在插件 crate 的 `init()` 中:
 
 ```rust
-pub fn init() -> Result<(), Error> {
+fn init() -> Result<(), Error> {
     register_output_builder("drop", Arc::new(DropOutputBuilder))?;
     register_output_metadata(ComponentMetadata::unit(
         "drop",
@@ -76,8 +76,8 @@ pub fn init() -> Result<(), Error> {
 
 然后沿调用链向上接线:
 
-1. 在 `crates/arkflow-plugin/src/mod.rs` 中,从该类别的 `init()` 调用你模块的 `init()`。
-2. 该类别的 `init()` 已经由 `crates/arkflow/src/main.rs` 调用——标准插件无需修改二进制。
+1. 把你模块的 `init()` 加进该类别模块的 `register_components()` 列表(如 `crates/arkflow-plugin/src/output/mod.rs`)。
+2. 该类别的 `init()` 经由 `crates/arkflow-plugin/src/lib.rs` 的 `initialize()` 统一接线,由 `crates/arkflow/src/main.rs` 调用——标准插件无需修改二进制。
 
 你注册的类型名(上文的 `"drop"`)就是用户在 YAML 的 `type:` 字段中写下的那个字符串。
 
@@ -105,7 +105,7 @@ pub fn init() -> Result<(), Error> {
 - [ ] trait 已实现(`async_trait`,输入输出为 `MessageBatch`)。
 - [ ] builder 防御性地解析配置;错误信息指明字段。
 - [ ] 以准确的 YAML `type:` 名称注册 + 带描述、schema、示例的元数据。
-- [ ] `init()` 经插件 `mod.rs` 中该类别的 `init()` 接线。
+- [ ] `init()` 已列入该类别的 `register_components()` 列表(如 `crates/arkflow-plugin/src/output/mod.rs`)。
 - [ ] 清单已重新生成(`ARKFLOW_REGENERATE_DOCS=1 ...`)。
 - [ ] 组件页面带 `components:` 归属 front matter。
 - [ ] 示例 YAML 已登记并通过校验。

@@ -18,11 +18,10 @@ Each kind has a trait in `arkflow-core` (`Input`, `Output`, `Processor`,
 `async_trait` and revolve around `MessageBatch` — ArkFlow's Arrow
 `RecordBatch` wrapper:
 
-```rust
-use arkflow_core::output::{Output, OutputBuilder};
-use arkflow_core::{Error, MessageBatchRef, Resource};
+```rust,no_run
+use arkflow_core::output::Output;
+use arkflow_core::{Error, MessageBatchRef};
 use async_trait::async_trait;
-use std::sync::Arc;
 
 struct DropOutput;
 
@@ -51,13 +50,33 @@ The builder turns YAML config into a component instance. It receives the
 component name, the optional JSON config, the optional codec, and the
 resource pool:
 
-```rust
+```rust,no_run
+# use arkflow_core::codec::Codec;
+# use arkflow_core::output::{Output, OutputBuilder};
+# use arkflow_core::{Error, MessageBatchRef, Resource};
+# use async_trait::async_trait;
+# use std::sync::Arc;
+#
+# struct DropOutput;
+#
+# #[async_trait]
+# impl Output for DropOutput {
+#     async fn connect(&self) -> Result<(), Error> {
+#         Ok(())
+#     }
+#     async fn write(&self, _: MessageBatchRef) -> Result<(), Error> {
+#         Ok(())
+#     }
+#     async fn close(&self) -> Result<(), Error> {
+#         Ok(())
+#     }
+# }
 struct DropOutputBuilder;
 
 impl OutputBuilder for DropOutputBuilder {
     fn build(
         &self,
-        _name: Option<&String>,
+        _name: Option<&str>,
         _: &Option<serde_json::Value>,
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
@@ -75,8 +94,43 @@ offending field.
 
 Registration happens in the plugin crate's `init()`:
 
-```rust
-pub fn init() -> Result<(), Error> {
+```rust,no_run
+# use arkflow_core::codec::Codec;
+# use arkflow_core::component::{register_output_metadata, ComponentMetadata};
+# use arkflow_core::output::{register_output_builder, Output, OutputBuilder};
+# use arkflow_core::{Error, MessageBatchRef, Resource};
+# use async_trait::async_trait;
+# use std::sync::Arc;
+#
+# struct DropOutput;
+#
+# #[async_trait]
+# impl Output for DropOutput {
+#     async fn connect(&self) -> Result<(), Error> {
+#         Ok(())
+#     }
+#     async fn write(&self, _: MessageBatchRef) -> Result<(), Error> {
+#         Ok(())
+#     }
+#     async fn close(&self) -> Result<(), Error> {
+#         Ok(())
+#     }
+# }
+#
+# struct DropOutputBuilder;
+#
+# impl OutputBuilder for DropOutputBuilder {
+#     fn build(
+#         &self,
+#         _name: Option<&str>,
+#         _: &Option<serde_json::Value>,
+#         codec: Option<Arc<dyn Codec>>,
+#         _resource: &Resource,
+#     ) -> Result<Arc<dyn Output>, Error> {
+#         Ok(Arc::new(DropOutput))
+#     }
+# }
+fn init() -> Result<(), Error> {
     register_output_builder("drop", Arc::new(DropOutputBuilder))?;
     register_output_metadata(ComponentMetadata::unit(
         "drop",
@@ -87,10 +141,11 @@ pub fn init() -> Result<(), Error> {
 
 Then wire it up the chain:
 
-1. Call your module's `init()` from the kind's `init()` in
-   `crates/arkflow-plugin/src/mod.rs`.
-2. That kind `init()` is already invoked from `crates/arkflow/src/main.rs` —
-   no binary change needed for a standard plugin.
+1. Add your module's `init()` to the kind's `register_components()` list in
+   the kind's module (e.g. `crates/arkflow-plugin/src/output/mod.rs`).
+2. The kind `init()`s are wired through `initialize()` in
+   `crates/arkflow-plugin/src/lib.rs`, which `crates/arkflow/src/main.rs`
+   calls — no binary change needed for a standard plugin.
 
 The type-name you register (`"drop"` above) is the exact string users write
 in the `type:` field of their YAML.
@@ -128,7 +183,7 @@ these pass:
 - [ ] Trait implemented (`async_trait`, `MessageBatch` in/out).
 - [ ] Builder parses config defensively; errors name the field.
 - [ ] Registered with the exact YAML `type:` name + metadata with description, schema, example.
-- [ ] `init()` wired through the kind's `init()` in the plugin `mod.rs`.
+- [ ] `init()` listed in the kind's `register_components()` (e.g. `crates/arkflow-plugin/src/output/mod.rs`).
 - [ ] Inventory regenerated (`ARKFLOW_REGENERATE_DOCS=1 ...`).
 - [ ] Component page with `components:` ownership front matter.
 - [ ] Example YAML registered and validating.
