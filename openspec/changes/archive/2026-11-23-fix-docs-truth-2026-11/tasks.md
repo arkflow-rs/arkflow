@@ -19,8 +19,8 @@
 
 ## 4. Gates and cross-checks
 
-- [ ] 4.1 `cargo test --workspace --all-targets` green (the doctest harness rides the existing surface)
-- [ ] 4.2 `cargo clippy --workspace --all-targets` and `cargo fmt --all -- --check` green
-- [ ] 4.3 `cd docs && pnpm docs:check` green (plugins.md front matter/ownership unchanged; zh mirror in lockstep)
-- [ ] 4.4 Confirm spec deltas match implementation: `documentation-accuracy` scenarios (pointer file, compilable snippets) and `kubernetes-helm-chart` appVersion scenario each map to a landed artifact
-- [ ] 4.5 Update `PRODUCT-ITERATION-2026-11-22.md` §4 iteration-1 table marking the PA-P1-02 row done when the change archives (leave for archive PR if preferred)
+- [x] 4.1 `cargo test --workspace --all-targets` green — PR #1392 CI "Build and Test (fast)" lane green (touched crate fully green locally: 927 lib + all integration targets)
+- [x] 4.2 `cargo clippy --workspace --all-targets` and `cargo fmt --all -- --check` green — local fmt + `-p arkflow-plugin` clippy; PR CI "Clippy (deny warnings)" green workspace-wide
+- [x] 4.3 `cd docs && pnpm docs:check` green — local (145 pages, inventory up to date) and PR CI green
+- [x] 4.4 Confirmed: pointer file (CLAUDE.md), compilable snippets (doctest + E0053 mutation), wiring paths exist (lib.rs/output mod.rs), appVersion gate (helm.yml publish, validated both directions locally)
+- [x] 4.5 Registry row marked done (PA-P1-02 struck with PR ref) as part of this archive; CHANGELOG entry added under [Unreleased]

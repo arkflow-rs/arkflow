@@ -1,7 +1,16 @@
 # kubernetes-helm-chart Specification
 
 ## Purpose
-TBD - created by archiving change add-helm-chart. Update Purpose after archive.
+
+Keep the official `deploy/charts/arkflow` chart a truthful, single-source
+install surface for standalone, agent, and control-plane modes: CI must lint
+and render every mode the chart claims to support, secrets must enter only
+through env expansion, and the published OCI artifact must track the engine
+release it deploys (chart version independent, `appVersion` gated). This
+exists because the chart ships infrastructure defaults operators cannot
+easily audit — wrong probes, leaked secrets, or a stale `appVersion` become
+production incidents, not documentation errors.
+
 ## Requirements
 ### Requirement: Single chart with standalone and agent install modes
 
@@ -65,7 +74,7 @@ In agent mode, when `config` does not set `node_id`, the chart SHALL default the
 
 ### Requirement: Chart publication and CI gates
 
-Every change touching the chart SHALL be gated by CI running `helm lint` and `helm template` for both modes. On release, the chart SHALL be published as a versioned OCI artifact to the project's registry namespace, with `appVersion` tracking the engine release tag.
+Every change touching the chart SHALL be gated by CI running `helm lint` and `helm template` for both modes. On release, the chart SHALL be published as a versioned OCI artifact to the project's registry namespace, with `appVersion` tracking the engine release tag. The release pipeline SHALL enforce that `Chart.yaml` `appVersion` equals the engine workspace version before publishing, so a forgotten bump fails the release instead of shipping a chart that references stale images.
 
 #### Scenario: CI gate
 - **WHEN** a pull request modifies files under the chart directory
@@ -74,6 +83,11 @@ Every change touching the chart SHALL be gated by CI running `helm lint` and `he
 #### Scenario: Release publication
 - **WHEN** a release tag is cut
 - **THEN** the chart is pushed to the registry as an OCI artifact installable via `helm install oci://…/charts/arkflow --version <chart-version>`
+
+#### Scenario: appVersion drift fails the release
+
+- **WHEN** the release pipeline runs and `Chart.yaml` `appVersion` differs from the workspace version in the root `Cargo.toml`
+- **THEN** the pipeline fails with an error naming both values, and no chart artifact is published
 
 ### Requirement: Control-plane install mode renders Hub and Console
 
