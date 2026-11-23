@@ -216,7 +216,8 @@ pub fn init() -> Result<(), Error> {
                         "value_field": {"type": "string"},
                         "codec": {"type": "object"},
                         "thread_num": {"type": "integer", "minimum": 1}
-                    }
+                    },
+                    "required": ["query", "codec"]
                 }
             },
             "required": ["gap"]

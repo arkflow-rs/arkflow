@@ -876,7 +876,7 @@ pub fn init() -> Result<(), Error> {
                 "key": {"oneOf": [ {"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}
                     ], "description": "Literal value or a SQL expression evaluated per batch."},
                 "client_id": {"type": "string", "description": "Optional client identifier."},
-                "compression": {"type": "string", "enum": ["none", "gzip", "snappy", "lz4", "zstd"], "description": "Compression algorithm."},
+                "compression": {"type": "string", "enum": ["none", "gzip", "snappy", "lz4"], "description": "Compression algorithm."},
                 "acks": {"type": "string", "enum": ["0", "1", "all"], "description": "Acknowledgment level."},
                 "value_field": {"type": "string", "description": "Record field used as the message payload."},
                 "exactly_once": {"type": "boolean", "default": false, "description": "Enable exactly-once transactional production (L2)."},

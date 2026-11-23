@@ -52,7 +52,8 @@ pub struct KafkaInputConfig {
     pub consumer_group: String,
     /// Client ID (optional)
     pub client_id: Option<String>,
-    /// Start with the most news
+    /// Start with the most news (defaults to `false`)
+    #[serde(default)]
     pub start_from_latest: bool,
     /// Fetch min bytes
     pub fetch_min_bytes: Option<u32>,
@@ -1591,6 +1592,7 @@ pub fn init() -> Result<(), Error> {
                 "fetch_wait_max_ms": {"type": "integer", "minimum": 0, "description": "Maximum time to wait for fetch data in milliseconds."},
                 "batch_max_rows": {"type": "integer", "minimum": 1, "default": 1024, "description": "Maximum number of messages aggregated into one read batch (clamped to 1 minimum; 1 restores per-message batches)."},
                 "batch_max_bytes": {"type": "integer", "minimum": 1, "default": 8388608, "description": "Maximum accumulated payload bytes per read batch; the first message is always included (clamped to 1 minimum)."},
+                "transactional_offsets": {"type": "boolean", "default": false, "description": "L3 exactly-once: let the transactional Kafka output commit this consumer group's offsets inside its transactions (the output sets `offset_commit_group`). Requires subscribe mode."},
                 "security": crate::kafka_security::json_schema()
             },
             "required": ["brokers", "topics", "consumer_group"]
@@ -1687,6 +1689,17 @@ mod tests {
         // Optional knobs stay unset.
         assert!(config.get("client.id").is_none());
         assert!(config.get("fetch.min.bytes").is_none());
+    }
+
+    /// The schema advertises `start_from_latest` with a default: omitting
+    /// it means `false` (earliest offset), not a missing-field error (spec:
+    /// component-config-honesty).
+    #[test]
+    fn omitted_start_from_latest_defaults_to_false() {
+        let mut value = base_config();
+        value.as_object_mut().unwrap().remove("start_from_latest");
+        let config = input_with(value).build_client_config().unwrap();
+        assert_eq!(config.get("auto.offset.reset"), Some("earliest"));
     }
 
     #[test]

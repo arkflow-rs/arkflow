@@ -46,12 +46,17 @@ fn default_retry_count() -> u32 {
     3
 }
 
+fn default_method() -> String {
+    "POST".to_string()
+}
+
 /// HTTP output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HttpOutputConfig {
     /// Destination URL
     url: String,
-    /// HTTP method
+    /// HTTP method (defaults to `POST`, as the schema documents)
+    #[serde(default = "default_method")]
     method: String,
     /// Timeout Period (ms)
     timeout_ms: u64,
@@ -336,7 +341,7 @@ pub fn init() -> Result<(), Error> {
                 "body_field": {"type": "string", "description": "Record field that holds the request body."},
                 "auth": {"type": "object", "description": "Authentication configuration."}
             },
-            "required": ["url"]
+            "required": ["url", "timeout_ms"]
         }),
     ).with_example(serde_json::json!({
         "url": "https://example.com/ingest",
@@ -375,6 +380,19 @@ mod tests {
 
     fn batch() -> MessageBatchRef {
         Arc::new(MessageBatch::new_binary(vec![b"{\"k\":1}".to_vec()]).unwrap())
+    }
+
+    /// The schema advertises `method` with a default: an omitted method is
+    /// POST, not a missing-field error (spec: component-config-honesty).
+    #[test]
+    fn omitted_method_defaults_to_post() {
+        let mut config = base_config("http://127.0.0.1:1/ingest".to_string());
+        config.as_object_mut().unwrap().remove("method");
+        let parsed: HttpOutputConfig = serde_json::from_value(config.clone()).unwrap();
+        assert_eq!(parsed.method, "POST");
+        HttpOutputBuilder
+            .build(None, &Some(config), None, &resource())
+            .expect("an omitted method is valid");
     }
 
     #[tokio::test]

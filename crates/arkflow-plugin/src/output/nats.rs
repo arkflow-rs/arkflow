@@ -294,7 +294,7 @@ pub fn init() -> Result<(), Error> {
                     "description": "Select regular or JetStream publishing.",
                     "oneOf": [
                         {"properties": {"type": {"const": "regular"}, "subject": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}}, "required": ["type", "subject"]},
-                        {"properties": {"type": {"const": "jet_stream"}, "stream": {"type": "string"}, "subject": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}}, "required": ["type", "stream", "subject"]}
+                        {"properties": {"type": {"const": "jet_stream"}, "subject": {"oneOf": [{"type": "object", "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"], "additionalProperties": false}, {"type": "object", "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"], "additionalProperties": false}]}}, "required": ["type", "subject"]}
                     ]
                 },
                 "auth": {"type": "object", "description": "NATS authentication configuration."},

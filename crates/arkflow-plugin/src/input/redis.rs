@@ -694,7 +694,7 @@ pub fn init() -> Result<(), Error> {
     register_input_builder("redis", Arc::new(RedisInputBuilder))?;
     register_input_metadata(ComponentMetadata::with_schema(
         "redis",
-        "Reads from Redis: list blocking pops, pub/sub subscriptions, or stream consumer groups.",
+        "Reads from Redis: blocking list pops or pub/sub subscriptions (channels or patterns).",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,

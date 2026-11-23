@@ -516,9 +516,18 @@ pub fn init() -> Result<(), Error> {
                 "service_url": {"type": "string", "description": "Pulsar service URL (e.g. pulsar://localhost:6650)."},
                 "topic": {"type": "string", "description": "Topic to subscribe to."},
                 "subscription_name": {"type": "string", "description": "Subscription name."},
-                "subscription_type": {"type": "string", "enum": ["Exclusive", "Shared", "Failover", "KeyShared"], "description": "Subscription type."},
+                "subscription_type": {"type": "string", "enum": ["exclusive", "shared", "failover", "key_shared"], "description": "Subscription type (defaults to exclusive)."},
                 "auth": {"type": "object", "description": "Pulsar authentication configuration."},
-                "retry_config": {"type": "object", "description": "Retry behaviour for failed messages."}
+                "retry_config": {"type": "object", "description": "Retry behaviour for failed messages."},
+                "tls": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "TLS settings.",
+                    "properties": {
+                        "certificate_chain_file": {"type": "string", "description": "Client certificate chain file (PEM), for mTLS."},
+                        "hostname_verification": {"type": "boolean", "default": true, "description": "Verify the server hostname. Defaults to true."}
+                    }
+                }
             },
             "required": ["service_url", "topic", "subscription_name"]
         }),

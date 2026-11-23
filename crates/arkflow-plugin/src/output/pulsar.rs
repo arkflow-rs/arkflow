@@ -348,6 +348,15 @@ pub fn init() -> Result<(), Error> {
                     "required": ["type"]
                 },
                 "auth": {"type": "object", "description": "Pulsar authentication configuration."},
+                "tls": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "TLS settings.",
+                    "properties": {
+                        "certificate_chain_file": {"type": "string", "description": "Client certificate chain file (PEM), for mTLS."},
+                        "hostname_verification": {"type": "boolean", "default": true, "description": "Verify the server hostname. Defaults to true."}
+                    }
+                },
                 "value_field": {"type": "string", "description": "Record field used as the payload."}
             },
             "required": ["service_url", "topic"]
