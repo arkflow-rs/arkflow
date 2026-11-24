@@ -38,18 +38,32 @@ pub(crate) fn truncate_body(body: &str) -> &str {
 /// and loopback endpoints (local dev instances, tests) bypass a system
 /// proxy — proxying localhost is never what a user means.
 pub(crate) fn build_http_client(timeout_ms: u64, base_url: &str) -> Result<Client, Error> {
-    let is_loopback = reqwest::Url::parse(&format!("{}/", base_url.trim_end_matches('/')))
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-        .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]")
-        .unwrap_or(false);
     let mut builder = Client::builder().timeout(Duration::from_millis(timeout_ms));
-    if is_loopback {
+    if is_loopback_url(base_url) {
         builder = builder.no_proxy();
     }
     builder
         .build()
         .map_err(|e| Error::Config(format!("Unable to create HTTP client: {e}")))
+}
+
+/// Whether a base URL points back at this machine: the `localhost` name,
+/// or any loopback address (`127.0.0.0/8`, not only `127.0.0.1`, and `::1`).
+pub(crate) fn is_loopback_url(base_url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(&format!("{}/", base_url.trim_end_matches('/')))
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+    else {
+        return false;
+    };
+    // An IPv6 host keeps its brackets in `host_str`.
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Joins a configured base URL with a request path: the base loses any
@@ -161,5 +175,30 @@ mod tests {
         let _ = client;
         let client = build_http_client(1_000, "http://example.com").unwrap();
         let _ = client;
+    }
+
+    #[test]
+    fn loopback_covers_the_whole_range() {
+        for url in [
+            "http://localhost:8080",
+            "http://LOCALHOST",
+            "http://127.0.0.1:8080/ingest",
+            "http://127.0.0.2",
+            "http://127.255.255.254:9/",
+            "http://[::1]:8080",
+            "https://[0:0:0:0:0:0:0:1]/x",
+        ] {
+            assert!(is_loopback_url(url), "{url} is loopback");
+        }
+        for url in [
+            "http://example.com",
+            "http://192.168.0.2:8080",
+            "http://0.0.0.0:8080",
+            "http://127.0.0.1.example.com",
+            "http://[::2]:8080",
+            "not a url",
+        ] {
+            assert!(!is_loopback_url(url), "{url} is not loopback");
+        }
     }
 }

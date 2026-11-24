@@ -272,6 +272,11 @@
       "name": "eos-kafka-l3",
       "path": "../examples/eos-kafka-l3.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "pulsar-tls",
+      "path": "../examples/pulsar_tls_example.yaml",
+      "kind": "yaml"
     }
   ]
 }

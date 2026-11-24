@@ -751,7 +751,7 @@ pub(crate) fn init() -> Result<(), Error> {
                         "username": {"type": "string"},
                         "password": {"type": "string"},
                         "token": {"type": "string"}
-                    }}
+                    }, "required": ["type"]}
                 },
                 "required": ["registry_url"]
             }),

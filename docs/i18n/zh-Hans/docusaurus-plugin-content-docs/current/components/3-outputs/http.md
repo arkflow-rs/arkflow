@@ -13,7 +13,7 @@ HTTP 输出(Output)将每条消息(Message)作为 HTTP 请求发送到配置的 
 |-------|------|----------|---------|-------------|
 | type  | string | yes | — | 固定值 `"http"` |
 | url | string | yes | — | 目标 URL。 |
-| method | string | yes | — | HTTP 方法:`GET`、`POST`、`PUT`、`DELETE`、`PATCH`。 |
+| method | string | no | `POST` | HTTP 方法:`GET`、`POST`、`PUT`、`DELETE`、`PATCH`。默认为 `POST`。 |
 | timeout_ms | integer | yes | — | 请求超时时间(毫秒)。 |
 | retry_count | integer | no | `3` | 失败时的重试次数。仅暂态失败(传输错误、`429`、`5xx`)会被重试;其他 `4xx` 响应立即失败。 |
 | headers | `map<string, string>` | no | — | 自定义 HTTP 请求头。 |

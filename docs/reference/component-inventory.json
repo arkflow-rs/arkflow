@@ -78,7 +78,7 @@
     {
       "kind": "input",
       "name": "http",
-      "description": "Receives data via HTTP. Can run as a server (POST/PUT on `path`) or poll a remote endpoint.",
+      "description": "Receives data via HTTP: runs a server that accepts POST requests on `address` + `path` and forwards each request body into the stream.",
       "config_optional": false,
       "config_schema": {
         "type": "object",
@@ -86,26 +86,11 @@
         "properties": {
           "address": {
             "type": "string",
-            "description": "Bind address (server mode) or base URL (client mode)."
+            "description": "Address to listen on, e.g. `0.0.0.0:8080`."
           },
           "path": {
             "type": "string",
-            "description": "Path to accept messages on (server mode) or full request path (client mode)."
-          },
-          "method": {
-            "type": "string",
-            "enum": [
-              "GET",
-              "POST",
-              "PUT",
-              "DELETE",
-              "PATCH"
-            ],
-            "description": "HTTP method (client mode)."
-          },
-          "interval": {
-            "type": "string",
-            "description": "Polling interval in humantime format (client mode, e.g. '5s')."
+            "description": "URL path that receives messages, e.g. `/data`."
           },
           "cors_enabled": {
             "type": "boolean",
@@ -162,7 +147,7 @@
           "start_from_latest": {
             "type": "boolean",
             "default": false,
-            "description": "When true, ignore committed offsets and start from the latest message."
+            "description": "When true, the offset reset goes to the end of the partition: a partition without a usable committed offset (first run, or one out of range) starts at its newest position and skips the records already there. The reset applies only when no usable offset exists — with a single-consumer subscription a committed group offset still in range wins, so a restart resumes where the group left off. Under an explicit partition assignment committed group offsets are not used: only a checkpointed position is."
           },
           "fetch_min_bytes": {
             "type": "integer",
@@ -195,6 +180,11 @@
             "minimum": 1,
             "default": 8388608,
             "description": "Maximum accumulated payload bytes per read batch; the first message is always included (clamped to 1 minimum)."
+          },
+          "transactional_offsets": {
+            "type": "boolean",
+            "default": false,
+            "description": "L3 exactly-once: let the transactional Kafka output commit this consumer group's offsets inside its transactions (the output sets `offset_commit_group`). Requires subscribe mode."
           },
           "security": {
             "type": "object",
@@ -645,12 +635,12 @@
           "subscription_type": {
             "type": "string",
             "enum": [
-              "Exclusive",
-              "Shared",
-              "Failover",
-              "KeyShared"
+              "exclusive",
+              "shared",
+              "failover",
+              "key_shared"
             ],
-            "description": "Subscription type."
+            "description": "Subscription type (defaults to exclusive)."
           },
           "auth": {
             "type": "object",
@@ -659,6 +649,22 @@
           "retry_config": {
             "type": "object",
             "description": "Retry behaviour for failed messages."
+          },
+          "tls": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "TLS settings.",
+            "properties": {
+              "certificate_chain_file": {
+                "type": "string",
+                "description": "PEM certificate chain the broker certificate is verified against (the trust anchor of a private CA). It is not a client certificate."
+              },
+              "hostname_verification": {
+                "type": "boolean",
+                "default": true,
+                "description": "Verify the server hostname. Defaults to true."
+              }
+            }
           }
         },
         "required": [
@@ -676,7 +682,7 @@
     {
       "kind": "input",
       "name": "redis",
-      "description": "Reads from Redis: list blocking pops, pub/sub subscriptions, or stream consumer groups.",
+      "description": "Reads from Redis: blocking list pops or pub/sub subscriptions (channels or patterns).",
       "config_optional": false,
       "config_schema": {
         "type": "object",
@@ -943,7 +949,8 @@
           }
         },
         "required": [
-          "url"
+          "url",
+          "timeout_ms"
         ]
       },
       "config_example": {
@@ -1184,8 +1191,7 @@
               "none",
               "gzip",
               "snappy",
-              "lz4",
-              "zstd"
+              "lz4"
             ],
             "description": "Compression algorithm."
           },
@@ -1602,9 +1608,6 @@
                   "type": {
                     "const": "jet_stream"
                   },
-                  "stream": {
-                    "type": "string"
-                  },
                   "subject": {
                     "oneOf": [
                       {
@@ -1644,7 +1647,6 @@
                 },
                 "required": [
                   "type",
-                  "stream",
                   "subject"
                 ]
               }
@@ -1741,28 +1743,60 @@
           "topic": {
             "type": "object",
             "description": "Destination topic expression: {\"type\":\"value\",\"value\":\"...\"} for a static topic or {\"type\":\"expr\",\"expr\":\"...\"} per message.",
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "value",
-                  "expr"
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "type": {
+                    "const": "value"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "value"
                 ]
               },
-              "value": {
-                "type": "string"
-              },
-              "expr": {
-                "type": "string"
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "type": {
+                    "const": "expr"
+                  },
+                  "expr": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "expr"
+                ]
               }
-            },
-            "required": [
-              "type"
             ]
           },
           "auth": {
             "type": "object",
             "description": "Pulsar authentication configuration."
+          },
+          "tls": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "TLS settings.",
+            "properties": {
+              "certificate_chain_file": {
+                "type": "string",
+                "description": "PEM certificate chain the broker certificate is verified against (the trust anchor of a private CA). It is not a client certificate."
+              },
+              "hostname_verification": {
+                "type": "boolean",
+                "default": true,
+                "description": "Verify the server hostname. Defaults to true."
+              }
+            }
           },
           "value_field": {
             "type": "string",
@@ -2182,7 +2216,7 @@
           },
           "table_name": {
             "type": "string",
-            "description": "Destination table."
+            "description": "Destination table. May be schema-qualified (`analytics.events`): each dot-separated part is quoted as one identifier, and a part that needs unusual characters — or exact case on PostgreSQL — can be written already quoted (`\"Events\"`)."
           },
           "upsert": {
             "type": "boolean",
@@ -2711,6 +2745,12 @@
             "type": "integer",
             "description": "Number of neighbors per row. Defaults to 5."
           },
+          "concurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 4,
+            "description": "Maximum in-flight search requests. Defaults to 4."
+          },
           "api_key": {
             "type": "string",
             "description": "API key sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."
@@ -2934,13 +2974,40 @@
                 },
                 "key": {
                   "type": "object",
-                  "properties": {
-                    "value": {
-                      "type": "string"
+                  "description": "Key used to look up data in the temporary source.",
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "value"
+                        },
+                        "value": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "value"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "expr"
+                        },
+                        "expr": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "expr"
+                      ]
                     }
-                  },
-                  "required": [
-                    "value"
                   ]
                 }
               },
@@ -3114,7 +3181,11 @@
                 "type": "integer",
                 "minimum": 1
               }
-            }
+            },
+            "required": [
+              "query",
+              "codec"
+            ]
           }
         },
         "required": [
@@ -3191,7 +3262,11 @@
                 "type": "integer",
                 "minimum": 1
               }
-            }
+            },
+            "required": [
+              "query",
+              "codec"
+            ]
           }
         },
         "required": [
@@ -3328,7 +3403,10 @@
               "token": {
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "type"
+            ]
           }
         },
         "required": [

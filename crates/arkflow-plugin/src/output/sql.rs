@@ -35,6 +35,7 @@ use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{Connection, MySqlConnection, PgConnection, QueryBuilder};
 
 use super::codec_helper::classify_sqlx_error_ctx;
+use crate::sql_ident::QuoteStyle;
 
 #[derive(Debug, Clone, PartialEq)]
 enum SqlValue {
@@ -58,6 +59,16 @@ enum DatabaseConnection {
     Mysql(MySqlConnection),
     Postgres(PgConnection),
     // Sqlite(SqliteConnection),
+}
+
+impl DatabaseType {
+    /// The identifier quoting of the configured server.
+    fn quote_style(&self) -> QuoteStyle {
+        match self {
+            DatabaseType::Mysql(_) => QuoteStyle::Backtick,
+            DatabaseType::Postgres(_) => QuoteStyle::DoubleQuote,
+        }
+    }
 }
 
 /// Runtime connect failure classification (connector-recovery-contract):
@@ -215,16 +226,25 @@ fn upsert_update_columns<'a>(columns: &'a [String], keys: &[String]) -> Vec<&'a 
 fn mysql_upsert_clause(columns: &[String], keys: &[String]) -> String {
     let assignments: Vec<String> = upsert_update_columns(columns, keys)
         .into_iter()
-        .map(|c| format!("`{}` = VALUES(`{}`)", c, c))
+        .map(|c| {
+            let quoted = QuoteStyle::Backtick.quote(c);
+            format!("{quoted} = VALUES({quoted})")
+        })
         .collect();
     format!(" ON DUPLICATE KEY UPDATE {}", assignments.join(", "))
 }
 
 fn postgres_upsert_clause(columns: &[String], keys: &[String]) -> String {
-    let conflict: Vec<String> = keys.iter().map(|k| format!("\"{}\"", k)).collect();
+    let conflict: Vec<String> = keys
+        .iter()
+        .map(|k| QuoteStyle::DoubleQuote.quote(k))
+        .collect();
     let assignments: Vec<String> = upsert_update_columns(columns, keys)
         .into_iter()
-        .map(|c| format!("\"{}\" = EXCLUDED.\"{}\"", c, c))
+        .map(|c| {
+            let quoted = QuoteStyle::DoubleQuote.quote(c);
+            format!("{quoted} = EXCLUDED.{quoted}")
+        })
         .collect();
     format!(
         " ON CONFLICT ({}) DO UPDATE SET {}",
@@ -240,10 +260,10 @@ fn build_mysql_insert(
 ) -> QueryBuilder<sqlx::MySql> {
     let mut query_builder = QueryBuilder::<sqlx::MySql>::new(format!(
         "INSERT INTO {} ({})",
-        output_config.table_name,
+        output_config.table_name_sql,
         columns
             .iter()
-            .map(|c| format!("`{}`", c))
+            .map(|c| QuoteStyle::Backtick.quote(c))
             .collect::<Vec<_>>()
             .join(", "),
     ));
@@ -280,10 +300,10 @@ fn build_postgres_insert(
 ) -> QueryBuilder<sqlx::Postgres> {
     let mut query_builder = QueryBuilder::<sqlx::Postgres>::new(format!(
         "INSERT INTO {} ({})",
-        output_config.table_name,
+        output_config.table_name_sql,
         columns
             .iter()
-            .map(|c| format!("\"{}\"", c))
+            .map(|c| QuoteStyle::DoubleQuote.quote(c))
             .collect::<Vec<_>>()
             .join(", "),
     ));
@@ -350,6 +370,15 @@ fn batch_rows(
     let schema = msg.schema();
     let num_rows = msg.len();
     let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    // A NUL byte is not an ordinary name character for either server's
+    // lexer: quoting cannot make it safe, so the statement would fail at the
+    // server in a confusing way. Refuse it before the transaction opens,
+    // with an error that names the column.
+    if let Some(name) = columns.iter().find(|name| name.contains('\0')) {
+        return Err(Error::Process(format!(
+            "column name {name:?} contains a NUL byte and cannot be written as a SQL identifier"
+        )));
+    }
     validate_upsert_keys(output_config, &columns)?;
 
     let mut rows: Vec<Vec<SqlValue>> = (0..num_rows)
@@ -485,6 +514,10 @@ struct SqlOutputConfig {
     /// SQL query statement
     output_type: DatabaseType,
     table_name: String,
+    /// `table_name` quoted for the configured dialect, resolved when the
+    /// output is built (see `sql_ident`). Not a configuration key.
+    #[serde(skip)]
+    table_name_sql: String,
     /// Use upsert (MySQL `ON DUPLICATE KEY UPDATE` / PostgreSQL
     /// `ON CONFLICT DO UPDATE`) instead of a plain insert.
     #[serde(default)]
@@ -492,6 +525,23 @@ struct SqlOutputConfig {
     /// Columns used as the conflict target when `upsert` is enabled.
     #[serde(default)]
     upsert_keys: Option<Vec<String>>,
+}
+
+impl SqlOutputConfig {
+    /// Resolves the quoted table reference, failing on a malformed name.
+    fn resolved(mut self) -> Result<Self, Error> {
+        self.table_name_sql = self
+            .output_type
+            .quote_style()
+            .quote_qualified(&self.table_name)
+            .map_err(|reason| {
+                Error::Config(format!(
+                    "sql output: invalid `table_name` {:?}: {reason}",
+                    self.table_name
+                ))
+            })?;
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -744,6 +794,9 @@ impl OutputBuilder for SqlOutputBuilder {
         _resource: &Resource,
     ) -> Result<Arc<dyn Output>, Error> {
         let config: SqlOutputConfig = parse_config(config, "SqlOutput input")?;
+        // Resolve the quoted table reference now, so `--validate` reports a
+        // malformed name and the write path only reads it.
+        let config = config.resolved()?;
         // SQL writes map typed Arrow columns to bound parameters; encoding
         // the batch through a codec would produce a Binary payload column
         // that can never insert. Reject at build time instead of failing
@@ -792,7 +845,7 @@ pub fn init() -> Result<(), Error> {
                     "uri": {"type": "string"},
                     "ssl": {"type": "object", "description": "Optional SSL configuration (ssl_mode, root_cert, client_cert, client_key)."}
                 }, "required": ["type", "uri"]},
-                "table_name": {"type": "string", "description": "Destination table."},
+                "table_name": {"type": "string", "description": "Destination table. May be schema-qualified (`analytics.events`): each dot-separated part is quoted as one identifier, and a part that needs unusual characters — or exact case on PostgreSQL — can be written already quoted (`\"Events\"`)."},
                 "upsert": {"type": "boolean", "default": false, "description": "Use upsert (MySQL ON DUPLICATE KEY UPDATE / PostgreSQL ON CONFLICT DO UPDATE) instead of a plain insert."},
                 "upsert_keys": {"type": "array", "items": {"type": "string"}, "description": "Columns used as the conflict target for upsert. Required (non-empty) when upsert is true."}
             },
@@ -814,15 +867,33 @@ mod tests {
     use std::collections::HashMap;
 
     fn postgres_config(upsert: bool, keys: Option<Vec<&str>>) -> SqlOutputConfig {
-        SqlOutputConfig {
-            output_type: DatabaseType::Postgres(PostgresConfig {
+        output_config(
+            DatabaseType::Postgres(PostgresConfig {
                 uri: "postgres://user:pass@localhost/db".to_string(),
                 ssl: None,
             }),
-            table_name: "events".to_string(),
+            "events",
+            upsert,
+            keys,
+        )
+    }
+
+    /// A config whose table reference was resolved the way the builder does.
+    fn output_config(
+        output_type: DatabaseType,
+        table: &str,
+        upsert: bool,
+        keys: Option<Vec<&str>>,
+    ) -> SqlOutputConfig {
+        SqlOutputConfig {
+            output_type,
+            table_name: table.to_string(),
             upsert,
             upsert_keys: keys.map(|ks| ks.into_iter().map(String::from).collect()),
+            table_name_sql: String::new(),
         }
+        .resolved()
+        .expect("a well-formed table name resolves")
     }
 
     fn columns() -> Vec<String> {
@@ -847,7 +918,7 @@ mod tests {
             .sql()
             .as_str()
             .to_string();
-        assert!(sql.starts_with("INSERT INTO events (\"id\", \"name\")"),);
+        assert!(sql.starts_with("INSERT INTO \"events\" (\"id\", \"name\")"));
         assert!(!sql.contains("ON CONFLICT"));
     }
 
@@ -876,15 +947,194 @@ mod tests {
                 ssl: None,
             }),
             ..postgres_config(true, Some(vec!["id"]))
-        };
+        }
+        .resolved()
+        .expect("a well-formed table name resolves");
         let sql = build_mysql_insert(&config, &columns(), &rows())
             .build()
             .sql()
             .as_str()
             .to_string();
-        assert!(sql.contains("INSERT INTO events (`id`, `name`)"));
+        assert!(sql.contains("INSERT INTO `events` (`id`, `name`)"));
         assert!(sql.contains(" ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"));
         assert!(!sql.contains("`id` = VALUES"));
+    }
+
+    // ---- identifier quoting (spec: sql-output, 标识符 SHALL 按方言加引号转义) ----
+
+    #[test]
+    fn hostile_column_names_are_quoted_as_single_identifiers() {
+        // The third name would close the column list and append a statement
+        // if it were interpolated raw.
+        let columns: Vec<String> = [
+            "a\"b",
+            "a`b",
+            "x) VALUES ('injected'); DROP TABLE events; --",
+        ]
+        .iter()
+        .map(|column| column.to_string())
+        .collect();
+        let rows = vec![vec![
+            SqlValue::Int64(1),
+            SqlValue::Int64(2),
+            SqlValue::Int64(3),
+        ]];
+
+        let sql = build_postgres_insert(
+            &output_config(
+                DatabaseType::Postgres(pg_config("postgres://user@localhost/db")),
+                "events",
+                false,
+                None,
+            ),
+            &columns,
+            &rows,
+        )
+        .build()
+        .sql()
+        .as_str()
+        .to_string();
+        assert!(
+            sql.starts_with(
+                "INSERT INTO \"events\" (\"a\"\"b\", \"a`b\", \
+                 \"x) VALUES ('injected'); DROP TABLE events; --\")"
+            ),
+            "{sql}"
+        );
+
+        let sql = build_mysql_insert(
+            &output_config(
+                DatabaseType::Mysql(mysql_config("mysql://root@localhost/db")),
+                "events",
+                false,
+                None,
+            ),
+            &columns,
+            &rows,
+        )
+        .build()
+        .sql()
+        .as_str()
+        .to_string();
+        assert!(
+            sql.starts_with(
+                "INSERT INTO `events` (`a\"b`, `a``b`, \
+                 `x) VALUES ('injected'); DROP TABLE events; --`)"
+            ),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn upsert_keys_and_assignments_share_the_column_quoting() {
+        let config = output_config(
+            DatabaseType::Postgres(pg_config("postgres://user@localhost/db")),
+            "events",
+            true,
+            Some(vec!["k\"ey"]),
+        );
+        let sql = build_postgres_insert(&config, &["k\"ey".to_string(), "v".to_string()], &rows())
+            .build()
+            .sql()
+            .as_str()
+            .to_string();
+        assert!(
+            sql.contains("ON CONFLICT (\"k\"\"ey\") DO UPDATE SET \"v\" = EXCLUDED.\"v\""),
+            "{sql}"
+        );
+
+        let config = output_config(
+            DatabaseType::Mysql(mysql_config("mysql://root@localhost/db")),
+            "events",
+            true,
+            Some(vec!["k`ey"]),
+        );
+        let sql = build_mysql_insert(&config, &["k`ey".to_string(), "v".to_string()], &rows())
+            .build()
+            .sql()
+            .as_str()
+            .to_string();
+        assert!(
+            sql.contains("ON DUPLICATE KEY UPDATE `v` = VALUES(`v`)"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn table_names_are_quoted_per_dotted_part() {
+        let pg = |table: &str| {
+            output_config(
+                DatabaseType::Postgres(pg_config("postgres://user@localhost/db")),
+                table,
+                false,
+                None,
+            )
+            .table_name_sql
+        };
+        assert_eq!(pg("events"), "\"events\"");
+        assert_eq!(pg("analytics.events"), "\"analytics\".\"events\"");
+        // An unquoted PostgreSQL identifier folds to lower case.
+        assert_eq!(pg("Events"), "\"events\"");
+        assert_eq!(pg("\"Events\""), "\"Events\"");
+        assert_eq!(
+            pg("events; DROP TABLE users; --"),
+            "\"events; drop table users; --\""
+        );
+
+        let mysql = |table: &str| {
+            output_config(
+                DatabaseType::Mysql(mysql_config("mysql://root@localhost/db")),
+                table,
+                false,
+                None,
+            )
+            .table_name_sql
+        };
+        assert_eq!(mysql("analytics.events"), "`analytics`.`events`");
+        assert_eq!(mysql("Events"), "`Events`");
+        assert_eq!(
+            mysql("events; DROP TABLE users; --"),
+            "`events; DROP TABLE users; --`"
+        );
+    }
+
+    #[test]
+    fn malformed_table_names_fail_the_build() {
+        for table in ["", "a..b", "\"events", "\"events\"x", "a\0b"] {
+            let config = serde_json::json!({
+                "output_type": {"type": "postgres", "uri": "postgres://user@localhost/db"},
+                "table_name": table,
+            });
+            let error = SqlOutputBuilder
+                .build(None, &Some(config), None, &resource())
+                .err()
+                .unwrap_or_else(|| panic!("{table:?} must fail the build"));
+            let message = error.to_string();
+            assert!(
+                message.contains("invalid `table_name`"),
+                "{table:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn nul_in_a_column_name_fails_before_the_transaction() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{Field, Schema};
+
+        let batch = datafusion::arrow::array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "a\0b",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let batch = MessageBatch::new_arrow(batch);
+        let error = batch_rows(&postgres_config(false, None), &batch)
+            .expect_err("a NUL-bearing column name is refused");
+        assert!(error.to_string().contains("NUL"), "{error}");
     }
 
     #[test]
@@ -1616,7 +1866,10 @@ mod tests {
             table_name: "events".to_string(),
             upsert: false,
             upsert_keys: None,
-        };
+            table_name_sql: String::new(),
+        }
+        .resolved()
+        .expect("a well-formed table name resolves");
         let output = SqlOutput::new(config).unwrap();
         let err = output.connect().await.unwrap_err();
         assert!(
@@ -1635,7 +1888,10 @@ mod tests {
             table_name: "events".to_string(),
             upsert: false,
             upsert_keys: None,
-        };
+            table_name_sql: String::new(),
+        }
+        .resolved()
+        .expect("a well-formed table name resolves");
         let output = SqlOutput::new(config).unwrap();
         let err = output.connect().await.unwrap_err();
         assert!(
@@ -1654,7 +1910,10 @@ mod tests {
             table_name: "events".to_string(),
             upsert: false,
             upsert_keys: None,
-        };
+            table_name_sql: String::new(),
+        }
+        .resolved()
+        .expect("a well-formed table name resolves");
         let output = SqlOutput::new(config).unwrap();
         let err = output.connect().await.unwrap_err();
         assert!(
@@ -1673,7 +1932,10 @@ mod tests {
             table_name: "events".to_string(),
             upsert: false,
             upsert_keys: None,
-        };
+            table_name_sql: String::new(),
+        }
+        .resolved()
+        .expect("a well-formed table name resolves");
         let output = SqlOutput::new(config).unwrap();
         let err = output.connect().await.unwrap_err();
         assert!(

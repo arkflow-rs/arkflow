@@ -272,6 +272,120 @@ aligned to it, two of which change runtime behavior:
   naming all three values, when `appVersion`, the workspace version, and
   the release tag diverge.
 
+### Added — Component metadata
+
+- A conformance gate (`crates/arkflow-plugin/tests/metadata_conformance.rs`)
+  checks every registered component schema against the config struct its
+  builder deserializes: field coverage in both directions, `required`,
+  `default`, and string-enum values, following `#[serde(flatten)]`, nested
+  objects and arrays, and serde's externally, internally, and untagged enum
+  layouts. The struct is read from source, so the field list cannot go
+  stale; every component with a schema must be mapped, and the two exemption
+  lists (`HIDDEN_FIELDS`, `BUILDER_REQUIRED`) fail the gate once an entry is
+  no longer needed, and a `BUILDER_REQUIRED` entry is probed through the
+  real builder (the example itself must build, and the builder must refuse a
+  config without the key, naming it). Generic field
+  types such as `Expr<String>` are resolved by name, so tagged-expression
+  properties are checked too. An advertised default is compared with the
+  value serde produces (the type's zero, or the literal the default
+  function returns — a default of the field's own before the container's,
+  and the function is found through its path); a key demanded by only some
+  `anyOf`/`oneOf` branches does not count as required, a key the enclosing
+  node demands does; every branch that selects a variant is checked — a
+  tagged branch without a selector included — each has to demand the tag,
+  a default the enclosing node states counts for every branch, and a
+  variant may not be selected twice under `oneOf`; a tag value that is not a
+  decodable variant,
+  an untagged branch that demands less than any variant, a flattened type
+  the gate cannot read, and a mapped component with an opaque root schema
+  are all reported. serde's `rename_all` conversions — different for fields
+  and variants, and ASCII-only — are cross-checked against the real derive.
+- Example configs cover the newly documented fields: `pulsar_tls_example.yaml`
+  (the Pulsar `tls` block on an input and an output) and `concurrency` in
+  the `milvus_search` example.
+
+### Changed — Component metadata
+
+The gate found drift in thirteen components; the IDE-facing schema and the
+committed inventory now match what serde accepts:
+
+- `kafka` input: `transactional_offsets` is in the schema (the IDE no longer
+  rejects it), and omitting `start_from_latest` now means `false` — the
+  default the schema always advertised — instead of failing with a
+  missing-field error. Its description no longer says the flag makes
+  committed offsets ignored: it only sets the offset reset policy — with a
+  single-consumer subscription a committed group offset still in range wins
+  on restart; under an explicit partition assignment committed group offsets
+  are not used. A config that relies on the
+  default fails to build again on the previous version: add
+  `start_from_latest: false` before rolling back.
+- `pulsar` input and output: the `tls` block (`certificate_chain_file`,
+  `hostname_verification`) is in the schema, and `certificate_chain_file` is
+  described as what the driver does with it — the chain the broker
+  certificate is verified against, not a client certificate for mTLS. The
+  component pages said the same wrong thing and are corrected.
+  The input's
+  `subscription_type` lists the values serde accepts (`exclusive`, `shared`,
+  `failover`, `key_shared`; the capitalized spellings it listed were
+  rejected at runtime).
+- `milvus_search`: `concurrency` is in the schema.
+- `pulsar` output: the `topic` schema requires `value` with `type: value`
+  and `expr` with `type: expr`; the flat schema let the IDE pass an
+  expression object carrying no expression.
+- `sql` processor: the `temporary_list[].key` schema is the tagged
+  expression the docs and examples already use (`type: value` or
+  `type: expr`); it required `value` and omitted the tag, so the IDE
+  rejected the documented form.
+- `http` input: the schema no longer documents `method` and `interval` —
+  the polling client mode does not exist — the description no longer
+  promises `PUT` (the server routes `POST` only), and a config carrying
+  either key
+  now fails at build with an explanatory error instead of being silently
+  ignored while the input runs as a server.
+- `http` output: omitting `method` means `POST` (the advertised default);
+  `timeout_ms` is marked required, as serde requires it. A config that
+  relies on this fails to build again on the previous version: add
+  `method: POST` before rolling back.
+- `kafka` output: `compression` no longer offers `zstd`, which the enum
+  never accepted. `nats` output: the `jet_stream` mode no longer documents
+  a required `stream` key that nothing reads.
+- The `session_window` and `tumbling_window` buffers mark the `join`
+  block's `query` and `codec` as required; the `schema_registry` codec marks
+  `auth.type` as required. The `redis` input description no longer claims
+  stream consumer groups, and the `http` input description no longer
+  advertises polling.
+
+### Fixed — Connectors
+
+- The `http` output builds its client through the shared
+  `http_util::build_http_client`, so — like every other HTTP component — a
+  loopback URL (`localhost`, `127.0.0.1`, `::1`) bypasses the system proxy
+  instead of being forwarded to it. On a machine with a system proxy this
+  also made the refused-connection test fail intermittently with the
+  proxy's `502`. The shared client now recognizes every loopback address
+  (`127.0.0.0/8`, `::1`), not only `127.0.0.1`.
+- The `sql` output rejects an empty quoted part in `table_name`
+  (`analytics.""`) when the output is built, instead of letting the
+  server reject the zero-length identifier on the first write.
+
+### Security — SQL output
+
+- Every identifier the `sql` output writes into SQL text is quoted for the
+  target dialect with embedded quotes doubled: column names, `upsert_keys`,
+  conflict assignments, and the table. Column names come from the batch
+  schema and may be inferred from data; a name containing quotes, backticks,
+  or `); DROP TABLE …; --` is written as that single identifier instead of
+  being able to change the statement.
+- `table_name` is quoted one dot-separated part at a time, so
+  `analytics.events` keeps working: a bare part resolves exactly like the
+  unquoted identifier it replaces (folded to lower case on PostgreSQL), and
+  a part already written in the dialect's quotes is kept verbatim. A
+  malformed name (empty part, unclosed quote, text after a closing quote,
+  NUL byte) fails when the output is built, so `--validate` reports it. A
+  column name containing a NUL byte fails the write.
+- The pgvector output and `pgvector_search` share the same implementation;
+  their generated SQL is unchanged.
+
 ### Fixed — Engine and control plane
 
 - The in-memory Hub no longer lets a settled Job observation roll a

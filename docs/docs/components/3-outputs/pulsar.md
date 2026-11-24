@@ -54,7 +54,7 @@ An expression must yield a non-null string for every row: a NULL result for any 
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| certificate_chain_file | string | no | — | Path to the client certificate chain (PEM) for mTLS. |
+| certificate_chain_file | string | no | — | PEM file with the certificate chain the broker certificate is verified against (the trust anchor of a private CA). It is not a client certificate: the driver adds it to its trust store. |
 | hostname_verification | boolean | no | `true` | Verify the broker certificate hostname. |
 
 ## Examples

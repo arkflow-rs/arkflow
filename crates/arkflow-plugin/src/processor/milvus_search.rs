@@ -55,6 +55,7 @@ pub fn init() -> Result<(), Error> {
                 "payload_field": {"type": "string", "description": "Collection field included in each match as a payload object. Defaults to 'payload'; set to an empty string to disable."},
                 "metric": {"type": "string", "enum": ["COSINE", "L2", "IP"], "description": "Metric type; must match the collection schema. Defaults to COSINE."},
                 "top_k": {"type": "integer", "description": "Number of neighbors per row. Defaults to 5."},
+                "concurrency": {"type": "integer", "minimum": 1, "default": 4, "description": "Maximum in-flight search requests. Defaults to 4."},
                 "api_key": {"type": "string", "description": "API key sent as 'Authorization: Bearer' (Milvus convention: <user>:<password>); supports secret references."},
                 "timeout_ms": {"type": "integer", "description": "HTTP request timeout in milliseconds. Defaults to 30000."},
                 "retry_count": {"type": "integer", "description": "Retries for transient failures (429/5xx/transport). Defaults to 3; 0 disables retrying."},

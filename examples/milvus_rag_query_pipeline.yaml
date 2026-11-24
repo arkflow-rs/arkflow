@@ -29,6 +29,7 @@ streams:
           id_field: doc_id
           metric: COSINE
           top_k: 5
+          concurrency: 4
         - type: arrow_to_json
 
     output:

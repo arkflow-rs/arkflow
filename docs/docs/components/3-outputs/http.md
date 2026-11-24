@@ -13,7 +13,7 @@ The HTTP output sends each message as an HTTP request to a configured URL. It su
 |-------|------|----------|---------|-------------|
 | type  | string | yes | — | Fixed value `"http"` |
 | url | string | yes | — | Destination URL. |
-| method | string | yes | — | HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`. |
+| method | string | no | `POST` | HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`. Defaults to `POST`. |
 | timeout_ms | integer | yes | — | Request timeout in milliseconds. |
 | retry_count | integer | no | `3` | Number of retry attempts on failure. Only transient failures (transport errors, `429`, `5xx`) are retried; other `4xx` responses fail immediately. |
 | headers | `map<string, string>` | no | — | Custom HTTP headers. |

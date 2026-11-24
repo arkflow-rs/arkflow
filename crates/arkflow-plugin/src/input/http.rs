@@ -299,24 +299,45 @@ impl InputBuilder for HttpInputBuilder {
         codec: Option<Arc<dyn Codec>>,
         _resource: &Resource,
     ) -> Result<Arc<dyn Input>, Error> {
+        reject_removed_client_keys(config)?;
         let config: HttpInputConfig = parse_config(config, "Http input")?;
         Ok(Arc::new(HttpInput::new(name, config, codec)?))
     }
+}
+
+/// Keys of the polling client mode the HTTP input no longer has. serde drops
+/// unknown keys, so a config still carrying them would run as a server while
+/// looking like a poller — fail loudly instead (spec:
+/// component-config-honesty).
+const REMOVED_CLIENT_KEYS: &[&str] = &["method", "interval"];
+
+fn reject_removed_client_keys(config: &Option<serde_json::Value>) -> Result<(), Error> {
+    for key in REMOVED_CLIENT_KEYS {
+        if config
+            .as_ref()
+            .is_some_and(|config| config.get(key).is_some())
+        {
+            return Err(Error::Config(format!(
+                "http input: `{key}` is not supported: the HTTP input only runs as a server that \
+                 accepts POST requests on `path` (the polling client mode no longer exists). \
+                 Remove `{key}` from the configuration."
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn init() -> Result<(), Error> {
     register_input_builder("http", Arc::new(HttpInputBuilder))?;
     register_input_metadata(ComponentMetadata::with_schema(
         "http",
-        "Receives data via HTTP. Can run as a server (POST/PUT on `path`) or poll a remote endpoint.",
+        "Receives data via HTTP: runs a server that accepts POST requests on `address` + `path` and forwards each request body into the stream.",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "address": {"type": "string", "description": "Bind address (server mode) or base URL (client mode)."},
-                "path": {"type": "string", "description": "Path to accept messages on (server mode) or full request path (client mode)."},
-                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"], "description": "HTTP method (client mode)."},
-                "interval": {"type": "string", "description": "Polling interval in humantime format (client mode, e.g. '5s')."},
+                "address": {"type": "string", "description": "Address to listen on, e.g. `0.0.0.0:8080`."},
+                "path": {"type": "string", "description": "URL path that receives messages, e.g. `/data`."},
                 "cors_enabled": {"type": "boolean", "default": false, "description": "Enable CORS for the server."},
                 "auth": {"type": "object", "description": "Authentication configuration."}
             },
@@ -393,6 +414,37 @@ mod tests {
     use serde_json::json;
     use tower::util::ServiceExt;
     // for `oneshot` method
+
+    /// The polling client mode no longer exists: a config still carrying its
+    /// keys must fail loudly instead of silently running as a server (spec:
+    /// component-config-honesty).
+    #[test]
+    fn removed_client_mode_keys_fail_the_build() {
+        let resource = Resource {
+            temporary: Default::default(),
+            input_names: std::cell::RefCell::new(Default::default()),
+        };
+        for key in REMOVED_CLIENT_KEYS {
+            let key = *key;
+            let config = json!({"address": "127.0.0.1:0", "path": "/data", key: "x"});
+            let error = HttpInputBuilder
+                .build(None, &Some(config), None, &resource)
+                .err()
+                .expect("a removed key must fail the build");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("`{key}` is not supported")),
+                "error names the removed key: {message}"
+            );
+        }
+        let valid = json!({"address": "127.0.0.1:0", "path": "/data"});
+        assert!(
+            HttpInputBuilder
+                .build(None, &Some(valid), None, &resource)
+                .is_ok(),
+            "a config without the removed keys builds"
+        );
+    }
 
     /// Spec "端口占用使 connect 失败": a port conflict must fail `connect()`
     /// itself — pre-fix, the bind panicked inside a detached listener task

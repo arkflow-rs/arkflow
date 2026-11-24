@@ -20,7 +20,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | codec | `schema_registry` | Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate. | [reference](../components/codecs/schema-registry) |
 | input | `file` | Reads records from local or remote object storage (S3, GCS, Azure, HDFS) in CSV/JSON/Parquet/Avro/Arrow formats. | [reference](../components/inputs/file) |
 | input | `generate` | Generates synthetic text messages on a fixed interval (useful for testing and load simulation). | [reference](../components/inputs/generate) |
-| input | `http` | Receives data via HTTP. Can run as a server (POST/PUT on `path`) or poll a remote endpoint. | [reference](../components/inputs/http) |
+| input | `http` | Receives data via HTTP: runs a server that accepts POST requests on `address` + `path` and forwards each request body into the stream. | [reference](../components/inputs/http) |
 | input | `kafka` | Consumes messages from Apache Kafka topics with a consumer group. | [reference](../components/inputs/kafka) |
 | input | `memory` | In-memory input queue seeded with an initial list of messages. Primarily for tests and demos. | [reference](../components/inputs/memory) |
 | input | `modbus` | Polls Modbus TCP devices on a fixed interval, reading coils, discrete inputs, or registers. | [reference](../components/inputs/modbus) |
@@ -28,7 +28,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | input | `multiple_inputs` | Combines multiple input sources into a single stream. Each source is tagged with __meta_source. | [reference](../components/inputs/multiple_inputs) |
 | input | `nats` | Consumes messages from NATS, supporting both regular subjects and JetStream consumers. | [reference](../components/inputs/nats) |
 | input | `pulsar` | Subscribes to an Apache Pulsar topic with configurable subscription type and authentication. | [reference](../components/inputs/pulsar) |
-| input | `redis` | Reads from Redis: list blocking pops, pub/sub subscriptions, or stream consumer groups. | [reference](../components/inputs/redis) |
+| input | `redis` | Reads from Redis: blocking list pops or pub/sub subscriptions (channels or patterns). | [reference](../components/inputs/redis) |
 | input | `sql` | Runs a one-shot SELECT against a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) and emits the rows as batches. | [reference](../components/inputs/sql) |
 | input | `websocket` | Connects to a WebSocket server and forwards each incoming message as a batch. | [reference](../components/inputs/websocket) |
 | output | `drop` | Discards all messages. Useful for performance benchmarks and dead-end pipelines. | [reference](../components/outputs/drop) |

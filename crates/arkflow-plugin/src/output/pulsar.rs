@@ -340,14 +340,21 @@ pub fn init() -> Result<(), Error> {
                 "topic": {
                     "type": "object",
                     "description": "Destination topic expression: {\"type\":\"value\",\"value\":\"...\"} for a static topic or {\"type\":\"expr\",\"expr\":\"...\"} per message.",
-                    "properties": {
-                        "type": {"type": "string", "enum": ["value", "expr"]},
-                        "value": {"type": "string"},
-                        "expr": {"type": "string"}
-                    },
-                    "required": ["type"]
+                    "oneOf": [
+                        {"type": "object", "additionalProperties": false, "properties": {"type": {"const": "value"}, "value": {"type": "string"}}, "required": ["type", "value"]},
+                        {"type": "object", "additionalProperties": false, "properties": {"type": {"const": "expr"}, "expr": {"type": "string"}}, "required": ["type", "expr"]}
+                    ]
                 },
                 "auth": {"type": "object", "description": "Pulsar authentication configuration."},
+                "tls": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "TLS settings.",
+                    "properties": {
+                        "certificate_chain_file": {"type": "string", "description": "PEM certificate chain the broker certificate is verified against (the trust anchor of a private CA). It is not a client certificate."},
+                        "hostname_verification": {"type": "boolean", "default": true, "description": "Verify the server hostname. Defaults to true."}
+                    }
+                },
                 "value_field": {"type": "string", "description": "Record field used as the payload."}
             },
             "required": ["service_url", "topic"]

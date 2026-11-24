@@ -1,0 +1,39 @@
+# Pulsar -> Pulsar over TLS, trusting a broker certificate issued by a
+# private CA.
+#
+# Both the input and the output take the same `tls` block:
+#
+#   certificate_chain_file  PEM file with the certificate chain the broker
+#                           certificate is verified against — the trust anchor
+#                           of a private CA. The driver adds it to its trust
+#                           store; it is not a client certificate.
+#   hostname_verification   verify the broker certificate hostname (default true)
+#
+# `tls.ca_file` is not a setting of the Pulsar driver: a config that still
+# carries it is rejected when the component is built.
+logging:
+  level: info
+streams:
+  - input:
+      type: "pulsar"
+      service_url: "pulsar+ssl://pulsar-broker:6651"
+      topic: "persistent://public/default/events"
+      subscription_name: "arkflow"
+      subscription_type: "failover"
+      codec:
+        type: "json"
+      tls:
+        certificate_chain_file: "/etc/arkflow/certs/private-ca-chain.pem"
+        hostname_verification: true
+
+    pipeline:
+      processors: []
+
+    output:
+      type: "pulsar"
+      service_url: "pulsar+ssl://pulsar-broker:6651"
+      topic:
+        type: "value"
+        value: "persistent://public/default/events-out"
+      tls:
+        certificate_chain_file: "/etc/arkflow/certs/private-ca-chain.pem"
