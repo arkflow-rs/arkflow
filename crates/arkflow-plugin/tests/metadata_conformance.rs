@@ -855,15 +855,22 @@ struct Field {
     /// `#[serde(default)]`, or a plain `Option<_>` (not behind a custom
     /// deserializer).
     optional: bool,
-    /// A plain `#[serde(default)]`, or a derived container default: the
-    /// value is the type's zero and can be compared with the schema.
+    /// The value of an absent key is the type's zero and can be compared
+    /// with the schema: a bare `#[serde(default)]` on the field, or a
+    /// derived container default behind which the field has no default of
+    /// its own.
     plain_default: bool,
     /// `#[serde(default = "path")]`: the function that supplies the value.
+    /// A default of the field's own, which wins over the container's.
     default_fn: Option<String>,
     /// `#[serde(skip)]` / `#[serde(skip_deserializing)]`: not an input.
     skip: bool,
     /// `#[serde(flatten)]`: the target type's fields are inlined.
     flatten: bool,
+    /// The file the field is declared in: a default function written as a
+    /// bare name is the one that file sees, also once the field is
+    /// flattened into another file's struct.
+    file: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -950,6 +957,7 @@ fn parse_fields(
     body: &[char],
     container_default: ContainerDefault,
     rule: Option<RenameRule>,
+    file: &str,
 ) -> Result<Vec<Field>, ParseError> {
     let mut fields = Vec::new();
     for part in split_top_level(body) {
@@ -978,18 +986,28 @@ fn parse_fields(
                 "field `{name}` has an unreadable type `{ty}`"
             )));
         }
+        // A default of the field's own wins over the container's: a function
+        // supplies its value, a bare `#[serde(default)]` is the field
+        // type's zero. Behind a derived container default an absent key
+        // takes the type's zero as well.
+        let (plain_default, default_fn) = match &serde.default_fn {
+            Some(function) => (false, Some(function.clone())),
+            None => (
+                serde.default || container_default == ContainerDefault::Derived,
+                None,
+            ),
+        };
         fields.push(Field {
             name: field_name(&name, &serde, rule),
-            optional: serde.default
-                || serde.default_fn.is_some()
+            optional: plain_default
+                || default_fn.is_some()
                 || container_default != ContainerDefault::None
                 || (type_is_option(&ty) && !serde.custom_deserializer),
-            // A field-level bare default is the field type's own zero, even
-            // inside a defaulted container.
-            plain_default: serde.default || container_default == ContainerDefault::Derived,
-            default_fn: serde.default_fn.clone(),
+            plain_default,
+            default_fn,
             skip: serde.skip,
             flatten: serde.flatten,
+            file: file.to_string(),
             ty,
         });
     }
@@ -1033,7 +1051,7 @@ fn parse_def_body(
             } else {
                 ContainerDefault::None
             };
-            def.fields = parse_fields(body, container_default, rule)?;
+            def.fields = parse_fields(body, container_default, rule, file)?;
         }
         DefKind::Enum => {
             // An enum's `rename_all` renames its variants. The fields of a
@@ -1071,7 +1089,8 @@ fn parse_def_body(
                         .as_deref()
                         .or(serde.rename_all_fields.as_deref())
                         .and_then(rename_rule);
-                    variant.fields = parse_fields(&inner, ContainerDefault::None, field_rule)?;
+                    variant.fields =
+                        parse_fields(&inner, ContainerDefault::None, field_rule, file)?;
                 } else if after.starts_with('(') && after.ends_with(')') {
                     let types: Vec<char> = after[1..after.len() - 1].chars().collect();
                     let mut pieces = split_top_level(&types);
@@ -1226,9 +1245,7 @@ fn literal_value(expr: &str) -> Option<Value> {
             return None;
         }
         let text: String = chars[1..close].iter().collect();
-        return Some(Value::String(
-            text.replace("\\\"", "\"").replace("\\\\", "\\"),
-        ));
+        return Some(Value::String(unescape(&text)?));
     }
     let negative = expr.starts_with('-');
     let digits = expr.trim_start_matches(['-', '+']).replace('_', "");
@@ -1250,6 +1267,55 @@ fn literal_value(expr: &str) -> Option<Value> {
         return expr.parse::<i64>().ok().map(|n| Value::Number(n.into()));
     }
     digits.parse::<u64>().ok().map(|n| Value::Number(n.into()))
+}
+
+/// The body of a Rust string literal as the text it denotes: the escape
+/// sequences are decoded in one pass. `None` for one that cannot be decoded,
+/// so such a default stays unverified instead of being compared with the
+/// wrong text.
+fn unescape(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match chars.get(i) {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('\\') | Some('"') | Some('\'') => out.push(chars[i]),
+            Some('x') => {
+                let digit = |k: usize| chars.get(k).and_then(|c| c.to_digit(16));
+                let (high, low) = (digit(i + 1)?, digit(i + 2)?);
+                out.push(char::from_u32(high * 16 + low)?);
+                i += 2;
+            }
+            Some('u') => {
+                if chars.get(i + 1) != Some(&'{') {
+                    return None;
+                }
+                let end = (i + 2..chars.len()).find(|&k| chars[k] == '}')?;
+                let digits: String = chars[i + 2..end].iter().collect();
+                out.push(char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?);
+                i = end;
+            }
+            // A backslash before a newline continues the line: the newline
+            // and the next line's indentation are not part of the text.
+            Some('\n') | Some('\r') => {
+                i = skip_ws(&chars, i + 1);
+                continue;
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+    Some(out)
 }
 
 /// The parameterless functions of a source whose body is one expression:
@@ -1642,16 +1708,59 @@ impl Index {
     }
 
     /// The value the function behind `#[serde(default = "path")]` returns,
-    /// when its body is one expression the gate can read and the function is
-    /// defined in `from_file` or only once in the crate.
+    /// when its body is one expression the gate can read. The path is read
+    /// the way the field's own file sees it: a path rooted in a module
+    /// (`crate::`, `self::`, `super::`) is the function that module
+    /// declares and nothing else; a bare name is a function of that file,
+    /// then one the file imports under that name, then one declared only
+    /// once in the crate. Whatever cannot be found that way stays
+    /// unverified.
     fn default_fn_value(&self, path: &str, from_file: &str) -> Option<Value> {
-        let name = path.rsplit("::").next().unwrap_or(path);
-        let defined = self.fn_defaults.get(name)?;
-        let found = defined
-            .iter()
-            .find(|(file, _)| file == from_file)
-            .or_else(|| (defined.len() == 1).then(|| &defined[0]))?;
-        found.1.clone()
+        let (qualifiers, name) = path.rsplit_once("::").unwrap_or(("", path));
+        let declared_in = |file: &str| {
+            self.fn_defaults
+                .get(name)?
+                .iter()
+                .find(|(defined, _)| defined == file)
+                .and_then(|(_, value)| value.clone())
+        };
+        let rooted = qualifiers
+            .split("::")
+            .next()
+            .is_some_and(|first| ["crate", "self", "super"].contains(&first));
+        if rooted {
+            return declared_in(&self.path_file(path, from_file)?);
+        }
+        let local = declared_in(from_file);
+        if !qualifiers.is_empty() {
+            // A type's associated function: only its name is followed.
+            return local.or_else(|| self.unique_fn_value(name));
+        }
+        local
+            .or_else(|| {
+                let (_, imported) = self
+                    .imports
+                    .get(from_file)?
+                    .iter()
+                    .find(|(local, _)| local.as_str() == name)?;
+                let file = self.path_file(imported, from_file)?;
+                let target = imported.rsplit("::").next()?;
+                self.fn_defaults
+                    .get(target)?
+                    .iter()
+                    .find(|(defined, _)| *defined == file)
+                    .and_then(|(_, value)| value.clone())
+            })
+            .or_else(|| self.unique_fn_value(name))
+    }
+
+    /// The value of the function `name` when the crate declares exactly one.
+    fn unique_fn_value(&self, name: &str) -> Option<Value> {
+        // `None` when the crate declares no function of that name, or several.
+        match self.fn_defaults.get(name)?.as_slice() {
+            [only] => only.1.clone(),
+            _ => None,
+        }
     }
 
     /// What a field type refers to: wrappers (`Option`, `Vec`, …) are peeled
@@ -1949,6 +2058,16 @@ fn always_required(node: &Value) -> BTreeSet<String> {
     demanded
 }
 
+/// Whether a newtype variant's payload stands for any object — a JSON
+/// `Value` or a map — so that no object schema is too lenient for it.
+fn decodes_any_object(ty: &str) -> bool {
+    let base = ty.split('<').next().unwrap_or(ty);
+    matches!(
+        base.rsplit("::").next(),
+        Some("Value" | "HashMap" | "BTreeMap" | "Map" | "IndexMap")
+    )
+}
+
 /// The values a node's `name` property selects through `const` or `enum`.
 fn selector_values(node: &Value, name: &str) -> Vec<String> {
     let Some(selector) = node.get("properties").and_then(|props| props.get(name)) else {
@@ -2142,7 +2261,7 @@ impl<'a> Gate<'a> {
         match def.kind {
             DefKind::Struct => {
                 let fields = self.shape_fields(&def.name, path, &def.fields, &def.file, 0);
-                self.check_shape(&def.name, &def.file, &fields, node, path, true);
+                self.check_shape(&def.name, &fields, node, path, true, &BTreeSet::new());
                 self.check_members(&def.name, &def.fields, &def.file, node, path);
             }
             DefKind::Enum => self.check_enum(def, node, path),
@@ -2240,21 +2359,24 @@ impl<'a> Gate<'a> {
 
     /// R1–R5 for one field set against one documented schema node. `ghosts`
     /// is off when the node is a merged view whose keys were already checked
-    /// against the union of every variant.
+    /// against the union of every variant. `outer` lists the keys the node
+    /// enclosing a branch demands of every configuration; they bind the
+    /// branch too.
     fn check_shape(
         &mut self,
         def: &str,
-        from_file: &str,
         fields: &[Field],
         node: &Value,
         path: &str,
         ghosts: bool,
+        outer: &BTreeSet<String>,
     ) {
         let props = props(node);
         let required = required(node);
         // A key the schema demands only under `anyOf`/`oneOf` can still be
-        // omitted through a lenient alternative.
-        let demanded = always_required(node);
+        // omitted through a lenient alternative — unless the enclosing node
+        // demands it.
+        let demanded: BTreeSet<String> = outer.union(&always_required(node)).cloned().collect();
         let by_name: BTreeMap<&str, &Field> = fields
             .iter()
             .map(|field| (field.name.as_str(), field))
@@ -2292,31 +2414,45 @@ impl<'a> Gate<'a> {
                 }
             }
         }
-        for name in &required {
-            // A merged view may list keys that belong to other variants.
-            if ghosts && !by_name.contains_key(name) {
-                self.problem(
-                    def,
-                    path,
-                    format!(
-                        "R3 the schema requires `{name}`, which the config struct never reads — no \
-                         configuration can satisfy it"
-                    ),
-                );
-                continue;
-            }
-            if let Some(field) = by_name.get(name) {
-                if field.optional && !self.exempt(ExemptionKind::BuilderRequired, def, name) {
+        for name in required
+            .iter()
+            .copied()
+            .chain(outer.iter().map(String::as_str))
+        {
+            let Some(field) = by_name.get(name) else {
+                // A merged view may list keys that belong to other variants.
+                if ghosts && required.contains(name) {
                     self.problem(
                         def,
                         path,
                         format!(
-                            "R3 the schema marks `{name}` required but serde accepts a config \
-                             without it — make the struct require it, drop it from `required`, \
-                             or register it in BUILDER_REQUIRED if the builder enforces it"
+                            "R3 the schema requires `{name}`, which the config struct never reads — no \
+                                                     configuration can satisfy it"
+                        ),
+                    );
+                } else if outer.contains(name) {
+                    // No branch can lift a requirement of the enclosing node.
+                    self.problem(
+                        def,
+                        path,
+                        format!(
+                            "R1 the enclosing schema requires `{name}`, which this variant never \
+                             reads — it rejects every configuration of the variant"
                         ),
                     );
                 }
+                continue;
+            };
+            if field.optional && !self.exempt(ExemptionKind::BuilderRequired, def, name) {
+                self.problem(
+                    def,
+                    path,
+                    format!(
+                        "R3 the schema marks `{name}` required but serde accepts a config \
+                             without it — make the struct require it, drop it from `required`, \
+                             or register it in BUILDER_REQUIRED if the builder enforces it"
+                    ),
+                );
             }
         }
         for field in fields.iter().filter(|field| !field.optional) {
@@ -2356,13 +2492,15 @@ impl<'a> Gate<'a> {
                 );
                 continue;
             }
-            // Only a default whose value is known can be compared: a plain
-            // `#[serde(default)]` (the type's zero), or a function whose body
-            // is a literal.
-            let actual = if field.plain_default {
+            // Only a default whose value is known can be compared: a
+            // function whose body is a literal (a default of the field's
+            // own comes first), or a plain `#[serde(default)]` (the type's
+            // zero). A default function is looked up from the file the
+            // field is declared in.
+            let actual = if let Some(function) = &field.default_fn {
+                self.index.default_fn_value(function, &field.file)
+            } else if field.plain_default {
                 plain_default_value(&field.ty)
-            } else if let Some(function) = &field.default_fn {
-                self.index.default_fn_value(function, from_file)
             } else {
                 None
             };
@@ -2412,6 +2550,9 @@ impl<'a> Gate<'a> {
             /// A struct or struct-valued newtype variant has a field set to
             /// check; unit and tuple variants do not.
             checkable: bool,
+            /// A newtype variant whose payload (`Value`, a map) decodes any
+            /// object whatever.
+            catch_all: bool,
         }
         // Adjacent tagging nests the fields under a content key: not modelled.
         if def.layout == EnumLayout::Adjacent {
@@ -2423,8 +2564,8 @@ impl<'a> Gate<'a> {
             if variant.skip {
                 continue;
             }
-            let (mut checkable, mut own, mut file): (bool, &'a [Field], &str) =
-                (true, &[] as &[Field], "");
+            let (mut checkable, mut catch_all, mut own, mut file): (bool, bool, &'a [Field], &str) =
+                (true, false, &[] as &[Field], "");
             match variant.kind {
                 VariantKind::Struct => {
                     own = &variant.fields;
@@ -2434,7 +2575,8 @@ impl<'a> Gate<'a> {
                     // A payload the gate cannot read is reported (R0) and
                     // leaves the variant without a field set to check.
                     let subject = format!("{path}[{}] payload", variant.name);
-                    let payload = variant.inner.as_deref().and_then(|inner| {
+                    let inner = variant.inner.as_deref();
+                    let payload = inner.and_then(|inner| {
                         self.local_def(&def.name, path, &subject, inner, &def.file)
                     });
                     match payload {
@@ -2442,7 +2584,10 @@ impl<'a> Gate<'a> {
                             own = &target.def.fields;
                             file = target.def.file.as_str();
                         }
-                        _ => checkable = false,
+                        _ => {
+                            checkable = false;
+                            catch_all = inner.is_some_and(decodes_any_object);
+                        }
                     }
                 }
                 VariantKind::Other => checkable = false,
@@ -2457,6 +2602,7 @@ impl<'a> Gate<'a> {
                     default_fn: None,
                     skip: false,
                     flatten: false,
+                    file: def.file.clone(),
                 });
             }
             shapes.push(Shape {
@@ -2465,6 +2611,7 @@ impl<'a> Gate<'a> {
                 own,
                 file: file.to_string(),
                 checkable,
+                catch_all,
             });
         }
         let props = props(node);
@@ -2500,11 +2647,11 @@ impl<'a> Gate<'a> {
                 let variant_path = format!("{path}.{}", shape.name);
                 self.check_shape(
                     &def.name,
-                    &shape.file,
                     &shape.fields,
                     sub,
                     &variant_path,
                     true,
+                    &BTreeSet::new(),
                 );
                 self.check_members(&def.name, shape.own, &shape.file, sub, path);
             }
@@ -2552,6 +2699,12 @@ impl<'a> Gate<'a> {
         // A node without `oneOf` branches is a merged view of every variant:
         // its keys were already checked against the union.
         let merged = branches.len() == 1 && std::ptr::eq(branches[0], node);
+        // The node's own `required` binds every branch it has.
+        let outer: BTreeSet<String> = if merged {
+            BTreeSet::new()
+        } else {
+            always_required(node)
+        };
         // Every discriminator the schema offers must name a variant serde
         // decodes, whatever its shape.
         if tag.is_some() {
@@ -2576,25 +2729,34 @@ impl<'a> Gate<'a> {
                 }
             }
         }
-        for shape in shapes.iter().filter(|shape| shape.checkable) {
-            let branch = match tag {
-                Some(tag) => branches
+        for shape in &shapes {
+            // Nothing is checked of a unit or tuple variant of an untagged
+            // enum: it has no keys.
+            if tag.is_none() && !shape.checkable {
+                continue;
+            }
+            // Every branch that selects the variant is checked. For a tagged
+            // enum that is each branch whose selector names it: a second,
+            // lenient one would let a configuration through that serde
+            // rejects. For an untagged enum it is each branch that documents
+            // all of its fields, or else the one that documents the most, so
+            // a field the schema left out is still reported.
+            let mut selecting: Vec<&Value> = branches
+                .iter()
+                .copied()
+                .filter(|branch| branch_matches(branch, tag, &shape.name, &shape.fields))
+                .collect();
+            if tag.is_none() && selecting.is_empty() {
+                if let Some(partial) = branches
                     .iter()
-                    .find(|branch| branch_matches(branch, Some(tag), &shape.name, &shape.fields)),
-                // Untagged: a branch that documents every field, else the one
-                // that documents the most, so a field the schema left out is
-                // still reported.
-                None => branches
-                    .iter()
-                    .find(|branch| branch_matches(branch, None, &shape.name, &shape.fields))
-                    .or_else(|| {
-                        branches
-                            .iter()
-                            .max_by_key(|branch| branch_overlap(branch, &shape.fields))
-                            .filter(|branch| branch_overlap(branch, &shape.fields) > 0)
-                    }),
-            };
-            let Some(branch) = branch else {
+                    .copied()
+                    .max_by_key(|branch| branch_overlap(branch, &shape.fields))
+                    .filter(|branch| branch_overlap(branch, &shape.fields) > 0)
+                {
+                    selecting.push(partial);
+                }
+            }
+            let Some(..) = selecting.first() else {
                 let how = if tag.is_some() {
                     format!("no `oneOf` entry selects it through `properties.{tag_name}`")
                 } else {
@@ -2611,21 +2773,42 @@ impl<'a> Gate<'a> {
                 continue;
             };
             let variant_path = format!("{path}[{}]", shape.name);
-            self.check_shape(
-                &def.name,
-                &shape.file,
-                &shape.fields,
-                branch,
-                &variant_path,
-                !merged,
-            );
-            self.check_members(&def.name, shape.own, &shape.file, branch, path);
+            for branch in selecting {
+                if !shape.checkable {
+                    // Only the tag is left to demand, and serde requires it
+                    // to select any variant — a unit one too.
+                    if !outer.contains(&tag_name) && !always_required(branch).contains(&tag_name) {
+                        self.problem(
+                            &def.name,
+                            &variant_path,
+                            format!(
+                                "R4 serde requires `{tag_name}` to select `{}`, but a schema branch \
+                                 that selects it does not demand it — add `{tag_name}` to that \
+                                 branch's `required`",
+                                shape.name
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                self.check_shape(
+                    &def.name,
+                    &shape.fields,
+                    branch,
+                    &variant_path,
+                    !merged,
+                    &outer,
+                );
+                self.check_members(&def.name, shape.own, &shape.file, branch, path);
+            }
         }
         // Untagged, with real branches: a branch that demands less than any
-        // variant requires admits objects serde rejects.
-        if tag.is_none() && !merged {
+        // variant requires admits objects serde rejects. While a variant
+        // decodes any object, no branch is too lenient.
+        if tag.is_none() && !merged && !shapes.iter().any(|shape| shape.catch_all) {
             for (position, branch) in branches.iter().enumerate() {
-                let demanded = always_required(branch);
+                let demanded: BTreeSet<String> =
+                    outer.union(&always_required(branch)).cloned().collect();
                 let decodable = shapes.iter().filter(|shape| shape.checkable).any(|shape| {
                     shape
                         .fields
@@ -2644,8 +2827,8 @@ impl<'a> Gate<'a> {
                         &def.name,
                         path,
                         format!(
-                            "R4 schema branch {} demands {demands}: no variant of `{}` requires just \
-                             those keys, so the schema accepts objects serde rejects",
+                            "R4 schema branch {} demands {demands}: no variant of `{}` \
+                             requires just those keys, so the schema accepts objects serde rejects",
                             position + 1,
                             def.name
                         ),
@@ -2763,29 +2946,87 @@ fn builder_block(source: &[char], kind: &str, name: &str) -> Option<String> {
 
 /// Whether a builder body deserializes `config`: a `let` binding typed as
 /// it (`let config: Config = …`) or a turbofish (`from_value::<Config>(…)`).
-/// String and character literals are blanked first, so a diagnostic that
-/// merely mentions the type does not count.
+/// The bound name, the colon, the type, and the `=` are matched as tokens,
+/// so the whitespace between them does not matter. String and character
+/// literals are blanked first, so a diagnostic that merely mentions the
+/// type does not count.
 fn reads_config(body: &[char], config: &str) -> bool {
-    let text: String = blank_literals(body).iter().collect();
-    if text.contains(&format!("::<{config}>(")) {
-        return true;
-    }
-    let needle = format!(": {config} =");
-    let mut from = 0;
-    while let Some(found) = text[from..].find(&needle) {
-        let at = from + found;
-        // The statement starts after the previous `;`, `{`, or `}`.
-        let start = text[..at]
-            .rfind([';', '{', '}'])
-            .map_or(0, |index| index + 1);
-        let statement = text[start..at].trim_start();
-        if statement
-            .strip_prefix("let")
-            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-        {
-            return true;
+    let s = blank_literals(body);
+    let len = config.chars().count();
+    // Index just before the whitespace that precedes `at`.
+    let back = |mut at: usize| {
+        while at > 0 && s[at - 1].is_whitespace() {
+            at -= 1;
         }
-        from = at + 1;
+        at
+    };
+    // The word that ends just before `at`, and where it starts.
+    let word_before = |at: usize| -> Option<(Vec<char>, usize)> {
+        let end = back(at);
+        let start = (0..end)
+            .rev()
+            .take_while(|&k| is_ident_continue(s[k]))
+            .last()?;
+        is_ident_start(s[start]).then(|| (s[start..end].to_vec(), start))
+    };
+    let word_at_start = |at: usize, word: &[char]| s.get(at..at + word.len()) == Some(word);
+
+    let mut i = 0;
+    while i < s.len() {
+        let names_it = is_ident_start(s[i])
+            && (i == 0 || !is_ident_continue(s[i - 1]))
+            && word_at(&s, i, config)
+            && !s.get(i + len).is_some_and(|c| is_ident_continue(*c));
+        if names_it {
+            // What follows: the `=` of a binding, or `>(` closing a turbofish.
+            let after = skip_ws(&s, i + len);
+            let initializer =
+                s.get(after) == Some(&'=') && !matches!(s.get(after + 1), Some('=') | Some('>'));
+            let turbofish_close =
+                s.get(after) == Some(&'>') && s.get(skip_ws(&s, after + 1)) == Some(&'(');
+            // What precedes: `<` and `::` for a turbofish; for a binding a
+            // type annotation (`:`, not a path separator) over the `module::`
+            // prefixes, then the bound name and a `let` that starts the
+            // statement.
+            let mut before = back(i);
+            let turbofish = s.get(before.wrapping_sub(1)) == Some(&'<') && {
+                before = back(before - 1);
+                before >= 2 && s[before - 2..before] == [':', ':']
+            };
+            let mut binding = false;
+            if !turbofish {
+                while before >= 2 && s[before - 2..before] == [':', ':'] {
+                    match word_before(before - 2) {
+                        Some((_, earlier)) => before = earlier,
+                        None => break,
+                    }
+                }
+                let annotated = back(before);
+                if s.get(annotated.wrapping_sub(1)) == Some(&':') {
+                    if let Some((_, name_start)) = word_before(annotated - 1) {
+                        // `let mut config: …`
+                        let statement = match word_before(name_start) {
+                            Some((word, earlier)) if word == ['m', 'u', 't'] => earlier,
+                            _ => name_start,
+                        };
+                        // `let` opens the statement: before it is the
+                        // start, `;`, `{`, or `}` — not `if` or `while`.
+                        let keyword_end = back(statement);
+                        let keyword_start = keyword_end.saturating_sub(3);
+                        binding =
+                            keyword_end >= 3 && word_at_start(keyword_start, &['l', 'e', 't']) && {
+                                let before_keyword = back(keyword_start);
+                                before_keyword == 0
+                                    || matches!(s[before_keyword - 1], ';' | '{' | '}')
+                            };
+                    }
+                }
+            }
+            if (binding && initializer) || (turbofish && turbofish_close) {
+                return true;
+            }
+        }
+        i += 1;
     }
     false
 }
@@ -2849,32 +3090,64 @@ fn build_component(kind: &str, name: &str, config: serde_json::Value) -> Result<
 }
 
 /// Probes the claim behind a `BUILDER_REQUIRED` entry: the component's
-/// builder must refuse a config that omits the exempt key. `Err` explains
-/// why the claim does not hold.
+/// builder must refuse a config that omits the exempt key, and only that.
+/// The example itself has to build first — an error it already carries must
+/// not pass for the key's omission — and the refusal has to name the key.
+/// `Err` explains why the claim does not hold.
 fn builder_enforces(
     component: &str,
     meta: &ComponentMetadata,
     field: &str,
 ) -> Result<String, String> {
-    let Some(mut example) = meta.config_example.clone() else {
+    let Some(intact) = meta.config_example.clone() else {
         return Err("the component has no `config_example` to probe its builder with".to_string());
     };
-    let Some(map) = example.as_object_mut() else {
-        return Err("`config_example` is not an object".to_string());
-    };
-    if map.remove(field).is_none() {
-        return Err(format!(
-            "`config_example` does not set `{field}`, so the probe cannot take it away"
-        ));
+    let mut example = intact.clone();
+    match example.as_object_mut() {
+        None => return Err("`config_example` is not an object".to_string()),
+        Some(object) if !object.contains_key(field) => {
+            return Err(format!(
+                "`config_example` does not set `{field}`, so the probe cannot take it away"
+            ));
+        }
+        Some(object) => {
+            object.remove(field);
+        }
     }
     let (kind, name) = component.split_once('/').unwrap_or(("", component));
-    match build_component(kind, name, example) {
+    judged_probe(
+        field,
+        build_component(kind, name, intact),
+        build_component(kind, name, example),
+    )
+}
+
+/// What the two builds of the probe show. `intact` has to succeed: an error
+/// the example already carries says nothing about the key. Without the key
+/// the builder has to refuse, and naming the key — any other refusal is not
+/// evidence that the key is what it wants.
+fn judged_probe(
+    field: &str,
+    intact: Result<(), String>,
+    without: Result<(), String>,
+) -> Result<String, String> {
+    if let Err(error) = intact {
+        return Err(format!(
+            "the builder rejects the intact `config_example` as well ({error}), so nothing shows \
+             that the key's omission is what it refuses — fix the example or the builder"
+        ));
+    }
+    match without {
         Ok(()) => Err(format!(
             "the builder accepts a config without `{field}` (probed with `config_example` minus \
              the key), so nothing makes the key required — drop it from the schema's `required` \
              or make the builder reject it"
         )),
-        Err(error) => Ok(error),
+        Err(error) if error.contains(field) => Ok(error),
+        Err(error) => Err(format!(
+            "the builder refuses a config without `{field}` for a reason that does not name it \
+             ({error})"
+        )),
     }
 }
 
@@ -2998,9 +3271,11 @@ fn run_gate() -> (Vec<String>, ExemptionUsage) {
 }
 
 const RULES: &str = "rules: R0 a referenced type cannot be read or is ambiguous · R1 struct \
-                     field missing from a strict schema · R2 schema key the struct never reads \
+                     field missing from a strict schema, or demanded by the enclosing schema of a \
+                     branch whose variant never reads it · R2 schema key the struct never reads \
                      · R3 schema-required but serde-optional, or required key nothing reads · \
-                     R4 serde-required but not demanded by every schema branch · R5 advertised \
+                     R4 serde-required but not demanded by every schema branch, or a tag a \
+                     branch does not demand · R5 advertised \
                      default serde never applies, or whose value differs · R6 string enum or \
                      tag value that is not a decodable variant.\n \
                      Exemptions are explicit and verified: HIDDEN_FIELDS (R1/R4), \
@@ -3020,15 +3295,6 @@ fn registered_schemas_match_config_structs() {
 #[test]
 fn exemptions_stay_accurate() {
     let (mut problems, usage) = run_gate();
-    // "No mismatch" has to mean "compared": the real registry advertises a
-    // dozen defaults whose value the gate can read, most of them supplied by
-    // a function.
-    assert!(
-        usage.defaults_compared >= 12 && usage.function_defaults_compared >= 8,
-        "only {} advertised defaults were compared ({} of them function-backed)",
-        usage.defaults_compared,
-        usage.function_defaults_compared
-    );
     let key = |component: &str, owner: &str, field: &str| {
         (component.to_string(), owner.to_string(), field.to_string())
     };
@@ -3173,6 +3439,15 @@ struct Tuple(String);
 
 struct Unit;
 "##;
+
+    const ENDPOINT: &str = r#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Endpoint {
+    Tcp { host: String, port: u16 },
+    Unix { host: String, path: String },
+}
+"#;
 
     fn demo_index() -> Index {
         Index::from_sources(&[("input/demo.rs".to_string(), DEMO.to_string())])
@@ -4288,6 +4563,23 @@ impl Default for Custom {
     }
 }
 
+// A default of the field's own comes before the derived container default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct DerivedWithFunction {
+    plain: bool,
+    #[serde(default = "default_on")]
+    flag: bool,
+}
+
+// A newtype variant whose payload decodes any object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Loose {
+    Raw(serde_json::Value),
+    File { path: String },
+}
+
 struct Child {
     nonce: [u8; {16}],
 }
@@ -4347,6 +4639,56 @@ struct Parent {
         // … a hand-written one is whatever its `Default` returns: not compared.
         assert!(problems(&index, "Custom", &advertised).is_empty());
 
+        // A default of the field's own wins over the derived container's.
+        let both = json!({"type": "object", "properties": {
+            "plain": {"default": false}, "flag": {"default": true}}});
+        assert!(problems(&index, "DerivedWithFunction", &both).is_empty());
+        let mut wrong = both.clone();
+        wrong["properties"]["flag"]["default"] = json!(false);
+        let found = problems(&index, "DerivedWithFunction", &wrong);
+        assert!(
+            reported(
+                &found,
+                "R5 the schema advertises `default: false` for `flag`, but `default_on` returns \
+                 true"
+            ),
+            "{found:?}"
+        );
+
+        // A comparison is counted where it happens — in this fixture, not
+        // by a number the live registry has to keep.
+        let usage = std::cell::RefCell::new(ExemptionUsage::default());
+        let seen = |config: &str, schema: &Value| {
+            let def = index
+                .get("input/demo.rs", config)
+                .unwrap_or_else(|| panic!("`{config}` is parsed"));
+            let mut gate = Gate {
+                index: &index,
+                component: "input/demo",
+                hidden: HIDDEN_FIELDS,
+                builder_required: BUILDER_REQUIRED,
+                usage: Some(&usage),
+                problems: Vec::new(),
+            };
+            gate.check_def(def, schema, config);
+            gate.problems
+        };
+        assert!(seen("Defaults", &conforming).is_empty());
+        assert_eq!(
+            (
+                usage.borrow().defaults_compared,
+                usage.borrow().function_defaults_compared
+            ),
+            (3, 3),
+            "`cpus` is not a literal: checked to be omittable, not compared"
+        );
+        assert!(!seen("Derived", &advertised).is_empty());
+        assert_eq!(
+            usage.borrow().defaults_compared,
+            4,
+            "a mismatch is a comparison too"
+        );
+
         // The expressions a default function is written with.
         for (expr, value) in [
             ("3", json!(3)),
@@ -4362,6 +4704,12 @@ struct Parent {
             ("Some(true)", json!(true)),
             ("None", Value::Null),
             (" 4 ", json!(4)),
+            // Escape sequences are decoded to the text they denote.
+            ("\"\\n\"", json!("\n")),
+            ("\"a\\\\b\"", json!("a\\b")),
+            ("\"\\t\\r\\0\"", json!("\t\r\0")),
+            ("\"\\x41\\u{42}\".to_string()", json!("AB")),
+            ("\"line \\\n       continued\"", json!("line continued")),
         ] {
             assert_eq!(literal_value(expr), Some(value), "{expr}");
         }
@@ -4372,6 +4720,11 @@ struct Parent {
             "{ 1; 2 }",
             "",
             "\"x\".trim()",
+            // A literal whose text cannot be decoded stays unverified.
+            "\"\\q\"",
+            "\"\\u{110000}\"",
+            "\"\\u{4_1}\"",
+            "r#\"x\"#",
         ] {
             assert_eq!(literal_value(expr), None, "{expr}");
         }
@@ -4497,11 +4850,39 @@ struct Parent {
             );
             gate.problems
         };
-        let off = json!({"properties": {"type": {"const": "off"}}});
+        let off = json!({"properties": {"type": {"const": "off"}}, "required": ["type"]});
         let file = json!({"properties": {"type": {"const": "file"}, "path": {"type": "string"}},
                           "required": ["type", "path"]});
         // A unit variant's value is a valid discriminator.
         assert!(check(json!({"oneOf": [off.clone(), file.clone()]})).is_empty());
+
+        // The tag is what serde selects by, so every branch that offers a
+        // variant has to demand it: `{}` matches a branch that does not, and
+        // serde rejects `{}` before it selects anything. A unit variant is
+        // no exception.
+        let found =
+            check(json!({"oneOf": [{"properties": {"type": {"const": "off"}}}, file.clone()]}));
+        assert!(
+            reported(
+                &found,
+                "R4 serde requires `type` to select `off`, but a schema branch that selects it \
+                 does not demand it — add `type` to that branch's `required`"
+            ),
+            "{found:?}"
+        );
+        // The node's own `required` demands the tag of every branch.
+        let found = check(json!({"required": ["type"],
+                                 "oneOf": [{"properties": {"type": {"const": "off"}}}, file.clone()]}));
+        assert!(found.is_empty(), "{found:?}");
+        // A variant no branch offers cannot be written.
+        let found = check(json!({"oneOf": [file.clone()]}));
+        assert!(
+            reported(
+                &found,
+                "R1 variant `off` has no schema branch that describes it"
+            ),
+            "{found:?}"
+        );
 
         let found = check(
             json!({"oneOf": [off, file, {"properties": {"type": {"const": "bogus"}}, "required": ["type"]}]}),
@@ -4632,6 +5013,24 @@ struct Parent {
             &body("let c: OldConfigExtra = x;"),
             "OldConfig"
         ));
+        // The tokens are matched whatever whitespace separates them, and
+        // through the module path of the type.
+        for text in [
+            "let config:OldConfig=parse_config(None)?;",
+            "let  mut  config\n    :\n    OldConfig\n    = next();",
+            "let config: crate::input::demo::OldConfig = x;",
+            "let c = serde_json::from_value::< OldConfig >(value)?;",
+        ] {
+            assert!(reads_config(&body(text), "OldConfig"), "{text}");
+        }
+        for text in [
+            "if let c: OldConfig = x {}",
+            "let c = OldConfig::default();",
+            "let c = HashMap<String, OldConfig>::new();",
+            "let c = parse::<OldConfig, Error>(x);",
+        ] {
+            assert!(!reads_config(&body(text), "OldConfig"), "{text}");
+        }
     }
 
     #[test]
@@ -4651,6 +5050,278 @@ struct Parent {
         // A key the example does not set cannot be probed.
         let why = builder_enforces("output/milvus", milvus, "headers").unwrap_err();
         assert!(why.contains("does not set `headers`"), "{why}");
+
+        // An example the builder already rejects proves nothing: without a
+        // `collection` it refuses before it looks at `id_field`.
+        let mut rejected = (**milvus).clone();
+        rejected.config_example.as_mut().unwrap()["collection"] = json!("");
+        let why = builder_enforces("output/milvus", &rejected, "id_field").unwrap_err();
+        assert!(
+            why.contains("rejects the intact `config_example` as well")
+                && why.contains("'collection' must not be empty"),
+            "{why}"
+        );
+        // Neither does a component that is not built at all.
+        let why = builder_enforces("temporary/milvus", milvus, "id_field").unwrap_err();
+        assert!(why.contains("rejects the intact `config_example`"), "{why}");
+
+        // A refusal that does not name the key is not about the key.
+        let why = judged_probe(
+            "id_field",
+            Ok(()),
+            Err("milvus output: 'collection' must not be empty".to_string()),
+        )
+        .unwrap_err();
+        assert!(why.contains("for a reason that does not name it"), "{why}");
+    }
+
+    // ---- fourth review round --------------------------------------------------
+
+    #[test]
+    fn a_default_function_is_found_through_its_path_and_its_own_file() {
+        let index = Index::from_sources(&[
+            (
+                "input/demo.rs".to_string(),
+                r#"
+struct Qualified {
+    #[serde(default = "crate::input::shared::count")]
+    a: u8,
+    #[serde(default = "super::shared::count")]
+    b: u8,
+    #[serde(default = "crate::missing::count")]
+    c: u8,
+    #[serde(default = "count")]
+    d: u8,
+    #[serde(default = "Config::count")]
+    e: u8,
+}
+fn count() -> u8 {
+    3
+}
+struct Parent {
+    #[serde(flatten)]
+    child: super::shared::Child,
+}
+"#
+                .to_string(),
+            ),
+            (
+                "input/shared.rs".to_string(),
+                r#"
+pub fn count() -> u8 {
+    4
+}
+pub struct Child {
+    #[serde(default = "count")]
+    n: u8,
+}
+"#
+                .to_string(),
+            ),
+        ]);
+        // A path rooted in a module is the function that module declares.
+        let value = |function: &str| index.default_fn_value(function, "input/demo.rs");
+        assert_eq!(value("crate::input::shared::count"), Some(json!(4)));
+        assert_eq!(value("super::shared::count"), Some(json!(4)));
+        // A bare name is the file's own function.
+        assert_eq!(value("count"), Some(json!(3)));
+        assert_eq!(
+            index.default_fn_value("count", "input/shared.rs"),
+            Some(json!(4))
+        );
+        // A path that leads nowhere names nothing: the same-file `count`
+        // does not stand in for it.
+        assert_eq!(value("crate::missing::count"), None);
+        // A type's associated function is followed by its name.
+        assert_eq!(value("Config::count"), Some(json!(3)));
+
+        // A flattened field keeps the file its default function lives in:
+        // `Parent`'s file has a `count` of its own, and it is not the one.
+        let advertised = json!({"type": "object", "properties": {"n": {"default": 4}}});
+        assert!(problems(&index, "Parent", &advertised).is_empty());
+        let mut wrong = advertised;
+        wrong["properties"]["n"]["default"] = json!(3);
+        let found = problems(&index, "Parent", &wrong);
+        assert!(
+            reported(
+                &found,
+                "R5 the schema advertises `default: 3` for `n`, but `count` returns 4"
+            ),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn every_branch_that_selects_a_variant_is_checked() {
+        let index = demo_index();
+        let check = |schema: Value| {
+            let mut gate = Gate::new(&index, "input/demo");
+            gate.check_def(index.get("input/demo.rs", "Mode").unwrap(), &schema, "Mode");
+            gate.problems
+        };
+        let cluster = json!({"properties": {"type": {"const": "cluster"},
+                                            "urls": {"type": "array"}},
+                             "required": ["type", "urls"]});
+        let single = json!({"properties": {"type": {"const": "single"},
+                                           "url": {"type": "string"},
+                                           "insecure": {"type": "boolean", "default": false}},
+                            "required": ["type", "url"]});
+        assert!(check(json!({"anyOf": [cluster.clone(), single.clone()]})).is_empty());
+
+        // A second branch that selects `single` but demands only the tag
+        // lets a configuration without `url` through the schema.
+        let lenient = json!({"properties": {"type": {"const": "single"}}, "required": ["type"]});
+        let found = check(json!({"anyOf": [cluster.clone(), single.clone(), lenient.clone()]}));
+        assert!(
+            reported(&found, "[Mode] Mode[single]: R4 serde requires `url`"),
+            "{found:?}"
+        );
+        // So does one that advertises another default for a field of the
+        // variant.
+        let mut other_default = single.clone();
+        other_default["properties"]["insecure"]["default"] = json!(true);
+        let found = check(json!({"anyOf": [cluster, single, other_default, lenient]}));
+        assert!(
+            reported(
+                &found,
+                "R5 the schema advertises `default: true` for `insecure`, but `#[serde(default)]` \
+                 yields false"
+            ),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_requirement_of_the_enclosing_schema_reaches_every_branch() {
+        let index =
+            Index::from_sources(&[("input/demo.rs".to_string(), format!("{DEMO}{ENDPOINT}"))]);
+        let check = |config: &str, schema: Value| {
+            let mut gate = Gate::new(&index, "input/demo");
+            gate.check_def(index.get("input/demo.rs", config).unwrap(), &schema, config);
+            gate.problems
+        };
+        let port = json!({"properties": {"port": {"type": "integer"}}, "required": ["port"]});
+        let path = json!({"properties": {"path": {"type": "string"}}, "required": ["path"]});
+        // `host` is demanded by the node itself, so of both variants.
+        let enclosing = json!({"properties": {"host": {"type": "string"}}, "required": ["host"],
+                               "anyOf": [port.clone(), path.clone()]});
+        let found = check("Endpoint", enclosing.clone());
+        assert!(found.is_empty(), "{found:?}");
+
+        // Once the node stops demanding it, a branch that leaves it out
+        // lets a configuration without `host` through.
+        let mut loose = enclosing;
+        loose["required"] = json!([]);
+        let found = check("Endpoint", loose);
+        assert!(
+            reported(&found, "[Endpoint] Endpoint[Tcp]: R4 serde requires `host`"),
+            "{found:?}"
+        );
+        assert!(
+            reported(&found, "R4 schema branch 1 demands only `port`"),
+            "{found:?}"
+        );
+
+        // A key only one variant reads cannot be demanded of every branch:
+        // the other variant's configurations would be rejected.
+        let file = json!({"properties": {"path": {"type": "string"}}, "required": ["path"]});
+        let found = check(
+            "Untagged",
+            json!({"required": ["format"], "anyOf": [file, port.clone()]}),
+        );
+        assert!(
+            !reported(&found, "Untagged[File]: R4 serde requires `format`"),
+            "the branch inherits the enclosing demand: {found:?}"
+        );
+        assert!(
+            reported(
+                &found,
+                "[Untagged] Untagged[Socket]: R1 the enclosing schema requires `format`, which \
+                 this variant never reads"
+            ),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_merged_view_still_checks_each_variant_against_the_union() {
+        let index = demo_index();
+        let mut gate = Gate::new(&index, "input/demo");
+        gate.check_def(
+            index.get("input/demo.rs", "Mode").unwrap(),
+            &json!({"type": "object", "properties": {
+                "type": {"enum": ["cluster", "single"]},
+                "urls": {"type": "array"}, "url": {"type": "string"},
+                "insecure": {"type": "boolean", "default": false}},
+                "required": ["type"]}),
+            "Mode",
+        );
+        // A key of another variant is not a ghost here — the merged view
+        // documents every variant — while a key the shared `required` leaves
+        // out is still reported for the variant that needs it.
+        assert!(
+            !reported(&gate.problems, "R2"),
+            "no ghost on a merged view: {:?}",
+            gate.problems
+        );
+        assert!(
+            reported(
+                &gate.problems,
+                "[Mode] Mode[cluster]: R4 serde requires `urls` but the schema does not list it"
+            ),
+            "{:?}",
+            gate.problems
+        );
+        assert!(
+            reported(
+                &gate.problems,
+                "[Mode] Mode[single]: R4 serde requires `url` but the schema does not list it"
+            ),
+            "{:?}",
+            gate.problems
+        );
+        // With the keys demanded, nothing is left to report.
+        let mut gate = Gate::new(&index, "input/demo");
+        gate.check_def(
+            index.get("input/demo.rs", "Mode").unwrap(),
+            &json!({"type": "object", "properties": {
+                "type": {"enum": ["cluster", "single"]},
+                "urls": {"type": "array"}, "url": {"type": "string"},
+                "insecure": {"type": "boolean", "default": false}},
+                "required": ["type", "urls", "url"]}),
+            "Mode",
+        );
+        assert!(gate.problems.is_empty(), "{:?}", gate.problems);
+    }
+
+    #[test]
+    fn a_variant_that_decodes_any_object_excuses_every_branch() {
+        let index =
+            Index::from_sources(&[("input/demo.rs".to_string(), format!("{DEMO}{}", DEFAULTS))]);
+        let check = |schema: Value| {
+            let mut gate = Gate::new(&index, "input/demo");
+            gate.check_def(
+                index.get("input/demo.rs", "Loose").unwrap(),
+                &schema,
+                "Loose",
+            );
+            gate.problems
+        };
+        let file = json!({"properties": {"path": {"type": "string"}}, "required": ["path"]});
+        // `Raw` decodes any object, so the schema may accept anything too.
+        assert!(check(json!({"anyOf": [file.clone(), {}]})).is_empty());
+        // Without such a variant an empty branch admits what serde rejects.
+        let mut gate = Gate::new(&index, "input/demo");
+        gate.check_def(
+            index.get("input/demo.rs", "Untagged").unwrap(),
+            &json!({"anyOf": [file, {}]}),
+            "Untagged",
+        );
+        assert!(
+            reported(&gate.problems, "R4 schema branch 2 demands nothing"),
+            "{:?}",
+            gate.problems
+        );
     }
 
     #[test]

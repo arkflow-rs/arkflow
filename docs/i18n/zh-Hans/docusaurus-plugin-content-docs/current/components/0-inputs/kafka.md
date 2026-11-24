@@ -16,7 +16,7 @@ Kafka 输入(Input)使用消费者组(consumer group)从一个或多个 Apache K
 | topics | array&lt;string&gt; | yes | — | 要订阅的主题列表 |
 | consumer_group | string | yes | — | 消费者组 ID,用于偏移量协调与负载均衡 |
 | client_id | string | no | — | 客户端 ID,用于监控和日志 |
-| start_from_latest | boolean | no | `false` | 为该消费组设置 `auto.offset.reset=latest`。在分区**没有已提交位点**(首次运行)或**已提交位点已超出保留范围**(broker 的保留策略已删除对应数据)时生效:消费者从最新消息开始,而不是从最早开始。其他情况下,输入以单个消费者订阅时,已提交的组位点优先,因此已有组的重启无论此标志如何都会从上次位置继续。在显式分区指派(多个 source task)下,没有检查点位置的分区从最早位点开始,开启本标志则从最新开始。省略该字段即视为 `false`:需要重置时,消费者从最早可用位点开始。 |
+| start_from_latest | boolean | no | `false` | 为 `true` 时为该消费组设置 `auto.offset.reset=latest`。分区没有已提交位点(首次运行),或已提交位点超出日志范围(数据因保留策略被清除,或日志被截断、topic 被重建)时触发重置:消费者从分区**末尾**开始,分区中已有的消息被跳过,只读取此后到达的消息。已提交位点不会被忽略:输入以单个消费者订阅时,已提交的组位点优先,因此已有组的重启无论此标志如何都会从上次位置继续。在显式分区指派(多个 source task)下,没有检查点位置的分区从最早位点开始,开启本标志则从末尾开始。省略该字段即视为 `false`:需要重置时,消费者从最早可用位点开始。 |
 | fetch_min_bytes | integer | no | — | broker 响应一次拉取请求所需的最小字节数。默认(`1`)对延迟友好:broker 一有数据立即返回。调大则让 broker 等数据凑量(最多等 `fetch_wait_max_ms`)——吞吐杠杆,但安静时段会给首条消息引入取数等待。 |
 | fetch_max_bytes | integer | no | — | 单次拉取请求返回的最大字节数 |
 | fetch_max_partition_bytes | integer | no | — | 单次拉取中每个分区返回的最大字节数 |

@@ -1585,7 +1585,7 @@ pub fn init() -> Result<(), Error> {
                 "topics": {"type": "array", "items": {"type": "string"}, "description": "Topics to subscribe to."},
                 "consumer_group": {"type": "string", "description": "Consumer group ID for offset coordination."},
                 "client_id": {"type": "string", "description": "Optional client identifier."},
-                "start_from_latest": {"type": "boolean", "default": false, "description": "When true, ignore committed offsets and start from the latest message."},
+                "start_from_latest": {"type": "boolean", "default": false, "description": "When true, the offset reset goes to the end of the partition: a partition without a committed offset (first run, or one out of range) starts at its newest position and skips the records already there. Committed group offsets are not ignored — a restart resumes where the group left off."},
                 "fetch_min_bytes": {"type": "integer", "minimum": 0, "description": "Minimum bytes before the broker responds to a fetch request."},
                 "fetch_max_bytes": {"type": "integer", "minimum": 0, "description": "Maximum bytes for a fetch request."},
                 "fetch_max_partition_bytes": {"type": "integer", "minimum": 0, "description": "Maximum bytes per partition in a fetch request."},

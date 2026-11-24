@@ -283,12 +283,16 @@ aligned to it, two of which change runtime behavior:
   stale; every component with a schema must be mapped, and the two exemption
   lists (`HIDDEN_FIELDS`, `BUILDER_REQUIRED`) fail the gate once an entry is
   no longer needed, and a `BUILDER_REQUIRED` entry is probed through the
-  real builder (it must refuse a config without the key). Generic field
+  real builder (the example itself must build, and the builder must refuse a
+  config without the key, naming it). Generic field
   types such as `Expr<String>` are resolved by name, so tagged-expression
   properties are checked too. An advertised default is compared with the
   value serde produces (the type's zero, or the literal the default
-  function returns); a key demanded by only some `anyOf`/`oneOf` branches
-  does not count as required; a tag value that is not a decodable variant,
+  function returns — a default of the field's own before the container's,
+  and the function is found through its path); a key demanded by only some
+  `anyOf`/`oneOf` branches does not count as required, a key the enclosing
+  node demands does; every branch that selects a variant is checked, and
+  each has to demand the tag; a tag value that is not a decodable variant,
   an untagged branch that demands less than any variant, a flattened type
   the gate cannot read, and a mapped component with an opaque root schema
   are all reported. serde's `rename_all` conversions — different for fields
@@ -305,8 +309,11 @@ committed inventory now match what serde accepts:
 - `kafka` input: `transactional_offsets` is in the schema (the IDE no longer
   rejects it), and omitting `start_from_latest` now means `false` — the
   default the schema always advertised — instead of failing with a
-  missing-field error. A config that relies on this fails to build again on
-  the previous version: add `start_from_latest: false` before rolling back.
+  missing-field error. Its description no longer says the flag makes
+  committed offsets ignored: it only sets the offset reset policy, and
+  committed group offsets still win on restart. A config that relies on the
+  default fails to build again on the previous version: add
+  `start_from_latest: false` before rolling back.
 - `pulsar` input and output: the `tls` block (`certificate_chain_file`,
   `hostname_verification`) is in the schema, and `certificate_chain_file` is
   described as what the driver does with it — the chain the broker
