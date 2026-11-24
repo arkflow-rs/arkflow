@@ -1306,9 +1306,12 @@ fn unescape(text: &str) -> Option<String> {
                 i = end;
             }
             // A backslash before a newline continues the line: the newline
-            // and the next line's indentation are not part of the text.
+            // and the next line's ASCII indentation are not part of the text.
+            // Other whitespace — a non-breaking space — stays.
             Some('\n') | Some('\r') => {
-                i = skip_ws(&chars, i + 1);
+                while matches!(chars.get(i), Some(' ' | '\t' | '\n' | '\r' | '\u{c}')) {
+                    i += 1;
+                }
                 continue;
             }
             _ => return None,
@@ -1714,7 +1717,9 @@ impl Index {
     /// declares and nothing else; a bare name is a function of that file,
     /// then one the file imports under that name, then one declared only
     /// once in the crate. Whatever cannot be found that way stays
-    /// unverified.
+    /// unverified — a type's associated function (`Config::count`) among
+    /// it: it would have to be found through its owner, and a free function
+    /// of the same name must not stand in for it.
     fn default_fn_value(&self, path: &str, from_file: &str) -> Option<Value> {
         let (qualifiers, name) = path.rsplit_once("::").unwrap_or(("", path));
         let declared_in = |file: &str| {
@@ -1731,11 +1736,10 @@ impl Index {
         if rooted {
             return declared_in(&self.path_file(path, from_file)?);
         }
-        let local = declared_in(from_file);
         if !qualifiers.is_empty() {
-            // A type's associated function: only its name is followed.
-            return local.or_else(|| self.unique_fn_value(name));
+            return None;
         }
+        let local = declared_in(from_file);
         local
             .or_else(|| {
                 let (_, imported) = self
@@ -1956,22 +1960,23 @@ fn direct_branches(node: &Value) -> Vec<&Value> {
     vec![node]
 }
 
-/// Whether a branch describes an enum variant: by the tag's `const` (or
-/// membership in the tag's `enum`) for tagged enums, otherwise by containing
-/// every field of the variant.
-fn branch_matches(branch: &Value, tag: Option<&str>, variant: &str, fields: &[Field]) -> bool {
+/// Whether a branch of an untagged enum describes a variant: it documents
+/// every field of it.
+fn documents_every_field(branch: &Value, fields: &[Field]) -> bool {
     let Some(entries) = branch.get("properties").and_then(Value::as_object) else {
         return false;
     };
-    if let Some(discriminator) = tag.and_then(|tag| entries.get(tag)) {
-        if let Some(value) = discriminator.get("const").and_then(Value::as_str) {
-            return value == variant;
-        }
-        if let Some(values) = discriminator.get("enum").and_then(Value::as_array) {
-            return values.iter().any(|value| value.as_str() == Some(variant));
-        }
-    }
     fields.iter().all(|field| entries.contains_key(&field.name))
+}
+
+/// The keyword holding a node's direct `oneOf`/`anyOf` branches, when it has
+/// any — the same ones `direct_branches` returns.
+fn branch_keyword(node: &Value) -> Option<&'static str> {
+    ["oneOf", "anyOf"].into_iter().find(|key| {
+        node.get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|branches| !branches.is_empty())
+    })
 }
 
 /// Whether a node says anything about the keys it accepts: documented
@@ -1979,6 +1984,22 @@ fn branch_matches(branch: &Value, tag: Option<&str>, variant: &str, fields: &[Fi
 /// it does not list, even when it lists none.
 fn is_documented(node: &Value) -> bool {
     has_docs(node) || is_strict(node)
+}
+
+/// What the node enclosing a `oneOf`/`anyOf` branch applies to the branch.
+#[derive(Default)]
+struct Outer<'a> {
+    /// The keys the node demands of every configuration.
+    demanded: BTreeSet<String>,
+    /// The node itself: a default, or a nested property, it documents for a
+    /// key counts for a branch that does not document the key.
+    node: Option<&'a Value>,
+}
+
+/// The subschema documented for `name` in `node` or, when `node` is a
+/// branch that does not document the key, in the node enclosing it.
+fn documented<'a>(node: &'a Value, enclosing: Option<&'a Value>, name: &str) -> Option<&'a Value> {
+    find_prop(node, name).or_else(|| enclosing?.get("properties")?.get(name))
 }
 
 /// The `default` a node advertises for `name`, from whichever schema mentions
@@ -2058,13 +2079,27 @@ fn always_required(node: &Value) -> BTreeSet<String> {
     demanded
 }
 
-/// Whether a newtype variant's payload stands for any object — a JSON
-/// `Value` or a map — so that no object schema is too lenient for it.
+/// Whether a newtype variant's payload stands for any object whatever, so
+/// that no object schema is too lenient for it: a JSON `Value`, or a map of
+/// strings to one. A map with narrower values (`BTreeMap<String, String>`)
+/// does not: it rejects an object holding a number.
 fn decodes_any_object(ty: &str) -> bool {
-    let base = ty.split('<').next().unwrap_or(ty);
+    fn last_segment(part: &str) -> &str {
+        part.rsplit("::").next().unwrap_or(part).trim()
+    }
+
+    let Some((base, args)) = ty.split_once('<') else {
+        return last_segment(ty) == "Value";
+    };
+    let mut args = args.trim_end_matches('>').split(',').map(last_segment);
     matches!(
-        base.rsplit("::").next(),
-        Some("Value" | "HashMap" | "BTreeMap" | "Map" | "IndexMap")
+        (last_segment(base), args.next(), args.next(), args.next()),
+        (
+            "HashMap" | "BTreeMap" | "Map" | "IndexMap",
+            Some("String"),
+            Some("Value"),
+            None
+        )
     )
 }
 
@@ -2261,14 +2296,17 @@ impl<'a> Gate<'a> {
         match def.kind {
             DefKind::Struct => {
                 let fields = self.shape_fields(&def.name, path, &def.fields, &def.file, 0);
-                self.check_shape(&def.name, &fields, node, path, true, &BTreeSet::new());
-                self.check_members(&def.name, &def.fields, &def.file, node, path);
+                let none = Outer::default();
+                self.check_shape(&def.name, &fields, node, path, true, &none);
+                self.check_members(&def.name, &def.fields, &def.file, node, path, None);
             }
             DefKind::Enum => self.check_enum(def, node, path),
         }
     }
 
-    /// Recurses into the nested types behind a shape's fields.
+    /// Recurses into the nested types behind a shape's fields. A key the
+    /// node enclosing a branch documents is read there when the branch does
+    /// not document it.
     fn check_members(
         &mut self,
         owner: &str,
@@ -2276,6 +2314,7 @@ impl<'a> Gate<'a> {
         from_file: &str,
         node: &Value,
         path: &str,
+        enclosing: Option<&Value>,
     ) {
         for field in fields {
             if field.skip {
@@ -2285,12 +2324,19 @@ impl<'a> Gate<'a> {
                 let subject = format!("{path}.{} (flattened)", field.name);
                 if let Some(target) = self.local_def(owner, path, &subject, &field.ty, from_file) {
                     if target.def.kind == DefKind::Struct {
-                        self.check_members(owner, &target.def.fields, &target.def.file, node, path);
+                        self.check_members(
+                            owner,
+                            &target.def.fields,
+                            &target.def.file,
+                            node,
+                            path,
+                            enclosing,
+                        );
                     }
                 }
                 continue;
             }
-            self.check_property(owner, field, node, path, from_file);
+            self.check_property(owner, field, node, path, from_file, enclosing);
         }
     }
 
@@ -2301,13 +2347,14 @@ impl<'a> Gate<'a> {
         node: &Value,
         path: &str,
         from_file: &str,
+        enclosing: Option<&Value>,
     ) {
         let subject = format!("{path}.{}", field.name);
         let Some(target) = self.local_def(owner, path, &subject, &field.ty, from_file) else {
             return;
         };
         let def = target.def;
-        let Some(mut sub) = find_prop(node, &field.name) else {
+        let Some(mut sub) = documented(node, enclosing, &field.name) else {
             return;
         };
         if target.array {
@@ -2359,9 +2406,9 @@ impl<'a> Gate<'a> {
 
     /// R1–R5 for one field set against one documented schema node. `ghosts`
     /// is off when the node is a merged view whose keys were already checked
-    /// against the union of every variant. `outer` lists the keys the node
-    /// enclosing a branch demands of every configuration; they bind the
-    /// branch too.
+    /// against the union of every variant. `outer` is what the node enclosing
+    /// a branch applies to it: the keys it demands, and the defaults it
+    /// documents for keys the branch does not document.
     fn check_shape(
         &mut self,
         def: &str,
@@ -2369,14 +2416,18 @@ impl<'a> Gate<'a> {
         node: &Value,
         path: &str,
         ghosts: bool,
-        outer: &BTreeSet<String>,
+        outer: &Outer,
     ) {
         let props = props(node);
         let required = required(node);
         // A key the schema demands only under `anyOf`/`oneOf` can still be
         // omitted through a lenient alternative — unless the enclosing node
         // demands it.
-        let demanded: BTreeSet<String> = outer.union(&always_required(node)).cloned().collect();
+        let demanded: BTreeSet<String> = outer
+            .demanded
+            .union(&always_required(node))
+            .cloned()
+            .collect();
         let by_name: BTreeMap<&str, &Field> = fields
             .iter()
             .map(|field| (field.name.as_str(), field))
@@ -2417,7 +2468,7 @@ impl<'a> Gate<'a> {
         for name in required
             .iter()
             .copied()
-            .chain(outer.iter().map(String::as_str))
+            .chain(outer.demanded.iter().map(String::as_str))
         {
             let Some(field) = by_name.get(name) else {
                 // A merged view may list keys that belong to other variants.
@@ -2430,7 +2481,7 @@ impl<'a> Gate<'a> {
                                                      configuration can satisfy it"
                         ),
                     );
-                } else if outer.contains(name) {
+                } else if outer.demanded.contains(name) {
                     // No branch can lift a requirement of the enclosing node.
                     self.problem(
                         def,
@@ -2478,56 +2529,78 @@ impl<'a> Gate<'a> {
             }
         }
         for (name, field) in &by_name {
-            let Some(advertised) = advertised_default(node, name) else {
-                continue;
+            // A default counts wherever the schema states it: on the node,
+            // and on the node enclosing a branch that does not repeat it —
+            // that one is shown for every variant that reads the key.
+            let here = advertised_default(node, name);
+            let above = outer
+                .node
+                .and_then(|node| node.get("properties")?.get(name)?.get("default"));
+            let stated: Vec<&Value> = match (here, above) {
+                (Some(here), Some(above)) if here == above => vec![here],
+                (here, above) => above.into_iter().chain(here).collect(),
             };
-            if !field.optional {
-                self.problem(
-                    def,
-                    path,
-                    format!(
-                        "R5 the schema advertises a default for `{name}` but serde requires the \
-                         field — add `#[serde(default …)]` or remove `default`"
-                    ),
-                );
-                continue;
+            for advertised in stated {
+                self.check_default(def, path, name, field, advertised);
             }
-            // Only a default whose value is known can be compared: a
-            // function whose body is a literal (a default of the field's
-            // own comes first), or a plain `#[serde(default)]` (the type's
-            // zero). A default function is looked up from the file the
-            // field is declared in.
-            let actual = if let Some(function) = &field.default_fn {
-                self.index.default_fn_value(function, &field.file)
-            } else if field.plain_default {
-                plain_default_value(&field.ty)
-            } else {
-                None
-            };
-            let Some(actual) = actual else {
-                continue;
-            };
-            if let Some(usage) = &self.usage {
-                let mut usage = usage.borrow_mut();
-                usage.defaults_compared += 1;
-                if field.default_fn.is_some() {
-                    usage.function_defaults_compared += 1;
-                }
+        }
+    }
+
+    /// R5 for one advertised default of a field.
+    fn check_default(
+        &mut self,
+        def: &str,
+        path: &str,
+        name: &str,
+        field: &Field,
+        advertised: &Value,
+    ) {
+        if !field.optional {
+            self.problem(
+                def,
+                path,
+                format!(
+                    "R5 the schema advertises a default for `{name}` but serde requires the \
+                     field — add `#[serde(default …)]` or remove `default`"
+                ),
+            );
+            return;
+        }
+        // Only a default whose value is known can be compared: a
+        // function whose body is a literal (a default of the field's
+        // own comes first), or a plain `#[serde(default)]` (the type's
+        // zero). A default function is looked up from the file the
+        // field is declared in.
+        let actual = if let Some(function) = &field.default_fn {
+            self.index.default_fn_value(function, &field.file)
+        } else if field.plain_default {
+            plain_default_value(&field.ty)
+        } else {
+            None
+        };
+        let Some(actual) = actual else {
+            return;
+        };
+        if let Some(usage) = &self.usage {
+            let mut usage = usage.borrow_mut();
+            usage.defaults_compared += 1;
+            if field.default_fn.is_some() {
+                usage.function_defaults_compared += 1;
             }
-            let source = match &field.default_fn {
-                Some(function) => format!("`{function}` returns"),
-                None => "`#[serde(default)]` yields".to_string(),
-            };
-            if !same_default(advertised, &actual) {
-                self.problem(
-                    def,
-                    path,
-                    format!(
-                        "R5 the schema advertises `default: {advertised}` for `{name}`, but \
-                         {source} {actual}"
-                    ),
-                );
-            }
+        }
+        let source = match &field.default_fn {
+            Some(function) => format!("`{function}` returns"),
+            None => "`#[serde(default)]` yields".to_string(),
+        };
+        if !same_default(advertised, &actual) {
+            self.problem(
+                def,
+                path,
+                format!(
+                    "R5 the schema advertises `default: {advertised}` for `{name}`, but \
+                     {source} {actual}"
+                ),
+            );
         }
     }
 
@@ -2536,8 +2609,8 @@ impl<'a> Gate<'a> {
     /// property per variant, internally tagged ones one object per variant
     /// selected by the tag, untagged ones the variant's fields directly.
     /// Coverage is checked on the union of variants first, then each variant
-    /// with a decodable payload is checked against the branch that
-    /// describes it, and every branch must be a variant serde can decode.
+    /// is checked against every branch that selects it, and every branch
+    /// must be a variant serde can decode.
     fn check_enum(&mut self, def: &'a Def, node: &Value, path: &str) {
         struct Shape<'a> {
             name: String,
@@ -2553,6 +2626,48 @@ impl<'a> Gate<'a> {
             /// A newtype variant whose payload (`Value`, a map) decodes any
             /// object whatever.
             catch_all: bool,
+        }
+
+        /// The branches that select `shape`, numbered from 1.
+        fn selecting_branches<'b>(
+            branches: &[&'b Value],
+            shape: &Shape,
+            tag: Option<&str>,
+            tag_name: &str,
+            admitted: Option<&[String]>,
+            merged: bool,
+        ) -> Vec<(usize, &'b Value)> {
+            let mut found: Vec<(usize, &'b Value)> = branches
+                .iter()
+                .enumerate()
+                .filter(|(_, branch)| match tag {
+                    Some(_) => match selector_values(branch, tag_name) {
+                        // A merged view without a selector describes a
+                        // variant only by documenting all of its fields.
+                        values if values.is_empty() => {
+                            if merged {
+                                documents_every_field(branch, &shape.fields)
+                            } else {
+                                admitted.is_none_or(|values| values.contains(&shape.name))
+                            }
+                        }
+                        values => values.contains(&shape.name),
+                    },
+                    None => documents_every_field(branch, &shape.fields),
+                })
+                .map(|(position, branch)| (position + 1, *branch))
+                .collect();
+            if tag.is_none() && found.is_empty() {
+                if let Some((position, partial)) = branches
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, branch)| branch_overlap(branch, &shape.fields))
+                    .filter(|(_, branch)| branch_overlap(branch, &shape.fields) > 0)
+                {
+                    found.push((position + 1, *partial));
+                }
+            }
+            found
         }
         // Adjacent tagging nests the fields under a content key: not modelled.
         if def.layout == EnumLayout::Adjacent {
@@ -2645,15 +2760,9 @@ impl<'a> Gate<'a> {
                     continue;
                 };
                 let variant_path = format!("{path}.{}", shape.name);
-                self.check_shape(
-                    &def.name,
-                    &shape.fields,
-                    sub,
-                    &variant_path,
-                    true,
-                    &BTreeSet::new(),
-                );
-                self.check_members(&def.name, shape.own, &shape.file, sub, path);
+                let none = Outer::default();
+                self.check_shape(&def.name, &shape.fields, sub, &variant_path, true, &none);
+                self.check_members(&def.name, shape.own, &shape.file, sub, path, None);
             }
             return;
         }
@@ -2699,11 +2808,15 @@ impl<'a> Gate<'a> {
         // A node without `oneOf` branches is a merged view of every variant:
         // its keys were already checked against the union.
         let merged = branches.len() == 1 && std::ptr::eq(branches[0], node);
-        // The node's own `required` binds every branch it has.
-        let outer: BTreeSet<String> = if merged {
-            BTreeSet::new()
-        } else {
-            always_required(node)
+        // What the enclosing node applies to a branch: its own `required`
+        // binds every branch, and a key it documents alone still counts.
+        let outer = Outer {
+            demanded: if merged {
+                BTreeSet::new()
+            } else {
+                always_required(node)
+            },
+            node: (!merged).then_some(node),
         };
         // Every discriminator the schema offers must name a variant serde
         // decodes, whatever its shape.
@@ -2729,32 +2842,51 @@ impl<'a> Gate<'a> {
                 }
             }
         }
+        // The branches that select a variant. A tagged branch with a
+        // selector of its own names it; one without offers whatever tag the
+        // enclosing node lets through — every variant when the node lists
+        // none — so it is held to each of them. An untagged branch selects
+        // by documenting every field of the variant, or else the one that
+        // documents the most, so a field the schema left out is still
+        // reported.
+        let admitted = (!merged)
+            .then(|| selector_values(node, &tag_name))
+            .filter(|values| !values.is_empty());
+        let enclosing = (!merged).then_some(node);
         for shape in &shapes {
             // Nothing is checked of a unit or tuple variant of an untagged
-            // enum: it has no keys.
-            if tag.is_none() && !shape.checkable {
+            // enum: it has no keys — nor of a variant without a field set on
+            // a merged view, whose tag values R6 already read.
+            if (tag.is_none() || merged) && !shape.checkable {
                 continue;
             }
-            // Every branch that selects the variant is checked. For a tagged
-            // enum that is each branch whose selector names it: a second,
-            // lenient one would let a configuration through that serde
-            // rejects. For an untagged enum it is each branch that documents
-            // all of its fields, or else the one that documents the most, so
-            // a field the schema left out is still reported.
-            let mut selecting: Vec<&Value> = branches
-                .iter()
-                .copied()
-                .filter(|branch| branch_matches(branch, tag, &shape.name, &shape.fields))
-                .collect();
-            if tag.is_none() && selecting.is_empty() {
-                if let Some(partial) = branches
+            let selecting = selecting_branches(
+                &branches,
+                shape,
+                tag,
+                &tag_name,
+                admitted.as_deref(),
+                merged,
+            );
+            // `oneOf` rejects a configuration that satisfies two branches,
+            // so a variant must not be selected twice.
+            if branch_keyword(node) == Some("oneOf") && selecting.len() > 1 {
+                let positions: Vec<String> = selecting
                     .iter()
-                    .copied()
-                    .max_by_key(|branch| branch_overlap(branch, &shape.fields))
-                    .filter(|branch| branch_overlap(branch, &shape.fields) > 0)
-                {
-                    selecting.push(partial);
-                }
+                    .map(|(position, _)| position.to_string())
+                    .collect();
+                self.problem(
+                    &def.name,
+                    path,
+                    format!(
+                        "R1 variant `{}` is selected by {} `oneOf` branches ({}): `oneOf` rejects a \
+                         configuration that satisfies more than one branch, so they would have to \
+                         exclude each other — which the gate cannot read; merge them or use `anyOf`",
+                        shape.name,
+                        selecting.len(),
+                        positions.join(", ")
+                    ),
+                );
             }
             let Some(..) = selecting.first() else {
                 let how = if tag.is_some() {
@@ -2773,11 +2905,16 @@ impl<'a> Gate<'a> {
                 continue;
             };
             let variant_path = format!("{path}[{}]", shape.name);
-            for branch in selecting {
+            for (_, branch) in selecting {
                 if !shape.checkable {
+                    let demanded: BTreeSet<String> = outer
+                        .demanded
+                        .union(&always_required(branch))
+                        .cloned()
+                        .collect();
                     // Only the tag is left to demand, and serde requires it
                     // to select any variant — a unit one too.
-                    if !outer.contains(&tag_name) && !always_required(branch).contains(&tag_name) {
+                    if !demanded.contains(&tag_name) {
                         self.problem(
                             &def.name,
                             &variant_path,
@@ -2789,17 +2926,34 @@ impl<'a> Gate<'a> {
                             ),
                         );
                     }
+                    // Any other key the schema demands of the variant is one
+                    // it never reads: its configurations are rejected.
+                    for key in demanded.iter().filter(|key| **key != tag_name) {
+                        self.problem(
+                            &def.name,
+                            &variant_path,
+                            format!(
+                                "R3 the schema requires `{key}` for variant `{}`, which reads no \
+                                 such key — a configuration of the variant without it is rejected",
+                                shape.name
+                            ),
+                        );
+                    }
                     continue;
                 }
+                // A branch with a selector of its own describes this variant
+                // alone, so a key of another variant is a ghost there; one
+                // without may serve several.
+                let own_selector = tag.is_none() || !selector_values(branch, &tag_name).is_empty();
                 self.check_shape(
                     &def.name,
                     &shape.fields,
                     branch,
                     &variant_path,
-                    !merged,
+                    !merged && own_selector,
                     &outer,
                 );
-                self.check_members(&def.name, shape.own, &shape.file, branch, path);
+                self.check_members(&def.name, shape.own, &shape.file, branch, path, enclosing);
             }
         }
         // Untagged, with real branches: a branch that demands less than any
@@ -2807,8 +2961,11 @@ impl<'a> Gate<'a> {
         // decodes any object, no branch is too lenient.
         if tag.is_none() && !merged && !shapes.iter().any(|shape| shape.catch_all) {
             for (position, branch) in branches.iter().enumerate() {
-                let demanded: BTreeSet<String> =
-                    outer.union(&always_required(branch)).cloned().collect();
+                let demanded: BTreeSet<String> = outer
+                    .demanded
+                    .union(&always_required(branch))
+                    .cloned()
+                    .collect();
                 let decodable = shapes.iter().filter(|shape| shape.checkable).any(|shape| {
                     shape
                         .fields
@@ -4580,6 +4737,29 @@ enum Loose {
     File { path: String },
 }
 
+// A map of strings decodes only objects whose values are strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StringMap {
+    Raw(std::collections::BTreeMap<String, String>),
+    File { path: String },
+}
+
+// A map of strings to JSON decodes any object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ValueMap {
+    Raw(std::collections::HashMap<String, serde_json::Value>),
+    File { path: String },
+}
+
+// A tagged variant with a nested struct, to document it outside the branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WithNested {
+    On { extra: Extra },
+}
+
 struct Child {
     nonce: [u8; {16}],
 }
@@ -4710,6 +4890,7 @@ struct Parent {
             ("\"\\t\\r\\0\"", json!("\t\r\0")),
             ("\"\\x41\\u{42}\".to_string()", json!("AB")),
             ("\"line \\\n       continued\"", json!("line continued")),
+            ("\"a \\\n\u{a0}b\"", json!("a \u{a0}b")),
         ] {
             assert_eq!(literal_value(expr), Some(value), "{expr}");
         }
@@ -5132,8 +5313,10 @@ pub struct Child {
         // A path that leads nowhere names nothing: the same-file `count`
         // does not stand in for it.
         assert_eq!(value("crate::missing::count"), None);
-        // A type's associated function is followed by its name.
-        assert_eq!(value("Config::count"), Some(json!(3)));
+        // A type's associated function would have to be found through its
+        // owner: the same-file free `count` must not stand in for it.
+        assert_eq!(value("Config::count"), None);
+        assert_eq!(value("Self::count"), None);
 
         // A flattened field keeps the file its default function lives in:
         // `Parent`'s file has a `count` of its own, and it is not the one.
@@ -5298,30 +5481,248 @@ pub struct Child {
     fn a_variant_that_decodes_any_object_excuses_every_branch() {
         let index =
             Index::from_sources(&[("input/demo.rs".to_string(), format!("{DEMO}{}", DEFAULTS))]);
-        let check = |schema: Value| {
+        let file = json!({"properties": {"path": {"type": "string"}}, "required": ["path"]});
+        let found = |config: &str| {
             let mut gate = Gate::new(&index, "input/demo");
             gate.check_def(
-                index.get("input/demo.rs", "Loose").unwrap(),
-                &schema,
-                "Loose",
+                index.get("input/demo.rs", config).unwrap(),
+                &json!({"anyOf": [file.clone(), {}]}),
+                config,
             );
             gate.problems
         };
-        let file = json!({"properties": {"path": {"type": "string"}}, "required": ["path"]});
-        // `Raw` decodes any object, so the schema may accept anything too.
-        assert!(check(json!({"anyOf": [file.clone(), {}]})).is_empty());
-        // Without such a variant an empty branch admits what serde rejects.
-        let mut gate = Gate::new(&index, "input/demo");
-        gate.check_def(
-            index.get("input/demo.rs", "Untagged").unwrap(),
-            &json!({"anyOf": [file, {}]}),
-            "Untagged",
+        // A `Value` decodes any object, so the schema may accept anything.
+        assert!(found("Loose").is_empty());
+        // So does a map of strings to JSON.
+        assert!(found("ValueMap").is_empty());
+        // A map of strings does not: `{"other": 1}` passes the schema and
+        // fails in serde. Neither does an enum without such a variant.
+        for config in ["StringMap", "Untagged"] {
+            let problems = found(config);
+            assert!(
+                reported(&problems, "R4 schema branch 2 demands nothing"),
+                "{config}: {problems:?}"
+            );
+        }
+    }
+
+    // ---- fifth review round ---------------------------------------------------
+
+    #[test]
+    fn a_branch_without_a_selector_offers_what_the_enclosing_node_lets_through() {
+        let index = demo_index();
+        let check = |config: &str, schema: Value| {
+            let mut gate = Gate::new(&index, "input/demo");
+            gate.check_def(index.get("input/demo.rs", config).unwrap(), &schema, config);
+            gate.problems
+        };
+        let off = json!({"properties": {"type": {"const": "off"}}, "required": ["type"]});
+        let file = json!({"properties": {"type": {"const": "file"}, "path": {"type": "string"}},
+                          "required": ["type", "path"]});
+
+        // A branch without a selector was never looked at: `{}` matches it,
+        // and serde rejects `{}` — it has no tag to select by.
+        let found = check(
+            "WithUnit",
+            json!({"oneOf": [off.clone(), file.clone(), {}]}),
         );
         assert!(
-            reported(&gate.problems, "R4 schema branch 2 demands nothing"),
-            "{:?}",
-            gate.problems
+            reported(
+                &found,
+                "[WithUnit] WithUnit[off]: R4 serde requires `type` to select `off`"
+            ),
+            "{found:?}"
         );
+        assert!(
+            reported(
+                &found,
+                "[WithUnit] WithUnit[file]: R4 serde requires `type`"
+            ),
+            "{found:?}"
+        );
+
+        // The node demands the tag: the bare branch still lets
+        // `{"type":"file"}` through without `path`, and asks nothing of
+        // `off` but the tag.
+        let found = check(
+            "WithUnit",
+            json!({"required": ["type"], "oneOf": [off.clone(), file.clone(), {}]}),
+        );
+        assert!(!reported(&found, "WithUnit[off]"), "{found:?}");
+        assert!(
+            reported(
+                &found,
+                "[WithUnit] WithUnit[file]: R4 serde requires `path`"
+            ),
+            "{found:?}"
+        );
+
+        // A key the bare branch documents for `file` is no ghost — the branch
+        // serves both variants. Not demanded, because `off` reads no such
+        // key: `{"type":"file"}` still gets through.
+        let found = check(
+            "WithUnit",
+            json!({"properties": {"type": {"enum": ["off", "file"]}}, "required": ["type"],
+                   "oneOf": [{"properties": {"path": {"type": "string"}}}]}),
+        );
+        assert!(!reported(&found, "R2"), "{found:?}");
+        assert!(
+            reported(
+                &found,
+                "[WithUnit] WithUnit[file]: R4 serde requires `path`"
+            ),
+            "{found:?}"
+        );
+
+        // Two struct variants and one bare branch: a key only one of them
+        // reads is no ghost — the branch serves both.
+        let found = check(
+            "Mode",
+            json!({"properties": {"type": {"enum": ["cluster", "single"]}}, "required": ["type"],
+                   "oneOf": [{"properties": {"insecure": {"type": "boolean", "default": false}}}]}),
+        );
+        assert!(!reported(&found, "R2"), "{found:?}");
+
+        // Demanded of a variant that reads no such key, its configurations
+        // are rejected.
+        let mut for_off = off.clone();
+        for_off["properties"]["legacy"] = json!({});
+        for_off["required"] = json!(["type", "legacy"]);
+        let found = check("WithUnit", json!({"oneOf": [for_off, file.clone()]}));
+        assert!(
+            reported(
+                &found,
+                "[WithUnit] WithUnit[off]: R3 the schema requires `legacy` for variant `off`, \
+                 which reads no such key"
+            ),
+            "{found:?}"
+        );
+        let found = check(
+            "WithUnit",
+            json!({"required": ["type", "path"], "oneOf": [off.clone(), file.clone()]}),
+        );
+        assert!(
+            reported(
+                &found,
+                "[WithUnit] WithUnit[off]: R3 the schema requires `path` for variant `off`, which \
+                 reads no such key"
+            ),
+            "{found:?}"
+        );
+
+        // Only the tags the node lists are offered: `off` cannot be written.
+        let bare =
+            json!({"properties": {"path": {"type": "string"}}, "required": ["type", "path"]});
+        let found = check(
+            "WithUnit",
+            json!({"properties": {"type": {"enum": ["file"]}}, "oneOf": [bare]}),
+        );
+        assert!(
+            reported(
+                &found,
+                "R1 variant `off` has no schema branch that describes it"
+            ),
+            "{found:?}"
+        );
+        assert!(!reported(&found, "WithUnit[file]"), "{found:?}");
+
+        // One variant, one bare branch that demands what it needs: sound.
+        let found = check(
+            "Upper",
+            json!({"properties": {"t": {"enum": ["FILE"]}}, "required": ["t"],
+                   "oneOf": [{"properties": {"pathName": {"type": "string"}},
+                              "required": ["pathName"]}]}),
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_one_of_must_not_select_a_variant_twice() {
+        let index = demo_index();
+        let check = |schema: Value| {
+            let mut gate = Gate::new(&index, "input/demo");
+            gate.check_def(
+                index.get("input/demo.rs", "WithUnit").unwrap(),
+                &schema,
+                "WithUnit",
+            );
+            gate.problems
+        };
+        let off = json!({"properties": {"type": {"const": "off"}}, "required": ["type"]});
+        let file = json!({"properties": {"type": {"const": "file"},
+                                         "path": {"type": "string", "description": "the path"}},
+                          "required": ["type", "path"]});
+        let twin = json!({"properties": {"type": {"const": "file"},
+                                         "path": {"type": "string", "description": "where"}},
+                          "required": ["type", "path"]});
+        // `{"type":"file","path":"x"}` satisfies both, and `oneOf` rejects it.
+        let found = check(json!({"oneOf": [off.clone(), file.clone(), twin.clone()]}));
+        assert!(
+            reported(
+                &found,
+                "R1 variant `file` is selected by 2 `oneOf` branches (2, 3)"
+            ),
+            "{found:?}"
+        );
+        // Under `anyOf` a configuration may satisfy several branches.
+        let found = check(json!({"anyOf": [off, file, twin]}));
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_default_stated_by_the_enclosing_node_counts_for_every_variant() {
+        let index =
+            Index::from_sources(&[("input/demo.rs".to_string(), format!("{DEMO}{}", DEFAULTS))]);
+        let check = |config: &str, schema: Value| {
+            let mut gate = Gate::new(&index, "input/demo");
+            gate.check_def(index.get("input/demo.rs", config).unwrap(), &schema, config);
+            gate.problems
+        };
+        let cluster = json!({"properties": {"type": {"const": "cluster"},
+                                            "urls": {"type": "array"}},
+                             "required": ["type", "urls"]});
+        let single = json!({"properties": {"type": {"const": "single"},
+                                           "url": {"type": "string"}},
+                            "required": ["type", "url"]});
+        // The branch says nothing about `insecure`; the enclosing node does,
+        // and it is wrong — serde's default is `false`.
+        let wrong = json!({"properties": {"insecure": {"type": "boolean", "default": true}},
+                           "oneOf": [cluster.clone(), single.clone()]});
+        let found = check("Mode", wrong);
+        assert!(
+            reported(
+                &found,
+                "[Mode] Mode[single]: R5 the schema advertises `default: true` for `insecure`, \
+                 but `#[serde(default)]` yields false"
+            ),
+            "{found:?}"
+        );
+        let right = json!({"properties": {"insecure": {"type": "boolean", "default": false}},
+                           "oneOf": [cluster, single]});
+        let found = check("Mode", right);
+        assert!(found.is_empty(), "{found:?}");
+
+        // A nested key documented by the enclosing node is checked against
+        // the type of the variant that reads it.
+        let on = json!({"properties": {"type": {"const": "on"}}, "required": ["type"]});
+        let mut extra = json!({"type": "object", "additionalProperties": false,
+                               "properties": {"host": {"type": "string"}, "port": {"type": "integer"},
+                                              "nonce": {"type": "array"}},
+                               "required": ["host"]});
+        let mut schema = json!({"properties": {"extra": extra.clone()}, "required": ["type", "extra"],
+                                "oneOf": [on.clone()]});
+        let found = check("WithNested", schema.clone());
+        assert!(
+            reported(
+                &found,
+                "[Extra] WithNested.extra: R4 serde requires `nonce`"
+            ),
+            "{found:?}"
+        );
+        extra["required"] = json!(["host", "nonce"]);
+        schema["properties"] = json!({"extra": extra});
+        let found = check("WithNested", schema);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

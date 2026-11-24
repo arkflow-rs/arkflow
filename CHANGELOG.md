@@ -291,8 +291,11 @@ aligned to it, two of which change runtime behavior:
   function returns — a default of the field's own before the container's,
   and the function is found through its path); a key demanded by only some
   `anyOf`/`oneOf` branches does not count as required, a key the enclosing
-  node demands does; every branch that selects a variant is checked, and
-  each has to demand the tag; a tag value that is not a decodable variant,
+  node demands does; every branch that selects a variant is checked — a
+  tagged branch without a selector included — each has to demand the tag,
+  a default the enclosing node states counts for every branch, and a
+  variant may not be selected twice under `oneOf`; a tag value that is not a
+  decodable variant,
   an untagged branch that demands less than any variant, a flattened type
   the gate cannot read, and a mapped component with an opaque root schema
   are all reported. serde's `rename_all` conversions — different for fields
@@ -310,8 +313,10 @@ committed inventory now match what serde accepts:
   rejects it), and omitting `start_from_latest` now means `false` — the
   default the schema always advertised — instead of failing with a
   missing-field error. Its description no longer says the flag makes
-  committed offsets ignored: it only sets the offset reset policy, and
-  committed group offsets still win on restart. A config that relies on the
+  committed offsets ignored: it only sets the offset reset policy — with a
+  single-consumer subscription a committed group offset still in range wins
+  on restart; under an explicit partition assignment committed group offsets
+  are not used. A config that relies on the
   default fails to build again on the previous version: add
   `start_from_latest: false` before rolling back.
 - `pulsar` input and output: the `tls` block (`certificate_chain_file`,
