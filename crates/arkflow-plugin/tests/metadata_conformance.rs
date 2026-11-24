@@ -1960,13 +1960,21 @@ fn direct_branches(node: &Value) -> Vec<&Value> {
     vec![node]
 }
 
-/// Whether a branch of an untagged enum describes a variant: it documents
-/// every field of it.
+/// Whether a branch documents every field of `fields`.
 fn documents_every_field(branch: &Value, fields: &[Field]) -> bool {
     let Some(entries) = branch.get("properties").and_then(Value::as_object) else {
         return false;
     };
     fields.iter().all(|field| entries.contains_key(&field.name))
+}
+
+/// Whether a branch documents exactly the fields of `fields`, by name —
+/// the branch of a variant of just that shape.
+fn documents_exactly(branch: &Value, fields: &[Field]) -> bool {
+    let Some(entries) = branch.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    entries.len() == fields.len() && fields.iter().all(|field| entries.contains_key(&field.name))
 }
 
 /// The keyword holding a node's direct `oneOf`/`anyOf` branches, when it has
@@ -2653,7 +2661,7 @@ impl<'a> Gate<'a> {
                         }
                         values => values.contains(&shape.name),
                     },
-                    None => documents_every_field(branch, &shape.fields),
+                    None => documents_exactly(branch, &shape.fields),
                 })
                 .map(|(position, branch)| (position + 1, *branch))
                 .collect();
@@ -2846,9 +2854,10 @@ impl<'a> Gate<'a> {
         // selector of its own names it; one without offers whatever tag the
         // enclosing node lets through — every variant when the node lists
         // none — so it is held to each of them. An untagged branch selects
-        // by documenting every field of the variant, or else the one that
-        // documents the most, so a field the schema left out is still
-        // reported.
+        // by documenting exactly the fields of the variant — the branch of a
+        // wider variant documents them too, but is that variant's — or else
+        // the one that documents the most, so a field the schema left out is
+        // still reported.
         let admitted = (!merged)
             .then(|| selector_values(node, &tag_name))
             .filter(|values| !values.is_empty());
@@ -4753,6 +4762,14 @@ enum ValueMap {
     File { path: String },
 }
 
+// An untagged variant whose fields are a subset of another's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Sized {
+    Small { path: String },
+    Large { path: String, format: String },
+}
+
 // A tagged variant with a nested struct, to document it outside the branch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -5667,6 +5684,48 @@ pub struct Child {
         // Under `anyOf` a configuration may satisfy several branches.
         let found = check(json!({"anyOf": [off, file, twin]}));
         assert!(found.is_empty(), "{found:?}");
+
+        // Untagged, two branches of exactly a variant's shape compete too.
+        let index =
+            Index::from_sources(&[("input/demo.rs".to_string(), format!("{DEMO}{}", DEFAULTS))]);
+        let check = |config: &str, schema: Value| {
+            let mut gate = Gate::new(&index, "input/demo");
+            gate.check_def(index.get("input/demo.rs", config).unwrap(), &schema, config);
+            gate.problems
+        };
+        let file = json!({"properties": {"path": {"type": "string"}, "format": {"type": "string"}},
+                          "required": ["path", "format"]});
+        let socket = json!({"properties": {"port": {"type": "integer"}}, "required": ["port"]});
+        let found = check(
+            "Untagged",
+            json!({"oneOf": [file.clone(), file.clone(), socket]}),
+        );
+        assert!(
+            reported(
+                &found,
+                "R1 variant `File` is selected by 2 `oneOf` branches (1, 2)"
+            ),
+            "{found:?}"
+        );
+        // The branch of a wider variant documents the narrower one's fields
+        // as well: it is the wider variant's, not a second branch of the
+        // narrower one, whichever comes first.
+        let small = json!({"properties": {"path": {"type": "string"}}, "required": ["path"]});
+        for branches in [
+            json!([small.clone(), file.clone()]),
+            json!([file.clone(), small.clone()]),
+        ] {
+            let found = check("Sized", json!({"oneOf": branches}));
+            assert!(found.is_empty(), "{found:?}");
+        }
+        let found = check("Sized", json!({"oneOf": [small.clone(), small, file]}));
+        assert!(
+            reported(
+                &found,
+                "R1 variant `Small` is selected by 2 `oneOf` branches (1, 2)"
+            ),
+            "{found:?}"
+        );
     }
 
     #[test]
