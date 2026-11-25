@@ -27,6 +27,8 @@
 //! 3. **Validation** — combining the schema with a config file lets the
 //!    engine validate user input without instantiating the component.
 
+pub mod feature_hints;
+
 use crate::Error;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

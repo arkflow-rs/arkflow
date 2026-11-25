@@ -48,6 +48,7 @@ fn serialize(value: &serde_json::Value) -> String {
 
 #[test]
 fn committed_docs_artifacts_match_the_registry() {
+    require_default_features();
     arkflow_plugin::initialize().expect("the built-in component catalogue registers");
 
     let artifacts = [
@@ -97,5 +98,18 @@ fn committed_docs_artifacts_match_the_registry() {
         "documentation artifacts are stale:\n{}\nRegenerate with: {}",
         stale.join("\n"),
         REGEN_COMMAND
+    );
+}
+/// Guard: this test asserts the FULL component inventory (registry,
+/// metadata, schemas, examples) and therefore only makes sense in a default
+/// all-families build. Under a reduced feature set it would report spurious
+/// drift, so refuse loudly with the fix instead (spec:
+/// `build-feature-gating`, generated-artifacts determinism).
+fn require_default_features() {
+    assert!(
+        cfg!(feature = "connectors-kafka"),
+        "this gate asserts the full component inventory and must run with the \
+         default (all families) feature set; rebuild without --no-default-features \
+         (see the add-cargo-feature-gating change)"
     );
 }

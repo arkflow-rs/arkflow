@@ -493,6 +493,7 @@ async fn docs_yaml_snippets_validate() {
 /// rejects. The sets are parsed out of the Node source to fail loudly.
 #[test]
 fn node_gate_vocabulary_is_in_sync() {
+    require_default_features();
     let source = std::fs::read_to_string(repo_root().join("docs/scripts/docs-check.mjs"))
         .expect("docs-check.mjs is readable");
 
@@ -524,5 +525,18 @@ fn node_gate_vocabulary_is_in_sync() {
     assert_eq!(
         node_wraps, rust_wraps,
         "YAML_WRAP_KINDS drifted between docs-check.mjs and docs_snippets_validate.rs"
+    );
+}
+/// Guard: this test asserts the FULL component inventory (registry,
+/// metadata, schemas, examples) and therefore only makes sense in a default
+/// all-families build. Under a reduced feature set it would report spurious
+/// drift, so refuse loudly with the fix instead (spec:
+/// `build-feature-gating`, generated-artifacts determinism).
+fn require_default_features() {
+    assert!(
+        cfg!(feature = "connectors-kafka"),
+        "this gate asserts the full component inventory and must run with the \
+         default (all families) feature set; rebuild without --no-default-features \
+         (see the add-cargo-feature-gating change)"
     );
 }

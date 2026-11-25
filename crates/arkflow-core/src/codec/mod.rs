@@ -63,9 +63,9 @@ impl CodecConfig {
         if let Some(builder) = builders.get(&self.codec_type) {
             builder.build(self.name.as_deref(), &self.config, resource)
         } else {
-            Err(Error::Config(format!(
-                "Unknown codec type: {}",
-                self.codec_type
+            Err(Error::Config(crate::component::feature_hints::unknown_type_message(
+                "codec",
+                &self.codec_type,
             )))
         }
     }

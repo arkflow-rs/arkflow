@@ -18,6 +18,7 @@ pub mod codec;
 pub mod component;
 pub mod context_pool;
 pub mod expr;
+mod feature_hints;
 pub mod http_util;
 pub mod input;
 #[cfg(feature = "connectors-kafka")]
@@ -124,6 +125,9 @@ pub(crate) fn init_steps(
 /// every already-registered kind short-circuits through its own success
 /// latch, and the retry resumes at the first failed kind.
 pub fn initialize() -> Result<(), Error> {
+    // Feature hints must precede the kind registrations: they tell a
+    // minimal build *why* a gated type is unknown, not just that it is.
+    feature_hints::register()?;
     input::init()?;
     output::init()?;
     processor::init()?;

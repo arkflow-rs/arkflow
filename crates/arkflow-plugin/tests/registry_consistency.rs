@@ -42,6 +42,7 @@ fn metadata_names(kind: ComponentKind) -> BTreeSet<String> {
 
 #[test]
 fn builder_and_metadata_registrations_are_aligned() {
+    require_default_features();
     arkflow_plugin::initialize().expect("component catalogue registers");
 
     let mut problems = Vec::new();
@@ -68,5 +69,18 @@ fn builder_and_metadata_registrations_are_aligned() {
         problems.is_empty(),
         "builder/metadata registry misalignment:\n{}",
         problems.join("\n")
+    );
+}
+/// Guard: this test asserts the FULL component inventory (registry,
+/// metadata, schemas, examples) and therefore only makes sense in a default
+/// all-families build. Under a reduced feature set it would report spurious
+/// drift, so refuse loudly with the fix instead (spec:
+/// `build-feature-gating`, generated-artifacts determinism).
+fn require_default_features() {
+    assert!(
+        cfg!(feature = "connectors-kafka"),
+        "this gate asserts the full component inventory and must run with the \
+         default (all families) feature set; rebuild without --no-default-features \
+         (see the add-cargo-feature-gating change)"
     );
 }
