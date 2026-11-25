@@ -28,22 +28,25 @@ arkflow-server = { workspace = true, default-features = false }
 # Default keeps every family enabled; use `--no-default-features --features
 # engine-minimal` for a minimal build (features are additive, so engine-minimal
 # only removes anything when combined with --no-default-features).
+# The default list enables THIS crate's mirror features (not the plugin's
+# directly) so `cfg!(feature = ...)` inside this crate — including the
+# full-inventory gate tests — reflects the real feature set.
 [features]
 default = [
-    "arkflow-plugin/connectors-sql",
-    "arkflow-plugin/connectors-kafka",
-    "arkflow-plugin/connectors-python",
-    "arkflow-plugin/connectors-mongodb",
-    "arkflow-plugin/connectors-pulsar",
-    "arkflow-plugin/connectors-hdfs",
-    "arkflow-plugin/connectors-mqtt",
-    "arkflow-plugin/connectors-nats",
-    "arkflow-plugin/connectors-redis",
-    "arkflow-plugin/connectors-websocket",
-    "arkflow-plugin/connectors-modbus",
-    "arkflow-plugin/ai-vector",
-    "arkflow-plugin/processors-vrl",
-    "arkflow-plugin/codecs-protobuf",
+    "connectors-sql",
+    "connectors-kafka",
+    "connectors-python",
+    "connectors-mongodb",
+    "connectors-pulsar",
+    "connectors-hdfs",
+    "connectors-mqtt",
+    "connectors-nats",
+    "connectors-redis",
+    "connectors-websocket",
+    "connectors-modbus",
+    "ai-vector",
+    "processors-vrl",
+    "codecs-protobuf",
 ]
 connectors-sql = ["arkflow-plugin/connectors-sql"]
 connectors-kafka = ["arkflow-plugin/connectors-kafka"]
