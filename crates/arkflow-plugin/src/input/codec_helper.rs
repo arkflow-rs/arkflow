@@ -15,7 +15,9 @@
 //! Helper functions for codec integration in input components
 
 use arkflow_core::codec::Codec;
-#[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+// MessageBatchRef backs the Delivery channel (nats/mqtt inputs) and the
+// cancellation-safety test scaffolding, which exists only under cfg(test).
+#[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt", test))]
 use arkflow_core::MessageBatchRef;
 use arkflow_core::{Bytes, Error, MessageBatch};
 use std::sync::Arc;
@@ -352,10 +354,12 @@ pub(crate) mod contract {
     /// a producer task decodes (the gate parks there, outside any engine
     /// select) and the channel carries finished [`Delivery`] values; `read`
     /// awaits `recv` only, so a dropped read future loses nothing.
+    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
     pub(crate) struct ProducerDecodedInput {
         receiver: flume::Receiver<Delivery>,
     }
 
+    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
     impl ProducerDecodedInput {
         pub fn pair() -> (flume::Sender<Delivery>, Arc<Self>) {
             let (sender, receiver) = flume::bounded(8);
@@ -363,6 +367,7 @@ pub(crate) mod contract {
         }
     }
 
+    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
     #[async_trait]
     impl Input for ProducerDecodedInput {
         async fn connect(&self) -> Result<(), Error> {
@@ -384,6 +389,7 @@ pub(crate) mod contract {
 
     /// Drive a compliant input's producer side: one payload through the
     /// gate codec into a finished delivery.
+    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
     pub(crate) async fn produce_one_delivery(
         sender: flume::Sender<Delivery>,
         codec: Arc<GateCodec>,
@@ -463,6 +469,7 @@ mod tests {
     /// Spec "合规实现零误报" (pattern level): a producer-decoded input passes
     /// the same probe — the dropped read loses nothing and the second read
     /// delivers exactly the one message.
+    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
     #[tokio::test]
     async fn compliant_producer_decoded_input_passes_the_probe() {
         use crate::input::codec_helper::contract::*;

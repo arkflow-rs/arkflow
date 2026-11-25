@@ -165,6 +165,10 @@ codecs-protobuf = ["dep:prost-reflect", "dep:prost-types", "dep:protox"]
 engine-minimal = []
 
 [dev-dependencies]
+# tokio's "full" does not include "test-util"; the default build got it
+# transitively from a gated connector dependency, so reduced test builds
+# (`#[tokio::test(start_paused = true)]` in generate.rs) need it explicitly.
+tokio = { workspace = true, features = ["test-util"] }
 mockall = { workspace = true }
 serial_test = "4.0.1"
 testcontainers = "0.28.0"

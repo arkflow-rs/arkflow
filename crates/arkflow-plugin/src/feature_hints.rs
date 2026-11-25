@@ -81,6 +81,33 @@ pub(crate) fn register() -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    /// The real run-time contract (spec: missing-feature hint): in a build
+    /// without the kafka family, building an input of type `kafka` fails
+    /// with an error naming the `connectors-kafka` feature. Only compiled
+    /// without the family — a default build registers kafka and the lookup
+    /// succeeds.
+    #[cfg(not(feature = "connectors-kafka"))]
+    #[test]
+    fn unknown_gated_type_error_names_the_feature() {
+        crate::initialize().expect("plugin initialize");
+        let config: arkflow_core::input::InputConfig =
+            serde_json::from_str(r#"{"type":"kafka","name":"probe","config":{}}"#)
+                .expect("input config parses");
+        let resource = arkflow_core::Resource {
+            temporary: std::collections::HashMap::new(),
+            input_names: std::cell::RefCell::new(Vec::new()),
+        };
+        let error = match config.build(&resource) {
+            Err(error) => error,
+            Ok(_) => panic!("kafka input must be absent without connectors-kafka"),
+        };
+        let message = format!("{error}");
+        assert!(
+            message.contains("connectors-kafka"),
+            "unknown-type error must name the missing feature, got: {message}"
+        );
+    }
+
     /// Every hint must point at a feature that actually exists in this
     /// crate's manifest, so renaming a feature cannot strand the hint table.
     #[test]
