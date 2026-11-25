@@ -7,6 +7,24 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — Engine build
+
+- Connector families are gated behind cargo features on `arkflow-plugin`
+  (mirrored by the `arkflow` binary and `arkflow-server`): `connectors-sql`,
+  `connectors-kafka`, `connectors-python`, `connectors-mongodb`,
+  `connectors-pulsar`, `connectors-hdfs`, `connectors-mqtt`,
+  `connectors-nats`, `connectors-redis`, `connectors-websocket`,
+  `connectors-modbus`, `ai-vector`, `processors-vrl`, and
+  `codecs-protobuf`. The default feature set enables every family, so
+  default builds register exactly the same components as before — no
+  behavior change. `--no-default-features --features engine-minimal` builds
+  a minimal binary with the core engine plus the light component set (see
+  "Build profiles" in the install guide). In a build without a family,
+  configs referencing its types fail validation naming the feature, e.g.
+  `Unknown input type: kafka (requires the 'connectors-kafka' feature)`.
+  CI compiles the reduced feature sets and structurally asserts the minimal
+  dependency tree excludes every gated family.
+
 ### Added — Control plane
 
 - `arkflow-server` accepts `--config <FILE>`: a full startup configuration
