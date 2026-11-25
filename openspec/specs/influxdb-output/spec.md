@@ -41,7 +41,7 @@ The output SHALL send buffered lines to `/api/v2/write` with token authenticatio
 - **THEN** the flush fails immediately without further attempts, the pending lines remain buffered, and the error message matches the single-shot failure text
 
 #### Scenario: Transient 5xx is retried with capped backoff
-- **WHEN** the write endpoint responds 503 and any `retry_count` (including oversized values) is configured
+- **WHEN** the write endpoint responds 503 and any `retry_count` above its minimum of 1 (a single attempt with no retry) is configured, including oversized values
 - **THEN** attempts are retried with exponential backoff capped at the shared `max_delay_ms`, with no overflow, panic, or wrap for any configured value
 
 ### Requirement: Plugin configuration and lifecycle are discoverable
