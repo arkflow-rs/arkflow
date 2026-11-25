@@ -21,6 +21,7 @@ use arkflow_core::{
     Error, MessageBatch, MessageBatchRef, Resource,
 };
 use async_trait::async_trait;
+#[cfg(feature = "connectors-sql")]
 use ballista::prelude::SessionContextExt;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
@@ -29,6 +30,7 @@ use datafusion::prelude::{
     AvroReadOptions, CsvReadOptions, DataFrame, ParquetReadOptions, SQLOptions, SessionContext,
 };
 use futures_util::TryStreamExt;
+#[cfg(feature = "connectors-hdfs")]
 use hdfs_native_object_store::HdfsObjectStoreBuilder;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
@@ -92,6 +94,7 @@ enum Store {
     Gs(GoogleCloudStorageConfig),
     Az(MicrosoftAzureConfig),
     Http(HttpConfig),
+    #[cfg(feature = "connectors-hdfs")]
     Hdfs(HdfsConfig),
 }
 
@@ -143,6 +146,7 @@ struct HttpConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "connectors-hdfs")]
 struct HdfsConfig {
     url: String,
     ha_config: Option<HashMap<String, String>>,
@@ -252,6 +256,7 @@ impl FileInput {
             Store::Gs(config) => self.google_cloud_storage(ctx, config),
             Store::Az(config) => self.microsoft_azure_store(ctx, config),
             Store::Http(config) => self.http_store(ctx, config),
+            #[cfg(feature = "connectors-hdfs")]
             Store::Hdfs(config) => self.hdfs_store(ctx, config),
         }
     }
@@ -414,6 +419,7 @@ impl FileInput {
         Ok(())
     }
 
+    #[cfg(feature = "connectors-hdfs")]
     fn hdfs_store(&self, ctx: &SessionContext, config: &HdfsConfig) -> Result<(), Error> {
         let mut builder = HdfsObjectStoreBuilder::new().with_url(&config.url);
         if let Some(ha_config) = config.ha_config.as_ref().filter(|m| !m.is_empty()) {
@@ -430,18 +436,33 @@ impl FileInput {
     }
 
     async fn create_session_context(&self) -> Result<SessionContext, Error> {
-        let mut ctx = if let Some(ballista) = &self.config.ballista {
-            SessionContext::remote(&ballista.remote_url)
-                .await
-                .map_err(|e| Error::Process(format!("Create session context failed: {}", e)))?
-        } else {
-            SessionContext::new()
-        };
+        let mut ctx = self.new_session_context().await?;
 
         udf::init(&mut ctx)?;
         datafusion_functions_json::register_all(&mut ctx)
             .map_err(|e| Error::Process(format!("Registration JSON function failed: {}", e)))?;
         Ok(ctx)
+    }
+
+    /// Build the base session context: a remote Ballista context when
+    /// `ballista` is configured (requires the `connectors-sql` feature),
+    /// a local context otherwise. UDF/JSON function registration happens
+    /// on either kind in [`Self::create_session_context`].
+    async fn new_session_context(&self) -> Result<SessionContext, Error> {
+        #[cfg(feature = "connectors-sql")]
+        if let Some(ballista) = &self.config.ballista {
+            return SessionContext::remote(&ballista.remote_url)
+                .await
+                .map_err(|e| Error::Process(format!("Create session context failed: {}", e)));
+        }
+        #[cfg(not(feature = "connectors-sql"))]
+        if self.config.ballista.is_some() {
+            return Err(Error::Config(
+                "file input 'ballista' requires the 'connectors-sql' feature, which is not enabled in this build"
+                    .to_string(),
+            ));
+        }
+        Ok(SessionContext::new())
     }
 }
 

@@ -16,19 +16,20 @@ use arkflow_core::Error;
 pub mod avro_arrow;
 pub mod debezium;
 pub mod json;
+#[cfg(feature = "codecs-protobuf")]
 pub mod protobuf;
+#[cfg(feature = "codecs-protobuf")]
 pub mod schema_registry;
 
 fn register_components() -> Result<(), Error> {
-    crate::init_steps(
-        &COMPLETED,
-        &[
-            json::init,
-            protobuf::init,
-            debezium::init,
-            schema_registry::init,
-        ],
-    )
+    let mut steps: Vec<fn() -> Result<(), Error>> = Vec::new();
+    steps.push(json::init);
+    #[cfg(feature = "codecs-protobuf")]
+    steps.push(protobuf::init);
+    steps.push(debezium::init);
+    #[cfg(feature = "codecs-protobuf")]
+    steps.push(schema_registry::init);
+    crate::init_steps(&COMPLETED, &steps)
 }
 
 static COMPLETED: std::sync::Mutex<std::collections::BTreeSet<usize>> =

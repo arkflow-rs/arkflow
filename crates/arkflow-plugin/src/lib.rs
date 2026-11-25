@@ -20,11 +20,15 @@ pub mod context_pool;
 pub mod expr;
 pub mod http_util;
 pub mod input;
+#[cfg(feature = "connectors-kafka")]
 pub mod kafka_security;
+#[cfg(feature = "connectors-kafka")]
 pub mod kafka_txn;
+#[cfg(feature = "connectors-mqtt")]
 pub mod mqtt_tls;
 pub mod output;
 pub mod processor;
+#[cfg(feature = "connectors-pulsar")]
 pub mod pulsar;
 pub mod rate_limiter;
 pub mod retry;
@@ -32,6 +36,7 @@ pub mod sql_ident;
 pub mod temporary;
 pub mod time;
 pub mod udf;
+#[cfg(feature = "ai-vector")]
 pub mod vector_util;
 pub mod wal;
 

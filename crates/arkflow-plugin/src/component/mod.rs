@@ -14,6 +14,8 @@
 
 pub(crate) mod batch_merge;
 pub(crate) mod json;
+#[cfg(feature = "codecs-protobuf")]
 pub(crate) mod protobuf;
+#[cfg(feature = "connectors-redis")]
 pub(crate) mod redis;
 pub(crate) mod sql;

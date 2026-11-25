@@ -19,36 +19,49 @@
 use arkflow_core::Error;
 
 pub mod batch;
+#[cfg(feature = "ai-vector")]
 pub mod embedding;
 pub mod json;
+#[cfg(feature = "ai-vector")]
 pub mod llm;
 pub mod lookup;
+#[cfg(feature = "ai-vector")]
 pub mod milvus_search;
+#[cfg(feature = "ai-vector")]
 pub mod pgvector_search;
+#[cfg(feature = "codecs-protobuf")]
 pub mod protobuf;
+#[cfg(feature = "connectors-python")]
 pub mod python;
 pub mod sql;
+#[cfg(feature = "ai-vector")]
 pub mod vector_search;
+#[cfg(feature = "processors-vrl")]
 pub mod vrl;
 
 fn register_components() -> Result<(), Error> {
-    crate::init_steps(
-        &COMPLETED,
-        &[
-            batch::init,
-            json::init,
-            llm::init,
-            lookup::init,
-            pgvector_search::init,
-            protobuf::init,
-            sql::init,
-            vrl::init,
-            python::init,
-            embedding::init,
-            vector_search::init,
-            milvus_search::init,
-        ],
-    )
+    let mut steps: Vec<fn() -> Result<(), Error>> = Vec::new();
+    steps.push(batch::init);
+    steps.push(json::init);
+    #[cfg(feature = "ai-vector")]
+    steps.push(llm::init);
+    steps.push(lookup::init);
+    #[cfg(feature = "ai-vector")]
+    steps.push(pgvector_search::init);
+    #[cfg(feature = "codecs-protobuf")]
+    steps.push(protobuf::init);
+    steps.push(sql::init);
+    #[cfg(feature = "processors-vrl")]
+    steps.push(vrl::init);
+    #[cfg(feature = "connectors-python")]
+    steps.push(python::init);
+    #[cfg(feature = "ai-vector")]
+    steps.push(embedding::init);
+    #[cfg(feature = "ai-vector")]
+    steps.push(vector_search::init);
+    #[cfg(feature = "ai-vector")]
+    steps.push(milvus_search::init);
+    crate::init_steps(&COMPLETED, &steps)
 }
 
 static COMPLETED: std::sync::Mutex<std::collections::BTreeSet<usize>> =

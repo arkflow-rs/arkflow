@@ -22,39 +22,56 @@ pub mod codec_helper;
 pub mod drop;
 pub mod http;
 pub mod influxdb;
+#[cfg(feature = "connectors-kafka")]
 pub mod kafka;
+#[cfg(feature = "ai-vector")]
 pub mod milvus;
+#[cfg(feature = "connectors-mongodb")]
 pub mod mongodb;
+#[cfg(feature = "connectors-mqtt")]
 pub mod mqtt;
+#[cfg(feature = "connectors-nats")]
 pub mod nats;
 pub mod payload;
+#[cfg(feature = "ai-vector")]
 pub mod pgvector;
+#[cfg(feature = "connectors-pulsar")]
 pub mod pulsar;
+#[cfg(feature = "ai-vector")]
 pub mod qdrant;
+#[cfg(feature = "connectors-redis")]
 pub mod redis;
+#[cfg(feature = "connectors-sql")]
 pub mod sql;
 pub mod stdout;
 
 fn register_components() -> Result<(), Error> {
-    crate::init_steps(
-        &COMPLETED,
-        &[
-            drop::init,
-            http::init,
-            influxdb::init,
-            kafka::init,
-            milvus::init,
-            mqtt::init,
-            mongodb::init,
-            nats::init,
-            pgvector::init,
-            pulsar::init,
-            qdrant::init,
-            redis::init,
-            sql::init,
-            stdout::init,
-        ],
-    )
+    let mut steps: Vec<fn() -> Result<(), Error>> = Vec::new();
+    steps.push(drop::init);
+    steps.push(http::init);
+    steps.push(influxdb::init);
+    #[cfg(feature = "connectors-kafka")]
+    steps.push(kafka::init);
+    #[cfg(feature = "ai-vector")]
+    steps.push(milvus::init);
+    #[cfg(feature = "connectors-mqtt")]
+    steps.push(mqtt::init);
+    #[cfg(feature = "connectors-mongodb")]
+    steps.push(mongodb::init);
+    #[cfg(feature = "connectors-nats")]
+    steps.push(nats::init);
+    #[cfg(feature = "ai-vector")]
+    steps.push(pgvector::init);
+    #[cfg(feature = "connectors-pulsar")]
+    steps.push(pulsar::init);
+    #[cfg(feature = "ai-vector")]
+    steps.push(qdrant::init);
+    #[cfg(feature = "connectors-redis")]
+    steps.push(redis::init);
+    #[cfg(feature = "connectors-sql")]
+    steps.push(sql::init);
+    steps.push(stdout::init);
+    crate::init_steps(&COMPLETED, &steps)
 }
 
 static COMPLETED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
