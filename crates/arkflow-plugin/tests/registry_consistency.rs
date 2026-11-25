@@ -20,6 +20,24 @@
 use arkflow_core::component::{list_components_by_kind, ComponentKind};
 use std::collections::BTreeSet;
 
+/// Guard: this test asserts the FULL component inventory (registry,
+/// metadata, schemas, examples) and therefore only makes sense in a default
+/// all-families build. Under a reduced feature set it would report spurious
+/// drift, so refuse loudly with the fix instead (spec:
+/// `build-feature-gating`, generated-artifacts determinism).
+fn require_default_features() {
+    // `if`+`panic!` rather than `assert!`: under a default build the cfg!
+    // folds to a constant and clippy::assertions_on_constants would deny
+    // assert! with a constant condition.
+    if !cfg!(feature = "connectors-kafka") {
+        panic!(
+            "this gate asserts the full component inventory and must run with the \
+             default (all families) feature set; rebuild without --no-default-features \
+             (see the add-cargo-feature-gating change)"
+        );
+    }
+}
+
 fn builder_names(kind: ComponentKind) -> BTreeSet<String> {
     match kind {
         ComponentKind::Input => arkflow_core::input::registered_names(),
@@ -69,18 +87,5 @@ fn builder_and_metadata_registrations_are_aligned() {
         problems.is_empty(),
         "builder/metadata registry misalignment:\n{}",
         problems.join("\n")
-    );
-}
-/// Guard: this test asserts the FULL component inventory (registry,
-/// metadata, schemas, examples) and therefore only makes sense in a default
-/// all-families build. Under a reduced feature set it would report spurious
-/// drift, so refuse loudly with the fix instead (spec:
-/// `build-feature-gating`, generated-artifacts determinism).
-fn require_default_features() {
-    assert!(
-        cfg!(feature = "connectors-kafka"),
-        "this gate asserts the full component inventory and must run with the \
-         default (all families) feature set; rebuild without --no-default-features \
-         (see the add-cargo-feature-gating change)"
     );
 }

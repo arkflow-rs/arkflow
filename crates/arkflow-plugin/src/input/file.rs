@@ -38,6 +38,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "connectors-hdfs")]
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;

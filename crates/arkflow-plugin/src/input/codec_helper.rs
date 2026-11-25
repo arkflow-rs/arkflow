@@ -15,7 +15,9 @@
 //! Helper functions for codec integration in input components
 
 use arkflow_core::codec::Codec;
-use arkflow_core::{Bytes, Error, MessageBatch, MessageBatchRef};
+#[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+use arkflow_core::MessageBatchRef;
+use arkflow_core::{Bytes, Error, MessageBatch};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -159,6 +161,9 @@ pub async fn apply_codec_to_payloads(
 /// `read()` futures at any select! branch loss (idle ticks fire every
 /// 100ms) — with deliveries pre-decoded, a dropped read loses nothing.
 /// This is the `Input::read` cancellation-safety contract in arkflow-core.
+/// Gated with the families whose inputs use the delivery channel (nats,
+/// mqtt); unconditional inputs read without it.
+#[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
 pub(crate) enum Delivery {
     /// One decoded batch and the acknowledgement that settles it.
     Data(MessageBatchRef, Arc<dyn arkflow_core::input::Ack>),
@@ -170,6 +175,7 @@ pub(crate) enum Delivery {
 /// codec applied, input name stamped, ack paired. Decode failures become
 /// `Delivery::Err` so `read()` can surface them without claiming a slot
 /// first.
+#[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
 pub(crate) async fn decode_delivery(
     payload: &[u8],
     codec: &Option<Arc<dyn Codec>>,
@@ -417,6 +423,7 @@ mod tests {
         assert_eq!(batch.len(), 2);
     }
 
+    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
     #[tokio::test]
     async fn decode_delivery_without_codec_pairs_batch_and_ack() {
         let delivery = decode_delivery(

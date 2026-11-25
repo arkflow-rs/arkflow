@@ -42,12 +42,18 @@ pub mod sql;
 pub mod websocket;
 
 fn register_components() -> Result<(), Error> {
-    let mut steps: Vec<fn() -> Result<(), Error>> = Vec::new();
-    steps.push(generate::init);
-    steps.push(http::init);
+    // `mut` is exercised only when family features append their init steps;
+    // with every family off the vec is complete at construction.
+    #[allow(unused_mut)]
+    let mut steps: Vec<fn() -> Result<(), Error>> = vec![
+        generate::init,
+        http::init,
+        memory::init,
+        multiple_inputs::init,
+        file::init,
+    ];
     #[cfg(feature = "connectors-kafka")]
     steps.push(kafka::init);
-    steps.push(memory::init);
     #[cfg(feature = "connectors-mqtt")]
     steps.push(mqtt::init);
     #[cfg(feature = "connectors-nats")]
@@ -60,10 +66,8 @@ fn register_components() -> Result<(), Error> {
     steps.push(sql::init);
     #[cfg(feature = "connectors-websocket")]
     steps.push(websocket::init);
-    steps.push(multiple_inputs::init);
     #[cfg(feature = "connectors-modbus")]
     steps.push(modbus::init);
-    steps.push(file::init);
     crate::init_steps(&COMPLETED, &steps)
 }
 

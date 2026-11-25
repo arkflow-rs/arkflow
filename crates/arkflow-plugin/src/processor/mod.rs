@@ -40,17 +40,17 @@ pub mod vector_search;
 pub mod vrl;
 
 fn register_components() -> Result<(), Error> {
-    let mut steps: Vec<fn() -> Result<(), Error>> = Vec::new();
-    steps.push(batch::init);
-    steps.push(json::init);
+    // `mut` is exercised only when family features append their init steps;
+    // with every family off the vec is complete at construction.
+    #[allow(unused_mut)]
+    let mut steps: Vec<fn() -> Result<(), Error>> =
+        vec![batch::init, json::init, lookup::init, sql::init];
     #[cfg(feature = "ai-vector")]
     steps.push(llm::init);
-    steps.push(lookup::init);
     #[cfg(feature = "ai-vector")]
     steps.push(pgvector_search::init);
     #[cfg(feature = "codecs-protobuf")]
     steps.push(protobuf::init);
-    steps.push(sql::init);
     #[cfg(feature = "processors-vrl")]
     steps.push(vrl::init);
     #[cfg(feature = "connectors-python")]

@@ -22,11 +22,12 @@ pub mod protobuf;
 pub mod schema_registry;
 
 fn register_components() -> Result<(), Error> {
-    let mut steps: Vec<fn() -> Result<(), Error>> = Vec::new();
-    steps.push(json::init);
+    // `mut` is exercised only when family features append their init steps;
+    // with every family off the vec is complete at construction.
+    #[allow(unused_mut)]
+    let mut steps: Vec<fn() -> Result<(), Error>> = vec![json::init, debezium::init];
     #[cfg(feature = "codecs-protobuf")]
     steps.push(protobuf::init);
-    steps.push(debezium::init);
     #[cfg(feature = "codecs-protobuf")]
     steps.push(schema_registry::init);
     crate::init_steps(&COMPLETED, &steps)

@@ -69,6 +69,10 @@ pub(crate) fn is_loopback_url(base_url: &str) -> bool {
 /// Joins a configured base URL with a request path: the base loses any
 /// trailing slash, the path gains exactly one. `join_url_base("http://h/",
 /// "/x")` and `join_url_base("http://h", "x")` both yield `http://h/x`.
+/// Join a configured base URL with a path segment, tolerating either side
+/// carrying the separating slash. Used by the milvus client; gated with the
+/// family so reduced builds do not carry dead helpers.
+#[cfg(feature = "ai-vector")]
 pub(crate) fn join_url_base(base: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -84,6 +88,7 @@ pub(crate) fn join_url_base(base: &str, path: &str) -> String {
 /// buffered body text; error messages are byte-identical to the
 /// pre-retry single-shot paths ("{component} request failed: …" /
 /// "{component} returned {status}: {body}").
+#[cfg(feature = "ai-vector")]
 pub(crate) async fn send_with_retry(
     build: impl Fn() -> reqwest::RequestBuilder,
     retry_config: &crate::retry::RetryConfig,
@@ -155,6 +160,7 @@ mod tests {
         assert_eq!(truncate_body(&emoji).chars().count(), 512);
     }
 
+    #[cfg(feature = "ai-vector")]
     #[test]
     fn join_url_base_normalizes_slashes() {
         assert_eq!(

@@ -58,10 +58,12 @@ impl TemporaryConfig {
         if let Some(builder) = builders.get(&self.temporary_type) {
             builder.build(&self.config, resource)
         } else {
-            Err(Error::Config(crate::component::feature_hints::unknown_type_message(
-                "temporary",
-                &self.temporary_type,
-            )))
+            Err(Error::Config(
+                crate::component::feature_hints::unknown_type_message(
+                    "temporary",
+                    &self.temporary_type,
+                ),
+            ))
         }
     }
 }

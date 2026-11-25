@@ -7,10 +7,10 @@ use arkflow_core::{
     Error, MessageBatch, MessageBatchRef, ProcessResult, Resource,
 };
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::FieldRef;
 use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
 use datafusion::arrow::{array::*, datatypes::DataType};
 use datafusion::parquet::data_type::AsBytes;
-use datafusion::arrow::datatypes::FieldRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{error, warn};

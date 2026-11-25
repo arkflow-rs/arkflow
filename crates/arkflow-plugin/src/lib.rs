@@ -33,6 +33,7 @@ pub mod processor;
 pub mod pulsar;
 pub mod rate_limiter;
 pub mod retry;
+#[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
 pub mod sql_ident;
 pub mod temporary;
 pub mod time;

@@ -46,10 +46,11 @@ pub mod sql;
 pub mod stdout;
 
 fn register_components() -> Result<(), Error> {
-    let mut steps: Vec<fn() -> Result<(), Error>> = Vec::new();
-    steps.push(drop::init);
-    steps.push(http::init);
-    steps.push(influxdb::init);
+    // `mut` is exercised only when family features append their init steps;
+    // with every family off the vec is complete at construction.
+    #[allow(unused_mut)]
+    let mut steps: Vec<fn() -> Result<(), Error>> =
+        vec![drop::init, http::init, influxdb::init, stdout::init];
     #[cfg(feature = "connectors-kafka")]
     steps.push(kafka::init);
     #[cfg(feature = "ai-vector")]
@@ -70,7 +71,6 @@ fn register_components() -> Result<(), Error> {
     steps.push(redis::init);
     #[cfg(feature = "connectors-sql")]
     steps.push(sql::init);
-    steps.push(stdout::init);
     crate::init_steps(&COMPLETED, &steps)
 }
 

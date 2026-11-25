@@ -15,6 +15,7 @@ use arkflow_core::Error;
 /// Every cargo feature on this crate that gates a component family, in the
 /// order of `[features].default`. The tests below pin the hint table to
 /// these names so a renamed or removed feature cannot strand a stale hint.
+#[cfg(test)]
 pub(crate) const FAMILY_FEATURES: &[&str] = &[
     "connectors-sql",
     "connectors-kafka",
@@ -57,8 +58,14 @@ const HINTS: &[(&str, &str)] = &[
     ("vrl", "requires the 'processors-vrl' feature"),
     ("protobuf", "requires the 'codecs-protobuf' feature"),
     ("schema_registry", "requires the 'codecs-protobuf' feature"),
-    ("arrow_to_protobuf", "requires the 'codecs-protobuf' feature"),
-    ("protobuf_to_arrow", "requires the 'codecs-protobuf' feature"),
+    (
+        "arrow_to_protobuf",
+        "requires the 'codecs-protobuf' feature",
+    ),
+    (
+        "protobuf_to_arrow",
+        "requires the 'codecs-protobuf' feature",
+    ),
 ];
 
 /// Register one hint per gated type name. Called from `initialize()` ahead

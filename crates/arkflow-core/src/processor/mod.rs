@@ -131,10 +131,12 @@ impl ProcessorConfig {
         if let Some(builder) = builders.get(&self.processor_type) {
             builder.build(self.name.as_deref(), &self.config, resource)
         } else {
-            Err(Error::Config(crate::component::feature_hints::unknown_type_message(
-                "processor",
-                &self.processor_type,
-            )))
+            Err(Error::Config(
+                crate::component::feature_hints::unknown_type_message(
+                    "processor",
+                    &self.processor_type,
+                ),
+            ))
         }
     }
 }

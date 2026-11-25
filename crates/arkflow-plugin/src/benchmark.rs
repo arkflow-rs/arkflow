@@ -26,9 +26,13 @@
 
 #[cfg(feature = "codecs-protobuf")]
 use crate::codec::schema_registry::{FetchedSchema, SchemaRegistryCodec, SchemaResolver};
+#[cfg(feature = "codecs-protobuf")]
 use apache_avro::types::Value as AvroValue;
+#[cfg(feature = "codecs-protobuf")]
 use apache_avro::writer::datum::GenericDatumWriter;
+#[cfg(feature = "codecs-protobuf")]
 use apache_avro::Schema as AvroSchema;
+#[cfg(feature = "codecs-protobuf")]
 use arkflow_core::codec::Decoder;
 use arkflow_core::config::EngineConfig;
 use arkflow_core::executor::run_job;
@@ -39,7 +43,9 @@ use arkflow_core::processor::{
 };
 use arkflow_core::state::RedbStateBackend;
 use arkflow_core::state::StateBackend as _;
-use arkflow_core::{Bytes, Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
+#[cfg(feature = "codecs-protobuf")]
+use arkflow_core::Bytes;
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -322,6 +328,7 @@ impl SchemaResolver for InMemorySchemaResolver {
 
 /// Field types cycled by the wide-schema builder: the supported leaf kinds
 /// the flat Arrow mapping sees in real payloads (incl. one nullable union).
+#[cfg(feature = "codecs-protobuf")]
 const AVRO_FIELD_TYPES: [&str; 6] = [
     r#""long""#,
     r#""string""#,
@@ -672,6 +679,9 @@ async fn json_decode_w200(count: usize) -> Result<ScenarioResult, Error> {
 
 /// Runs every scenario once (helper for measurement loops).
 async fn run_each(count: usize) -> Result<Vec<ScenarioResult>, Error> {
+    // `mut` is only needed when the schema-registry scenarios are compiled
+    // in; under `codecs-protobuf`-less builds the vec is returned as built.
+    #[cfg_attr(not(feature = "codecs-protobuf"), allow(unused_mut))]
     let mut results = vec![
         linear_sql(count).await?,
         groupby_sql(count).await?,
