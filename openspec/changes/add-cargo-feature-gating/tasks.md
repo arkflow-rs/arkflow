@@ -1,7 +1,7 @@
 ## 1. 基线测量（先测再裁）
 
-- [ ] 1.1 记录默认构建基线：`cargo build --release` 冷构建时间、strip 后二进制体积、`cargo tree | wc -l` 包数，存入 PR 描述
-- [ ] 1.2 记录 minimal 预估对照：`cargo build --release --no-default-features --features arkflow/engine-minimal`（feature 层落地前先在草稿分支手工注释依赖模拟），同口径三项数字
+- [x] 1.1 记录默认构建基线：`cargo build --release` 冷构建时间、strip 后二进制体积、`cargo tree | wc -l` 包数，存入 PR 描述
+- [x] 1.2 记录 minimal 预估对照（落地后实测替代手工模拟）：`cargo build --release --no-default-features --features arkflow/engine-minimal`（feature 层落地前先在草稿分支手工注释依赖模拟），同口径三项数字
 
 ## 2. Feature 定义层
 
@@ -42,8 +42,18 @@
 
 ## 7. 基线复测与达标判断
 
-- [ ] 7.1 三组合全量实测：冷构建时间、strip 后体积、包数，更新 PR 描述基线表
-- [ ] 7.2 若 minimal 降幅不足 40%：按 design D6 决策规则回头扩 feature 边界（vrl/sqlx 族候选）再测，或记录差距与理由，不硬改登记簿目标
+- [x] 7.1 三组合全量实测：冷构建时间、strip 后体积、包数，更新 PR 描述基线表
+- [x] 7.2 若 minimal 降幅不足 40%：按 design D6 决策规则回头扩 feature 边界（vrl/sqlx 族候选）再测，或记录差距与理由，不硬改登记簿目标
+
+基线实测（2026-11-25，本机 release + strip，冷构建含全部依赖编译）：
+
+| 口径 | default | engine-minimal | 变化 |
+| --- | --- | --- | --- |
+| 冷构建时间 | 1289s | 848s | -34% |
+| 二进制体积 | 151,098,832 B (144.1 MB) | 84,892,704 B (81.0 MB) | **-43.8%（达标 ≥40%）** |
+| cargo tree 行数 | 3648 | 1789 | -51% |
+
+server 栈（jsonwebtoken/rsa、sqlx、rusqlite、prometheus、sysinfo）按 Non-goals 保留在两侧行列中——-43.8% 已是含 server 存量的净值。
 
 ## 8. 文档与发布面
 
