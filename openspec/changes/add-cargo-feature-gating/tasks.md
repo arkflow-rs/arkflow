@@ -64,6 +64,6 @@ server 栈（jsonwebtoken/rsa、sqlx、rusqlite、prometheus、sysinfo）按 Non
 
 ## 9. 全量门禁与评审
 
-- [ ] 9.1 本地三组合矩阵全绿 + `cargo test --workspace --all-targets`（默认特性集）+ `cargo clippy --workspace --all-targets` + rustfmt 全绿
+- [x] 9.1 本地三组合矩阵全绿 + `cargo test --workspace --all-targets`（默认特性集）+ `cargo clippy --workspace --all-targets` + rustfmt 全绿
 - [ ] 9.2 开 PR，跑 CodeRabbit 评审循环，逐条核实处置、线程清零（"Fixed in <sha>" 开头回复可自动解决）
 - [ ] 9.3 CI 全绿（含三个镜像构建）后交用户合并
