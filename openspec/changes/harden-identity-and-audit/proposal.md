@@ -12,7 +12,7 @@
 - **Observable audit write failures**:
   - Add a closed-label Prometheus counter `arkflow_audit_write_failures_total{category="..."}` on `CommandMetrics` (categories: `auth_denial`, `identity`, `job`, `approval`, `rollout`, `node`, `other`) exported via Hub `/metrics`.
   - Add `Hub::record_audit_best_effort(category, record)` and categorized `Hub::record_audit_event_for(category, record)` that increment the counter and emit a structured `tracing::warn!` (scalar metadata only, never credentials) whenever a configured durable store fails an audit write. Volatile Hubs without durable storage (`self.storage.is_none()`) do not count as write failures on best-effort paths.
-  - Route every `let _ = ...record_audit...` call site (`api/mod.rs`, `hub/identity.rs`, `hub/observability.rs`, `hub/job_pause.rs`, `hub/nodes.rs`, `hub/operations.rs`) and propagating audit sites (`hub/approval.rs`, `hub/rollout.rs`, `hub/job_orchestration.rs`) through the instrumented helpers.
+  - Route every standalone `let _ = ...record_audit...` call site (`api/mod.rs`, `hub/identity.rs`, `hub/observability.rs`, `hub/job_pause.rs`, `hub/nodes.rs`, `hub/operations.rs`) and propagating standalone audit sites (`hub/approval.rs`, `hub/rollout.rs`, `hub/job_orchestration.rs`) through the instrumented helpers (transactional audit inserts such as `replace_node_labels` fail and roll back their enclosing transaction directly).
   - Keep security denials (`401`/`403`) unaffected by audit write failure, and remove the duplicate `operator_principal` lookup in `operator_denied`.
 - **Atomic `create_user` with `INSERT` semantics and `409 Conflict`**:
   - Acquire `self.identity_write_lock` in `Hub::create_user`.
@@ -20,13 +20,13 @@
   - Add `HubError::UserAlreadyExists` and map it to `409 Conflict` (`user_already_exists`) in `api/users.rs`.
 - **Complete OIDC subject session revocation**:
   - Add fenced `StorageBackend::delete_sessions_by_oidc_subject` (SQLite + PostgreSQL) to delete unbound sessions (`user_id IS NULL`) whose principal id matches the OIDC subject.
-  - Revoke matching subject sessions on `create_user` (when binding `oidc_subject`), `save_user` (when binding/changing/clearing `oidc_subject`, disabling, or changing role/scopes), `delete_user` (atomically inside the delete transaction), and `revoke_user_tokens`.
+  - Revoke affected bound and unbound subject sessions atomically inside the storage transaction on `create_user` (when binding `oidc_subject`), `upsert_user` / `save_user` (when binding/changing/clearing `oidc_subject`, disabling, or changing role/scopes), and `delete_user`, as well as on `revoke_user_tokens`.
   - Add defense-in-depth in `Hub::resolve_session`: an unbound session (`user_id IS NULL`) is rejected immediately if `managed_users_only` is enabled, if its subject is now bound to any directory user, or if the lookup fails (fail-closed).
   - Pass explicit `bound_user_id` from `apply_federated_directory_with_binding` into `Hub::create_session_for_user` in `hub_oidc_callback` so an unbound OIDC `sub` can never collide with an unrelated local `user_id`.
   - Clean up the stale comment at `crates/arkflow-server/src/oidc.rs:40-42` (periodic JWKS refresh is already implemented).
 - **Approval segregation threat model**:
   - Keep the existing three-role RBAC model (`admin` / `operator` / `viewer`) unchanged.
-  - Explicitly document the threat boundary in `configuration-approval` spec and EN/ZH operator docs: the gate enforces two-principal four-eyes review (`approver_id != requester_id`) against accidental or operator self-approval, does not prevent a malicious admin who holds `ManageUsers` from creating a second identity, and relies on the actor-attributed audit trail and/or external OIDC identity governance for admin-collusion defense.
+  - Explicitly document the threat boundary in `configuration-approval` spec and EN/ZH operator docs: the gate enforces two-principal four-eyes review (`approver_id != requester_id`) against accidental or operator self-approval, does not prevent any malicious admin (static, directory-managed, or OIDC-authenticated) who holds `ManageUsers` from creating a second local user and credential to self-approve, and relies on external review/alerting over the actor-attributed audit trail (with any local issuance restriction enforced externally by operators).
   - Add regression tests verifying direct self-approval rejection and cross-admin approval with complete actor-attributed audit records (`user.create`, `credential.create`, `config_approval.submit`, `config_approval.approve`).
 
 ## Non-goals

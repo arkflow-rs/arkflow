@@ -377,8 +377,8 @@ subject 的联邦令牌若 `iat` 更早(60 秒时钟偏斜容差)会被拒绝。
   `credential.rotate` 与 `credential.revoke`,只含标量元数据。拒绝记录以同一动作
   写入 `outcome=rejected`,带真实 actor,并把稳定的问题码作为 `failure_code`
   (例如 `last_admin_required`、`user_already_exists`、`credential_limit`、
-  `user_not_found`)。配置了持久化存储的 Hub 写审计失败时会递增 `/metrics` 上的
-  `arkflow_audit_write_failures_total{category}` 并记录告警日志,不会静默丢弃。
+  `user_not_found`)。配置了持久化存储的 Hub 写独立审计记录失败时会递增 `/metrics` 上
+  的 `arkflow_audit_write_failures_total{category}` 并记录告警日志,不会静默丢弃。
 
 | 状态 | 错误码 | 何时出现 |
 |------|--------|----------|

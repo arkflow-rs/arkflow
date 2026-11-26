@@ -250,22 +250,6 @@ impl Hub {
             return Err(HubError::UserLimit);
         }
         let created = storage.create_user(user).await.map_err(HubError::from)?;
-        // Any browser session previously minted for this OIDC subject while
-        // unbound carries stale IdP claims and `user_id = NULL`; revoke it so
-        // the directory record takes effect immediately.
-        if let Some(subject) = created.oidc_subject.as_deref() {
-            let removed = storage
-                .delete_sessions_by_oidc_subject(subject)
-                .await
-                .map_err(HubError::from)?;
-            if removed > 0 {
-                tracing::info!(
-                    user_id = %created.user_id,
-                    sessions = removed,
-                    "revoked unbound OIDC sessions after binding subject to new user"
-                );
-            }
-        }
         self.record_identity_audit(
             "user.create",
             actor,
@@ -279,7 +263,9 @@ impl Hub {
 
     /// Replace an existing user record. The last enabled admin cannot be
     /// disabled, deleted, or demoted unless a static break-glass credential
-    /// exists.
+    /// exists. Affected durable sessions (for `user_id` and affected OIDC
+    /// subjects) are revoked atomically in the same storage transaction as the
+    /// user update.
     pub async fn save_user(&self, user: UserRecord, actor: &str) -> Result<UserRecord, HubError> {
         let storage = self.identity_storage()?.clone();
         // Serialize the reachability check with the write: two concurrent
@@ -298,44 +284,6 @@ impl Hub {
         self.ensure_admin_reachability(&current, &next, &storage)
             .await?;
         let saved = storage.upsert_user(next).await.map_err(HubError::from)?;
-        // Role, scopes, disabled state, and OIDC subject bindings govern
-        // stored session principals (`resolve_session` returns the recorded
-        // `principal_json`), so changing any of them must revoke both bound
-        // sessions (`user_id`) and any pre-existing unbound OIDC sessions
-        // (`user_id IS NULL`) matching the affected subject(s).
-        let authz_changed = current.role != saved.role || current.scopes_json != saved.scopes_json;
-        let subject_changed = current.oidc_subject != saved.oidc_subject;
-        let newly_disabled = saved.disabled && !current.disabled;
-        let mut removed = 0usize;
-        if authz_changed || subject_changed || newly_disabled {
-            removed += storage
-                .delete_user_sessions(&saved.user_id)
-                .await
-                .map_err(HubError::from)?;
-        }
-        if let Some(subject) = saved.oidc_subject.as_deref() {
-            if subject_changed || authz_changed || saved.disabled {
-                removed += storage
-                    .delete_sessions_by_oidc_subject(subject)
-                    .await
-                    .map_err(HubError::from)?;
-            }
-        }
-        if let Some(previous_subject) = current.oidc_subject.as_deref() {
-            if subject_changed {
-                removed += storage
-                    .delete_sessions_by_oidc_subject(previous_subject)
-                    .await
-                    .map_err(HubError::from)?;
-            }
-        }
-        if removed > 0 {
-            tracing::info!(
-                user_id = %saved.user_id,
-                sessions = removed,
-                "revoked durable sessions after a user identity or authorization change"
-            );
-        }
         self.record_identity_audit(
             "user.update",
             actor,

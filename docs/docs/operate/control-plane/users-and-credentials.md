@@ -240,9 +240,9 @@ problem code as `failure_code` (for example `last_admin_required`,
 store — validation errors such as an invalid user id or an unknown role — is
 also recorded as rejected. Authorization denials (missing credential, or a
 principal without `manage_users`) are audited by the generic authorization
-rejection path instead. When a Hub with durable storage fails to persist an
-audit record, the failure is never silent: it logs a warning (scalar metadata
-only) and increments `arkflow_audit_write_failures_total{category}` on
+rejection path instead. When a Hub with durable storage fails to persist a
+standalone audit record, the failure is never silent: it logs a warning (scalar
+metadata only) and increments `arkflow_audit_write_failures_total{category}` on
 `/api/v1/metrics`, while security denials still return `401`/`403`. Query the
 trail at `GET /api/v1/audit`.
 

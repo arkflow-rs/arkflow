@@ -503,9 +503,9 @@ Behavioral invariants:
   A rejection writes the same action with `outcome=rejected`, the real actor,
   and the stable problem code as `failure_code` (for example
   `last_admin_required`, `user_already_exists`, `credential_limit`,
-  `user_not_found`). Audit persistence failures against a configured durable
-  store increment `arkflow_audit_write_failures_total{category}` on `/metrics`
-  and emit a warning log rather than failing silently.
+  `user_not_found`). Standalone audit persistence failures against a configured
+  durable store increment `arkflow_audit_write_failures_total{category}` on
+  `/metrics` and emit a warning log rather than failing silently.
 
 | Status | Code | When |
 |--------|------|------|

@@ -2764,6 +2764,9 @@ impl StorageBackend for PostgresBackend {
             )
             .await
             .map_err(map_postgres_user_write_error)?;
+        if let Some(subject) = user_for_row.oidc_subject.as_deref() {
+            pg_delete_unbound_sessions_by_subject(&mut transaction, subject).await?;
+        }
         transaction.commit().await?;
         Ok(user_for_row)
     }
@@ -2771,6 +2774,14 @@ impl StorageBackend for PostgresBackend {
     async fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
         let mut transaction = self.begin().await?;
         let user_for_row = user.clone();
+        let previous: Option<UserRecord> = transaction
+            .query_row(
+                &q("SELECT user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms FROM cp_users WHERE user_id = ?1"),
+                binds![user.user_id.as_str()],
+                row_to_user_pg,
+            )
+            .await
+            .optional()?;
         transaction
             .execute(
                 &q("INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, role=excluded.role, scopes_json=excluded.scopes_json, disabled=excluded.disabled, oidc_subject=excluded.oidc_subject, tokens_valid_after_ms=excluded.tokens_valid_after_ms, created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms"),
@@ -2788,6 +2799,35 @@ impl StorageBackend for PostgresBackend {
             )
             .await
             .map_err(map_postgres_user_write_error)?;
+        let authz_changed = previous.as_ref().is_some_and(|p| {
+            p.role != user_for_row.role || p.scopes_json != user_for_row.scopes_json
+        });
+        let subject_changed = previous
+            .as_ref()
+            .is_some_and(|p| p.oidc_subject != user_for_row.oidc_subject);
+        let newly_disabled = user_for_row.disabled && previous.as_ref().is_none_or(|p| !p.disabled);
+        let is_new_insert = previous.is_none();
+        if authz_changed || subject_changed || newly_disabled {
+            transaction
+                .execute(
+                    &q("DELETE FROM cp_sessions WHERE user_id = ?1"),
+                    binds![user_for_row.user_id.as_str()],
+                )
+                .await?;
+        }
+        if let Some(subject) = user_for_row.oidc_subject.as_deref() {
+            if is_new_insert || subject_changed || authz_changed || user_for_row.disabled {
+                pg_delete_unbound_sessions_by_subject(&mut transaction, subject).await?;
+            }
+        }
+        if let Some(prev_subject) = previous
+            .as_ref()
+            .and_then(|p| p.oidc_subject.as_deref())
+        {
+            if subject_changed {
+                pg_delete_unbound_sessions_by_subject(&mut transaction, prev_subject).await?;
+            }
+        }
         transaction.commit().await?;
         Ok(user_for_row)
     }
@@ -2810,23 +2850,7 @@ impl StorageBackend for PostgresBackend {
             .execute(&q("DELETE FROM cp_sessions WHERE user_id = ?1"), binds![user_id])
             .await?;
         if let Some(subject) = oidc_subject.as_deref() {
-            let rows: Vec<(String, String)> = transaction
-                .query_all(
-                    &q("SELECT session_hash, principal_json FROM cp_sessions WHERE user_id IS NULL"),
-                    binds![],
-                    |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
-                )
-                .await?;
-            for (session_hash, principal_json) in rows {
-                if super::session_principal_matches_subject(&principal_json, subject) {
-                    transaction
-                        .execute(
-                            &q("DELETE FROM cp_sessions WHERE session_hash = ?1"),
-                            binds![session_hash],
-                        )
-                        .await?;
-                }
-            }
+            pg_delete_unbound_sessions_by_subject(&mut transaction, subject).await?;
         }
         let changed = transaction
             .execute(&q("DELETE FROM cp_users WHERE user_id = ?1"), binds![user_id])
@@ -3038,25 +3062,7 @@ impl StorageBackend for PostgresBackend {
         oidc_subject: &str,
     ) -> Result<usize, StorageError> {
         let mut transaction = self.begin().await?;
-        let rows: Vec<(String, String)> = transaction
-            .query_all(
-                &q("SELECT session_hash, principal_json FROM cp_sessions WHERE user_id IS NULL"),
-                binds![],
-                |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
-            )
-            .await?;
-        let mut deleted = 0usize;
-        for (session_hash, principal_json) in rows {
-            if super::session_principal_matches_subject(&principal_json, oidc_subject) {
-                let changed = transaction
-                    .execute(
-                        &q("DELETE FROM cp_sessions WHERE session_hash = ?1"),
-                        binds![session_hash],
-                    )
-                    .await?;
-                deleted += changed as usize;
-            }
-        }
+        let deleted = pg_delete_unbound_sessions_by_subject(&mut transaction, oidc_subject).await?;
         transaction.commit().await?;
         Ok(deleted)
     }
@@ -3446,5 +3452,31 @@ fn map_postgres_user_write_error(error: StorageError) -> StorageError {
     } else {
         error
     }
+}
+
+async fn pg_delete_unbound_sessions_by_subject(
+    transaction: &mut PgTx,
+    oidc_subject: &str,
+) -> Result<usize, StorageError> {
+    let rows: Vec<(String, String)> = transaction
+        .query_all(
+            &q("SELECT session_hash, principal_json FROM cp_sessions WHERE user_id IS NULL"),
+            binds![],
+            |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+        )
+        .await?;
+    let mut deleted = 0usize;
+    for (session_hash, principal_json) in rows {
+        if super::session_principal_matches_subject(&principal_json, oidc_subject) {
+            let changed = transaction
+                .execute(
+                    &q("DELETE FROM cp_sessions WHERE session_hash = ?1"),
+                    binds![session_hash],
+                )
+                .await?;
+            deleted += changed as usize;
+        }
+    }
+    Ok(deleted)
 }
 

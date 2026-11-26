@@ -27,13 +27,13 @@
 
 - **No schema migration needed**: Unbound OIDC browser sessions already have `cp_sessions.user_id IS NULL` and `principal_json` carrying `OperatorPrincipal { id: "<oidc_subject>", ... }`. Bound sessions carry `user_id = Some("<user_id>")` and are already deleted by `DELETE FROM cp_sessions WHERE user_id = ?1`.
 - **Prevent `sub` ↔ `user_id` collision on login**: Split `apply_federated_directory` into `apply_federated_directory_with_binding(...) -> Option<(OperatorPrincipal, Option<String>)>` returning `Some(user.user_id)` only when matched via `cp_users.oidc_subject` and `None` when unbound. `hub_oidc_callback` passes that explicit `bound_user_id` into `Hub::create_session_for_user(principal, bound_user_id)`. Existing `Hub::create_session(principal)` stays compatible for direct callers/tests.
-- **Write-side revocation (`delete_sessions_by_oidc_subject`)**:
-  - Add fenced `delete_sessions_by_oidc_subject(oidc_subject: &str) -> Result<usize, StorageError>` to `StorageBackend` (SQLite + PostgreSQL): inside a transaction, selects `(session_hash, principal_json)` from `cp_sessions WHERE user_id IS NULL`, parses `OperatorPrincipal`, and deletes matching `session_hash` rows.
-  - Invoke on:
-    - `create_user`: if `created.oidc_subject` is `Some(sub)`.
-    - `save_user`: revoke `user_id` sessions on disable/role/scope/oidc_subject change; revoke `oidc_subject` sessions for any newly bound/changed/cleared subject or when a bound user is disabled or has authorization changed.
-    - `delete_user`: inside the storage transaction, read `oidc_subject` before deleting from `cp_users` and delete matching unbound sessions in the same transaction alongside `cp_credentials` and `user_id` sessions.
-    - `revoke_user_tokens`: delete both `user_id` sessions and `oidc_subject` unbound sessions and sum the count.
+- **Write-side revocation (atomic in-transaction + `delete_sessions_by_oidc_subject`)**:
+  - Add fenced `delete_sessions_by_oidc_subject(oidc_subject: &str) -> Result<usize, StorageError>` to `StorageBackend` (SQLite + PostgreSQL) and shared in-transaction helpers (`sqlite_delete_unbound_sessions_by_subject` / `pg_delete_unbound_sessions_by_subject`): inside a transaction, selects `(session_hash, principal_json)` from `cp_sessions WHERE user_id IS NULL`, parses `OperatorPrincipal`, and deletes matching `session_hash` rows.
+  - Execute atomically inside the storage transaction on:
+    - `create_user`: if `user.oidc_subject` is `Some(sub)`, delete matching unbound sessions before commit so a session-delete failure rolls back the `cp_users` insert.
+    - `upsert_user` (`save_user`): read previous `cp_users` row inside the transaction, apply the upsert, and revoke `user_id` sessions on disable/role/scope/oidc_subject change plus `oidc_subject` unbound sessions for any newly bound/changed/cleared subject or when a bound user is disabled or has authorization changed — all before commit so failure never leaves committed user changes with live stale sessions.
+    - `delete_user`: read `oidc_subject` before deleting from `cp_users` and delete matching unbound sessions in the same transaction alongside `cp_credentials` and `user_id` sessions.
+  - On `revoke_user_tokens`: delete both `user_id` sessions and `oidc_subject` unbound sessions and sum the count.
 - **Read-side defense-in-depth (`Hub::resolve_session`)**:
   - When `record.user_id` is `None`:
     - If `self.oidc` has `managed_users_only == true`, return `None`.
@@ -45,5 +45,5 @@
 - Keep `OperatorRole::{Admin, Operator, Viewer}` and `OperatorAction::ALL` unchanged.
 - Document in `openspec/specs/configuration-approval/spec.md`, `docs/docs/operate/control-plane/reconciliation.md`, `docs/docs/operate/control-plane/users-and-credentials.md`, and their `zh-Hans` counterparts:
   - Segregation prevents accidental self-approval and operator→admin self-promotion (`approver_id != requester_id`, `ApproveRollouts` admin-only).
-  - Because `admin` holds both `ManageUsers` and `ApproveRollouts` (and static `ARKFLOW_OPERATOR_TOKEN` is break-glass), a malicious admin can mint a second identity; the Hub does not enforce anti-collusion in software. Defense against admin collusion relies on external audit review (all user/credential/approval events record the real actor) and/or managing admin identities exclusively in an external IdP.
+  - Because `admin` holds both `ManageUsers` and `ApproveRollouts` (and static `ARKFLOW_OPERATOR_TOKEN` is break-glass), a malicious admin — whether static, directory-managed, or OIDC-authenticated — can create a second local user and credential to self-approve; the Hub does not enforce anti-collusion in software. Detection relies on external review and alerting over the actor-attributed audit trail (`user.create`, `credential.create`, `config_approval.submit`, `config_approval.approve`), and any policy restricting local user/credential issuance must be enforced externally by operators.
 - Lock both behaviors (direct self-approval rejected; distinct second admin approved with full audit attribution) in API/Hub tests.

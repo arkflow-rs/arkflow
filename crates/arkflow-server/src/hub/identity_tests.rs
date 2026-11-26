@@ -1015,3 +1015,106 @@ async fn audit_write_failures_are_counted_without_affecting_volatile_hubs() {
         "volatile Hub must not emit audit write failure counters"
     );
 }
+
+/// If session deletion fails during `create_user` or `save_user`, the user
+/// row mutation must roll back in the same transaction so a partial commit can
+/// never leave stale sessions valid or blind a subsequent retry.
+#[tokio::test]
+async fn identity_write_and_session_revocation_roll_back_atomically() {
+    use crate::api_contract::{OperatorPrincipal, OperatorRole};
+
+    let backend = crate::storage::SqliteBackend::in_memory().unwrap();
+    let store = ControlPlaneStore::Sqlite(backend.clone());
+    let hub = Hub::with_storage(config(true), StorageActor::start(store, 8));
+
+    // Seed an existing bound user + bound session, and an unbound OIDC session
+    // for a subject that will be bound via `create_user`.
+    let mut alice = user("alice", "operator");
+    alice.oidc_subject = Some("sub-a".into());
+    hub.create_user(alice, "admin").await.unwrap();
+    let alice_session = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "alice".into(),
+                roles: vec![OperatorRole::Operator],
+                scopes: Vec::new(),
+            },
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    let bob_unbound_session = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "sub-bob".into(),
+                roles: vec![OperatorRole::Operator],
+                scopes: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Inject a failure on any `DELETE FROM cp_sessions`.
+    backend
+        .with_connection(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER fail_session_delete BEFORE DELETE ON cp_sessions \
+                 BEGIN SELECT RAISE(ABORT, 'injected session delete failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // 1. `save_user` changing subject + role fails AND rolls back `cp_users`.
+    let mut updated_alice = hub.user("alice").await.unwrap().unwrap();
+    updated_alice.oidc_subject = Some("sub-b".into());
+    updated_alice.role = "viewer".into();
+    assert!(
+        hub.save_user(updated_alice.clone(), "admin").await.is_err(),
+        "save_user must fail when session revocation fails"
+    );
+    let stored_alice = hub.user("alice").await.unwrap().unwrap();
+    assert_eq!(
+        stored_alice.oidc_subject.as_deref(),
+        Some("sub-a"),
+        "failed session revocation must roll back the oidc_subject update"
+    );
+    assert_eq!(
+        stored_alice.role, "operator",
+        "failed session revocation must roll back the role update"
+    );
+
+    // 2. `create_user` with a bound OIDC subject fails AND rolls back the insert
+    //    (so no committed user is left without an accepted audit record).
+    let mut bob = user("bob", "viewer");
+    bob.oidc_subject = Some("sub-bob".into());
+    assert!(
+        hub.create_user(bob.clone(), "admin").await.is_err(),
+        "create_user must fail when unbound session cleanup fails"
+    );
+    assert!(
+        hub.user("bob").await.unwrap().is_none(),
+        "failed unbound session cleanup must roll back the user insert"
+    );
+
+    // Clear the injected fault: retrying the exact same mutations now succeeds
+    // and revokes both the bound and unbound sessions cleanly.
+    backend
+        .with_connection(|connection| {
+            connection.execute_batch("DROP TRIGGER fail_session_delete;")?;
+            Ok(())
+        })
+        .unwrap();
+
+    hub.save_user(updated_alice, "admin").await.unwrap();
+    assert!(
+        hub.resolve_session(&alice_session).await.is_none(),
+        "retry after rollback must revoke alice's old bound session"
+    );
+    hub.create_user(bob, "admin").await.unwrap();
+    assert!(
+        hub.resolve_session(&bob_unbound_session).await.is_none(),
+        "retry after rollback must revoke bob's old unbound session"
+    );
+}

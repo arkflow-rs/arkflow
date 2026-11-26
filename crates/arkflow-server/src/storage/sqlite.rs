@@ -3371,8 +3371,10 @@ impl SqliteBackend {
     }
 
     /// Insert a new user without overwriting an existing row on `user_id`
-    /// conflict. Distinguishes primary-key conflicts (`UserAlreadyExists`)
-    /// from unique OIDC subject conflicts (`OidcSubjectConflict`).
+    /// conflict, and atomically revoke any unbound (`user_id IS NULL`) OIDC
+    /// browser sessions for its bound `oidc_subject` in the same transaction.
+    /// Distinguishes primary-key conflicts (`UserAlreadyExists`) from unique
+    /// OIDC subject conflicts (`OidcSubjectConflict`).
     pub fn create_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
         self.immediate_transaction(|connection| {
             connection
@@ -3391,12 +3393,30 @@ impl SqliteBackend {
                     ],
                 )
                 .map_err(map_sqlite_user_write_error)?;
+            if let Some(subject) = user.oidc_subject.as_deref() {
+                sqlite_delete_unbound_sessions_by_subject(connection, subject)?;
+            }
             Ok(user)
         })
     }
 
+    /// Upsert a user record and atomically revoke affected durable sessions in
+    /// the same transaction whenever authorization (`role`/`scopes_json`),
+    /// `oidc_subject` binding, or `disabled` status changes. Either the user
+    /// mutation and all required session revocations commit together, or both
+    /// roll back — eliminating partial-commit states that retries cannot heal.
     pub fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
         self.immediate_transaction(|connection| {
+            let previous: Option<UserRecord> = connection
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM cp_users WHERE user_id = ?1",
+                        Self::USER_COLUMNS
+                    ),
+                    [user.user_id.as_str()],
+                    row_to_user,
+                )
+                .optional()?;
             connection
                 .execute(
                     "INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, role=excluded.role, scopes_json=excluded.scopes_json, disabled=excluded.disabled, oidc_subject=excluded.oidc_subject, tokens_valid_after_ms=excluded.tokens_valid_after_ms, created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms",
@@ -3413,6 +3433,33 @@ impl SqliteBackend {
                     ],
                 )
                 .map_err(map_sqlite_user_write_error)?;
+            let authz_changed = previous
+                .as_ref()
+                .is_some_and(|p| p.role != user.role || p.scopes_json != user.scopes_json);
+            let subject_changed = previous
+                .as_ref()
+                .is_some_and(|p| p.oidc_subject != user.oidc_subject);
+            let newly_disabled = user.disabled && previous.as_ref().is_none_or(|p| !p.disabled);
+            let is_new_insert = previous.is_none();
+            if authz_changed || subject_changed || newly_disabled {
+                connection.execute(
+                    "DELETE FROM cp_sessions WHERE user_id = ?1",
+                    [user.user_id.as_str()],
+                )?;
+            }
+            if let Some(subject) = user.oidc_subject.as_deref() {
+                if is_new_insert || subject_changed || authz_changed || user.disabled {
+                    sqlite_delete_unbound_sessions_by_subject(connection, subject)?;
+                }
+            }
+            if let Some(prev_subject) = previous
+                .as_ref()
+                .and_then(|p| p.oidc_subject.as_deref())
+            {
+                if subject_changed {
+                    sqlite_delete_unbound_sessions_by_subject(connection, prev_subject)?;
+                }
+            }
             Ok(user)
         })
     }

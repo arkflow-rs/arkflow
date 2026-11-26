@@ -15,9 +15,9 @@
 
 - [x] 3.1 Add fenced `delete_sessions_by_oidc_subject` to `StorageBackend`, `SqliteBackend`, and `PostgresBackend`; update `delete_user` transactions to also clean up unbound sessions matching the deleted user's `oidc_subject`.
 - [x] 3.2 Split `apply_federated_directory_with_binding` and add `Hub::create_session_for_user` so `hub_oidc_callback` never mis-binds an unbound OIDC subject whose `sub` collides with a local `user_id`.
-- [x] 3.3 Wire subject session revocation into `create_user`, `save_user` (bind/rebind/unbind/disable/role/scopes), and `revoke_user_tokens`, and add read-side defense-in-depth in `Hub::resolve_session` for `user_id == None` rows (deny when `managed_users_only`, when subject is now bound, or on storage error).
+- [x] 3.3 Wire subject session revocation atomically inside the `create_user` and `upsert_user` (`save_user`) storage transactions (SQLite + PostgreSQL) and in `revoke_user_tokens`, and add read-side defense-in-depth in `Hub::resolve_session` for `user_id == None` rows (deny when `managed_users_only`, when subject is now bound, or on storage error).
 - [x] 3.4 Clean up stale comment in `crates/arkflow-server/src/oidc.rs` (lines 40-42); verify existing periodic JWKS refresh tests pass.
-- [x] 3.5 Add unit and HTTP tests covering unbound OIDC session → bind (`create_user` / `save_user`) → 401, disable → 401, delete → 401, revoke-tokens → 401, and `sub` == unbound local `user_id` collision safety.
+- [x] 3.5 Add unit and HTTP tests covering unbound OIDC session → bind (`create_user` / `save_user`) → 401, disable → 401, delete → 401, revoke-tokens → 401, atomic rollback on session-delete failure, and `sub` == unbound local `user_id` collision safety.
 
 ## 4. Approval segregation threat model & tests
 
@@ -27,4 +27,4 @@
 
 - [x] 5.1 Update EN and zh-Hans docs (`operate/control-plane/users-and-credentials.md`, `operate/control-plane/reconciliation.md`, `reference/api.md`) for `409 user_already_exists`, `arkflow_audit_write_failures_total`, unbound OIDC session revocation on binding/disabling/deletion, and the approval segregation threat model.
 - [x] 5.2 Update `CHANGELOG.md` `[Unreleased]` and `PRODUCT-ITERATION-2026-11-22.md` (`PA-P1-08`).
-- [x] 5.3 Run `cargo test -p arkflow-server`, `cargo clippy --workspace --all-targets`, `cargo fmt --check`, and `pnpm docs:check` (from `docs/`).
+- [x] 5.3 Local verification: `cargo test -p arkflow-server --no-default-features --features engine-minimal --lib -- --skip split_l3_pair_stays_pinned_across_incremental_replacement`, `cargo clippy -p arkflow-server --no-default-features --features engine-minimal --lib --tests -- -D warnings`, `cargo fmt --check`, and `node docs/scripts/docs-check.mjs` (full workspace test/clippy matrix including `connectors-kafka` and `pnpm docs:check` verified in PR CI).

@@ -191,8 +191,8 @@ OIDC 登录流会创建 8 小时的服务端会话 cookie(`arkflow_session`)。H
 `user_already_exists`、`credential_limit`、`user_not_found`、
 `oidc_subject_conflict`)。尚未到达身份存储就失败的变更——例如用户 id 非法、角色未
 知等校验错误——同样记为 rejected。而授权拒绝(缺少凭证,或主体没有 `manage_users`)
-由通用授权拒绝路径审计。当配置了持久化存储的 Hub 写审计失败时，不会静默吞错：会记
-录告警日志(仅标量元数据)并递增 `/api/v1/metrics` 上的
+由通用授权拒绝路径审计。当配置了持久化存储的 Hub 写独立审计记录失败时，不会静默吞
+错：会记录告警日志(仅标量元数据)并递增 `/api/v1/metrics` 上的
 `arkflow_audit_write_failures_total{category}`，同时安全拒绝仍按原语义返回
 `401`/`403`。可在 `GET /api/v1/audit` 查询审计轨迹。
 
