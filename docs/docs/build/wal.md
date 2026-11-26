@@ -244,6 +244,72 @@ On a modern CPU at zstd-3, expect ~5-10% single-core utilization for
 ~70% storage reduction. Use `lz4` for CPU-bound workloads, `zstd-9` for
 storage-bound workloads.
 
+## Dimension 4: Segment Retention & Reclamation
+
+Without reclamation, sealed S3 WAL segments and `manifest.json` grow without
+bound, and restarts spend increasing time listing and downloading historical
+segments. The `retention` block controls automatic reclamation of sealed
+segments that are wholly behind the committed reclaim floor.
+
+```yaml validate=fragment wrap=durability
+durability:
+  backend:
+    type: object_store
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
+    retention:
+      enabled: true        # default: true
+      max_segments: 16     # optional: max acknowledged sealed segments to keep
+      max_age: "24h"       # optional: max age (supports ms, s, m, h, d, e.g. "1h30m")
+      max_bytes: 67108864  # optional: max total bytes across kept acknowledged segments
+```
+
+### Default Policy & Multi-Cap Semantics
+
+- **Default (`retention` omitted, or `enabled: true` with all three caps unset):**
+  ArkFlow reclaims **every** eligible acknowledged sealed segment immediately on
+  the background reclaim loop (matching local `redb` WAL reclamation).
+- **Explicit caps (`max_segments`, `max_age`, `max_bytes`):** When one or more
+  caps are configured, only those configured caps apply. Eligible segments are
+  evaluated newest-to-oldest and retention stops at the first violated cap,
+  keeping a contiguous newest suffix without leaving history gaps.
+- **Disabled (`enabled: false`):** No segments are deleted by ArkFlow (useful
+  when delegating archival or expiration to S3 bucket lifecycle rules).
+
+### Safety & Crash-Recovery Guarantees
+
+- **Rewind-safe boundary:** Only sealed segments in `sealed_segments` whose
+  `last_seq <= min(manifest.cursor, reclaimable_hwm)` are eligible.
+  `reclaimable_hwm` advances to `seq - 1` only after the wrapped source commit
+  succeeds (`mark_committed(seq)`), matching the local `redb` backend so an
+  in-flight `rewind_cursor` or `Wal::undo(seq)` can never lose its segment.
+  Unacknowledged segments and the newest `active_segment` are never deleted.
+- **Manifest-first crash safety:** Reclamation runs on a dedicated, cancellable
+  background loop (decoupled from segment sealing so slow S3 deletes never
+  delay acknowledgements or stall `close()`):
+  1. ETag-coordinated manifest update moves eligible segments from
+     `sealed_segments` into `pending_deletes`.
+  2. Best-effort bounded S3 `DELETE` removes queued objects (`NotFound` is
+     idempotent).
+  3. ETag-coordinated manifest update removes confirmed deletions from
+     `pending_deletes`.
+- **Fast recovery:** `manifest.json` records per-segment sequence bounds, size,
+  and seal time (`segment_meta`, backward-compatible schema v2). On restart,
+  `recover()`, `read_after_cursor()`, and `read_after()` skip `GET` requests
+  for `pending_deletes` and for any segment with `last_seq <= manifest.cursor`,
+  downloading only unacknowledged (or unindexed legacy/LIST-fallback) segments.
+
+### Object-Storage Cost Model
+
+| Cost Component | Behavior with Retention Enabled |
+| --- | --- |
+| **Stored bytes** | Under the default policy, bounded to active unacknowledged segments plus `active_segment` (1 sealed segment). With explicit caps, bounded to `active + unacknowledged + min(max_segments, max_age × seal_rate, max_bytes)`. |
+| **DELETE requests** | Standard `DELETE` requests are free on AWS S3 (and most S3-compatible stores); capped at 64 objects per sweep so backlogs drain smoothly. |
+| **Manifest PUTs** | Active reclaim sweeps that deregister and delete objects add 2 small manifest PUTs (deregister + cleanup). Idle sweeps perform **0** manifest PUTs. |
+| **Restart GETs** | Drops from `O(total historical segments)` to `O(unacknowledged segments only)`, eliminating linear restart degradation on long-running streams. |
+
 ## Putting It All Together
 
 ### High-Throughput Batch Job
@@ -320,6 +386,8 @@ All configurations are validated at startup:
 - `parallel_put.workers` must be 1-8 (zero is rejected)
 - `compression.level` must be in the algorithm's range
   (zstd 0-22, lz4 1-16)
+- `retention.max_age` must be greater than zero when set (use
+  `retention.max_segments: 0` or omit all caps for immediate reclaim)
 - Existing checks: `node_id` and `stream_id` non-empty, `bucket`
   non-empty, `sync: per_entry` rejected for `object_store`
 

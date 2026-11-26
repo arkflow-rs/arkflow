@@ -161,6 +161,54 @@ impl CompressionConfig {
     pub const MIN_COMPRESSION_SIZE: usize = 10 * 1024; // 10 KB
 }
 
+fn default_retention_enabled() -> bool {
+    true
+}
+
+/// Retention policy for sealed segments on the object-store WAL backend.
+///
+/// Only sealed segments in `sealed_segments` wholly at or below the committed
+/// reclaim floor (`last_seq <= reclaim_floor`) are ever eligible for deletion;
+/// unacknowledged segments and `active_segment` are never deleted.
+///
+/// When `enabled` is `true` (the default) and all three caps (`max_segments`,
+/// `max_age`, `max_bytes`) are `None`, every eligible sealed segment is
+/// reclaimed immediately. When one or more caps are set, only the contiguous
+/// newest suffix of eligible segments satisfying all configured caps is kept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// Enable automatic reclamation of acknowledged sealed segments.
+    /// Defaults to `true`.
+    #[serde(default = "default_retention_enabled")]
+    pub enabled: bool,
+    /// Maximum number of acknowledged (reclaim-eligible) sealed segments to
+    /// retain behind the committed reclaim floor. `Some(0)` reclaims all
+    /// eligible segments immediately; `None` imposes no count cap unless all
+    /// three caps are `None` (default immediate reclaim).
+    #[serde(default)]
+    pub max_segments: Option<usize>,
+    /// Maximum age of acknowledged sealed segments (measured from segment
+    /// seal time). Eligible segments older than `max_age` are reclaimed.
+    #[serde(with = "duration_serde_option", default)]
+    pub max_age: Option<Duration>,
+    /// Maximum total compressed bytes across retained acknowledged sealed
+    /// segments. When exceeded, the violating segment and all older eligible
+    /// segments are reclaimed.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_retention_enabled(),
+            max_segments: None,
+            max_age: None,
+            max_bytes: None,
+        }
+    }
+}
+
 /// Backend selection for the WAL.
 ///
 /// The default (and legacy) shape is `Local` (when `backend:` is omitted or
@@ -252,6 +300,10 @@ pub struct ObjectStoreWalConfig {
     /// Compression configuration.
     #[serde(default)]
     pub compression: CompressionConfig,
+    /// Sealed-segment retention policy. Defaults to `enabled: true` with
+    /// immediate reclamation of eligible acknowledged sealed segments.
+    #[serde(default)]
+    pub retention: RetentionConfig,
     /// Sync policy. Forced to `GroupCommit`/`Periodic` at the store level;
     /// `PerEntry` is rejected at config-load time.
     #[serde(default)]
@@ -346,9 +398,33 @@ impl Default for CursorFlushConfig {
     }
 }
 
-// --- duration serde (humantime-ish string form: "1s", "500ms") ---
+// --- duration serde (humantime string form: "1s", "500ms", "24h", "7d", "1h30m") ---
+
+fn parse_duration_human(s: &str) -> Result<Duration, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("duration string must not be empty".to_string());
+    }
+    if let Ok(d) = humantime::parse_duration(trimmed) {
+        return Ok(d);
+    }
+    // Preserve backward compatibility with fractional seconds ("0.5s") and
+    // bare millisecond strings ("500").
+    if let Some(rest) = trimmed.strip_suffix('s') {
+        if let Ok(secs) = rest.parse::<f64>() {
+            if secs.is_finite() && secs >= 0.0 {
+                return Ok(Duration::from_secs_f64(secs));
+            }
+        }
+    }
+    if let Ok(ms) = trimmed.parse::<u64>() {
+        return Ok(Duration::from_millis(ms));
+    }
+    Err(format!("invalid duration: {s}"))
+}
 
 pub mod duration_serde {
+    use super::parse_duration_human;
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
@@ -365,32 +441,14 @@ pub mod duration_serde {
         }
         match Raw::deserialize(d)? {
             Raw::Int(ms) => Ok(Duration::from_millis(ms)),
-            Raw::Str(s) => parse_human(&s)
-                .ok_or_else(|| serde::de::Error::custom(format!("invalid duration: {}", s))),
+            Raw::Str(s) => parse_duration_human(&s).map_err(serde::de::Error::custom),
         }
-    }
-
-    fn parse_human(s: &str) -> Option<Duration> {
-        let s = s.trim();
-        if let Some(rest) = s.strip_suffix("ms") {
-            return rest.parse::<u64>().ok().map(Duration::from_millis);
-        }
-        if let Some(rest) = s.strip_suffix('s') {
-            if let Ok(secs) = rest.parse::<f64>() {
-                return Some(Duration::from_secs_f64(secs));
-            }
-        }
-        if let Some(rest) = s.strip_suffix('m') {
-            if let Ok(mins) = rest.parse::<u64>() {
-                return Some(Duration::from_secs(mins * 60));
-            }
-        }
-        s.parse::<u64>().ok().map(Duration::from_millis)
     }
 }
 
 /// Duration serde for Option<Duration> fields.
 pub mod duration_serde_option {
+    use super::parse_duration_human;
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
@@ -404,34 +462,17 @@ pub mod duration_serde_option {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum RawOption {
+        enum Raw {
             Str(String),
             Int(u64),
-            None,
         }
-        match RawOption::deserialize(d)? {
-            RawOption::Str(s) => Ok(parse_human(&s)),
-            RawOption::Int(ms) => Ok(Some(Duration::from_millis(ms))),
-            RawOption::None => Ok(None),
+        match Option::<Raw>::deserialize(d)? {
+            None => Ok(None),
+            Some(Raw::Int(ms)) => Ok(Some(Duration::from_millis(ms))),
+            Some(Raw::Str(s)) => parse_duration_human(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
         }
-    }
-
-    fn parse_human(s: &str) -> Option<Duration> {
-        let s = s.trim();
-        if let Some(rest) = s.strip_suffix("ms") {
-            return rest.parse::<u64>().ok().map(Duration::from_millis);
-        }
-        if let Some(rest) = s.strip_suffix('s') {
-            if let Ok(secs) = rest.parse::<f64>() {
-                return Some(Duration::from_secs_f64(secs));
-            }
-        }
-        if let Some(rest) = s.strip_suffix('m') {
-            if let Ok(mins) = rest.parse::<u64>() {
-                return Some(Duration::from_secs(mins * 60));
-            }
-        }
-        s.parse::<u64>().ok().map(Duration::from_millis)
     }
 }
 
@@ -546,6 +587,7 @@ mod tests {
             segment_tuning: SegmentTuningConfig::default(),
             parallel_put: ParallelPutConfig::default(),
             compression: CompressionConfig::default(),
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let cfg = WalConfig {
@@ -753,5 +795,108 @@ mod tests {
         ));
         assert_eq!(o.parallel_put.workers, 1);
         assert!(matches!(o.compression, CompressionConfig::None));
+        assert_eq!(o.retention, RetentionConfig::default());
+        assert!(o.retention.enabled);
+        assert_eq!(o.retention.max_segments, None);
+        assert_eq!(o.retention.max_age, None);
+        assert_eq!(o.retention.max_bytes, None);
+    }
+
+    #[test]
+    fn object_store_with_retention_fields_parses() {
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              enabled: true
+              max_segments: 16
+              max_age: "24h"
+              max_bytes: 10485760
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        assert!(o.retention.enabled);
+        assert_eq!(o.retention.max_segments, Some(16));
+        assert_eq!(o.retention.max_age, Some(Duration::from_secs(24 * 3600)));
+        assert_eq!(o.retention.max_bytes, Some(10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn retention_supports_days_compound_durations_and_disabled() {
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              enabled: false
+              max_age: "7d"
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        assert!(!o.retention.enabled);
+        assert_eq!(o.retention.max_age, Some(Duration::from_secs(7 * 86400)));
+
+        let yaml_compound = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "1h30m"
+            s3:
+              bucket: b
+        "#;
+        let b2: WalBackend = serde_yaml::from_str(yaml_compound).unwrap();
+        let o2 = match b2 {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        assert_eq!(o2.retention.max_age, Some(Duration::from_secs(5400)));
+    }
+
+    #[test]
+    fn retention_rejects_invalid_duration_and_zero_max_age() {
+        let bad_duration_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "not-a-duration"
+            s3:
+              bucket: b
+        "#;
+        assert!(serde_yaml::from_str::<WalBackend>(bad_duration_yaml).is_err());
+
+        let zero_age_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "0s"
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(zero_age_yaml).unwrap();
+        let cfg = WalConfig {
+            enabled: true,
+            path: String::new(),
+            sync: SyncPolicy::default(),
+            backend: Some(b),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("max_age"),
+            "expected max_age error, got: {err}"
+        );
     }
 }

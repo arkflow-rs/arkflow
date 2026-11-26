@@ -195,6 +195,15 @@ impl WalConfig {
                     }
                     crate::wal::config::CompressionConfig::None => {}
                 }
+                if let Some(max_age) = o.retention.max_age {
+                    if max_age.is_zero() {
+                        return Err(Error::Config(
+                            "durability.backend.object_store.retention.max_age \
+                             must be greater than zero (use max_segments: 0 for immediate reclaim)"
+                                .into(),
+                        ));
+                    }
+                }
                 Ok(())
             }
         }

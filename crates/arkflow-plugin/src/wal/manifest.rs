@@ -25,6 +25,22 @@
 //! rewritten) doesn't lose entries.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Per-segment metadata persisted in the manifest so retention and recovery
+/// can evaluate sequence bounds, byte budgets, and segment ages without
+/// downloading the segment object.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SegmentMeta {
+    /// First sequence number contained in the segment.
+    pub first_seq: u64,
+    /// Last sequence number contained in the segment.
+    pub last_seq: u64,
+    /// Compressed object size in bytes stored on the object store.
+    pub size_bytes: u64,
+    /// Unix epoch timestamp in milliseconds when the segment was sealed.
+    pub sealed_at_ms: u64,
+}
 
 /// Compression algorithm used for a sealed segment. Persisted in the
 /// manifest so recovery knows how to decode the bytes.
@@ -73,6 +89,14 @@ pub(crate) struct Manifest {
     /// relative to the `segments/` prefix.
     #[serde(default)]
     pub sealed_segments: Vec<String>,
+    /// Per-segment metadata keyed by segment filename (`"00000001.wal"`).
+    /// Additive v2 field so legacy v1/v2 manifests deserialize cleanly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub segment_meta: BTreeMap<String, SegmentMeta>,
+    /// Segments deregistered from `sealed_segments` and queued for object-store
+    /// `DELETE`. Persisted before deletion so crashes remain self-healing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_deletes: Vec<String>,
 }
 
 fn default_version() -> u32 {
@@ -93,6 +117,8 @@ impl Manifest {
             active_segment: None,
             active_segment_compression: None,
             sealed_segments: Vec::new(),
+            segment_meta: BTreeMap::new(),
+            pending_deletes: Vec::new(),
         }
     }
 
@@ -153,5 +179,46 @@ mod tests {
         }"#;
         let m = Manifest::from_json(json.as_bytes()).unwrap();
         assert_eq!(m.active_segment, None);
+        assert!(m.segment_meta.is_empty());
+        assert!(m.pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn segment_meta_and_pending_deletes_round_trip() {
+        let mut m = Manifest::fresh("pod-a".into(), "main".into());
+        m.sealed_segments.push("00000001.wal".into());
+        m.segment_meta.insert(
+            "00000001.wal".into(),
+            SegmentMeta {
+                first_seq: 1,
+                last_seq: 4,
+                size_bytes: 512,
+                sealed_at_ms: 1_700_000_000_000,
+            },
+        );
+        m.pending_deletes.push("00000000.wal".into());
+
+        let bytes = m.to_json().unwrap();
+        let back = Manifest::from_json(&bytes).unwrap();
+        assert_eq!(m, back);
+        assert_eq!(back.version, 2);
+    }
+
+    #[test]
+    fn legacy_v2_manifest_without_retention_fields_loads() {
+        let json = r#"{
+            "version": 2,
+            "node_id": "pod-a",
+            "stream_id": "main",
+            "cursor": 10,
+            "max_sealed_seq": 12,
+            "active_segment": "00000002.wal",
+            "sealed_segments": ["00000001.wal"]
+        }"#;
+        let m = Manifest::from_json(json.as_bytes()).unwrap();
+        assert_eq!(m.cursor, 10);
+        assert_eq!(m.max_sealed_seq, 12);
+        assert!(m.segment_meta.is_empty());
+        assert!(m.pending_deletes.is_empty());
     }
 }

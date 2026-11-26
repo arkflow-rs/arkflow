@@ -180,6 +180,49 @@ durability:
 
 **CPU 成本与节省:**压缩用 CPU 换取网络与存储。在现代 CPU 上,zstd-3 约占 5-10% 的单核利用率,换来约 70% 的存储缩减。CPU 受限的负载用 `lz4`,存储受限的负载用 `zstd-9`。
 
+## 维度 4:段保留策略与自动回收
+
+如果没有回收机制,S3 WAL 的已密封段和 `manifest.json` 会无界增长,重启时需要下载并过滤全部历史段。`retention` 块用于控制已确认密封段的自动回收。
+
+```yaml validate=fragment wrap=durability
+durability:
+  backend:
+    type: object_store
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
+    retention:
+      enabled: true        # default: true
+      max_segments: 16     # optional: max acknowledged sealed segments to keep
+      max_age: "24h"       # optional: max age (supports ms, s, m, h, d, e.g. "1h30m")
+      max_bytes: 67108864  # optional: max total bytes across kept acknowledged segments
+```
+
+### 默认策略与多上限语义
+
+- **默认策略(省略 `retention`,或 `enabled: true` 且三项上限均未设置):**后台回收循环会立即回收**所有**满足安全下界的已确认密封段(与本地 `redb` WAL 回收语义一致)。
+- **显式上限(`max_segments`、`max_age`、`max_bytes`):**只要显式配置了其中一项或多项,仅按已配置的上限生效。系统从新到旧扫描可回收段,遇到首个超限段即停止保留并回收该段及所有更老的段,始终保留连续的最新后缀,不产生历史空洞。
+- **关闭回收(`enabled: false`):**ArkFlow 不执行任何对象删除(适合交由 S3 Bucket Lifecycle 规则统一归档或过期的场景)。
+
+### 安全性与崩溃恢复保障
+
+- **Rewind 安全下界:**仅 `sealed_segments` 中满足 `last_seq <= min(manifest.cursor, reclaimable_hwm)` 的段可被回收。`reclaimable_hwm` 仅在源确认提交成功后(`mark_committed(seq)`)推进到 `seq - 1`,与本地 `redb` 保持一致,确保在途 `rewind_cursor` 或 `Wal::undo(seq)` 绝不会读到已删除段。未确认段与最新的 `active_segment` 永远不会被删除。
+- **Manifest 优先的崩溃安全顺序:**回收运行在独立、可取消的后台循环中(与段密封循环解耦,慢速或失败的 S3 删除不会阻塞摄入、不会拉长确认门控延迟,也不会卡住 `close()`):
+  1. 通过 ETag 条件写入更新 `manifest.json`,将待回收段从 `sealed_segments` 移入 `pending_deletes`。
+  2. 按批(每轮上限 64 个对象)尽力执行 S3 `DELETE`(`NotFound` 视为幂等成功)。
+  3. 通过 ETag 条件写入将已确认删除的段名从 `pending_deletes` 中清理。
+- **只读必要段的快速恢复:**`manifest.json` 持久化每段的序列范围、字节大小与密封时间(`segment_meta`,保持向后兼容的 schema v2)。重启时,`recover()`、`read_after_cursor()` 与 `read_after()` 会跳过 `pending_deletes` 以及所有 `last_seq <= manifest.cursor` 的段,不发 `GET` 请求,仅下载未确认段(或尚无元数据的历史/LIST-fallback 段)。
+
+### 对象存储成本模型
+
+| 成本项 | 启用保留策略后的行为 |
+| --- | --- |
+| **对象存储占用** | 默认策略下收敛为"未确认段 + `active_segment`(1 个已密封段)"。显式设限时收敛为 `active + 未确认段 + min(max_segments, max_age × 封段速率, max_bytes)`。 |
+| **DELETE 请求** | AWS S3 及主流兼容对象存储对标准 `DELETE` 免费;每轮上限 64 个对象,存量平滑消化。 |
+| **Manifest PUT** | 实际触发回收的轮次增加 2 次小对象 manifest PUT(摘除注册 + 清理队列);空闲轮次为 **0** 次 PUT。 |
+| **重启 GET 开销** | 从 `O(全量历史段数)` 降至 `O(仅未确认段数)`,消除长稳运行后的重启线性劣化。 |
+
 ## 综合运用
 
 ### 高吞吐批处理作业
@@ -252,6 +295,7 @@ durability:
 
 - `parallel_put.workers` 必须为 1-8(拒绝 0)
 - `compression.level` 必须在算法范围内(zstd 0-22,lz4 1-16)
+- `retention.max_age` 设置时必须大于 0(需要立即回收请设 `retention.max_segments: 0` 或省略三项上限)
 - 既有检查:`node_id` 与 `stream_id` 非空、`bucket` 非空、`object_store` 拒绝 `sync: per_entry`
 
 无效配置会让 `Stream::run` 在启动时返回 `Err`,引擎快速失败而非静默降级。

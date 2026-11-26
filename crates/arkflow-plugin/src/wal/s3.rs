@@ -47,11 +47,13 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use arkflow_core::wal::config::{CursorFlushConfig, ObjectStoreS3Config, SegmentConfig};
+use arkflow_core::wal::config::{
+    CursorFlushConfig, ObjectStoreS3Config, RetentionConfig, SegmentConfig,
+};
 use arkflow_core::wal::{
     store::{WalStore, WalStoreBuilder},
     WalConfig,
@@ -66,9 +68,14 @@ use object_store::{
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
-use super::manifest::Manifest;
+use super::manifest::{Manifest, SegmentMeta};
 use super::segment;
+
+/// Upper bound on S3 DELETE calls issued per background reclaim sweep so large
+/// backlogs drain smoothly without monopolizing object-store request budgets.
+const MAX_DELETES_PER_SWEEP: usize = 64;
 
 /// A segment ready for upload. Holds the encoded bytes and metadata.
 pub(crate) struct PendingSegment {
@@ -217,10 +224,10 @@ impl ParallelPutWorkers {
     }
 }
 
-/// A background-thread handle for the segment flusher. Owned by `S3Store`
-/// while running; stopped on `close`.
+/// A background-thread handle for the segment flusher and reclaim loops.
+/// Owned by `S3Store` while running; cancelled and joined on `close`.
 struct FlusherHandle {
-    stop: Arc<Notify>,
+    stop: CancellationToken,
     join: std::thread::JoinHandle<()>,
 }
 
@@ -237,11 +244,17 @@ pub(crate) struct S3Store {
     manifest_key: String,
     segment_cfg: SegmentConfig,
     cursor_cfg: CursorFlushConfig,
+    retention_cfg: RetentionConfig,
     /// Cached first/last sequence of each sealed segment object (its
     /// `{:08}.wal` index → range). `recover` fills it once; paged reads use
     /// it to skip segments wholly below the page cursor instead of
     /// re-downloading the whole backlog on every page.
-    segment_ranges: StdMutex<std::collections::BTreeMap<u64, (u64, u64)>>,
+    segment_ranges: StdMutex<BTreeMap<u64, (u64, u64)>>,
+    /// Decoded metadata for legacy manifest segments and LIST-fallback segments
+    /// collected read-only during `recover()`. Lazily merged and adopted into
+    /// `manifest.json` during the next reclaim sweep so startup recovery stays
+    /// strictly read-only.
+    backfilled_meta: StdMutex<BTreeMap<String, SegmentMeta>>,
     /// Parallel PUT workers pool (task 3.3).
     put_workers: Option<ParallelPutWorkers>,
     /// Segment compression selected by configuration. Applied on every
@@ -262,6 +275,11 @@ pub(crate) struct S3Store {
     /// Purely in-memory; folded into the manifest `cursor` at flush time,
     /// clamped to `max_sealed_seq` so the cursor never passes unsealed data.
     acked_hwm: AtomicU64,
+    /// Highest sequence safe to reclaim without violating rewind/undo safety.
+    /// Seeded from `manifest.cursor` at startup; advanced in `mark_committed(seq)`
+    /// to `seq.saturating_sub(1)` (matching `LocalStore` so `Wal::undo(seq)` can
+    /// still replay `seq`), and clamped in `rewind_cursor`.
+    reclaimable_hwm: AtomicU64,
     /// Highest sequence ever written (sealed or in the active segment).
     /// Seeded by `recover` from `max_seq_seen` and kept current in
     /// `append_batch`; `next_seq_hint` returns this + 1 so a restart never
@@ -295,6 +313,9 @@ pub(crate) struct S3Store {
     /// segment finishing first would let `sealed_seq` advance the ack
     /// frontier past an earlier, not-yet-durable segment.
     seal_lock: tokio::sync::Mutex<()>,
+    /// Serializes background segment reclamation sweeps without blocking
+    /// `seal_lock`, `append_batch`, or `mark_committed`.
+    reclaim_lock: tokio::sync::Mutex<()>,
     /// Segments whose PUT failed, in seal order. The next seal re-uploads
     /// them (in order) BEFORE sealing the active segment, so a newer
     /// segment's publication never implies an earlier one's durability.
@@ -383,12 +404,25 @@ impl S3Store {
     }
 
     /// Every segment object name: the manifest's index unioned with a LIST
-    /// of the prefix, ordered by segment index (the serialized seal order,
-    /// which is also sequence order). Unparseable names sort last.
+    /// of the prefix, excluding segments in `manifest.pending_deletes`,
+    /// ordered by segment index (the serialized seal order, which is also
+    /// sequence order). Unparseable names sort last.
     fn all_segment_names(&self, manifest: &Manifest) -> Result<Vec<String>, Error> {
-        let mut segs: HashSet<String> = manifest.sealed_segments.iter().cloned().collect();
+        let pending_deletes: HashSet<&str> = manifest
+            .pending_deletes
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let mut segs: HashSet<String> = manifest
+            .sealed_segments
+            .iter()
+            .filter(|s| !pending_deletes.contains(s.as_str()))
+            .cloned()
+            .collect();
         if let Some(active) = &manifest.active_segment {
-            segs.insert(active.clone());
+            if !pending_deletes.contains(active.as_str()) {
+                segs.insert(active.clone());
+            }
         }
         let prefix = ObjectPath::from(self.segments_prefix.as_str());
         let listed = self.rt().block_on(async {
@@ -402,7 +436,7 @@ impl S3Store {
         for item in listed {
             let meta = item.map_err(|e| Error::Process(format!("S3 list: {}", e)))?;
             let name = meta.location.filename().unwrap_or("").to_string();
-            if name.ends_with(".wal") {
+            if name.ends_with(".wal") && !pending_deletes.contains(name.as_str()) {
                 segs.insert(name);
             }
         }
@@ -411,17 +445,47 @@ impl S3Store {
         Ok(names)
     }
 
-    /// Remember a decoded segment's sequence range for later page skips.
-    fn remember_segment_range(&self, name: &str, entries: &[(u64, MessageBatchRef)]) {
+    /// Remember a segment's sequence bounds for later read/page skips.
+    fn remember_segment_bounds(&self, name: &str, first: u64, last: u64) {
         let Some(index) = segment_index_of(name) else {
             return;
         };
-        if let (Some((first, _)), Some((last, _))) = (entries.first(), entries.last()) {
+        if first > 0 || last > 0 {
             self.segment_ranges
                 .lock()
                 .expect("segment range cache")
-                .insert(index, (*first, *last));
+                .insert(index, (first, last));
         }
+    }
+
+    /// Remember a decoded segment's sequence range for later page skips.
+    fn remember_segment_range(&self, name: &str, entries: &[(u64, MessageBatchRef)]) {
+        if let (Some((first, _)), Some((last, _))) = (entries.first(), entries.last()) {
+            self.remember_segment_bounds(name, *first, *last);
+        }
+    }
+
+    /// Whether `seg_name` is known (via manifest metadata or cached decode
+    /// range) to contain no sequence strictly greater than `watermark`.
+    fn segment_covered_by(&self, manifest: &Manifest, seg_name: &str, watermark: u64) -> bool {
+        if let Some(meta) = manifest.segment_meta.get(seg_name) {
+            if meta.last_seq <= watermark {
+                return true;
+            }
+        }
+        if let Some(index) = segment_index_of(seg_name) {
+            if let Some(&(_, last)) = self
+                .segment_ranges
+                .lock()
+                .expect("segment range cache")
+                .get(&index)
+            {
+                if last <= watermark {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The private runtime (present until Drop shuts it down).
@@ -544,6 +608,14 @@ impl S3Store {
             arkflow_core::wal::config::CompressionConfig::None => {}
         }
 
+        if let Some(max_age) = osc.retention.max_age {
+            if max_age.is_zero() {
+                return Err(Error::Config(
+                    "retention.max_age must be greater than zero (use max_segments: 0 for immediate reclaim)".into(),
+                ));
+            }
+        }
+
         let ns = format!(
             "{}/{}/{}",
             osc.prefix.trim_end_matches('/'),
@@ -568,7 +640,9 @@ impl S3Store {
             manifest_key,
             segment_cfg: resolved_segment,
             cursor_cfg: osc.cursor,
-            segment_ranges: StdMutex::new(std::collections::BTreeMap::new()),
+            retention_cfg: osc.retention,
+            segment_ranges: StdMutex::new(BTreeMap::new()),
+            backfilled_meta: StdMutex::new(BTreeMap::new()),
             // Honest status of the knob: seals are SERIALIZED (seal_lock) so
             // the acknowledged frontier can never advance past an earlier
             // unsealed segment, and each seal uploads exactly one object —
@@ -604,6 +678,7 @@ impl S3Store {
             cursor_pending: AtomicU64::new(0),
             cursor_last_flush_ms: AtomicU64::new(now_ms()),
             acked_hwm: AtomicU64::new(0),
+            reclaimable_hwm: AtomicU64::new(0),
             max_written_seq: AtomicU64::new(0),
             rewind_floor: AtomicU64::new(u64::MAX),
             cursor_mirror: AtomicU64::new(0),
@@ -611,6 +686,7 @@ impl S3Store {
             seal_notify: Notify::new(),
             flusher: StdMutex::new(None),
             seal_lock: tokio::sync::Mutex::new(()),
+            reclaim_lock: tokio::sync::Mutex::new(()),
             pending_seal: StdMutex::new(std::collections::VecDeque::new()),
         });
 
@@ -729,16 +805,33 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
         Err(e) => return Err(Error::Process(format!("S3 GET manifest: {}", e))),
     };
 
-    // Step 2: LIST segments, union with manifest's index.
+    // Step 2: LIST segments, union with manifest's index, while accounting
+    // for every known segment index (including `pending_deletes`) so future
+    // segment filenames never collide with reclaimed ones.
+    let pending_deletes: HashSet<String> = manifest.pending_deletes.iter().cloned().collect();
+    let mut max_idx_seen = 0u64;
+    let mut observe_idx = |name: &str| {
+        if let Some(n) = segment_index_of(name) {
+            if n > max_idx_seen {
+                max_idx_seen = n;
+            }
+        }
+    };
+    for s in &manifest.pending_deletes {
+        observe_idx(s);
+    }
+
     let mut seen: HashSet<String> = HashSet::new();
     let mut all_segs: Vec<String> = Vec::new();
     for s in manifest.sealed_segments.iter() {
-        if seen.insert(s.clone()) {
+        observe_idx(s);
+        if !pending_deletes.contains(s) && seen.insert(s.clone()) {
             all_segs.push(s.clone());
         }
     }
     if let Some(active) = &manifest.active_segment {
-        if seen.insert(active.clone()) {
+        observe_idx(active);
+        if !pending_deletes.contains(active) && seen.insert(active.clone()) {
             all_segs.push(active.clone());
         }
     }
@@ -750,30 +843,43 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
         if !name.ends_with(".wal") {
             continue;
         }
-        if seen.insert(name.clone()) {
+        observe_idx(&name);
+        if !pending_deletes.contains(&name) && seen.insert(name.clone()) {
             all_segs.push(name);
         }
     }
+    all_segs.sort_by_key(|name| segment_index_of(name).unwrap_or(u64::MAX));
 
-    // Step 3: decode every segment. We don't surface the entries here — the
-    // store's `read_after_cursor()` does that on demand — but we use the
-    // union to (a) verify every referenced segment is readable, (b) update
-    // the in-memory active segment state if the manifest's active_segment
-    // is present, and (c) advance `next_index` to avoid clashing with any
-    // sealed segment filename on the next rotation.
-    let mut max_seq_seen = 0u64;
-    let mut max_idx_seen = 0u64;
+    // Step 3: inspect only necessary segments (strictly read-only: never PUT
+    // the manifest during recovery).
+    // - Seed `max_seq_seen` from `max(manifest.max_sealed_seq, manifest.cursor)`
+    //   so deleting old segments never regresses `next_seq_hint()`.
+    // - Seed `reclaimable_hwm` from `manifest.cursor`: no in-flight ack/undo
+    //   handles survive a process restart, so everything <= `manifest.cursor`
+    //   from a prior lifetime is past any possible rewind.
+    // - Skip GET for segments whose `manifest.segment_meta.last_seq <= cursor`.
+    // - For legacy manifest segments or LIST-fallback segments lacking
+    //   `segment_meta`, decode once and record metadata in `backfilled_meta`
+    //   so the next reclaim sweep adopts them into `manifest.json`.
+    let mut max_seq_seen = manifest.max_sealed_seq.max(manifest.cursor);
+    store
+        .reclaimable_hwm
+        .store(manifest.cursor, Ordering::Release);
+
     for seg_name in &all_segs {
-        if let Some(num_str) = seg_name.strip_suffix(".wal") {
-            if let Ok(n) = num_str.parse::<u64>() {
-                if n > max_idx_seen {
-                    max_idx_seen = n;
-                }
+        if let Some(meta) = manifest.segment_meta.get(seg_name) {
+            store.remember_segment_bounds(seg_name, meta.first_seq, meta.last_seq);
+            if meta.last_seq > max_seq_seen {
+                max_seq_seen = meta.last_seq;
+            }
+            if meta.last_seq <= manifest.cursor {
+                continue;
             }
         }
         let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, seg_name).as_str());
         match store.client.get(&key).await {
             Ok(r) => {
+                let last_modified_ms = r.meta.last_modified.timestamp_millis().max(0) as u64;
                 let bytes = r
                     .bytes()
                     .await
@@ -781,15 +887,28 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
                 let decoded = decode_segment_object(&bytes)?;
                 warn_segment_truncation(seg_name, &decoded);
                 store.remember_segment_range(seg_name, &decoded.entries);
-                if let Some((last, _)) = decoded.entries.last() {
+                if let (Some((first, _)), Some((last, _))) =
+                    (decoded.entries.first(), decoded.entries.last())
+                {
                     if *last > max_seq_seen {
                         max_seq_seen = *last;
                     }
+                    if !manifest.segment_meta.contains_key(seg_name) {
+                        store
+                            .backfilled_meta
+                            .lock()
+                            .expect("backfilled_meta lock")
+                            .insert(
+                                seg_name.clone(),
+                                SegmentMeta {
+                                    first_seq: *first,
+                                    last_seq: *last,
+                                    size_bytes: bytes.len() as u64,
+                                    sealed_at_ms: last_modified_ms,
+                                },
+                            );
+                    }
                 }
-                // The active segment is identified by the manifest (if any);
-                // a segment that's listed but not in the manifest is a
-                // LIST-fallback candidate (D5). Its bytes are already
-                // readable here, so we don't need to do anything extra.
             }
             Err(object_store::Error::NotFound { .. }) => {
                 // Manifest referenced a segment that was truncated between
@@ -936,6 +1055,7 @@ impl WalStore for S3Store {
         self.rewind_floor
             .fetch_min(seq.saturating_add(1), Ordering::AcqRel);
         self.acked_hwm.fetch_min(seq, Ordering::AcqRel);
+        self.reclaimable_hwm.fetch_min(seq, Ordering::AcqRel);
         let previous = self.cursor_mirror.fetch_min(seq, Ordering::AcqRel);
         if previous > seq {
             block_on_init(self.rt(), flush_manifest(self))
@@ -944,10 +1064,22 @@ impl WalStore for S3Store {
         Ok(())
     }
 
+    fn mark_committed(&self, seq: u64) -> Result<(), Error> {
+        // Match `LocalStore::mark_committed`: only entries strictly below `seq`
+        // (`<= seq - 1`) are safe to reclaim, because `Wal::undo(seq)` can
+        // still rewind the latest committed sequence back to `seq - 1`.
+        self.reclaimable_hwm
+            .fetch_max(seq.saturating_sub(1), Ordering::AcqRel);
+        Ok(())
+    }
+
     fn read_after_cursor(&self) -> Result<Vec<(u64, MessageBatchRef)>, Error> {
         let manifest = self.read_manifest()?;
         let mut out: Vec<(u64, MessageBatchRef)> = Vec::new();
         for seg_name in self.all_segment_names(&manifest)? {
+            if self.segment_covered_by(&manifest, &seg_name, manifest.cursor) {
+                continue;
+            }
             let key = ObjectPath::from(format!("{}/{}", self.segments_prefix, seg_name).as_str());
             let bytes = match self.rt().block_on(self.client.get(&key)) {
                 Ok(r) => match self.rt().block_on(r.bytes()) {
@@ -981,21 +1113,10 @@ impl WalStore for S3Store {
         let after = after.max(manifest.cursor);
         let mut out: Vec<(u64, MessageBatchRef)> = Vec::new();
         for seg_name in self.all_segment_names(&manifest)? {
-            // A segment whose cached range ends at or below the cursor cannot
-            // contain a page entry: skip its GET entirely. Segments decoded
-            // earlier in this recovery are cached here, so page N does not
-            // re-download the backlog pages 1..N-1 already consumed.
-            if let Some(index) = segment_index_of(&seg_name) {
-                if let Some(&(_, last)) = self
-                    .segment_ranges
-                    .lock()
-                    .expect("segment range cache")
-                    .get(&index)
-                {
-                    if last <= after {
-                        continue;
-                    }
-                }
+            // A segment whose manifest metadata or cached range ends at or
+            // below the watermark cannot contain a page entry: skip its GET.
+            if self.segment_covered_by(&manifest, &seg_name, after) {
+                continue;
             }
             let key = ObjectPath::from(format!("{}/{}", self.segments_prefix, seg_name).as_str());
             let bytes = match self.rt().block_on(self.client.get(&key)) {
@@ -1074,9 +1195,10 @@ impl WalStore for S3Store {
     }
 
     fn close(&self) -> Result<(), Error> {
-        // Stop the background flusher.
+        // Cancel and join the background flusher + reclaim loops (any in-flight
+        // reclaim DELETE is cancelled immediately so shutdown never stalls).
         if let Some(handle) = self.flusher.lock().unwrap().take() {
-            handle.stop.notify_one();
+            handle.stop.cancel();
             let _ = handle.join.join();
         }
         // Final seal + manifest flush so anything buffered is durable.
@@ -1347,6 +1469,7 @@ async fn publish_sealed_segment(store: &S3Store, batch: &SealedBatch) -> Result<
     // this object even if the configured algorithm changed since (and keeps
     // legacy untagged objects readable).
     let object_bytes = encode_segment_object(store, &batch.bytes)?;
+    let object_size = object_bytes.len() as u64;
     // Clone for the PUT so the original bytes survive a failed upload in the
     // caller's parked batch.
     store
@@ -1360,13 +1483,16 @@ async fn publish_sealed_segment(store: &S3Store, batch: &SealedBatch) -> Result<
             ))
         })?;
 
-    // Bump the manifest's `max_sealed_seq` and add the new segment to
-    // `sealed_segments`. If we had an active segment before, demote it.
-    // Use the ETag-coordinated writer so concurrent seal callbacks from
-    // parallel PUT workers don't lose each other's updates (`apply_seal`
-    // guards against out-of-order seals regressing the active pointer).
+    // Bump the manifest's `max_sealed_seq`, record per-segment metadata, and
+    // add the new segment to `sealed_segments`. If we had an active segment
+    // before, demote it. Use the ETag-coordinated writer so concurrent seal
+    // callbacks from parallel PUT workers don't lose each other's updates
+    // (`apply_seal` guards against out-of-order seals regressing the active
+    // pointer).
     let name_for_mutator = name.clone();
+    let first_seq = batch.first_seq;
     let last_seq = batch.last_seq;
+    let sealed_at_ms = now_ms();
     let active_compression = segment_compression_for(store.compression_kind);
     write_manifest_with_etag(store, move |m| {
         apply_seal(m, &name_for_mutator);
@@ -1374,8 +1500,19 @@ async fn publish_sealed_segment(store: &S3Store, batch: &SealedBatch) -> Result<
             m.max_sealed_seq = last_seq;
         }
         m.active_segment_compression = Some(active_compression);
+        m.segment_meta.insert(
+            name_for_mutator.clone(),
+            SegmentMeta {
+                first_seq,
+                last_seq,
+                size_bytes: object_size,
+                sealed_at_ms,
+            },
+        );
     })
     .await?;
+
+    store.remember_segment_bounds(&name, first_seq, last_seq);
 
     // D2: the segment object and the manifest both hold this range now —
     // publish the sealed frontier and wake acknowledgements gated on it.
@@ -1392,12 +1529,9 @@ async fn publish_sealed_segment(store: &S3Store, batch: &SealedBatch) -> Result<
 
 /// Flush the in-memory cursor watermark to the manifest (D6).
 ///
-/// Truncation of sealed segments past the cursor (D7) is intentionally not
-/// performed here: a correct implementation needs per-segment last-seq tracking,
-/// which the manifest does not yet carry. The previous in-mutator truncation was
-/// a broken placeholder that emptied `sealed_segments` without deleting the
-/// objects (orphans), so it has been removed; sealed segments stay listed in the
-/// manifest and remain reachable via the recovery LIST-fallback until D7 lands.
+/// Sealed-segment reclamation runs asynchronously in `reclaim_segments` on a
+/// decoupled, cancellable background task so S3 `DELETE` calls never delay
+/// cursor flushes or segment sealing.
 async fn flush_manifest(store: &S3Store) -> Result<(), Error> {
     // The cursor tracks the highest acknowledged sequence, clamped to
     // `max_sealed_seq`: it never passes data not yet sealed to object
@@ -1501,9 +1635,31 @@ async fn write_manifest_with_etag<F>(store: &S3Store, mut mutate: F) -> Result<(
 where
     F: FnMut(&mut Manifest),
 {
+    write_manifest_with_etag_if_changed(store, |m| {
+        mutate(m);
+        true
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Apply a conditional mutator closure to the manifest under ETag-coordinated
+/// PUT coordination. Returns `(manifest, mutated)`: if `mutate(&mut m)` returns
+/// `false`, no manifest PUT is issued and the freshly-read manifest is returned
+/// directly. Otherwise the serialized manifest is PUT with `If-Match` / `Create`
+/// and retried on contention up to `MANIFEST_WRITE_MAX_RETRIES`.
+async fn write_manifest_with_etag_if_changed<F>(
+    store: &S3Store,
+    mut mutate: F,
+) -> Result<(Manifest, bool), Error>
+where
+    F: FnMut(&mut Manifest) -> bool,
+{
     for attempt in 0..MANIFEST_WRITE_MAX_RETRIES {
         let (mut m, etag) = read_manifest_with_etag(store).await?;
-        mutate(&mut m);
+        if !mutate(&mut m) {
+            return Ok((m, false));
+        }
         let bytes = m
             .to_json()
             .map_err(|e| Error::Process(format!("manifest serialize: {}", e)))?;
@@ -1539,7 +1695,7 @@ where
                         "manifest write recovered after contention"
                     );
                 }
-                return Ok(());
+                return Ok((m, true));
             }
             // `Precondition` = ETag mismatch on `Update`; `AlreadyExists` =
             // lost the first-write race on `Create`. Both mean "the manifest
@@ -1578,7 +1734,7 @@ where
                     .put_opts(&path, payload, PutOptions::default())
                     .await
                     .map_err(|e| Error::Process(format!("S3 PUT manifest: {}", e)))?;
-                return Ok(());
+                return Ok((m, true));
             }
             Err(e) => {
                 return Err(Error::Process(format!("S3 PUT manifest: {}", e)));
@@ -1591,26 +1747,285 @@ where
     )))
 }
 
+/// Select which eligible sealed segments should be reclaimed under `cfg`.
+///
+/// `eligible` MUST contain only segments from `manifest.sealed_segments`
+/// (never `active_segment`) whose `last_seq <= reclaim_floor`.
+///
+/// When `enabled` is `true` and all three caps are `None`, every eligible
+/// segment is selected for immediate reclamation. When one or more caps are
+/// configured, scanning newest-to-oldest stops at the first violation so the
+/// retained set is always a contiguous newest suffix (no gaps).
+///
+/// Returns segment filenames to reclaim, ordered oldest-first.
+fn select_reclaimable_segments(
+    cfg: &RetentionConfig,
+    eligible: &[(String, SegmentMeta)],
+    now_ms: u64,
+) -> Vec<String> {
+    if !cfg.enabled || eligible.is_empty() {
+        return Vec::new();
+    }
+    let mut ordered: Vec<&(String, SegmentMeta)> = eligible.iter().collect();
+    ordered.sort_by_key(|(name, _)| segment_index(name));
+
+    if cfg.max_segments.is_none() && cfg.max_age.is_none() && cfg.max_bytes.is_none() {
+        return ordered.into_iter().map(|(name, _)| name.clone()).collect();
+    }
+
+    let max_age_ms = cfg.max_age.map(|d| d.as_millis() as u64);
+    let mut kept_bytes: u64 = 0;
+    let mut keep_from_idx = ordered.len();
+    for (kept_count, (idx, (_, meta))) in ordered.iter().enumerate().rev().enumerate() {
+        if let Some(age_cap) = max_age_ms {
+            if now_ms.saturating_sub(meta.sealed_at_ms) > age_cap {
+                break;
+            }
+        }
+        if let Some(seg_cap) = cfg.max_segments {
+            if kept_count >= seg_cap {
+                break;
+            }
+        }
+        if let Some(byte_cap) = cfg.max_bytes {
+            if kept_bytes.saturating_add(meta.size_bytes) > byte_cap {
+                break;
+            }
+        }
+        kept_bytes = kept_bytes.saturating_add(meta.size_bytes);
+        keep_from_idx = idx;
+    }
+
+    ordered[..keep_from_idx]
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Crash-safe, best-effort, bounded two-phase segment reclamation:
+///
+/// 1. ETag-coordinated manifest update adopts any backfilled legacy /
+///    LIST-fallback metadata and moves eligible sealed segments
+///    (`last_seq <= min(manifest.cursor, reclaimable_hwm)`, never
+///    `active_segment`) from `sealed_segments` into `pending_deletes`.
+///    Performs zero manifest PUTs when idle.
+/// 2. Best-effort cancellable object-store `DELETE` removes up to
+///    `MAX_DELETES_PER_SWEEP` segments from `pending_deletes` (`NotFound` is
+///    treated as idempotent success).
+/// 3. ETag-coordinated manifest cleanup removes confirmed-deleted names from
+///    `pending_deletes`.
+async fn reclaim_segments(
+    store: &S3Store,
+    cancel: Option<&CancellationToken>,
+) -> Result<usize, Error> {
+    reclaim_segments_at(store, now_ms(), cancel).await
+}
+
+async fn reclaim_segments_at(
+    store: &S3Store,
+    now: u64,
+    cancel: Option<&CancellationToken>,
+) -> Result<usize, Error> {
+    let _reclaim_guard = store.reclaim_lock.lock().await;
+
+    if !store.retention_cfg.enabled {
+        return Ok(0);
+    }
+    if store.rewind_floor.load(Ordering::Acquire) != u64::MAX {
+        return Ok(0);
+    }
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(0);
+    }
+
+    let backfill_snapshot = store
+        .backfilled_meta
+        .lock()
+        .expect("backfilled_meta lock")
+        .clone();
+
+    // Phase 1: lazily adopt backfilled metadata & move eligible sealed
+    // segments into `pending_deletes` before touching S3 objects.
+    let (manifest, mutated) = write_manifest_with_etag_if_changed(store, |m| {
+        if store.rewind_floor.load(Ordering::Acquire) != u64::MAX {
+            return false;
+        }
+        let mut changed = false;
+
+        for (name, meta) in &backfill_snapshot {
+            if m.pending_deletes.iter().any(|p| p == name) {
+                continue;
+            }
+            if m.active_segment.as_deref() != Some(name.as_str())
+                && !m.sealed_segments.iter().any(|s| s == name)
+            {
+                apply_seal(m, name);
+                changed = true;
+            }
+            if !m.segment_meta.contains_key(name) {
+                m.segment_meta.insert(name.clone(), meta.clone());
+                changed = true;
+            }
+            if meta.last_seq > m.max_sealed_seq {
+                m.max_sealed_seq = meta.last_seq;
+                changed = true;
+            }
+        }
+
+        let reclaim_floor = m.cursor.min(store.reclaimable_hwm.load(Ordering::Acquire));
+        let eligible: Vec<(String, SegmentMeta)> = m
+            .sealed_segments
+            .iter()
+            .filter(|name| m.active_segment.as_deref() != Some(name.as_str()))
+            .filter_map(|name| {
+                let meta = m.segment_meta.get(name)?;
+                if meta.last_seq <= reclaim_floor {
+                    Some((name.clone(), meta.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let to_reclaim = select_reclaimable_segments(&store.retention_cfg, &eligible, now);
+        if !to_reclaim.is_empty() {
+            let reclaim_set: HashSet<&str> = to_reclaim.iter().map(|s| s.as_str()).collect();
+            m.sealed_segments
+                .retain(|s| !reclaim_set.contains(s.as_str()));
+            for name in &to_reclaim {
+                m.segment_meta.remove(name);
+                if !m.pending_deletes.contains(name) {
+                    m.pending_deletes.push(name.clone());
+                }
+            }
+            changed = true;
+        }
+        changed
+    })
+    .await?;
+
+    if mutated && !backfill_snapshot.is_empty() {
+        let mut backfilled = store.backfilled_meta.lock().expect("backfilled_meta lock");
+        for key in backfill_snapshot.keys() {
+            backfilled.remove(key);
+        }
+    }
+
+    if manifest.pending_deletes.is_empty() {
+        return Ok(0);
+    }
+
+    // Phase 2: best-effort, bounded, cancellable S3 object deletions.
+    let candidates: Vec<String> = manifest
+        .pending_deletes
+        .iter()
+        .take(MAX_DELETES_PER_SWEEP)
+        .cloned()
+        .collect();
+    let mut confirmed_deleted: Vec<String> = Vec::new();
+    let mut cancelled = false;
+
+    for seg_name in candidates {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            break;
+        }
+        let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, seg_name).as_str());
+        let delete_res = if let Some(stop) = cancel {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                res = store.client.delete(&key) => res,
+            }
+        } else {
+            store.client.delete(&key).await
+        };
+
+        match delete_res {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                if let Some(index) = segment_index_of(&seg_name) {
+                    store
+                        .segment_ranges
+                        .lock()
+                        .expect("segment range cache")
+                        .remove(&index);
+                }
+                confirmed_deleted.push(seg_name);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    segment = %seg_name,
+                    error = %e,
+                    "S3 WAL segment delete failed; leaving in pending_deletes for retry"
+                );
+            }
+        }
+    }
+
+    // Phase 3: clear confirmed deletions from `pending_deletes`.
+    if !confirmed_deleted.is_empty() && !cancelled {
+        let confirmed_set: HashSet<String> = confirmed_deleted.iter().cloned().collect();
+        let _ = write_manifest_with_etag_if_changed(store, |m| {
+            let before = m.pending_deletes.len();
+            m.pending_deletes.retain(|s| !confirmed_set.contains(s));
+            m.pending_deletes.len() != before
+        })
+        .await?;
+        tracing::debug!(
+            reclaimed = confirmed_deleted.len(),
+            "S3 WAL reclaimed sealed segments"
+        );
+    }
+
+    Ok(confirmed_deleted.len())
+}
+
 fn spawn_flusher(store: Arc<S3Store>) -> FlusherHandle {
-    let stop = Arc::new(Notify::new());
-    let stop_clone = stop.clone();
+    let stop = CancellationToken::new();
+    let stop_seal = stop.clone();
+    let stop_reclaim = stop.clone();
     let join = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("flusher runtime");
         rt.block_on(async move {
-            let interval = store.segment_cfg.flush_interval;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = stop_clone.notified() => break,
-                    _ = tokio::time::sleep(interval) => {
-                        let _ = seal_active_segment(&store).await;
-                        let _ = flush_manifest(&store).await;
+            let seal_interval = store.segment_cfg.flush_interval;
+            let reclaim_interval = seal_interval.max(std::time::Duration::from_secs(1));
+
+            let seal_store = store.clone();
+            let seal_loop = async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = stop_seal.cancelled() => break,
+                        _ = tokio::time::sleep(seal_interval) => {
+                            let _ = seal_active_segment(&seal_store).await;
+                            let _ = flush_manifest(&seal_store).await;
+                        }
                     }
                 }
-            }
+            };
+
+            let reclaim_store = store;
+            let reclaim_loop = async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = stop_reclaim.cancelled() => break,
+                        _ = tokio::time::sleep(reclaim_interval) => {
+                            if let Err(e) = reclaim_segments(&reclaim_store, Some(&stop_reclaim)).await {
+                                tracing::warn!(error = %e, "S3 WAL segment reclaim sweep failed");
+                            }
+                        }
+                    }
+                }
+            };
+
+            tokio::join!(seal_loop, reclaim_loop);
         });
     });
     FlusherHandle { stop, join }
@@ -1717,6 +2132,7 @@ mod tests {
             segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::default(),
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let store =
@@ -1843,6 +2259,7 @@ mod tests {
                 segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
                 parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
                 compression: arkflow_core::wal::config::CompressionConfig::default(),
+                retention: RetentionConfig::default(),
                 sync: SyncPolicy::GroupCommit,
             };
             S3Store::build_with_client(&WalConfig::default(), osc, Runtime::new().unwrap(), client)
@@ -1985,6 +2402,7 @@ mod tests {
             segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::default(),
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let store =
@@ -2025,6 +2443,7 @@ mod tests {
             },
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::default(),
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let store =
@@ -2068,6 +2487,7 @@ mod tests {
             },
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::default(),
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let store =
@@ -2111,6 +2531,7 @@ mod tests {
             segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::default(),
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         // Force tuning to use the invalid `segment` (no overrides)
@@ -2189,6 +2610,7 @@ mod tests {
                 ..Default::default()
             },
             compression: arkflow_core::wal::config::CompressionConfig::default(),
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let result = S3Store::build_with_client(&WalConfig::default(), osc, runtime, client);
@@ -2230,6 +2652,7 @@ mod tests {
             segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::Zstd { level: 25 },
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let result = S3Store::build_with_client(&WalConfig::default(), osc, runtime, client);
@@ -2268,6 +2691,7 @@ mod tests {
             segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::None,
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let store =
@@ -2314,6 +2738,7 @@ mod tests {
             segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::default(),
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap()
@@ -2437,6 +2862,7 @@ mod tests {
             segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::None,
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         S3Store::build_with_client(&WalConfig::default(), osc, runtime, client).unwrap()
@@ -3017,6 +3443,7 @@ mod tests {
             segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
             parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
             compression: arkflow_core::wal::config::CompressionConfig::None,
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         }
     }
@@ -4238,6 +4665,697 @@ mod tests {
         assert!(
             cached >= 2,
             "sealed segments were decoded and their ranges cached, got {cached}"
+        );
+    }
+
+    // ===== Retention & crash-safe segment reclamation tests =====
+
+    #[derive(Debug)]
+    struct SpyObjectStore {
+        inner: Arc<InMemory>,
+        gets: StdMutex<Vec<String>>,
+        puts: StdMutex<Vec<String>>,
+        deletes: StdMutex<Vec<String>>,
+        fail_deletes: std::sync::atomic::AtomicBool,
+    }
+
+    impl SpyObjectStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                gets: StdMutex::new(Vec::new()),
+                puts: StdMutex::new(Vec::new()),
+                deletes: StdMutex::new(Vec::new()),
+                fail_deletes: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn clear_counts(&self) {
+            self.gets.lock().unwrap().clear();
+            self.puts.lock().unwrap().clear();
+            self.deletes.lock().unwrap().clear();
+        }
+
+        fn segment_gets(&self) -> Vec<String> {
+            self.gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.ends_with(".wal"))
+                .cloned()
+                .collect()
+        }
+
+        fn manifest_puts(&self) -> usize {
+            self.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.ends_with("manifest.json"))
+                .count()
+        }
+
+        fn list_segment_names(&self, rt: &Runtime, prefix: &str) -> Vec<String> {
+            let p = ObjectPath::from(prefix);
+            let mut names: Vec<String> = rt.block_on(async {
+                let mut out = Vec::new();
+                let mut stream = std::pin::pin!(self.inner.list(Some(&p)));
+                while let Some(item) = stream.next().await {
+                    let meta = item.unwrap();
+                    if let Some(name) = meta.location.filename() {
+                        if name.ends_with(".wal") {
+                            out.push(name.to_string());
+                        }
+                    }
+                }
+                out
+            });
+            names.sort();
+            names
+        }
+    }
+
+    impl std::fmt::Display for SpyObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SpyObjectStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for SpyObjectStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.puts.lock().unwrap().push(location.to_string());
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.gets.lock().unwrap().push(location.to_string());
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            if self.fail_deletes.load(Ordering::Acquire) {
+                return Box::pin(locations.map(|res| match res {
+                    Ok(loc) => Err(object_store::Error::Generic {
+                        store: "SpyObjectStore",
+                        source: format!("injected delete failure for {loc}").into(),
+                    }),
+                    Err(e) => Err(e),
+                }));
+            }
+            let deletes = &self.deletes;
+            let recorded: Vec<object_store::Result<ObjectPath>> =
+                futures::executor::block_on(async {
+                    let mut out = Vec::new();
+                    let mut s = locations;
+                    while let Some(item) = s.next().await {
+                        if let Ok(ref loc) = item {
+                            deletes.lock().unwrap().push(loc.to_string());
+                        }
+                        out.push(item);
+                    }
+                    out
+                });
+            self.inner
+                .delete_stream(Box::pin(futures::stream::iter(recorded)))
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn build_retention_store(
+        client: Arc<dyn object_store::ObjectStore>,
+        stream_id: &str,
+        retention: RetentionConfig,
+    ) -> Arc<S3Store> {
+        let osc = ObjectStoreWalConfig {
+            node_id: "ret-pod".into(),
+            stream_id: stream_id.into(),
+            prefix: "arkflow/ret".into(),
+            s3: ObjectStoreS3Config {
+                bucket: "unused".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig {
+                max_entries: 4,
+                max_bytes: usize::MAX,
+                flush_interval: std::time::Duration::from_secs(3600),
+            },
+            cursor: CursorFlushConfig {
+                max_entries: 1000,
+                interval: std::time::Duration::from_secs(3600),
+            },
+            segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
+            parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
+            compression: arkflow_core::wal::config::CompressionConfig::None,
+            retention,
+            sync: SyncPolicy::GroupCommit,
+        };
+        S3Store::build_with_client(&WalConfig::default(), osc, Runtime::new().unwrap(), client)
+            .unwrap()
+    }
+
+    #[test]
+    fn select_reclaimable_segments_policy_matrix() {
+        let mk = |idx: u64, size_bytes: u64, sealed_at_ms: u64| {
+            (
+                format!("{idx:08}.wal"),
+                SegmentMeta {
+                    first_seq: (idx - 1) * 4 + 1,
+                    last_seq: idx * 4,
+                    size_bytes,
+                    sealed_at_ms,
+                },
+            )
+        };
+        let now = 100_000u64;
+        // Pass unsorted to verify deterministic segment-index ordering.
+        let eligible = vec![
+            mk(3, 600, now - 10_000),
+            mk(1, 300, now - 90_000),
+            mk(2, 500, now - 40_000),
+        ];
+
+        // Disabled keeps everything.
+        assert!(select_reclaimable_segments(
+            &RetentionConfig {
+                enabled: false,
+                max_segments: Some(0),
+                max_age: None,
+                max_bytes: None,
+            },
+            &eligible,
+            now
+        )
+        .is_empty());
+
+        // Default (enabled, all caps None) reclaims everything oldest-first.
+        assert_eq!(
+            select_reclaimable_segments(&RetentionConfig::default(), &eligible, now),
+            vec!["00000001.wal", "00000002.wal", "00000003.wal"]
+        );
+
+        // max_segments = 2 keeps [2, 3], reclaims [1].
+        assert_eq!(
+            select_reclaimable_segments(
+                &RetentionConfig {
+                    enabled: true,
+                    max_segments: Some(2),
+                    max_age: None,
+                    max_bytes: None,
+                },
+                &eligible,
+                now
+            ),
+            vec!["00000001.wal"]
+        );
+
+        // max_age = 50s keeps [2 (40s), 3 (10s)], reclaims [1 (90s)].
+        assert_eq!(
+            select_reclaimable_segments(
+                &RetentionConfig {
+                    enabled: true,
+                    max_segments: None,
+                    max_age: Some(std::time::Duration::from_secs(50)),
+                    max_bytes: None,
+                },
+                &eligible,
+                now
+            ),
+            vec!["00000001.wal"]
+        );
+
+        // max_bytes = 1000: seg 3 (600) fits; seg 2 (600+500=1100) exceeds ->
+        // MUST break so seg 1 (300) is ALSO reclaimed (contiguous suffix, no gap!).
+        assert_eq!(
+            select_reclaimable_segments(
+                &RetentionConfig {
+                    enabled: true,
+                    max_segments: None,
+                    max_age: None,
+                    max_bytes: Some(1000),
+                },
+                &eligible,
+                now
+            ),
+            vec!["00000001.wal", "00000002.wal"]
+        );
+
+        // Backwards wall-clock jump (now < sealed_at_ms) saturates to 0 age -> kept.
+        assert!(select_reclaimable_segments(
+            &RetentionConfig {
+                enabled: true,
+                max_segments: None,
+                max_age: Some(std::time::Duration::from_secs(1)),
+                max_bytes: None,
+            },
+            &[mk(1, 100, now + 5_000)],
+            now
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn retention_default_reclaims_segments_behind_committed_floor_and_skips_gets_on_reopen() {
+        let spy = SpyObjectStore::new();
+        let store =
+            build_retention_store(spy.clone(), "default-reclaim", RetentionConfig::default());
+        let payload = sample_payload(None);
+
+        // Write 5 full segments (20 entries): segs 1..=4 in sealed_segments, seg 5 active.
+        for seq in 1..=20u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        // Advance and commit through seq 13 (first entry of seg 4):
+        // reclaimable_hwm = 12 => segs 1..=3 (N-2 = 3) are wholly behind the floor.
+        for seq in 1..=13u64 {
+            store.advance_cursor(seq).unwrap();
+            store.mark_committed(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+
+        let reclaimed = store.rt().block_on(reclaim_segments(&store, None)).unwrap();
+        assert_eq!(reclaimed, 3, "segments 1..=3 must be reclaimed");
+
+        // Verify object store holds only segments 4 and 5.
+        let remaining =
+            spy.list_segment_names(store.rt(), "arkflow/ret/ret-pod/default-reclaim/segments");
+        assert_eq!(remaining, vec!["00000004.wal", "00000005.wal"]);
+
+        // Verify manifest cleared pending_deletes and lists only seg 4 + active seg 5.
+        let manifest = store.read_manifest().unwrap();
+        assert_eq!(manifest.sealed_segments, vec!["00000004.wal"]);
+        assert_eq!(manifest.active_segment.as_deref(), Some("00000005.wal"));
+        assert!(manifest.pending_deletes.is_empty());
+
+        // Idle reclaim sweep must issue 0 manifest PUTs.
+        spy.clear_counts();
+        let idle = store.rt().block_on(reclaim_segments(&store, None)).unwrap();
+        assert_eq!(idle, 0);
+        assert_eq!(spy.manifest_puts(), 0, "idle sweep must not PUT manifest");
+
+        store.close().unwrap();
+        drop(store);
+
+        // Reopen: recovery + replay must NOT GET any deleted segment and must
+        // replay exactly 14..=20 with monotonic next_seq_hint and next_index.
+        spy.clear_counts();
+        let reopened =
+            build_retention_store(spy.clone(), "default-reclaim", RetentionConfig::default());
+        assert_eq!(reopened.next_seq_hint(), 21);
+        let replayed: Vec<u64> = reopened
+            .read_after_cursor()
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(replayed, (14..=20u64).collect::<Vec<_>>());
+
+        let seg_gets = spy.segment_gets();
+        for deleted in ["00000001.wal", "00000002.wal", "00000003.wal"] {
+            assert!(
+                !seg_gets.iter().any(|p| p.ends_with(deleted)),
+                "reopen must not GET deleted segment {deleted}, got: {seg_gets:?}"
+            );
+        }
+
+        // Next seal gets index 6 (no collision with reclaimed 1..=3).
+        for seq in 21..=24u64 {
+            reopened.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        let m2 = reopened.read_manifest().unwrap();
+        assert_eq!(m2.active_segment.as_deref(), Some("00000006.wal"));
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn retention_with_max_segments_retains_tail_and_skips_covered_gets_on_reopen() {
+        let spy = SpyObjectStore::new();
+        let cfg = RetentionConfig {
+            enabled: true,
+            max_segments: Some(1),
+            max_age: None,
+            max_bytes: None,
+        };
+        let store = build_retention_store(spy.clone(), "keep-tail", cfg.clone());
+        let payload = sample_payload(None);
+
+        for seq in 1..=20u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        for seq in 1..=13u64 {
+            store.advance_cursor(seq).unwrap();
+            store.mark_committed(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+
+        let reclaimed = store.rt().block_on(reclaim_segments(&store, None)).unwrap();
+        assert_eq!(reclaimed, 2, "segments 1..=2 deleted; segment 3 retained");
+
+        let remaining =
+            spy.list_segment_names(store.rt(), "arkflow/ret/ret-pod/keep-tail/segments");
+        assert_eq!(
+            remaining,
+            vec!["00000003.wal", "00000004.wal", "00000005.wal"]
+        );
+        store.close().unwrap();
+        drop(store);
+
+        // Reopen: retained-but-acknowledged segment 3 (last_seq=12 <= cursor=13)
+        // must ALSO be skipped during recover() and read_after_cursor()!
+        spy.clear_counts();
+        let reopened = build_retention_store(spy.clone(), "keep-tail", cfg);
+        let replayed: Vec<u64> = reopened
+            .read_after_cursor()
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(replayed, (14..=20u64).collect::<Vec<_>>());
+        let seg_gets = spy.segment_gets();
+        assert!(
+            !seg_gets.iter().any(|p| p.ends_with("00000003.wal")),
+            "covered segment 3 must not be downloaded on recovery/replay: {seg_gets:?}"
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn retention_disabled_keeps_all_sealed_segments() {
+        let spy = SpyObjectStore::new();
+        let cfg = RetentionConfig {
+            enabled: false,
+            max_segments: Some(0),
+            max_age: None,
+            max_bytes: None,
+        };
+        let store = build_retention_store(spy.clone(), "disabled", cfg);
+        let payload = sample_payload(None);
+        for seq in 1..=16u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        for seq in 1..=12u64 {
+            store.advance_cursor(seq).unwrap();
+            store.mark_committed(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+        assert_eq!(
+            store.rt().block_on(reclaim_segments(&store, None)).unwrap(),
+            0
+        );
+        assert_eq!(
+            spy.list_segment_names(store.rt(), "arkflow/ret/ret-pod/disabled/segments")
+                .len(),
+            4
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn retention_respects_rewind_safety_and_undo_boundary() {
+        let spy = SpyObjectStore::new();
+        let store = build_retention_store(spy.clone(), "rewind-safe", RetentionConfig::default());
+        let payload = sample_payload(None);
+
+        // 3 segments: [1..=4], [5..=8], [9..=12].
+        for seq in 1..=12u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        // Advance cursor to 8 WITHOUT mark_committed: nothing may be reclaimed.
+        for seq in 1..=8u64 {
+            store.advance_cursor(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+        assert_eq!(
+            store.rt().block_on(reclaim_segments(&store, None)).unwrap(),
+            0,
+            "advance_cursor without mark_committed must not reclaim"
+        );
+
+        // mark_committed(4) sets reclaimable_hwm = 3: segment 1 (last_seq = 4)
+        // must remain intact so Wal::undo(4) -> rewind_cursor(3) can replay 4.
+        store.mark_committed(4).unwrap();
+        assert_eq!(
+            store.rt().block_on(reclaim_segments(&store, None)).unwrap(),
+            0,
+            "segment containing latest committed seq 4 must survive for undo"
+        );
+        store.rewind_cursor(3).unwrap();
+        let after_rewind: Vec<u64> = store
+            .read_after_cursor()
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(after_rewind, (4..=12u64).collect::<Vec<_>>());
+
+        // While rewind poison is active, reclaim stays paused.
+        assert_eq!(
+            store.rt().block_on(reclaim_segments(&store, None)).unwrap(),
+            0
+        );
+
+        // Re-ack and commit through 5 -> clears poison, reclaimable_hwm = 4 ->
+        // segment 1 (last_seq = 4 <= 4) is now reclaimed!
+        store.advance_cursor(4).unwrap();
+        store.mark_committed(4).unwrap();
+        store.advance_cursor(5).unwrap();
+        store.mark_committed(5).unwrap();
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+        assert_eq!(
+            store.rt().block_on(reclaim_segments(&store, None)).unwrap(),
+            1
+        );
+        assert_eq!(
+            spy.list_segment_names(store.rt(), "arkflow/ret/ret-pod/rewind-safe/segments"),
+            vec!["00000002.wal", "00000003.wal"]
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn retention_crash_between_phases_and_delete_errors_self_heal() {
+        let spy = SpyObjectStore::new();
+        let store = build_retention_store(spy.clone(), "crash-heal", RetentionConfig::default());
+        let payload = sample_payload(None);
+        for seq in 1..=12u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        for seq in 1..=5u64 {
+            store.advance_cursor(seq).unwrap();
+            store.mark_committed(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+
+        // Simulate failure during Phase 2 DELETE (Phase 1 already moved seg 1
+        // into `pending_deletes`, but the object remains on S3).
+        spy.fail_deletes.store(true, Ordering::Release);
+        assert_eq!(
+            store.rt().block_on(reclaim_segments(&store, None)).unwrap(),
+            0
+        );
+        let m = store.read_manifest().unwrap();
+        assert_eq!(m.pending_deletes, vec!["00000001.wal"]);
+        assert!(spy
+            .list_segment_names(store.rt(), "arkflow/ret/ret-pod/crash-heal/segments")
+            .contains(&"00000001.wal".to_string()));
+        store.close().unwrap();
+        drop(store);
+
+        // Reopen while `00000001.wal` is still on S3 and in `pending_deletes`:
+        // recovery MUST skip GETting it, and once DELETE succeeds the next sweep
+        // removes the object and clears `pending_deletes`.
+        spy.clear_counts();
+        let reopened = build_retention_store(spy.clone(), "crash-heal", RetentionConfig::default());
+        assert!(
+            !spy.segment_gets()
+                .iter()
+                .any(|p| p.ends_with("00000001.wal")),
+            "recovery must skip pending_deletes segment"
+        );
+        spy.fail_deletes.store(false, Ordering::Release);
+        assert_eq!(
+            reopened
+                .rt()
+                .block_on(reclaim_segments(&reopened, None))
+                .unwrap(),
+            1
+        );
+        assert!(reopened.read_manifest().unwrap().pending_deletes.is_empty());
+        assert_eq!(
+            spy.list_segment_names(reopened.rt(), "arkflow/ret/ret-pod/crash-heal/segments"),
+            vec!["00000002.wal", "00000003.wal"]
+        );
+
+        // Now simulate crash between Phase 2 (object already deleted) and
+        // Phase 3 (`pending_deletes` still lists an already-absent segment).
+        reopened
+            .rt()
+            .block_on(write_manifest_with_etag(&reopened, |m| {
+                m.pending_deletes.push("00000001.wal".into());
+            }))
+            .unwrap();
+        reopened.close().unwrap();
+        drop(reopened);
+
+        spy.clear_counts();
+        let reopened2 =
+            build_retention_store(spy.clone(), "crash-heal", RetentionConfig::default());
+        assert!(
+            !spy.segment_gets()
+                .iter()
+                .any(|p| p.ends_with("00000001.wal")),
+            "recovery must not GET already-deleted pending_deletes entry"
+        );
+        // Next sweep treats NotFound as idempotent success and clears pending_deletes.
+        assert_eq!(
+            reopened2
+                .rt()
+                .block_on(reclaim_segments(&reopened2, None))
+                .unwrap(),
+            1
+        );
+        assert!(reopened2
+            .read_manifest()
+            .unwrap()
+            .pending_deletes
+            .is_empty());
+        reopened2.close().unwrap();
+    }
+
+    #[test]
+    fn retention_legacy_manifest_and_list_fallback_open_readonly_then_adopt_and_reclaim() {
+        let spy = SpyObjectStore::new();
+        let payload = sample_payload(None);
+        let rt = Runtime::new().unwrap();
+        let ns = "arkflow/ret/ret-pod/legacy-adopt";
+
+        // Seed 3 raw segment objects:
+        // - 00000001.wal ([1..=4]): listed in legacy manifest without segment_meta
+        // - 00000002.wal ([5..=8]): LIST-fallback (absent from manifest!)
+        // - 00000003.wal ([9..=12]): active_segment in legacy manifest without segment_meta
+        rt.block_on(async {
+            for (idx, range) in [(1u64, 1u64..=4), (2, 5..=8), (3, 9..=12)] {
+                let entries: Vec<(u64, Vec<u8>)> = range.map(|s| (s, payload.clone())).collect();
+                let mut buf = Vec::new();
+                super::super::segment::encode(&entries, &mut buf).unwrap();
+                spy.inner
+                    .put(
+                        &ObjectPath::from(format!("{ns}/segments/{idx:08}.wal").as_str()),
+                        PutPayload::from(Bytes::from(buf)),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let legacy_manifest = serde_json::json!({
+                "version": 2,
+                "node_id": "ret-pod",
+                "stream_id": "legacy-adopt",
+                "cursor": 4,
+                "max_sealed_seq": 12,
+                "active_segment": "00000003.wal",
+                "sealed_segments": ["00000001.wal"]
+            });
+            spy.inner
+                .put(
+                    &ObjectPath::from(format!("{ns}/manifest.json").as_str()),
+                    PutPayload::from(Bytes::from(serde_json::to_vec(&legacy_manifest).unwrap())),
+                )
+                .await
+                .unwrap();
+        });
+
+        spy.clear_counts();
+        let store = build_retention_store(spy.clone(), "legacy-adopt", RetentionConfig::default());
+        assert_eq!(
+            spy.manifest_puts(),
+            0,
+            "recover() must remain strictly read-only"
+        );
+        let replayed: Vec<u64> = store
+            .read_after_cursor()
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(replayed, (5..=12u64).collect::<Vec<_>>());
+
+        // Commit through seq 9 -> reclaimable_hwm = 8 -> adopts LIST-fallback
+        // segment 2 + legacy segment 1 metadata and reclaims BOTH 1 and 2.
+        for seq in 5..=9u64 {
+            store.advance_cursor(seq).unwrap();
+            store.mark_committed(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+
+        let reclaimed = store.rt().block_on(reclaim_segments(&store, None)).unwrap();
+        assert_eq!(
+            reclaimed, 2,
+            "legacy seg 1 and LIST-fallback seg 2 reclaimed"
+        );
+        assert_eq!(
+            spy.list_segment_names(store.rt(), &format!("{ns}/segments")),
+            vec!["00000003.wal"]
+        );
+        let manifest = store.read_manifest().unwrap();
+        assert!(manifest.sealed_segments.is_empty());
+        assert_eq!(manifest.active_segment.as_deref(), Some("00000003.wal"));
+        assert!(manifest.segment_meta.contains_key("00000003.wal"));
+        assert_eq!(store.next_seq_hint(), 13);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn build_rejects_zero_retention_max_age() {
+        let err = unwrap_err(
+            build_cov_store_err(|osc| {
+                osc.retention.max_age = Some(std::time::Duration::ZERO);
+            }),
+            "zero retention.max_age must be rejected",
+        );
+        assert!(
+            err.to_string().contains("max_age"),
+            "expected max_age error, got: {err}"
         );
     }
 }

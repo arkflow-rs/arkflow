@@ -134,6 +134,7 @@ fn osc(s3: ObjectStoreS3Config) -> ObjectStoreWalConfig {
         segment_tuning: arkflow_core::wal::config::SegmentTuningConfig::default(),
         parallel_put: arkflow_core::wal::config::ParallelPutConfig::default(),
         compression: arkflow_core::wal::config::CompressionConfig::default(),
+        retention: arkflow_core::wal::config::RetentionConfig::default(),
         sync: SyncPolicy::GroupCommit,
     }
 }
