@@ -2744,48 +2744,95 @@ impl StorageBackend for PostgresBackend {
             .optional()
     }
 
+    async fn create_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
+        let mut transaction = self.begin().await?;
+        let user_for_row = user.clone();
+        transaction
+            .execute(
+                &q("INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"),
+                binds![
+                    user.user_id,
+                    user.display_name,
+                    user.role,
+                    user.scopes_json,
+                    user.disabled,
+                    user.oidc_subject,
+                    user.tokens_valid_after_ms,
+                    user.created_at_ms,
+                    user.updated_at_ms,
+                ],
+            )
+            .await
+            .map_err(map_postgres_user_write_error)?;
+        transaction.commit().await?;
+        Ok(user_for_row)
+    }
+
     async fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
         let mut transaction = self.begin().await?;
         let user_for_row = user.clone();
-        let __ret = async {
-            transaction
-                .execute(
-                    &q("INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, role=excluded.role, scopes_json=excluded.scopes_json, disabled=excluded.disabled, oidc_subject=excluded.oidc_subject, tokens_valid_after_ms=excluded.tokens_valid_after_ms, created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms"),
-                    binds![
-                        user.user_id,
-                        user.display_name,
-                        user.role,
-                        user.scopes_json,
-                        user.disabled,
-                        user.oidc_subject,
-                        user.tokens_valid_after_ms,
-                        user.created_at_ms,
-                        user.updated_at_ms,
-                    ],
-                )
-                .await?;
-            Ok(user_for_row)
-        }.await;
+        transaction
+            .execute(
+                &q("INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, role=excluded.role, scopes_json=excluded.scopes_json, disabled=excluded.disabled, oidc_subject=excluded.oidc_subject, tokens_valid_after_ms=excluded.tokens_valid_after_ms, created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms"),
+                binds![
+                    user.user_id,
+                    user.display_name,
+                    user.role,
+                    user.scopes_json,
+                    user.disabled,
+                    user.oidc_subject,
+                    user.tokens_valid_after_ms,
+                    user.created_at_ms,
+                    user.updated_at_ms,
+                ],
+            )
+            .await
+            .map_err(map_postgres_user_write_error)?;
         transaction.commit().await?;
-        __ret
+        Ok(user_for_row)
     }
 
     async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
         let mut transaction = self.begin().await?;
-        let __ret = async {
-            transaction
-                .execute(&q("DELETE FROM cp_credentials WHERE user_id = ?1"), binds![user_id])
+        let oidc_subject: Option<String> = transaction
+            .query_row(
+                &q("SELECT oidc_subject FROM cp_users WHERE user_id = ?1"),
+                binds![user_id],
+                |row| row.get::<Option<String>>(0),
+            )
+            .await
+            .optional()?
+            .flatten();
+        transaction
+            .execute(&q("DELETE FROM cp_credentials WHERE user_id = ?1"), binds![user_id])
+            .await?;
+        transaction
+            .execute(&q("DELETE FROM cp_sessions WHERE user_id = ?1"), binds![user_id])
+            .await?;
+        if let Some(subject) = oidc_subject.as_deref() {
+            let rows: Vec<(String, String)> = transaction
+                .query_all(
+                    &q("SELECT session_hash, principal_json FROM cp_sessions WHERE user_id IS NULL"),
+                    binds![],
+                    |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+                )
                 .await?;
-            transaction
-                .execute(&q("DELETE FROM cp_sessions WHERE user_id = ?1"), binds![user_id])
-                .await?;
-            let changed = transaction
-                .execute(&q("DELETE FROM cp_users WHERE user_id = ?1"), binds![user_id])
-                .await?;
-            Ok(changed > 0)
-        }.await;
+            for (session_hash, principal_json) in rows {
+                if super::session_principal_matches_subject(&principal_json, subject) {
+                    transaction
+                        .execute(
+                            &q("DELETE FROM cp_sessions WHERE session_hash = ?1"),
+                            binds![session_hash],
+                        )
+                        .await?;
+                }
+            }
+        }
+        let changed = transaction
+            .execute(&q("DELETE FROM cp_users WHERE user_id = ?1"), binds![user_id])
+            .await?;
         transaction.commit().await?;
-        __ret
+        Ok(changed > 0)
     }
 
     async fn bump_user_tokens_valid_after(
@@ -2979,14 +3026,39 @@ impl StorageBackend for PostgresBackend {
 
     async fn delete_user_sessions(&self, user_id: &str) -> Result<usize, StorageError> {
         let mut transaction = self.begin().await?;
-        let __ret = async {
-            let changed = transaction
-                .execute(&q("DELETE FROM cp_sessions WHERE user_id = ?1"), binds![user_id])
-                .await?;
-            Ok(changed as usize)
-        }.await;
+        let changed = transaction
+            .execute(&q("DELETE FROM cp_sessions WHERE user_id = ?1"), binds![user_id])
+            .await?;
         transaction.commit().await?;
-        __ret
+        Ok(changed as usize)
+    }
+
+    async fn delete_sessions_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<usize, StorageError> {
+        let mut transaction = self.begin().await?;
+        let rows: Vec<(String, String)> = transaction
+            .query_all(
+                &q("SELECT session_hash, principal_json FROM cp_sessions WHERE user_id IS NULL"),
+                binds![],
+                |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+            )
+            .await?;
+        let mut deleted = 0usize;
+        for (session_hash, principal_json) in rows {
+            if super::session_principal_matches_subject(&principal_json, oidc_subject) {
+                let changed = transaction
+                    .execute(
+                        &q("DELETE FROM cp_sessions WHERE session_hash = ?1"),
+                        binds![session_hash],
+                    )
+                    .await?;
+                deleted += changed as usize;
+            }
+        }
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     async fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError> {
@@ -3346,3 +3418,33 @@ fn row_to_job_pg(row: &Row<'_>) -> Result<JobRecord, StorageError> {
         paused_by: row.get(16)?,
     })
 }
+
+fn map_postgres_user_write_error(error: StorageError) -> StorageError {
+    if let StorageError::Pool(sqlx::Error::Database(ref db_error)) = error {
+        if db_error.code().as_deref() == Some("23505") {
+            return match db_error.constraint() {
+                Some("cp_users_pkey") => StorageError::UserAlreadyExists,
+                Some("cp_users_oidc_subject") => StorageError::OidcSubjectConflict,
+                _ => {
+                    let message = db_error.message();
+                    if message.contains("cp_users_pkey") {
+                        StorageError::UserAlreadyExists
+                    } else if message.contains("cp_users_oidc_subject") {
+                        StorageError::OidcSubjectConflict
+                    } else {
+                        error
+                    }
+                }
+            };
+        }
+    }
+    let text = error.to_string();
+    if text.contains("cp_users_pkey") {
+        StorageError::UserAlreadyExists
+    } else if text.contains("cp_users_oidc_subject") {
+        StorageError::OidcSubjectConflict
+    } else {
+        error
+    }
+}
+

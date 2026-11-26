@@ -691,6 +691,19 @@ pub enum StorageError {
     TargetBusy(String),
     #[error("unsupported column type in store copy: {0}")]
     ColumnType(String),
+    #[error("user already exists")]
+    UserAlreadyExists,
+    #[error("OIDC subject is already bound to another user")]
+    OidcSubjectConflict,
+}
+
+/// Whether a stored session's `principal_json` belongs to the given OIDC
+/// subject (used to clean up unbound sessions when a subject is bound,
+/// disabled, deleted, or revoked).
+pub(crate) fn session_principal_matches_subject(principal_json: &str, oidc_subject: &str) -> bool {
+    serde_json::from_str::<crate::api_contract::OperatorPrincipal>(principal_json)
+        .ok()
+        .is_some_and(|principal| principal.id == oidc_subject)
 }
 
 /// Schema version this binary's DDL understands. Each backend stamps it
@@ -987,6 +1000,9 @@ storage_ops! {
     ("get_user_by_oidc_subject", GetUserByOidcSubject, get_user_by_oidc_subject) plain Option<UserRecord> {
         oidc_subject: String as s,
     },
+    ("create_user", CreateUser, create_user) fenced UserRecord {
+        user: UserRecord as v,
+    },
     ("upsert_user", UpsertUser, upsert_user) fenced UserRecord {
         user: UserRecord as v,
     },
@@ -1026,6 +1042,9 @@ storage_ops! {
     },
     ("delete_user_sessions", DeleteUserSessions, delete_user_sessions) fenced usize {
         user_id: String as s,
+    },
+    ("delete_sessions_by_oidc_subject", DeleteSessionsByOidcSubject, delete_sessions_by_oidc_subject) fenced usize {
+        oidc_subject: String as s,
     },
     ("prune_sessions", PruneSessions, prune_sessions) fenced usize {
         now_ms: u64 as v,
@@ -1757,6 +1776,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         &self,
         oidc_subject: &str,
     ) -> Result<Option<UserRecord>, StorageError>;
+    async fn create_user(&self, user: UserRecord) -> Result<UserRecord, StorageError>;
     async fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError>;
     async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError>;
     async fn bump_user_tokens_valid_after(
@@ -1786,6 +1806,10 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn upsert_session(&self, record: SessionRecord) -> Result<bool, StorageError>;
     async fn delete_session(&self, session_hash: &str) -> Result<bool, StorageError>;
     async fn delete_user_sessions(&self, user_id: &str) -> Result<usize, StorageError>;
+    async fn delete_sessions_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<usize, StorageError>;
     async fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError>;
     async fn upsert_job_checkpoint(&self, record: JobCheckpointRecord) -> Result<(), StorageError>;
     async fn list_job_checkpoints(
@@ -3033,6 +3057,12 @@ impl StorageBackend for ControlPlaneStore {
             }
         }
     }
+    async fn create_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::create_user(backend, user).await,
+            Self::Postgres(backend) => StorageBackend::create_user(backend, user).await,
+        }
+    }
     async fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
         match self {
             Self::Sqlite(backend) => StorageBackend::upsert_user(backend, user).await,
@@ -3143,6 +3173,19 @@ impl StorageBackend for ControlPlaneStore {
         match self {
             Self::Sqlite(backend) => StorageBackend::delete_user_sessions(backend, user_id).await,
             Self::Postgres(backend) => StorageBackend::delete_user_sessions(backend, user_id).await,
+        }
+    }
+    async fn delete_sessions_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::delete_sessions_by_oidc_subject(backend, oidc_subject).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::delete_sessions_by_oidc_subject(backend, oidc_subject).await
+            }
         }
     }
     async fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError> {
@@ -7966,5 +8009,86 @@ mod job_storage_tests {
         assert!(store.get_user("alice").await.unwrap().is_none());
         assert!(store.list_credentials("alice").await.unwrap().is_empty());
         assert!(store.get_session("session-c").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_duplicates_without_overwriting_and_cleans_unbound_sessions() {
+        let store = ControlPlaneStore::contract("create_user_and_unbound_sessions").await;
+        let mut alice = identity_user("alice");
+        alice.display_name = "Original Alice".into();
+        alice.oidc_subject = Some("sub-alice".into());
+        assert_eq!(store.create_user(alice.clone()).await.unwrap(), alice);
+
+        // Insert-only semantics: a duplicate user_id fails with
+        // UserAlreadyExists and never overwrites the existing record.
+        let mut overwrite_attempt = identity_user("alice");
+        overwrite_attempt.display_name = "Overwritten Alice".into();
+        overwrite_attempt.role = "admin".into();
+        assert!(matches!(
+            store.create_user(overwrite_attempt).await,
+            Err(StorageError::UserAlreadyExists)
+        ));
+        assert_eq!(
+            store.get_user("alice").await.unwrap().unwrap().display_name,
+            "Original Alice"
+        );
+
+        // Duplicate OIDC subject on a distinct user_id maps to
+        // OidcSubjectConflict.
+        let mut bob = identity_user("bob");
+        bob.oidc_subject = Some("sub-alice".into());
+        assert!(matches!(
+            store.create_user(bob).await,
+            Err(StorageError::OidcSubjectConflict)
+        ));
+
+        // Unbound sessions (`user_id: None`) are selectively removable by
+        // OIDC subject without touching other subjects or bound sessions.
+        let unbound_alice = SessionRecord {
+            session_hash: "unbound-alice".into(),
+            user_id: None,
+            principal_json: r#"{"id":"sub-alice","roles":["operator"],"scopes":[]}"#.into(),
+            created_at_ms: 10,
+            expires_at_ms: 1000,
+            revoked_at_ms: None,
+        };
+        let unbound_other = SessionRecord {
+            session_hash: "unbound-other".into(),
+            user_id: None,
+            principal_json: r#"{"id":"sub-other","roles":["viewer"],"scopes":[]}"#.into(),
+            created_at_ms: 10,
+            expires_at_ms: 1000,
+            revoked_at_ms: None,
+        };
+        let bound_alice = SessionRecord {
+            session_hash: "bound-alice".into(),
+            user_id: Some("alice".into()),
+            principal_json: r#"{"id":"alice","roles":["operator"],"scopes":[]}"#.into(),
+            created_at_ms: 10,
+            expires_at_ms: 1000,
+            revoked_at_ms: None,
+        };
+        store.upsert_session(unbound_alice.clone()).await.unwrap();
+        store.upsert_session(unbound_other.clone()).await.unwrap();
+        store.upsert_session(bound_alice.clone()).await.unwrap();
+
+        assert_eq!(
+            store
+                .delete_sessions_by_oidc_subject("sub-alice")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(store.get_session("unbound-alice").await.unwrap().is_none());
+        assert!(store.get_session("unbound-other").await.unwrap().is_some());
+        assert!(store.get_session("bound-alice").await.unwrap().is_some());
+
+        // Deleting the bound user also removes any lingering unbound session
+        // matching its `oidc_subject` in the same transaction.
+        store.upsert_session(unbound_alice).await.unwrap();
+        assert!(store.delete_user("alice").await.unwrap());
+        assert!(store.get_session("unbound-alice").await.unwrap().is_none());
+        assert!(store.get_session("bound-alice").await.unwrap().is_none());
+        assert!(store.get_session("unbound-other").await.unwrap().is_some());
     }
 }

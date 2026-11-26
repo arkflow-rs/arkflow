@@ -3370,32 +3370,71 @@ impl SqliteBackend {
         })
     }
 
-    pub fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
+    /// Insert a new user without overwriting an existing row on `user_id`
+    /// conflict. Distinguishes primary-key conflicts (`UserAlreadyExists`)
+    /// from unique OIDC subject conflicts (`OidcSubjectConflict`).
+    pub fn create_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
         self.immediate_transaction(|connection| {
-            connection.execute(
-                "INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, role=excluded.role, scopes_json=excluded.scopes_json, disabled=excluded.disabled, oidc_subject=excluded.oidc_subject, tokens_valid_after_ms=excluded.tokens_valid_after_ms, created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms",
-                rusqlite::params![
-                    user.user_id,
-                    user.display_name,
-                    user.role,
-                    user.scopes_json,
-                    user.disabled,
-                    user.oidc_subject,
-                    user.tokens_valid_after_ms,
-                    user.created_at_ms,
-                    user.updated_at_ms,
-                ],
-            )?;
+            connection
+                .execute(
+                    "INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        user.user_id,
+                        user.display_name,
+                        user.role,
+                        user.scopes_json,
+                        user.disabled,
+                        user.oidc_subject,
+                        user.tokens_valid_after_ms,
+                        user.created_at_ms,
+                        user.updated_at_ms,
+                    ],
+                )
+                .map_err(map_sqlite_user_write_error)?;
             Ok(user)
         })
     }
 
-    /// Delete a user and cascade its credentials and sessions in one
+    pub fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
+        self.immediate_transaction(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO cp_users (user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, role=excluded.role, scopes_json=excluded.scopes_json, disabled=excluded.disabled, oidc_subject=excluded.oidc_subject, tokens_valid_after_ms=excluded.tokens_valid_after_ms, created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms",
+                    rusqlite::params![
+                        user.user_id,
+                        user.display_name,
+                        user.role,
+                        user.scopes_json,
+                        user.disabled,
+                        user.oidc_subject,
+                        user.tokens_valid_after_ms,
+                        user.created_at_ms,
+                        user.updated_at_ms,
+                    ],
+                )
+                .map_err(map_sqlite_user_write_error)?;
+            Ok(user)
+        })
+    }
+
+    /// Delete a user and cascade its credentials and sessions (both bound and
+    /// any unbound sessions matching its bound OIDC subject) in one
     /// transaction (SQLite foreign keys are not required for correctness).
     pub fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
         self.immediate_transaction(|connection| {
+            let oidc_subject: Option<String> = connection
+                .query_row(
+                    "SELECT oidc_subject FROM cp_users WHERE user_id = ?1",
+                    [user_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
             connection.execute("DELETE FROM cp_credentials WHERE user_id = ?1", [user_id])?;
             connection.execute("DELETE FROM cp_sessions WHERE user_id = ?1", [user_id])?;
+            if let Some(subject) = oidc_subject.as_deref() {
+                sqlite_delete_unbound_sessions_by_subject(connection, subject)?;
+            }
             let changed =
                 connection.execute("DELETE FROM cp_users WHERE user_id = ?1", [user_id])?;
             Ok(changed > 0)
@@ -3570,6 +3609,17 @@ impl SqliteBackend {
         })
     }
 
+    /// Delete unbound (`user_id IS NULL`) browser sessions whose stored
+    /// principal matches `oidc_subject`.
+    pub fn delete_sessions_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<usize, StorageError> {
+        self.immediate_transaction(|connection| {
+            sqlite_delete_unbound_sessions_by_subject(connection, oidc_subject)
+        })
+    }
+
     pub fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError> {
         self.with_connection(|connection| {
             let changed = connection.execute(
@@ -3579,6 +3629,41 @@ impl SqliteBackend {
             Ok(changed)
         })
     }
+}
+
+fn map_sqlite_user_write_error(error: rusqlite::Error) -> StorageError {
+    let text = error.to_string();
+    if text.contains("UNIQUE constraint failed: cp_users.user_id") {
+        StorageError::UserAlreadyExists
+    } else if text.contains("UNIQUE constraint failed: cp_users.oidc_subject") {
+        StorageError::OidcSubjectConflict
+    } else {
+        StorageError::Sqlite(error)
+    }
+}
+
+fn sqlite_delete_unbound_sessions_by_subject(
+    connection: &rusqlite::Connection,
+    oidc_subject: &str,
+) -> Result<usize, StorageError> {
+    let mut statement = connection
+        .prepare("SELECT session_hash, principal_json FROM cp_sessions WHERE user_id IS NULL")?;
+    let hashes: Vec<String> = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, principal_json)| {
+            super::session_principal_matches_subject(principal_json, oidc_subject)
+        })
+        .map(|(hash, _)| hash)
+        .collect();
+    let mut deleted = 0usize;
+    for hash in hashes {
+        deleted += connection.execute("DELETE FROM cp_sessions WHERE session_hash = ?1", [hash])?;
+    }
+    Ok(deleted)
 }
 
 /// Max numeric suffix among ids carrying `prefix` — the id floor scan for
@@ -4172,6 +4257,9 @@ impl StorageBackend for SqliteBackend {
     ) -> Result<Option<UserRecord>, StorageError> {
         self.get_user_by_oidc_subject(oidc_subject)
     }
+    async fn create_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
+        self.create_user(user)
+    }
     async fn upsert_user(&self, user: UserRecord) -> Result<UserRecord, StorageError> {
         self.upsert_user(user)
     }
@@ -4223,6 +4311,12 @@ impl StorageBackend for SqliteBackend {
     }
     async fn delete_user_sessions(&self, user_id: &str) -> Result<usize, StorageError> {
         self.delete_user_sessions(user_id)
+    }
+    async fn delete_sessions_by_oidc_subject(
+        &self,
+        oidc_subject: &str,
+    ) -> Result<usize, StorageError> {
+        self.delete_sessions_by_oidc_subject(oidc_subject)
     }
     async fn prune_sessions(&self, now_ms: u64) -> Result<usize, StorageError> {
         self.prune_sessions(now_ms)

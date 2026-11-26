@@ -36,10 +36,11 @@ use tokio::sync::Mutex;
 /// Only asymmetric algorithms: a JWKS endpoint publishes public keys, and
 /// allowing HMAC algorithms would turn it into a shared-secret oracle.
 const ALLOWED_ALGORITHMS: [Algorithm; 2] = [Algorithm::ES256, Algorithm::RS256];
-/// Minimum interval between forced JWKS refetches, so garbage `kid`s
-/// cannot hammer the identity provider. Known kids stay usable forever
-/// (availability over strict revocation; recommend short-lived tokens at
-/// the IdP).
+/// Minimum interval between forced JWKS refetches on unknown `kid`s, so
+/// garbage `kid`s cannot hammer the identity provider. Known kids are refreshed
+/// on a configurable periodic cadence (`DEFAULT_JWKS_REFRESH_INTERVAL`,
+/// default 1h) so rotated-away keys are revoked while an IdP outage retains the
+/// last good key set.
 const JWKS_REFRESH_THROTTLE: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]

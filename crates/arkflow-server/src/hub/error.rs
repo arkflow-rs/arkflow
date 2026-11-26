@@ -52,6 +52,8 @@ pub enum HubError {
     UserLimit,
     #[error("credential limit reached for this user")]
     CredentialLimit,
+    #[error("user already exists")]
+    UserAlreadyExists,
     #[error("the OIDC subject is already bound to another user")]
     OidcSubjectConflict,
 }
@@ -71,6 +73,7 @@ impl HubError {
             Self::LastAdminRequired
             | Self::UserLimit
             | Self::CredentialLimit
+            | Self::UserAlreadyExists
             | Self::OidcSubjectConflict => "identity",
             _ => "invalid",
         }
@@ -93,6 +96,8 @@ impl From<StorageError> for HubError {
                 current: current_epoch,
             },
             StorageError::JobPauseConflict { .. } => Self::JobPauseConflict,
+            StorageError::UserAlreadyExists => Self::UserAlreadyExists,
+            StorageError::OidcSubjectConflict => Self::OidcSubjectConflict,
             other => Self::Storage(other.to_string()),
         }
     }

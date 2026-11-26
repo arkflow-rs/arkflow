@@ -341,12 +341,13 @@ impl Hub {
         note: Option<&str>,
         outcome: &str,
     ) -> Result<(), HubError> {
-        let Some(storage) = self.storage.as_ref() else {
+        if self.storage.is_none() {
             return Ok(());
-        };
+        }
         // Scalar metadata only: no configuration bodies, no credentials.
-        storage
-            .record_audit(AuditRecord {
+        self.record_audit_event_for(
+            "approval",
+            AuditRecord {
                 event_id: 0,
                 actor: Some(actor.to_owned()),
                 action: action.to_owned(),
@@ -365,9 +366,9 @@ impl Hub {
                     note.map(|note| format!(" note={note}")).unwrap_or_default()
                 )),
                 occurred_at_ms: now_ms(),
-            })
-            .await
-            .map_err(HubError::from)?;
+            },
+        )
+        .await?;
         Ok(())
     }
 }

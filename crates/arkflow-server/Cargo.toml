@@ -83,6 +83,7 @@ rcgen = "0.14"
 tower = { workspace = true }
 tempfile = { workspace = true }
 datafusion = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 
 [lints]

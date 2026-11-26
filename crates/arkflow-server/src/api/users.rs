@@ -66,6 +66,7 @@ fn identity_error_parts(
         hub::HubError::LastAdminRequired => (StatusCode::CONFLICT, "last_admin_required"),
         hub::HubError::UserLimit => (StatusCode::CONFLICT, "user_limit"),
         hub::HubError::CredentialLimit => (StatusCode::CONFLICT, "credential_limit"),
+        hub::HubError::UserAlreadyExists => (StatusCode::CONFLICT, "user_already_exists"),
         hub::HubError::OidcSubjectConflict => (StatusCode::CONFLICT, "oidc_subject_conflict"),
         hub::HubError::StorageUnavailable | hub::HubError::Storage(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")

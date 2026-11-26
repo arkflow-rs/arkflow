@@ -376,7 +376,9 @@ subject 的联邦令牌若 `iat` 更早(60 秒时钟偏斜容差)会被拒绝。
   `user.delete`、`user.revoke_tokens`、`credential.create`、
   `credential.rotate` 与 `credential.revoke`,只含标量元数据。拒绝记录以同一动作
   写入 `outcome=rejected`,带真实 actor,并把稳定的问题码作为 `failure_code`
-  (例如 `last_admin_required`、`credential_limit`、`user_not_found`)。
+  (例如 `last_admin_required`、`user_already_exists`、`credential_limit`、
+  `user_not_found`)。配置了持久化存储的 Hub 写审计失败时会递增 `/metrics` 上的
+  `arkflow_audit_write_failures_total{category}` 并记录告警日志,不会静默丢弃。
 
 | 状态 | 错误码 | 何时出现 |
 |------|--------|----------|
@@ -384,6 +386,7 @@ subject 的联邦令牌若 `iat` 更早(60 秒时钟偏斜容差)会被拒绝。
 | `400` | `invalid_credential` | 对已吊销凭证执行轮换。 |
 | `403` | `forbidden` | 已认证主体缺少 `manage_users`。 |
 | `404` | `user_not_found` / `credential_not_found` | 用户或凭证不存在——包括对不存在用户列出凭证。 |
+| `409` | `user_already_exists` | 创建用户时 `user_id` 已存在。 |
 | `409` | `last_admin_required` | 在没有静态应急凭证的情况下,最后一个启用的 admin 将被禁用、删除或降级。 |
 | `409` | `user_limit` / `credential_limit` | 已有 1024 个用户 / 该用户已有 16 个活跃凭证。 |
 | `409` | `oidc_subject_conflict` | 该 OIDC subject 已绑定到其他用户。 |
@@ -410,9 +413,10 @@ subject 的联邦令牌若 `iat` 更早(60 秒时钟偏斜容差)会被拒绝。
 | `POST` | `/config-approvals/{id}/decide` | 批准或拒绝(`{"decision":"approve"\|"reject","note":"..."}`)。需要 `ApproveRollouts` 权限(仅 admin 角色),且审批人必须不同于提交人。 |
 
 批准后由系统创建 rollout 并以审批人作为 actor;回滚只有在目标版本
-曾应用到受影响节点时才豁免审批。
+曾应用到受影响节点时才豁免审批。职责分离实施的是双主体四眼复核,不防御
+持有 `ManageUsers` 的恶意 admin 自建第二身份合谋。
 
-这些路由背后的状态机参见[对账式灰度发布与恢复](/zh-Hans/docs/operate/control-plane/reconciliation)。
+这些路由背后的状态机与威胁模型参见[对账式灰度发布与恢复](/zh-Hans/docs/operate/control-plane/reconciliation)。
 
 ### 登录会话(OIDC)
 

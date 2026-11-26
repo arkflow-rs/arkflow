@@ -374,8 +374,12 @@ pub(crate) async fn hub_oidc_callback(
     let issued_at_ms = issued_at
         .and_then(|seconds| u64::try_from(seconds).ok())
         .map(|seconds| seconds.saturating_mul(1000));
-    let Some(principal) = hub
-        .apply_federated_directory(principal, issued_at_ms, federation.managed_users_only())
+    let Some((principal, bound_user_id)) = hub
+        .apply_federated_directory_with_binding(
+            principal,
+            issued_at_ms,
+            federation.managed_users_only(),
+        )
         .await
     else {
         return unauthorized();
@@ -385,7 +389,10 @@ pub(crate) async fn hub_oidc_callback(
     // federation's in-memory fallback is used. On a durable Hub the fallback
     // would create a session that `resolve_session` can never see, so a
     // storage failure must fail the login instead.
-    let session_id = match hub.create_session(principal.clone()).await {
+    let session_id = match hub
+        .create_session_for_user(principal.clone(), bound_user_id)
+        .await
+    {
         Some(session_id) => session_id,
         None if hub.storage().is_none() => {
             match hub

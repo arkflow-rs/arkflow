@@ -239,7 +239,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 **建议 change**：`harden-node-identity-and-mtls`。
 
-#### PA-P1-08 审计、身份写入与会话撤销的一致性 · 已复核
+#### PA-P1-08 审计、身份写入与会话撤销的一致性 · ✅ 已实施（`harden-identity-and-audit`，2026-11-26）
 
 **现象**：
 - 安全拒绝、身份变更、Job 操作审计均为 `let _ = record(...)`，存储故障静默丢失（[observability.rs:332](crates/arkflow-server/src/hub/observability.rs:332)）。
@@ -252,8 +252,8 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 **动作**：
 1. 安全关键审计改为 outbox/失败计数 + 告警，至少不能静默；
 2. `create_user` 取 `identity_write_lock`，改用 `INSERT` 语义并处理冲突；
-3. 用户绑定/禁用/删除时按 subject 追索并删除相关 session；JWKS 已知 kid 增加周期刷新；
-4. 审批分离原则写入威胁模型：要么禁止同一 principal 兼任，要么文档明确“当前不防合谋”。
+3. 用户绑定/禁用/删除时按 subject 追索并删除相关 session；JWKS 已知 kid 增加周期刷新（核实已在 `oidc.rs:282-323` 实现并覆盖单测）；
+4. 审批分离原则写入威胁模型：保持三角色模型并在规格与文档明确“防误操作与 operator→admin 四眼复核，不防恶意 admin 自建账号合谋”。
 
 **验收**：
 - 存储故障注入：拒绝请求仍返回 401/403，审计失败有 counter + 日志；
@@ -350,7 +350,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 | --- | --- | --- | --- |
 | 1 | PA-P1-01 Cargo feature gating | 无 | `add-cargo-feature-gating` |
 | 2 | PA-P1-07 节点身份 + mTLS | 无 | `harden-node-identity-and-mtls` |
-| 3 | PA-P1-08 审计/身份一致性 | 身份模型 | `harden-identity-and-audit` |
+| ~~3~~ | ~~PA-P1-08 审计/身份一致性~~ ✅ 已实施（2026-11-26） | 身份模型 | `harden-identity-and-audit` |
 | 4 | PA-P1-05 向量输出批量原子性 | 无 | `add-vector-output-batch-atomicity` |
 | 5 | PA-P1-06 S3 WAL 段回收 | 无 | `add-s3-wal-retention` |
 | 6 | PA-P1-09 local Job 隔离 | 无 | `add-local-job-isolation-policy` |

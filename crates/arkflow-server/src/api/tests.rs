@@ -8230,3 +8230,202 @@ async fn stalled_control_request_times_out_with_the_standard_envelope() {
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["code"], "request_timeout");
 }
+
+#[tokio::test]
+async fn hub_concurrent_create_user_returns_409_conflict_without_overwriting() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+
+    let (first, second) = tokio::join!(
+        post_json(
+            &app,
+            "/api/v1/users",
+            "operator",
+            serde_json::json!({
+                "user_id": "alice",
+                "display_name": "Alice One",
+                "role": "viewer"
+            }),
+        ),
+        post_json(
+            &app,
+            "/api/v1/users",
+            "operator",
+            serde_json::json!({
+                "user_id": "alice",
+                "display_name": "Alice Two",
+                "role": "operator"
+            }),
+        ),
+    );
+    let results = [first, second];
+    let created: Vec<_> = results
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::CREATED)
+        .collect();
+    let conflicted: Vec<_> = results
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::CONFLICT)
+        .collect();
+    assert_eq!(created.len(), 1, "expected exactly one 201: {results:?}");
+    assert_eq!(conflicted.len(), 1, "expected exactly one 409: {results:?}");
+    assert_eq!(conflicted[0].1["code"], "user_already_exists");
+
+    let (status, stored) = get_json(&app, "/api/v1/users/alice", "operator").await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    assert_eq!(stored["display_name"], created[0].1["display_name"]);
+    assert_eq!(stored["role"], created[0].1["role"]);
+}
+
+#[tokio::test]
+async fn hub_auth_denial_with_audit_storage_failure_returns_401_403_and_counts_metric() {
+    let faulty_backend = storage::SqliteBackend::in_memory().unwrap();
+    faulty_backend
+        .with_connection(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER fail_audit_insert BEFORE INSERT ON cp_audit_events \
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let faulty_hub = hub::Hub::with_storage(
+        hub::HubConfig {
+            operator_token: Some("bob|viewer|viewer-static".into()),
+            ..storage_hub_config()
+        },
+        storage::StorageActor::start(storage::ControlPlaneStore::Sqlite(faulty_backend), 8),
+    );
+    let faulty_app = hub_router(faulty_hub.clone(), &ServerConfig::default());
+
+    // 1. Authenticated viewer calling admin-only route still returns 403 while
+    //    incrementing `arkflow_audit_write_failures_total{category="auth_denial"}`.
+    let (status, body) = get_json(&faulty_app, "/api/v1/users", "viewer-static").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "forbidden");
+
+    // 2. Unauthenticated denial in `require_operator_action` still returns 401
+    //    while incrementing the same counter.
+    let err_response = require_operator_action(
+        &faulty_hub,
+        &HeaderMap::new(),
+        OperatorAction::ManageUsers,
+        "user",
+        None,
+    )
+    .await
+    .expect_err("unauthenticated request must be denied with 401");
+    assert_eq!(err_response.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. `/api/v1/metrics` exports the closed-label counter with value 2.
+    let metrics_response = faulty_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/metrics")
+                .header(header::AUTHORIZATION, "Bearer viewer-static")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics_response.status(), StatusCode::OK);
+    let metrics_body = String::from_utf8(
+        axum::body::to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        metrics_body.contains("arkflow_audit_write_failures_total{category=\"auth_denial\"} 2"),
+        "expected auth_denial audit write failure counter in /metrics:\n{metrics_body}"
+    );
+}
+
+#[tokio::test]
+async fn hub_unbound_oidc_session_cookie_returns_401_immediately_after_binding_or_disabling() {
+    let hub = storage_hub();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+
+    let session_1 = hub
+        .create_session_for_user(
+            crate::api_contract::OperatorPrincipal {
+                id: "oidc-sub-http-1".into(),
+                roles: vec![crate::api_contract::OperatorRole::Operator],
+                scopes: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let cookie_get = |session_id: &str| {
+        let app = app.clone();
+        let cookie = format!("arkflow_session={session_id}");
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/system")
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            response.status()
+        }
+    };
+
+    assert_eq!(cookie_get(&session_1).await, StatusCode::OK);
+
+    // Binding the OIDC subject via POST /api/v1/users immediately invalidates
+    // the pre-existing unbound session cookie.
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/users",
+        "operator",
+        serde_json::json!({
+            "user_id": "alice",
+            "role": "viewer",
+            "oidc_subject": "oidc-sub-http-1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(cookie_get(&session_1).await, StatusCode::UNAUTHORIZED);
+
+    // Binding and disabling via PATCH /api/v1/users/{id} also immediately
+    // invalidates an existing unbound session cookie.
+    let session_2 = hub
+        .create_session_for_user(
+            crate::api_contract::OperatorPrincipal {
+                id: "oidc-sub-http-2".into(),
+                roles: vec![crate::api_contract::OperatorRole::Operator],
+                scopes: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/users",
+        "operator",
+        serde_json::json!({"user_id": "bob", "role": "viewer"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(cookie_get(&session_2).await, StatusCode::OK);
+
+    let (status, _) = patch_json(
+        &app,
+        "/api/v1/users/bob",
+        "operator",
+        serde_json::json!({"oidc_subject": "oidc-sub-http-2", "disabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cookie_get(&session_2).await, StatusCode::UNAUTHORIZED);
+}

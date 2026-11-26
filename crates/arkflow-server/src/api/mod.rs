@@ -1299,12 +1299,8 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
     })
 }
 
-async fn operator_denied(
-    hub: &hub::Hub,
-    supplied: Option<String>,
-    action: OperatorAction,
-) -> Response {
-    if hub.operator_principal(supplied.as_deref()).await.is_none() {
+fn operator_denied(authenticated: bool, action: OperatorAction) -> Response {
+    if !authenticated {
         problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -1341,8 +1337,10 @@ async fn require_operator_action(
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let _ = hub
-        .record_audit_event(crate::storage::AuditRecord {
+    let authenticated = principal.is_some();
+    hub.record_audit_best_effort(
+        "auth_denial",
+        crate::storage::AuditRecord {
             event_id: 0,
             actor: principal.as_ref().map(|principal| principal.id.clone()),
             action: format!("operator.{action:?}").to_lowercase(),
@@ -1353,7 +1351,7 @@ async fn require_operator_action(
             correlation_id,
             outcome: "rejected".into(),
             failure_code: Some(
-                if principal.is_some() {
+                if authenticated {
                     "forbidden"
                 } else {
                     "unauthorized"
@@ -1362,9 +1360,10 @@ async fn require_operator_action(
             ),
             message: None,
             occurred_at_ms: hub::now_ms_for_metrics(),
-        })
-        .await;
-    Err(operator_denied(hub, supplied, action).await)
+        },
+    )
+    .await;
+    Err(operator_denied(authenticated, action))
 }
 
 /// Normalize a target selection (explicit node ids XOR label selector) into
@@ -1455,6 +1454,7 @@ fn hub_problem(error: hub::HubError) -> Response {
         hub::HubError::LastAdminRequired
         | hub::HubError::UserLimit
         | hub::HubError::CredentialLimit
+        | hub::HubError::UserAlreadyExists
         | hub::HubError::OidcSubjectConflict => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
@@ -1477,6 +1477,7 @@ fn hub_problem(error: hub::HubError) -> Response {
         hub::HubError::LastAdminRequired => "last_admin_required",
         hub::HubError::UserLimit => "user_limit",
         hub::HubError::CredentialLimit => "credential_limit",
+        hub::HubError::UserAlreadyExists => "user_already_exists",
         hub::HubError::OidcSubjectConflict => "oidc_subject_conflict",
         _ => "agent_request_rejected",
     };

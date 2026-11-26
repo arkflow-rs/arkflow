@@ -136,8 +136,12 @@ claim 映射行为。
 `{"revoked_sessions": n}`。它**不会**吊销托管凭证——托管凭证可单独吊销与轮换，
 请对它们使用 `DELETE /api/v1/credentials/{credential_id}` 或轮换。
 
-禁用用户、删除用户与 `revoke-tokens` 都立即生效：会话在每个请求上都要经过目录
-解析，没有需要刷新的缓存。删除用户还会同时删除其凭证与会话。
+禁用用户、删除用户、修改 OIDC subject 绑定与 `revoke-tokens` 都立即生效：会话在
+每个请求上都要经过目录解析，没有需要刷新的缓存。把 OIDC subject 绑定到目录用户
+（`POST /api/v1/users` 或 `PATCH /api/v1/users/{id}`）时，还会立即吊销该 subject
+在绑定前签发的所有未绑定浏览器会话；会话解析对已绑定 subject 的旧未绑定会话（或
+启用 `ARKFLOW_OIDC_MANAGED_USERS_ONLY=true` 时的未绑定会话）也默认拒绝。删除用
+户还会同时删除其凭证以及绑定和未绑定会话。
 
 ## 浏览器会话持久化
 
@@ -145,8 +149,8 @@ OIDC 登录流会创建 8 小时的服务端会话 cookie(`arkflow_session`)。H
 存储时会话行落盘，把运行故事从早先版本改变为：
 
 - **重启幸存**：Hub 重启不再强制所有人重新登录；cookie 对同一存储继续有效。
-- **集中吊销**：登出删除会话行；禁用/删除用户或调用 `revoke-tokens` 会使其会话在
-  下一个请求即失效。
+- **集中吊销**：登出删除会话行；绑定/变更 OIDC subject、禁用/删除用户或调用
+  `revoke-tokens` 会使绑定会话与先前未绑定会话在下一个请求即失效。
 - **维护**：Hub 的周期性维护任务清扫过期与已吊销的会话行，表容量保持有界。
 - **HA**：共用同一数据库的多个 Hub 实例共享会话表；在 leader 上创建的会话可在任何
   能服务 operator 流量的实例上解析(standby 仍返回 `503 hub_standby`)。
@@ -184,10 +188,13 @@ OIDC 登录流会创建 8 小时的服务端会话 cookie(`arkflow_session`)。H
 
 被拒绝的变更同样会审计:以同一动作写入 `outcome=rejected`,记录真实 actor、目标
 用户/凭证,并把稳定的问题码作为 `failure_code`(例如 `last_admin_required`、
-`credential_limit`、`user_not_found`、`oidc_subject_conflict`)。尚未到达身份存储就
-失败的变更——例如用户 id 非法、角色未知等校验错误——同样记为 rejected。而授权拒绝
-(缺少凭证,或主体没有 `manage_users`)由通用授权拒绝路径审计。可在
-`GET /api/v1/audit` 查询审计轨迹。
+`user_already_exists`、`credential_limit`、`user_not_found`、
+`oidc_subject_conflict`)。尚未到达身份存储就失败的变更——例如用户 id 非法、角色未
+知等校验错误——同样记为 rejected。而授权拒绝(缺少凭证,或主体没有 `manage_users`)
+由通用授权拒绝路径审计。当配置了持久化存储的 Hub 写审计失败时，不会静默吞错：会记
+录告警日志(仅标量元数据)并递增 `/api/v1/metrics` 上的
+`arkflow_audit_write_failures_total{category}`，同时安全拒绝仍按原语义返回
+`401`/`403`。可在 `GET /api/v1/audit` 查询审计轨迹。
 
 ## 错误码
 
@@ -198,6 +205,7 @@ OIDC 登录流会创建 8 小时的服务端会话 cookie(`arkflow_session`)。H
 | `401` | `unauthorized` | 没有有效凭证。 |
 | `403` | `forbidden` | 已认证，但主体缺少 `manage_users`(仅 admin 持有)。 |
 | `404` | `user_not_found` / `credential_not_found` | 用户或凭证不存在——包括对不存在的用户列出凭证。 |
+| `409` | `user_already_exists` | 创建用户时 `user_id` 已存在(由 insert-only 存储原子拒绝，绝不覆盖既有用户)。 |
 | `409` | `last_admin_required` | 在没有静态 operator 凭证时，最后一个启用的 admin 将被禁用、删除或降级。 |
 | `409` | `user_limit` | 已有 1024 个用户。 |
 | `409` | `credential_limit` | 该用户已有 16 个活跃凭证。 |
