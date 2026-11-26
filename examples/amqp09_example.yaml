@@ -1,0 +1,36 @@
+logging:
+  level: info
+streams:
+  - input:
+      type: amqp09
+      url: amqp://guest:guest@localhost:5672/%2f
+      queue: events-in
+      exchange: events
+      exchange_type: topic
+      routing_key: "events.#"
+      declare_exchange: true
+      declare_queue: true
+      durable: true
+      prefetch_count: 64
+
+    pipeline:
+      thread_num: 4
+      processors:
+        - type: json_to_arrow
+        - type: sql
+          query: "SELECT * FROM flow"
+        - type: arrow_to_json
+
+    output:
+      type: amqp09
+      url: amqp://guest:guest@localhost:5672/%2f
+      exchange: events-out
+      exchange_type: direct
+      routing_key:
+        type: value
+        value: processed
+      declare_exchange: true
+      durable: true
+      persistent: true
+      confirm: true
+      content_type: application/json

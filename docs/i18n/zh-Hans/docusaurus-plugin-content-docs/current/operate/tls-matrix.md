@@ -13,6 +13,7 @@ description: 每个 ArkFlow 网络组件的加密传输启用方式。
 | kafka (input/output) | rdkafka `security.protocol` + broker/CA 配置 |
 | mqtt (input/output) | `tls` 块(`enabled`、`ca`、`client_cert`、`client_key`) |
 | nats (input/output) | `tls://` URL 方案(由 async-nats 原生协商) |
+| amqp09 (input/output) | `amqps://` URL 方案(由 lapin 通过 rustls 与系统根证书原生协商) |
 | pulsar (input/output) | `pulsar+ssl://` URL 方案(原生) |
 | redis (input/output/temporary) | `rediss://` URL 方案 |
 | sql (output) | sqlx TLS(Postgres `sslmode`、MySQL `ssl-mode`) |

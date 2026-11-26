@@ -84,6 +84,9 @@ tokio-tungstenite = { version = "0.30", optional = true, features = ["native-tls
 # NATS
 async-nats = { version = "0.53", optional = true }
 
+# RabbitMQ (AMQP 0.9/0.9.1)
+lapin = { version = "4.13", optional = true, default-features = false, features = ["tokio", "rustls", "rustls--ring", "rustls-native-certs"] }
+
 # Pulsar
 pulsar = { version = "6.6", optional = true }
 rand = { workspace = true }
@@ -124,6 +127,7 @@ default = [
     "connectors-hdfs",
     "connectors-mqtt",
     "connectors-nats",
+    "connectors-amqp09",
     "connectors-redis",
     "connectors-websocket",
     "connectors-modbus",
@@ -147,6 +151,8 @@ connectors-hdfs = ["dep:hdfs-native-object-store"]
 connectors-mqtt = ["dep:rumqttc"]
 # NATS input/output
 connectors-nats = ["dep:async-nats"]
+# RabbitMQ (AMQP 0.9/0.9.1) input/output
+connectors-amqp09 = ["dep:lapin"]
 # Redis input/output/temporary
 connectors-redis = ["dep:redis"]
 # WebSocket input

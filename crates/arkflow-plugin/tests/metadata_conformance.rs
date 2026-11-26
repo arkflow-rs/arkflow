@@ -88,6 +88,7 @@ type Exemptions = &'static [(&'static str, &'static str, &'static str, &'static 
 /// that name (its `impl` block must deserialize the struct).
 const CONFIG_TYPES: &[(&str, &str, &str, &str)] = &[
     // inputs
+    ("input", "amqp09", "input/amqp09.rs", "Amqp09InputConfig"),
     ("input", "file", "input/file.rs", "FileInputConfig"),
     (
         "input",
@@ -117,6 +118,7 @@ const CONFIG_TYPES: &[(&str, &str, &str, &str)] = &[
         "WebSocketInputConfig",
     ),
     // outputs
+    ("output", "amqp09", "output/amqp09.rs", "Amqp09OutputConfig"),
     ("output", "http", "output/http.rs", "HttpOutputConfig"),
     (
         "output",

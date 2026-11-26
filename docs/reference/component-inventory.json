@@ -3,6 +3,87 @@
   "components": [
     {
       "kind": "input",
+      "name": "amqp09",
+      "description": "Consumes messages from an AMQP 0.9/0.9.1 broker (such as RabbitMQ).",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "AMQP 0.9/0.9.1 broker URL (e.g. amqp://guest:guest@localhost:5672/%2f or amqps://...)."
+          },
+          "queue": {
+            "type": "string",
+            "description": "Queue name to consume messages from."
+          },
+          "exchange": {
+            "type": "string",
+            "description": "Optional exchange name to declare and/or bind the queue to."
+          },
+          "exchange_type": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "fanout",
+              "topic",
+              "headers"
+            ],
+            "description": "Exchange type used when declare_exchange is true (defaults to direct)."
+          },
+          "routing_key": {
+            "type": "string",
+            "description": "Routing key used when binding the queue to the exchange (defaults to empty string)."
+          },
+          "declare_queue": {
+            "type": "boolean",
+            "description": "Declare the queue if it does not already exist (defaults to false)."
+          },
+          "declare_exchange": {
+            "type": "boolean",
+            "description": "Declare the exchange if it does not already exist (defaults to false)."
+          },
+          "durable": {
+            "type": "boolean",
+            "description": "Mark declared exchange/queue as durable (defaults to true)."
+          },
+          "auto_delete": {
+            "type": "boolean",
+            "description": "Auto-delete declared exchange/queue when unused (defaults to false)."
+          },
+          "exclusive": {
+            "type": "boolean",
+            "description": "Declare the queue as exclusive to this connection (defaults to false)."
+          },
+          "consumer_tag": {
+            "type": "string",
+            "description": "Consumer tag identifying this consumer (defaults to broker-generated)."
+          },
+          "auto_ack": {
+            "type": "boolean",
+            "description": "Automatically acknowledge deliveries on receipt (defaults to false)."
+          },
+          "prefetch_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535,
+            "description": "Per-channel QoS prefetch count."
+          }
+        },
+        "required": [
+          "url",
+          "queue"
+        ]
+      },
+      "config_example": {
+        "url": "amqp://guest:guest@localhost:5672/%2f",
+        "queue": "events",
+        "declare_queue": true
+      }
+    },
+    {
+      "kind": "input",
       "name": "file",
       "description": "Reads records from local or remote object storage (S3, GCS, Azure, HDFS) in CSV/JSON/Parquet/Avro/Arrow formats.",
       "config_optional": false,
@@ -885,6 +966,131 @@
       },
       "config_example": {
         "url": "ws://localhost:8080/stream"
+      }
+    },
+    {
+      "kind": "output",
+      "name": "amqp09",
+      "description": "Publishes messages to an AMQP 0.9/0.9.1 exchange (such as RabbitMQ).",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "AMQP 0.9/0.9.1 broker URL (e.g. amqp://guest:guest@localhost:5672/%2f or amqps://...)."
+          },
+          "exchange": {
+            "type": "string",
+            "description": "Exchange name to publish to (empty string targets the AMQP default exchange)."
+          },
+          "exchange_type": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "fanout",
+              "topic",
+              "headers"
+            ],
+            "description": "Exchange type used when declare_exchange is true (defaults to direct)."
+          },
+          "routing_key": {
+            "description": "Routing key for publishing, either a static value or a SQL expression evaluated per row.",
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "value"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "value"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "expr"
+                  },
+                  "expr": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "expr"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "declare_exchange": {
+            "type": "boolean",
+            "description": "Declare the exchange if it does not already exist (defaults to false)."
+          },
+          "durable": {
+            "type": "boolean",
+            "description": "Mark the declared exchange as durable (defaults to true)."
+          },
+          "auto_delete": {
+            "type": "boolean",
+            "description": "Auto-delete the declared exchange when unused (defaults to false)."
+          },
+          "persistent": {
+            "type": "boolean",
+            "description": "Set AMQP delivery_mode to persistent (2) when true or transient (1) when false."
+          },
+          "confirm": {
+            "type": "boolean",
+            "description": "Enable AMQP publisher confirms and fail writes on broker NACK (defaults to false)."
+          },
+          "priority": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "AMQP message priority (0-255)."
+          },
+          "expiration": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Per-message TTL in milliseconds."
+          },
+          "content_type": {
+            "type": "string",
+            "description": "MIME content type header (e.g. application/json)."
+          },
+          "content_encoding": {
+            "type": "string",
+            "description": "MIME content encoding header (e.g. utf-8)."
+          },
+          "value_field": {
+            "type": "string",
+            "description": "Binary or string record column used as the message payload; when unset, codec encoding applies."
+          }
+        },
+        "required": [
+          "url",
+          "exchange",
+          "routing_key"
+        ]
+      },
+      "config_example": {
+        "url": "amqp://guest:guest@localhost:5672/%2f",
+        "exchange": "events",
+        "routing_key": {
+          "type": "value",
+          "value": "events.created"
+        },
+        "declare_exchange": true,
+        "confirm": true
       }
     },
     {

@@ -135,6 +135,7 @@ ArkFlow支持多种输入源：
 - **生成器** (`generate`)：生成测试数据
 - **SQL** (`sql`)：从 SQL 数据库（MySQL、PostgreSQL、SQLite）查询数据
 - **NATS** (`nats`)：订阅来自 NATS 主题的消息，支持 JetStream
+- **AMQP 0.9 / RabbitMQ** (`amqp09`)：从 AMQP 0.9/0.9.1（RabbitMQ）队列消费消息
 - **Pulsar** (`pulsar`)：订阅来自 Pulsar 主题的消息
 - **Redis** (`redis`)：订阅来自 Redis 发布/订阅频道或列表的消息
 - **WebSocket** (`websocket`)：订阅来自 WebSocket 连接的消息
@@ -202,6 +203,7 @@ ArkFlow支持多种输出目标：
 - **InfluxDB** (`influxdb`)：将时序数据写入 InfluxDB 2.x
 - **MongoDB** (`mongodb`)：将文档写入 MongoDB 集合
 - **NATS** (`nats`)：将消息发布到 NATS 主题
+- **AMQP 0.9 / RabbitMQ** (`amqp09`)：将消息发布到 AMQP 0.9/0.9.1（RabbitMQ）交换机
 - **Pulsar** (`pulsar`)：将消息发布到 Pulsar 主题
 - **Redis** (`redis`)：写入 Redis 列表、哈希、字符串或发布/订阅频道
 - **SQL** (`sql`)：写入 SQL 数据库（MySQL、PostgreSQL），支持批量插入与 UPSERT

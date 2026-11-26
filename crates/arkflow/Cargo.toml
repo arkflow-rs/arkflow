@@ -41,6 +41,7 @@ default = [
     "connectors-hdfs",
     "connectors-mqtt",
     "connectors-nats",
+    "connectors-amqp09",
     "connectors-redis",
     "connectors-websocket",
     "connectors-modbus",
@@ -56,6 +57,7 @@ connectors-pulsar = ["arkflow-plugin/connectors-pulsar"]
 connectors-hdfs = ["arkflow-plugin/connectors-hdfs"]
 connectors-mqtt = ["arkflow-plugin/connectors-mqtt"]
 connectors-nats = ["arkflow-plugin/connectors-nats"]
+connectors-amqp09 = ["arkflow-plugin/connectors-amqp09"]
 connectors-redis = ["arkflow-plugin/connectors-redis"]
 connectors-websocket = ["arkflow-plugin/connectors-websocket"]
 connectors-modbus = ["arkflow-plugin/connectors-modbus"]

@@ -15,6 +15,7 @@ generate, drop, stdout, and pure-compute processors) have no TLS surface.
 | kafka (input/output) | rdkafka `security.protocol` + broker/CA config |
 | mqtt (input/output) | `tls` block (`enabled`, `ca`, `client_cert`, `client_key`) |
 | nats (input/output) | `tls://` URL scheme (native async-nats negotiation) |
+| amqp09 (input/output) | `amqps://` URL scheme (native lapin rustls with system root certificates) |
 | pulsar (input/output) | `pulsar+ssl://` URL scheme (native) |
 | redis (input/output/temporary) | `rediss://` URL scheme |
 | sql (output) | sqlx TLS (Postgres `sslmode`, MySQL `ssl-mode`) |

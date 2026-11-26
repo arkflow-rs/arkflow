@@ -43,6 +43,7 @@ component set — useful for custom images and edge deployments.
 | `connectors-hdfs` | `hdfs` object store of the `file` input |
 | `connectors-mqtt` | `mqtt` input/output |
 | `connectors-nats` | `nats` input/output |
+| `connectors-amqp09` | `amqp09` (RabbitMQ) input/output |
 | `connectors-redis` | `redis` input/output/temporary |
 | `connectors-websocket` | `websocket` input |
 | `connectors-modbus` | `modbus` input |
