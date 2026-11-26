@@ -69,7 +69,7 @@ To uphold the `input-durability` invariant (*"A WAL backend SHALL NOT delete an 
 - Effective reclaim floor inside a retention sweep:
   - If `self.rewind_floor.load(Ordering::Acquire) != u64::MAX` (rewind poison active), skip reclamation entirely until re-acknowledged.
   - Otherwise `reclaim_floor = manifest.cursor.min(self.reclaimable_hwm.load(Ordering::Acquire))`.
-- **Exact boundary**: Committing sequence `S` advances `reclaimable_hwm` to `S - 1`, so every sealed segment with `last_seq <= S - 1` is eligible immediately, while the segment containing `S` itself stays protected until `S + 1` commits (or until restart, when `reclaimable_hwm` seeds from `manifest.cursor`).
+- **Exact boundary**: Committing sequence `S` advances `reclaimable_hwm` to `S - 1`, so every sealed segment with `last_seq <= S - 1` is eligible immediately, while the segment containing `S` itself stays protected until `S + 1` commits (or until restart, when `reclaimable_hwm` seeds from `manifest.cursor`). This matches `LocalStore::mark_committed`'s single-step undo contract (`crates/arkflow-core/src/wal/store.rs:441`); multi-step reverse-order undo across already-committed sequences is outside `WalStore::mark_committed`'s contract for both backends.
 - Only segments in `manifest.sealed_segments` (never `manifest.active_segment`) whose `segment_meta` reports `last_seq <= reclaim_floor` are eligible. Keeping `active_segment` un-reclaimed plus seeding `max_seq_seen = manifest.max_sealed_seq.max(manifest.cursor)` in `recover()` guarantees monotonic sequence allocation and collision-free filenames across restarts.
 
 ### D3. Manifest schema extension & read-only recovery backfill (backward-compatible v2)
@@ -97,15 +97,18 @@ Population:
 
 Reclamation MUST NOT run inline inside `spawn_flusher`'s seal loop (where slow S3 `DELETE` calls would stall `seal_active_segment` and trip `Wal::wait_for_sealed`'s `4 * flush_interval + 5s` timeout) and MUST NOT run synchronously inside `S3Store::close()` (where deleting a backlog would stall graceful shutdown).
 
-Instead, `spawn_flusher` runs **two concurrent tasks** on its tokio runtime sharing `stop_clone: Arc<Notify>`:
-1. **Seal & cursor-flush loop**: unchanged cadence (`segment_cfg.flush_interval`), never blocked by reclamation.
-2. **Reclaim loop**: wakes on `reclaim_interval = segment_cfg.flush_interval.max(Duration::from_secs(1))` (capped sensibly; immediately cancellable via `stop_clone.notified()`), invokes `reclaim_segments(&store, &stop_clone)` under `reclaim_lock: tokio::sync::Mutex<()>`.
+Instead, `spawn_flusher` runs **two concurrent tasks** on its tokio runtime sharing a persistent `CancellationToken`:
+1. **Seal & cursor-flush loop**: unchanged cadence (`segment_cfg.flush_interval`), wakes on `stop_seal.cancelled()`, never blocked by reclamation.
+2. **Reclaim loop**: wakes on `reclaim_interval = segment_cfg.flush_interval.max(Duration::from_secs(1))` and races both the sleep timer and `reclaim_segments(&store, Some(&stop_reclaim))` against `stop_reclaim.cancelled()`. Because `CancellationToken` is persistent, cancellation signalled by `close()` is observed immediately even if it fires before a sweep starts waiting.
 
 Inside `reclaim_segments(store, cancel)`:
-- Uses a new helper `write_manifest_with_etag_if_changed(store, |m| -> bool) -> Result<Option<Manifest>, Error>` which skips the manifest PUT (0 PUTs) whenever the closure returns `false`, and returns the exact committed `Manifest` snapshot after ETag convergence (avoiding stale outer-closure state across ETag retries).
-- **Fast skip**: If `!retention_cfg.enabled` or `rewind_floor != u64::MAX`, return `Ok(0)` immediately.
-- **Phase 1 — Adopt & deregister in manifest (ETag-coordinated)**:
-  - Inside `write_manifest_with_etag_if_changed`, on each attempt against the freshly-read `m`:
+- Uses `write_manifest_with_etag_if_changed_with_policy(store, ConditionalPolicy::RequireConditional, |m| -> bool) -> Result<(Manifest, bool), Error>`:
+  - Skips the manifest PUT (0 PUTs) whenever the closure returns `false`, and returns `(manifest, mutated)` so callers inspect the freshly-read `manifest.pending_deletes` even when `mutated == false` (ensuring crash-left pending objects are still deleted).
+  - Requires conditional PUT (`If-Match` / `Create`): if the backend returns `NotImplemented`, reclamation refuses the unconditional overwrite fallback, reports reclamation unavailable, and leaves all segment objects intact (preventing a concurrent seal from clobbering `pending_deletes` and re-listing a deleted segment). Non-reclamation callers keep `ConditionalPolicy::FallbackOverwrite`.
+- Every await inside `reclaim_segments_at` — `reclaim_lock.lock()`, Phase 1 manifest read/write, Phase 2 per-object S3 `DELETE`, and Phase 3 manifest cleanup — is raced against `cancel.cancelled()` so `close()` never stalls on a slow or hung object-store request.
+- **Fast skip**: If `!retention_cfg.enabled`, `rewind_floor != u64::MAX`, or `cancel` is already cancelled, return `Ok(0)` immediately.
+- **Phase 1 — Adopt & deregister in manifest (ETag-coordinated, conditional-only)**:
+  - Inside `write_manifest_with_etag_if_changed_with_policy`, on each attempt against the freshly-read `m`:
     - Re-check `rewind_floor == u64::MAX`; if poisoned, return `false`.
     - Merge any in-memory `backfilled_meta` entries into `m.segment_meta` (and call `apply_seal` + bump `m.max_sealed_seq` if the segment is neither `active_segment` nor in `sealed_segments` nor in `pending_deletes`).
     - Compute `reclaim_floor = m.cursor.min(store.reclaimable_hwm.load(Ordering::Acquire))`.
@@ -113,15 +116,15 @@ Inside `reclaim_segments(store, cancel)`:
     - Move `to_reclaim` out of `m.sealed_segments` and `m.segment_meta` into `m.pending_deletes` (deduplicated).
     - Return `true` iff any backfill or deregistration mutated `m`.
   - If the manifest was updated, clear the merged keys from `store.backfilled_meta`.
-  - Determine `candidates = pending_deletes` from the committed (or freshly read) manifest, capped at `MAX_DELETES_PER_SWEEP = 64` per pass so backlogs drain smoothly without monopolizing resources. If empty, return `Ok(0)`.
+  - Read `candidates = manifest.pending_deletes` (even when `mutated == false`), capped at `MAX_DELETES_PER_SWEEP = 64` per pass. If empty, return `Ok(0)`.
 - **Phase 2 — Best-effort, cancellable S3 `DELETE`**:
-  - For each `seg` in `candidates` (up to `MAX_DELETES_PER_SWEEP`), race `client.delete(&segment_path)` against `cancel.notified()`:
-    - On cancellation, break out cleanly (already-confirmed deletions still clean up in Phase 3 only if not cancelled; otherwise the next run recovers `pending_deletes` idempotently).
+  - For each `seg` in `candidates` (up to `MAX_DELETES_PER_SWEEP`), race `client.delete(&segment_path)` against `cancel.cancelled()`:
+    - On cancellation, break out immediately (any objects already deleted are reconciled idempotently on the next run).
     - `Ok(())` and `Err(object_store::Error::NotFound { .. })` count as confirmed deleted.
-    - Other errors log `tracing::warn!` and leave `seg` in `pending_deletes` for retry on a future sweep.
+    - Other errors log `tracing::warn!` and record `seg` in `failed_deleted` for tail rotation.
   - Evict confirmed-deleted indices from `store.segment_ranges`.
-- **Phase 3 — Cleanup `pending_deletes` (ETag-coordinated, best-effort)**:
-  - If `confirmed_deleted` is non-empty, call `write_manifest_with_etag_if_changed` to remove `confirmed_deleted` from `m.pending_deletes`.
+- **Phase 3 — Cleanup & failure rotation in `pending_deletes` (ETag-coordinated, conditional-only, cancellable)**:
+  - If `!confirmed_deleted.is_empty() || !failed_deleted.is_empty()` and not cancelled, call `write_manifest_with_etag_if_changed_with_policy` to remove `confirmed_deleted` and rotate `failed_deleted` to the tail of `m.pending_deletes` (returning `false` if the list order did not change, avoiding redundant PUTs). Tail rotation ensures a permanently failing prefix of 64 objects never starves healthy segments behind it.
 
 **Crash matrix**:
 - Crash before Phase 1 PUT: nothing deleted, next sweep retries cleanly.

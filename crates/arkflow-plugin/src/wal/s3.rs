@@ -488,6 +488,37 @@ impl S3Store {
         false
     }
 
+    /// Check whether a segment that returned `NotFound` during replay is still
+    /// required by the latest persisted manifest. A concurrent reclaim sweep
+    /// may have legitimately advanced the cursor and deleted the segment after
+    /// the reader loaded its initial manifest snapshot; only warn when the
+    /// latest manifest still needs this segment for replay (or cannot be read).
+    fn segment_still_required_for_replay(&self, seg_name: &str, watermark: u64) -> bool {
+        let Ok(latest) = self.read_manifest() else {
+            return true;
+        };
+        if latest.pending_deletes.iter().any(|s| s == seg_name) {
+            return false;
+        }
+        let tracked = latest.active_segment.as_deref() == Some(seg_name)
+            || latest.sealed_segments.iter().any(|s| s == seg_name);
+        if !tracked {
+            return false;
+        }
+        !self.segment_covered_by(&latest, seg_name, watermark.max(latest.cursor))
+    }
+
+    fn warn_if_still_missing(&self, seg_name: &str, watermark: u64) {
+        if self.segment_still_required_for_replay(seg_name, watermark) {
+            warn_missing_segment(seg_name);
+        } else {
+            tracing::debug!(
+                segment = %seg_name,
+                "segment returned NotFound during read but is already reclaimed in the latest manifest"
+            );
+        }
+    }
+
     /// The private runtime (present until Drop shuts it down).
     fn rt(&self) -> &Runtime {
         self.runtime.as_ref().expect("S3 store runtime alive")
@@ -1087,7 +1118,7 @@ impl WalStore for S3Store {
                     Err(e) => return Err(Error::Process(format!("S3 GET segment body: {}", e))),
                 },
                 Err(object_store::Error::NotFound { .. }) => {
-                    warn_missing_segment(&seg_name);
+                    self.warn_if_still_missing(&seg_name, manifest.cursor);
                     continue;
                 }
                 Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
@@ -1125,7 +1156,7 @@ impl WalStore for S3Store {
                     Err(e) => return Err(Error::Process(format!("S3 GET segment body: {}", e))),
                 },
                 Err(object_store::Error::NotFound { .. }) => {
-                    warn_missing_segment(&seg_name);
+                    self.warn_if_still_missing(&seg_name, after);
                     continue;
                 }
                 Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
@@ -1631,14 +1662,31 @@ async fn read_manifest_with_etag(store: &S3Store) -> Result<(Manifest, Option<St
 /// a mutated `Manifest` outside the coordination window (which would
 /// silently overwrite a concurrent writer's later update). The mutator
 /// receives the latest base on every attempt.
+/// How `write_manifest_with_etag_if_changed_with_policy` handles object-store
+/// backends that return `Error::NotImplemented` for conditional PUT (`If-Match`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConditionalPolicy {
+    /// Fall back to unconditional `Overwrite` with a warning (preserves
+    /// compatibility for seal and cursor-flush writes on local-FS backends).
+    FallbackOverwrite,
+    /// Refuse unconditional overwrite: segment reclamation requires conditional
+    /// PUTs to reject stale writers so a concurrent seal cannot re-introduce a
+    /// deleted segment into `sealed_segments`.
+    RequireConditional,
+}
+
 async fn write_manifest_with_etag<F>(store: &S3Store, mut mutate: F) -> Result<(), Error>
 where
     F: FnMut(&mut Manifest),
 {
-    write_manifest_with_etag_if_changed(store, |m| {
-        mutate(m);
-        true
-    })
+    write_manifest_with_etag_if_changed_with_policy(
+        store,
+        ConditionalPolicy::FallbackOverwrite,
+        |m| {
+            mutate(m);
+            true
+        },
+    )
     .await
     .map(|_| ())
 }
@@ -1648,8 +1696,9 @@ where
 /// `false`, no manifest PUT is issued and the freshly-read manifest is returned
 /// directly. Otherwise the serialized manifest is PUT with `If-Match` / `Create`
 /// and retried on contention up to `MANIFEST_WRITE_MAX_RETRIES`.
-async fn write_manifest_with_etag_if_changed<F>(
+async fn write_manifest_with_etag_if_changed_with_policy<F>(
     store: &S3Store,
+    policy: ConditionalPolicy,
     mut mutate: F,
 ) -> Result<(Manifest, bool), Error>
 where
@@ -1718,24 +1767,36 @@ where
             }
             // The backend does not implement conditional PUT (`PutMode::Update`),
             // e.g. `LocalFileSystem` or an S3-compatible store with conditional
-            // writes disabled. Fall back to an unconditional `Overwrite` so the
-            // write still lands, but warn: coordination is now OFF, and the
-            // flusher thread + ingestion thread are two concurrent manifest
-            // writers that can silently clobber each other on such a backend.
-            // Production S3 supports conditional PUT and never reaches here.
-            Err(object_store::Error::NotImplemented { .. }) => {
-                tracing::warn!(
-                    "manifest backend does not support conditional PUT; falling \
-                     back to unconditional Overwrite — coordination disabled, \
-                     concurrent writers may lose updates"
-                );
-                store
-                    .client
-                    .put_opts(&path, payload, PutOptions::default())
-                    .await
-                    .map_err(|e| Error::Process(format!("S3 PUT manifest: {}", e)))?;
-                return Ok((m, true));
-            }
+            // writes disabled. Non-reclaim writers fall back to `Overwrite` so
+            // local-FS tests and legacy setups keep working; reclamation refuses
+            // unconditional overwrite so a stale seal cannot re-register a
+            // deleted segment.
+            Err(object_store::Error::NotImplemented { .. }) => match policy {
+                ConditionalPolicy::RequireConditional => {
+                    tracing::warn!(
+                        "S3 WAL segment reclamation requires conditional PUT (If-Match), \
+                         which this object-store backend does not implement; leaving \
+                         segments intact"
+                    );
+                    return Err(Error::Process(
+                        "manifest backend does not support conditional PUT required for safe segment reclamation"
+                            .into(),
+                    ));
+                }
+                ConditionalPolicy::FallbackOverwrite => {
+                    tracing::warn!(
+                        "manifest backend does not support conditional PUT; falling \
+                         back to unconditional Overwrite — coordination disabled, \
+                         concurrent writers may lose updates"
+                    );
+                    store
+                        .client
+                        .put_opts(&path, payload, PutOptions::default())
+                        .await
+                        .map_err(|e| Error::Process(format!("S3 PUT manifest: {}", e)))?;
+                    return Ok((m, true));
+                }
+            },
             Err(e) => {
                 return Err(Error::Process(format!("S3 PUT manifest: {}", e)));
             }
@@ -1826,8 +1887,6 @@ async fn reclaim_segments_at(
     now: u64,
     cancel: Option<&CancellationToken>,
 ) -> Result<usize, Error> {
-    let _reclaim_guard = store.reclaim_lock.lock().await;
-
     if !store.retention_cfg.enabled {
         return Ok(0);
     }
@@ -1838,6 +1897,20 @@ async fn reclaim_segments_at(
         return Ok(0);
     }
 
+    let _reclaim_guard = if let Some(stop) = cancel {
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Ok(0),
+            guard = store.reclaim_lock.lock() => guard,
+        }
+    } else {
+        store.reclaim_lock.lock().await
+    };
+
+    if store.rewind_floor.load(Ordering::Acquire) != u64::MAX {
+        return Ok(0);
+    }
+
     let backfill_snapshot = store
         .backfilled_meta
         .lock()
@@ -1845,64 +1918,78 @@ async fn reclaim_segments_at(
         .clone();
 
     // Phase 1: lazily adopt backfilled metadata & move eligible sealed
-    // segments into `pending_deletes` before touching S3 objects.
-    let (manifest, mutated) = write_manifest_with_etag_if_changed(store, |m| {
-        if store.rewind_floor.load(Ordering::Acquire) != u64::MAX {
-            return false;
-        }
-        let mut changed = false;
+    // segments into `pending_deletes` before touching S3 objects. Requires
+    // conditional PUT so a stale seal cannot re-register a deleted segment,
+    // and races `cancel.cancelled()` so shutdown never stalls on manifest I/O.
+    let phase1 = write_manifest_with_etag_if_changed_with_policy(
+        store,
+        ConditionalPolicy::RequireConditional,
+        |m| {
+            if store.rewind_floor.load(Ordering::Acquire) != u64::MAX {
+                return false;
+            }
+            let mut changed = false;
 
-        for (name, meta) in &backfill_snapshot {
-            if m.pending_deletes.iter().any(|p| p == name) {
-                continue;
-            }
-            if m.active_segment.as_deref() != Some(name.as_str())
-                && !m.sealed_segments.iter().any(|s| s == name)
-            {
-                apply_seal(m, name);
-                changed = true;
-            }
-            if !m.segment_meta.contains_key(name) {
-                m.segment_meta.insert(name.clone(), meta.clone());
-                changed = true;
-            }
-            if meta.last_seq > m.max_sealed_seq {
-                m.max_sealed_seq = meta.last_seq;
-                changed = true;
-            }
-        }
-
-        let reclaim_floor = m.cursor.min(store.reclaimable_hwm.load(Ordering::Acquire));
-        let eligible: Vec<(String, SegmentMeta)> = m
-            .sealed_segments
-            .iter()
-            .filter(|name| m.active_segment.as_deref() != Some(name.as_str()))
-            .filter_map(|name| {
-                let meta = m.segment_meta.get(name)?;
-                if meta.last_seq <= reclaim_floor {
-                    Some((name.clone(), meta.clone()))
-                } else {
-                    None
+            for (name, meta) in &backfill_snapshot {
+                if m.pending_deletes.iter().any(|p| p == name) {
+                    continue;
                 }
-            })
-            .collect();
-
-        let to_reclaim = select_reclaimable_segments(&store.retention_cfg, &eligible, now);
-        if !to_reclaim.is_empty() {
-            let reclaim_set: HashSet<&str> = to_reclaim.iter().map(|s| s.as_str()).collect();
-            m.sealed_segments
-                .retain(|s| !reclaim_set.contains(s.as_str()));
-            for name in &to_reclaim {
-                m.segment_meta.remove(name);
-                if !m.pending_deletes.contains(name) {
-                    m.pending_deletes.push(name.clone());
+                if m.active_segment.as_deref() != Some(name.as_str())
+                    && !m.sealed_segments.iter().any(|s| s == name)
+                {
+                    apply_seal(m, name);
+                    changed = true;
+                }
+                if !m.segment_meta.contains_key(name) {
+                    m.segment_meta.insert(name.clone(), meta.clone());
+                    changed = true;
+                }
+                if meta.last_seq > m.max_sealed_seq {
+                    m.max_sealed_seq = meta.last_seq;
+                    changed = true;
                 }
             }
-            changed = true;
+
+            let reclaim_floor = m.cursor.min(store.reclaimable_hwm.load(Ordering::Acquire));
+            let eligible: Vec<(String, SegmentMeta)> = m
+                .sealed_segments
+                .iter()
+                .filter(|name| m.active_segment.as_deref() != Some(name.as_str()))
+                .filter_map(|name| {
+                    let meta = m.segment_meta.get(name)?;
+                    if meta.last_seq <= reclaim_floor {
+                        Some((name.clone(), meta.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let to_reclaim = select_reclaimable_segments(&store.retention_cfg, &eligible, now);
+            if !to_reclaim.is_empty() {
+                let reclaim_set: HashSet<&str> = to_reclaim.iter().map(|s| s.as_str()).collect();
+                m.sealed_segments
+                    .retain(|s| !reclaim_set.contains(s.as_str()));
+                for name in &to_reclaim {
+                    m.segment_meta.remove(name);
+                    if !m.pending_deletes.contains(name) {
+                        m.pending_deletes.push(name.clone());
+                    }
+                }
+                changed = true;
+            }
+            changed
+        },
+    );
+    let (manifest, mutated) = if let Some(stop) = cancel {
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Ok(0),
+            res = phase1 => res?,
         }
-        changed
-    })
-    .await?;
+    } else {
+        phase1.await?
+    };
 
     if mutated && !backfill_snapshot.is_empty() {
         let mut backfilled = store.backfilled_meta.lock().expect("backfilled_meta lock");
@@ -1923,6 +2010,7 @@ async fn reclaim_segments_at(
         .cloned()
         .collect();
     let mut confirmed_deleted: Vec<String> = Vec::new();
+    let mut failed_deleted: Vec<String> = Vec::new();
     let mut cancelled = false;
 
     for seg_name in candidates {
@@ -1959,25 +2047,54 @@ async fn reclaim_segments_at(
                 tracing::warn!(
                     segment = %seg_name,
                     error = %e,
-                    "S3 WAL segment delete failed; leaving in pending_deletes for retry"
+                    "S3 WAL segment delete failed; rotating to tail of pending_deletes for retry"
                 );
+                failed_deleted.push(seg_name);
             }
         }
     }
 
-    // Phase 3: clear confirmed deletions from `pending_deletes`.
-    if !confirmed_deleted.is_empty() && !cancelled {
+    // Phase 3: clear confirmed deletions from `pending_deletes` and rotate
+    // failed names to the tail so a failing prefix of 64 objects cannot starve
+    // healthy objects queued behind them.
+    if (!confirmed_deleted.is_empty() || !failed_deleted.is_empty()) && !cancelled {
         let confirmed_set: HashSet<String> = confirmed_deleted.iter().cloned().collect();
-        let _ = write_manifest_with_etag_if_changed(store, |m| {
-            let before = m.pending_deletes.len();
-            m.pending_deletes.retain(|s| !confirmed_set.contains(s));
-            m.pending_deletes.len() != before
-        })
-        .await?;
-        tracing::debug!(
-            reclaimed = confirmed_deleted.len(),
-            "S3 WAL reclaimed sealed segments"
+        let failed_set: HashSet<String> = failed_deleted.iter().cloned().collect();
+        let phase3 = write_manifest_with_etag_if_changed_with_policy(
+            store,
+            ConditionalPolicy::RequireConditional,
+            |m| {
+                let original = m.pending_deletes.clone();
+                let mut rotated_tail = Vec::new();
+                m.pending_deletes.retain(|s| {
+                    if confirmed_set.contains(s) {
+                        return false;
+                    }
+                    if failed_set.contains(s) {
+                        rotated_tail.push(s.clone());
+                        return false;
+                    }
+                    true
+                });
+                m.pending_deletes.extend(rotated_tail);
+                m.pending_deletes != original
+            },
         );
+        if let Some(stop) = cancel {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Ok(confirmed_deleted.len()),
+                res = phase3 => { let _ = res?; }
+            }
+        } else {
+            let _ = phase3.await?;
+        }
+        if !confirmed_deleted.is_empty() {
+            tracing::debug!(
+                reclaimed = confirmed_deleted.len(),
+                "S3 WAL reclaimed sealed segments"
+            );
+        }
     }
 
     Ok(confirmed_deleted.len())
@@ -2017,8 +2134,14 @@ fn spawn_flusher(store: Arc<S3Store>) -> FlusherHandle {
                         biased;
                         _ = stop_reclaim.cancelled() => break,
                         _ = tokio::time::sleep(reclaim_interval) => {
-                            if let Err(e) = reclaim_segments(&reclaim_store, Some(&stop_reclaim)).await {
-                                tracing::warn!(error = %e, "S3 WAL segment reclaim sweep failed");
+                            tokio::select! {
+                                biased;
+                                _ = stop_reclaim.cancelled() => break,
+                                res = reclaim_segments(&reclaim_store, Some(&stop_reclaim)) => {
+                                    if let Err(e) = res {
+                                        tracing::warn!(error = %e, "S3 WAL segment reclaim sweep failed");
+                                    }
+                                }
                             }
                         }
                     }
@@ -4677,6 +4800,7 @@ mod tests {
         puts: StdMutex<Vec<String>>,
         deletes: StdMutex<Vec<String>>,
         fail_deletes: std::sync::atomic::AtomicBool,
+        fail_delete_names: StdMutex<HashSet<String>>,
     }
 
     impl SpyObjectStore {
@@ -4687,6 +4811,7 @@ mod tests {
                 puts: StdMutex::new(Vec::new()),
                 deletes: StdMutex::new(Vec::new()),
                 fail_deletes: std::sync::atomic::AtomicBool::new(false),
+                fail_delete_names: StdMutex::new(HashSet::new()),
             })
         }
 
@@ -4781,20 +4906,33 @@ mod tests {
                 }));
             }
             let deletes = &self.deletes;
-            let recorded: Vec<object_store::Result<ObjectPath>> =
-                futures::executor::block_on(async {
-                    let mut out = Vec::new();
-                    let mut s = locations;
-                    while let Some(item) = s.next().await {
-                        if let Ok(ref loc) = item {
-                            deletes.lock().unwrap().push(loc.to_string());
+            let fail_names = self.fail_delete_names.lock().unwrap().clone();
+            let mut to_delete: Vec<object_store::Result<ObjectPath>> = Vec::new();
+            let mut failed: Vec<object_store::Result<ObjectPath>> = Vec::new();
+            futures::executor::block_on(async {
+                let mut s = locations;
+                while let Some(item) = s.next().await {
+                    match item {
+                        Ok(loc) => {
+                            let fname = loc.filename().unwrap_or("").to_string();
+                            if fail_names.contains(&fname) {
+                                failed.push(Err(object_store::Error::Generic {
+                                    store: "SpyObjectStore",
+                                    source: format!("injected delete failure for {loc}").into(),
+                                }));
+                            } else {
+                                deletes.lock().unwrap().push(loc.to_string());
+                                to_delete.push(Ok(loc));
+                            }
                         }
-                        out.push(item);
+                        Err(e) => failed.push(Err(e)),
                     }
-                    out
-                });
-            self.inner
-                .delete_stream(Box::pin(futures::stream::iter(recorded)))
+                }
+            });
+            let inner_stream = self
+                .inner
+                .delete_stream(Box::pin(futures::stream::iter(to_delete)));
+            Box::pin(inner_stream.chain(futures::stream::iter(failed)))
         }
         fn list(
             &self,
@@ -4953,6 +5091,54 @@ mod tests {
             now
         )
         .is_empty());
+
+        // Combined caps: bytes tighter than count (max_segments=2 allows 2 & 3,
+        // max_bytes=1000 allows only 3 -> must reclaim 1 & 2, no gap).
+        assert_eq!(
+            select_reclaimable_segments(
+                &RetentionConfig {
+                    enabled: true,
+                    max_segments: Some(2),
+                    max_age: None,
+                    max_bytes: Some(1000),
+                },
+                &eligible,
+                now
+            ),
+            vec!["00000001.wal", "00000002.wal"]
+        );
+
+        // Complementary combined caps: count tighter than bytes (max_bytes=10_000
+        // allows all 3, max_segments=1 allows only 3 -> must reclaim 1 & 2).
+        assert_eq!(
+            select_reclaimable_segments(
+                &RetentionConfig {
+                    enabled: true,
+                    max_segments: Some(1),
+                    max_age: None,
+                    max_bytes: Some(10_000),
+                },
+                &eligible,
+                now
+            ),
+            vec!["00000001.wal", "00000002.wal"]
+        );
+
+        // Combined count + age: age tighter than count (max_segments=3,
+        // max_age=20s -> keeps only seg 3 at 10s, reclaims 1 & 2).
+        assert_eq!(
+            select_reclaimable_segments(
+                &RetentionConfig {
+                    enabled: true,
+                    max_segments: Some(3),
+                    max_age: Some(std::time::Duration::from_secs(20)),
+                    max_bytes: Some(10_000),
+                },
+                &eligible,
+                now
+            ),
+            vec!["00000001.wal", "00000002.wal"]
+        );
     }
 
     #[test]
@@ -5357,5 +5543,226 @@ mod tests {
             err.to_string().contains("max_age"),
             "expected max_age error, got: {err}"
         );
+    }
+
+    #[test]
+    fn retention_failed_delete_batch_rotates_so_later_healthy_segments_reclaim() {
+        let spy = SpyObjectStore::new();
+        let store = build_retention_store(spy.clone(), "rotate-failed", RetentionConfig::default());
+        let ns = "arkflow/ret/ret-pod/rotate-failed";
+
+        // Seed 65 pending-delete objects: 1..=64 fail DELETE persistently,
+        // while 65 is healthy. Sweep 1 attempts 1..=64 and rotates them to the
+        // tail; sweep 2 must then reach and delete 65 instead of starving it.
+        store.rt().block_on(async {
+            let mut failing = HashSet::new();
+            let mut pending = Vec::new();
+            for idx in 1..=65u64 {
+                let name = format!("{idx:08}.wal");
+                spy.inner
+                    .put(
+                        &ObjectPath::from(format!("{ns}/segments/{name}").as_str()),
+                        PutPayload::from(Bytes::from_static(b"dummy")),
+                    )
+                    .await
+                    .unwrap();
+                if idx <= 64 {
+                    failing.insert(name.clone());
+                }
+                pending.push(name);
+            }
+            *spy.fail_delete_names.lock().unwrap() = failing;
+            write_manifest_with_etag(&store, move |m| {
+                m.pending_deletes = pending.clone();
+            })
+            .await
+            .unwrap();
+        });
+
+        // Sweep 1: 1..=64 all fail and rotate behind 65.
+        let sweep1 = store.rt().block_on(reclaim_segments(&store, None)).unwrap();
+        assert_eq!(sweep1, 0);
+        let m1 = store.read_manifest().unwrap();
+        assert_eq!(m1.pending_deletes.len(), 65);
+        assert_eq!(
+            m1.pending_deletes.first().map(String::as_str),
+            Some("00000065.wal"),
+            "failed batch must rotate to tail so 00000065.wal moves to head"
+        );
+
+        // Sweep 2: reaches 00000065.wal at the head and deletes it cleanly.
+        let sweep2 = store.rt().block_on(reclaim_segments(&store, None)).unwrap();
+        assert_eq!(sweep2, 1, "healthy segment 65 must be deleted on sweep 2");
+        let m2 = store.read_manifest().unwrap();
+        assert_eq!(m2.pending_deletes.len(), 64);
+        assert!(!m2.pending_deletes.contains(&"00000065.wal".to_string()));
+        assert!(!spy
+            .list_segment_names(store.rt(), &format!("{ns}/segments"))
+            .contains(&"00000065.wal".to_string()));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn retention_requires_conditional_put_and_leaves_objects_intact_on_not_implemented() {
+        let inner = Arc::new(InMemory::new());
+        let client: Arc<dyn object_store::ObjectStore> = Arc::new(NotImplementedPutStore {
+            inner: inner.clone(),
+        });
+        let store = build_retention_store(client, "no-cond-put", RetentionConfig::default());
+        let payload = sample_payload(None);
+        for seq in 1..=12u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        for seq in 1..=5u64 {
+            store.advance_cursor(seq).unwrap();
+            store.mark_committed(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+
+        let err = store
+            .rt()
+            .block_on(reclaim_segments(&store, None))
+            .expect_err("reclamation must fail closed without conditional PUT");
+        assert!(
+            err.to_string().contains("conditional PUT"),
+            "unexpected error: {err}"
+        );
+        // Segment 1 must remain intact on the store.
+        let head = store.rt().block_on(inner.head(&ObjectPath::from(
+            "arkflow/ret/ret-pod/no-cond-put/segments/00000001.wal",
+        )));
+        assert!(
+            head.is_ok(),
+            "object must remain intact when reclaim refuses"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn retention_cancellation_interrupts_stalled_manifest_io() {
+        #[derive(Debug)]
+        struct StalledManifestGetStore {
+            inner: Arc<InMemory>,
+            stall: std::sync::atomic::AtomicBool,
+        }
+        impl std::fmt::Display for StalledManifestGetStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "StalledManifestGetStore")
+            }
+        }
+        #[async_trait]
+        impl object_store::ObjectStore for StalledManifestGetStore {
+            async fn put_opts(
+                &self,
+                location: &ObjectPath,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &ObjectPath,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+            async fn get_opts(
+                &self,
+                location: &ObjectPath,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                if self.stall.load(Ordering::Acquire)
+                    && location.as_ref().ends_with("manifest.json")
+                {
+                    futures::future::pending::<()>().await;
+                }
+                self.inner.get_opts(location, options).await
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+                self.inner.delete_stream(locations)
+            }
+            fn list(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &ObjectPath,
+                to: &ObjectPath,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+        }
+
+        let stalled = Arc::new(StalledManifestGetStore {
+            inner: Arc::new(InMemory::new()),
+            stall: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store =
+            build_retention_store(stalled.clone(), "cancel-stall", RetentionConfig::default());
+        stalled.stall.store(true, Ordering::Release);
+
+        let token = CancellationToken::new();
+        let cancel_trigger = token.clone();
+        let start = std::time::Instant::now();
+        let res = store.rt().block_on(async {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                cancel_trigger.cancel();
+            });
+            reclaim_segments(&store, Some(&token)).await
+        });
+        assert_eq!(res.unwrap(), 0);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "cancellation must interrupt stalled Phase 1 manifest GET promptly"
+        );
+        stalled.stall.store(false, Ordering::Release);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn segment_still_required_for_replay_distinguishes_reclaimed_vs_missing() {
+        let spy = SpyObjectStore::new();
+        let store = build_retention_store(spy.clone(), "missing-check", RetentionConfig::default());
+        let payload = sample_payload(None);
+        for seq in 1..=12u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        // Unacked segment 2 (5..=8) is still required for replay.
+        assert!(store.segment_still_required_for_replay("00000002.wal", 0));
+
+        // Commit through 5 and reclaim segment 1 -> latest manifest no longer
+        // requires segment 1, so a stale reader's NotFound must not warn.
+        for seq in 1..=5u64 {
+            store.advance_cursor(seq).unwrap();
+            store.mark_committed(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+        assert_eq!(
+            store.rt().block_on(reclaim_segments(&store, None)).unwrap(),
+            1
+        );
+        assert!(
+            !store.segment_still_required_for_replay("00000001.wal", 0),
+            "reclaimed segment must not be flagged as missing replay data"
+        );
+        // Active unacked segment 3 is still required for replay.
+        assert!(store.segment_still_required_for_replay("00000003.wal", 5));
+        store.close().unwrap();
     }
 }

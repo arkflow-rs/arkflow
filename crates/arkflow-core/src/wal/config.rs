@@ -409,12 +409,12 @@ fn parse_duration_human(s: &str) -> Result<Duration, String> {
         return Ok(d);
     }
     // Preserve backward compatibility with fractional seconds ("0.5s") and
-    // bare millisecond strings ("500").
+    // bare millisecond strings ("500"). Use `try_from_secs_f64` so values
+    // exceeding `Duration::MAX` (e.g. `"1e20s"`) return an error instead of
+    // panicking.
     if let Some(rest) = trimmed.strip_suffix('s') {
         if let Ok(secs) = rest.parse::<f64>() {
-            if secs.is_finite() && secs >= 0.0 {
-                return Ok(Duration::from_secs_f64(secs));
-            }
+            return Duration::try_from_secs_f64(secs).map_err(|_| format!("invalid duration: {s}"));
         }
     }
     if let Ok(ms) = trimmed.parse::<u64>() {
@@ -423,13 +423,24 @@ fn parse_duration_human(s: &str) -> Result<Duration, String> {
     Err(format!("invalid duration: {s}"))
 }
 
+/// Format a `Duration` preserving exact millisecond output (`"500ms"`) while
+/// serializing sub-millisecond durations losslessly via `humantime` (e.g.
+/// `500µs` → `"500us"` instead of truncating to `"0ms"`).
+fn format_duration_lossless(d: &Duration) -> String {
+    if d.subsec_nanos().is_multiple_of(1_000_000) {
+        format!("{}ms", d.as_millis())
+    } else {
+        humantime::format_duration(*d).to_string()
+    }
+}
+
 pub mod duration_serde {
-    use super::parse_duration_human;
+    use super::{format_duration_lossless, parse_duration_human};
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{}ms", d.as_millis()))
+        s.serialize_str(&format_duration_lossless(d))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
@@ -448,13 +459,13 @@ pub mod duration_serde {
 
 /// Duration serde for Option<Duration> fields.
 pub mod duration_serde_option {
-    use super::parse_duration_human;
+    use super::{format_duration_lossless, parse_duration_human};
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
     pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
         match d {
-            Some(duration) => s.serialize_str(&format!("{}ms", duration.as_millis())),
+            Some(duration) => s.serialize_str(&format_duration_lossless(duration)),
             None => s.serialize_none(),
         }
     }
@@ -898,5 +909,93 @@ mod tests {
             err.to_string().contains("max_age"),
             "expected max_age error, got: {err}"
         );
+    }
+
+    #[test]
+    fn retention_submillisecond_max_age_round_trips_and_validates() {
+        let mut o = ObjectStoreWalConfig {
+            node_id: "pod-a".into(),
+            stream_id: "main".into(),
+            prefix: default_prefix(),
+            s3: ObjectStoreS3Config {
+                bucket: "b".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig::default(),
+            cursor: CursorFlushConfig::default(),
+            segment_tuning: SegmentTuningConfig::default(),
+            parallel_put: ParallelPutConfig::default(),
+            compression: CompressionConfig::default(),
+            retention: RetentionConfig {
+                enabled: true,
+                max_segments: None,
+                max_age: Some(Duration::from_micros(500)),
+                max_bytes: None,
+            },
+            sync: SyncPolicy::GroupCommit,
+        };
+        let yaml = serde_yaml::to_string(&WalBackend::ObjectStore(o.clone())).unwrap();
+        assert!(
+            yaml.contains("max_age: 500us"),
+            "sub-millisecond max_age must serialize losslessly as 500us: {yaml}"
+        );
+        let reloaded: WalBackend = serde_yaml::from_str(&yaml).unwrap();
+        let cfg = WalConfig {
+            enabled: true,
+            path: String::new(),
+            sync: SyncPolicy::default(),
+            backend: Some(reloaded.clone()),
+        };
+        cfg.validate()
+            .expect("reloaded sub-millisecond max_age must validate");
+        match reloaded {
+            WalBackend::ObjectStore(r) => {
+                assert_eq!(r.retention.max_age, Some(Duration::from_micros(500)));
+            }
+            _ => panic!("expected ObjectStore"),
+        }
+
+        // Exact millisecond values still serialize with ms suffix.
+        o.retention.max_age = Some(Duration::from_millis(250));
+        let ms_yaml = serde_yaml::to_string(&WalBackend::ObjectStore(o)).unwrap();
+        assert!(ms_yaml.contains("max_age: 250ms"), "got: {ms_yaml}");
+    }
+
+    #[test]
+    fn retention_rejects_overflowing_fractional_seconds_and_keeps_valid_fractions() {
+        let overflow_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "1e20s"
+            s3:
+              bucket: b
+        "#;
+        assert!(
+            serde_yaml::from_str::<WalBackend>(overflow_yaml).is_err(),
+            "overflowing fractional seconds must fail deserialization instead of panicking"
+        );
+
+        let valid_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "0.5s"
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(valid_yaml).unwrap();
+        match b {
+            WalBackend::ObjectStore(o) => {
+                assert_eq!(o.retention.max_age, Some(Duration::from_millis(500)));
+            }
+            _ => panic!("expected ObjectStore"),
+        }
     }
 }

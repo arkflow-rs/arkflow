@@ -305,7 +305,7 @@ durability:
 
 | Cost Component | Behavior with Retention Enabled |
 | --- | --- |
-| **Stored bytes** | Under the default policy, bounded to active unacknowledged segments plus `active_segment` (1 sealed segment). With explicit caps, bounded to `active + unacknowledged + min(max_segments, max_age × seal_rate, max_bytes)`. |
+| **Stored bytes** | Retention caps (`max_segments`, `max_age`, `max_bytes`) bound only the **eligible acknowledged history selected for retention**, not total bucket occupancy. Actual stored bytes = unacknowledged segments + `active_segment` (1 sealed segment) + undo-protected segment (containing the latest committed sequence) + retained eligible history + `pending_deletes` (sweeps delete at most 64 objects per pass, and failed deletes continue consuming storage until retried). |
 | **DELETE requests** | Standard `DELETE` requests are free on AWS S3 (and most S3-compatible stores); capped at 64 objects per sweep so backlogs drain smoothly. |
 | **Manifest PUTs** | Active reclaim sweeps that deregister and delete objects add 2 small manifest PUTs (deregister + cleanup). Idle sweeps perform **0** manifest PUTs. |
 | **Restart GETs** | Drops from `O(total historical segments)` to `O(unacknowledged segments only)`, eliminating linear restart degradation on long-running streams. |
