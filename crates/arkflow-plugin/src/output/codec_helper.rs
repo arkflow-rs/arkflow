@@ -73,6 +73,7 @@ pub fn ensure_row_aligned(payloads: &[Bytes], rows: usize, output: &str) -> Resu
 /// ("server has gone away") and 2013 ("lost connection") under the generic
 /// `HY000` class, so the classifier downcasts for those before falling
 /// back to the SQLSTATE.
+#[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
 pub(crate) fn classify_sqlx_error(error: &sqlx::Error) -> Error {
     match error {
         sqlx::Error::Io(_) => Error::Disconnection,
@@ -109,6 +110,7 @@ pub(crate) fn classify_sqlx_error(error: &sqlx::Error) -> Error {
 /// `57` operator intervention (server shutdown / admin cancel),
 /// `53300` too many connections. Everything else (syntax `42xxx`,
 /// constraint `23xxx`, data exceptions `22xxx`) is deterministic.
+#[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
 fn sqlstate_is_transient(code: &str) -> bool {
     code.starts_with("08") || code.starts_with("40") || code.starts_with("57") || code == "53300"
 }
@@ -116,6 +118,7 @@ fn sqlstate_is_transient(code: &str) -> bool {
 /// [`classify_sqlx_error`] with a deterministic-failure context: the
 /// transient `Disconnection` carries no payload (its Display is
 /// "Connection lost"), so only the `Process` arm gets the component prefix.
+#[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
 pub(crate) fn classify_sqlx_error_ctx(error: &sqlx::Error, context: &str) -> Error {
     match classify_sqlx_error(error) {
         Error::Process(_) => Error::Process(format!("{context}: {error}")),
@@ -201,16 +204,20 @@ mod tests {
     /// Test double standing in for a driver `DatabaseError`: carries a
     /// SQLSTATE `code()` like both the MySQL and Postgres drivers do
     /// through the trait method.
+    #[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
     #[derive(Debug)]
     struct FakeDbError {
         code: Option<String>,
     }
+    #[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
     impl std::fmt::Display for FakeDbError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "fake database error")
         }
     }
+    #[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
     impl std::error::Error for FakeDbError {}
+    #[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
     impl sqlx::error::DatabaseError for FakeDbError {
         fn message(&self) -> &str {
             "fake database error"
@@ -232,12 +239,14 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
     fn db_error(code: Option<&str>) -> sqlx::Error {
         sqlx::Error::Database(Box::new(FakeDbError {
             code: code.map(str::to_string),
         }))
     }
 
+    #[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
     #[test]
     fn classify_sqlx_error_transients() {
         use crate::output::codec_helper::classify_sqlx_error;
@@ -269,6 +278,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
     #[test]
     fn classify_sqlx_error_deterministic() {
         use crate::output::codec_helper::classify_sqlx_error;

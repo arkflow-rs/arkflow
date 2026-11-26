@@ -21,8 +21,48 @@ tempfile = { workspace = true }
 
 # arkflow
 arkflow-core = { workspace = true }
-arkflow-plugin = { workspace = true }
-arkflow-server = { workspace = true }
+arkflow-plugin = { workspace = true, default-features = false }
+arkflow-server = { workspace = true, default-features = false }
+
+# Feature gating: mirrors arkflow-plugin's family features (forwarded 1:1).
+# Default keeps every family enabled; use `--no-default-features --features
+# engine-minimal` for a minimal build (features are additive, so engine-minimal
+# only removes anything when combined with --no-default-features).
+# The default list enables THIS crate's mirror features (not the plugin's
+# directly) so `cfg!(feature = ...)` inside this crate — including the
+# full-inventory gate tests — reflects the real feature set.
+[features]
+default = [
+    "connectors-sql",
+    "connectors-kafka",
+    "connectors-python",
+    "connectors-mongodb",
+    "connectors-pulsar",
+    "connectors-hdfs",
+    "connectors-mqtt",
+    "connectors-nats",
+    "connectors-redis",
+    "connectors-websocket",
+    "connectors-modbus",
+    "ai-vector",
+    "processors-vrl",
+    "codecs-protobuf",
+]
+connectors-sql = ["arkflow-plugin/connectors-sql"]
+connectors-kafka = ["arkflow-plugin/connectors-kafka"]
+connectors-python = ["arkflow-plugin/connectors-python"]
+connectors-mongodb = ["arkflow-plugin/connectors-mongodb"]
+connectors-pulsar = ["arkflow-plugin/connectors-pulsar"]
+connectors-hdfs = ["arkflow-plugin/connectors-hdfs"]
+connectors-mqtt = ["arkflow-plugin/connectors-mqtt"]
+connectors-nats = ["arkflow-plugin/connectors-nats"]
+connectors-redis = ["arkflow-plugin/connectors-redis"]
+connectors-websocket = ["arkflow-plugin/connectors-websocket"]
+connectors-modbus = ["arkflow-plugin/connectors-modbus"]
+ai-vector = ["arkflow-plugin/ai-vector"]
+processors-vrl = ["arkflow-plugin/processors-vrl"]
+codecs-protobuf = ["arkflow-plugin/codecs-protobuf"]
+engine-minimal = ["arkflow-plugin/engine-minimal"]
 
 [lints]
 workspace = true

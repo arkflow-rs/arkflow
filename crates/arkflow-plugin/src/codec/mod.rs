@@ -16,19 +16,21 @@ use arkflow_core::Error;
 pub mod avro_arrow;
 pub mod debezium;
 pub mod json;
+#[cfg(feature = "codecs-protobuf")]
 pub mod protobuf;
+#[cfg(feature = "codecs-protobuf")]
 pub mod schema_registry;
 
 fn register_components() -> Result<(), Error> {
-    crate::init_steps(
-        &COMPLETED,
-        &[
-            json::init,
-            protobuf::init,
-            debezium::init,
-            schema_registry::init,
-        ],
-    )
+    // `mut` is exercised only when family features append their init steps;
+    // with every family off the vec is complete at construction.
+    #[allow(unused_mut)]
+    let mut steps: Vec<fn() -> Result<(), Error>> = vec![json::init, debezium::init];
+    #[cfg(feature = "codecs-protobuf")]
+    steps.push(protobuf::init);
+    #[cfg(feature = "codecs-protobuf")]
+    steps.push(schema_registry::init);
+    crate::init_steps(&COMPLETED, &steps)
 }
 
 static COMPLETED: std::sync::Mutex<std::collections::BTreeSet<usize>> =

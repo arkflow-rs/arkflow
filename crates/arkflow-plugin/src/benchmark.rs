@@ -24,10 +24,15 @@
 //! benchmark that fails on slow hardware is useless. Regression tracking is
 //! the caller's job (compare reports across commits on the same machine).
 
+#[cfg(feature = "codecs-protobuf")]
 use crate::codec::schema_registry::{FetchedSchema, SchemaRegistryCodec, SchemaResolver};
+#[cfg(feature = "codecs-protobuf")]
 use apache_avro::types::Value as AvroValue;
+#[cfg(feature = "codecs-protobuf")]
 use apache_avro::writer::datum::GenericDatumWriter;
+#[cfg(feature = "codecs-protobuf")]
 use apache_avro::Schema as AvroSchema;
+#[cfg(feature = "codecs-protobuf")]
 use arkflow_core::codec::Decoder;
 use arkflow_core::config::EngineConfig;
 use arkflow_core::executor::run_job;
@@ -38,7 +43,9 @@ use arkflow_core::processor::{
 };
 use arkflow_core::state::RedbStateBackend;
 use arkflow_core::state::StateBackend as _;
-use arkflow_core::{Bytes, Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
+#[cfg(feature = "codecs-protobuf")]
+use arkflow_core::Bytes;
+use arkflow_core::{Error, MessageBatch, MessageBatchRef, ProcessResult, Resource};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -303,10 +310,12 @@ async fn state_backend(count: usize) -> Result<ScenarioResult, Error> {
 /// Offline schema resolver for the avro-decode scenarios: pre-registers the
 /// schemas the benchmark uses so the real `SchemaRegistryCodec` decode path
 /// runs without any network (suite-wide self-containment contract).
+#[cfg(feature = "codecs-protobuf")]
 struct InMemorySchemaResolver {
     schemas: HashMap<u32, FetchedSchema>,
 }
 
+#[cfg(feature = "codecs-protobuf")]
 #[async_trait::async_trait]
 impl SchemaResolver for InMemorySchemaResolver {
     async fn fetch_schema(&self, id: u32) -> Result<FetchedSchema, Error> {
@@ -319,6 +328,7 @@ impl SchemaResolver for InMemorySchemaResolver {
 
 /// Field types cycled by the wide-schema builder: the supported leaf kinds
 /// the flat Arrow mapping sees in real payloads (incl. one nullable union).
+#[cfg(feature = "codecs-protobuf")]
 const AVRO_FIELD_TYPES: [&str; 6] = [
     r#""long""#,
     r#""string""#,
@@ -328,6 +338,7 @@ const AVRO_FIELD_TYPES: [&str; 6] = [
     r#"{"type": "int", "logicalType": "date"}"#,
 ];
 
+#[cfg(feature = "codecs-protobuf")]
 fn wide_avro_schema(width: usize) -> AvroSchema {
     let fields: Vec<String> = (0..width)
         .map(|i| {
@@ -344,6 +355,7 @@ fn wide_avro_schema(width: usize) -> AvroSchema {
     AvroSchema::parse_str(&json).expect("benchmark avro schema parses")
 }
 
+#[cfg(feature = "codecs-protobuf")]
 fn wide_avro_value(width: usize, i: u64) -> AvroValue {
     AvroValue::Record(
         (0..width)
@@ -363,6 +375,7 @@ fn wide_avro_value(width: usize, i: u64) -> AvroValue {
 }
 
 /// Encodes one Confluent wire-format message: `[0x00][4-byte BE id][payload]`.
+#[cfg(feature = "codecs-protobuf")]
 fn wire_message(schema: &AvroSchema, id: u32, value: AvroValue) -> Vec<u8> {
     let payload = GenericDatumWriter::builder(schema)
         .build()
@@ -384,6 +397,7 @@ fn wire_message(schema: &AvroSchema, id: u32, value: AvroValue) -> Vec<u8> {
 /// inversely with the schema width (per-message cost grows linearly in
 /// width), giving every width roughly the same time budget and keeping the
 /// whole suite bounded.
+#[cfg(feature = "codecs-protobuf")]
 async fn avro_decode(
     name: &'static str,
     description: &'static str,
@@ -422,6 +436,7 @@ async fn avro_decode(
 }
 
 /// Avro decode, 5-field schema (narrow records).
+#[cfg(feature = "codecs-protobuf")]
 async fn avro_decode_w5(count: usize) -> Result<ScenarioResult, Error> {
     avro_decode(
         "avro-decode-w5",
@@ -433,6 +448,7 @@ async fn avro_decode_w5(count: usize) -> Result<ScenarioResult, Error> {
 }
 
 /// Avro decode, 25-field schema (medium records).
+#[cfg(feature = "codecs-protobuf")]
 async fn avro_decode_w25(count: usize) -> Result<ScenarioResult, Error> {
     avro_decode(
         "avro-decode-w25",
@@ -445,6 +461,7 @@ async fn avro_decode_w25(count: usize) -> Result<ScenarioResult, Error> {
 
 /// Avro decode, 100-field schema (wide records — per-message cost scales
 /// with field count).
+#[cfg(feature = "codecs-protobuf")]
 async fn avro_decode_w100(count: usize) -> Result<ScenarioResult, Error> {
     avro_decode(
         "avro-decode-w100",
@@ -662,22 +679,31 @@ async fn json_decode_w200(count: usize) -> Result<ScenarioResult, Error> {
 
 /// Runs every scenario once (helper for measurement loops).
 async fn run_each(count: usize) -> Result<Vec<ScenarioResult>, Error> {
-    Ok(vec![
+    // `mut` is only needed when the schema-registry scenarios are compiled
+    // in; under `codecs-protobuf`-less builds the vec is returned as built.
+    #[cfg_attr(not(feature = "codecs-protobuf"), allow(unused_mut))]
+    let mut results = vec![
         linear_sql(count).await?,
         groupby_sql(count).await?,
         filter_project_sql(count).await?,
         codec_json(count).await?,
         json_decode(count).await?,
         state_backend(count).await?,
-        avro_decode_w5(count).await?,
-        avro_decode_w25(count).await?,
-        avro_decode_w100(count).await?,
         window_journal_n1(count).await?,
         window_journal_n100(count).await?,
         window_journal_n1k(count).await?,
         sql_hot_cache(count).await?,
         json_decode_w200(count).await?,
-    ])
+    ];
+    // The avro-decode scenarios run the real schema-registry codec, which is
+    // feature-gated (`codecs-protobuf`); skip them in builds without it.
+    #[cfg(feature = "codecs-protobuf")]
+    results.extend([
+        avro_decode_w5(count).await?,
+        avro_decode_w25(count).await?,
+        avro_decode_w100(count).await?,
+    ]);
+    Ok(results)
 }
 
 /// Serializes whole suite runs. The stream scenarios count the rows the

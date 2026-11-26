@@ -22,36 +22,53 @@ pub mod codec_helper;
 pub mod file;
 pub mod generate;
 pub mod http;
+#[cfg(feature = "connectors-kafka")]
 pub mod kafka;
 pub mod memory;
+#[cfg(feature = "connectors-modbus")]
 pub mod modbus;
+#[cfg(feature = "connectors-mqtt")]
 pub mod mqtt;
 pub mod multiple_inputs;
+#[cfg(feature = "connectors-nats")]
 pub mod nats;
+#[cfg(feature = "connectors-pulsar")]
 pub mod pulsar;
+#[cfg(feature = "connectors-redis")]
 pub mod redis;
+#[cfg(feature = "connectors-sql")]
 pub mod sql;
+#[cfg(feature = "connectors-websocket")]
 pub mod websocket;
 
 fn register_components() -> Result<(), Error> {
-    crate::init_steps(
-        &COMPLETED,
-        &[
-            generate::init,
-            http::init,
-            kafka::init,
-            memory::init,
-            mqtt::init,
-            nats::init,
-            pulsar::init,
-            redis::init,
-            sql::init,
-            websocket::init,
-            multiple_inputs::init,
-            modbus::init,
-            file::init,
-        ],
-    )
+    // `mut` is exercised only when family features append their init steps;
+    // with every family off the vec is complete at construction.
+    #[allow(unused_mut)]
+    let mut steps: Vec<fn() -> Result<(), Error>> = vec![
+        generate::init,
+        http::init,
+        memory::init,
+        multiple_inputs::init,
+        file::init,
+    ];
+    #[cfg(feature = "connectors-kafka")]
+    steps.push(kafka::init);
+    #[cfg(feature = "connectors-mqtt")]
+    steps.push(mqtt::init);
+    #[cfg(feature = "connectors-nats")]
+    steps.push(nats::init);
+    #[cfg(feature = "connectors-pulsar")]
+    steps.push(pulsar::init);
+    #[cfg(feature = "connectors-redis")]
+    steps.push(redis::init);
+    #[cfg(feature = "connectors-sql")]
+    steps.push(sql::init);
+    #[cfg(feature = "connectors-websocket")]
+    steps.push(websocket::init);
+    #[cfg(feature = "connectors-modbus")]
+    steps.push(modbus::init);
+    crate::init_steps(&COMPLETED, &steps)
 }
 
 /// Per-component success markers so a retry after a later component failed

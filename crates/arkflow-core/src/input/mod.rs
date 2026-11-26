@@ -784,10 +784,9 @@ impl InputConfig {
 
             builder.build(self.name.as_deref(), &self.config, codec, resource)
         } else {
-            Err(Error::Config(format!(
-                "Unknown input type: {}",
-                self.input_type
-            )))
+            Err(Error::Config(
+                crate::component::feature_hints::unknown_type_message("input", &self.input_type),
+            ))
         }
     }
 }

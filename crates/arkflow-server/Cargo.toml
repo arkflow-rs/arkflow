@@ -11,7 +11,7 @@ license.workspace = true
 [dependencies]
 jsonwebtoken = { workspace = true }
 arkflow-core = { workspace = true }
-arkflow-plugin = { workspace = true }
+arkflow-plugin = { workspace = true, default-features = false }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -41,6 +41,42 @@ bytes = { workspace = true }
 prometheus = { workspace = true }
 sysinfo = { workspace = true }
 async-trait = { workspace = true }
+
+# Feature gating: mirrors arkflow-plugin's family features (forwarded 1:1).
+# Default enables THIS crate's mirror features so cfg!(feature = ...) inside
+# arkflow-server reflects the real feature set.
+[features]
+default = [
+    "connectors-sql",
+    "connectors-kafka",
+    "connectors-python",
+    "connectors-mongodb",
+    "connectors-pulsar",
+    "connectors-hdfs",
+    "connectors-mqtt",
+    "connectors-nats",
+    "connectors-redis",
+    "connectors-websocket",
+    "connectors-modbus",
+    "ai-vector",
+    "processors-vrl",
+    "codecs-protobuf",
+]
+connectors-sql = ["arkflow-plugin/connectors-sql"]
+connectors-kafka = ["arkflow-plugin/connectors-kafka"]
+connectors-python = ["arkflow-plugin/connectors-python"]
+connectors-mongodb = ["arkflow-plugin/connectors-mongodb"]
+connectors-pulsar = ["arkflow-plugin/connectors-pulsar"]
+connectors-hdfs = ["arkflow-plugin/connectors-hdfs"]
+connectors-mqtt = ["arkflow-plugin/connectors-mqtt"]
+connectors-nats = ["arkflow-plugin/connectors-nats"]
+connectors-redis = ["arkflow-plugin/connectors-redis"]
+connectors-websocket = ["arkflow-plugin/connectors-websocket"]
+connectors-modbus = ["arkflow-plugin/connectors-modbus"]
+ai-vector = ["arkflow-plugin/ai-vector"]
+processors-vrl = ["arkflow-plugin/processors-vrl"]
+codecs-protobuf = ["arkflow-plugin/codecs-protobuf"]
+engine-minimal = ["arkflow-plugin/engine-minimal"]
 
 [dev-dependencies]
 rcgen = "0.14"

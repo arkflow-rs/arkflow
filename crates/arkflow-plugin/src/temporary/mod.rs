@@ -11,11 +11,13 @@
  *    See the License for the specific language governing permissions and
  *    limitations under the License.
  */
+#[cfg(feature = "connectors-redis")]
 mod redis;
 
 use arkflow_core::Error;
 
 pub fn init() -> Result<(), Error> {
+    #[cfg(feature = "connectors-redis")]
     redis::init()?;
     Ok(())
 }

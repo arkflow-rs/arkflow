@@ -60,6 +60,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Guard: this test asserts the FULL component inventory (registry,
+/// metadata, schemas, examples) and therefore only makes sense in a default
+/// all-families build. Under a reduced feature set it would report spurious
+/// drift, so refuse loudly with the fix instead (spec:
+/// `build-feature-gating`, generated-artifacts determinism).
+fn require_default_features() {
+    // `if`+`panic!` rather than `assert!`: under a default build the cfg!
+    // folds to a constant and clippy::assertions_on_constants would deny
+    // assert! with a constant condition.
+    if !cfg!(feature = "connectors-kafka") {
+        panic!(
+            "this gate asserts the full component inventory and must run with the \
+             default (all families) feature set; rebuild without --no-default-features \
+             (see the add-cargo-feature-gating change)"
+        );
+    }
+}
+
 type Exemptions = &'static [(&'static str, &'static str, &'static str, &'static str)];
 
 /// `(kind, registered name, source file under src/, config struct the builder
@@ -3450,6 +3468,7 @@ const RULES: &str = "rules: R0 a referenced type cannot be read or is ambiguous 
 
 #[test]
 fn registered_schemas_match_config_structs() {
+    require_default_features();
     let (problems, _) = run_gate();
     assert!(
         problems.is_empty(),
@@ -3460,6 +3479,7 @@ fn registered_schemas_match_config_structs() {
 
 #[test]
 fn exemptions_stay_accurate() {
+    require_default_features();
     let (mut problems, usage) = run_gate();
     let key = |component: &str, owner: &str, field: &str| {
         (component.to_string(), owner.to_string(), field.to_string())
@@ -3687,6 +3707,7 @@ enum Endpoint {
 
     #[test]
     fn parser_reads_fields_with_their_serde_attributes() {
+        require_default_features();
         let index = demo_index();
         let demo = index.get("input/demo.rs", "DemoConfig").unwrap();
         let names: Vec<&str> = demo.fields.iter().map(|f| f.name.as_str()).collect();
@@ -3796,6 +3817,7 @@ enum Endpoint {
 
     #[test]
     fn comments_and_literals_never_become_definitions() {
+        require_default_features();
         let source = r##"
 // struct Fake { a: u8 }
 /* enum Block { A } */
@@ -3818,6 +3840,7 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
 
     #[test]
     fn rename_rules_match_serde() {
+        require_default_features();
         macro_rules! rule_enum {
             ($name:ident, $rule:expr) => {
                 #[derive(serde::Serialize)]
@@ -4084,11 +4107,13 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
 
     #[test]
     fn a_conforming_schema_reports_nothing() {
+        require_default_features();
         assert!(problems(&demo_index(), "DemoConfig", &conforming()).is_empty());
     }
 
     #[test]
     fn every_drift_class_is_reported() {
+        require_default_features();
         let index = demo_index();
 
         let mut schema = conforming();
@@ -4261,6 +4286,7 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
 
     #[test]
     fn enum_edges_are_still_checked() {
+        require_default_features();
         let index = demo_index();
         let check = |config: &str, schema: Value| {
             let mut gate = Gate::new(&index, "input/demo");
@@ -4381,6 +4407,7 @@ pub struct Real { pub x: u8 } // trailing struct Trailing { }
 
     #[test]
     fn unreadable_and_ambiguous_types_are_reported_not_skipped() {
+        require_default_features();
         // A local definition whose body does not parse is reported where a
         // documented field refers to it.
         let index = Index::from_sources(&[(
@@ -4478,6 +4505,7 @@ struct Broken { broken_field, }
 
     #[test]
     fn exemptions_apply_and_are_scoped() {
+        require_default_features();
         let index = demo_index();
         let def = index.get("input/demo.rs", "DemoConfig").unwrap();
         let mut schema = conforming();
@@ -4518,6 +4546,7 @@ struct Broken { broken_field, }
 
     #[test]
     fn externally_tagged_enums_read_one_property_per_variant() {
+        require_default_features();
         let source = r#"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4603,6 +4632,7 @@ struct Ssl {
 
     #[test]
     fn a_row_is_bound_to_the_builder_registered_under_its_name() {
+        require_default_features();
         let source: Vec<char> = r#"
 struct OldConfig { a: u8 }
 struct NewConfig { b: u8 }
@@ -4644,6 +4674,7 @@ pub fn init() {
 
     #[test]
     fn the_real_index_resolves_types_across_modules() {
+        require_default_features();
         let index = Index::load();
         let resolved = |ty: &str, file: &str| match index.resolve(ty, file) {
             Resolution::Resolved(inner) => {
@@ -4789,6 +4820,7 @@ struct Parent {
 
     #[test]
     fn default_values_are_compared_with_their_source() {
+        require_default_features();
         let index = Index::from_sources(&[("input/demo.rs".to_string(), DEFAULTS.to_string())]);
         let conforming = json!({"type": "object", "properties": {
             "count": {"default": 4}, "name": {"default": "flow"},
@@ -4930,6 +4962,7 @@ struct Parent {
 
     #[test]
     fn default_functions_are_read_from_the_real_sources() {
+        require_default_features();
         let index = Index::load();
         let value = |function: &str, file: &str| index.default_fn_value(function, file);
         assert_eq!(
@@ -4954,6 +4987,7 @@ struct Parent {
 
     #[test]
     fn a_key_demanded_by_one_alternative_only_is_not_required() {
+        require_default_features();
         let index = demo_index();
         let required = conforming()["required"].clone();
 
@@ -4999,6 +5033,7 @@ struct Parent {
 
     #[test]
     fn every_untagged_branch_must_be_a_variant_serde_can_decode() {
+        require_default_features();
         let index = demo_index();
         let check = |schema: Value| {
             let mut gate = Gate::new(&index, "input/demo");
@@ -5038,6 +5073,7 @@ struct Parent {
 
     #[test]
     fn a_discriminator_must_name_a_decodable_variant() {
+        require_default_features();
         let index = demo_index();
         let check = |schema: Value| {
             let mut gate = Gate::new(&index, "input/demo");
@@ -5107,6 +5143,7 @@ struct Parent {
 
     #[test]
     fn an_unreadable_flattened_type_is_reported() {
+        require_default_features();
         let index = Index::from_sources(&[("input/demo.rs".to_string(), DEFAULTS.to_string())]);
         // A closed schema that documents only `enabled` must not pass while
         // `Child`'s fields are invisible to the gate.
@@ -5126,6 +5163,7 @@ struct Parent {
 
     #[test]
     fn relative_paths_resolve_their_module_suffix() {
+        require_default_features();
         let index = Index::from_sources(&[
             (
                 "lib.rs".to_string(),
@@ -5179,6 +5217,7 @@ struct Parent {
 
     #[test]
     fn only_real_deserialization_sites_count() {
+        require_default_features();
         let body = |text: &str| text.chars().collect::<Vec<char>>();
         assert!(reads_config(
             &body("let config: OldConfig = parse_config(None, \"demo\")?;"),
@@ -5233,6 +5272,7 @@ struct Parent {
 
     #[test]
     fn a_builder_enforced_exemption_is_probed_against_the_real_builder() {
+        require_default_features();
         let registered = registered_components();
         let milvus = &registered["output/milvus"];
         // The exemption holds: the builder refuses a config without the key.
@@ -5277,6 +5317,7 @@ struct Parent {
 
     #[test]
     fn a_default_function_is_found_through_its_path_and_its_own_file() {
+        require_default_features();
         let index = Index::from_sources(&[
             (
                 "input/demo.rs".to_string(),
@@ -5353,6 +5394,7 @@ pub struct Child {
 
     #[test]
     fn every_branch_that_selects_a_variant_is_checked() {
+        require_default_features();
         let index = demo_index();
         let check = |schema: Value| {
             let mut gate = Gate::new(&index, "input/demo");
@@ -5393,6 +5435,7 @@ pub struct Child {
 
     #[test]
     fn a_requirement_of_the_enclosing_schema_reaches_every_branch() {
+        require_default_features();
         let index =
             Index::from_sources(&[("input/demo.rs".to_string(), format!("{DEMO}{ENDPOINT}"))]);
         let check = |config: &str, schema: Value| {
@@ -5445,6 +5488,7 @@ pub struct Child {
 
     #[test]
     fn a_merged_view_still_checks_each_variant_against_the_union() {
+        require_default_features();
         let index = demo_index();
         let mut gate = Gate::new(&index, "input/demo");
         gate.check_def(
@@ -5496,6 +5540,7 @@ pub struct Child {
 
     #[test]
     fn a_variant_that_decodes_any_object_excuses_every_branch() {
+        require_default_features();
         let index =
             Index::from_sources(&[("input/demo.rs".to_string(), format!("{DEMO}{}", DEFAULTS))]);
         let file = json!({"properties": {"path": {"type": "string"}}, "required": ["path"]});
@@ -5527,6 +5572,7 @@ pub struct Child {
 
     #[test]
     fn a_branch_without_a_selector_offers_what_the_enclosing_node_lets_through() {
+        require_default_features();
         let index = demo_index();
         let check = |config: &str, schema: Value| {
             let mut gate = Gate::new(&index, "input/demo");
@@ -5655,6 +5701,7 @@ pub struct Child {
 
     #[test]
     fn a_one_of_must_not_select_a_variant_twice() {
+        require_default_features();
         let index = demo_index();
         let check = |schema: Value| {
             let mut gate = Gate::new(&index, "input/demo");
@@ -5730,6 +5777,7 @@ pub struct Child {
 
     #[test]
     fn a_default_stated_by_the_enclosing_node_counts_for_every_variant() {
+        require_default_features();
         let index =
             Index::from_sources(&[("input/demo.rs".to_string(), format!("{DEMO}{}", DEFAULTS))]);
         let check = |config: &str, schema: Value| {
@@ -5786,6 +5834,7 @@ pub struct Child {
 
     #[test]
     fn rename_rules_match_serde_for_non_ascii_names() {
+        require_default_features();
         let name_of = |value: serde_json::Value| value.as_str().unwrap().to_string();
         macro_rules! rule_struct {
             ($name:ident, $rule:expr) => {

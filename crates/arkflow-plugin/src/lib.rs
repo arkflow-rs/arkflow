@@ -18,20 +18,27 @@ pub mod codec;
 pub mod component;
 pub mod context_pool;
 pub mod expr;
+mod feature_hints;
 pub mod http_util;
 pub mod input;
+#[cfg(feature = "connectors-kafka")]
 pub mod kafka_security;
+#[cfg(feature = "connectors-kafka")]
 pub mod kafka_txn;
+#[cfg(feature = "connectors-mqtt")]
 pub mod mqtt_tls;
 pub mod output;
 pub mod processor;
+#[cfg(feature = "connectors-pulsar")]
 pub mod pulsar;
 pub mod rate_limiter;
 pub mod retry;
+#[cfg(any(feature = "connectors-sql", feature = "ai-vector"))]
 pub mod sql_ident;
 pub mod temporary;
 pub mod time;
 pub mod udf;
+#[cfg(feature = "ai-vector")]
 pub mod vector_util;
 pub mod wal;
 
@@ -119,6 +126,9 @@ pub(crate) fn init_steps(
 /// every already-registered kind short-circuits through its own success
 /// latch, and the retry resumes at the first failed kind.
 pub fn initialize() -> Result<(), Error> {
+    // Feature hints must precede the kind registrations: they tell a
+    // minimal build *why* a gated type is unknown, not just that it is.
+    feature_hints::register()?;
     input::init()?;
     output::init()?;
     processor::init()?;

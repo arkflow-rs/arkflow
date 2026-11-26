@@ -88,6 +88,78 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+  # Reduced feature-set builds (add-cargo-feature-gating). The default
+  # all-families combination is covered by the clippy and build-and-test jobs
+  # above, which run the full test suite — the full-inventory gate tests are
+  # bound to the default feature set on purpose (they would report spurious
+  # drift on a reduced build). Per-package `-p` selections are not style:
+  # cargo only applies --no-default-features/-F to a single-package
+  # selection, so a workspace-wide invocation would silently re-enable the
+  # plugin's default families. `--all-targets` is equally deliberate: the
+  # broker integration tests link gated crates directly and only exist in
+  # the default build.
+  feature-matrix:
+    name: Feature Matrix (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "engine-minimal"
+          - "engine-minimal,connectors-kafka"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install system dependencies (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+
+      - name: Set PROTOC Environment Variable
+        run: echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      - name: Check and lint (libs + bins)
+        run: |
+          for pkg in arkflow-plugin arkflow-server arkflow; do
+            cargo check --locked -p "$pkg" --no-default-features --features "${{ matrix.features }}"
+            cargo clippy --locked -p "$pkg" --no-default-features --features "${{ matrix.features }}" -- -D warnings
+          done
+
+      - name: Core engine tests
+        run: cargo test --locked -p arkflow-core
+
+      # Structural guard for the minimal build: none of the gated dependency
+      # families may appear in the binary's dependency graph. rdkafka joins
+      # the allowed set only when the kafka family itself is enabled.
+      - name: Minimal tree excludes gated dependency families
+        run: |
+          FORBIDDEN='pyo3 v|spiceai_duckdb_fork|ballista|mongodb v|pulsar v|rumqttc|async-nats|tokio-tungstenite|tokio-modbus|prost-reflect|protox|hdfs-native-object-store|vrl v'
+          if [ "${{ matrix.features }}" = "engine-minimal" ]; then
+            FORBIDDEN="$FORBIDDEN|rdkafka"
+          fi
+          if cargo tree -p arkflow --no-default-features --features "${{ matrix.features }}" | grep -E "$FORBIDDEN"; then
+            echo "::error::reduced-feature build still contains gated dependencies"
+            exit 1
+          fi
+          echo "dependency tree is clean for: ${{ matrix.features }}"
+
   build-and-test:
     name: Build and Test (fast)
     runs-on: ubuntu-latest

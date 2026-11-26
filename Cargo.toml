@@ -97,8 +97,11 @@ redb = "5"
 object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 bytes = "1"
 arkflow-core = { path = "crates/arkflow-core", version = "0.6.0" }
-arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.6.0" }
-arkflow-server = { path = "crates/arkflow-server", version = "0.6.0" }
+# default-features = false: member crates forward the family features
+# explicitly in their own [features].default (see crates/arkflow/Cargo.toml);
+# a plain dependency edge must not silently re-enable the full plugin.
+arkflow-plugin = { path = "crates/arkflow-plugin", version = "0.6.0", default-features = false }
+arkflow-server = { path = "crates/arkflow-server", version = "0.6.0", default-features = false }
 
 [profile.release]
 codegen-units = 1

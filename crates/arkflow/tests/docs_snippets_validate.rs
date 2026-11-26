@@ -32,6 +32,24 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+/// Guard: this test asserts the FULL component inventory (registry,
+/// metadata, schemas, examples) and therefore only makes sense in a default
+/// all-families build. Under a reduced feature set it would report spurious
+/// drift, so refuse loudly with the fix instead (spec:
+/// `build-feature-gating`, generated-artifacts determinism).
+fn require_default_features() {
+    // `if`+`panic!` rather than `assert!`: under a default build the cfg!
+    // folds to a constant and clippy::assertions_on_constants would deny
+    // assert! with a constant condition.
+    if !cfg!(feature = "connectors-kafka") {
+        panic!(
+            "this gate asserts the full component inventory and must run with the \
+             default (all families) feature set; rebuild without --no-default-features \
+             (see the add-cargo-feature-gating change)"
+        );
+    }
+}
+
 /// Classifications accepted by this test and by `docs/scripts/docs-check.mjs`.
 const CLASSIFICATIONS: &[&str] = &["full", "fragment", "foreign"];
 /// Wrap kinds accepted for `validate=fragment` by both gates.
@@ -493,6 +511,7 @@ async fn docs_yaml_snippets_validate() {
 /// rejects. The sets are parsed out of the Node source to fail loudly.
 #[test]
 fn node_gate_vocabulary_is_in_sync() {
+    require_default_features();
     let source = std::fs::read_to_string(repo_root().join("docs/scripts/docs-check.mjs"))
         .expect("docs-check.mjs is readable");
 
