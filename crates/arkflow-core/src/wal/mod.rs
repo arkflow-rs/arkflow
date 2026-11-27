@@ -1128,7 +1128,7 @@ impl Wal {
         };
 
         match pending {
-            Some(PendingUndo::Removed) => return Ok(()),
+            Some(PendingUndo::Removed) => Ok(()),
             Some(PendingUndo::Retry(source_ack)) => {
                 if let Err(error) = source_ack.abort().await {
                     if let Some(entry) = self.acknowledgements.lock().await.get_mut(&seq) {
@@ -1154,7 +1154,7 @@ impl Wal {
                 }
                 self.acknowledgements.lock().await.remove(&seq);
                 self.ack_notify.notify_waiters();
-                return Ok(());
+                Ok(())
             }
             Some(PendingUndo::Committed(start_stage)) => {
                 // Drive compensation in a detached task so cancelling the caller
