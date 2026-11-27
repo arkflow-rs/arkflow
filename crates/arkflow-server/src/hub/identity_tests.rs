@@ -1256,4 +1256,30 @@ async fn stale_authorization_session_is_rejected_and_federated_admission_seriali
             }]
         );
     }
+
+    // 3. Concurrent `admit_federated_session` (for an older-`iat` token) vs
+    //    `revoke_user_tokens` is also serialized: either admission wins first
+    //    and `revoke_user_tokens` deletes the session, or `revoke_user_tokens`
+    //    wins first and admission sees the bumped `tokens_valid_after_ms` and
+    //    denies. Neither order leaves a surviving session.
+    let mut restored = hub.user("alice").await.unwrap().unwrap();
+    restored.tokens_valid_after_ms = 0;
+    hub.save_user(restored, "admin").await.unwrap();
+    let old_iat = super::now_ms().saturating_sub(120_000);
+    let claims = OperatorPrincipal {
+        id: "sub-alice".into(),
+        roles: vec![OperatorRole::Viewer],
+        scopes: Vec::new(),
+    };
+    let (admission, revoke_res) = tokio::join!(
+        hub.admit_federated_session(claims, Some(old_iat), true),
+        hub.revoke_user_tokens("alice", "admin"),
+    );
+    revoke_res.unwrap();
+    if let FederatedSessionAdmission::Created(session_id) = admission {
+        assert!(
+            hub.resolve_session(&session_id).await.is_none(),
+            "concurrent revoke_user_tokens must revoke any session created before the bump"
+        );
+    }
 }

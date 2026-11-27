@@ -368,21 +368,25 @@ impl Hub {
     pub async fn revoke_user_tokens(&self, user_id: &str, actor: &str) -> Result<usize, HubError> {
         let storage = self.identity_storage()?.clone();
         let now = now_ms();
-        let user = storage
-            .bump_user_tokens_valid_after(user_id, now)
-            .await
-            .map_err(HubError::from)?
-            .ok_or(HubError::NotFound)?;
-        let mut removed = storage
-            .delete_user_sessions(user_id)
-            .await
-            .map_err(HubError::from)?;
-        if let Some(subject) = user.oidc_subject.as_deref() {
-            removed += storage
-                .delete_sessions_by_oidc_subject(subject)
+        let (user, removed) = {
+            let _write_guard = self.identity_write_lock.lock().await;
+            let user = storage
+                .bump_user_tokens_valid_after(user_id, now)
+                .await
+                .map_err(HubError::from)?
+                .ok_or(HubError::NotFound)?;
+            let mut removed = storage
+                .delete_user_sessions(user_id)
                 .await
                 .map_err(HubError::from)?;
-        }
+            if let Some(subject) = user.oidc_subject.as_deref() {
+                removed += storage
+                    .delete_sessions_by_oidc_subject(subject)
+                    .await
+                    .map_err(HubError::from)?;
+            }
+            (user, removed)
+        };
         self.record_identity_audit(
             "user.revoke_tokens",
             actor,
