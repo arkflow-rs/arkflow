@@ -284,3 +284,155 @@ async fn approval_flow_over_http_end_to_end() {
         .unwrap_or_default()
         .contains("not found"));
 }
+
+/// Locks the decided segregation policy (`configuration-approval` threat model):
+/// 1. Direct self-approval by the submitting admin is rejected (`422`).
+/// 2. Because `admin` holds both `ManageUsers` and `ApproveRollouts`, a second
+///    distinct admin principal is authorized to approve, and every step in the
+///    chain (`user.create`, `credential.create`, `config_approval.submit`,
+///    `config_approval.approve`) is attributed to its real actor in the audit
+///    trail so external audit review detects admin self-collusion.
+#[tokio::test]
+async fn approval_segregation_rejects_self_approval_and_audits_distinct_admin_chain() {
+    let store =
+        crate::storage::ControlPlaneStore::contract("approval_segregation_threat_model").await;
+    let storage = crate::storage::StorageActor::start(store, 8);
+    let hub = hub::Hub::with_storage(
+        hub::HubConfig {
+            operator_token: Some("bootstrap|admin|bootstrap-secret".into()),
+            node_token: Some("node-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 100,
+            session_ttl_ms: hub::default_session_ttl_ms(),
+            approval_required: true,
+            approval_ttl_ms: hub::default_approval_ttl_ms(),
+        },
+        storage,
+    );
+    hub.register(hub::RegisterRequest {
+        data_address: None,
+        node_id: "node-a".into(),
+        node_token: "node-secret".into(),
+        protocol_version: "v1".into(),
+        capabilities: vec![],
+        boot_id: None,
+    })
+    .await
+    .unwrap();
+    hub.create_rollout_with_content(
+        "cfg-seg-1".into(),
+        "{\"streams\":[]}".into(),
+        vec!["node-a".into()],
+        1,
+        Some("seeder".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+
+    // Bootstrap creates admin-a and issues its credential.
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/users",
+        "bootstrap-secret",
+        serde_json::json!({"user_id": "admin-a", "role": "admin"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, issued_a) = post_json(
+        &app,
+        "/api/v1/users/admin-a/credentials",
+        "bootstrap-secret",
+        serde_json::json!({"label": "a"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token_a = issued_a["token"].as_str().unwrap().to_string();
+
+    // admin-a submits an approval request and attempts to self-approve -> 422.
+    let (status, submitted) = post_json(
+        &app,
+        "/api/v1/config-approvals",
+        &token_a,
+        serde_json::json!({
+            "config_version": "cfg-seg-1",
+            "node_ids": ["node-a"],
+            "batch_size": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{submitted}");
+    let request_id = submitted["request_id"].as_str().unwrap().to_string();
+
+    let (status, denied) = post_json(
+        &app,
+        &format!("/api/v1/config-approvals/{request_id}/decide"),
+        &token_a,
+        serde_json::json!({"decision": "approve"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+    assert!(
+        denied["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("second principal"),
+        "self-approval must cite the segregation rule: {denied}"
+    );
+
+    // admin-a creates admin-b and issues a credential; admin-b approves as a
+    // distinct principal. The entire chain stays visible in the audit trail.
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/users",
+        &token_a,
+        serde_json::json!({"user_id": "admin-b", "role": "admin"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, issued_b) = post_json(
+        &app,
+        "/api/v1/users/admin-b/credentials",
+        &token_a,
+        serde_json::json!({"label": "b"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token_b = issued_b["token"].as_str().unwrap().to_string();
+
+    let (status, decided) = post_json(
+        &app,
+        &format!("/api/v1/config-approvals/{request_id}/decide"),
+        &token_b,
+        serde_json::json!({"decision": "approve"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{decided}");
+    assert_eq!(decided["status"], "approved");
+    assert_eq!(decided["requester_id"], "admin-a");
+    assert_eq!(decided["approver_id"], "admin-b");
+
+    let audit = hub.audit(None).await.unwrap();
+    assert!(audit.iter().any(|row| {
+        row.action == "user.create"
+            && row.actor.as_deref() == Some("admin-a")
+            && row.resource_id.as_deref() == Some("admin-b")
+    }));
+    assert!(audit.iter().any(|row| {
+        row.action == "credential.create"
+            && row.actor.as_deref() == Some("admin-a")
+            && row.resource_id.as_deref() == Some("admin-b")
+    }));
+    assert!(audit.iter().any(|row| {
+        row.action == "config_approval.submit"
+            && row.actor.as_deref() == Some("admin-a")
+            && row.resource_id.as_deref() == Some(request_id.as_str())
+    }));
+    assert!(audit.iter().any(|row| {
+        row.action == "config_approval.approve"
+            && row.actor.as_deref() == Some("admin-b")
+            && row.resource_id.as_deref() == Some(request_id.as_str())
+    }));
+}

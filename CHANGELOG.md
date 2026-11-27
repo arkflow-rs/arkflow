@@ -66,6 +66,38 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resource scope (admin/viewer allowed; operator returns `403`). Queries
   support exact `actor`/`action` filters and inclusive `from_ms`/`to_ms`
   bounds before pagination; inverted ranges return `400 invalid_audit_query`.
+- Hardened control-plane audit, identity writes, and OIDC session revocation
+  (`harden-identity-and-audit`):
+  - Standalone audit write failures routed through `Hub::record_audit_event_for`
+    / `record_audit_best_effort` against a configured durable store are no
+    longer silently dropped: they emit a structured `tracing::warn!` (scalar
+    metadata only) and increment the closed-label Prometheus counter
+    `arkflow_audit_write_failures_total{category}` (`auth_denial`, `identity`,
+    `job`, `approval`, `rollout`, `node`, `other`), while security denials
+    still return `401`/`403`. (Transactional audit rows embedded inside a
+    mutation transaction such as `replace_node_labels` already roll back and
+    fail the mutation directly rather than dropping silently; volatile Hubs
+    without durable storage do not count missing storage as a failure.)
+  - `POST /api/v1/users` (`Hub::create_user`) now serializes against
+    `identity_write_lock` and persists with insert-only SQL (`INSERT INTO
+    cp_users` without `ON CONFLICT DO UPDATE`) on both SQLite and PostgreSQL,
+    returning `409 Conflict` (`user_already_exists`) instead of silently
+    overwriting or answering `400` on duplicate `user_id`.
+  - Unbound OIDC browser sessions (`cp_sessions.user_id IS NULL`) are now
+    revoked atomically inside the same storage transaction as user creation,
+    update (bind/rebind/unbind/disable/role/scopes), and deletion — and by
+    `revoke_user_tokens` — eliminating partial-commit windows; federated login
+    admission (`Hub::admit_federated_session`) is serialized against identity
+    writes via `identity_write_lock`, `resolve_session` fails closed on read
+    for bound sessions whose role/scopes drifted from `cp_users` as well as
+    unbound sessions whose subject is now bound or when `managed_users_only`
+    is enabled, and OIDC callback login no longer mis-associates an unbound
+    subject with an unrelated local `user_id` of the same string.
+  - Documented the configuration-approval segregation threat model
+    (two-principal four-eyes review; the Hub does not prevent static, managed,
+    or OIDC `admin` principals holding `ManageUsers` from creating local
+    identities, so admin-collusion detection relies on external review of the
+    actor-attributed audit trail).
 - Job operation audits carry the authenticated principal for direct operator
   dispatches, including dispatches deferred until a target reconnects;
   operations with no originating request use `system`. Optional operation actor

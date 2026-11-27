@@ -64,8 +64,9 @@ impl Hub {
             .create_rollout(rollout.clone(), targets)
             .await
             .map_err(HubError::from)?;
-        storage
-            .record_audit(crate::storage::AuditRecord {
+        self.record_audit_event_for(
+            "rollout",
+            crate::storage::AuditRecord {
                 event_id: 0,
                 actor,
                 action: "rollout.create".into(),
@@ -78,9 +79,9 @@ impl Hub {
                 failure_code: None,
                 message: None,
                 occurred_at_ms: now,
-            })
-            .await
-            .map_err(HubError::from)?;
+            },
+        )
+        .await?;
         self.rollouts
             .write()
             .await
@@ -131,8 +132,9 @@ impl Hub {
             .create_rollout_with_content(rollout.clone(), targets, content, actor.clone())
             .await
             .map_err(HubError::from)?;
-        storage
-            .record_audit(crate::storage::AuditRecord {
+        self.record_audit_event_for(
+            "rollout",
+            crate::storage::AuditRecord {
                 event_id: 0,
                 actor,
                 action: "rollout.create".into(),
@@ -145,9 +147,9 @@ impl Hub {
                 failure_code: None,
                 message: None,
                 occurred_at_ms: now,
-            })
-            .await
-            .map_err(HubError::from)?;
+            },
+        )
+        .await?;
         self.rollouts
             .write()
             .await
@@ -401,9 +403,9 @@ impl Hub {
         outcome: &str,
         message: Option<String>,
     ) -> Result<(), HubError> {
-        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
-        storage
-            .record_audit(crate::storage::AuditRecord {
+        self.record_audit_event_for(
+            "rollout",
+            crate::storage::AuditRecord {
                 event_id: 0,
                 actor,
                 action: action.into(),
@@ -416,10 +418,10 @@ impl Hub {
                 failure_code: None,
                 message: message.map(|value| value.chars().take(256).collect()),
                 occurred_at_ms: now_ms(),
-            })
-            .await
-            .map(|_| ())
-            .map_err(HubError::from)
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn reconcile_rollouts(&self) -> Result<usize, HubError> {

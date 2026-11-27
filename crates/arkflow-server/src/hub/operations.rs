@@ -361,8 +361,9 @@ impl Hub {
                 )
                 .await;
             } else {
-                let _ = self
-                    .record_audit_event(crate::storage::AuditRecord {
+                self.record_audit_best_effort(
+                    "other",
+                    crate::storage::AuditRecord {
                         event_id: 0,
                         actor: None,
                         action: "command.dispatch".into(),
@@ -375,8 +376,9 @@ impl Hub {
                         failure_code: Some("incompatible_capability".into()),
                         message: Some(message.clone()),
                         occurred_at_ms: now,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             return Err(HubError::Invalid(message));
         }

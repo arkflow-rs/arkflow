@@ -50,6 +50,7 @@ mod tests;
 
 pub use command_metrics::CommandMetrics;
 pub use error::HubError;
+pub(crate) use identity::FederatedSessionAdmission;
 pub use leadership::{HubHaConfig, Leadership};
 pub use nodes::{parse_label_term, validate_labels};
 pub use webhooks::{run_webhook_forwarder, WebhookTestOutcome, WEBHOOK_LIMIT};

@@ -61,6 +61,16 @@ Hub 重启时,持久化的 Intent 与 outbox 行会被恢复。排队的工作�
 回滚仅在目标版本曾应用到受影响节点时豁免:回滚到一个从未应用过的版本
 属于新内容借道回滚路径,会被拒绝。
 
+**职责分离威胁模型**：该闸门实施双主体四眼复核(`approver_id != requester_id`，
+且 `ApproveRollouts` 仅授予 `admin` 角色)，用于防止误操作自批与 operator 角色越权
+自批。由于 `admin` 角色同时持有 `ManageUsers` 与 `ApproveRollouts`(且静态
+`ARKFLOW_OPERATOR_TOKEN` 为应急超级凭据)，Hub **不在软件层面阻止任何来源的恶意
+admin(包括静态凭据、托管目录或 OIDC 认证的 admin)自建本地用户与凭证以自批**。对
+恶意 admin 合谋的发现依赖于对带真实 actor 审计轨迹(`user.create`、
+`credential.create`、`config_approval.submit`、`config_approval.approve`)的外
+部审阅与告警；若需限制本地用户/凭证签发，须由运维方通过外部制度与控制落实，而不
+是 Hub 提供的软件保证。
+
 由此带来两条运维要求。单条静态 operator 凭据只解析出一个身份,因此
 **无法批准自己的提交**——在单身份部署上开启该策略会冻结发布(Hub 启动
 时检测到会输出告警)。开启闸门前请准备至少两个 operator 身份(结构化

@@ -20,6 +20,8 @@ pub struct CommandMetrics {
     pause_outcomes: std::sync::Mutex<BTreeMap<String, u64>>,
     /// Operator authentication outcomes by source (closed vocabulary).
     auth_outcomes: std::sync::Mutex<BTreeMap<(String, String), u64>>,
+    /// Failed audit persistence attempts by category (closed vocabulary).
+    audit_write_failures: std::sync::Mutex<BTreeMap<String, u64>>,
 }
 
 /// Closed label set for the pause outcome counter.
@@ -29,6 +31,17 @@ pub(crate) const PAUSE_OUTCOMES: &[&str] =
 /// Closed label sets for the operator-authentication counter.
 pub(crate) const AUTH_SOURCES: &[&str] = &["static", "managed", "oidc", "session", "anonymous"];
 pub(crate) const AUTH_OUTCOMES: &[&str] = &["ok", "denied"];
+
+/// Closed label set for the audit write failure counter.
+pub(crate) const AUDIT_FAILURE_CATEGORIES: &[&str] = &[
+    "auth_denial",
+    "identity",
+    "job",
+    "approval",
+    "rollout",
+    "node",
+    "other",
+];
 
 #[derive(Default)]
 struct CommandLatency {
@@ -155,6 +168,15 @@ impl CommandMetrics {
                 }
             }
         }
+        if let Ok(failures) = self.audit_write_failures.lock() {
+            for category in AUDIT_FAILURE_CATEGORIES {
+                if let Some(total) = failures.get(*category) {
+                    body.push_str(&format!(
+                        "arkflow_audit_write_failures_total{{category=\"{category}\"}} {total}\n"
+                    ));
+                }
+            }
+        }
         body
     }
 
@@ -179,6 +201,20 @@ impl CommandMetrics {
         }
         if let Ok(mut outcomes) = self.pause_outcomes.lock() {
             *outcomes.entry(outcome.to_owned()).or_insert(0) += 1;
+        }
+    }
+
+    /// Record a failed control-plane audit write against a configured durable
+    /// store; unknown categories collapse into `other` so the series space
+    /// stays closed.
+    pub(crate) fn record_audit_write_failure(&self, category: &str) {
+        let label = if AUDIT_FAILURE_CATEGORIES.contains(&category) {
+            category
+        } else {
+            "other"
+        };
+        if let Ok(mut failures) = self.audit_write_failures.lock() {
+            *failures.entry(label.to_owned()).or_insert(0) += 1;
         }
     }
 }

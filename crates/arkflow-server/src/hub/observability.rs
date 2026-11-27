@@ -283,8 +283,51 @@ impl Hub {
         &self,
         record: crate::storage::AuditRecord,
     ) -> Result<i64, HubError> {
+        self.record_audit_event_for("other", record).await
+    }
+
+    /// Persist an audit event and account for any durable-store failure with a
+    /// closed-label metric and structured warning log (never credentials).
+    /// A volatile Hub (`storage == None`) returns `StorageUnavailable` without
+    /// incrementing the failure counter.
+    pub(crate) async fn record_audit_event_for(
+        &self,
+        category: &str,
+        record: crate::storage::AuditRecord,
+    ) -> Result<i64, HubError> {
         let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
-        storage.record_audit(record).await.map_err(HubError::from)
+        let action = record.action.clone();
+        let resource_type = record.resource_type.clone();
+        let outcome = record.outcome.clone();
+        storage.record_audit(record).await.map_err(|error| {
+            self.command_metrics.record_audit_write_failure(category);
+            tracing::warn!(
+                category,
+                action = %action,
+                resource_type = %resource_type,
+                outcome = %outcome,
+                %error,
+                "control-plane audit write failed"
+            );
+            HubError::from(error)
+        })
+    }
+
+    /// Best-effort audit persistence for paths whose primary response must not
+    /// be altered by audit-store outages (for example `401`/`403` denials or
+    /// already-committed mutations). On a Hub with durable storage, failures
+    /// are never silent: they increment `arkflow_audit_write_failures_total`
+    /// and emit a warning log. Volatile Hubs without durable storage have no
+    /// audit store by design and return quietly.
+    pub(crate) async fn record_audit_best_effort(
+        &self,
+        category: &str,
+        record: crate::storage::AuditRecord,
+    ) {
+        if self.storage.is_none() {
+            return;
+        }
+        let _ = self.record_audit_event_for(category, record).await;
     }
 
     /// Audit action name for a dispatched operation: `job_start` becomes
@@ -299,7 +342,8 @@ impl Hub {
     /// Record the acceptance or rejection of a Job lifecycle operation.
     /// The message carries scalar operation metadata only — never the Job
     /// spec or configuration body (`control-plane-identity` MUST NOT).
-    /// Best effort: audit failures never fail the mutation itself.
+    /// Best effort: audit failures never fail the mutation itself, but are
+    /// counted and logged when durable storage is configured.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_job_operation_audit(
         &self,
@@ -329,7 +373,7 @@ impl Hub {
             message: Some(message),
             occurred_at_ms: now_ms(),
         };
-        let _ = self.record_audit_event(record).await;
+        self.record_audit_best_effort("job", record).await;
     }
 
     pub async fn prune_events(&self, retain: usize) -> Result<usize, HubError> {

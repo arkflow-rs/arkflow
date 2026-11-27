@@ -288,8 +288,9 @@ impl Hub {
         }
         if request.protocol_version != SUPPORTED_PROTOCOL_VERSION {
             let message = format!("unsupported protocol version: {}", request.protocol_version);
-            let _ = self
-                .record_audit_event(crate::storage::AuditRecord {
+            self.record_audit_best_effort(
+                "node",
+                crate::storage::AuditRecord {
                     event_id: 0,
                     actor: None,
                     action: "agent.register".into(),
@@ -302,8 +303,9 @@ impl Hub {
                     failure_code: Some("incompatible_protocol".into()),
                     message: Some(message.clone()),
                     occurred_at_ms: now_ms(),
-                })
-                .await;
+                },
+            )
+            .await;
             return Err(HubError::Invalid(message));
         }
         let now = now_ms();

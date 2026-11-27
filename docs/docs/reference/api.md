@@ -502,7 +502,10 @@ Behavioral invariants:
   `credential.rotate`, and `credential.revoke`, with scalar metadata only.
   A rejection writes the same action with `outcome=rejected`, the real actor,
   and the stable problem code as `failure_code` (for example
-  `last_admin_required`, `credential_limit`, `user_not_found`).
+  `last_admin_required`, `user_already_exists`, `credential_limit`,
+  `user_not_found`). Standalone audit persistence failures against a configured
+  durable store increment `arkflow_audit_write_failures_total{category}` on
+  `/metrics` and emit a warning log rather than failing silently.
 
 | Status | Code | When |
 |--------|------|------|
@@ -510,6 +513,7 @@ Behavioral invariants:
 | `400` | `invalid_credential` | Rotating an already-revoked credential. |
 | `403` | `forbidden` | Authenticated principal without `manage_users`. |
 | `404` | `user_not_found` / `credential_not_found` | Unknown user or credential — including a credentials listing for a user that does not exist. |
+| `409` | `user_already_exists` | Creating a user whose `user_id` already exists. |
 | `409` | `last_admin_required` | The last enabled admin would be disabled, deleted, or demoted with no static break-glass credential. |
 | `409` | `user_limit` / `credential_limit` | 1024 users exist / the user has 16 active credentials. |
 | `409` | `oidc_subject_conflict` | The OIDC subject is already bound to another user. |
@@ -539,10 +543,11 @@ through approval requests instead:
 
 Approval creates the rollout with the approver as actor; a rollback is
 exempt only when its target version was previously applied to the affected
-nodes.
+nodes. Segregation enforces two-principal four-eyes review rather than
+anti-collusion against a malicious admin holding `ManageUsers`.
 
 See [Reconciliation rollout and recovery](../operate/control-plane/reconciliation.md)
-for the state machine behind these routes.
+for the state machine and threat model behind these routes.
 
 ### Login sessions (OIDC)
 

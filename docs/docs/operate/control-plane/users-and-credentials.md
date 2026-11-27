@@ -167,10 +167,15 @@ deletes every stored browser session for that user. It returns
 are individually revocable and rotatable, so revoke or rotate them
 individually.
 
-Disabling a user, deleting a user, and `revoke-tokens` all take effect
-immediately: sessions resolve through the directory on every request, so there
-is no cache to flush. Deleting a user also deletes its credentials and
-sessions.
+Disabling a user, deleting a user, changing its OIDC subject binding, and
+`revoke-tokens` all take effect immediately: sessions resolve through the
+directory on every request, so there is no cache to flush. Binding an OIDC
+subject to a directory user (on `POST /api/v1/users` or `PATCH /api/v1/users/{id}`)
+also immediately revokes any pre-existing unbound browser sessions minted for
+that subject before it was bound, and session resolution fails closed for any
+unbound session whose subject is now bound (or when
+`ARKFLOW_OIDC_MANAGED_USERS_ONLY=true`). Deleting a user also deletes its
+credentials and both bound and unbound sessions for its subject.
 
 ## Browser session persistence
 
@@ -180,9 +185,9 @@ persisted, which changes the operational story from earlier releases:
 
 - **Restart survival**: a Hub restart no longer signs everyone out; the cookie
   keeps working against the same store.
-- **Central revocation**: logout deletes the session row; disabling/deleting
-  the user or calling `revoke-tokens` invalidates the user's sessions on their
-  next request.
+- **Central revocation**: logout deletes the session row; binding/changing an
+  OIDC subject, disabling/deleting the user, or calling `revoke-tokens`
+  invalidates both bound and previously unbound sessions on their next request.
 - **Maintenance**: the Hub's periodic maintenance task prunes expired and
   revoked session rows, so the table stays bounded.
 - **HA**: multiple Hub instances sharing one database share the session table;
@@ -230,12 +235,16 @@ these records:
 Rejected mutations are audited too: the same action is written with
 `outcome=rejected`, the real actor, the target user/credential, and the stable
 problem code as `failure_code` (for example `last_admin_required`,
-`credential_limit`, `user_not_found`, `oidc_subject_conflict`). A mutation that
-fails before reaching the identity store — validation errors such as an
-invalid user id or an unknown role — is also recorded as rejected. Authorization
-denials (missing credential, or a principal without `manage_users`) are
-audited by the generic authorization rejection path instead. Query the trail
-at `GET /api/v1/audit`.
+`user_already_exists`, `credential_limit`, `user_not_found`,
+`oidc_subject_conflict`). A mutation that fails before reaching the identity
+store — validation errors such as an invalid user id or an unknown role — is
+also recorded as rejected. Authorization denials (missing credential, or a
+principal without `manage_users`) are audited by the generic authorization
+rejection path instead. When a Hub with durable storage fails to persist a
+standalone audit record, the failure is never silent: it logs a warning (scalar
+metadata only) and increments `arkflow_audit_write_failures_total{category}` on
+`/api/v1/metrics`, while security denials still return `401`/`403`. Query the
+trail at `GET /api/v1/audit`.
 
 ## Error codes
 
@@ -246,6 +255,7 @@ at `GET /api/v1/audit`.
 | `401` | `unauthorized` | No valid credential. |
 | `403` | `forbidden` | Authenticated, but the principal lacks `manage_users` (only admin holds it). |
 | `404` | `user_not_found` / `credential_not_found` | Unknown user or credential — including a credentials listing for a user that does not exist. |
+| `409` | `user_already_exists` | Creating a user whose `user_id` already exists (enforced atomically by insert-only storage). |
 | `409` | `last_admin_required` | The last enabled admin would be disabled, deleted, or demoted while no static operator credential exists. |
 | `409` | `user_limit` | 1024 users already exist. |
 | `409` | `credential_limit` | The user already has 16 active credentials. |

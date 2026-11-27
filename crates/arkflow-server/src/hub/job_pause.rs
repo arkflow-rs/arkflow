@@ -76,11 +76,9 @@ impl Hub {
         failure_code: Option<&str>,
         message: String,
     ) {
-        let Some(storage) = self.storage.as_ref() else {
-            return;
-        };
-        let _ = storage
-            .record_audit(AuditRecord {
+        self.record_audit_best_effort(
+            "job",
+            AuditRecord {
                 event_id: 0,
                 actor: Some(actor.to_owned()),
                 action: action.to_owned(),
@@ -95,8 +93,9 @@ impl Hub {
                 failure_code: failure_code.map(str::to_owned),
                 message: Some(message),
                 occurred_at_ms: now_ms(),
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     fn broadcast_pause_event(

@@ -95,6 +95,19 @@ Rollback is exempt only when its target version was previously applied to
 the affected nodes: rolling back to a version that was never applied is new
 content riding the rollback path and is rejected.
 
+**Segregation threat model:** the gate enforces two-principal four-eyes review
+(`approver_id != requester_id`, with `ApproveRollouts` restricted to the
+`admin` role) to prevent accidental self-approval and operator self-promotion.
+Because the `admin` role holds both `ManageUsers` and `ApproveRollouts` (and
+static `ARKFLOW_OPERATOR_TOKEN` is break-glass), the Hub does **not** defend in
+software against a malicious admin — whether static, directory-managed, or
+OIDC-authenticated — creating a second local user and credential to
+self-approve. Detection relies on external review and alerting over the
+actor-attributed audit trail (`user.create`, `credential.create`,
+`config_approval.submit`, `config_approval.approve`). Any policy restricting
+local user/credential issuance must be enforced externally by operators rather
+than assumed as a Hub guarantee.
+
 Two operational requirements follow from the design. A single static
 operator credential resolves to one principal identity, so it **cannot
 approve its own submission** — enabling the policy on a one-identity

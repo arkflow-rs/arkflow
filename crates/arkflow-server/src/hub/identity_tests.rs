@@ -739,3 +739,556 @@ async fn postgres_identity_revocation_survives_failover_and_fences_stale_writes(
         .expect("drop isolated identity HA schema");
     eprintln!("PostgreSQL identity HA assertions completed; removed schema {schema}");
 }
+
+/// Concurrent creates for the same `user_id` must serialize cleanly: exactly
+/// one caller wins, the rest fail with `UserAlreadyExists`, and the stored
+/// record belongs to the winner without being overwritten.
+#[tokio::test]
+async fn concurrent_create_user_same_id_never_overwrites() {
+    let hub = identity_fixture("concurrent_create_user_same_id", false).await;
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let hub = hub.clone();
+        handles.push(tokio::spawn(async move {
+            let mut candidate = user("alice", if index % 2 == 0 { "viewer" } else { "operator" });
+            candidate.display_name = format!("winner-{index}");
+            hub.create_user(candidate, "admin").await
+        }));
+    }
+    let mut successes = Vec::new();
+    let mut conflicts = 0usize;
+    for handle in handles {
+        match handle.await.unwrap() {
+            Ok(created) => successes.push(created),
+            Err(super::error::HubError::UserAlreadyExists) => conflicts += 1,
+            Err(other) => panic!("expected UserAlreadyExists conflict, got {other:?}"),
+        }
+    }
+    assert_eq!(successes.len(), 1, "exactly one concurrent create must win");
+    assert_eq!(
+        conflicts, 7,
+        "all losing creates must get UserAlreadyExists"
+    );
+    let stored = hub.user("alice").await.unwrap().unwrap();
+    assert_eq!(stored.display_name, successes[0].display_name);
+    assert_eq!(stored.role, successes[0].role);
+}
+
+/// Unbound OIDC browser sessions (`user_id = None`) must stop working
+/// immediately when their subject is bound via `create_user` or `save_user`,
+/// disabled, deleted, or revoked — and an unbound OIDC `sub` colliding with an
+/// unrelated local `user_id` must not be mis-bound to that local user.
+#[tokio::test]
+async fn unbound_oidc_sessions_are_revoked_on_bind_disable_delete_and_revoke_tokens() {
+    use crate::api_contract::{OperatorPrincipal, OperatorRole};
+
+    let hub = identity_fixture("unbound_oidc_session_revocation", true).await;
+
+    // 1. Binding via `create_user` revokes existing unbound sessions for that subject.
+    let session_create = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "sub-bind-create".into(),
+                roles: vec![OperatorRole::Operator],
+                scopes: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(hub.resolve_session(&session_create).await.is_some());
+    let mut bound = user("alice", "viewer");
+    bound.oidc_subject = Some("sub-bind-create".into());
+    hub.create_user(bound, "admin").await.unwrap();
+    assert!(
+        hub.resolve_session(&session_create).await.is_none(),
+        "binding an OIDC subject in create_user must revoke existing unbound sessions"
+    );
+
+    // 2. Binding via `save_user` revokes existing unbound sessions for that subject.
+    let session_save = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "sub-bind-save".into(),
+                roles: vec![OperatorRole::Admin],
+                scopes: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    hub.create_user(user("bob", "viewer"), "admin")
+        .await
+        .unwrap();
+    assert!(hub.resolve_session(&session_save).await.is_some());
+    let mut bob = hub.user("bob").await.unwrap().unwrap();
+    bob.oidc_subject = Some("sub-bind-save".into());
+    hub.save_user(bob, "admin").await.unwrap();
+    assert!(
+        hub.resolve_session(&session_save).await.is_none(),
+        "binding an OIDC subject in save_user must revoke existing unbound sessions"
+    );
+
+    // 3. Even if an unbound session raced with bind, `resolve_session` fails
+    //    closed on read, and disabling / deleting / revoking removes the row.
+    let raced_session = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "sub-bind-save".into(),
+                roles: vec![OperatorRole::Admin],
+                scopes: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        hub.resolve_session(&raced_session).await.is_none(),
+        "read-side check must reject any unbound session whose subject is now bound"
+    );
+    // Deleting `bob` must delete that lingering unbound row too so it cannot
+    // resurrect after deletion.
+    hub.delete_user("bob", "admin").await.unwrap();
+    assert!(
+        hub.resolve_session(&raced_session).await.is_none(),
+        "deleting a bound user must delete unbound sessions for its subject so they cannot resurrect"
+    );
+
+    // 4. `revoke_user_tokens` deletes unbound sessions matching the user's subject.
+    let session_revoke = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "sub-bind-create".into(),
+                roles: vec![OperatorRole::Operator],
+                scopes: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let revoked_count = hub.revoke_user_tokens("alice", "admin").await.unwrap();
+    assert_eq!(revoked_count, 1);
+    assert!(hub.resolve_session(&session_revoke).await.is_none());
+
+    // 5. Disabling a bound user deletes its bound sessions and rejects them.
+    let bound_session = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "alice".into(),
+                roles: vec![OperatorRole::Viewer],
+                scopes: Vec::new(),
+            },
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    assert!(hub.resolve_session(&bound_session).await.is_some());
+    let mut alice = hub.user("alice").await.unwrap().unwrap();
+    alice.disabled = true;
+    hub.save_user(alice, "admin").await.unwrap();
+    assert!(hub.resolve_session(&bound_session).await.is_none());
+
+    // 6. An unbound OIDC subject whose `sub` happens to match an unrelated
+    //    local `user_id` (with `oidc_subject = None`) is NOT mis-bound to it.
+    hub.create_user(user("charlie", "viewer"), "admin")
+        .await
+        .unwrap();
+    let (resolved, bound_user_id) = hub
+        .apply_federated_directory_with_binding(
+            OperatorPrincipal {
+                id: "charlie".into(),
+                roles: vec![OperatorRole::Operator],
+                scopes: Vec::new(),
+            },
+            Some(super::now_ms()),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved.id, "charlie");
+    assert_eq!(
+        bound_user_id, None,
+        "unbound OIDC subject must not be treated as a bound local user"
+    );
+}
+
+/// Audit persistence failures against a configured durable store must never be
+/// silent: best-effort identity/auth audit helpers increment the closed-label
+/// counter and emit a structured warning log (scalar metadata only), while
+/// volatile Hubs without durable storage do not.
+#[tokio::test]
+async fn audit_write_failures_are_counted_without_affecting_volatile_hubs() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+    struct BufferGuard(Arc<Mutex<Vec<u8>>>);
+    impl Write for BufferGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
+        type Writer = BufferGuard;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferGuard(self.0.clone())
+        }
+    }
+
+    let backend = crate::storage::SqliteBackend::in_memory().unwrap();
+    backend
+        .with_connection(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER inject_audit_failure BEFORE INSERT ON cp_audit_events \
+                 BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let hub = Hub::with_storage(
+        config(true),
+        StorageActor::start(ControlPlaneStore::Sqlite(backend), 8),
+    );
+
+    let writer = BufferWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(writer.clone())
+        .finish();
+
+    // Creating a user succeeds, while its best-effort identity audit fails,
+    // increments `category="identity"`, and logs a warning without secrets.
+    hub.create_user(user("alice", "viewer"), "admin")
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    let metrics = hub.command_metrics().render();
+    assert!(
+        metrics.contains("arkflow_audit_write_failures_total{category=\"identity\"} 1"),
+        "identity audit write failure must be counted: {metrics}"
+    );
+    let logs = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("control-plane audit write failed")
+            && logs.contains("category=\"identity\"")
+            && logs.contains("action=user.create"),
+        "audit write failure must emit structured warn log: {logs}"
+    );
+    assert!(
+        !logs.contains("break-glass"),
+        "audit failure log must never leak credentials: {logs}"
+    );
+
+    // A volatile Hub has no audit store by design and must not count failures.
+    let volatile = Hub::new(config(true));
+    volatile
+        .record_audit_best_effort(
+            "auth_denial",
+            crate::storage::AuditRecord {
+                event_id: 0,
+                actor: None,
+                action: "operator.read".into(),
+                resource_type: "user".into(),
+                resource_id: None,
+                node_id: None,
+                stream_id: None,
+                correlation_id: None,
+                outcome: "rejected".into(),
+                failure_code: Some("unauthorized".into()),
+                message: None,
+                occurred_at_ms: super::now_ms(),
+            },
+        )
+        .await;
+    assert!(
+        !volatile
+            .command_metrics()
+            .render()
+            .contains("arkflow_audit_write_failures_total"),
+        "volatile Hub must not emit audit write failure counters"
+    );
+}
+
+/// If session deletion fails during `create_user` or `save_user`, the user
+/// row mutation must roll back in the same transaction so a partial commit can
+/// never leave stale sessions valid or blind a subsequent retry.
+#[tokio::test]
+async fn identity_write_and_session_revocation_roll_back_atomically() {
+    use crate::api_contract::{OperatorPrincipal, OperatorRole};
+
+    let backend = crate::storage::SqliteBackend::in_memory().unwrap();
+    let store = ControlPlaneStore::Sqlite(backend.clone());
+    let hub = Hub::with_storage(config(true), StorageActor::start(store, 8));
+
+    // Seed an existing bound user + bound session, and an unbound OIDC session
+    // for a subject that will be bound via `create_user`.
+    let mut alice = user("alice", "operator");
+    alice.oidc_subject = Some("sub-a".into());
+    hub.create_user(alice, "admin").await.unwrap();
+    let alice_session = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "alice".into(),
+                roles: vec![OperatorRole::Operator],
+                scopes: Vec::new(),
+            },
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    let bob_unbound_session = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "sub-bob".into(),
+                roles: vec![OperatorRole::Operator],
+                scopes: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Inject a failure on any `DELETE FROM cp_sessions`.
+    backend
+        .with_connection(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER fail_session_delete BEFORE DELETE ON cp_sessions \
+                 BEGIN SELECT RAISE(ABORT, 'injected session delete failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // 1. `save_user` changing subject + role fails AND rolls back `cp_users`.
+    let mut updated_alice = hub.user("alice").await.unwrap().unwrap();
+    updated_alice.oidc_subject = Some("sub-b".into());
+    updated_alice.role = "viewer".into();
+    assert!(
+        hub.save_user(updated_alice.clone(), "admin").await.is_err(),
+        "save_user must fail when session revocation fails"
+    );
+    let stored_alice = hub.user("alice").await.unwrap().unwrap();
+    assert_eq!(
+        stored_alice.oidc_subject.as_deref(),
+        Some("sub-a"),
+        "failed session revocation must roll back the oidc_subject update"
+    );
+    assert_eq!(
+        stored_alice.role, "operator",
+        "failed session revocation must roll back the role update"
+    );
+
+    // 2. `create_user` with a bound OIDC subject fails AND rolls back the insert
+    //    (so no committed user is left without an accepted audit record).
+    let mut bob = user("bob", "viewer");
+    bob.oidc_subject = Some("sub-bob".into());
+    assert!(
+        hub.create_user(bob.clone(), "admin").await.is_err(),
+        "create_user must fail when unbound session cleanup fails"
+    );
+    assert!(
+        hub.user("bob").await.unwrap().is_none(),
+        "failed unbound session cleanup must roll back the user insert"
+    );
+
+    // Clear the injected fault: retrying the exact same mutations now succeeds
+    // and revokes both the bound and unbound sessions cleanly.
+    backend
+        .with_connection(|connection| {
+            connection.execute_batch("DROP TRIGGER fail_session_delete;")?;
+            Ok(())
+        })
+        .unwrap();
+
+    hub.save_user(updated_alice, "admin").await.unwrap();
+    assert!(
+        hub.resolve_session(&alice_session).await.is_none(),
+        "retry after rollback must revoke alice's old bound session"
+    );
+    hub.create_user(bob, "admin").await.unwrap();
+    assert!(
+        hub.resolve_session(&bob_unbound_session).await.is_none(),
+        "retry after rollback must revoke bob's old unbound session"
+    );
+}
+
+#[tokio::test]
+async fn stale_authorization_session_is_rejected_and_federated_admission_serializes_with_updates() {
+    use crate::api_contract::{OperatorPrincipal, OperatorRole, ResourceScope};
+    use crate::hub::FederatedSessionAdmission;
+
+    let hub = identity_fixture("session_authz_drift_and_serialization", true).await;
+
+    let mut alice = user("alice", "admin");
+    alice.oidc_subject = Some("sub-alice".into());
+    hub.create_user(alice, "admin").await.unwrap();
+
+    // 1. Even if a stale bound session row exists in `cp_sessions` (e.g.
+    //    written before a role downgrade or across a failover), `resolve_session`
+    //    verifies role + scopes against the live directory record fail-closed.
+    let stale_role_session = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "alice".into(),
+                roles: vec![OperatorRole::Admin],
+                scopes: Vec::new(),
+            },
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    assert!(hub.resolve_session(&stale_role_session).await.is_some());
+
+    // Simulate a stale row carrying Admin privileges after alice is demoted
+    // to viewer (bypassing `save_user`'s in-tx delete by writing a stale row
+    // directly after the downgrade).
+    let mut demoted = hub.user("alice").await.unwrap().unwrap();
+    demoted.role = "viewer".into();
+    hub.save_user(demoted, "admin").await.unwrap();
+
+    let raced_stale_role = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "alice".into(),
+                roles: vec![OperatorRole::Admin],
+                scopes: Vec::new(),
+            },
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        hub.resolve_session(&raced_stale_role).await.is_none(),
+        "resolve_session must reject a bound session whose role drifted from cp_users"
+    );
+
+    // Same for narrowed scopes: a session carrying unscoped Viewer is rejected
+    // once alice is restricted to job:orders.
+    let mut narrowed = hub.user("alice").await.unwrap().unwrap();
+    narrowed.scopes_json = r#"[{"resource_type":"job","resource_id":"orders"}]"#.into();
+    hub.save_user(narrowed, "admin").await.unwrap();
+
+    let raced_stale_scopes = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "alice".into(),
+                roles: vec![OperatorRole::Viewer],
+                scopes: Vec::new(),
+            },
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        hub.resolve_session(&raced_stale_scopes).await.is_none(),
+        "resolve_session must reject a bound session whose scopes drifted from cp_users"
+    );
+
+    // 2. Concurrent `admit_federated_session` vs `save_user` downgrade never
+    //    leaves a surviving Admin session after the downgrade completes, while
+    //    a fresh login succeeds with the updated Viewer + scoped privileges.
+    for round in 0..10 {
+        let mut promoted = hub.user("alice").await.unwrap().unwrap();
+        promoted.role = "admin".into();
+        promoted.scopes_json = "[]".into();
+        hub.save_user(promoted, "admin").await.unwrap();
+
+        let mut downgrade = hub.user("alice").await.unwrap().unwrap();
+        downgrade.role = "viewer".into();
+        downgrade.scopes_json = r#"[{"resource_type":"job","resource_id":"orders"}]"#.into();
+
+        let now = super::now_ms();
+        let claims = OperatorPrincipal {
+            id: "sub-alice".into(),
+            roles: vec![OperatorRole::Admin],
+            scopes: Vec::new(),
+        };
+        let (admission, save_res) = tokio::join!(
+            hub.admit_federated_session(claims.clone(), Some(now), true),
+            hub.save_user(downgrade, "admin"),
+        );
+        save_res.unwrap();
+
+        if let FederatedSessionAdmission::Created(session_id) = admission {
+            if let Some(resolved) = hub.resolve_session(&session_id).await {
+                assert_eq!(
+                    resolved.roles,
+                    vec![OperatorRole::Viewer],
+                    "round {round}: surviving session after downgrade must never keep Admin role"
+                );
+                assert_eq!(
+                    resolved.scopes,
+                    vec![ResourceScope {
+                        resource_type: "job".into(),
+                        resource_id: Some("orders".into()),
+                    }],
+                    "round {round}: surviving session after downgrade must carry updated scopes"
+                );
+            }
+        } else {
+            panic!("round {round}: expected Created session during concurrent admission");
+        }
+
+        // Fresh login after downgrade succeeds with the downgraded role/scopes.
+        let fresh = hub
+            .admit_federated_session(claims, Some(super::now_ms()), true)
+            .await;
+        let FederatedSessionAdmission::Created(fresh_session) = fresh else {
+            panic!("round {round}: fresh login after downgrade must succeed");
+        };
+        let resolved = hub
+            .resolve_session(&fresh_session)
+            .await
+            .expect("fresh session must resolve");
+        assert_eq!(resolved.roles, vec![OperatorRole::Viewer]);
+        assert_eq!(
+            resolved.scopes,
+            vec![ResourceScope {
+                resource_type: "job".into(),
+                resource_id: Some("orders".into()),
+            }]
+        );
+    }
+
+    // 3. Concurrent `admit_federated_session` (for an older-`iat` token) vs
+    //    `revoke_user_tokens` is also serialized: either admission wins first
+    //    and `revoke_user_tokens` deletes the session, or `revoke_user_tokens`
+    //    wins first and admission sees the bumped `tokens_valid_after_ms` and
+    //    denies. Neither order leaves a surviving session.
+    let mut restored = hub.user("alice").await.unwrap().unwrap();
+    restored.tokens_valid_after_ms = 0;
+    hub.save_user(restored, "admin").await.unwrap();
+    let old_iat = super::now_ms().saturating_sub(120_000);
+    let claims = OperatorPrincipal {
+        id: "sub-alice".into(),
+        roles: vec![OperatorRole::Viewer],
+        scopes: Vec::new(),
+    };
+    let (admission, revoke_res) = tokio::join!(
+        hub.admit_federated_session(claims, Some(old_iat), true),
+        hub.revoke_user_tokens("alice", "admin"),
+    );
+    revoke_res.unwrap();
+    match admission {
+        FederatedSessionAdmission::Created(session_id) => {
+            assert!(
+                hub.resolve_session(&session_id).await.is_none(),
+                "concurrent revoke_user_tokens must revoke any session created before the bump"
+            );
+        }
+        FederatedSessionAdmission::Unauthorized => {}
+        FederatedSessionAdmission::StorageFailed => {
+            panic!("durable storage fixture must not report StorageFailed");
+        }
+        FederatedSessionAdmission::Volatile(_) => {
+            panic!("durable storage fixture must not report Volatile");
+        }
+    }
+}

@@ -20,6 +20,15 @@ pub(crate) const MANAGED_TOKEN_PREFIX: &str = "ark_";
 pub(crate) const MAX_USERS: usize = 1024;
 pub(crate) const MAX_CREDENTIALS_PER_USER: usize = 16;
 
+/// Outcome of atomically evaluating federated directory admission and creating
+/// a durable browser session under `identity_write_lock`.
+pub(crate) enum FederatedSessionAdmission {
+    Unauthorized,
+    Volatile(OperatorPrincipal),
+    Created(String),
+    StorageFailed,
+}
+
 pub(crate) fn generate_secret() -> Result<String, HubError> {
     use rand::TryRngCore;
     let mut bytes = [0u8; 32];
@@ -109,7 +118,8 @@ impl Hub {
     }
 
     /// Best-effort audit trail for identity mutations: scalar identifiers
-    /// only, never token material or secret hashes.
+    /// only, never token material or secret hashes. Failures against durable
+    /// storage are counted and logged, never silently dropped.
     async fn record_identity_audit(
         &self,
         action: &str,
@@ -118,9 +128,6 @@ impl Hub {
         credential_id: Option<String>,
         outcome: &str,
     ) {
-        let Some(storage) = self.storage.as_ref() else {
-            return;
-        };
         let message = match credential_id.as_deref() {
             Some(credential_id) => format!(
                 "user={} credential={credential_id}",
@@ -128,8 +135,9 @@ impl Hub {
             ),
             None => format!("user={}", user_id.as_deref().unwrap_or("unknown")),
         };
-        let _ = storage
-            .record_audit(AuditRecord {
+        self.record_audit_best_effort(
+            "identity",
+            AuditRecord {
                 event_id: 0,
                 actor: Some(actor.to_owned()),
                 action: action.to_owned(),
@@ -142,8 +150,9 @@ impl Hub {
                 failure_code: None,
                 message: Some(message),
                 occurred_at_ms: now_ms(),
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     /// Audit a rejected identity mutation (stable failure code, scalars only).
@@ -155,9 +164,6 @@ impl Hub {
         credential_id: Option<String>,
         failure_code: &str,
     ) {
-        let Some(storage) = self.storage.as_ref() else {
-            return;
-        };
         let message = match credential_id.as_deref() {
             Some(credential_id) => format!(
                 "user={} credential={credential_id} failure={failure_code}",
@@ -168,8 +174,9 @@ impl Hub {
                 user_id.as_deref().unwrap_or("unknown")
             ),
         };
-        let _ = storage
-            .record_audit(AuditRecord {
+        self.record_audit_best_effort(
+            "identity",
+            AuditRecord {
                 event_id: 0,
                 actor: Some(actor.to_owned()),
                 action: action.to_owned(),
@@ -182,8 +189,9 @@ impl Hub {
                 failure_code: Some(failure_code.to_owned()),
                 message: Some(message),
                 occurred_at_ms: now_ms(),
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     /// Parse and validate a user record supplied by an administration API.
@@ -223,31 +231,34 @@ impl Hub {
             .map_err(HubError::from)
     }
 
-    /// Create a new user. Existing ids are rejected (administration updates
-    /// go through `save_user`), as are duplicate OIDC subject bindings.
+    /// Create a new user. Existing ids are rejected with `UserAlreadyExists`
+    /// (administration updates go through `save_user`), as are duplicate OIDC
+    /// subject bindings. Concurrent creates are serialized with
+    /// `identity_write_lock` and persisted with insert-only SQL so a race can
+    /// never overwrite an existing user.
     pub async fn create_user(
         &self,
         mut user: UserRecord,
         actor: &str,
     ) -> Result<UserRecord, HubError> {
         let storage = self.identity_storage()?.clone();
+        user.created_at_ms = now_ms();
+        user.tokens_valid_after_ms = 0;
+        let user = Self::validated_user(user)?;
+        // Serialize capacity checks and inserts against concurrent creates/
+        // updates; the DB `INSERT` enforces uniqueness even across processes.
+        let _write_guard = self.identity_write_lock.lock().await;
         let users = storage.list_users().await.map_err(HubError::from)?;
-        if users.len() >= MAX_USERS {
-            return Err(HubError::UserLimit);
-        }
         if users
             .iter()
             .any(|existing| existing.user_id == user.user_id)
         {
-            return Err(HubError::Invalid(format!(
-                "user '{}' already exists",
-                user.user_id
-            )));
+            return Err(HubError::UserAlreadyExists);
         }
-        user.created_at_ms = now_ms();
-        user.tokens_valid_after_ms = 0;
-        let user = Self::validated_user(user)?;
-        let created = storage.upsert_user(user).await.map_err(map_user_write)?;
+        if users.len() >= MAX_USERS {
+            return Err(HubError::UserLimit);
+        }
+        let created = storage.create_user(user).await.map_err(HubError::from)?;
         self.record_identity_audit(
             "user.create",
             actor,
@@ -261,7 +272,9 @@ impl Hub {
 
     /// Replace an existing user record. The last enabled admin cannot be
     /// disabled, deleted, or demoted unless a static break-glass credential
-    /// exists.
+    /// exists. Affected durable sessions (for `user_id` and affected OIDC
+    /// subjects) are revoked atomically in the same storage transaction as the
+    /// user update.
     pub async fn save_user(&self, user: UserRecord, actor: &str) -> Result<UserRecord, HubError> {
         let storage = self.identity_storage()?.clone();
         // Serialize the reachability check with the write: two concurrent
@@ -279,25 +292,7 @@ impl Hub {
         })?;
         self.ensure_admin_reachability(&current, &next, &storage)
             .await?;
-        let saved = storage.upsert_user(next).await.map_err(map_user_write)?;
-        // Role and scopes are baked into stored session principals
-        // (`resolve_session` returns the recorded `principal_json`), so an
-        // authorization change must revoke the durable sessions that still
-        // carry the old privileges. Unchanged authorization fields keep
-        // sessions intact.
-        if current.role != saved.role || current.scopes_json != saved.scopes_json {
-            let removed = storage
-                .delete_user_sessions(&saved.user_id)
-                .await
-                .map_err(HubError::from)?;
-            if removed > 0 {
-                tracing::info!(
-                    user_id = %saved.user_id,
-                    sessions = removed,
-                    "revoked durable sessions after an authorization change"
-                );
-            }
-        }
+        let saved = storage.upsert_user(next).await.map_err(HubError::from)?;
         self.record_identity_audit(
             "user.update",
             actor,
@@ -368,19 +363,30 @@ impl Hub {
     }
 
     /// Raise the user's federated-token invalidation threshold and drop all
-    /// of the user's browser sessions.
+    /// of the user's browser sessions (both bound sessions and any unbound
+    /// sessions matching the user's bound OIDC subject).
     pub async fn revoke_user_tokens(&self, user_id: &str, actor: &str) -> Result<usize, HubError> {
         let storage = self.identity_storage()?.clone();
-        let now = now_ms();
-        let user = storage
-            .bump_user_tokens_valid_after(user_id, now)
-            .await
-            .map_err(HubError::from)?
-            .ok_or(HubError::NotFound)?;
-        let removed = storage
-            .delete_user_sessions(user_id)
-            .await
-            .map_err(HubError::from)?;
+        let (user, removed) = {
+            let _write_guard = self.identity_write_lock.lock().await;
+            let now = now_ms();
+            let user = storage
+                .bump_user_tokens_valid_after(user_id, now)
+                .await
+                .map_err(HubError::from)?
+                .ok_or(HubError::NotFound)?;
+            let mut removed = storage
+                .delete_user_sessions(user_id)
+                .await
+                .map_err(HubError::from)?;
+            if let Some(subject) = user.oidc_subject.as_deref() {
+                removed += storage
+                    .delete_sessions_by_oidc_subject(subject)
+                    .await
+                    .map_err(HubError::from)?;
+            }
+            (user, removed)
+        };
         self.record_identity_audit(
             "user.revoke_tokens",
             actor,
@@ -598,17 +604,79 @@ impl Hub {
     /// random cookie value; only its hash is stored. `None` means the login
     /// must fail (no randomness, or no durable session store).
     pub async fn create_session(&self, principal: OperatorPrincipal) -> Option<String> {
-        use rand::TryRngCore;
-        let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.try_fill_bytes(&mut bytes).ok()?;
-        let session_id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         let storage = self.storage.as_ref()?;
+        let _guard = self.identity_write_lock.lock().await;
         let user_id = storage
             .get_user(&principal.id)
             .await
             .ok()
             .flatten()
             .map(|user| user.user_id);
+        self.create_session_for_user_locked(principal, user_id)
+            .await
+    }
+
+    /// Persist a browser session with an explicit directory user binding
+    /// (`Some(user_id)` when the login matched a managed directory user,
+    /// `None` when it was an unbound OIDC subject). Separating the binding
+    /// from `principal.id` prevents an unbound OIDC `sub` that happens to
+    /// match an unrelated local `user_id` from being mis-associated with that
+    /// local user.
+    pub async fn create_session_for_user(
+        &self,
+        principal: OperatorPrincipal,
+        user_id: Option<String>,
+    ) -> Option<String> {
+        let _guard = self.identity_write_lock.lock().await;
+        self.create_session_for_user_locked(principal, user_id)
+            .await
+    }
+
+    /// Atomically evaluate directory admission for a validated OIDC principal
+    /// and persist its durable browser session while holding
+    /// `identity_write_lock`, serializing session creation against concurrent
+    /// `create_user`, `save_user`, `delete_user`, and `revoke_user_tokens`
+    /// mutations so a demoted role or narrowed scope cannot slip into a new
+    /// session between the directory read and the session insert.
+    pub(crate) async fn admit_federated_session(
+        &self,
+        principal: OperatorPrincipal,
+        issued_at_ms: Option<u64>,
+        managed_users_only: bool,
+    ) -> FederatedSessionAdmission {
+        if self.storage.is_none() {
+            return if managed_users_only {
+                FederatedSessionAdmission::Unauthorized
+            } else {
+                FederatedSessionAdmission::Volatile(principal)
+            };
+        }
+        let _guard = self.identity_write_lock.lock().await;
+        let Some((admitted, bound_user_id)) = self
+            .apply_federated_directory_with_binding(principal, issued_at_ms, managed_users_only)
+            .await
+        else {
+            return FederatedSessionAdmission::Unauthorized;
+        };
+        match self
+            .create_session_for_user_locked(admitted, bound_user_id)
+            .await
+        {
+            Some(session_id) => FederatedSessionAdmission::Created(session_id),
+            None => FederatedSessionAdmission::StorageFailed,
+        }
+    }
+
+    async fn create_session_for_user_locked(
+        &self,
+        principal: OperatorPrincipal,
+        user_id: Option<String>,
+    ) -> Option<String> {
+        use rand::TryRngCore;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.try_fill_bytes(&mut bytes).ok()?;
+        let session_id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let storage = self.storage.as_ref()?;
         let now = now_ms();
         let record = crate::storage::SessionRecord {
             session_hash: session_hash(&session_id),
@@ -623,8 +691,9 @@ impl Hub {
     }
 
     /// Resolve a browser session id: storage-backed on a durable Hub, the
-    /// in-memory federation map otherwise. Revoked, expired, or disabled-user
-    /// sessions are rejected.
+    /// in-memory federation map otherwise. Revoked, expired, disabled-user,
+    /// deleted-user, authorization-drifted, and now-bound unbound OIDC
+    /// sessions are rejected fail-closed.
     pub async fn resolve_session(&self, session_id: &str) -> Option<OperatorPrincipal> {
         if let Some(storage) = self.storage.as_ref() {
             let record = storage
@@ -634,15 +703,43 @@ impl Hub {
             if record.revoked_at_ms.is_some() || now_ms() >= record.expires_at_ms {
                 return None;
             }
+            let principal =
+                serde_json::from_str::<OperatorPrincipal>(&record.principal_json).ok()?;
             if let Some(user_id) = record.user_id.as_deref() {
                 match storage.get_user(user_id).await {
-                    Ok(Some(user)) if user.disabled => return None,
-                    Ok(None) => return None,
-                    Err(_) => return None,
-                    Ok(Some(_)) => {}
+                    Ok(Some(user)) => {
+                        if user.disabled {
+                            return None;
+                        }
+                        // Defense-in-depth: never honor a session whose cached
+                        // role or scopes no longer match the live directory
+                        // record (closes any cross-process or stale-write race).
+                        let role = parse_role(&user.role)?;
+                        let scopes = scopes_from_json(&user.scopes_json)?;
+                        if principal.roles != [role] || principal.scopes != scopes {
+                            return None;
+                        }
+                    }
+                    Ok(None) | Err(_) => return None,
+                }
+            } else {
+                // Defense-in-depth for unbound OIDC sessions (`user_id IS NULL`):
+                // reject if `managed_users_only` is active, if the subject has
+                // since been bound to any directory user (closes any race
+                // between callback and bind), or if the lookup fails.
+                if self
+                    .oidc
+                    .as_ref()
+                    .is_some_and(|federation| federation.managed_users_only())
+                {
+                    return None;
+                }
+                match storage.get_user_by_oidc_subject(&principal.id).await {
+                    Ok(None) => {}
+                    Ok(Some(_)) | Err(_) => return None,
                 }
             }
-            return serde_json::from_str::<OperatorPrincipal>(&record.principal_json).ok();
+            return Some(principal);
         }
         self.oidc.as_ref()?.resolve_session(session_id)
     }
@@ -674,10 +771,23 @@ impl Hub {
         issued_at_ms: Option<u64>,
         managed_users_only: bool,
     ) -> Option<OperatorPrincipal> {
+        self.apply_federated_directory_with_binding(principal, issued_at_ms, managed_users_only)
+            .await
+            .map(|(principal, _)| principal)
+    }
+
+    /// Like [`Self::apply_federated_directory`], also returning the matched
+    /// directory `user_id` (`None` when the subject was admitted unbound).
+    pub(crate) async fn apply_federated_directory_with_binding(
+        &self,
+        principal: OperatorPrincipal,
+        issued_at_ms: Option<u64>,
+        managed_users_only: bool,
+    ) -> Option<(OperatorPrincipal, Option<String>)> {
         let Some(storage) = self.storage.as_ref() else {
             // A volatile Hub cannot check the directory; a deployment that
             // requires managed users must not admit unbound subjects.
-            return (!managed_users_only).then_some(principal);
+            return (!managed_users_only).then_some((principal, None));
         };
         match storage.get_user_by_oidc_subject(&principal.id).await {
             Ok(Some(user)) => {
@@ -691,14 +801,18 @@ impl Hub {
                 }
                 let role = parse_role(&user.role)?;
                 let scopes = scopes_from_json(&user.scopes_json)?;
-                Some(OperatorPrincipal {
-                    id: user.user_id,
-                    roles: vec![role],
-                    scopes,
-                })
+                let bound_user_id = user.user_id.clone();
+                Some((
+                    OperatorPrincipal {
+                        id: user.user_id,
+                        roles: vec![role],
+                        scopes,
+                    },
+                    Some(bound_user_id),
+                ))
             }
             Ok(None) if managed_users_only => None,
-            Ok(None) => Some(principal),
+            Ok(None) => Some((principal, None)),
             Err(error) => {
                 tracing::warn!(%error, "identity lookup failed; denying federated request");
                 None
@@ -736,13 +850,4 @@ fn generate_credential_id() -> Result<String, HubError> {
         .try_fill_bytes(&mut bytes)
         .map_err(|_| HubError::Invalid("OS random source is unavailable".into()))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-fn map_user_write(error: crate::storage::StorageError) -> HubError {
-    let text = error.to_string();
-    if text.contains("UNIQUE") || text.contains("duplicate key") {
-        HubError::OidcSubjectConflict
-    } else {
-        HubError::from(error)
-    }
 }

@@ -160,8 +160,9 @@ impl Hub {
             record.phase_deadline_at_ms = now + COMMIT_PHASE_TIMEOUT_MS;
         }
         storage.upsert_job_upgrade(record.clone()).await?;
-        storage
-            .record_audit(crate::storage::AuditRecord {
+        self.record_audit_event_for(
+            "job",
+            crate::storage::AuditRecord {
                 event_id: 0,
                 actor,
                 action: "job.upgrade.atomic.initiate".into(),
@@ -177,10 +178,9 @@ impl Hub {
                     record.to_version, record.from_version
                 )),
                 occurred_at_ms: now,
-            })
-            .await
-            .map(|_| ())
-            .map_err(HubError::from)?;
+            },
+        )
+        .await?;
         self.job_upgrades
             .write()
             .await
@@ -946,9 +946,9 @@ impl Hub {
         correlation_id: Option<String>,
         outcome: &str,
     ) -> Result<(), HubError> {
-        let storage = self.storage.as_ref().ok_or(HubError::StorageUnavailable)?;
-        storage
-            .record_audit(crate::storage::AuditRecord {
+        self.record_audit_event_for(
+            "job",
+            crate::storage::AuditRecord {
                 event_id: 0,
                 actor,
                 action: action.into(),
@@ -964,10 +964,10 @@ impl Hub {
                     action, record.upgrade_id, record.phase
                 )),
                 occurred_at_ms: now_ms(),
-            })
-            .await
-            .map(|_| ())
-            .map_err(HubError::from)
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Boot recovery for orchestration rows: repopulate the fence/pin cache
