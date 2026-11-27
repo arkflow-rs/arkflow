@@ -18,12 +18,12 @@
 - [x] 3.5 `connectors-pulsar`：门住 `input/pulsar.rs`/`output/pulsar.rs`/`pulsar/` 模块
 - [x] 3.6 `connectors-hdfs`：`input/file.rs` 内 hdfs scheme 分支加模块内门（其余 file/object_store 保持无条件）
 - [x] 3.7 `connectors-mqtt`：门住 input/output mqtt + `mqtt_tls.rs`
-- [ ] 3.8 `connectors-nats`：门住 input/output nats
-- [ ] 3.9 `connectors-redis`：门住 input/output/temporary redis + 共享 `component/redis.rs`
-- [ ] 3.10 `connectors-websocket`（input/websocket.rs）+ `connectors-modbus`（input/modbus.rs），两个单模块轻家族一并处理
-- [ ] 3.11 `ai-vector`：门住 embedding/llm/vector_search/milvus_search/pgvector_search 处理器与 qdrant/milvus/pgvector 输出；核实 `output/codec_helper.rs` 的 sqlx 引用调用方归属（仅 sql/pgvector 用则随双特性门，否则把 sql helper 拆到 `connectors-sql` 侧）
-- [ ] 3.12 `processors-vrl`：门住 `processor/vrl.rs`
-- [ ] 3.13 `codecs-protobuf`：门住 protobuf/schema_registry 编解码 + arrow_to_protobuf/protobuf_to_arrow 处理器 + 共享 `component/protobuf.rs`
+- [x] 3.8 `connectors-nats`：门住 input/output nats
+- [x] 3.9 `connectors-redis`：门住 input/output/temporary redis + 共享 `component/redis.rs`
+- [x] 3.10 `connectors-websocket`（input/websocket.rs）+ `connectors-modbus`（input/modbus.rs），两个单模块轻家族一并处理
+- [x] 3.11 `ai-vector`：门住 embedding/llm/vector_search/milvus_search/pgvector_search 处理器与 qdrant/milvus/pgvector 输出；核实 `output/codec_helper.rs` 的 sqlx 引用调用方归属（仅 sql/pgvector 用则随双特性门，否则把 sql helper 拆到 `connectors-sql` 侧）
+- [x] 3.12 `processors-vrl`：门住 `processor/vrl.rs`
+- [x] 3.13 `codecs-protobuf`：门住 protobuf/schema_registry 编解码 + arrow_to_protobuf/protobuf_to_arrow 处理器 + 共享 `component/protobuf.rs`
 
 ## 4. 缺失 feature 错误提示
 
@@ -65,5 +65,5 @@ server 栈（jsonwebtoken/rsa、sqlx、rusqlite、prometheus、sysinfo）按 Non
 ## 9. 全量门禁与评审
 
 - [x] 9.1 本地三组合矩阵全绿 + `cargo test --workspace --all-targets`（默认特性集）+ `cargo clippy --workspace --all-targets` + rustfmt 全绿
-- [ ] 9.2 开 PR，跑 CodeRabbit 评审循环，逐条核实处置、线程清零（"Fixed in <sha>" 开头回复可自动解决）
-- [ ] 9.3 CI 全绿（含三个镜像构建）后交用户合并
+- [x] 9.2 开 PR，跑 CodeRabbit 评审循环，逐条核实处置、线程清零（"Fixed in <sha>" 开头回复可自动解决）
+- [x] 9.3 CI 全绿（含三个镜像构建）后交用户合并
