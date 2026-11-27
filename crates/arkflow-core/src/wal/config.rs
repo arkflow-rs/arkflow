@@ -68,7 +68,7 @@ pub struct SegmentTuningConfig {
     /// Override max_bytes from the preset strategy.
     pub max_bytes: Option<usize>,
     /// Override flush_interval from the preset strategy.
-    #[serde(with = "duration_serde_option", default)]
+    #[serde(with = "lenient_duration_serde_option", default)]
     pub flush_interval: Option<Duration>,
 }
 
@@ -594,7 +594,7 @@ pub mod duration_serde {
     }
 }
 
-/// Duration serde for Option<Duration> fields.
+/// Duration serde for Option<Duration> fields (strict on malformed non-empty strings).
 pub mod duration_serde_option {
     use super::{format_duration_lossless, parse_duration_human};
     use serde::{Deserialize, Deserializer, Serializer};
@@ -624,6 +624,42 @@ pub mod duration_serde_option {
                     parse_duration_human(&s)
                         .map(Some)
                         .map_err(serde::de::Error::custom)
+                }
+            }
+        }
+    }
+}
+
+/// Backward-compatible optional duration serde for `segment_tuning.flush_interval`:
+/// treats unparseable strings (e.g. `"auto"`) as `None` so the `strategy`
+/// preset still applies, matching prior behavior.
+pub mod lenient_duration_serde_option {
+    use super::{format_duration_lossless, parse_duration_human};
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        match d {
+            Some(duration) => s.serialize_str(&format_duration_lossless(duration)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Str(String),
+            Int(u64),
+        }
+        match Option::<Raw>::deserialize(d)? {
+            None => Ok(None),
+            Some(Raw::Int(ms)) => Ok(Some(Duration::from_millis(ms))),
+            Some(Raw::Str(s)) => {
+                if s.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(parse_duration_human(&s).ok())
                 }
             }
         }
@@ -1223,5 +1259,39 @@ mod tests {
               bucket: b
         "#;
         assert!(serde_yaml::from_str::<WalBackend>(blank_required_yaml).is_err());
+
+        // Legacy `segment_tuning.flush_interval` preserves `None` fallback for
+        // unparseable strings (e.g. `"auto"` -> strategy preset 100ms), whereas
+        // `retention.max_age` remains strict and rejects malformed strings.
+        let legacy_auto_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment_tuning:
+              strategy: low_latency
+              flush_interval: "auto"
+            s3:
+              bucket: b
+        "#;
+        match serde_yaml::from_str::<WalBackend>(legacy_auto_yaml).unwrap() {
+            WalBackend::ObjectStore(o) => {
+                assert_eq!(o.segment_tuning.flush_interval, None);
+                assert_eq!(
+                    o.segment_tuning.resolve().flush_interval,
+                    Duration::from_millis(100)
+                );
+            }
+            _ => panic!("expected ObjectStore"),
+        }
+        let strict_max_age_auto_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "auto"
+            s3:
+              bucket: b
+        "#;
+        assert!(serde_yaml::from_str::<WalBackend>(strict_max_age_auto_yaml).is_err());
     }
 }

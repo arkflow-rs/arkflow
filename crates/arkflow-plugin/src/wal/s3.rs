@@ -874,6 +874,7 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
     }
 
     let mut seen: HashSet<String> = HashSet::new();
+    let mut listed_segs: HashSet<String> = HashSet::new();
     let mut all_segs: Vec<String> = Vec::new();
     for s in manifest.sealed_segments.iter() {
         observe_idx(s);
@@ -895,6 +896,7 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
         if !name.ends_with(".wal") {
             continue;
         }
+        listed_segs.insert(name.clone());
         observe_idx(&name);
         if !pending_deletes.contains(&name) && seen.insert(name.clone()) {
             all_segs.push(name);
@@ -913,7 +915,9 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
     // - Seed `reclaimable_hwm` from `manifest.cursor`: no in-flight ack/undo
     //   handles survive a process restart, so everything <= `manifest.cursor`
     //   from a prior lifetime is past any possible rewind.
-    // - Skip GET for segments whose `manifest.segment_meta.last_seq <= cursor`.
+    // - Skip GET for segments whose `manifest.segment_meta.last_seq <= cursor`
+    //   (issuing only a metadata HEAD check if the registered segment was absent
+    //   from LIST so unexpected missing registered segments still emit a warning).
     // - For legacy manifest segments or LIST-fallback segments lacking
     //   `segment_meta`, decode once and record metadata in `backfilled_meta`
     //   so the next reclaim sweep adopts them into `manifest.json`.
@@ -925,6 +929,23 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
     for seg_name in &all_segs {
         if let Some(meta) = manifest.segment_meta.get(seg_name) {
             if meta.last_seq <= manifest.cursor {
+                if !listed_segs.contains(seg_name) {
+                    let key = ObjectPath::from(
+                        format!("{}/{}", store.segments_prefix, seg_name).as_str(),
+                    );
+                    match store.client.head(&key).await {
+                        Ok(_) => {}
+                        Err(object_store::Error::NotFound { .. }) => {
+                            warn_missing_segment(seg_name);
+                        }
+                        Err(e) => {
+                            return Err(Error::Process(format!(
+                                "S3 HEAD segment {}: {}",
+                                seg_name, e
+                            )))
+                        }
+                    }
+                }
                 store.remember_segment_bounds(seg_name, meta.first_seq, meta.last_seq);
                 continue;
             }
@@ -4851,6 +4872,7 @@ mod tests {
     struct SpyObjectStore {
         inner: Arc<InMemory>,
         gets: StdMutex<Vec<String>>,
+        heads: StdMutex<Vec<String>>,
         puts: StdMutex<Vec<String>>,
         deletes: StdMutex<Vec<String>>,
         fail_deletes: std::sync::atomic::AtomicBool,
@@ -4862,6 +4884,7 @@ mod tests {
             Arc::new(Self {
                 inner: Arc::new(InMemory::new()),
                 gets: StdMutex::new(Vec::new()),
+                heads: StdMutex::new(Vec::new()),
                 puts: StdMutex::new(Vec::new()),
                 deletes: StdMutex::new(Vec::new()),
                 fail_deletes: std::sync::atomic::AtomicBool::new(false),
@@ -4871,12 +4894,23 @@ mod tests {
 
         fn clear_counts(&self) {
             self.gets.lock().unwrap().clear();
+            self.heads.lock().unwrap().clear();
             self.puts.lock().unwrap().clear();
             self.deletes.lock().unwrap().clear();
         }
 
         fn segment_gets(&self) -> Vec<String> {
             self.gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.ends_with(".wal"))
+                .cloned()
+                .collect()
+        }
+
+        fn segment_heads(&self) -> Vec<String> {
+            self.heads
                 .lock()
                 .unwrap()
                 .iter()
@@ -4943,7 +4977,11 @@ mod tests {
             location: &ObjectPath,
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            self.gets.lock().unwrap().push(location.to_string());
+            if options.head {
+                self.heads.lock().unwrap().push(location.to_string());
+            } else {
+                self.gets.lock().unwrap().push(location.to_string());
+            }
             self.inner.get_opts(location, options).await
         }
         fn delete_stream(
@@ -6083,5 +6121,56 @@ mod tests {
             "second object must remain intact when rewind poison activates"
         );
         store.close().unwrap();
+    }
+
+    #[test]
+    fn recovery_checks_head_without_body_get_for_missing_covered_registered_segment() {
+        let spy = SpyObjectStore::new();
+        let store =
+            build_retention_store(spy.clone(), "missing-covered", RetentionConfig::default());
+        let payload = sample_payload(None);
+        // Segment 1: [1..=4] (sealed), Segment 2: [5..=8] (active).
+        for seq in 1..=8u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        for seq in 1..=5u64 {
+            store.advance_cursor(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+
+        // Delete registered sealed segment 1 (`last_seq = 4 <= cursor = 5`)
+        // directly from the bucket while leaving it registered in `sealed_segments`.
+        store
+            .rt()
+            .block_on(spy.inner.delete(&ObjectPath::from(
+                "arkflow/ret/ret-pod/missing-covered/segments/00000001.wal",
+            )))
+            .unwrap();
+        store.close().unwrap();
+        drop(store);
+
+        spy.clear_counts();
+        let reopened =
+            build_retention_store(spy.clone(), "missing-covered", RetentionConfig::default());
+        let replayed: Vec<u64> = reopened
+            .read_after_cursor()
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(replayed, vec![6, 7, 8]);
+        assert!(
+            !spy.segment_gets()
+                .iter()
+                .any(|p| p.ends_with("00000001.wal")),
+            "covered missing segment must not issue a body GET"
+        );
+        assert!(
+            spy.segment_heads()
+                .iter()
+                .any(|p| p.ends_with("00000001.wal")),
+            "covered registered segment absent from LIST must probe HEAD to confirm absence and warn"
+        );
+        reopened.close().unwrap();
     }
 }

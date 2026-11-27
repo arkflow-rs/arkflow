@@ -258,6 +258,12 @@ pub struct Wal {
     /// is processed only by the caller that owns that sequence; a gap-closing
     /// acknowledgement must never drain a later entry on its behalf.
     acknowledgements: Mutex<BTreeMap<u64, PendingWalAck>>,
+    /// Active or failed committed-sequence compensations (`Wal::undo_ack`).
+    /// Kept separate from `acknowledgements` so an in-flight undo blocks both
+    /// concurrent `ack(seq)` and `ack(seq + 1)` without causing `ack(seq)` to
+    /// mistake undo's removal for a completed acknowledgement, and stays intact
+    /// even if the `undo` future is dropped mid-compensation.
+    undo_reservations: Arc<std::sync::Mutex<BTreeMap<u64, UndoReservationState>>>,
     /// Next sequence number to assign. Append is single-threaded (the input
     /// worker), but an atomic keeps it race-free regardless.
     next_seq: AtomicU64,
@@ -286,7 +292,7 @@ pub struct Wal {
     flush_lock: tokio::sync::Mutex<()>,
     /// Wakes acknowledgements that are waiting for an earlier WAL sequence
     /// to finish its source-side commit and cursor advance.
-    ack_notify: Notify,
+    ack_notify: Arc<Notify>,
     close: CancellationToken,
     flusher: Mutex<Option<JoinHandle<()>>>,
     // --- flusher failure visibility (D3 of fix-object-store-wal-loss-window) ---
@@ -309,6 +315,12 @@ pub struct Wal {
     /// policy), so the timeout and close paths are exercisable without
     /// waiting the production bound.
     seal_wait_timeout_ms: AtomicU64,
+}
+
+#[derive(Clone)]
+enum UndoReservationState {
+    InFlight,
+    Failed(String),
 }
 
 struct PendingWalAck {
@@ -373,6 +385,20 @@ const WAL_SEAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// stops sealing entirely.
 const WAL_SEAL_WAIT_FALLBACK_BOUND: Duration = Duration::from_secs(30);
 
+async fn call_wal_store<T, F>(store: &Arc<dyn WalStore>, f: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce(&Arc<dyn WalStore>) -> Result<T, Error> + Send + 'static,
+{
+    if store.kind() != "object_store" {
+        return f(store);
+    }
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || f(&store))
+        .await
+        .map_err(|e| Error::Process(format!("WAL store task failed: {e}")))?
+}
+
 impl Wal {
     /// Open (or create) a WAL.
     ///
@@ -427,6 +453,7 @@ impl Wal {
             store,
             frontier,
             acknowledgements: Mutex::new(BTreeMap::new()),
+            undo_reservations: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             next_seq: AtomicU64::new(next_seq),
             returned_seqs: std::sync::Mutex::new(Vec::new()),
             ack_drain_window_ms: AtomicU64::new(WAL_ACK_DRAIN_WINDOW.as_millis() as u64),
@@ -435,7 +462,7 @@ impl Wal {
             pending: Mutex::new(Vec::new()),
             pending_notify: Notify::new(),
             flush_lock: tokio::sync::Mutex::new(()),
-            ack_notify: Notify::new(),
+            ack_notify: Arc::new(Notify::new()),
             close: CancellationToken::new(),
             flusher: Mutex::new(None),
             flush_failures: Arc::new(AtomicU64::new(0)),
@@ -518,13 +545,7 @@ impl Wal {
         T: Send + 'static,
         F: FnOnce(&Arc<dyn WalStore>) -> Result<T, Error> + Send + 'static,
     {
-        if self.store.kind() != "object_store" {
-            return f(&self.store);
-        }
-        let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || f(&store))
-            .await
-            .map_err(|e| Error::Process(format!("WAL store task failed: {e}")))?
+        call_wal_store(&self.store, f).await
     }
 
     /// Persist a message and return its assigned sequence number.
@@ -700,12 +721,39 @@ impl Wal {
                     )));
                 }
 
+                // Do not let an acknowledgement of `seq` or any later sequence
+                // proceed while an undo compensation at `<= seq` is in-flight
+                // or left an unresolved failure.
+                let blocking_undo = {
+                    let undos = self
+                        .undo_reservations
+                        .lock()
+                        .expect("undo_reservations lock");
+                    undos
+                        .iter()
+                        .find(|(&u_seq, _)| u_seq <= seq)
+                        .map(|(&u_seq, state)| (u_seq, state.clone()))
+                };
+                if let Some((u_seq, UndoReservationState::Failed(error))) = blocking_undo {
+                    if u_seq < seq {
+                        return Err(Error::Process(format!(
+                            "WAL acknowledgement is blocked by an earlier source undo failure: {error}"
+                        )));
+                    } else {
+                        return Err(Error::Process(format!(
+                            "WAL sequence {seq} has an unresolved undo failure: {error}"
+                        )));
+                    }
+                }
+
                 // Only the lowest outstanding sequence may run. This remains
                 // true even after the WAL cursor has been advanced before
                 // its source-side acknowledgement: later callers must not
-                // overtake an in-flight earlier source commit.
+                // overtake an in-flight earlier source commit or an in-flight
+                // undo at `<= seq`.
                 let cursor = self.call_store(|store| Ok(store.cursor())).await?;
-                if first_seq != Some(seq)
+                if blocking_undo.is_some()
+                    || first_seq != Some(seq)
                     || entry.in_flight
                     // A caller may acknowledge a later WAL sequence before
                     // the earlier delivery has even reached its sink. Keep
@@ -973,9 +1021,8 @@ impl Wal {
             /// compensated before the WAL delivery can be discarded.
             Retry(Arc<dyn crate::input::Ack>),
             /// The WAL acknowledgement had already committed; `seq` is reserved
-            /// as `in_flight` while `inner.undo()` and `rewind_cursor` run so
-            /// no successor acknowledgement (`seq + 1`) can advance the cursor
-            /// or `reclaimable_hwm` mid-compensation.
+            /// in `undo_reservations` while a supervised task completes
+            /// `inner.undo()` and `rewind_cursor` cleanly even if the caller drops.
             Committed,
         }
 
@@ -1007,23 +1054,48 @@ impl Wal {
                     Some(PendingUndo::Removed)
                 }
             } else {
+                {
+                    let undos = self
+                        .undo_reservations
+                        .lock()
+                        .expect("undo_reservations lock");
+                    if matches!(undos.get(&seq), Some(UndoReservationState::InFlight)) {
+                        return Err(Error::Process(
+                            "cannot undo an in-flight WAL acknowledgement".into(),
+                        ));
+                    }
+                }
                 let cursor = self.call_store(|store| Ok(store.cursor())).await?;
                 if cursor < seq {
+                    let cleared = self
+                        .undo_reservations
+                        .lock()
+                        .expect("undo_reservations lock")
+                        .remove(&seq)
+                        .is_some();
+                    if cleared {
+                        self.ack_notify.notify_waiters();
+                    }
                     return Ok(());
                 }
                 if cursor > seq {
+                    let cleared = self
+                        .undo_reservations
+                        .lock()
+                        .expect("undo_reservations lock")
+                        .remove(&seq)
+                        .is_some();
+                    if cleared {
+                        self.ack_notify.notify_waiters();
+                    }
                     return Err(Error::Process(
                         "cannot undo a WAL acknowledgement behind a later cursor".into(),
                     ));
                 }
-                acknowledgements.insert(
-                    seq,
-                    PendingWalAck {
-                        ack: inner.clone(),
-                        in_flight: true,
-                        last_error: None,
-                    },
-                );
+                self.undo_reservations
+                    .lock()
+                    .expect("undo_reservations lock")
+                    .insert(seq, UndoReservationState::InFlight);
                 Some(PendingUndo::Committed)
             }
         };
@@ -1061,29 +1133,82 @@ impl Wal {
             None => return Ok(()),
         }
 
-        // The source-side commit is undone before the WAL cursor is rewound;
-        // otherwise a crash in this compensation window could replay a record
-        // whose connector offset had already been restored.
-        let undo_res = async {
-            inner.undo().await?;
-            let rewind_to = seq.saturating_sub(1);
-            self.call_store(move |store| store.rewind_cursor(rewind_to))
-                .await?;
-            if !self
-                .frontier
-                .rewind_position(None, 0, seq.saturating_add(1))
-            {
-                return Err(Error::Process(
-                    "WAL acknowledgement frontier changed before compensation".into(),
-                ));
-            }
-            Ok(())
+        // Drive compensation in a detached task so cancelling the caller future
+        // never leaks `UndoReservationState::InFlight` or unblocks successors
+        // before source compensation finishes. An RAII guard ensures even an
+        // unexpected panic settles the reservation and wakes parked waiters.
+        struct UndoReservationGuard {
+            seq: u64,
+            settled: bool,
+            reservations: Arc<std::sync::Mutex<BTreeMap<u64, UndoReservationState>>>,
+            notify: Arc<Notify>,
         }
-        .await;
+        impl UndoReservationGuard {
+            fn settle(mut self, outcome: &Result<(), Error>) {
+                self.settled = true;
+                {
+                    let mut undos = self.reservations.lock().expect("undo_reservations lock");
+                    match outcome {
+                        Ok(()) => {
+                            undos.remove(&self.seq);
+                        }
+                        Err(err) => {
+                            undos.insert(self.seq, UndoReservationState::Failed(err.to_string()));
+                        }
+                    }
+                }
+                self.notify.notify_waiters();
+            }
+        }
+        impl Drop for UndoReservationGuard {
+            fn drop(&mut self) {
+                if !self.settled {
+                    self.reservations
+                        .lock()
+                        .expect("undo_reservations lock")
+                        .insert(
+                            self.seq,
+                            UndoReservationState::Failed(
+                                "WAL undo task panicked before completing".into(),
+                            ),
+                        );
+                    self.notify.notify_waiters();
+                }
+            }
+        }
 
-        self.acknowledgements.lock().await.remove(&seq);
-        self.ack_notify.notify_waiters();
-        undo_res
+        let store = Arc::clone(&self.store);
+        let frontier = Arc::clone(&self.frontier);
+        let reservations = Arc::clone(&self.undo_reservations);
+        let notify = Arc::clone(&self.ack_notify);
+        let handle = tokio::spawn(async move {
+            let guard = UndoReservationGuard {
+                seq,
+                settled: false,
+                reservations,
+                notify,
+            };
+            // The source-side commit is undone before the WAL cursor is rewound;
+            // otherwise a crash in this compensation window could replay a record
+            // whose connector offset had already been restored.
+            let res: Result<(), Error> = async {
+                inner.undo().await?;
+                let rewind_to = seq.saturating_sub(1);
+                call_wal_store(&store, move |s| s.rewind_cursor(rewind_to)).await?;
+                if !frontier.rewind_position(None, 0, seq.saturating_add(1)) {
+                    return Err(Error::Process(
+                        "WAL acknowledgement frontier changed before compensation".into(),
+                    ));
+                }
+                Ok(())
+            }
+            .await;
+            guard.settle(&res);
+            res
+        });
+        handle
+            .await
+            .map_err(|e| Error::Process(format!("WAL undo task failed: {e}")))?
     }
 
     /// Read all entries with sequence strictly greater than the committed
@@ -3325,6 +3450,107 @@ mod tests {
 
         ack2_task.abort();
         let _ = ack2_task.await;
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_undo_keeps_reservation_until_source_settles_and_recommits_concurrent_ack() {
+        struct GatedUndoAndCountAck {
+            undo_started: StdArc<tokio::sync::Notify>,
+            undo_release: StdArc<tokio::sync::Notify>,
+            acks: StdArc<AtomicU64>,
+        }
+        #[async_trait::async_trait]
+        impl Ack for GatedUndoAndCountAck {
+            async fn ack(&self) -> Result<(), Error> {
+                self.acks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn undo(&self) -> Result<(), Error> {
+                self.undo_started.notify_one();
+                self.undo_release.notified().await;
+                Ok(())
+            }
+        }
+
+        let dir = tempdir();
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&cfg).unwrap();
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            wal.append(&StdArc::new(sample_batch(None))).await.unwrap(),
+            2
+        );
+
+        let ack_calls = StdArc::new(AtomicU64::new(0));
+        let undo_started = StdArc::new(tokio::sync::Notify::new());
+        let undo_release = StdArc::new(tokio::sync::Notify::new());
+        let inner = StdArc::new(GatedUndoAndCountAck {
+            undo_started: undo_started.clone(),
+            undo_release: undo_release.clone(),
+            acks: ack_calls.clone(),
+        });
+
+        WalAck::new(wal.clone(), 1, inner.clone())
+            .ack()
+            .await
+            .unwrap();
+        assert_eq!(ack_calls.load(Ordering::SeqCst), 1);
+
+        // Start `undo(1)`, wait for it to reach `inner.undo()`, then CANCEL
+        // (abort) the caller handle before compensation completes.
+        let undo_caller = tokio::spawn({
+            let wal = wal.clone();
+            let inner = inner.clone();
+            async move { WalAck::new(wal, 1, inner).undo().await }
+        });
+        undo_started.notified().await;
+        undo_caller.abort();
+        let _ = undo_caller.await;
+
+        // While the supervised compensation task is still running in the
+        // background:
+        // - a duplicate `undo(1)` rejects as in-flight,
+        // - a concurrent `ack(1)` and successor `ack(2)` both park cleanly.
+        let dup_err = WalAck::new(wal.clone(), 1, StdArc::new(NoopAck))
+            .undo()
+            .await
+            .unwrap_err();
+        assert!(dup_err.to_string().contains("in-flight"), "{dup_err}");
+
+        let concurrent_ack1 = tokio::spawn({
+            let wal = wal.clone();
+            let inner = inner.clone();
+            async move { WalAck::new(wal, 1, inner).ack().await }
+        });
+        let concurrent_ack2 = tokio::spawn({
+            let wal = wal.clone();
+            async move { WalAck::new(wal, 2, StdArc::new(NoopAck)).ack().await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!concurrent_ack1.is_finished());
+        assert!(!concurrent_ack2.is_finished());
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+
+        // Once compensation completes, `undo_reservations` clears and the
+        // parked `ack(1)` ACTUALLY recommits seq 1 (`ack_calls == 2`), unblocking
+        // `ack(2)` to finish afterwards (`cursor == 2`).
+        undo_release.notify_one();
+        concurrent_ack1.await.unwrap().unwrap();
+        concurrent_ack2.await.unwrap().unwrap();
+        assert_eq!(
+            ack_calls.load(Ordering::SeqCst),
+            2,
+            "concurrent ack(1) must actually re-run Ack::ack after undo(1) rewinds"
+        );
+        assert_eq!(wal.cursor().await.unwrap(), 2);
         wal.close().await.unwrap();
     }
 }
