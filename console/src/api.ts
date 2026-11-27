@@ -1159,3 +1159,192 @@ async function handleUnauthorized(tokenWasSent: boolean): Promise<void> {
   }
   publishAuthChallenge({ required: true, tokenRejected: tokenWasSent })
 }
+
+// --- Hub AI Copilot SSE streaming ----------------------------------------
+
+export type AiChatMessagePayload = {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export type AiUiContext = {
+  page?: string
+  node_id?: string
+  job_id?: string
+  stream_id?: string
+  draft_format?: string
+  draft_content?: string
+  error_summary?: string
+}
+
+export type AiStreamConfigProposal = {
+  kind: 'stream_config'
+  title: string
+  summary: string
+  format: 'yaml' | 'json'
+  content: string
+  node_id?: string
+  validated: boolean
+}
+
+export type AiJobSpecProposal = {
+  kind: 'job_spec'
+  title: string
+  summary: string
+  spec: Record<string, unknown>
+  mode?: 'create' | 'upgrade'
+  target_job_id?: string
+  validated: boolean
+}
+
+export type AiDiagnosticActionProposal = {
+  kind: 'diagnostic_action'
+  severity: 'info' | 'warn' | 'critical'
+  title: string
+  summary: string
+  route: string
+  params?: Record<string, string>
+  action_label: string
+}
+
+export type AiProposal = AiStreamConfigProposal | AiJobSpecProposal | AiDiagnosticActionProposal
+
+export type AiChatCallbacks = {
+  onToolStart?: (event: { call_id: string; tool: string; summary: string }) => void
+  onToolResult?: (event: { call_id: string; tool: string; ok: boolean; summary: string }) => void
+  onDelta?: (text: string) => void
+  onProposal?: (proposal: AiProposal) => void
+  onDone?: (event: {
+    usage: { prompt_tokens: number; completion_tokens: number }
+    tool_calls: string[]
+  }) => void
+  onError?: (code: string, message: string) => void
+}
+
+export function dispatchAiSseFrame(eventType: string, rawData: string, callbacks: AiChatCallbacks): void {
+  if (!rawData) return
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawData)
+  } catch {
+    return
+  }
+  const obj = parsed as Record<string, unknown>
+  switch (eventType) {
+    case 'tool_start':
+      callbacks.onToolStart?.(obj as { call_id: string; tool: string; summary: string })
+      break
+    case 'tool_result':
+      callbacks.onToolResult?.(obj as { call_id: string; tool: string; ok: boolean; summary: string })
+      break
+    case 'delta':
+      if (typeof obj.text === 'string') callbacks.onDelta?.(obj.text)
+      break
+    case 'proposal':
+      callbacks.onProposal?.(obj as unknown as AiProposal)
+      break
+    case 'done':
+      callbacks.onDone?.(
+        obj as { usage: { prompt_tokens: number; completion_tokens: number }; tool_calls: string[] },
+      )
+      break
+    case 'error':
+      callbacks.onError?.(
+        typeof obj.code === 'string' ? obj.code : 'ai_error',
+        typeof obj.message === 'string' ? obj.message : 'AI Copilot request failed',
+      )
+      break
+    default:
+      break
+  }
+}
+
+export function streamAiCopilotChat(
+  messages: AiChatMessagePayload[],
+  context: AiUiContext | undefined,
+  callbacks: AiChatCallbacks,
+): AbortController {
+  const controller = new AbortController()
+  void (async () => {
+    try {
+      const token = currentBearerToken()
+      const response = await fetch(`${base}/ai/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ messages, context }),
+        signal: controller.signal,
+      })
+
+      if (!response.ok) {
+        let code = `http_${response.status}`
+        let message = translate(currentLocale(), 'api.requestFailed', { status: response.status })
+        try {
+          const problem = (await response.json()) as Partial<ApiError>
+          if (typeof problem.code === 'string') code = problem.code
+          if (typeof problem.message === 'string') message = problem.message
+        } catch {
+          /* non-JSON body */
+        }
+        if (response.status === 401) {
+          await handleUnauthorized(Boolean(token))
+        }
+        callbacks.onError?.(code, message)
+        return
+      }
+
+      if (!response.body) {
+        callbacks.onError?.('ai_empty_stream', 'Empty AI response stream')
+        return
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let sawTerminal = false
+
+      const wrapped: AiChatCallbacks = {
+        ...callbacks,
+        onDone: (ev) => {
+          sawTerminal = true
+          callbacks.onDone?.(ev)
+        },
+        onError: (code, msg) => {
+          sawTerminal = true
+          callbacks.onError?.(code, msg)
+        },
+      }
+
+      while (!controller.signal.aborted) {
+        const next = await reader.read()
+        if (next.done) break
+        buffer += decoder.decode(next.value, { stream: true })
+        const frames = buffer.split(/\r?\n\r?\n/)
+        buffer = frames.pop() ?? ''
+        for (const frame of frames) {
+          let eventType = 'message'
+          const dataLines: string[] = []
+          for (const line of frame.split(/\r?\n/)) {
+            if (line.startsWith('event:')) eventType = line.slice(6).trim()
+            else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+          }
+          if (dataLines.length > 0) {
+            dispatchAiSseFrame(eventType, dataLines.join('\n'), wrapped)
+          }
+        }
+      }
+
+      if (!controller.signal.aborted && !sawTerminal) {
+        callbacks.onDone?.({ usage: { prompt_tokens: 0, completion_tokens: 0 }, tool_calls: [] })
+      }
+    } catch (cause) {
+      if (!controller.signal.aborted) {
+        callbacks.onError?.('ai_network_error', cause instanceof Error ? cause.message : String(cause))
+      }
+    }
+  })()
+  return controller
+}

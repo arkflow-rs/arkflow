@@ -21,7 +21,7 @@ import {
   streamEvents,
   waitForOperation,
 } from './api'
-import { useNodes, useLiveError, useMutationFailure } from './queries'
+import { useNodes, useLiveError, useMutationFailure, useSystem } from './queries'
 import { useHubMode, usePermissions } from './permissions'
 import type { ApiError } from './api'
 import { Overview } from './features/overview'
@@ -33,6 +33,7 @@ import { Events } from './features/events'
 import { Settings } from './features/settings'
 import { Audit } from './features/audit'
 import { ConfirmProvider } from './features/confirm'
+import { CopilotDrawer, CopilotProvider, useCopilot } from './features/copilot'
 import { resolvedTheme } from './theme'
 import { Rollouts } from './features/rollouts'
 import { Approvals } from './features/approvals'
@@ -240,168 +241,193 @@ function ConsoleShell() {
     ) : (
       page
     )
+  const systemQuery = useSystem()
+  const copilotEnabled =
+    systemQuery.data?.id === 'arkflow-control-hub' &&
+    Boolean(systemQuery.data?.capabilities?.includes('ai_copilot'))
+
   return (
-    <div className="shell">
-      <Toaster theme={resolvedTheme(themeSetting)} position="bottom-right" />
-      <aside>
-        <h1>arkflow</h1>
-        <p>{t('brand.tagline')}</p>
-        <nav>
-          {NAV_GROUPS.map((group) => (
-            <div className="nav-group" key={group.key}>
-              <p className="nav-group-label">{t(`nav.group.${group.key}`)}</p>
-              {group.items.map((key) => {
-                const item = ITEM_BY_KEY.get(key)
-                if (!item || !visibleNav(key)) return null
-                return (
-                  <NavLink
-                    key={item.key}
-                    to={navSearch ? `${item.path}${navSearch}` : item.path}
-                    end={item.path === '/'}
-                    className={({ isActive }) => (isActive ? 'active' : '')}
-                  >
-                    {t(`nav.${item.key}`)}
-                  </NavLink>
-                )
-              })}
+    <CopilotProvider enabled={copilotEnabled} canConfigure={can('configure')}>
+      <div className="shell">
+        <Toaster theme={resolvedTheme(themeSetting)} position="bottom-right" />
+        <aside>
+          <h1>arkflow</h1>
+          <p>{t('brand.tagline')}</p>
+          <nav>
+            {NAV_GROUPS.map((group) => (
+              <div className="nav-group" key={group.key}>
+                <p className="nav-group-label">{t(`nav.group.${group.key}`)}</p>
+                {group.items.map((key) => {
+                  const item = ITEM_BY_KEY.get(key)
+                  if (!item || !visibleNav(key)) return null
+                  return (
+                    <NavLink
+                      key={item.key}
+                      to={navSearch ? `${item.path}${navSearch}` : item.path}
+                      end={item.path === '/'}
+                      className={({ isActive }) => (isActive ? 'active' : '')}
+                    >
+                      {t(`nav.${item.key}`)}
+                    </NavLink>
+                  )
+                })}
+              </div>
+            ))}
+          </nav>
+        </aside>
+        <main>
+          <header>
+            <div>
+              <span className="eyebrow">{t('header.eyebrow')}</span>
+              <h2>{pageTitle}</h2>
             </div>
-          ))}
-        </nav>
-      </aside>
-      <main>
-        <header>
-          <div>
-            <span className="eyebrow">{t('header.eyebrow')}</span>
-            <h2>{pageTitle}</h2>
-          </div>
-          <div className="actions">
-            <span
-              className="identity"
-              title={principal ? principal.actions.join(', ') : undefined}
-              data-testid="principal-identity"
-            >
-              {principal
-                ? t('perm.signedInAs', { id: principal.id, roles: principal.roles.join(', ') })
-                : t('perm.identityUnknown')}
-            </span>
-            {oidcAuthenticated && (
-              <button
-                onClick={() => {
-                  void oidcLogout()
-                    .then((ok) => {
-                      if (ok) setOidcAuthenticated(false)
-                      else setError('Sign-out failed; retry')
-                    })
-                    .catch(() => setError('Sign-out failed; retry'))
-                }}
+            <div className="actions">
+              <span
+                className="identity"
+                title={principal ? principal.actions.join(', ') : undefined}
+                data-testid="principal-identity"
               >
-                {t('header.signOut')}
+                {principal
+                  ? t('perm.signedInAs', { id: principal.id, roles: principal.roles.join(', ') })
+                  : t('perm.identityUnknown')}
+              </span>
+              {oidcAuthenticated && (
+                <button
+                  onClick={() => {
+                    void oidcLogout()
+                      .then((ok) => {
+                        if (ok) setOidcAuthenticated(false)
+                        else setError('Sign-out failed; retry')
+                      })
+                      .catch(() => setError('Sign-out failed; retry'))
+                  }}
+                >
+                  {t('header.signOut')}
+                </button>
+              )}
+              <span className={`connection ${live ? 'connected' : 'disconnected'}`}>
+                {live ? t('header.liveEvents') : t('header.snapshotMode')}
+              </span>
+              <select
+                aria-label={t('header.computeNode')}
+                value={selectedNode}
+                onChange={(event) => setNodeParam(event.target.value)}
+              >
+                <option value="">{t('header.allNodes')}</option>
+                {nodes.map((node) => (
+                  <option key={node.id} value={node.id}>
+                    {node.id} · {node.state}
+                  </option>
+                ))}
+              </select>
+              <select
+                aria-label={t('header.theme')}
+                value={themeSetting}
+                onChange={(event) => setThemeSetting(event.target.value as ThemeSetting)}
+              >
+                <option value="dark">{t('theme.dark')}</option>
+                <option value="light">{t('theme.light')}</option>
+                <option value="system">{t('theme.system')}</option>
+              </select>
+              <select
+                aria-label={t('header.language')}
+                value={locale}
+                onChange={(event) => setLocale(event.target.value as Locale)}
+              >
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+              </select>
+              <button disabled={nodesQuery.isFetching} onClick={refresh}>
+                {nodesQuery.isFetching ? t('header.refreshing') : t('header.refresh')}
               </button>
-            )}
-            <span className={`connection ${live ? 'connected' : 'disconnected'}`}>
-              {live ? t('header.liveEvents') : t('header.snapshotMode')}
-            </span>
-            <select
-              aria-label={t('header.computeNode')}
-              value={selectedNode}
-              onChange={(event) => setNodeParam(event.target.value)}
-            >
-              <option value="">{t('header.allNodes')}</option>
-              {nodes.map((node) => (
-                <option key={node.id} value={node.id}>
-                  {node.id} · {node.state}
-                </option>
-              ))}
-            </select>
-            <select
-              aria-label={t('header.theme')}
-              value={themeSetting}
-              onChange={(event) => setThemeSetting(event.target.value as ThemeSetting)}
-            >
-              <option value="dark">{t('theme.dark')}</option>
-              <option value="light">{t('theme.light')}</option>
-              <option value="system">{t('theme.system')}</option>
-            </select>
-            <select
-              aria-label={t('header.language')}
-              value={locale}
-              onChange={(event) => setLocale(event.target.value as Locale)}
-            >
-              <option value="zh">中文</option>
-              <option value="en">English</option>
-            </select>
-            <button disabled={nodesQuery.isFetching} onClick={refresh}>
-              {nodesQuery.isFetching ? t('header.refreshing') : t('header.refresh')}
-            </button>
-          </div>
-        </header>
-        {selectedNodeState &&
-          selectedNodeState.state !== 'online' &&
-          selectedNodeState.state !== 'running' && (
-            <div className="warning">
-              {t('warning.nodeUnavailable', { node: selectedNode, state: selectedNodeState.state })}
+              <CopilotHeaderButton />
             </div>
-          )}
-        {standby ? (
-          <div className="warning">{t('warning.hubStandby')}</div>
-        ) : (
-          stale && <div className="warning">{t('warning.staleState')}</div>
-        )}
-        {error && <div className="error">{error}</div>}
-        {queryError && !standby && <div className="error">{errorMessage(queryError)}</div>}
-        <RuntimeTokenPrompt />
-        <Routes>
-          <Route path="/" element={<Overview onError={setError} canManageNodes={can('manage_nodes')} />} />
-          <Route
-            path="/runtime"
-            element={
-              <Runtime
-                command={command}
-                canMutate={canMutate}
-                canOperate={can('operate')}
-                onError={setError}
-              />
-            }
-          />
-          <Route path="/jobs" element={hubOnly(<Jobs onError={setError} canMutate={canMutate} />)} />
-          <Route
-            path="/configuration"
-            element={
-              <Configuration
-                onError={setError}
-                nodeId={selectedNode || undefined}
-                canMutate={nodeReachable && can('configure')}
-              />
-            }
-          />
-          <Route
-            path="/rollouts"
-            element={hubOnly(<Rollouts onError={setError} canMutate={can('manage_rollouts')} />)}
-          />
-          <Route
-            path="/approvals"
-            element={hubOnly(
-              <Approvals
-                onError={setError}
-                canMutate={can('approve_rollouts')}
-                canSubmit={can('manage_rollouts')}
-              />,
+          </header>
+          {selectedNodeState &&
+            selectedNodeState.state !== 'online' &&
+            selectedNodeState.state !== 'running' && (
+              <div className="warning">
+                {t('warning.nodeUnavailable', { node: selectedNode, state: selectedNodeState.state })}
+              </div>
             )}
-          />
-          <Route path="/components" element={<Components onError={setError} />} />
-          <Route path="/events" element={<Events />} />
-          <Route path="/audit" element={hubOnly(<Audit onError={setError} />)} />
-          <Route
-            path="/users"
-            element={hubOnly(<Users onError={setError} canManageUsers={can('manage_users')} />)}
-          />
-          <Route
-            path="/settings"
-            element={<Settings hubMode={hubMode} canManageWebhooks={can('manage_webhooks')} />}
-          />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </main>
-    </div>
+          {standby ? (
+            <div className="warning">{t('warning.hubStandby')}</div>
+          ) : (
+            stale && <div className="warning">{t('warning.staleState')}</div>
+          )}
+          {error && <div className="error">{error}</div>}
+          {queryError && !standby && <div className="error">{errorMessage(queryError)}</div>}
+          <RuntimeTokenPrompt />
+          <Routes>
+            <Route path="/" element={<Overview onError={setError} canManageNodes={can('manage_nodes')} />} />
+            <Route
+              path="/runtime"
+              element={
+                <Runtime
+                  command={command}
+                  canMutate={canMutate}
+                  canOperate={can('operate')}
+                  onError={setError}
+                />
+              }
+            />
+            <Route path="/jobs" element={hubOnly(<Jobs onError={setError} canMutate={canMutate} />)} />
+            <Route
+              path="/configuration"
+              element={
+                <Configuration
+                  onError={setError}
+                  nodeId={selectedNode || undefined}
+                  canMutate={nodeReachable && can('configure')}
+                />
+              }
+            />
+            <Route
+              path="/rollouts"
+              element={hubOnly(<Rollouts onError={setError} canMutate={can('manage_rollouts')} />)}
+            />
+            <Route
+              path="/approvals"
+              element={hubOnly(
+                <Approvals
+                  onError={setError}
+                  canMutate={can('approve_rollouts')}
+                  canSubmit={can('manage_rollouts')}
+                />,
+              )}
+            />
+            <Route path="/components" element={<Components onError={setError} />} />
+            <Route path="/events" element={<Events />} />
+            <Route path="/audit" element={hubOnly(<Audit onError={setError} />)} />
+            <Route
+              path="/users"
+              element={hubOnly(<Users onError={setError} canManageUsers={can('manage_users')} />)}
+            />
+            <Route
+              path="/settings"
+              element={<Settings hubMode={hubMode} canManageWebhooks={can('manage_webhooks')} />}
+            />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </main>
+        <CopilotDrawer />
+      </div>
+    </CopilotProvider>
+  )
+}
+
+function CopilotHeaderButton() {
+  const t = useT()
+  const copilot = useCopilot()
+  if (!copilot.enabled) return null
+  return (
+    <button
+      type="button"
+      className="copilot-trigger"
+      data-testid="copilot-header-button"
+      onClick={() => copilot.setOpen(!copilot.open)}
+    >
+      {t('copilot.button')}
+    </button>
   )
 }

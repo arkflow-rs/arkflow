@@ -14,8 +14,8 @@ pub mod startup_config;
 pub mod storage;
 
 pub use api::{
-    hub_router, observability_router, router, serve, serve_hub, serve_observability, ServerConfig,
-    API_VERSION,
+    hub_router, observability_router, router, serve, serve_hub, serve_observability,
+    AiCopilotConfig, ServerConfig, API_VERSION,
 };
 pub use startup_config::{
     apply_env_overrides, load_startup_config, HubFileConfig, HubStartupConfig, StartupConfigError,

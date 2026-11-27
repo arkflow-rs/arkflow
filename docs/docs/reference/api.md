@@ -587,6 +587,20 @@ stream actions) and outcome classes (`enqueued`, `acknowledged`, `succeeded`,
 command names collapse into `other`, and resource IDs, correlation IDs, and
 error text never become labels. Counters reset on Hub restart.
 
+### AI Copilot (`POST /api/v1/ai/chat`)
+
+When `ai.enabled` is configured on the Hub (see [CLI reference](./cli.md)), `GET /api/v1/system` advertises `"ai_copilot"` in `capabilities` (without disclosing `api_key` or `api_base`) and mounts the Hub-only SSE orchestration route:
+
+| Method | Route | Purpose |
+|--------|-------|---------|
+| `POST` | `/ai/chat` | Stateless multi-turn chat (`messages`, optional `context`) streaming `text/event-stream` SSE events (`tool_start`, `tool_result`, `delta`, `proposal`, `done`, `error`). |
+
+Behavior and safety boundaries:
+
+- **Read-only & validation-only tools**: internal tools inspect component schemas, fleet nodes, redacted configurations/jobs, events, metrics, and audit logs strictly scoped by the caller's `OperatorPrincipal::can_scope`. Authoring and validation proposals (`stream_config`, `job_spec`) require `Configure` and are validated on the server (`parse_and_validate` / `deep_validate_job`) before a `proposal` event is emitted; audit queries require `ReadAudit`. No tool mutates Hub state.
+- **Secret redaction & zero data-plane exposure**: literal credentials and URL userinfo passwords are masked as `******` while unexpanded `${secret:...}` / `${env:...}` placeholders may stay visible; data-plane `MessageBatch` payloads are never read.
+- **Rate limiting & metadata audit**: enforced per principal (`ai.requests_per_minute` / `ai.burst`, returning `429 ai_rate_limit_exceeded` + `Retry-After`). Each completed or failed call records a metadata-only entry (`ai.copilot.chat` with model, tool names, token usage, and outcome) in `cp_audit_events` without storing user prompt text or assistant replies.
+
 ## Hub agent API (`/api/v1/agent/*`)
 
 The Agent contract is separate from the operator contract: agents authenticate

@@ -147,6 +147,15 @@ ha:
   enabled: true
   lease_ttl_ms: 15000
   advertise_url: https://hub.example.com
+ai:
+  enabled: true
+  api_base: https://api.openai.com/v1
+  model: gpt-4o-mini
+  api_key: ${secret:OPENAI_API_KEY}
+  timeout_ms: 90000
+  max_tool_rounds: 8
+  requests_per_minute: 20
+  burst: 5
 ```
 
 Rules:
@@ -182,6 +191,15 @@ Rules:
 | `ARKFLOW_OTEL_TRACING_ENABLED` | off | Set to `1`/`true`/`yes` to export Hub spans via OTLP/HTTP-JSON. |
 | `ARKFLOW_OTEL_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | OTLP/HTTP-JSON span export endpoint. |
 | `ARKFLOW_OTEL_SERVICE_NAME` | `arkflow` | Resource `service.name` on exported spans. Set it (e.g. `arkflow-hub`) when a collector also receives engine traces. |
+| `ARKFLOW_AI_ENABLED` | off | Set to `1`/`true`/`yes` to enable the Hub AI Copilot (`ai_copilot` capability). Requires `ARKFLOW_AI_API_BASE` and `ARKFLOW_AI_MODEL`. |
+| `ARKFLOW_AI_API_BASE` | — | OpenAI-compatible `http://` or `https://` base URL (requests target `{api_base}/chat/completions`). |
+| `ARKFLOW_AI_MODEL` | — | Chat model name supporting OpenAI tool calling. |
+| `ARKFLOW_AI_API_KEY` | — | Optional Bearer API key for the upstream LLM endpoint (omit for unauthenticated local Ollama/vLLM). |
+| `ARKFLOW_AI_TIMEOUT_MS` | `90000` | Total orchestration timeout in milliseconds (minimum 1000). |
+| `ARKFLOW_AI_MAX_TOOL_ROUNDS` | `8` | Maximum tool-calling loop iterations per request (minimum 1). |
+| `ARKFLOW_AI_MAX_TOKENS` | `4096` | Optional `max_tokens` cap forwarded to the upstream model. |
+| `ARKFLOW_AI_REQUESTS_PER_MINUTE` | `20` | Per-principal AI Copilot sustained request rate limit. |
+| `ARKFLOW_AI_BURST` | `5` | Per-principal AI Copilot burst capacity. |
 
 The `RUST_LOG` environment variable, when set to parseable `EnvFilter`
 directives (e.g. `RUST_LOG=info` or `arkflow=debug`), overrides the static

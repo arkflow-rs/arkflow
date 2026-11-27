@@ -45,11 +45,15 @@ pub(super) async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) 
     let fleet_visible = principal
         .as_ref()
         .is_some_and(|principal| principal.can_scope(OperatorAction::Read, "node", None));
+    let mut capabilities = vec!["node_registry", "command_dispatch", "fleet_aggregation"];
+    if hub.ai_enabled() {
+        capabilities.push("ai_copilot");
+    }
     let mut payload = serde_json::json!({
         "id": "arkflow-control-hub",
         "version": env!("CARGO_PKG_VERSION"),
         "state": "running",
-        "capabilities": ["node_registry", "command_dispatch", "fleet_aggregation"],
+        "capabilities": capabilities,
         "principal": principal.as_ref().map(|principal| principal.echo()),
     });
     if fleet_visible {

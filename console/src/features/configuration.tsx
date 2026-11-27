@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
@@ -7,6 +7,7 @@ import type { ConfigCandidate, ConfigDiff, ConfigIssue } from '../api'
 import { useT } from '../i18n'
 import { useMutationFailure, useSystem } from '../queries'
 import { useConfirm } from './confirm'
+import { useCopilot } from './copilot'
 
 export function convertConfiguration(
   content: string,
@@ -34,6 +35,7 @@ export function Configuration({
   const queryClient = useQueryClient()
   const reportMutationFailure = useMutationFailure()
   const confirm = useConfirm()
+  const copilot = useCopilot()
   // Hub deployments manage configuration per node; there is no fleet-wide
   // draft or active config to load until a node is selected. The mode stays
   // undetermined until /system settles, so a slow first load cannot briefly
@@ -73,11 +75,13 @@ export function Configuration({
   const [diff, setDiff] = useState<ConfigDiff>()
   const [editable, setEditable] = useState(false)
   const [activeSnapshot, setActiveSnapshot] = useState(false)
+  const [showProposalDiff, setShowProposalDiff] = useState(false)
+  const proposalLoadedForNodeRef = useRef<string | null>(null)
   const versions = versionsQuery.data ?? []
   const candidate = { format, content }
   const identity = `${format}\u0000${content}`
   const dirty = content !== saved || format !== savedFormat
-  const validated = editable && !dirty && validatedCandidate === identity && issues.length === 0
+  const validated = editable && (isHub || !dirty) && validatedCandidate === identity && issues.length === 0
   useEffect(() => {
     if (configQuery.data === undefined) return
     // A global draft loads independently of the config; wait for it to settle
@@ -91,16 +95,20 @@ export function Configuration({
     }
     const draft = draftRelevant ? draftQuery.data : undefined
     const next = draft ?? { format: 'json' as const, content: JSON.stringify(configQuery.data, null, 2) }
-    // Sync the editable editor state from the server snapshot/draft once it
-    // settles: the accepted "copy external state into local editable state"
-    // pattern — the editor owns mutations until the next snapshot lands.
+    // If a Copilot proposal already hydrated the editor for this node before
+    // the active snapshot request settled, keep the proposal candidate intact
+    // and only update the saved baseline used for diff comparison.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setContent(next.content)
-    setFormat(next.format)
     setSaved(next.content)
     setSavedFormat(next.format)
+    if (proposalLoadedForNodeRef.current === (nodeId ?? '') || copilot.pendingConfigProposal) {
+      return
+    }
+    setContent(next.content)
+    setFormat(next.format)
     setEditable(Boolean(draft))
     setActiveSnapshot(!draft)
+    setShowProposalDiff(false)
     setIssues([])
     setValidatedCandidate(undefined)
   }, [
@@ -112,8 +120,26 @@ export function Configuration({
     isHub,
     nodeId,
     onError,
+    copilot.pendingConfigProposal,
   ])
+
+  const pendingProposal = copilot.pendingConfigProposal
+  useEffect(() => {
+    if (!pendingProposal || !systemKnown || fleetMode) return
+    proposalLoadedForNodeRef.current = nodeId ?? ''
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- consuming an explicit Copilot proposal into local candidate state
+    setFormat(pendingProposal.proposal.format)
+    setContent(pendingProposal.proposal.content)
+    setEditable(true)
+    setActiveSnapshot(false)
+    setShowProposalDiff(true)
+    setIssues([])
+    setValidatedCandidate(undefined)
+    toast.success(t('copilot.proposalLoaded'))
+    copilot.consumeConfigProposal(pendingProposal.id)
+  }, [pendingProposal, systemKnown, fleetMode, nodeId, copilot, t])
   const reload = async () => {
+    proposalLoadedForNodeRef.current = null
     await queryClient.invalidateQueries({ queryKey: ['config'] })
     await queryClient.invalidateQueries({ queryKey: ['config-draft'] })
     await queryClient.invalidateQueries({ queryKey: ['config-versions'] })
@@ -232,7 +258,7 @@ export function Configuration({
             <small>{t('config.hubSelectNode')}</small>
           </div>
         </div>
-        <p className="empty">{t('config.hubFleetNotice')}</p>
+        <p className="empty">{pendingProposal ? t('copilot.selectNodeFirst') : t('config.hubFleetNotice')}</p>
       </section>
     )
   }
@@ -254,6 +280,26 @@ export function Configuration({
           </small>
         </div>
         <div className="actions">
+          {copilot.enabled && (
+            <button
+              type="button"
+              disabled={!canMutate || !!busy}
+              title={!canMutate ? t('copilot.requiresConfigure') : undefined}
+              onClick={() =>
+                copilot.openWithContext({
+                  page: '/configuration',
+                  node_id: nodeId,
+                  draft_format: format,
+                  draft_content: content,
+                  error_summary: issues.length
+                    ? issues.map((i) => `${i.path}: ${i.message}`).join('\n')
+                    : undefined,
+                })
+              }
+            >
+              {t('copilot.aiGenerate')}
+            </button>
+          )}
           <select
             aria-label={t('config.formatLabel')}
             value={format}
@@ -263,7 +309,7 @@ export function Configuration({
             <option value="yaml">YAML</option>
             <option value="json">JSON</option>
           </select>
-          <button disabled={!editable || !dirty || !!busy} onClick={saveDraft}>
+          <button disabled={!editable || !dirty || !!busy || isHub} onClick={saveDraft}>
             {t('config.saveDraft')}
           </button>
           <button disabled={!editable || !!busy} onClick={validate}>
@@ -278,6 +324,19 @@ export function Configuration({
           </button>
         </div>
       </div>
+      {isHub && editable && (
+        <div className="copilot-diff-bar">
+          <button type="button" onClick={() => setShowProposalDiff((prev) => !prev)}>
+            {showProposalDiff ? t('copilot.hideDiff') : t('copilot.configPreviewDiff')}
+          </button>
+          {showProposalDiff && (
+            <div className="copilot-diff-grid" data-testid="copilot-config-diff">
+              <pre>{saved}</pre>
+              <pre>{content}</pre>
+            </div>
+          )}
+        </div>
+      )}
       <textarea
         aria-label={t('config.editorLabel')}
         value={content}

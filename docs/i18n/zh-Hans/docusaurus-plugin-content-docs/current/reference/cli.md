@@ -131,6 +131,15 @@ ha:
   enabled: true
   lease_ttl_ms: 15000
   advertise_url: https://hub.example.com
+ai:
+  enabled: true
+  api_base: https://api.openai.com/v1
+  model: gpt-4o-mini
+  api_key: ${secret:OPENAI_API_KEY}
+  timeout_ms: 90000
+  max_tool_rounds: 8
+  requests_per_minute: 20
+  burst: 5
 ```
 
 规则:
@@ -159,6 +168,15 @@ ha:
 | `ARKFLOW_OTEL_TRACING_ENABLED` | 关 | 设为 `1`/`true`/`yes` 以经 OTLP/HTTP-JSON 导出 Hub span。 |
 | `ARKFLOW_OTEL_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | OTLP/HTTP-JSON span 导出端点。 |
 | `ARKFLOW_OTEL_SERVICE_NAME` | `arkflow` | 导出 span 的 Resource `service.name`。当 collector 同时接收引擎 trace 时建议显式设置(如 `arkflow-hub`)。 |
+| `ARKFLOW_AI_ENABLED` | 关 | 设为 `1`/`true`/`yes` 启用 Hub AI Copilot(`ai_copilot` 能力)。启用时必须同时配置 `ARKFLOW_AI_API_BASE` 与 `ARKFLOW_AI_MODEL`。 |
+| `ARKFLOW_AI_API_BASE` | — | OpenAI 兼容的 `http://` 或 `https://` 基础地址(请求发送至 `{api_base}/chat/completions`)。 |
+| `ARKFLOW_AI_MODEL` | — | 支持 OpenAI tool calling 的对话模型名称。 |
+| `ARKFLOW_AI_API_KEY` | — | 可选的上游 LLM 端点 Bearer API Key(无鉴权内网 Ollama/vLLM 可省略)。 |
+| `ARKFLOW_AI_TIMEOUT_MS` | `90000` | 单次编排总超时时间(毫秒,最小 1000)。 |
+| `ARKFLOW_AI_MAX_TOOL_ROUNDS` | `8` | 单次请求的最大 tool-calling 循环轮次(最小 1)。 |
+| `ARKFLOW_AI_MAX_TOKENS` | `4096` | 透传给上游模型的可选 `max_tokens` 上限。 |
+| `ARKFLOW_AI_REQUESTS_PER_MINUTE` | `20` | 按主体限流的 AI Copilot 持续请求速率(次/分钟)。 |
+| `ARKFLOW_AI_BURST` | `5` | 按主体限流的 AI Copilot 突发令牌桶容量。 |
 
 `RUST_LOG` 环境变量设为可解析的 `EnvFilter` 指令(如 `RUST_LOG=info` 或
 `arkflow=debug`)时,在引擎与 Hub 中都覆盖静态日志级别。优先级:

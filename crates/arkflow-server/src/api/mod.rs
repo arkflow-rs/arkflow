@@ -7,6 +7,9 @@
 //! `arkflow_core::control_plane::ControlPlane` and contains no Axum types.
 
 mod agent_endpoints;
+mod ai;
+#[cfg(test)]
+mod ai_api_tests;
 #[cfg(test)]
 mod approval_api_tests;
 #[cfg(test)]
@@ -33,6 +36,8 @@ mod webhooks_api_tests;
 #[cfg(test)]
 mod tests;
 
+pub use crate::hub::AiCopilotConfig;
+
 // Crate-root re-exports: `lib.rs` forwards these so `crate::X` paths (used by
 // `oidc` tests and `hub::job_orchestration`) keep resolving.
 pub(crate) use diagnostics::{hub_oidc_callback, hub_oidc_login, hub_oidc_logout, hub_oidc_status};
@@ -43,6 +48,7 @@ use agent_endpoints::{
     agent_command_result, agent_commands, agent_heartbeat, agent_job_observation, agent_register,
     agent_report,
 };
+use ai::hub_ai_chat;
 use config_approvals::{decide_approval, get_approval, list_approvals, submit_approval};
 use configuration::{
     apply_configuration, configuration, configuration_diff, configuration_draft,
@@ -174,6 +180,9 @@ pub struct ServerConfig {
     /// other `ServerConfig` consumers do not re-initialize logging from it.
     #[serde(default)]
     pub logging: arkflow_core::config::LoggingConfig,
+    /// Hub-only AI Copilot configuration (disabled by default).
+    #[serde(default)]
+    pub ai: AiCopilotConfig,
 }
 
 impl ServerConfig {
@@ -204,6 +213,7 @@ impl ServerConfig {
             rate_limit: control_api.rate_limit.clone(),
             observability: config.node.observability.clone(),
             logging: config.logging.clone(),
+            ai: AiCopilotConfig::default(),
         }
     }
 
@@ -217,6 +227,12 @@ impl ServerConfig {
                 format!("invalid Hub bind address '{}': {error}", self.address),
             )
         })?;
+        if let Err(message) = self.ai.validate() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            ));
+        }
         if self.insecure_local && !is_loopback_bind(address) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -289,6 +305,7 @@ impl Default for ServerConfig {
             rate_limit: arkflow_core::config::RateLimitConfig::default(),
             observability: arkflow_core::config::ObservabilityConfig::default(),
             logging: arkflow_core::config::LoggingConfig::default(),
+            ai: AiCopilotConfig::default(),
         }
     }
 }
@@ -675,6 +692,8 @@ async fn local_auth_middleware(
 }
 
 pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
+    hub.set_ai_enabled(config.ai.enabled);
+    let ai_service = std::sync::Arc::new(hub::ai::AiCopilotService::new(config.ai.clone()));
     let auth_hub = hub.clone();
     let prefix = config.api_prefix.trim_end_matches('/');
     // Standby allowlist: probes the load balancer needs to route traffic to
@@ -805,6 +824,7 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         )
         .route("/nodes/{node_id}/labels", put(hub_replace_node_labels))
         .route("/metrics", get(hub_metrics))
+        .route("/ai/chat", post(hub_ai_chat))
         .route("/agent/register", post(agent_register))
         .route("/agent/heartbeat", post(agent_heartbeat))
         .route("/agent/report", post(agent_report))
@@ -820,6 +840,7 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
         api
     }
     .with_state(hub.clone())
+    .layer(axum::Extension(ai_service))
     // Layer order is reverse-addition: operator authentication (added last)
     // runs first, then rate limiting, then the handler. The limiter switches
     // to the agent key space by path prefix, covering the auth-exempt agent

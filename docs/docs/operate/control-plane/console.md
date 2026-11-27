@@ -180,6 +180,26 @@ acts as the initial default; clearing the runtime credential falls back to it.
 When OIDC login is enabled the normal redirect-to-login flow takes precedence,
 and the runtime prompt is not used.
 
+## AI Copilot
+
+When connected to a Hub that advertises `"ai_copilot"` in `/system`
+capabilities, the console header shows an **AI Copilot** toggle that opens a
+slide-over assistant drawer whose conversation stays in browser
+`sessionStorage` across route navigation. In local standalone mode or on Hubs
+with AI disabled, the drawer and all page-level AI buttons are hidden.
+
+- **Contextual triggers**: **Configuration**, **Jobs** / **Job editor**, and
+  **Events** include context buttons (**AI Generate / Fix**, **AI Build DAG**,
+  **AI Assist**, **AI Diagnose**) that open the drawer with the active node,
+  job, draft, or error attached. Authoring controls are gated on `Configure`.
+- **Proposal-only workflow**: Copilot never executes mutations directly.
+  Validated `stream_config` cards load into an editable local candidate on
+  **Configuration** (with client-side diff preview against the node snapshot,
+  without touching local-only `/configuration/draft`) where node validation
+  still gates **Publish**; validated `job_spec` cards import directly into the
+  **Job DAG** canvas and require `/jobs/validate` before submit; diagnostic
+  cards link to the target view for manual operator confirmation.
+
 ## When to use the console vs. the API
 
 - **Console**: day-to-day observation, single job lifecycle changes, rollout
