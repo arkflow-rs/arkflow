@@ -72,6 +72,7 @@ export function Configuration({
   const [saved, setSaved] = useState('')
   const [savedFormat, setSavedFormat] = useState<ConfigCandidate['format']>('yaml')
   const [busy, setBusy] = useState('')
+  const [validating, setValidating] = useState(false)
   const [diff, setDiff] = useState<ConfigDiff>()
   const [editable, setEditable] = useState(false)
   const [activeSnapshot, setActiveSnapshot] = useState(false)
@@ -86,6 +87,7 @@ export function Configuration({
     }
     // eslint-disable-next-line react-hooks/set-state-in-effect -- clear prior node edits and validation before new node snapshot/proposal hydrates
     setBusy('')
+    setValidating(false)
     setEditable(false)
     setShowProposalDiff(false)
     setIssues([])
@@ -164,7 +166,7 @@ export function Configuration({
     setShowProposalDiff(true)
     setIssues([])
     setValidatedCandidate(undefined)
-    setBusy((current) => (current === t('config.busyValidating') ? '' : current))
+    setValidating(false)
     toast.success(t('copilot.proposalLoaded'))
     copilot.consumeConfigProposal(pendingProposal.id)
   }, [pendingProposal, systemKnown, fleetMode, nodeId, copilot, t])
@@ -193,19 +195,21 @@ export function Configuration({
       validationTokenRef.current.nodeId === reqNode && validationTokenRef.current.generation === reqGen
     void (async () => {
       try {
-        setBusy(t('config.busyValidating'))
+        setValidating(true)
         const report = await resolveValidation(candidate, nodeId)
         if (!isCurrent()) return
         setIssues(report.errors)
         setValidatedCandidate(report.valid ? identity : undefined)
-        setBusy('')
+        setValidating(false)
       } catch (cause) {
         if (!isCurrent()) return
-        setBusy('')
+        setValidating(false)
         reportMutationFailure(onError, cause)
       }
     })()
   }
+  const busyLabel = validating ? t('config.busyValidating') : busy
+  const isBusy = Boolean(busy || validating)
   const saveDraft = () =>
     void run(t('config.busySavingDraft'), async () => {
       await api.saveDraft(candidate)
@@ -323,7 +327,7 @@ export function Configuration({
               : dirty
                 ? t('config.unsavedDraft')
                 : t('config.draftSaved')}
-            {busy && ` · ${busy}`}
+            {busyLabel && ` · ${busyLabel}`}
             {!validated && t('config.validateBeforePublish')}
           </small>
         </div>
@@ -331,7 +335,7 @@ export function Configuration({
           {copilot.enabled && (
             <button
               type="button"
-              disabled={!canMutate || !!busy}
+              disabled={!canMutate || isBusy}
               title={!canMutate ? t('copilot.requiresConfigure') : undefined}
               onClick={() =>
                 copilot.openWithContext({
@@ -351,20 +355,20 @@ export function Configuration({
           <select
             aria-label={t('config.formatLabel')}
             value={format}
-            disabled={!editable || !!busy}
+            disabled={!editable || isBusy}
             onChange={(event) => changeFormat(event.target.value as ConfigCandidate['format'])}
           >
             <option value="yaml">YAML</option>
             <option value="json">JSON</option>
           </select>
-          <button disabled={!editable || !dirty || !!busy || isHub} onClick={saveDraft}>
+          <button disabled={!editable || !dirty || isBusy || isHub} onClick={saveDraft}>
             {t('config.saveDraft')}
           </button>
-          <button disabled={!editable || !!busy} onClick={validate}>
+          <button disabled={!editable || isBusy} onClick={validate}>
             {t('config.validate')}
           </button>
           <button
-            disabled={!validated || !canMutate || !!busy}
+            disabled={!validated || !canMutate || isBusy}
             title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
             onClick={publish}
           >
@@ -388,7 +392,7 @@ export function Configuration({
       <textarea
         aria-label={t('config.editorLabel')}
         value={content}
-        readOnly={!editable || !!busy}
+        readOnly={!editable || isBusy}
         onChange={(event) => {
           validationTokenRef.current = {
             nodeId: nodeId ?? '',
@@ -420,14 +424,14 @@ export function Configuration({
               </span>
               <div className="actions">
                 <button
-                  disabled={!predecessorOf(version.id) || !!busy}
+                  disabled={!predecessorOf(version.id) || isBusy}
                   title={!predecessorOf(version.id) ? t('config.noPredecessor') : undefined}
                   onClick={() => void compare(version.id)}
                 >
                   {t('config.compare')}
                 </button>
                 <button
-                  disabled={!canMutate || !!busy}
+                  disabled={!canMutate || isBusy}
                   title={!canMutate ? t('perm.requires', { action: 'configure' }) : undefined}
                   onClick={() => void rollback(version.id)}
                 >
