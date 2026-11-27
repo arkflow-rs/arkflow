@@ -77,6 +77,9 @@ export function Configuration({
   const [activeSnapshot, setActiveSnapshot] = useState(false)
   const [showProposalDiff, setShowProposalDiff] = useState(false)
   const proposalLoadedForNodeRef = useRef<string | null>(null)
+  useEffect(() => {
+    proposalLoadedForNodeRef.current = null
+  }, [nodeId])
   const versions = versionsQuery.data ?? []
   const candidate = { format, content }
   const identity = `${format}\u0000${content}`

@@ -651,6 +651,7 @@ export const en = {
   'copilot.contextAttached': 'Context: {summary}',
   'copilot.clearContext': 'Detach',
   'copilot.validatedBadge': 'Validated',
+  'copilot.unvalidatedBadge': 'Unvalidated',
   'copilot.applyConfig': 'Apply to Configuration',
   'copilot.importDag': 'Import to Job DAG',
   'copilot.copy': 'Copy',

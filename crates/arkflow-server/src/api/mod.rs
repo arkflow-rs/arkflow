@@ -692,7 +692,6 @@ async fn local_auth_middleware(
 }
 
 pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
-    hub.set_ai_enabled(config.ai.enabled);
     let ai_service = std::sync::Arc::new(hub::ai::AiCopilotService::new(config.ai.clone()));
     let auth_hub = hub.clone();
     let prefix = config.api_prefix.trim_end_matches('/');

@@ -155,8 +155,8 @@ pub(super) async fn hub_ai_chat(
         let metadata = serde_json::json!({
             "model": summary.model,
             "tool_calls": summary.tool_calls,
-            "prompt_tokens": summary.usage.prompt_tokens,
-            "completion_tokens": summary.usage.completion_tokens,
+            "prompt_tokens": summary.usage.as_ref().map(|u| u.prompt_tokens),
+            "completion_tokens": summary.usage.as_ref().map(|u| u.completion_tokens),
             "duration_ms": summary.duration_ms,
         })
         .to_string();

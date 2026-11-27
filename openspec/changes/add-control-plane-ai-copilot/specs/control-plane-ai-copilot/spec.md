@@ -4,7 +4,7 @@
 
 Define the Hub-side AI Copilot proxy, OpenAI-compatible tool-calling orchestration, SSE streaming protocol, RBAC/scope enforcement, secret redaction, rate limiting, and metadata audit requirements for the ArkFlow control plane.
 
-## Requirements
+## ADDED Requirements
 
 ### Requirement: Hub-only AI Copilot configuration and startup validation
 

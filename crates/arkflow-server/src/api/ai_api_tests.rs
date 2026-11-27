@@ -349,14 +349,20 @@ async fn multi_round_tool_calling_validates_and_audits_without_prompt_leakage() 
     assert!(events.iter().any(|(n, _)| n == "done"));
 
     // Verify metadata-only audit event (no prompt or completion text persisted).
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let audits = hub
-        .audit_filtered(AuditFilter {
-            action: Some("ai.copilot.chat".into()),
-            ..AuditFilter::default()
-        })
-        .await
-        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let audits = loop {
+        let rows = hub
+            .audit_filtered(AuditFilter {
+                action: Some("ai.copilot.chat".into()),
+                ..AuditFilter::default()
+            })
+            .await
+            .unwrap();
+        if !rows.is_empty() || tokio::time::Instant::now() >= deadline {
+            break rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
     assert_eq!(audits.len(), 1);
     assert_eq!(audits[0].actor.as_deref(), Some("root"));
     assert_eq!(audits[0].outcome, "succeeded");
@@ -535,4 +541,105 @@ async fn tool_round_limit_terminates_cleanly() {
         "{events:?}"
     );
     let _ = OperatorRole::Viewer;
+}
+
+#[tokio::test]
+async fn incomplete_stream_fails_and_unknown_tool_is_masked_in_audit() {
+    // Turn 0 emits an unknown provider tool name; Turn 1 ends abruptly without [DONE]/finish_reason.
+    let (api_base, _hits) = spawn_mock_openai_sse(|turn, _body| {
+        if turn == 0 {
+            (
+                200,
+                sse_chunks(vec![json!({
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "c_unknown",
+                                "type": "function",
+                                "function": {
+                                    "name": "leaked_completion_tool_name",
+                                    "arguments": "{}"
+                                }
+                            }]
+                        }
+                    }]
+                })]),
+            )
+        } else {
+            (
+                200,
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {"content": "truncated"}}]})
+                ),
+            )
+        }
+    })
+    .await;
+
+    let store = ControlPlaneStore::contract("ai_incomplete_audit").await;
+    let actor = StorageActor::start(store, 8);
+    let mut cfg_hub = test_hub_config("root|admin|admin-secret");
+    cfg_hub.operator_token = Some("root|admin|admin-secret".into());
+    let hub = hub::Hub::with_storage(cfg_hub, actor);
+    let cfg = ServerConfig {
+        ai: AiCopilotConfig {
+            enabled: true,
+            api_base: Some(api_base),
+            model: Some("mock".into()),
+            ..AiCopilotConfig::default()
+        },
+        ..ServerConfig::default()
+    };
+    let app = hub_router(hub.clone(), &cfg);
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/ai/chat")
+                .header("authorization", "Bearer admin-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"messages": [{"role": "user", "content": "hi"}]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .into_owned();
+    let events = parse_sse_events(&raw);
+    assert!(
+        events
+            .iter()
+            .any(|(n, v)| n == "error" && v["code"] == "ai_provider_error"),
+        "{events:?}"
+    );
+    assert!(!events.iter().any(|(n, _)| n == "done"), "{events:?}");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let audits = loop {
+        let rows = hub
+            .audit_filtered(AuditFilter {
+                action: Some("ai.copilot.chat".into()),
+                ..AuditFilter::default()
+            })
+            .await
+            .unwrap();
+        if !rows.is_empty() || tokio::time::Instant::now() >= deadline {
+            break rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].outcome, "failed");
+    let msg = audits[0].message.as_deref().unwrap();
+    assert!(!msg.contains("leaked_completion_tool_name"), "{msg}");
+    assert!(msg.contains("<unknown_tool>"), "{msg}");
 }

@@ -631,6 +631,7 @@ export const zh = {
   'copilot.contextAttached': '已附带上下文：{summary}',
   'copilot.clearContext': '移除',
   'copilot.validatedBadge': '已通过校验',
+  'copilot.unvalidatedBadge': '未校验',
   'copilot.applyConfig': '填入配置编辑器',
   'copilot.importDag': '导入 Job DAG 画布',
   'copilot.copy': '复制',

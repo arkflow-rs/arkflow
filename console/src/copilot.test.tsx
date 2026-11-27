@@ -6,12 +6,18 @@ import { App } from './app'
 const fetchMock = vi.fn()
 const page = (items: unknown[]) => ({ items, page: 1, page_size: items.length || 50, total: items.length })
 
-function sseResponse(frames: Array<{ event: string; data: unknown }>): Response {
+function sseResponse(frames: Array<{ event: string; data: unknown }>, chunkSize?: number): Response {
   const payload = frames.map((f) => `event: ${f.event}\ndata: ${JSON.stringify(f.data)}\n\n`).join('')
-  const encoder = new TextEncoder()
+  const bytes = new TextEncoder().encode(payload)
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(encoder.encode(payload))
+      if (!chunkSize || chunkSize >= bytes.length) {
+        controller.enqueue(bytes)
+      } else {
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+          controller.enqueue(bytes.slice(offset, offset + chunkSize))
+        }
+      }
       controller.close()
     },
   })
@@ -186,16 +192,61 @@ describe('AI Copilot SSE and Console workflows', () => {
     await waitFor(() => expect(onError).toHaveBeenCalledWith('ai_rate_limit_exceeded', 'Slow down'))
   })
 
+  it('parses chunked SSE frames split mid-line, across multi-byte UTF-8, and batched together', async () => {
+    const frames = [
+      { event: 'tool_start', data: { call_id: 'c1', tool: 'list_components', summary: 'Listing' } },
+      { event: 'delta', data: { text: '你好，ArkFlow 🚀' } },
+      { event: 'done', data: { usage: null, tool_calls: ['list_components'] } },
+    ]
+    for (const chunkSize of [1, 5, 19, undefined]) {
+      fetchMock.mockResolvedValueOnce(sseResponse(frames, chunkSize))
+      const onToolStart = vi.fn()
+      const onDelta = vi.fn()
+      const onDone = vi.fn()
+      const onError = vi.fn()
+      streamAiCopilotChat([{ role: 'user', content: 'hi' }], undefined, {
+        onToolStart,
+        onDelta,
+        onDone,
+        onError,
+      })
+      await waitFor(() => expect(onDone).toHaveBeenCalledTimes(1))
+      expect(onToolStart).toHaveBeenCalledWith({
+        call_id: 'c1',
+        tool: 'list_components',
+        summary: 'Listing',
+      })
+      expect(onDelta).toHaveBeenCalledWith('你好，ArkFlow 🚀')
+      expect(onError).not.toHaveBeenCalled()
+    }
+
+    // Incomplete stream without terminal done/error reports ai_stream_incomplete.
+    fetchMock.mockResolvedValueOnce(sseResponse([{ event: 'delta', data: { text: 'partial' } }]))
+    const onDoneIncomplete = vi.fn()
+    const onErrorIncomplete = vi.fn()
+    streamAiCopilotChat([{ role: 'user', content: 'hi' }], undefined, {
+      onDone: onDoneIncomplete,
+      onError: onErrorIncomplete,
+    })
+    await waitFor(() =>
+      expect(onErrorIncomplete).toHaveBeenCalledWith(
+        'ai_stream_incomplete',
+        'AI Copilot stream ended before completion event',
+      ),
+    )
+    expect(onDoneIncomplete).not.toHaveBeenCalled()
+  })
+
   it('hides Copilot trigger in local standalone mode and when Hub lacks ai_copilot capability', async () => {
     setupHubFetch({ id: 'arkflow-control-plane', capabilities: [] })
     render(<App />)
-    await screen.findByText('Fleet health')
+    await waitFor(() => expect(screen.getByTestId('principal-identity')).toHaveTextContent('alice'))
     expect(screen.queryByTestId('copilot-header-button')).not.toBeInTheDocument()
 
     cleanup()
     setupHubFetch({ id: 'arkflow-control-hub', capabilities: ['node_registry'] })
     render(<App />)
-    await screen.findByText('Fleet health')
+    await waitFor(() => expect(screen.getByTestId('principal-identity')).toHaveTextContent('alice'))
     expect(screen.queryByTestId('copilot-header-button')).not.toBeInTheDocument()
   })
 
@@ -274,10 +325,20 @@ describe('AI Copilot SSE and Console workflows', () => {
                 version: 1,
                 parallelism: 1,
                 max_parallelism: 128,
-                sources: [{ operator_id: 'src', component: 'generate', config: {} }],
-                operators: [],
-                sinks: [{ operator_id: 'out', component: 'stdout', config: {} }],
-                edges: [{ from: 'src', to: 'out', partitioning: 'partitioned' }],
+                operators: [
+                  { id: 'src', kind: 'source', config: {} },
+                  { id: 'out', kind: 'sink', config: {} },
+                ],
+                sources: [
+                  {
+                    operator_id: 'src',
+                    input_type: 'generate',
+                    config: { batch_size: 1 },
+                    time: { mode: 'processing_time' },
+                  },
+                ],
+                sinks: [{ operator_id: 'out', output_type: 'stdout', config: {} }],
+                edges: [{ id: 'src-out', from: 'src', to: 'out', partitioned: true }],
               },
               validated: true,
             },
@@ -304,6 +365,8 @@ describe('AI Copilot SSE and Console workflows', () => {
 
     await waitFor(() => expect(window.location.pathname).toBe('/jobs'))
     expect(await screen.findByDisplayValue('demo-job')).toBeInTheDocument()
+    expect(screen.getByTestId('rf__node-src')).toBeInTheDocument()
+    expect(screen.getByTestId('rf__node-out')).toBeInTheDocument()
   })
 
   it('disables configuration proposal application for viewer role', async () => {
@@ -312,6 +375,17 @@ describe('AI Copilot SSE and Console workflows', () => {
       actions: ['read', 'read_audit'],
       onAiChat: () =>
         sseResponse([
+          {
+            event: 'proposal',
+            data: {
+              kind: 'stream_config',
+              title: 'Read-only Config Proposal',
+              summary: 'Cannot apply as viewer',
+              format: 'yaml',
+              content: 'streams:\n  - id: demo\n',
+              validated: true,
+            },
+          },
           {
             event: 'proposal',
             data: {
@@ -331,6 +405,10 @@ describe('AI Copilot SSE and Console workflows', () => {
     fireEvent.click(await screen.findByTestId('copilot-header-button'))
     expect(screen.queryByRole('button', { name: /Generate a Kafka/i })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /Diagnose recent fleet errors/i }))
+
+    const streamCard = await screen.findByTestId('copilot-proposal-stream')
+    expect(streamCard).toHaveTextContent('Read-only Config Proposal')
+    expect(screen.getByRole('button', { name: 'Apply to Configuration' })).toBeDisabled()
 
     const diagCard = await screen.findByTestId('copilot-proposal-diagnostic')
     expect(diagCard).toHaveTextContent('Check Events')

@@ -1215,10 +1215,36 @@ export type AiChatCallbacks = {
   onDelta?: (text: string) => void
   onProposal?: (proposal: AiProposal) => void
   onDone?: (event: {
-    usage: { prompt_tokens: number; completion_tokens: number }
+    usage?: { prompt_tokens: number; completion_tokens: number } | null
     tool_calls: string[]
   }) => void
   onError?: (code: string, message: string) => void
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isValidProposal(obj: Record<string, unknown>): obj is AiProposal {
+  if (typeof obj.title !== 'string' || typeof obj.summary !== 'string') return false
+  if (obj.kind === 'stream_config') {
+    return (
+      (obj.format === 'yaml' || obj.format === 'json') &&
+      typeof obj.content === 'string' &&
+      typeof obj.validated === 'boolean'
+    )
+  }
+  if (obj.kind === 'job_spec') {
+    return isPlainRecord(obj.spec) && typeof obj.validated === 'boolean'
+  }
+  if (obj.kind === 'diagnostic_action') {
+    return (
+      (obj.severity === 'info' || obj.severity === 'warn' || obj.severity === 'critical') &&
+      typeof obj.route === 'string' &&
+      typeof obj.action_label === 'string'
+    )
+  }
+  return false
 }
 
 export function dispatchAiSseFrame(eventType: string, rawData: string, callbacks: AiChatCallbacks): void {
@@ -1229,30 +1255,59 @@ export function dispatchAiSseFrame(eventType: string, rawData: string, callbacks
   } catch {
     return
   }
-  const obj = parsed as Record<string, unknown>
+  if (!isPlainRecord(parsed)) return
+  const obj = parsed
   switch (eventType) {
     case 'tool_start':
-      callbacks.onToolStart?.(obj as { call_id: string; tool: string; summary: string })
+      if (
+        typeof obj.call_id === 'string' &&
+        typeof obj.tool === 'string' &&
+        typeof obj.summary === 'string'
+      ) {
+        callbacks.onToolStart?.({ call_id: obj.call_id, tool: obj.tool, summary: obj.summary })
+      }
       break
     case 'tool_result':
-      callbacks.onToolResult?.(obj as { call_id: string; tool: string; ok: boolean; summary: string })
+      if (
+        typeof obj.call_id === 'string' &&
+        typeof obj.tool === 'string' &&
+        typeof obj.ok === 'boolean' &&
+        typeof obj.summary === 'string'
+      ) {
+        callbacks.onToolResult?.({
+          call_id: obj.call_id,
+          tool: obj.tool,
+          ok: obj.ok,
+          summary: obj.summary,
+        })
+      }
       break
     case 'delta':
       if (typeof obj.text === 'string') callbacks.onDelta?.(obj.text)
       break
     case 'proposal':
-      callbacks.onProposal?.(obj as unknown as AiProposal)
+      if (isValidProposal(obj)) callbacks.onProposal?.(obj)
       break
-    case 'done':
-      callbacks.onDone?.(
-        obj as { usage: { prompt_tokens: number; completion_tokens: number }; tool_calls: string[] },
-      )
+    case 'done': {
+      const toolCalls = Array.isArray(obj.tool_calls)
+        ? obj.tool_calls.filter((item): item is string => typeof item === 'string')
+        : []
+      const usage =
+        isPlainRecord(obj.usage) &&
+        typeof obj.usage.prompt_tokens === 'number' &&
+        typeof obj.usage.completion_tokens === 'number'
+          ? { prompt_tokens: obj.usage.prompt_tokens, completion_tokens: obj.usage.completion_tokens }
+          : null
+      callbacks.onDone?.({ usage, tool_calls: toolCalls })
       break
+    }
     case 'error':
-      callbacks.onError?.(
-        typeof obj.code === 'string' ? obj.code : 'ai_error',
-        typeof obj.message === 'string' ? obj.message : 'AI Copilot request failed',
-      )
+      if (typeof obj.code === 'string' || typeof obj.message === 'string') {
+        callbacks.onError?.(
+          typeof obj.code === 'string' ? obj.code : 'ai_error',
+          typeof obj.message === 'string' ? obj.message : 'AI Copilot request failed',
+        )
+      }
       break
     default:
       break
@@ -1338,7 +1393,7 @@ export function streamAiCopilotChat(
       }
 
       if (!controller.signal.aborted && !sawTerminal) {
-        callbacks.onDone?.({ usage: { prompt_tokens: 0, completion_tokens: 0 }, tool_calls: [] })
+        callbacks.onError?.('ai_stream_incomplete', 'AI Copilot stream ended before completion event')
       }
     } catch (cause) {
       if (!controller.signal.aborted) {

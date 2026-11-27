@@ -84,9 +84,44 @@ pub fn redact_for_ai(value: &Value) -> Value {
     }
 }
 
-/// Mask `Bearer <token>` fragments and URL passwords in free-text event or
-/// audit strings before sending them to an upstream LLM.
+/// Mask `Bearer <token>` fragments and embedded `scheme://user:password@` URLs
+/// in free-text strings before sending them to an upstream LLM.
 pub fn redact_text_for_ai(text: &str) -> String {
+    let bearer_masked = mask_bearer_tokens(text);
+    let url_masked = mask_inline_url_credentials(&bearer_masked);
+    if let Value::String(final_masked) = redacted_value(&Value::String(url_masked.clone())) {
+        final_masked
+    } else {
+        url_masked
+    }
+}
+
+/// Redact YAML/JSON config fragments structurally when parseable, and apply
+/// line-level key/URL/Bearer redaction for partial snippets or plain text while
+/// keeping `${secret:...}` / `${env:...}` / `${file:...}` placeholders intact.
+pub fn redact_config_or_text_for_ai(text: &str) -> String {
+    let trimmed = text.trim();
+    if (trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.contains(':'))
+        && !trimmed.is_empty()
+    {
+        if let Ok(val) = serde_yaml::from_str::<Value>(text) {
+            if matches!(val, Value::Object(_) | Value::Array(_)) {
+                let redacted = redact_for_ai(&val);
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    if let Ok(json_out) = serde_json::to_string_pretty(&redacted) {
+                        return redact_text_for_ai(&json_out);
+                    }
+                } else if let Ok(yaml_out) = serde_yaml::to_string(&redacted) {
+                    return redact_text_for_ai(&yaml_out);
+                }
+            }
+        }
+    }
+    let line_masked = mask_secret_key_lines(text);
+    redact_text_for_ai(&line_masked)
+}
+
+fn mask_bearer_tokens(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = rest.to_ascii_lowercase().find("bearer ") {
@@ -101,11 +136,102 @@ pub fn redact_text_for_ai(text: &str) -> String {
         rest = &after[token_end..];
     }
     result.push_str(rest);
-    if let Value::String(url_masked) = redacted_value(&Value::String(result.clone())) {
-        url_masked
-    } else {
-        result
+    result
+}
+
+fn mask_inline_url_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_pos) = rest.find("://") {
+        let head = &rest[..scheme_pos + 3];
+        out.push_str(head);
+        let after_scheme = &rest[scheme_pos + 3..];
+        let url_end = after_scheme
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | ')' | ']' | '}')
+            })
+            .unwrap_or(after_scheme.len());
+        let url_body = &after_scheme[..url_end];
+        if let Some(at_pos) = url_body.find('@') {
+            let userinfo = &url_body[..at_pos];
+            if let Some(colon_pos) = userinfo.find(':') {
+                out.push_str(&userinfo[..colon_pos + 1]);
+                out.push_str("******");
+                out.push_str(&url_body[at_pos..]);
+            } else {
+                out.push_str(url_body);
+            }
+        } else {
+            out.push_str(url_body);
+        }
+        rest = &after_scheme[url_end..];
     }
+    out.push_str(rest);
+    out
+}
+
+fn mask_secret_key_lines(text: &str) -> String {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let trimmed_start = line.trim_start();
+        let leading = &line[..line.len() - trimmed_start.len()];
+        let candidate = trimmed_start.strip_prefix("- ").unwrap_or(trimmed_start);
+        let prefix_dash = if trimmed_start.starts_with("- ") {
+            "- "
+        } else {
+            ""
+        };
+        if let Some((raw_key, raw_val)) = candidate.split_once(':') {
+            let clean_key = raw_key.trim().trim_matches(|c| c == '"' || c == '\'');
+            let val_trimmed = raw_val.trim();
+            if is_secret_key(clean_key) && !val_trimmed.is_empty() {
+                let unquoted = val_trimmed
+                    .trim_end_matches(',')
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'');
+                if !unquoted.starts_with("${secret:")
+                    && !unquoted.starts_with("${env:")
+                    && !unquoted.starts_with("${file:")
+                    && unquoted != "******"
+                {
+                    let trailing_comma = if val_trimmed.ends_with(',') { "," } else { "" };
+                    lines.push(format!(
+                        "{leading}{prefix_dash}{raw_key}: \"******\"{trailing_comma}"
+                    ));
+                    continue;
+                }
+            }
+        }
+        lines.push(line.to_string());
+    }
+    let mut joined = lines.join("\n");
+    if text.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// Return true if `name` is a known built-in Copilot tool name.
+pub fn is_known_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "list_components"
+            | "get_component_schema"
+            | "get_fleet_overview"
+            | "list_nodes"
+            | "get_node_configuration"
+            | "list_jobs"
+            | "get_job_detail"
+            | "get_job_plan"
+            | "list_events"
+            | "get_metrics_summary"
+            | "list_audit_events"
+            | "validate_stream_config"
+            | "validate_job_spec"
+            | "emit_stream_config_proposal"
+            | "emit_job_spec_proposal"
+            | "emit_diagnostic_action"
+    )
 }
 
 fn pure_secret_reference(value: &Value) -> Option<&str> {
@@ -306,7 +432,7 @@ pub fn tool_definitions_for_principal(principal: &OperatorPrincipal) -> Vec<Valu
         ),
     ]);
 
-    if principal.can(OperatorAction::ReadAudit) {
+    if principal.can_scope(OperatorAction::ReadAudit, "audit", None) {
         tools.push(tool_def(
             "list_audit_events",
             "List recent control-plane audit records (requires ReadAudit permission).",
@@ -875,13 +1001,13 @@ async fn exec_list_audit_events(
     principal: &OperatorPrincipal,
     args: &Value,
 ) -> (Value, Option<AiProposal>) {
-    if !principal.can(OperatorAction::ReadAudit) {
-        return denied(OperatorAction::ReadAudit, "audit");
-    }
     let resource_id = args
         .get("resource_id")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    if !principal.can_scope(OperatorAction::ReadAudit, "audit", resource_id.as_deref()) {
+        return denied(OperatorAction::ReadAudit, "audit");
+    }
     let action = args
         .get("action")
         .and_then(Value::as_str)
@@ -965,6 +1091,8 @@ fn validate_stream_candidate_content(
         Err(direct_err) => {
             // If the direct parse failed only because a non-string field holds
             // a `${...}` reference (e.g. a port), fall back to full resolution.
+            // Never return raw resolved messages from this fallback so resolved
+            // `${secret:...}` / `${env:...}` values cannot reach the upstream LLM.
             if content.contains("${") {
                 let candidate = ConfigCandidate {
                     format,
@@ -972,7 +1100,15 @@ fn validate_stream_candidate_content(
                     content_verbatim: None,
                 };
                 if let Ok(report) = parse_and_validate(&candidate) {
-                    return Ok(report.errors);
+                    let sanitized = report
+                        .errors
+                        .into_iter()
+                        .map(|err| ConfigIssue {
+                            path: err.path,
+                            message: "Validation constraint failed after resolving ${...} references (details redacted)".into(),
+                        })
+                        .collect();
+                    return Ok(sanitized);
                 }
             }
             Err(direct_err)
@@ -1124,7 +1260,18 @@ fn exec_emit_job_spec_proposal(
     let Some(spec_val) = args.get("spec") else {
         return invalid_args("Missing required object field 'spec'");
     };
-    let mode = args.get("mode").and_then(Value::as_str).map(str::to_owned);
+    let mode = match args.get("mode") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) if matches!(raw.as_str(), "create" | "upgrade") => {
+            Some(raw.clone())
+        }
+        Some(Value::String(other)) => {
+            return invalid_args(format!(
+                "Unsupported mode '{other}'; expected 'create' or 'upgrade'"
+            ));
+        }
+        Some(_) => return invalid_args("Field 'mode' must be a string ('create' or 'upgrade')"),
+    };
     let target_job_id = args
         .get("target_job_id")
         .and_then(Value::as_str)
@@ -1407,6 +1554,61 @@ streams:
         )
         .await;
         assert_eq!(res["error"], "forbidden");
+        assert!(prop.is_none());
+    }
+
+    #[test]
+    fn redacts_multiline_yaml_and_inline_urls() {
+        let draft = "streams:\n  - input:\n      password: plain-secret\n      api_key: ${secret:KEEP_ME}\n      dsn: postgres://u:urlsecret@db.internal:5432/app\n";
+        let masked = redact_config_or_text_for_ai(draft);
+        assert!(!masked.contains("plain-secret"), "{masked}");
+        assert!(!masked.contains("urlsecret"), "{masked}");
+        assert!(masked.contains("${secret:KEEP_ME}"), "{masked}");
+
+        let partial = "password: raw-pw\nurl: https://alice:s3cr3t@example.com/hook";
+        let partial_masked = redact_config_or_text_for_ai(partial);
+        assert!(!partial_masked.contains("raw-pw"), "{partial_masked}");
+        assert!(!partial_masked.contains("s3cr3t"), "{partial_masked}");
+
+        let prose = "failed connecting to https://alice:pw123@hub.local/api with Bearer tok123";
+        let prose_masked = redact_text_for_ai(prose);
+        assert!(!prose_masked.contains("pw123"), "{prose_masked}");
+        assert!(!prose_masked.contains("tok123"), "{prose_masked}");
+    }
+
+    #[tokio::test]
+    async fn node_scoped_viewer_cannot_list_audit_events_and_invalid_job_mode_fails() {
+        let hub = Hub::new(hub_config());
+        let scoped_viewer = principal_with(
+            OperatorRole::Viewer,
+            vec![ResourceScope {
+                resource_type: "node".into(),
+                resource_id: Some("node-a".into()),
+            }],
+        );
+        let tools: Vec<_> = tool_definitions_for_principal(&scoped_viewer)
+            .into_iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(str::to_owned))
+            .collect();
+        assert!(!tools.contains(&"list_audit_events".to_string()));
+
+        let (res, _) = execute_tool(&hub, &scoped_viewer, "list_audit_events", &json!({})).await;
+        assert_eq!(res["error"], "forbidden");
+
+        let admin = principal_with(OperatorRole::Admin, vec![]);
+        let (bad_mode, prop) = execute_tool(
+            &hub,
+            &admin,
+            "emit_job_spec_proposal",
+            &json!({
+                "title": "Job",
+                "summary": "Summary",
+                "mode": "replace",
+                "spec": {}
+            }),
+        )
+        .await;
+        assert_eq!(bad_mode["error"], "invalid_arguments");
         assert!(prop.is_none());
     }
 }

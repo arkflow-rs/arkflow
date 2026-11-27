@@ -237,8 +237,6 @@ pub struct Hub {
     identity_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Process start of this Hub instance, for `/status` uptime reporting.
     started_at: std::time::Instant,
-    /// Whether Hub AI Copilot is enabled on the active router.
-    ai_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -356,17 +354,7 @@ impl Hub {
             oidc: None,
             identity_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             started_at: std::time::Instant::now(),
-            ai_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
-    }
-
-    pub fn set_ai_enabled(&self, enabled: bool) {
-        self.ai_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn ai_enabled(&self) -> bool {
-        self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn with_storage(config: HubConfig, storage: StorageActor) -> Self {

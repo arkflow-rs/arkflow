@@ -4,7 +4,8 @@
 
 use crate::api_contract::OperatorPrincipal;
 use crate::hub::ai_tools::{
-    execute_tool, redact_text_for_ai, tool_definitions_for_principal, AiProposal,
+    execute_tool, is_known_tool_name, redact_config_or_text_for_ai, redact_text_for_ai,
+    tool_definitions_for_principal, AiProposal,
 };
 use crate::hub::Hub;
 use reqwest::Client;
@@ -21,6 +22,9 @@ pub const MAX_CHAT_MESSAGES: usize = 40;
 pub const MAX_CHAT_CHARS: usize = 65_536;
 const MAX_AI_RATE_BUCKETS: usize = 1024;
 const MAX_TOOL_OUTPUT_CHARS: usize = 24_000;
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_ROUND_OUTPUT_BYTES: usize = 512 * 1024;
 
 /// Configuration for the Hub-only AI Copilot proxy (`ServerConfig.ai` and
 /// `ARKFLOW_AI_*` environment overrides).
@@ -94,11 +98,18 @@ impl AiCopilotConfig {
                     .to_string()
             })?;
         let parsed = reqwest::Url::parse(api_base)
-            .map_err(|err| format!("invalid ai.api_base '{api_base}': {err}"))?;
+            .map_err(|_| "ai.api_base (or ARKFLOW_AI_API_BASE) is not a valid URL".to_string())?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return Err(format!(
-                "ai.api_base '{api_base}' must be an http:// or https:// URL with a host"
-            ));
+            return Err(
+                "ai.api_base (or ARKFLOW_AI_API_BASE) must be an http:// or https:// URL with a host"
+                    .to_string(),
+            );
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(
+                "ai.api_base (or ARKFLOW_AI_API_BASE) must not contain query parameters or fragments"
+                    .to_string(),
+            );
         }
         let model = self
             .model
@@ -183,7 +194,7 @@ pub enum AiStreamEvent {
     },
     Proposal(AiProposal),
     Done {
-        usage: AiUsage,
+        usage: Option<AiUsage>,
         tool_calls: Vec<String>,
     },
     Error {
@@ -196,7 +207,7 @@ pub enum AiStreamEvent {
 pub struct AiSessionSummary {
     pub model: String,
     pub tool_calls: Vec<String>,
-    pub usage: AiUsage,
+    pub usage: Option<AiUsage>,
     pub outcome: &'static str,
     pub failure_code: Option<String>,
     pub duration_ms: u64,
@@ -236,9 +247,9 @@ impl AiRateLimiter {
     }
 
     pub fn check(&self, principal_id: &str) -> Result<(), u64> {
-        let now = Instant::now();
         let key = hash_principal(principal_id);
         let mut table = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
         if !table.contains_key(&key) && table.len() >= MAX_AI_RATE_BUCKETS {
             let idle_window = Duration::from_secs_f64((2.0 * self.burst / self.rps).max(60.0));
             table.retain(|_, bucket| now.duration_since(bucket.last_refill) < idle_window);
@@ -246,7 +257,8 @@ impl AiRateLimiter {
         if !table.contains_key(&key) && table.len() >= MAX_AI_RATE_BUCKETS {
             drop(table);
             let mut catch_all = self.catch_all.lock().unwrap_or_else(|e| e.into_inner());
-            return take_token(&mut catch_all, self.rps, self.burst, now);
+            let catch_now = Instant::now();
+            return take_token(&mut catch_all, self.rps, self.burst, catch_now);
         }
         let bucket = table.entry(key).or_insert_with(|| Bucket {
             tokens: self.burst,
@@ -336,7 +348,7 @@ pub fn validate_chat_request(req: &AiChatRequest) -> Result<(), String> {
             "messages exceeds maximum of {MAX_CHAT_MESSAGES} turns"
         ));
     }
-    let mut total_chars = 0usize;
+    let mut total_bytes = 0usize;
     for msg in &req.messages {
         if !matches!(msg.role.as_str(), "user" | "assistant") {
             return Err(format!(
@@ -347,22 +359,34 @@ pub fn validate_chat_request(req: &AiChatRequest) -> Result<(), String> {
         if msg.content.trim().is_empty() {
             return Err("message content must not be empty".to_string());
         }
-        total_chars = total_chars.saturating_add(msg.content.len());
+        total_bytes = total_bytes.saturating_add(msg.content.len());
     }
     if let Some(ctx) = &req.context {
-        if let Some(draft) = &ctx.draft_content {
-            total_chars = total_chars.saturating_add(draft.len());
-        }
-        if let Some(err) = &ctx.error_summary {
-            total_chars = total_chars.saturating_add(err.len());
+        for field in [
+            ctx.page.as_deref(),
+            ctx.node_id.as_deref(),
+            ctx.job_id.as_deref(),
+            ctx.stream_id.as_deref(),
+            ctx.draft_format.as_deref(),
+            ctx.draft_content.as_deref(),
+            ctx.error_summary.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            total_bytes = total_bytes.saturating_add(field.len());
         }
     }
-    if total_chars > MAX_CHAT_CHARS {
+    if total_bytes > MAX_CHAT_CHARS {
         return Err(format!(
-            "request payload exceeds maximum budget of {MAX_CHAT_CHARS} characters"
+            "request payload exceeds maximum budget of {MAX_CHAT_CHARS} bytes"
         ));
     }
     Ok(())
+}
+
+async fn send_terminal_event(tx: &mpsc::Sender<AiStreamEvent>, event: AiStreamEvent) {
+    let _ = tokio::time::timeout(Duration::from_millis(250), tx.send(event)).await;
 }
 
 /// Run the bounded OpenAI-compatible tool-calling orchestration loop and stream
@@ -382,7 +406,7 @@ pub async fn run_copilot_session(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let mut invoked_tools = Vec::new();
-    let mut total_usage = AiUsage::default();
+    let mut total_usage: Option<AiUsage> = None;
 
     let timeout_duration = Duration::from_millis(service.config.timeout_ms.max(1_000));
     let outcome_result = tokio::time::timeout(timeout_duration, async {
@@ -404,12 +428,14 @@ pub async fn run_copilot_session(
     let duration_ms = started.elapsed().as_millis() as u64;
     match outcome_result {
         Ok(Ok(())) => {
-            let _ = tx
-                .send(AiStreamEvent::Done {
+            send_terminal_event(
+                &tx,
+                AiStreamEvent::Done {
                     usage: total_usage.clone(),
                     tool_calls: invoked_tools.clone(),
-                })
-                .await;
+                },
+            )
+            .await;
             AiSessionSummary {
                 model,
                 tool_calls: invoked_tools,
@@ -421,12 +447,14 @@ pub async fn run_copilot_session(
         }
         Ok(Err((code, message))) => {
             if code != "ai_cancelled" {
-                let _ = tx
-                    .send(AiStreamEvent::Error {
+                send_terminal_event(
+                    &tx,
+                    AiStreamEvent::Error {
                         code: code.clone(),
                         message,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             AiSessionSummary {
                 model,
@@ -443,15 +471,17 @@ pub async fn run_copilot_session(
         }
         Err(_) => {
             let code = "ai_timeout".to_string();
-            let _ = tx
-                .send(AiStreamEvent::Error {
+            send_terminal_event(
+                &tx,
+                AiStreamEvent::Error {
                     code: code.clone(),
                     message: format!(
                         "AI Copilot request exceeded {}ms timeout",
                         service.config.timeout_ms
                     ),
-                })
-                .await;
+                },
+            )
+            .await;
             AiSessionSummary {
                 model,
                 tool_calls: invoked_tools,
@@ -471,7 +501,7 @@ async fn run_loop(
     request: AiChatRequest,
     tx: &mpsc::Sender<AiStreamEvent>,
     invoked_tools: &mut Vec<String>,
-    total_usage: &mut AiUsage,
+    total_usage: &mut Option<AiUsage>,
 ) -> Result<(), (String, String)> {
     let tools = tool_definitions_for_principal(principal);
     if tools.is_empty() {
@@ -488,7 +518,7 @@ async fn run_loop(
     for msg in request.messages {
         messages.push(json!({
             "role": msg.role,
-            "content": msg.content,
+            "content": redact_config_or_text_for_ai(&msg.content),
         }));
     }
 
@@ -520,7 +550,12 @@ async fn run_loop(
         }));
 
         for tc in round_out.tool_calls {
-            invoked_tools.push(tc.name.clone());
+            let audit_name = if is_known_tool_name(&tc.name) {
+                tc.name.clone()
+            } else {
+                "<unknown_tool>".to_string()
+            };
+            invoked_tools.push(audit_name);
             let _ = tx
                 .send(AiStreamEvent::ToolStart {
                     call_id: tc.id.clone(),
@@ -572,11 +607,7 @@ async fn run_loop(
                 })
                 .await;
 
-            let mut content_str = result_json.to_string();
-            if content_str.len() > MAX_TOOL_OUTPUT_CHARS {
-                content_str.truncate(MAX_TOOL_OUTPUT_CHARS);
-                content_str.push_str("...[truncated]");
-            }
+            let content_str = truncate_str(&result_json.to_string(), MAX_TOOL_OUTPUT_CHARS);
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -609,13 +640,14 @@ async fn call_openai_stream(
     messages: &[Value],
     tools: &[Value],
     tx: &mpsc::Sender<AiStreamEvent>,
-    total_usage: &mut AiUsage,
+    total_usage: &mut Option<AiUsage>,
 ) -> Result<RoundOutput, (String, String)> {
     let api_base = service
         .config
         .api_base
         .as_deref()
-        .map(|s| s.trim_end_matches('/'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             (
                 "ai_not_configured".to_string(),
@@ -629,19 +661,41 @@ async fn call_openai_stream(
         )
     })?;
 
-    let url = format!("{api_base}/chat/completions");
+    let mut endpoint = reqwest::Url::parse(api_base).map_err(|_| {
+        (
+            "ai_not_configured".to_string(),
+            "AI api_base is not a valid URL".to_string(),
+        )
+    })?;
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    {
+        let mut segments = endpoint.path_segments_mut().map_err(|()| {
+            (
+                "ai_not_configured".to_string(),
+                "AI api_base cannot serve as a base URL".to_string(),
+            )
+        })?;
+        segments.pop_if_empty();
+        segments.push("chat");
+        segments.push("completions");
+    }
+
     let mut body = json!({
         "model": model,
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
         "stream": true,
+        "stream_options": {
+            "include_usage": true,
+        },
     });
     if let Some(max_tokens) = service.config.max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
 
-    let mut req = service.client.post(&url).json(&body);
+    let mut req = service.client.post(endpoint).json(&body);
     if let Some(api_key) = service
         .config
         .api_key
@@ -652,16 +706,29 @@ async fn call_openai_stream(
         req = req.bearer_auth(api_key);
     }
 
-    let response = req.send().await.map_err(|err| {
+    let mut response = req.send().await.map_err(|err| {
+        let safe_err = err.without_url();
         (
             "ai_provider_error".to_string(),
-            format!("Upstream LLM request failed: {err}"),
+            format!("Upstream LLM request failed: {safe_err}"),
         )
     })?;
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let mut err_buf = Vec::new();
+        while let Some(chunk) = response.chunk().await.unwrap_or(None) {
+            let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(err_buf.len());
+            if remaining == 0 {
+                break;
+            }
+            let take = chunk.len().min(remaining);
+            err_buf.extend_from_slice(&chunk[..take]);
+            if err_buf.len() >= MAX_ERROR_BODY_BYTES {
+                break;
+            }
+        }
+        let body_text = String::from_utf8_lossy(&err_buf).into_owned();
         let lower = body_text.to_ascii_lowercase();
         let code = if status.as_u16() == 400 || status.as_u16() == 422 {
             if lower.contains("tool") || lower.contains("function") {
@@ -684,20 +751,30 @@ async fn call_openai_stream(
 
     let mut content = String::new();
     let mut calls: BTreeMap<u64, (Option<String>, Option<String>, String)> = BTreeMap::new();
-    let mut buffer = String::new();
-    let mut response = response;
+    let mut byte_buf: Vec<u8> = Vec::new();
+    let mut round_bytes: usize = 0;
+    let mut saw_completion = false;
 
     'outer: while let Some(bytes) = response.chunk().await.map_err(|err| {
+        let safe_err = err.without_url();
         (
             "ai_provider_error".to_string(),
-            format!("Upstream LLM stream read error: {err}"),
+            format!("Upstream LLM stream read error: {safe_err}"),
         )
     })? {
-        buffer.push_str(&String::from_utf8_lossy(&bytes));
+        if byte_buf.len().saturating_add(bytes.len()) > MAX_SSE_LINE_BYTES {
+            return Err((
+                "ai_provider_error".to_string(),
+                "Upstream LLM SSE frame exceeded buffer limit".to_string(),
+            ));
+        }
+        byte_buf.extend_from_slice(&bytes);
 
-        while let Some(newline_pos) = buffer.find('\n') {
-            let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
-            buffer.drain(..=newline_pos);
+        while let Some(newline_pos) = byte_buf.iter().position(|&b| b == b'\n') {
+            let line_bytes = byte_buf[..newline_pos].to_vec();
+            byte_buf.drain(..=newline_pos);
+            let line_decoded = String::from_utf8_lossy(&line_bytes);
+            let line = line_decoded.trim_end_matches('\r');
 
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with(':') {
@@ -708,6 +785,7 @@ async fn call_openai_stream(
             };
             let payload = payload.trim();
             if payload == "[DONE]" {
+                saw_completion = true;
                 break 'outer;
             }
             if payload.is_empty() {
@@ -729,22 +807,32 @@ async fn call_openai_stream(
                 ));
             }
             if let Some(usage) = parsed.get("usage").and_then(Value::as_object) {
+                let entry = total_usage.get_or_insert_with(AiUsage::default);
                 if let Some(p) = usage.get("prompt_tokens").and_then(Value::as_u64) {
-                    total_usage.prompt_tokens = total_usage.prompt_tokens.saturating_add(p);
+                    entry.prompt_tokens = entry.prompt_tokens.saturating_add(p);
                 }
                 if let Some(c) = usage.get("completion_tokens").and_then(Value::as_u64) {
-                    total_usage.completion_tokens = total_usage.completion_tokens.saturating_add(c);
+                    entry.completion_tokens = entry.completion_tokens.saturating_add(c);
                 }
             }
-            let Some(delta) = parsed
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("delta"))
-            else {
+            let Some(choice0) = parsed.get("choices").and_then(|c| c.get(0)) else {
+                continue;
+            };
+            if choice0.get("finish_reason").is_some_and(|v| !v.is_null()) {
+                saw_completion = true;
+            }
+            let Some(delta) = choice0.get("delta") else {
                 continue;
             };
             if let Some(delta_text) = delta.get("content").and_then(Value::as_str) {
                 if !delta_text.is_empty() {
+                    round_bytes = round_bytes.saturating_add(delta_text.len());
+                    if round_bytes > MAX_ROUND_OUTPUT_BYTES {
+                        return Err((
+                            "ai_provider_error".to_string(),
+                            "Upstream LLM output exceeded round byte limit".to_string(),
+                        ));
+                    }
                     content.push_str(delta_text);
                     let _ = tx
                         .send(AiStreamEvent::Delta {
@@ -769,12 +857,27 @@ async fn call_openai_stream(
                             }
                         }
                         if let Some(args_part) = func.get("arguments").and_then(Value::as_str) {
+                            round_bytes = round_bytes.saturating_add(args_part.len());
+                            if round_bytes > MAX_ROUND_OUTPUT_BYTES {
+                                return Err((
+                                    "ai_provider_error".to_string(),
+                                    "Upstream LLM tool arguments exceeded round byte limit"
+                                        .to_string(),
+                                ));
+                            }
                             entry.2.push_str(args_part);
                         }
                     }
                 }
             }
         }
+    }
+
+    if !saw_completion {
+        return Err((
+            "ai_provider_error".to_string(),
+            "Upstream LLM stream ended before completion signal".to_string(),
+        ));
     }
 
     let tool_calls = calls
@@ -846,7 +949,7 @@ fn build_system_prompt(principal: &OperatorPrincipal, context: Option<&AiUiConte
         if let Some(draft) = &ctx.draft_content {
             ctx_map.insert(
                 "draft_content".into(),
-                json!(redact_text_for_ai(&truncate_str(draft, 8_000))),
+                json!(truncate_str(&redact_config_or_text_for_ai(draft), 8_000)),
             );
         }
         if let Some(err) = &ctx.error_summary {
@@ -978,5 +1081,30 @@ mod tests {
             context: None,
         };
         assert!(validate_chat_request(&huge).is_err());
+
+        let huge_ctx = AiChatRequest {
+            messages: vec![AiChatMessage {
+                role: "user".into(),
+                content: "x".repeat(MAX_CHAT_CHARS - 10),
+            }],
+            context: Some(AiUiContext {
+                page: Some("/configuration/very-long-route-segment".into()),
+                ..AiUiContext::default()
+            }),
+        };
+        assert!(validate_chat_request(&huge_ctx).is_err());
+    }
+
+    #[test]
+    fn config_validation_rejects_query_and_never_echoes_secret_url() {
+        let with_query = AiCopilotConfig {
+            enabled: true,
+            api_base: Some("https://user:secretpw@llm.internal/v1?api_key=leakme".into()),
+            model: Some("gpt-4o-mini".into()),
+            ..AiCopilotConfig::default()
+        };
+        let err = with_query.validate().unwrap_err();
+        assert!(!err.contains("secretpw"), "{err}");
+        assert!(!err.contains("leakme"), "{err}");
     }
 }

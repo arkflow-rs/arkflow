@@ -94,12 +94,22 @@ export function useCopilot(): CopilotContextValue {
   return useContext(CopilotContext)
 }
 
+function isValidStoredMessage(entry: unknown): entry is CopilotMessage {
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return false
+  const rec = entry as Record<string, unknown>
+  return (
+    typeof rec.id === 'string' &&
+    typeof rec.content === 'string' &&
+    (rec.role === 'user' || rec.role === 'assistant')
+  )
+}
+
 function loadStoredMessages(): CopilotMessage[] {
   try {
     const raw = sessionStorage.getItem(STORAGE_KEY)
     if (!raw) return []
     const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? (parsed as CopilotMessage[]) : []
+    return Array.isArray(parsed) ? parsed.filter(isValidStoredMessage) : []
   } catch {
     return []
   }
@@ -132,7 +142,11 @@ export function CopilotProvider({
 
   const [open, setOpen] = useState(false)
   const [streaming, setStreaming] = useState(false)
-  const [messages, setMessages] = useState<CopilotMessage[]>(() => (enabled ? loadStoredMessages() : []))
+  const [sessionState, setSessionState] = useState<{ hydrated: boolean; messages: CopilotMessage[] }>(() => ({
+    hydrated: enabled,
+    messages: enabled ? loadStoredMessages() : [],
+  }))
+  const messages = sessionState.messages
   const [context, setContext] = useState<AiUiContext | undefined>(undefined)
   const [pendingConfigProposal, setPendingConfigProposal] = useState<PendingConfigProposal | null>(null)
   const [pendingJobProposal, setPendingJobProposal] = useState<PendingJobProposal | null>(null)
@@ -140,9 +154,16 @@ export function CopilotProvider({
   const abortRef = useRef<AbortController | null>(null)
   const messagesRef = useRef(messages)
   useEffect(() => {
+    if (enabled && !sessionState.hydrated) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate stored messages atomically once capability enables Copilot
+      setSessionState({ hydrated: true, messages: loadStoredMessages() })
+      return
+    }
     messagesRef.current = messages
-    if (enabled) saveStoredMessages(messages)
-  }, [messages, enabled])
+    if (enabled && sessionState.hydrated) {
+      saveStoredMessages(messages)
+    }
+  }, [enabled, sessionState.hydrated, messages])
 
   useEffect(() => {
     if (!enabled) {
@@ -165,7 +186,7 @@ export function CopilotProvider({
 
   const clear = useCallback(() => {
     stop()
-    setMessages([])
+    setSessionState({ hydrated: true, messages: [] })
     try {
       sessionStorage.removeItem(STORAGE_KEY)
     } catch {
@@ -201,11 +222,14 @@ export function CopilotProvider({
         proposals: [],
       }
 
-      setMessages((prev) => [...prev, userMsg, assistantMsg])
+      setSessionState((prev) => ({ hydrated: true, messages: [...prev.messages, userMsg, assistantMsg] }))
       setStreaming(true)
 
       const updateAssistant = (updater: (msg: CopilotMessage) => CopilotMessage) => {
-        setMessages((prev) => prev.map((m) => (m.id === assistantId ? updater(m) : m)))
+        setSessionState((prev) => ({
+          ...prev,
+          messages: prev.messages.map((m) => (m.id === assistantId ? updater(m) : m)),
+        }))
       }
 
       abortRef.current?.abort()
@@ -532,7 +556,9 @@ function ProposalCard({
       <div className="copilot-proposal" data-testid="copilot-proposal-stream">
         <div className="copilot-proposal-head">
           <strong>{proposal.title}</strong>
-          <span className="state converged">{t('copilot.validatedBadge')}</span>
+          <span className={proposal.validated ? 'state converged' : 'state'}>
+            {proposal.validated ? t('copilot.validatedBadge') : t('copilot.unvalidatedBadge')}
+          </span>
         </div>
         <p>{proposal.summary}</p>
         <pre className="copilot-proposal-code">{proposal.content}</pre>
@@ -559,7 +585,9 @@ function ProposalCard({
       <div className="copilot-proposal" data-testid="copilot-proposal-job">
         <div className="copilot-proposal-head">
           <strong>{proposal.title}</strong>
-          <span className="state converged">{t('copilot.validatedBadge')}</span>
+          <span className={proposal.validated ? 'state converged' : 'state'}>
+            {proposal.validated ? t('copilot.validatedBadge') : t('copilot.unvalidatedBadge')}
+          </span>
         </div>
         <p>{proposal.summary}</p>
         <pre className="copilot-proposal-code">{pretty}</pre>
