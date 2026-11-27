@@ -277,6 +277,11 @@
       "name": "pulsar-tls",
       "path": "../examples/pulsar_tls_example.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "amqp09",
+      "path": "../examples/amqp09_example.yaml",
+      "kind": "yaml"
     }
   ]
 }

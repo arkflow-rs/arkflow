@@ -18,6 +18,8 @@
 
 use arkflow_core::Error;
 
+#[cfg(feature = "connectors-amqp09")]
+pub mod amqp09;
 pub mod codec_helper;
 pub mod drop;
 pub mod http;
@@ -51,6 +53,8 @@ fn register_components() -> Result<(), Error> {
     #[allow(unused_mut)]
     let mut steps: Vec<fn() -> Result<(), Error>> =
         vec![drop::init, http::init, influxdb::init, stdout::init];
+    #[cfg(feature = "connectors-amqp09")]
+    steps.push(amqp09::init);
     #[cfg(feature = "connectors-kafka")]
     steps.push(kafka::init);
     #[cfg(feature = "ai-vector")]

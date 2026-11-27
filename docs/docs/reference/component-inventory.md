@@ -18,6 +18,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | codec | `json` | Encodes/decodes Arrow RecordBatches as JSON byte payloads. | [reference](../components/codecs/json) |
 | codec | `protobuf` | Encodes/decodes Arrow RecordBatches using a Protobuf descriptor. | [reference](../components/codecs/protobuf) |
 | codec | `schema_registry` | Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate. | [reference](../components/codecs/schema-registry) |
+| input | `amqp09` | Consumes messages from an AMQP 0.9/0.9.1 broker (such as RabbitMQ). | [reference](../components/inputs/amqp09) |
 | input | `file` | Reads records from local or remote object storage (S3, GCS, Azure, HDFS) in CSV/JSON/Parquet/Avro/Arrow formats. | [reference](../components/inputs/file) |
 | input | `generate` | Generates synthetic text messages on a fixed interval (useful for testing and load simulation). | [reference](../components/inputs/generate) |
 | input | `http` | Receives data via HTTP: runs a server that accepts POST requests on `address` + `path` and forwards each request body into the stream. | [reference](../components/inputs/http) |
@@ -31,6 +32,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | input | `redis` | Reads from Redis: blocking list pops or pub/sub subscriptions (channels or patterns). | [reference](../components/inputs/redis) |
 | input | `sql` | Runs a one-shot SELECT against a SQL database (MySQL / PostgreSQL / SQLite / DuckDB) and emits the rows as batches. | [reference](../components/inputs/sql) |
 | input | `websocket` | Connects to a WebSocket server and forwards each incoming message as a batch. | [reference](../components/inputs/websocket) |
+| output | `amqp09` | Publishes messages to an AMQP 0.9/0.9.1 exchange (such as RabbitMQ). | [reference](../components/outputs/amqp09) |
 | output | `drop` | Discards all messages. Useful for performance benchmarks and dead-end pipelines. | [reference](../components/outputs/drop) |
 | output | `http` | Posts each batch to an HTTP endpoint. Supports custom headers, retry, and auth. | [reference](../components/outputs/http) |
 | output | `influxdb` | Writes time-series data to InfluxDB v2.x using the Line Protocol. | [reference](../components/outputs/influxdb) |

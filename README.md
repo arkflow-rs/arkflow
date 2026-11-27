@@ -139,6 +139,7 @@ ArkFlow supports multiple input sources:
 - **Generate** (`generate`): Generate synthetic test data
 - **SQL** (`sql`): Query data from SQL databases (MySQL, PostgreSQL, SQLite)
 - **NATS** (`nats`): Subscribe to messages from NATS topics with JetStream support
+- **AMQP 0.9 / RabbitMQ** (`amqp09`): Consume messages from AMQP 0.9/0.9.1 (RabbitMQ) queues
 - **Pulsar** (`pulsar`): Subscribe to messages from Pulsar topics
 - **Redis** (`redis`): Subscribe to messages from Redis pub/sub channels or lists
 - **WebSocket** (`websocket`): Subscribe to messages from WebSocket connections
@@ -206,6 +207,7 @@ ArkFlow supports multiple output targets:
 - **InfluxDB** (`influxdb`): Write time-series data to InfluxDB 2.x
 - **MongoDB** (`mongodb`): Write documents to a MongoDB collection
 - **NATS** (`nats`): Publish messages to NATS topics
+- **AMQP 0.9 / RabbitMQ** (`amqp09`): Publish messages to AMQP 0.9/0.9.1 (RabbitMQ) exchanges
 - **Pulsar** (`pulsar`): Publish messages to Pulsar topics
 - **Redis** (`redis`): Write to Redis lists, hashes, strings, or pub/sub channels
 - **SQL** (`sql`): Write to SQL databases (MySQL, PostgreSQL) with batch inserts and UPSERT

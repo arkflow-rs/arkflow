@@ -17,7 +17,12 @@
 use arkflow_core::codec::Codec;
 // MessageBatchRef backs the Delivery channel (nats/mqtt inputs) and the
 // cancellation-safety test scaffolding, which exists only under cfg(test).
-#[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt", test))]
+#[cfg(any(
+    feature = "connectors-nats",
+    feature = "connectors-mqtt",
+    feature = "connectors-amqp09",
+    test
+))]
 use arkflow_core::MessageBatchRef;
 use arkflow_core::{Bytes, Error, MessageBatch};
 use std::sync::Arc;
@@ -165,7 +170,11 @@ pub async fn apply_codec_to_payloads(
 /// This is the `Input::read` cancellation-safety contract in arkflow-core.
 /// Gated with the families whose inputs use the delivery channel (nats,
 /// mqtt); unconditional inputs read without it.
-#[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+#[cfg(any(
+    feature = "connectors-nats",
+    feature = "connectors-mqtt",
+    feature = "connectors-amqp09"
+))]
 pub(crate) enum Delivery {
     /// One decoded batch and the acknowledgement that settles it.
     Data(MessageBatchRef, Arc<dyn arkflow_core::input::Ack>),
@@ -177,7 +186,11 @@ pub(crate) enum Delivery {
 /// codec applied, input name stamped, ack paired. Decode failures become
 /// `Delivery::Err` so `read()` can surface them without claiming a slot
 /// first.
-#[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+#[cfg(any(
+    feature = "connectors-nats",
+    feature = "connectors-mqtt",
+    feature = "connectors-amqp09"
+))]
 pub(crate) async fn decode_delivery(
     payload: &[u8],
     codec: &Option<Arc<dyn Codec>>,
@@ -354,12 +367,20 @@ pub(crate) mod contract {
     /// a producer task decodes (the gate parks there, outside any engine
     /// select) and the channel carries finished [`Delivery`] values; `read`
     /// awaits `recv` only, so a dropped read future loses nothing.
-    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+    #[cfg(any(
+        feature = "connectors-nats",
+        feature = "connectors-mqtt",
+        feature = "connectors-amqp09"
+    ))]
     pub(crate) struct ProducerDecodedInput {
         receiver: flume::Receiver<Delivery>,
     }
 
-    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+    #[cfg(any(
+        feature = "connectors-nats",
+        feature = "connectors-mqtt",
+        feature = "connectors-amqp09"
+    ))]
     impl ProducerDecodedInput {
         pub fn pair() -> (flume::Sender<Delivery>, Arc<Self>) {
             let (sender, receiver) = flume::bounded(8);
@@ -367,7 +388,11 @@ pub(crate) mod contract {
         }
     }
 
-    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+    #[cfg(any(
+        feature = "connectors-nats",
+        feature = "connectors-mqtt",
+        feature = "connectors-amqp09"
+    ))]
     #[async_trait]
     impl Input for ProducerDecodedInput {
         async fn connect(&self) -> Result<(), Error> {
@@ -389,7 +414,11 @@ pub(crate) mod contract {
 
     /// Drive a compliant input's producer side: one payload through the
     /// gate codec into a finished delivery.
-    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+    #[cfg(any(
+        feature = "connectors-nats",
+        feature = "connectors-mqtt",
+        feature = "connectors-amqp09"
+    ))]
     pub(crate) async fn produce_one_delivery(
         sender: flume::Sender<Delivery>,
         codec: Arc<GateCodec>,
@@ -429,7 +458,11 @@ mod tests {
         assert_eq!(batch.len(), 2);
     }
 
-    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+    #[cfg(any(
+        feature = "connectors-nats",
+        feature = "connectors-mqtt",
+        feature = "connectors-amqp09"
+    ))]
     #[tokio::test]
     async fn decode_delivery_without_codec_pairs_batch_and_ack() {
         let delivery = decode_delivery(
@@ -469,7 +502,11 @@ mod tests {
     /// Spec "合规实现零误报" (pattern level): a producer-decoded input passes
     /// the same probe — the dropped read loses nothing and the second read
     /// delivers exactly the one message.
-    #[cfg(any(feature = "connectors-nats", feature = "connectors-mqtt"))]
+    #[cfg(any(
+        feature = "connectors-nats",
+        feature = "connectors-mqtt",
+        feature = "connectors-amqp09"
+    ))]
     #[tokio::test]
     async fn compliant_producer_decoded_input_passes_the_probe() {
         use crate::input::codec_helper::contract::*;

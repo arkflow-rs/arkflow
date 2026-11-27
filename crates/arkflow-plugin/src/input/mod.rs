@@ -18,6 +18,8 @@
 
 use arkflow_core::Error;
 
+#[cfg(feature = "connectors-amqp09")]
+pub mod amqp09;
 pub mod codec_helper;
 pub mod file;
 pub mod generate;
@@ -52,6 +54,8 @@ fn register_components() -> Result<(), Error> {
         multiple_inputs::init,
         file::init,
     ];
+    #[cfg(feature = "connectors-amqp09")]
+    steps.push(amqp09::init);
     #[cfg(feature = "connectors-kafka")]
     steps.push(kafka::init);
     #[cfg(feature = "connectors-mqtt")]
