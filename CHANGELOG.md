@@ -86,11 +86,13 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Unbound OIDC browser sessions (`cp_sessions.user_id IS NULL`) are now
     revoked atomically inside the same storage transaction as user creation,
     update (bind/rebind/unbind/disable/role/scopes), and deletion — and by
-    `revoke_user_tokens` — eliminating partial-commit windows; `resolve_session`
-    also fails closed on read for unbound sessions whose subject is now bound
-    or when `managed_users_only` is enabled, and OIDC callback login no longer
-    mis-associates an unbound subject with an unrelated local `user_id` of the
-    same string.
+    `revoke_user_tokens` — eliminating partial-commit windows; federated login
+    admission (`Hub::admit_federated_session`) is serialized against identity
+    writes via `identity_write_lock`, `resolve_session` fails closed on read
+    for bound sessions whose role/scopes drifted from `cp_users` as well as
+    unbound sessions whose subject is now bound or when `managed_users_only`
+    is enabled, and OIDC callback login no longer mis-associates an unbound
+    subject with an unrelated local `user_id` of the same string.
   - Documented the configuration-approval segregation threat model
     (two-principal four-eyes review; the Hub does not prevent static, managed,
     or OIDC `admin` principals holding `ManageUsers` from creating local

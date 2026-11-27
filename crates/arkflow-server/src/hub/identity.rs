@@ -20,6 +20,15 @@ pub(crate) const MANAGED_TOKEN_PREFIX: &str = "ark_";
 pub(crate) const MAX_USERS: usize = 1024;
 pub(crate) const MAX_CREDENTIALS_PER_USER: usize = 16;
 
+/// Outcome of atomically evaluating federated directory admission and creating
+/// a durable browser session under `identity_write_lock`.
+pub(crate) enum FederatedSessionAdmission {
+    Unauthorized,
+    Volatile(OperatorPrincipal),
+    Created(String),
+    StorageFailed,
+}
+
 pub(crate) fn generate_secret() -> Result<String, HubError> {
     use rand::TryRngCore;
     let mut bytes = [0u8; 32];
@@ -592,13 +601,15 @@ impl Hub {
     /// must fail (no randomness, or no durable session store).
     pub async fn create_session(&self, principal: OperatorPrincipal) -> Option<String> {
         let storage = self.storage.as_ref()?;
+        let _guard = self.identity_write_lock.lock().await;
         let user_id = storage
             .get_user(&principal.id)
             .await
             .ok()
             .flatten()
             .map(|user| user.user_id);
-        self.create_session_for_user(principal, user_id).await
+        self.create_session_for_user_locked(principal, user_id)
+            .await
     }
 
     /// Persist a browser session with an explicit directory user binding
@@ -608,6 +619,51 @@ impl Hub {
     /// match an unrelated local `user_id` from being mis-associated with that
     /// local user.
     pub async fn create_session_for_user(
+        &self,
+        principal: OperatorPrincipal,
+        user_id: Option<String>,
+    ) -> Option<String> {
+        let _guard = self.identity_write_lock.lock().await;
+        self.create_session_for_user_locked(principal, user_id)
+            .await
+    }
+
+    /// Atomically evaluate directory admission for a validated OIDC principal
+    /// and persist its durable browser session while holding
+    /// `identity_write_lock`, serializing session creation against concurrent
+    /// `create_user`, `save_user`, `delete_user`, and `revoke_user_tokens`
+    /// mutations so a demoted role or narrowed scope cannot slip into a new
+    /// session between the directory read and the session insert.
+    pub(crate) async fn admit_federated_session(
+        &self,
+        principal: OperatorPrincipal,
+        issued_at_ms: Option<u64>,
+        managed_users_only: bool,
+    ) -> FederatedSessionAdmission {
+        if self.storage.is_none() {
+            return if managed_users_only {
+                FederatedSessionAdmission::Unauthorized
+            } else {
+                FederatedSessionAdmission::Volatile(principal)
+            };
+        }
+        let _guard = self.identity_write_lock.lock().await;
+        let Some((admitted, bound_user_id)) = self
+            .apply_federated_directory_with_binding(principal, issued_at_ms, managed_users_only)
+            .await
+        else {
+            return FederatedSessionAdmission::Unauthorized;
+        };
+        match self
+            .create_session_for_user_locked(admitted, bound_user_id)
+            .await
+        {
+            Some(session_id) => FederatedSessionAdmission::Created(session_id),
+            None => FederatedSessionAdmission::StorageFailed,
+        }
+    }
+
+    async fn create_session_for_user_locked(
         &self,
         principal: OperatorPrincipal,
         user_id: Option<String>,
@@ -632,8 +688,8 @@ impl Hub {
 
     /// Resolve a browser session id: storage-backed on a durable Hub, the
     /// in-memory federation map otherwise. Revoked, expired, disabled-user,
-    /// deleted-user, and now-bound unbound OIDC sessions are rejected
-    /// fail-closed.
+    /// deleted-user, authorization-drifted, and now-bound unbound OIDC
+    /// sessions are rejected fail-closed.
     pub async fn resolve_session(&self, session_id: &str) -> Option<OperatorPrincipal> {
         if let Some(storage) = self.storage.as_ref() {
             let record = storage
@@ -647,10 +703,20 @@ impl Hub {
                 serde_json::from_str::<OperatorPrincipal>(&record.principal_json).ok()?;
             if let Some(user_id) = record.user_id.as_deref() {
                 match storage.get_user(user_id).await {
-                    Ok(Some(user)) if user.disabled => return None,
-                    Ok(None) => return None,
-                    Err(_) => return None,
-                    Ok(Some(_)) => {}
+                    Ok(Some(user)) => {
+                        if user.disabled {
+                            return None;
+                        }
+                        // Defense-in-depth: never honor a session whose cached
+                        // role or scopes no longer match the live directory
+                        // record (closes any cross-process or stale-write race).
+                        let role = parse_role(&user.role)?;
+                        let scopes = scopes_from_json(&user.scopes_json)?;
+                        if principal.roles != [role] || principal.scopes != scopes {
+                            return None;
+                        }
+                    }
+                    Ok(None) | Err(_) => return None,
                 }
             } else {
                 // Defense-in-depth for unbound OIDC sessions (`user_id IS NULL`):

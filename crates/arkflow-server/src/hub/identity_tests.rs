@@ -1118,3 +1118,142 @@ async fn identity_write_and_session_revocation_roll_back_atomically() {
         "retry after rollback must revoke bob's old unbound session"
     );
 }
+
+#[tokio::test]
+async fn stale_authorization_session_is_rejected_and_federated_admission_serializes_with_updates() {
+    use crate::api_contract::{OperatorPrincipal, OperatorRole, ResourceScope};
+    use crate::hub::FederatedSessionAdmission;
+
+    let hub = identity_fixture("session_authz_drift_and_serialization", true).await;
+
+    let mut alice = user("alice", "admin");
+    alice.oidc_subject = Some("sub-alice".into());
+    hub.create_user(alice, "admin").await.unwrap();
+
+    // 1. Even if a stale bound session row exists in `cp_sessions` (e.g.
+    //    written before a role downgrade or across a failover), `resolve_session`
+    //    verifies role + scopes against the live directory record fail-closed.
+    let stale_role_session = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "alice".into(),
+                roles: vec![OperatorRole::Admin],
+                scopes: Vec::new(),
+            },
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    assert!(hub.resolve_session(&stale_role_session).await.is_some());
+
+    // Simulate a stale row carrying Admin privileges after alice is demoted
+    // to viewer (bypassing `save_user`'s in-tx delete by writing a stale row
+    // directly after the downgrade).
+    let mut demoted = hub.user("alice").await.unwrap().unwrap();
+    demoted.role = "viewer".into();
+    hub.save_user(demoted, "admin").await.unwrap();
+
+    let raced_stale_role = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "alice".into(),
+                roles: vec![OperatorRole::Admin],
+                scopes: Vec::new(),
+            },
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        hub.resolve_session(&raced_stale_role).await.is_none(),
+        "resolve_session must reject a bound session whose role drifted from cp_users"
+    );
+
+    // Same for narrowed scopes: a session carrying unscoped Viewer is rejected
+    // once alice is restricted to job:orders.
+    let mut narrowed = hub.user("alice").await.unwrap().unwrap();
+    narrowed.scopes_json = r#"[{"resource_type":"job","resource_id":"orders"}]"#.into();
+    hub.save_user(narrowed, "admin").await.unwrap();
+
+    let raced_stale_scopes = hub
+        .create_session_for_user(
+            OperatorPrincipal {
+                id: "alice".into(),
+                roles: vec![OperatorRole::Viewer],
+                scopes: Vec::new(),
+            },
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        hub.resolve_session(&raced_stale_scopes).await.is_none(),
+        "resolve_session must reject a bound session whose scopes drifted from cp_users"
+    );
+
+    // 2. Concurrent `admit_federated_session` vs `save_user` downgrade never
+    //    leaves a surviving Admin session after the downgrade completes, while
+    //    a fresh login succeeds with the updated Viewer + scoped privileges.
+    for round in 0..10 {
+        let mut promoted = hub.user("alice").await.unwrap().unwrap();
+        promoted.role = "admin".into();
+        promoted.scopes_json = "[]".into();
+        hub.save_user(promoted, "admin").await.unwrap();
+
+        let mut downgrade = hub.user("alice").await.unwrap().unwrap();
+        downgrade.role = "viewer".into();
+        downgrade.scopes_json = r#"[{"resource_type":"job","resource_id":"orders"}]"#.into();
+
+        let now = super::now_ms();
+        let claims = OperatorPrincipal {
+            id: "sub-alice".into(),
+            roles: vec![OperatorRole::Admin],
+            scopes: Vec::new(),
+        };
+        let (admission, save_res) = tokio::join!(
+            hub.admit_federated_session(claims.clone(), Some(now), true),
+            hub.save_user(downgrade, "admin"),
+        );
+        save_res.unwrap();
+
+        if let FederatedSessionAdmission::Created(session_id) = admission {
+            if let Some(resolved) = hub.resolve_session(&session_id).await {
+                assert_eq!(
+                    resolved.roles,
+                    vec![OperatorRole::Viewer],
+                    "round {round}: surviving session after downgrade must never keep Admin role"
+                );
+                assert_eq!(
+                    resolved.scopes,
+                    vec![ResourceScope {
+                        resource_type: "job".into(),
+                        resource_id: Some("orders".into()),
+                    }],
+                    "round {round}: surviving session after downgrade must carry updated scopes"
+                );
+            }
+        } else {
+            panic!("round {round}: expected Created session during concurrent admission");
+        }
+
+        // Fresh login after downgrade succeeds with the downgraded role/scopes.
+        let fresh = hub
+            .admit_federated_session(claims, Some(super::now_ms()), true)
+            .await;
+        let FederatedSessionAdmission::Created(fresh_session) = fresh else {
+            panic!("round {round}: fresh login after downgrade must succeed");
+        };
+        let resolved = hub
+            .resolve_session(&fresh_session)
+            .await
+            .expect("fresh session must resolve");
+        assert_eq!(resolved.roles, vec![OperatorRole::Viewer]);
+        assert_eq!(
+            resolved.scopes,
+            vec![ResourceScope {
+                resource_type: "job".into(),
+                resource_id: Some("orders".into()),
+            }]
+        );
+    }
+}

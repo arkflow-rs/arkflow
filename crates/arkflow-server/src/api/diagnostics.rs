@@ -374,27 +374,19 @@ pub(crate) async fn hub_oidc_callback(
     let issued_at_ms = issued_at
         .and_then(|seconds| u64::try_from(seconds).ok())
         .map(|seconds| seconds.saturating_mul(1000));
-    let Some((principal, bound_user_id)) = hub
-        .apply_federated_directory_with_binding(
-            principal,
-            issued_at_ms,
-            federation.managed_users_only(),
-        )
-        .await
-    else {
-        return unauthorized();
-    };
-    // Session ids are persisted (hashed) when the Hub has durable storage so
-    // they survive restarts and can be revoked per user; without storage the
-    // federation's in-memory fallback is used. On a durable Hub the fallback
-    // would create a session that `resolve_session` can never see, so a
-    // storage failure must fail the login instead.
+    // Session admission (directory read + durable `cp_sessions` insert) is
+    // serialized against concurrent user updates on a durable Hub so a
+    // concurrent role/scope downgrade cannot leave a new session carrying the
+    // old privileges; without storage the federation's in-memory fallback is
+    // used. On a durable Hub the fallback would create a session that
+    // `resolve_session` can never see, so a storage failure must fail the
+    // login instead.
     let session_id = match hub
-        .create_session_for_user(principal.clone(), bound_user_id)
+        .admit_federated_session(principal, issued_at_ms, federation.managed_users_only())
         .await
     {
-        Some(session_id) => session_id,
-        None if hub.storage().is_none() => {
+        hub::FederatedSessionAdmission::Created(session_id) => session_id,
+        hub::FederatedSessionAdmission::Volatile(principal) => {
             match hub
                 .oidc_login()
                 .and_then(|federation| federation.create_session(principal))
@@ -405,16 +397,17 @@ pub(crate) async fn hub_oidc_callback(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "session_create_failed",
                         "session cannot be created".into(),
-                    )
+                    );
                 }
             }
         }
-        None => {
+        hub::FederatedSessionAdmission::Unauthorized => return unauthorized(),
+        hub::FederatedSessionAdmission::StorageFailed => {
             return problem(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "session_create_failed",
                 "session cannot be created".into(),
-            )
+            );
         }
     };
     let max_age = oidc::session_ttl_secs();

@@ -26,7 +26,7 @@
 ### D3. Complete OIDC subject session revocation without schema bump
 
 - **No schema migration needed**: Unbound OIDC browser sessions already have `cp_sessions.user_id IS NULL` and `principal_json` carrying `OperatorPrincipal { id: "<oidc_subject>", ... }`. Bound sessions carry `user_id = Some("<user_id>")` and are already deleted by `DELETE FROM cp_sessions WHERE user_id = ?1`.
-- **Prevent `sub` ↔ `user_id` collision on login**: Split `apply_federated_directory` into `apply_federated_directory_with_binding(...) -> Option<(OperatorPrincipal, Option<String>)>` returning `Some(user.user_id)` only when matched via `cp_users.oidc_subject` and `None` when unbound. `hub_oidc_callback` passes that explicit `bound_user_id` into `Hub::create_session_for_user(principal, bound_user_id)`. Existing `Hub::create_session(principal)` stays compatible for direct callers/tests.
+- **Prevent `sub` ↔ `user_id` collision and login-vs-downgrade race**: Split `apply_federated_directory` into `apply_federated_directory_with_binding(...) -> Option<(OperatorPrincipal, Option<String>)>` returning `Some(user.user_id)` only when matched via `cp_users.oidc_subject` and `None` when unbound. `hub_oidc_callback` calls `Hub::admit_federated_session`, which acquires `self.identity_write_lock` around both directory admission and `cp_sessions` persistence so a concurrent `save_user` role/scope downgrade cannot interleave between the directory read and the session insert. Existing `Hub::create_session(principal)` and `Hub::create_session_for_user(...)` also acquire `self.identity_write_lock`.
 - **Write-side revocation (atomic in-transaction + `delete_sessions_by_oidc_subject`)**:
   - Add fenced `delete_sessions_by_oidc_subject(oidc_subject: &str) -> Result<usize, StorageError>` to `StorageBackend` (SQLite + PostgreSQL) and shared in-transaction helpers (`sqlite_delete_unbound_sessions_by_subject` / `pg_delete_unbound_sessions_by_subject`): inside a transaction, selects `(session_hash, principal_json)` from `cp_sessions WHERE user_id IS NULL`, parses `OperatorPrincipal`, and deletes matching `session_hash` rows.
   - Execute atomically inside the storage transaction on:
@@ -35,10 +35,11 @@
     - `delete_user`: read `oidc_subject` before deleting from `cp_users` and delete matching unbound sessions in the same transaction alongside `cp_credentials` and `user_id` sessions.
   - On `revoke_user_tokens`: delete both `user_id` sessions and `oidc_subject` unbound sessions and sum the count.
 - **Read-side defense-in-depth (`Hub::resolve_session`)**:
+  - When `record.user_id` is `Some(user_id)`: reject if the user is missing or disabled, or if the stored session's `principal.roles` / `principal.scopes` no longer match the live directory record (fail-closed on storage or parse error).
   - When `record.user_id` is `None`:
     - If `self.oidc` has `managed_users_only == true`, return `None`.
     - Parse `principal` from `record.principal_json` and check `storage.get_user_by_oidc_subject(&principal.id)`: if `Ok(Some(_))` (now bound to a directory user) or `Err(_)` (fail-closed), return `None`.
-  - Closes any race window between an in-flight OIDC callback creating an unbound session and a concurrent admin binding that subject.
+  - Closes any race window between an in-flight OIDC callback creating a session and a concurrent admin binding, demoting, or scoping that user across both SQLite and PostgreSQL.
 
 ### D4. Approval segregation threat model
 
