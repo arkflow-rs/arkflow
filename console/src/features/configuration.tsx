@@ -77,9 +77,15 @@ export function Configuration({
   const [activeSnapshot, setActiveSnapshot] = useState(false)
   const [showProposalDiff, setShowProposalDiff] = useState(false)
   const proposalLoadedForNodeRef = useRef<string | null>(null)
+  const validationTokenRef = useRef({ nodeId: nodeId ?? '', generation: 0 })
   useEffect(() => {
     proposalLoadedForNodeRef.current = null
+    validationTokenRef.current = {
+      nodeId: nodeId ?? '',
+      generation: validationTokenRef.current.generation + 1,
+    }
     // eslint-disable-next-line react-hooks/set-state-in-effect -- clear prior node edits and validation before new node snapshot/proposal hydrates
+    setBusy('')
     setEditable(false)
     setShowProposalDiff(false)
     setIssues([])
@@ -110,8 +116,16 @@ export function Configuration({
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setSaved(next.content)
     setSavedFormat(next.format)
-    if (proposalLoadedForNodeRef.current === (nodeId ?? '') || copilot.pendingConfigProposal) {
+    const pendingMatchesNode =
+      Boolean(copilot.pendingConfigProposal) &&
+      (!copilot.pendingConfigProposal?.proposal.node_id ||
+        copilot.pendingConfigProposal.proposal.node_id === (nodeId ?? ''))
+    if (proposalLoadedForNodeRef.current === (nodeId ?? '') || pendingMatchesNode) {
       return
+    }
+    validationTokenRef.current = {
+      nodeId: nodeId ?? '',
+      generation: validationTokenRef.current.generation + 1,
     }
     setContent(next.content)
     setFormat(next.format)
@@ -135,7 +149,13 @@ export function Configuration({
   const pendingProposal = copilot.pendingConfigProposal
   useEffect(() => {
     if (!pendingProposal || !systemKnown || fleetMode) return
+    const targetNode = pendingProposal.proposal.node_id
+    if (targetNode && targetNode !== (nodeId ?? '')) return
     proposalLoadedForNodeRef.current = nodeId ?? ''
+    validationTokenRef.current = {
+      nodeId: nodeId ?? '',
+      generation: validationTokenRef.current.generation + 1,
+    }
     // eslint-disable-next-line react-hooks/set-state-in-effect -- consuming an explicit Copilot proposal into local candidate state
     setFormat(pendingProposal.proposal.format)
     setContent(pendingProposal.proposal.content)
@@ -165,12 +185,26 @@ export function Configuration({
       return false
     }
   }
-  const validate = () =>
-    void run(t('config.busyValidating'), async () => {
-      const report = await resolveValidation(candidate, nodeId)
-      setIssues(report.errors)
-      setValidatedCandidate(report.valid ? identity : undefined)
-    })
+  const validate = () => {
+    const reqNode = nodeId ?? ''
+    const reqGen = validationTokenRef.current.generation
+    const isCurrent = () =>
+      validationTokenRef.current.nodeId === reqNode && validationTokenRef.current.generation === reqGen
+    void (async () => {
+      try {
+        setBusy(t('config.busyValidating'))
+        const report = await resolveValidation(candidate, nodeId)
+        if (!isCurrent()) return
+        setIssues(report.errors)
+        setValidatedCandidate(report.valid ? identity : undefined)
+        setBusy('')
+      } catch (cause) {
+        if (!isCurrent()) return
+        setBusy('')
+        reportMutationFailure(onError, cause)
+      }
+    })()
+  }
   const saveDraft = () =>
     void run(t('config.busySavingDraft'), async () => {
       await api.saveDraft(candidate)
@@ -226,6 +260,10 @@ export function Configuration({
     if (next === format) return
     try {
       const converted = convertConfiguration(content, format, next)
+      validationTokenRef.current = {
+        nodeId: nodeId ?? '',
+        generation: validationTokenRef.current.generation + 1,
+      }
       setFormat(next)
       setContent(converted)
       setIssues([])
@@ -351,6 +389,10 @@ export function Configuration({
         value={content}
         readOnly={!editable || !!busy}
         onChange={(event) => {
+          validationTokenRef.current = {
+            nodeId: nodeId ?? '',
+            generation: validationTokenRef.current.generation + 1,
+          }
           setContent(event.target.value)
           setIssues([])
           setValidatedCandidate(undefined)
