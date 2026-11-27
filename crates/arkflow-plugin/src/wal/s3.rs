@@ -292,6 +292,9 @@ pub(crate) struct S3Store {
     /// compensation would seal the failed sequence and break the replay
     /// guarantee ("Both WAL backends keep the replay guarantee").
     rewind_floor: AtomicU64,
+    /// Set when `rewind_cursor` lowers `cursor_mirror` so a retry after a
+    /// failed `flush_manifest` still flushes the lowered cursor to S3.
+    rewind_flush_pending: std::sync::atomic::AtomicBool,
     /// In-memory mirror of the committed cursor, seeded by recovery and
     /// maintained by advance/rewind/flush. `cursor()` runs on every WAL
     /// acknowledgement, so it must not perform a manifest GET per call.
@@ -631,6 +634,18 @@ impl S3Store {
                 "segment.flush_interval must be greater than zero".into(),
             ));
         }
+        if resolved_segment
+            .flush_interval
+            .checked_mul(4)
+            .and_then(|d| d.checked_add(std::time::Duration::from_secs(5)))
+            .is_none()
+        {
+            return Err(Error::Config(
+                "segment.flush_interval is too large and overflows the seal-wait deadline \
+                 calculation (4 * interval + 5s)"
+                    .into(),
+            ));
+        }
 
         // Validate parallel PUT workers (task 3.12).
         if osc.parallel_put.workers == 0 {
@@ -733,6 +748,7 @@ impl S3Store {
             reclaimable_hwm: AtomicU64::new(0),
             max_written_seq: AtomicU64::new(0),
             rewind_floor: AtomicU64::new(u64::MAX),
+            rewind_flush_pending: std::sync::atomic::AtomicBool::new(false),
             cursor_mirror: AtomicU64::new(0),
             sealed_seq: AtomicU64::new(0),
             seal_notify: Notify::new(),
@@ -939,10 +955,12 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
                             warn_missing_segment(seg_name);
                         }
                         Err(e) => {
-                            return Err(Error::Process(format!(
-                                "S3 HEAD segment {}: {}",
-                                seg_name, e
-                            )))
+                            tracing::warn!(
+                                segment = %seg_name,
+                                error = %e,
+                                "diagnostic S3 HEAD failed for covered sealed WAL segment; \
+                                 continuing recovery"
+                            );
                         }
                     }
                 }
@@ -1132,8 +1150,12 @@ impl WalStore for S3Store {
         self.reclaimable_hwm.fetch_min(seq, Ordering::AcqRel);
         let previous = self.cursor_mirror.fetch_min(seq, Ordering::AcqRel);
         if previous > seq {
+            self.rewind_flush_pending.store(true, Ordering::Release);
+        }
+        if previous > seq || self.rewind_flush_pending.load(Ordering::Acquire) {
             block_on_init(self.rt(), flush_manifest(self))
                 .map_err(|e| Error::Process(format!("rewind corrective flush failed: {e}")))??;
+            self.rewind_flush_pending.store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -6172,5 +6194,217 @@ mod tests {
             "covered registered segment absent from LIST must probe HEAD to confirm absence and warn"
         );
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn recovery_continues_when_diagnostic_head_errors_on_covered_segment() {
+        #[derive(Debug)]
+        struct FailHeadStore {
+            inner: Arc<InMemory>,
+        }
+        impl std::fmt::Display for FailHeadStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "FailHeadStore")
+            }
+        }
+        #[async_trait]
+        impl object_store::ObjectStore for FailHeadStore {
+            async fn put_opts(
+                &self,
+                location: &ObjectPath,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &ObjectPath,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+            async fn get_opts(
+                &self,
+                location: &ObjectPath,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                if options.head && location.as_ref().ends_with("00000001.wal") {
+                    return Err(object_store::Error::Generic {
+                        store: "FailHeadStore",
+                        source: "transient HEAD failure".into(),
+                    });
+                }
+                self.inner.get_opts(location, options).await
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+                self.inner.delete_stream(locations)
+            }
+            fn list(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &ObjectPath,
+                to: &ObjectPath,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+        }
+
+        let inner = Arc::new(InMemory::new());
+        let seed_store =
+            build_retention_store(inner.clone(), "head-err-ok", RetentionConfig::default());
+        let payload = sample_payload(None);
+        for seq in 1..=8u64 {
+            seed_store
+                .append_batch(vec![(seq, payload.clone())])
+                .unwrap();
+        }
+        for seq in 1..=5u64 {
+            seed_store.advance_cursor(seq).unwrap();
+        }
+        seed_store
+            .rt()
+            .block_on(flush_manifest(&seed_store))
+            .unwrap();
+        seed_store
+            .rt()
+            .block_on(inner.delete(&ObjectPath::from(
+                "arkflow/ret/ret-pod/head-err-ok/segments/00000001.wal",
+            )))
+            .unwrap();
+        seed_store.close().unwrap();
+        drop(seed_store);
+
+        let wrapped: Arc<dyn object_store::ObjectStore> = Arc::new(FailHeadStore { inner });
+        let reopened = build_retention_store(wrapped, "head-err-ok", RetentionConfig::default());
+        let replayed: Vec<u64> = reopened
+            .read_after_cursor()
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(replayed, vec![6, 7, 8]);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn s3_rewind_cursor_retries_manifest_flush_after_first_flush_failure() {
+        let inner = Arc::new(InMemory::new());
+        // Fail manifest writes transiently via FailPutStore or manual toggle?
+        // Reuse SpyObjectStore? Wait: FailPutStore exists in s3.rs, let's build a
+        // tiny toggle wrapper around InMemory for manifest.json PUTs.
+        #[derive(Debug)]
+        struct ToggleManifestPutStore {
+            inner: Arc<InMemory>,
+            fail_manifest_puts: std::sync::atomic::AtomicBool,
+        }
+        impl std::fmt::Display for ToggleManifestPutStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "ToggleManifestPutStore")
+            }
+        }
+        #[async_trait]
+        impl object_store::ObjectStore for ToggleManifestPutStore {
+            async fn put_opts(
+                &self,
+                location: &ObjectPath,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                if self.fail_manifest_puts.load(Ordering::Acquire)
+                    && location.as_ref().ends_with("manifest.json")
+                {
+                    return Err(object_store::Error::Generic {
+                        store: "ToggleManifestPutStore",
+                        source: "injected manifest PUT failure".into(),
+                    });
+                }
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &ObjectPath,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+            async fn get_opts(
+                &self,
+                location: &ObjectPath,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                self.inner.get_opts(location, options).await
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+                self.inner.delete_stream(locations)
+            }
+            fn list(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &ObjectPath,
+                to: &ObjectPath,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+        }
+
+        let client = Arc::new(ToggleManifestPutStore {
+            inner,
+            fail_manifest_puts: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store =
+            build_retention_store(client.clone(), "rewind-retry", RetentionConfig::default());
+        let payload = sample_payload(None);
+        for seq in 1..=4u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        store.advance_cursor(4).unwrap();
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+        assert_eq!(store.read_manifest().unwrap().cursor, 4);
+
+        // First rewind fails manifest PUT, lowering `cursor_mirror` to 3 while
+        // S3 manifest still says 4.
+        client.fail_manifest_puts.store(true, Ordering::Release);
+        assert!(store.rewind_cursor(3).is_err());
+        assert_eq!(store.cursor(), 3);
+        assert_eq!(store.read_manifest().unwrap().cursor, 4);
+
+        // Second rewind with same target `3` must STILL flush manifest to 3!
+        client.fail_manifest_puts.store(false, Ordering::Release);
+        store.rewind_cursor(3).unwrap();
+        assert_eq!(store.read_manifest().unwrap().cursor, 3);
+        store.close().unwrap();
     }
 }

@@ -631,10 +631,11 @@ pub mod duration_serde_option {
 }
 
 /// Backward-compatible optional duration serde for `segment_tuning.flush_interval`:
-/// treats unparseable strings (e.g. `"auto"`) as `None` so the `strategy`
-/// preset still applies, matching prior behavior.
+/// preserves the legacy grammar (`ms`, checked `s`, checked `m`, bare integer
+/// `ms`, plus leading `+`) and treats blank or unrecognized strings (e.g.
+/// `"auto"`, `"1h"`) as `None` so the `strategy` preset still applies.
 pub mod lenient_duration_serde_option {
-    use super::{format_duration_lossless, parse_duration_human};
+    use super::format_duration_lossless;
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
@@ -643,6 +644,41 @@ pub mod lenient_duration_serde_option {
             Some(duration) => s.serialize_str(&format_duration_lossless(duration)),
             None => s.serialize_none(),
         }
+    }
+
+    fn parse_legacy_tuning_duration(s: &str) -> Option<Duration> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(rest) = trimmed.strip_suffix("ms") {
+            let digits = rest.strip_prefix('+').unwrap_or(rest);
+            if digits.bytes().all(|b| b.is_ascii_digit()) && !digits.is_empty() {
+                if let Ok(ms) = digits.parse::<u128>() {
+                    if let Ok(secs) = u64::try_from(ms / 1_000) {
+                        let nanos = ((ms % 1_000) * 1_000_000) as u32;
+                        return Some(Duration::new(secs, nanos));
+                    }
+                }
+            }
+            return None;
+        }
+        if let Some(rest) = trimmed.strip_suffix('s') {
+            if let Ok(secs) = rest.parse::<f64>() {
+                return Duration::try_from_secs_f64(secs).ok();
+            }
+            return None;
+        }
+        if let Some(rest) = trimmed.strip_suffix('m') {
+            let digits = rest.strip_prefix('+').unwrap_or(rest);
+            if digits.bytes().all(|b| b.is_ascii_digit()) && !digits.is_empty() {
+                if let Ok(mins) = digits.parse::<u64>() {
+                    return mins.checked_mul(60).map(Duration::from_secs);
+                }
+            }
+            return None;
+        }
+        trimmed.parse::<u64>().ok().map(Duration::from_millis)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
@@ -655,13 +691,7 @@ pub mod lenient_duration_serde_option {
         match Option::<Raw>::deserialize(d)? {
             None => Ok(None),
             Some(Raw::Int(ms)) => Ok(Some(Duration::from_millis(ms))),
-            Some(Raw::Str(s)) => {
-                if s.trim().is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(parse_duration_human(&s).ok())
-                }
-            }
+            Some(Raw::Str(s)) => Ok(parse_legacy_tuning_duration(&s)),
         }
     }
 }
@@ -1261,15 +1291,16 @@ mod tests {
         assert!(serde_yaml::from_str::<WalBackend>(blank_required_yaml).is_err());
 
         // Legacy `segment_tuning.flush_interval` preserves `None` fallback for
-        // unparseable strings (e.g. `"auto"` -> strategy preset 100ms), whereas
-        // `retention.max_age` remains strict and rejects malformed strings.
+        // non-legacy strings (e.g. `"auto"` and `"1h"` -> strategy preset 100ms),
+        // while still accepting legacy overrides (`"500ms"`, `"+2m"`, `"0.5s"`)
+        // and keeping `retention.max_age` strict.
         let legacy_auto_yaml = r#"
             type: object_store
             node_id: pod-a
             stream_id: main
             segment_tuning:
               strategy: low_latency
-              flush_interval: "auto"
+              flush_interval: "1h"
             s3:
               bucket: b
         "#;
@@ -1283,6 +1314,40 @@ mod tests {
             }
             _ => panic!("expected ObjectStore"),
         }
+        let legacy_auto_str_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment_tuning:
+              strategy: low_latency
+              flush_interval: "auto"
+            s3:
+              bucket: b
+        "#;
+        assert_eq!(
+            match serde_yaml::from_str::<WalBackend>(legacy_auto_str_yaml).unwrap() {
+                WalBackend::ObjectStore(o) => o.segment_tuning.resolve().flush_interval,
+                _ => panic!("expected ObjectStore"),
+            },
+            Duration::from_millis(100)
+        );
+        let legacy_override_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment_tuning:
+              strategy: low_latency
+              flush_interval: "+2m"
+            s3:
+              bucket: b
+        "#;
+        assert_eq!(
+            match serde_yaml::from_str::<WalBackend>(legacy_override_yaml).unwrap() {
+                WalBackend::ObjectStore(o) => o.segment_tuning.resolve().flush_interval,
+                _ => panic!("expected ObjectStore"),
+            },
+            Duration::from_secs(120)
+        );
         let strict_max_age_auto_yaml = r#"
             type: object_store
             node_id: pod-a
@@ -1293,5 +1358,27 @@ mod tests {
               bucket: b
         "#;
         assert!(serde_yaml::from_str::<WalBackend>(strict_max_age_auto_yaml).is_err());
+
+        // Huge `segment.flush_interval` that would overflow `4 * interval + 5s`
+        // must be rejected cleanly by `WalConfig::validate`.
+        let huge_flush_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: "10000000000000000000sec"
+            s3:
+              bucket: b
+        "#;
+        let parsed_huge = WalConfig {
+            enabled: true,
+            sync: SyncPolicy::GroupCommit,
+            backend: Some(serde_yaml::from_str::<WalBackend>(huge_flush_yaml).unwrap()),
+            ..WalConfig::default()
+        };
+        assert!(
+            parsed_huge.validate().is_err(),
+            "flush_interval overflowing 4*interval+5s deadline must fail validation"
+        );
     }
 }
