@@ -972,6 +972,11 @@ impl Wal {
             /// The source-side acknowledgement failed and must be
             /// compensated before the WAL delivery can be discarded.
             Retry(Arc<dyn crate::input::Ack>),
+            /// The WAL acknowledgement had already committed; `seq` is reserved
+            /// as `in_flight` while `inner.undo()` and `rewind_cursor` run so
+            /// no successor acknowledgement (`seq + 1`) can advance the cursor
+            /// or `reclaimable_hwm` mid-compensation.
+            Committed,
         }
 
         // A source acknowledgement can fail after the WAL cursor was
@@ -1002,7 +1007,24 @@ impl Wal {
                     Some(PendingUndo::Removed)
                 }
             } else {
-                None
+                let cursor = self.call_store(|store| Ok(store.cursor())).await?;
+                if cursor < seq {
+                    return Ok(());
+                }
+                if cursor > seq {
+                    return Err(Error::Process(
+                        "cannot undo a WAL acknowledgement behind a later cursor".into(),
+                    ));
+                }
+                acknowledgements.insert(
+                    seq,
+                    PendingWalAck {
+                        ack: inner.clone(),
+                        in_flight: true,
+                        last_error: None,
+                    },
+                );
+                Some(PendingUndo::Committed)
             }
         };
 
@@ -1035,36 +1057,33 @@ impl Wal {
                 self.ack_notify.notify_waiters();
                 return Ok(());
             }
-            None => {}
-        }
-
-        let cursor = self.call_store(|store| Ok(store.cursor())).await?;
-        if cursor < seq {
-            return Ok(());
-        }
-        if cursor > seq {
-            return Err(Error::Process(
-                "cannot undo a WAL acknowledgement behind a later cursor".into(),
-            ));
+            Some(PendingUndo::Committed) => {}
+            None => return Ok(()),
         }
 
         // The source-side commit is undone before the WAL cursor is rewound;
         // otherwise a crash in this compensation window could replay a record
         // whose connector offset had already been restored.
-        inner.undo().await?;
-        let rewind_to = seq.saturating_sub(1);
-        self.call_store(move |store| store.rewind_cursor(rewind_to))
-            .await?;
-        if !self
-            .frontier
-            .rewind_position(None, 0, seq.saturating_add(1))
-        {
-            return Err(Error::Process(
-                "WAL acknowledgement frontier changed before compensation".into(),
-            ));
+        let undo_res = async {
+            inner.undo().await?;
+            let rewind_to = seq.saturating_sub(1);
+            self.call_store(move |store| store.rewind_cursor(rewind_to))
+                .await?;
+            if !self
+                .frontier
+                .rewind_position(None, 0, seq.saturating_add(1))
+            {
+                return Err(Error::Process(
+                    "WAL acknowledgement frontier changed before compensation".into(),
+                ));
+            }
+            Ok(())
         }
+        .await;
+
+        self.acknowledgements.lock().await.remove(&seq);
         self.ack_notify.notify_waiters();
-        Ok(())
+        undo_res
     }
 
     /// Read all entries with sequence strictly greater than the committed
@@ -3232,5 +3251,80 @@ mod tests {
         // report a drop back to zero.
         drop(wal);
         assert_eq!(metrics.snapshot().wal_flush_failures, reported);
+    }
+
+    #[tokio::test]
+    async fn undo_in_flight_parks_successor_ack_until_rewind_completes() {
+        struct GatedUndoAck {
+            started: StdArc<tokio::sync::Notify>,
+            release: StdArc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl Ack for GatedUndoAck {
+            async fn ack(&self) -> Result<(), Error> {
+                Ok(())
+            }
+            async fn undo(&self) -> Result<(), Error> {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+        }
+
+        let dir = tempdir();
+        let cfg = WalConfig::local(
+            true,
+            dir.to_string_lossy().to_string(),
+            SyncPolicy::PerEntry,
+        );
+        let wal = Wal::open(&cfg).unwrap();
+        let s1 = wal.append(&StdArc::new(sample_batch(None))).await.unwrap();
+        let s2 = wal.append(&StdArc::new(sample_batch(None))).await.unwrap();
+        assert_eq!((s1, s2), (1, 2));
+
+        // Commit seq 1 cleanly (`cursor == 1`, `acknowledgements` is empty).
+        let started = StdArc::new(tokio::sync::Notify::new());
+        let release = StdArc::new(tokio::sync::Notify::new());
+        let ack1 = WalAck::new(
+            wal.clone(),
+            1,
+            StdArc::new(GatedUndoAck {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+        );
+        ack1.ack().await.unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 1);
+
+        // Start `undo(1)` and wait until `GatedUndoAck::undo()` is awaiting.
+        let undo_task = tokio::spawn(async move { ack1.undo().await });
+        started.notified().await;
+
+        // Launch `ack(2)` while `undo(1)` is in-flight. It MUST park instead of
+        // advancing cursor to 2 or calling `mark_committed(2)`.
+        let ack2 = WalAck::new(wal.clone(), 2, StdArc::new(NoopAck));
+        let ack2_task = tokio::spawn(async move { ack2.ack().await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            wal.cursor().await.unwrap(),
+            1,
+            "successor ack must not advance cursor while undo(1) is in flight"
+        );
+        assert!(!ack2_task.is_finished());
+
+        // Release `undo(1)` -> cursor rewinds to 0 and `ack(2)` remains parked
+        // behind the missing seq 1 (verified via short park lease or abort).
+        release.notify_one();
+        undo_task.await.unwrap().unwrap();
+        assert_eq!(wal.cursor().await.unwrap(), 0);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !ack2_task.is_finished(),
+            "successor ack must stay parked behind rewound seq 1"
+        );
+
+        ack2_task.abort();
+        let _ = ack2_task.await;
+        wal.close().await.unwrap();
     }
 }

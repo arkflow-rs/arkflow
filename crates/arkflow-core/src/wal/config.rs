@@ -402,7 +402,15 @@ impl Default for CursorFlushConfig {
 
 fn parse_checked_compound_duration(trimmed: &str) -> Result<Duration, String> {
     let mut total = Duration::ZERO;
-    let mut rest = trimmed;
+    let mut rest = if let Some(after_plus) = trimmed.strip_prefix('+') {
+        if after_plus.starts_with(|c: char| c.is_ascii_digit()) {
+            after_plus
+        } else {
+            return Err(format!("invalid duration: {trimmed}"));
+        }
+    } else {
+        trimmed
+    };
     let mut parsed_any = false;
 
     while !rest.is_empty() {
@@ -609,9 +617,15 @@ pub mod duration_serde_option {
         match Option::<Raw>::deserialize(d)? {
             None => Ok(None),
             Some(Raw::Int(ms)) => Ok(Some(Duration::from_millis(ms))),
-            Some(Raw::Str(s)) => parse_duration_human(&s)
-                .map(Some)
-                .map_err(serde::de::Error::custom),
+            Some(Raw::Str(s)) => {
+                if s.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    parse_duration_human(&s)
+                        .map(Some)
+                        .map_err(serde::de::Error::custom)
+                }
+            }
         }
     }
 }
@@ -1167,5 +1181,47 @@ mod tests {
             }
             _ => panic!("expected ObjectStore"),
         }
+
+        // Leading '+' on non-ms compound terms (e.g. "+2m") and blank optional
+        // durations (e.g. segment_tuning.flush_interval: "") remain supported.
+        let plus_min_and_blank_opt_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: "+2m"
+            segment_tuning:
+              strategy: low_latency
+              flush_interval: ""
+            retention:
+              max_age: ""
+            s3:
+              bucket: b
+        "#;
+        let b_plus: WalBackend = serde_yaml::from_str(plus_min_and_blank_opt_yaml).unwrap();
+        match b_plus {
+            WalBackend::ObjectStore(o) => {
+                assert_eq!(o.segment.flush_interval, Duration::from_secs(120));
+                assert_eq!(o.segment_tuning.flush_interval, None);
+                assert_eq!(
+                    o.segment_tuning.resolve().flush_interval,
+                    Duration::from_millis(100)
+                );
+                assert_eq!(o.retention.max_age, None);
+            }
+            _ => panic!("expected ObjectStore"),
+        }
+
+        // Blank required duration still fails.
+        let blank_required_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: ""
+            s3:
+              bucket: b
+        "#;
+        assert!(serde_yaml::from_str::<WalBackend>(blank_required_yaml).is_err());
     }
 }

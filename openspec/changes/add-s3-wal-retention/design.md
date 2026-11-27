@@ -54,7 +54,7 @@ pub struct RetentionConfig {
       3. `max_bytes.map_or(true, |cap| kept_bytes.saturating_add(meta.size_bytes) <= cap)`
     - If all hold, keep it (`kept_count += 1; kept_bytes += meta.size_bytes`).
     - On the **first violation**, **`break`** — that segment and **every older** eligible segment are marked for reclamation. Breaking prevents non-contiguous history gaps (e.g., where a large newer segment exceeds `max_bytes` while a smaller older segment would still fit).
-- **Duration parsing**: Reuse `humantime::parse_duration` (already a direct dependency of `arkflow-core`) inside `duration_serde` / `duration_serde_option` so `h`, `d`, and compound durations (`"1h30m"`) work naturally alongside existing bare-integer ms and fractional seconds (`"0.5s"`), and return a serde deserialization error on invalid non-empty strings instead of silently producing `None`.
+- **Duration parsing**: `duration_serde` and `duration_serde_option` use `parse_checked_compound_duration` (checked arithmetic supporting leading `+` and compound terms such as `"1h30m"` or `"7d"`, returning a serde error instead of panicking on overflow) with a checked fractional-seconds fallback (`Duration::try_from_secs_f64`), bare integer milliseconds, and `None` for blank optional strings; `humantime` is used only for lossless sub-millisecond serialization (`format_duration_lossless`). Malformed non-empty strings and blank required durations fail deserialization instead of silently producing `None`.
 - **Validation**: Reject `max_age == Some(Duration::ZERO)` in both `WalConfig::validate` and `S3Store::build_with_client_inner` (directing callers to `max_segments: 0` for immediate reclaim).
 
 ### D2. Rewind-safe reclaim floor (`mark_committed` parity with `LocalStore`)

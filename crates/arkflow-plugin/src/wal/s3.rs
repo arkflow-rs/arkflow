@@ -383,6 +383,14 @@ fn segment_index_of(name: &str) -> Option<u64> {
 impl S3Store {
     /// GET and decode the manifest; a missing manifest is a fresh WAL.
     fn read_manifest(&self) -> Result<Manifest, Error> {
+        self.try_read_manifest().map(|opt| {
+            opt.unwrap_or_else(|| Manifest::fresh(store_ns_node_id(self), store_ns_stream_id(self)))
+        })
+    }
+
+    /// GET and decode the manifest, returning `Ok(None)` when `manifest.json`
+    /// does not exist (`NotFound`).
+    fn try_read_manifest(&self) -> Result<Option<Manifest>, Error> {
         match self.rt().block_on(
             self.client
                 .get(&ObjectPath::from(self.manifest_key.as_str())),
@@ -393,12 +401,10 @@ impl S3Store {
                     .block_on(r.bytes())
                     .map_err(|e| Error::Process(format!("S3 GET manifest body: {}", e)))?;
                 Manifest::from_json(&bytes)
+                    .map(Some)
                     .map_err(|e| Error::Process(format!("manifest JSON: {}", e)))
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(Manifest::fresh(
-                store_ns_node_id(self),
-                store_ns_stream_id(self),
-            )),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(Error::Process(format!("S3 GET manifest: {}", e))),
         }
     }
@@ -500,7 +506,7 @@ impl S3Store {
         seg_name: &str,
         watermark: u64,
     ) -> bool {
-        let Ok(latest) = self.read_manifest() else {
+        let Ok(Some(latest)) = self.try_read_manifest() else {
             return true;
         };
         if latest.pending_deletes.iter().any(|s| s == seg_name) {
@@ -2061,6 +2067,9 @@ async fn reclaim_segments_at(
     for seg_name in candidates {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             cancelled = true;
+            break;
+        }
+        if store.rewind_floor.load(Ordering::Acquire) != u64::MAX {
             break;
         }
         let key = ObjectPath::from(format!("{}/{}", store.segments_prefix, seg_name).as_str());
@@ -5830,6 +5839,20 @@ mod tests {
         );
         // Active unacked segment 3 is still required for replay.
         assert!(store.segment_still_required_for_replay(&orig_manifest, "00000003.wal", 5));
+
+        // If `manifest.json` itself is missing (NotFound), `orig_manifest`'s
+        // tracked segment must still warn rather than being treated as reclaimed.
+        store
+            .rt()
+            .block_on(
+                spy.inner
+                    .delete(&ObjectPath::from(store.manifest_key.as_str())),
+            )
+            .unwrap();
+        assert!(
+            store.segment_still_required_for_replay(&orig_manifest, "00000002.wal", 0),
+            "missing manifest.json must not suppress missing-segment warning"
+        );
         store.close().unwrap();
     }
 
@@ -5918,6 +5941,147 @@ mod tests {
         assert!(m.sealed_segments.is_empty());
         assert_eq!(m.active_segment, None);
         assert!(m.pending_deletes.is_empty());
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn retention_pauses_phase2_deletes_when_rewind_poison_activates() {
+        struct HookedDeleteStore {
+            inner: Arc<InMemory>,
+            hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+            deletes: std::sync::atomic::AtomicUsize,
+        }
+        impl std::fmt::Debug for HookedDeleteStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("HookedDeleteStore").finish()
+            }
+        }
+        impl std::fmt::Display for HookedDeleteStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "HookedDeleteStore")
+            }
+        }
+        #[async_trait]
+        impl object_store::ObjectStore for HookedDeleteStore {
+            async fn put_opts(
+                &self,
+                location: &ObjectPath,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &ObjectPath,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+            async fn get_opts(
+                &self,
+                location: &ObjectPath,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                self.inner.get_opts(location, options).await
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+                use futures::StreamExt;
+                let inner = self.inner.clone();
+                self.deletes.fetch_add(1, Ordering::AcqRel);
+                if let Some(cb) = self.hook.lock().unwrap().as_ref() {
+                    cb();
+                }
+                locations
+                    .then(move |loc| {
+                        let inner = inner.clone();
+                        async move {
+                            let path = loc?;
+                            inner.delete(&path).await?;
+                            Ok(path)
+                        }
+                    })
+                    .boxed()
+            }
+            fn list(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &ObjectPath,
+                to: &ObjectPath,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+        }
+
+        let inner = Arc::new(InMemory::new());
+        let ns = "arkflow/ret/ret-pod/rewind-phase2";
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            for idx in [1u64, 2] {
+                inner
+                    .put(
+                        &ObjectPath::from(format!("{ns}/segments/{idx:08}.wal").as_str()),
+                        PutPayload::from(Bytes::from_static(b"dummy")),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        drop(rt);
+
+        let client = Arc::new(HookedDeleteStore {
+            inner: inner.clone(),
+            hook: std::sync::Mutex::new(None),
+            deletes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store =
+            build_retention_store(client.clone(), "rewind-phase2", RetentionConfig::default());
+        store
+            .rt()
+            .block_on(write_manifest_with_etag(&store, |m| {
+                m.pending_deletes = vec!["00000001.wal".into(), "00000002.wal".into()];
+            }))
+            .unwrap();
+        let store_weak = Arc::downgrade(&store);
+        *client.hook.lock().unwrap() = Some(Box::new(move || {
+            if let Some(s) = store_weak.upgrade() {
+                s.rewind_floor.store(0, Ordering::Release);
+            }
+        }));
+
+        let reclaimed = store.rt().block_on(reclaim_segments(&store, None)).unwrap();
+        assert_eq!(
+            reclaimed, 1,
+            "only first DELETE runs before rewind_floor pauses loop"
+        );
+        assert_eq!(client.deletes.load(Ordering::Acquire), 1);
+        let m = store.read_manifest().unwrap();
+        assert_eq!(m.pending_deletes, vec!["00000002.wal"]);
+        assert!(
+            store
+                .rt()
+                .block_on(inner.head(&ObjectPath::from(
+                    format!("{ns}/segments/00000002.wal").as_str()
+                )))
+                .is_ok(),
+            "second object must remain intact when rewind poison activates"
+        );
         store.close().unwrap();
     }
 }

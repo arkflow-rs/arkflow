@@ -310,7 +310,7 @@ durability:
 
 | Cost Component | Behavior with Retention Enabled |
 | --- | --- |
-| **Stored bytes** | Retention caps (`max_segments`, `max_age`, `max_bytes`) bound only the **eligible acknowledged history selected for retention** among **current** WAL objects, not total bucket occupancy. Actual current-object bytes = unacknowledged segments + `active_segment` (1 sealed segment) + undo-protected segment (containing the latest committed sequence) + retained eligible history + `pending_deletes` (sweeps delete at most 64 objects per pass, and failed deletes continue consuming storage until retried). On **versioned** S3 buckets, key-only deletes create delete markers and noncurrent versions continue incurring storage charges until a noncurrent-version expiration lifecycle rule removes them. |
+| **Stored bytes** | Retention caps (`max_segments`, `max_age`, `max_bytes`) bound only the **eligible acknowledged history selected for retention** among **current** WAL objects, not total bucket occupancy. Actual current-object bytes equal the combined size of **distinct** current objects across: unacknowledged segments, `active_segment` (1 sealed segment), any undo-protected segment (containing the latest committed sequence), retained eligible history, and `pending_deletes` (an object that falls into more than one category, such as an unacknowledged `active_segment`, is counted once; sweeps delete at most 64 objects per pass, and failed deletes continue consuming storage until retried). On **versioned** S3 buckets, key-only deletes create delete markers and noncurrent versions continue incurring storage charges until a noncurrent-version expiration lifecycle rule removes them. |
 | **DELETE requests** | Standard `DELETE` requests are free on AWS S3 (and most S3-compatible stores); capped at 64 objects per sweep so backlogs drain smoothly. |
 | **Manifest PUTs** | Active reclaim sweeps that deregister and delete objects add 2 small manifest PUTs (deregister + cleanup). Idle sweeps perform **0** manifest PUTs. |
 | **Restart GETs** | Drops from `O(total historical segments)` to `O(unacknowledged segments only)`, eliminating linear restart degradation on long-running streams. |
@@ -415,7 +415,10 @@ omitting `retention` now enables automatic deletion of eligible acknowledged
 sealed segments behind the committed reclaim floor. Operators who rely on the
 previous no-deletion behavior (for example, external inspection of historical
 segments in the WAL prefix) should explicitly set `retention.enabled: false`
-before upgrading.
+before upgrading. Operators enabling automatic reclamation should verify that
+the IAM role/policy grants `s3:DeleteObject` (or equivalent delete permission)
+on the WAL segment prefix and that the object store supports conditional PUTs
+(`If-Match`) for `manifest.json`.
 
 ## Example Configs
 
