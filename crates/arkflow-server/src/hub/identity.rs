@@ -367,9 +367,9 @@ impl Hub {
     /// sessions matching the user's bound OIDC subject).
     pub async fn revoke_user_tokens(&self, user_id: &str, actor: &str) -> Result<usize, HubError> {
         let storage = self.identity_storage()?.clone();
-        let now = now_ms();
         let (user, removed) = {
             let _write_guard = self.identity_write_lock.lock().await;
+            let now = now_ms();
             let user = storage
                 .bump_user_tokens_valid_after(user_id, now)
                 .await

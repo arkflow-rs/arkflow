@@ -1276,10 +1276,19 @@ async fn stale_authorization_session_is_rejected_and_federated_admission_seriali
         hub.revoke_user_tokens("alice", "admin"),
     );
     revoke_res.unwrap();
-    if let FederatedSessionAdmission::Created(session_id) = admission {
-        assert!(
-            hub.resolve_session(&session_id).await.is_none(),
-            "concurrent revoke_user_tokens must revoke any session created before the bump"
-        );
+    match admission {
+        FederatedSessionAdmission::Created(session_id) => {
+            assert!(
+                hub.resolve_session(&session_id).await.is_none(),
+                "concurrent revoke_user_tokens must revoke any session created before the bump"
+            );
+        }
+        FederatedSessionAdmission::Unauthorized => {}
+        FederatedSessionAdmission::StorageFailed => {
+            panic!("durable storage fixture must not report StorageFailed");
+        }
+        FederatedSessionAdmission::Volatile(_) => {
+            panic!("durable storage fixture must not report Volatile");
+        }
     }
 }
