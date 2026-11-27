@@ -49,7 +49,7 @@ pub struct RetentionConfig {
 - If one or more of `max_segments`, `max_age`, `max_bytes` is `Some(...)`: **contiguous newest-suffix retention under tightest bound (AND-to-keep)**:
   - Walk eligible segments from **newest to oldest** (`rev()`), maintaining `kept_count` and `kept_bytes`:
     - Check whether the segment satisfies all configured caps:
-      1. `max_age.map_or(true, |d| now_ms.saturating_sub(meta.sealed_at_ms) <= d.as_millis() as u64)` (uses `saturating_sub` so backwards wall-clock jumps never cause premature deletion)
+      1. `max_age.map_or(true, |d| Duration::from_millis(now_ms.saturating_sub(meta.sealed_at_ms)) <= d)` (uses `saturating_sub` so backwards wall-clock jumps never cause premature deletion, and compares `Duration` directly without narrowing `d.as_millis()`)
       2. `max_segments.map_or(true, |cap| kept_count < cap)`
       3. `max_bytes.map_or(true, |cap| kept_bytes.saturating_add(meta.size_bytes) <= cap)`
     - If all hold, keep it (`kept_count += 1; kept_bytes += meta.size_bytes`).
@@ -70,7 +70,7 @@ To uphold the `input-durability` invariant (*"A WAL backend SHALL NOT delete an 
   - If `self.rewind_floor.load(Ordering::Acquire) != u64::MAX` (rewind poison active), skip reclamation entirely until re-acknowledged.
   - Otherwise `reclaim_floor = manifest.cursor.min(self.reclaimable_hwm.load(Ordering::Acquire))`.
 - **Exact boundary**: Committing sequence `S` advances `reclaimable_hwm` to `S - 1`, so every sealed segment with `last_seq <= S - 1` is eligible immediately, while the segment containing `S` itself stays protected until `S + 1` commits (or until restart, when `reclaimable_hwm` seeds from `manifest.cursor`). This matches `LocalStore::mark_committed`'s single-step undo contract (`crates/arkflow-core/src/wal/store.rs:441`); multi-step reverse-order undo across already-committed sequences is outside `WalStore::mark_committed`'s contract for both backends.
-- Only segments in `manifest.sealed_segments` (never `manifest.active_segment`) whose `segment_meta` reports `last_seq <= reclaim_floor` are eligible. Keeping `active_segment` un-reclaimed plus seeding `max_seq_seen = manifest.max_sealed_seq.max(manifest.cursor)` in `recover()` guarantees monotonic sequence allocation and collision-free filenames across restarts.
+- Only segments in `manifest.sealed_segments` (never `manifest.active_segment`) whose `segment_meta` reports `last_seq <= reclaim_floor` are eligible. Keeping `active_segment` un-reclaimed plus seeding `max_seq_seen = manifest.cursor` (and advancing it from recovered segments) in `recover()` guarantees monotonic sequence allocation without introducing an unrecoverable ack gap if an unacked tail segment is missing, while keeping filenames collision-free across restarts.
 
 ### D3. Manifest schema extension & read-only recovery backfill (backward-compatible v2)
 
@@ -135,16 +135,14 @@ Inside `reclaim_segments(store, cancel)`:
 ### D5. Recovery & replay skip optimization
 
 - In `recover()`:
-  - Seed `max_seq_seen = manifest.max_sealed_seq.max(manifest.cursor)`.
+  - Seed `max_seq_seen = manifest.cursor` (not `manifest.max_sealed_seq`, so a missing unacked tail segment never advances `next_seq_hint()` past the unrecoverable gap).
   - Seed `reclaimable_hwm = manifest.cursor`.
   - Seed `max_idx_seen` across `manifest.active_segment`, `manifest.sealed_segments`, `manifest.pending_deletes`, AND all LISTed `.wal` filenames (before excluding `pending_deletes`).
   - Build `pending_set: HashSet<&str>` from `manifest.pending_deletes` and skip any segment in `pending_set` (no `GET`, no warning).
   - For each remaining segment `seg_name`:
-    - If `manifest.segment_meta.get(seg_name)` exists:
-      - Seed `store.segment_ranges` with `(meta.first_seq, meta.last_seq)` and bump `max_seq_seen = max_seq_seen.max(meta.last_seq)`.
-      - If `meta.last_seq <= manifest.cursor`: **skip `GET` completely**.
-      - Otherwise (`meta.last_seq > manifest.cursor`), `GET` and decode as before (preserving corruption/missing-segment observability for replayable data).
-    - If `segment_meta` is absent (legacy segment or LIST-fallback segment): `GET` and decode as before, recording `segment_ranges`, `max_seq_seen`, and inserting into `store.backfilled_meta` (using `r.meta.last_modified` for `sealed_at_ms`).
+    - If `manifest.segment_meta.get(seg_name)` exists and `meta.last_seq <= manifest.cursor`:
+      - Seed `store.segment_ranges` with `(meta.first_seq, meta.last_seq)` and **skip `GET` completely**.
+    - Otherwise (unacked segment `meta.last_seq > manifest.cursor`, or legacy/LIST-fallback segment lacking `segment_meta`): `GET` and decode as before (preserving corruption/missing-segment observability for replayable data), updating `segment_ranges` and `max_seq_seen` only after `GET` + decode succeeds, and inserting into `store.backfilled_meta` (using `r.meta.last_modified` for `sealed_at_ms`) when `segment_meta` is absent.
 - In `all_segment_names(&manifest)`:
   - Exclude filenames present in `manifest.pending_deletes`.
 - In `read_after_cursor()` and `read_after()`:

@@ -10,7 +10,7 @@ Reclaim eligibility SHALL be governed by the following safety invariants:
 - When `retention.enabled` is `true` (the default) and none of `max_segments`, `max_age`, or `max_bytes` is configured, all eligible sealed segments SHALL be reclaimed. When one or more limits are configured, the backend SHALL retain only the contiguous newest suffix of eligible sealed segments satisfying all configured limits (stopping on the first violated limit when scanning newest-to-oldest) and SHALL reclaim all older eligible segments. When `retention.enabled` is `false`, no segments SHALL be deleted.
 - Reclaim SHALL be best-effort, bounded per sweep, and decoupled from the segment-sealing loop so that slow or failing S3 deletes SHALL NOT block ingestion, delay segment sealing / acknowledgement gating, or stall graceful `close()`.
 - A segment referenced by `sealed_segments` in the manifest but missing on the store SHALL still be ignored with a warning during recovery; a segment listed in `pending_deletes` SHALL be ignored quietly during recovery and its deletion retried on subsequent reclaim sweeps.
-- Sequence assignment after reclamation SHALL remain strictly greater than `max(manifest.max_sealed_seq, manifest.cursor)` and segment indices SHALL NOT collide with previously reclaimed segments.
+- Sequence assignment after reclamation SHALL remain strictly greater than `max(manifest.cursor, max_recovered_seq)` and segment indices SHALL NOT collide with previously reclaimed segments.
 
 #### Scenario: Reclaimed segments are behind the committed floor under default retention
 - **WHEN** N sealed segments are written, acknowledgements commit entries past segment N-2 (so the committed reclaim floor covers segments 1..=N-2), and retention runs with default settings

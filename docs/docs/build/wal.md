@@ -275,8 +275,13 @@ durability:
   caps are configured, only those configured caps apply. Eligible segments are
   evaluated newest-to-oldest and retention stops at the first violated cap,
   keeping a contiguous newest suffix without leaving history gaps.
-- **Disabled (`enabled: false`):** No segments are deleted by ArkFlow (useful
-  when delegating archival or expiration to S3 bucket lifecycle rules).
+- **Disabled (`enabled: false`):** Disables ArkFlow's own segment deletions
+  (keeping sealed segments in place). Note that S3 bucket lifecycle expiration
+  rules are **not cursor-aware** — **do not** configure current-version
+  expiration on the live WAL prefix, as a stalled downstream consumer can fall
+  behind the expiration age and lose unacknowledged WAL segments. Restrict
+  age-based lifecycle expiration to separately archived copies (or noncurrent
+  object versions on versioned buckets).
 
 ### Safety & Crash-Recovery Guarantees
 
@@ -305,7 +310,7 @@ durability:
 
 | Cost Component | Behavior with Retention Enabled |
 | --- | --- |
-| **Stored bytes** | Retention caps (`max_segments`, `max_age`, `max_bytes`) bound only the **eligible acknowledged history selected for retention**, not total bucket occupancy. Actual stored bytes = unacknowledged segments + `active_segment` (1 sealed segment) + undo-protected segment (containing the latest committed sequence) + retained eligible history + `pending_deletes` (sweeps delete at most 64 objects per pass, and failed deletes continue consuming storage until retried). |
+| **Stored bytes** | Retention caps (`max_segments`, `max_age`, `max_bytes`) bound only the **eligible acknowledged history selected for retention** among **current** WAL objects, not total bucket occupancy. Actual current-object bytes = unacknowledged segments + `active_segment` (1 sealed segment) + undo-protected segment (containing the latest committed sequence) + retained eligible history + `pending_deletes` (sweeps delete at most 64 objects per pass, and failed deletes continue consuming storage until retried). On **versioned** S3 buckets, key-only deletes create delete markers and noncurrent versions continue incurring storage charges until a noncurrent-version expiration lifecycle rule removes them. |
 | **DELETE requests** | Standard `DELETE` requests are free on AWS S3 (and most S3-compatible stores); capped at 64 objects per sweep so backlogs drain smoothly. |
 | **Manifest PUTs** | Active reclaim sweeps that deregister and delete objects add 2 small manifest PUTs (deregister + cleanup). Idle sweeps perform **0** manifest PUTs. |
 | **Restart GETs** | Drops from `O(total historical segments)` to `O(unacknowledged segments only)`, eliminating linear restart degradation on long-running streams. |
@@ -396,15 +401,21 @@ the engine fails fast rather than silently degrading.
 
 ## Backward Compatibility
 
-Old configs (without `segment_tuning`, `parallel_put`, or `compression`)
-continue to work — these new fields default to:
+Old configs (without `segment_tuning`, `parallel_put`, `compression`, or
+`retention`) remain syntactically valid — these fields default to:
 
 - `segment_tuning.strategy: balanced` (same params as legacy `segment:`)
 - `parallel_put.workers: 1`
 - `compression.type: none`
+- `retention.enabled: true` (with all three caps unset — automatic reclamation
+  of eligible acknowledged sealed segments)
 
-This means existing deployments see no behavior change unless they
-explicitly opt into the new fields.
+**Upgrade note on retention behavior:** while existing configs parse unchanged,
+omitting `retention` now enables automatic deletion of eligible acknowledged
+sealed segments behind the committed reclaim floor. Operators who rely on the
+previous no-deletion behavior (for example, external inspection of historical
+segments in the WAL prefix) should explicitly set `retention.enabled: false`
+before upgrading.
 
 ## Example Configs
 

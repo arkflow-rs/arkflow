@@ -14,7 +14,7 @@ The object-store WAL manifest SHALL persist additive, backward-compatible per-se
 - **AND** the next reclaim sweep adopts those segments and their metadata into the manifest so they become eligible for retention and skipped on future restarts
 
 ### Requirement: Recovery and replay reads skip segments behind the committed cursor
-During startup `recover()`, `read_after_cursor()`, and `read_after()`, the S3 WAL backend SHALL consult `manifest.segment_meta` (and the in-memory `segment_ranges` cache) to skip issuing object-store `GET` requests for segments whose `last_seq` is at or below the committed cursor (or requested `after` sequence), as well as any segments listed in `manifest.pending_deletes`. Recovery SHALL initialize its highest-written-sequence watermark from `max(manifest.max_sealed_seq, manifest.cursor)` and its next segment index past all manifest-known (including `pending_deletes`) and listed segment indices so skipping or deleting old segments never regresses sequence allocation or collides on filenames.
+During startup `recover()`, `read_after_cursor()`, and `read_after()`, the S3 WAL backend SHALL consult `manifest.segment_meta` (and the in-memory `segment_ranges` cache) to skip issuing object-store `GET` requests for segments whose `last_seq` is at or below the committed cursor (or requested `after` sequence), as well as any segments listed in `manifest.pending_deletes`. Recovery SHALL initialize its highest-written-sequence watermark from `max(manifest.cursor, max_recovered_seq)` (advancing past `manifest.cursor` only from decoded segments so a missing unacked tail segment never creates an unrecoverable ack gap) and its next segment index past all manifest-known (including `pending_deletes`) and listed segment indices so skipping or deleting old segments never regresses sequence allocation or collides on filenames.
 
 #### Scenario: Startup recovery only downloads necessary segments
 - **WHEN** a WAL has retained acknowledged sealed segments (with `segment_meta.last_seq <= manifest.cursor`) alongside unacknowledged segments (`last_seq > manifest.cursor`) and is reopened
@@ -23,7 +23,7 @@ During startup `recover()`, `read_after_cursor()`, and `read_after()`, the S3 WA
 
 #### Scenario: Sequence allocation remains monotonic after full old-segment reclaim
 - **WHEN** all older sealed segments have been reclaimed and the WAL is reopened
-- **THEN** `next_seq_hint()` is strictly greater than `manifest.max_sealed_seq` and `manifest.cursor`
+- **THEN** `next_seq_hint()` is strictly greater than `manifest.cursor` and every recovered segment's highest sequence
 - **AND** the next sealed segment receives a strictly higher filename index than every previously created segment
 
 ## MODIFIED Requirements

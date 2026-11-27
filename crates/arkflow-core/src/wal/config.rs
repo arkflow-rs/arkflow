@@ -400,12 +400,141 @@ impl Default for CursorFlushConfig {
 
 // --- duration serde (humantime string form: "1s", "500ms", "24h", "7d", "1h30m") ---
 
+fn parse_checked_compound_duration(trimmed: &str) -> Result<Duration, String> {
+    let mut total = Duration::ZERO;
+    let mut rest = trimmed;
+    let mut parsed_any = false;
+
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let digit_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digit_end == 0 {
+            return Err(format!("invalid duration: {trimmed}"));
+        }
+        let value: u128 = rest[..digit_end]
+            .parse()
+            .map_err(|_| format!("invalid duration: {trimmed}"))?;
+        rest = rest[digit_end..].trim_start();
+        let unit_end = rest
+            .find(|c: char| c.is_ascii_digit() || c.is_whitespace())
+            .unwrap_or(rest.len());
+        if unit_end == 0 {
+            return Err(format!("invalid duration: {trimmed}"));
+        }
+        let unit = &rest[..unit_end];
+        rest = &rest[unit_end..];
+
+        let term = match unit {
+            "ns" | "nsec" | "nsecs" | "nanosecond" | "nanoseconds" => {
+                let secs = u64::try_from(value / 1_000_000_000)
+                    .map_err(|_| format!("invalid duration: {trimmed}"))?;
+                let nanos = (value % 1_000_000_000) as u32;
+                Duration::new(secs, nanos)
+            }
+            "us" | "usec" | "usecs" | "µs" | "μs" | "microsecond" | "microseconds" => {
+                let total_ns = value
+                    .checked_mul(1_000)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs = u64::try_from(total_ns / 1_000_000_000)
+                    .map_err(|_| format!("invalid duration: {trimmed}"))?;
+                let nanos = (total_ns % 1_000_000_000) as u32;
+                Duration::new(secs, nanos)
+            }
+            "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => {
+                let secs = u64::try_from(value / 1_000)
+                    .map_err(|_| format!("invalid duration: {trimmed}"))?;
+                let nanos = ((value % 1_000) * 1_000_000) as u32;
+                Duration::new(secs, nanos)
+            }
+            "s" | "sec" | "secs" | "second" | "seconds" => {
+                let secs =
+                    u64::try_from(value).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "m" | "min" | "mins" | "minute" | "minutes" => {
+                let secs_u128 = value
+                    .checked_mul(60)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "h" | "hr" | "hrs" | "hour" | "hours" => {
+                let secs_u128 = value
+                    .checked_mul(3_600)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "d" | "day" | "days" => {
+                let secs_u128 = value
+                    .checked_mul(86_400)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "w" | "week" | "weeks" => {
+                let secs_u128 = value
+                    .checked_mul(604_800)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "M" | "month" | "months" => {
+                let secs_u128 = value
+                    .checked_mul(2_630_016)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "y" | "year" | "years" => {
+                let secs_u128 = value
+                    .checked_mul(31_557_600)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            _ => return Err(format!("invalid duration: {trimmed}")),
+        };
+
+        total = total
+            .checked_add(term)
+            .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+        parsed_any = true;
+    }
+
+    if parsed_any {
+        Ok(total)
+    } else {
+        Err(format!("invalid duration: {trimmed}"))
+    }
+}
+
 fn parse_duration_human(s: &str) -> Result<Duration, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err("duration string must not be empty".to_string());
     }
-    if let Ok(d) = humantime::parse_duration(trimmed) {
+    // Single integer millisecond term (preserves leading '+' like "+500ms"
+    // and round-trips large u64/u128 millisecond values without ns overflow).
+    if let Some(rest) = trimmed.strip_suffix("ms") {
+        if let Ok(ms) = rest.parse::<u128>() {
+            let secs = u64::try_from(ms / 1_000).map_err(|_| format!("invalid duration: {s}"))?;
+            let nanos = ((ms % 1_000) * 1_000_000) as u32;
+            return Ok(Duration::new(secs, nanos));
+        }
+    }
+    if let Ok(d) = parse_checked_compound_duration(trimmed) {
         return Ok(d);
     }
     // Preserve backward compatibility with fractional seconds ("0.5s") and
@@ -994,6 +1123,47 @@ mod tests {
         match b {
             WalBackend::ObjectStore(o) => {
                 assert_eq!(o.retention.max_age, Some(Duration::from_millis(500)));
+            }
+            _ => panic!("expected ObjectStore"),
+        }
+
+        // Compound carry overflow must return a deserialization error (no panic).
+        let compound_overflow_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: "18446744073709551615s 1000ms"
+            s3:
+              bucket: b
+        "#;
+        assert!(
+            serde_yaml::from_str::<WalBackend>(compound_overflow_yaml).is_err(),
+            "compound carry overflow must be rejected without panicking"
+        );
+
+        // Single integer ms term preserves leading '+' and large u64 ms round-trip.
+        let plus_and_large_ms_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: "+500ms"
+            retention:
+              max_age: 18446744073710
+            s3:
+              bucket: b
+        "#;
+        let b_ms: WalBackend = serde_yaml::from_str(plus_and_large_ms_yaml).unwrap();
+        let serialized = serde_yaml::to_string(&b_ms).unwrap();
+        let reloaded: WalBackend = serde_yaml::from_str(&serialized).unwrap();
+        match reloaded {
+            WalBackend::ObjectStore(o) => {
+                assert_eq!(o.segment.flush_interval, Duration::from_millis(500));
+                assert_eq!(
+                    o.retention.max_age,
+                    Some(Duration::from_millis(18_446_744_073_710))
+                );
             }
             _ => panic!("expected ObjectStore"),
         }

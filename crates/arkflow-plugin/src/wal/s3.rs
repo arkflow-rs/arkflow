@@ -492,24 +492,39 @@ impl S3Store {
     /// required by the latest persisted manifest. A concurrent reclaim sweep
     /// may have legitimately advanced the cursor and deleted the segment after
     /// the reader loaded its initial manifest snapshot; only warn when the
-    /// latest manifest still needs this segment for replay (or cannot be read).
-    fn segment_still_required_for_replay(&self, seg_name: &str, watermark: u64) -> bool {
+    /// latest manifest still needs this segment for replay (or cannot be read),
+    /// or when the segment was a LIST-only untracked segment that vanished.
+    fn segment_still_required_for_replay(
+        &self,
+        original_manifest: &Manifest,
+        seg_name: &str,
+        watermark: u64,
+    ) -> bool {
         let Ok(latest) = self.read_manifest() else {
             return true;
         };
         if latest.pending_deletes.iter().any(|s| s == seg_name) {
             return false;
         }
+        let was_tracked = original_manifest.active_segment.as_deref() == Some(seg_name)
+            || original_manifest
+                .sealed_segments
+                .iter()
+                .any(|s| s == seg_name);
         let tracked = latest.active_segment.as_deref() == Some(seg_name)
             || latest.sealed_segments.iter().any(|s| s == seg_name);
         if !tracked {
-            return false;
+            // Suppress only when the segment was tracked in the reader's initial
+            // manifest (reclaimed concurrently). A LIST-only untracked segment
+            // absent from both snapshots was not deregistered via the manifest
+            // and must still log a missing-segment warning.
+            return !was_tracked;
         }
         !self.segment_covered_by(&latest, seg_name, watermark.max(latest.cursor))
     }
 
-    fn warn_if_still_missing(&self, seg_name: &str, watermark: u64) {
-        if self.segment_still_required_for_replay(seg_name, watermark) {
+    fn warn_if_still_missing(&self, original_manifest: &Manifest, seg_name: &str, watermark: u64) {
+        if self.segment_still_required_for_replay(original_manifest, seg_name, watermark) {
             warn_missing_segment(seg_name);
         } else {
             tracing::debug!(
@@ -883,8 +898,12 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
 
     // Step 3: inspect only necessary segments (strictly read-only: never PUT
     // the manifest during recovery).
-    // - Seed `max_seq_seen` from `max(manifest.max_sealed_seq, manifest.cursor)`
-    //   so deleting old segments never regresses `next_seq_hint()`.
+    // - Seed `max_seq_seen` from `manifest.cursor` (not `manifest.max_sealed_seq`):
+    //   all deleted/skipped segments satisfy `last_seq <= manifest.cursor`, so
+    //   `manifest.cursor` prevents sequence regression after reclaim, while
+    //   updating `max_seq_seen` past `manifest.cursor` only after `GET` + decode
+    //   succeeds prevents a missing unacked tail segment from creating an
+    //   unrecoverable ack gap.
     // - Seed `reclaimable_hwm` from `manifest.cursor`: no in-flight ack/undo
     //   handles survive a process restart, so everything <= `manifest.cursor`
     //   from a prior lifetime is past any possible rewind.
@@ -892,18 +911,15 @@ async fn recover(store: &Arc<S3Store>) -> Result<u64, Error> {
     // - For legacy manifest segments or LIST-fallback segments lacking
     //   `segment_meta`, decode once and record metadata in `backfilled_meta`
     //   so the next reclaim sweep adopts them into `manifest.json`.
-    let mut max_seq_seen = manifest.max_sealed_seq.max(manifest.cursor);
+    let mut max_seq_seen = manifest.cursor;
     store
         .reclaimable_hwm
         .store(manifest.cursor, Ordering::Release);
 
     for seg_name in &all_segs {
         if let Some(meta) = manifest.segment_meta.get(seg_name) {
-            store.remember_segment_bounds(seg_name, meta.first_seq, meta.last_seq);
-            if meta.last_seq > max_seq_seen {
-                max_seq_seen = meta.last_seq;
-            }
             if meta.last_seq <= manifest.cursor {
+                store.remember_segment_bounds(seg_name, meta.first_seq, meta.last_seq);
                 continue;
             }
         }
@@ -1118,7 +1134,7 @@ impl WalStore for S3Store {
                     Err(e) => return Err(Error::Process(format!("S3 GET segment body: {}", e))),
                 },
                 Err(object_store::Error::NotFound { .. }) => {
-                    self.warn_if_still_missing(&seg_name, manifest.cursor);
+                    self.warn_if_still_missing(&manifest, &seg_name, manifest.cursor);
                     continue;
                 }
                 Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
@@ -1156,7 +1172,7 @@ impl WalStore for S3Store {
                     Err(e) => return Err(Error::Process(format!("S3 GET segment body: {}", e))),
                 },
                 Err(object_store::Error::NotFound { .. }) => {
-                    self.warn_if_still_missing(&seg_name, after);
+                    self.warn_if_still_missing(&manifest, &seg_name, after);
                     continue;
                 }
                 Err(e) => return Err(Error::Process(format!("S3 GET segment: {}", e))),
@@ -1834,12 +1850,12 @@ fn select_reclaimable_segments(
         return ordered.into_iter().map(|(name, _)| name.clone()).collect();
     }
 
-    let max_age_ms = cfg.max_age.map(|d| d.as_millis() as u64);
     let mut kept_bytes: u64 = 0;
     let mut keep_from_idx = ordered.len();
     for (kept_count, (idx, (_, meta))) in ordered.iter().enumerate().rev().enumerate() {
-        if let Some(age_cap) = max_age_ms {
-            if now_ms.saturating_sub(meta.sealed_at_ms) > age_cap {
+        if let Some(age_cap) = cfg.max_age {
+            if std::time::Duration::from_millis(now_ms.saturating_sub(meta.sealed_at_ms)) > age_cap
+            {
                 break;
             }
         }
@@ -1930,23 +1946,41 @@ async fn reclaim_segments_at(
             }
             let mut changed = false;
 
-            for (name, meta) in &backfill_snapshot {
-                if m.pending_deletes.iter().any(|p| p == name) {
-                    continue;
-                }
-                if m.active_segment.as_deref() != Some(name.as_str())
-                    && !m.sealed_segments.iter().any(|s| s == name)
-                {
-                    apply_seal(m, name);
-                    changed = true;
-                }
-                if !m.segment_meta.contains_key(name) {
-                    m.segment_meta.insert(name.clone(), meta.clone());
-                    changed = true;
-                }
-                if meta.last_seq > m.max_sealed_seq {
-                    m.max_sealed_seq = meta.last_seq;
-                    changed = true;
+            if !backfill_snapshot.is_empty() {
+                let pending_set: HashSet<String> = m.pending_deletes.iter().cloned().collect();
+                let mut sealed_set: HashSet<String> = m.sealed_segments.iter().cloned().collect();
+
+                for (name, meta) in &backfill_snapshot {
+                    if pending_set.contains(name) {
+                        continue;
+                    }
+                    if m.active_segment.as_deref() != Some(name.as_str())
+                        && !sealed_set.contains(name)
+                    {
+                        let install_as_active = match &m.active_segment {
+                            Some(current) => segment_index(name) > segment_index(current),
+                            None => true,
+                        };
+                        if install_as_active {
+                            if let Some(prev) = m.active_segment.take() {
+                                if sealed_set.insert(prev.clone()) {
+                                    m.sealed_segments.push(prev);
+                                }
+                            }
+                            m.active_segment = Some(name.clone());
+                        } else if sealed_set.insert(name.clone()) {
+                            m.sealed_segments.push(name.clone());
+                        }
+                        changed = true;
+                    }
+                    if !m.segment_meta.contains_key(name) {
+                        m.segment_meta.insert(name.clone(), meta.clone());
+                        changed = true;
+                    }
+                    if meta.last_seq > m.max_sealed_seq {
+                        m.max_sealed_seq = meta.last_seq;
+                        changed = true;
+                    }
                 }
             }
 
@@ -1970,9 +2004,10 @@ async fn reclaim_segments_at(
                 let reclaim_set: HashSet<&str> = to_reclaim.iter().map(|s| s.as_str()).collect();
                 m.sealed_segments
                     .retain(|s| !reclaim_set.contains(s.as_str()));
+                let mut pending_set: HashSet<String> = m.pending_deletes.iter().cloned().collect();
                 for name in &to_reclaim {
                     m.segment_meta.remove(name);
-                    if !m.pending_deletes.contains(name) {
+                    if pending_set.insert(name.clone()) {
                         m.pending_deletes.push(name.clone());
                     }
                 }
@@ -1991,10 +2026,20 @@ async fn reclaim_segments_at(
         phase1.await?
     };
 
-    if mutated && !backfill_snapshot.is_empty() {
+    if !backfill_snapshot.is_empty() {
+        let pending_set: HashSet<&str> = manifest
+            .pending_deletes
+            .iter()
+            .map(String::as_str)
+            .collect();
         let mut backfilled = store.backfilled_meta.lock().expect("backfilled_meta lock");
         for key in backfill_snapshot.keys() {
-            backfilled.remove(key);
+            if mutated
+                || pending_set.contains(key.as_str())
+                || manifest.segment_meta.contains_key(key)
+            {
+                backfilled.remove(key);
+            }
         }
     }
 
@@ -5139,6 +5184,21 @@ mod tests {
             ),
             vec!["00000001.wal", "00000002.wal"]
         );
+
+        // Huge max_age whose `.as_millis()` exceeds `u64::MAX` (e.g.
+        // 18_446_744_073_709_552s wraps `as_millis() as u64` to 384ms) must
+        // keep a 1-second-old segment rather than narrowing and deleting it.
+        assert!(select_reclaimable_segments(
+            &RetentionConfig {
+                enabled: true,
+                max_segments: None,
+                max_age: Some(std::time::Duration::from_secs(18_446_744_073_709_552)),
+                max_bytes: None,
+            },
+            &[mk(1, 100, now - 1_000)],
+            now
+        )
+        .is_empty());
     }
 
     #[test]
@@ -5743,8 +5803,15 @@ mod tests {
         for seq in 1..=12u64 {
             store.append_batch(vec![(seq, payload.clone())]).unwrap();
         }
+        let orig_manifest = store.read_manifest().unwrap();
         // Unacked segment 2 (5..=8) is still required for replay.
-        assert!(store.segment_still_required_for_replay("00000002.wal", 0));
+        assert!(store.segment_still_required_for_replay(&orig_manifest, "00000002.wal", 0));
+
+        // A LIST-only untracked segment that vanishes on GET must still warn.
+        assert!(
+            store.segment_still_required_for_replay(&orig_manifest, "00000099.wal", 0),
+            "LIST-only untracked segment must still warn when missing"
+        );
 
         // Commit through 5 and reclaim segment 1 -> latest manifest no longer
         // requires segment 1, so a stale reader's NotFound must not warn.
@@ -5758,11 +5825,99 @@ mod tests {
             1
         );
         assert!(
-            !store.segment_still_required_for_replay("00000001.wal", 0),
+            !store.segment_still_required_for_replay(&orig_manifest, "00000001.wal", 0),
             "reclaimed segment must not be flagged as missing replay data"
         );
         // Active unacked segment 3 is still required for replay.
-        assert!(store.segment_still_required_for_replay("00000003.wal", 5));
+        assert!(store.segment_still_required_for_replay(&orig_manifest, "00000003.wal", 5));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn recovery_with_missing_unacked_tail_does_not_create_ack_gap() {
+        let spy = SpyObjectStore::new();
+        let store = build_retention_store(spy.clone(), "missing-tail", RetentionConfig::default());
+        let payload = sample_payload(None);
+        // Segment 1: [1..=4], Segment 2 (active): [5..=8].
+        for seq in 1..=8u64 {
+            store.append_batch(vec![(seq, payload.clone())]).unwrap();
+        }
+        for seq in 1..=4u64 {
+            store.advance_cursor(seq).unwrap();
+            store.mark_committed(seq).unwrap();
+        }
+        store.rt().block_on(flush_manifest(&store)).unwrap();
+
+        // Simulate missing unacked tail segment 2 (5..=8) on S3 while manifest
+        // still records cursor = 4, max_sealed_seq = 8.
+        store
+            .rt()
+            .block_on(spy.inner.delete(&ObjectPath::from(
+                "arkflow/ret/ret-pod/missing-tail/segments/00000002.wal",
+            )))
+            .unwrap();
+        store.close().unwrap();
+        drop(store);
+
+        let reopened =
+            build_retention_store(spy.clone(), "missing-tail", RetentionConfig::default());
+        assert_eq!(
+            reopened.next_seq_hint(),
+            5,
+            "missing unacked tail must not advance next_seq_hint past manifest.cursor + 1"
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn retention_backfilled_meta_cleared_when_already_pending_delete_on_noop() {
+        let spy = SpyObjectStore::new();
+        let store = build_retention_store(spy.clone(), "noop-backfill", RetentionConfig::default());
+        let ns = "arkflow/ret/ret-pod/noop-backfill";
+
+        // Seed 00000001.wal in S3 + pending_deletes, and also inject a stale
+        // backfilled_meta entry for 00000001.wal so Phase 1 is a no-op
+        // (`mutated == false`).
+        store.rt().block_on(async {
+            spy.inner
+                .put(
+                    &ObjectPath::from(format!("{ns}/segments/00000001.wal").as_str()),
+                    PutPayload::from(Bytes::from_static(b"dummy")),
+                )
+                .await
+                .unwrap();
+            write_manifest_with_etag(&store, |m| {
+                m.pending_deletes.push("00000001.wal".into());
+            })
+            .await
+            .unwrap();
+        });
+        store.backfilled_meta.lock().unwrap().insert(
+            "00000001.wal".into(),
+            SegmentMeta {
+                first_seq: 1,
+                last_seq: 4,
+                size_bytes: 5,
+                sealed_at_ms: 1_000,
+            },
+        );
+
+        // Sweep 1: Phase 1 makes no changes, must still prune backfilled_meta
+        // for 00000001.wal, and Phase 2+3 deletes it from S3 and pending_deletes.
+        let reclaimed = store.rt().block_on(reclaim_segments(&store, None)).unwrap();
+        assert_eq!(reclaimed, 1);
+        assert!(
+            store.backfilled_meta.lock().unwrap().is_empty(),
+            "stale backfilled_meta entry already in pending_deletes must be cleared on no-op Phase 1"
+        );
+
+        // Sweep 2: must NOT re-adopt the deleted segment back into the manifest.
+        let reclaimed2 = store.rt().block_on(reclaim_segments(&store, None)).unwrap();
+        assert_eq!(reclaimed2, 0);
+        let m = store.read_manifest().unwrap();
+        assert!(m.sealed_segments.is_empty());
+        assert_eq!(m.active_segment, None);
+        assert!(m.pending_deletes.is_empty());
         store.close().unwrap();
     }
 }
