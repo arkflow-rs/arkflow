@@ -511,7 +511,7 @@ pub fn init() -> Result<(), Error> {
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 65535,
-                        "description": "Per-channel QoS prefetch count (defaults to 256 to bound broker backlog)."
+                        "description": "Per-channel QoS limit on unacknowledged in-flight deliveries (defaults to 256; 0 means unlimited; ignored when auto_ack is true)."
                     }
                 },
                 "required": ["url", "queue"]

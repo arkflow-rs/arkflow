@@ -24,7 +24,7 @@ The AMQP 0.9 input consumes messages from an AMQP 0.9/0.9.1 broker such as Rabbi
 | exclusive | boolean | no | `false` | Declare the queue as exclusive to this connection |
 | consumer_tag | string | no | `""` | Consumer tag identifying this consumer (empty lets the broker assign one) |
 | auto_ack | boolean | no | `false` | Automatically acknowledge deliveries on receipt; when `false`, acknowledgements are sent after downstream processing completes |
-| prefetch_count | integer | no | `256` | Per-channel QoS prefetch count (`0`–`65535`; defaults to `256` to bound broker backlog) |
+| prefetch_count | integer | no | `256` | Per-channel QoS prefetch limit on unacknowledged in-flight deliveries (`0`–`65535`; does not cap messages queued on the broker). Defaults to `256`; `0` means unlimited, and the limit does not apply when `auto_ack` is `true` |
 
 ## Examples
 
