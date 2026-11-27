@@ -37,6 +37,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
+/// Default per-channel QoS prefetch count applied when `prefetch_count` is not
+/// explicitly configured, bounding broker delivery backlog to preserve
+/// backpressure when downstream processing is slow.
+const DEFAULT_PREFETCH_COUNT: u16 = 256;
+
 /// Supported AMQP 0.9/0.9.1 exchange types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -175,6 +180,15 @@ impl Input for Amqp09Input {
             Self::shutdown_state(prev_state).await;
         }
 
+        // Buffered manual-ack deliveries belong to a retired channel whose
+        // Ackers are poisoned and cannot be settled; discard them before
+        // starting a fresh consumer (the broker will redeliver them on the new
+        // session). Keep buffered deliveries in auto_ack mode because the
+        // broker already settled them on delivery.
+        if !self.config.auto_ack.unwrap_or(false) {
+            while self.receiver.try_recv().is_ok() {}
+        }
+
         // Create connection (lapin 4 uses the Tokio runtime natively).
         let conn = Connection::connect(&self.config.url, ConnectionProperties::default())
             .await
@@ -186,13 +200,13 @@ impl Input for Amqp09Input {
             .await
             .map_err(|e| Error::Connection(format!("Failed to create channel: {}", e)))?;
 
-        // Set prefetch count if specified
-        if let Some(prefetch_count) = self.config.prefetch_count {
-            channel
-                .basic_qos(prefetch_count, BasicQosOptions::default())
-                .await
-                .map_err(|e| Error::Connection(format!("Failed to set QoS: {}", e)))?;
-        }
+        // Always bound in-flight broker deliveries so a slow downstream cannot
+        // accumulate an unbounded internal lapin queue (backpressure invariant).
+        let prefetch_count = self.config.prefetch_count.unwrap_or(DEFAULT_PREFETCH_COUNT);
+        channel
+            .basic_qos(prefetch_count, BasicQosOptions::default())
+            .await
+            .map_err(|e| Error::Connection(format!("Failed to set QoS: {}", e)))?;
 
         // Declare exchange if needed
         if let Some(exchange) = &self.config.exchange {
@@ -292,14 +306,18 @@ impl Input for Amqp09Input {
                                     Arc::new(Amqp09Ack { acker: delivery.acker })
                                 };
                                 // Decode and pair the ack BEFORE claiming a channel slot
-                                // (Input::read cancellation-safety contract).
-                                let decoded = crate::input::codec_helper::decode_delivery(
-                                    &delivery.data,
-                                    &codec_clone,
-                                    input_name_clone.clone(),
-                                    ack,
-                                )
-                                .await;
+                                // (Input::read cancellation-safety contract), while still
+                                // observing shutdown cancellation so close()/reconnect
+                                // cannot hang on a blocked codec.
+                                let decoded = tokio::select! {
+                                    _ = task_token.cancelled() => break,
+                                    decoded = crate::input::codec_helper::decode_delivery(
+                                        &delivery.data,
+                                        &codec_clone,
+                                        input_name_clone.clone(),
+                                        ack,
+                                    ) => decoded,
+                                };
                                 tokio::select! {
                                     _ = task_token.cancelled() => break,
                                     res = sender_clone.send_async(decoded) => {
@@ -400,11 +418,18 @@ struct Amqp09Ack {
 #[async_trait]
 impl Ack for Amqp09Ack {
     async fn ack(&self) -> Result<(), Error> {
-        self.acker
+        let acked = self
+            .acker
             .ack(BasicAckOptions::default())
             .await
-            .map(|_| ())
-            .map_err(|e| Error::Process(format!("Failed to ack Amqp09 message: {}", e)))
+            .map_err(|e| Error::Process(format!("Failed to ack Amqp09 message: {}", e)))?;
+        if acked {
+            Ok(())
+        } else {
+            Err(Error::Process(
+                "Failed to ack Amqp09 message: acker is poisoned or already used".into(),
+            ))
+        }
     }
 }
 
@@ -486,7 +511,7 @@ pub fn init() -> Result<(), Error> {
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 65535,
-                        "description": "Per-channel QoS prefetch count."
+                        "description": "Per-channel QoS prefetch count (defaults to 256 to bound broker backlog)."
                     }
                 },
                 "required": ["url", "queue"]

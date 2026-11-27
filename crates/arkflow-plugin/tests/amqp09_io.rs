@@ -32,8 +32,7 @@ use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-const AMQP_HOST_PORT: u16 = 5672;
-const AMQP_URL: &str = "amqp://guest:guest@127.0.0.1:5672/%2f";
+const AMQP_CONTAINER_PORT: u16 = 5672;
 
 static UNIQUE: AtomicUsize = AtomicUsize::new(0);
 
@@ -46,11 +45,18 @@ fn unique(prefix: &str) -> String {
     )
 }
 
-static SERVER: LazyLock<tokio::sync::Mutex<Option<ContainerAsync<GenericImage>>>> =
+struct SharedServer {
+    container: ContainerAsync<GenericImage>,
+    url: String,
+}
+
+static SERVER: LazyLock<tokio::sync::Mutex<Option<SharedServer>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(None));
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
-struct ServerLease;
+struct ServerLease {
+    url: String,
+}
 
 async fn server_lease() -> Option<ServerLease> {
     let mut server = SERVER.lock().await;
@@ -62,8 +68,13 @@ async fn server_lease() -> Option<ServerLease> {
         sweep_leftover_servers();
         *server = Some(start_server().await);
     }
+    let url = server
+        .as_ref()
+        .expect("shared server initialized")
+        .url
+        .clone();
     ACTIVE.fetch_add(1, Ordering::SeqCst);
-    Some(ServerLease)
+    Some(ServerLease { url })
 }
 
 impl Drop for ServerLease {
@@ -73,39 +84,33 @@ impl Drop for ServerLease {
     }
 }
 
+/// Remove the shared container once the last lease drops. Keeps `SERVER`
+/// locked across `container.rm()` (and uses dynamic host ports per container)
+/// so no subsequent lease can ever race with a tearing-down container.
 fn remove_shared_server() {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let container = loop {
-        match SERVER.try_lock() {
-            Ok(mut server) => {
-                if ACTIVE.load(Ordering::SeqCst) != 0 {
-                    return;
-                }
-                break server.take();
-            }
-            Err(_) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return,
-        }
-    };
-    let Some(container) = container else {
-        return;
-    };
     let (done, released) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
+            let _ = done.send(());
             return;
         };
-        if let Err(error) = runtime.block_on(container.rm()) {
-            eprintln!("amqp09_io: container removal failed: {error}");
-        }
+        runtime.block_on(async {
+            let mut server = SERVER.lock().await;
+            if ACTIVE.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            if let Some(shared) = server.take() {
+                if let Err(error) = shared.container.rm().await {
+                    eprintln!("amqp09_io: container removal failed: {error}");
+                }
+            }
+        });
         let _ = done.send(());
     });
-    let _ = released.recv_timeout(Duration::from_secs(15));
+    let _ = released.recv();
 }
 
 fn sweep_leftover_servers() {
@@ -182,20 +187,25 @@ fn resource() -> Resource {
     }
 }
 
-async fn start_server() -> ContainerAsync<GenericImage> {
+async fn start_server() -> SharedServer {
     let image = GenericImage::new("rabbitmq", "3-alpine")
-        .with_mapped_port(AMQP_HOST_PORT, AMQP_HOST_PORT.tcp())
+        .with_exposed_port(AMQP_CONTAINER_PORT.tcp())
         .with_startup_timeout(Duration::from_secs(180));
     let container = image.start().await.expect("rabbitmq container start");
-    wait_for_server().await;
-    container
+    let host_port = container
+        .get_host_port_ipv4(AMQP_CONTAINER_PORT)
+        .await
+        .expect("rabbitmq mapped AMQP port");
+    let url = format!("amqp://guest:guest@127.0.0.1:{host_port}/%2f");
+    wait_for_server(&url).await;
+    SharedServer { container, url }
 }
 
-async fn wait_for_server() {
+async fn wait_for_server(url: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
         let ready = async {
-            let conn = Connection::connect(AMQP_URL, ConnectionProperties::default()).await?;
+            let conn = Connection::connect(url, ConnectionProperties::default()).await?;
             let ch = conn.create_channel().await?;
             ch.close(200, "probe".into()).await?;
             conn.close(200, "probe".into()).await?;
@@ -207,7 +217,7 @@ async fn wait_for_server() {
             return;
         }
         if std::time::Instant::now() > deadline {
-            panic!("RabbitMQ server not ready within 120s");
+            panic!("RabbitMQ server not ready within 120s at {url}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -216,7 +226,7 @@ async fn wait_for_server() {
 #[tokio::test]
 async fn amqp09_roundtrip_with_confirms_properties_and_manual_ack() {
     ensure_init();
-    let Some(_lease) = server_lease().await else {
+    let Some(lease) = server_lease().await else {
         skip_without_docker("amqp09_roundtrip_with_confirms_properties_and_manual_ack");
         return;
     };
@@ -228,7 +238,7 @@ async fn amqp09_roundtrip_with_confirms_properties_and_manual_ack() {
     let input_cfg: InputConfig = serde_json::from_value(serde_json::json!({
         "type": "amqp09",
         "name": "amqp_in",
-        "url": AMQP_URL,
+        "url": lease.url,
         "queue": queue,
         "exchange": exchange,
         "exchange_type": "direct",
@@ -245,7 +255,7 @@ async fn amqp09_roundtrip_with_confirms_properties_and_manual_ack() {
 
     let output_cfg: OutputConfig = serde_json::from_value(serde_json::json!({
         "type": "amqp09",
-        "url": AMQP_URL,
+        "url": lease.url,
         "exchange": exchange,
         "exchange_type": "direct",
         "routing_key": { "type": "value", "value": rk },
@@ -294,7 +304,7 @@ async fn amqp09_roundtrip_with_confirms_properties_and_manual_ack() {
 #[tokio::test]
 async fn amqp09_fanout_and_dynamic_routing_key_and_reconnect() {
     ensure_init();
-    let Some(_lease) = server_lease().await else {
+    let Some(lease) = server_lease().await else {
         skip_without_docker("amqp09_fanout_and_dynamic_routing_key_and_reconnect");
         return;
     };
@@ -305,7 +315,7 @@ async fn amqp09_fanout_and_dynamic_routing_key_and_reconnect() {
 
     let input_cfg: InputConfig = serde_json::from_value(serde_json::json!({
         "type": "amqp09",
-        "url": AMQP_URL,
+        "url": lease.url,
         "queue": fanout_q,
         "exchange": fanout_ex,
         "exchange_type": "fanout",
@@ -320,7 +330,7 @@ async fn amqp09_fanout_and_dynamic_routing_key_and_reconnect() {
 
     let output_cfg: OutputConfig = serde_json::from_value(serde_json::json!({
         "type": "amqp09",
-        "url": AMQP_URL,
+        "url": lease.url,
         "exchange": fanout_ex,
         "exchange_type": "fanout",
         "routing_key": { "type": "expr", "expr": "rk" },

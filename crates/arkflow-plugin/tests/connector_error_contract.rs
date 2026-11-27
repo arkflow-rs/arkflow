@@ -53,6 +53,7 @@ const BOUNDED_EOF_INPUT: &[&str] = &[
 /// fatal; the variant is documentation-grade honesty here). `codec_helper.rs`
 /// hosts the shared sqlx classifier itself.
 const OUTPUT_DISCONNECTION_ALLOW: &[&str] = &[
+    "amqp09.rs",
     "codec_helper.rs",
     "nats.rs",
     "pgvector.rs",
@@ -259,6 +260,21 @@ async fn redis_output_write_before_connect_is_connection_error() {
             "mode": {"type": "single", "url": "redis://127.0.0.1:1"},
             "redis_type": {"type": "publish", "channel": {"type": "value", "value": "ch"}},
             "value_field": null,
+        }),
+    )
+    .await;
+    assert!(matches!(err, Error::Connection(_)), "{err:?}");
+}
+
+#[cfg(feature = "connectors-amqp09")]
+#[tokio::test]
+async fn amqp09_output_write_before_connect_is_connection_error() {
+    let err = guard_error(
+        "amqp09",
+        serde_json::json!({
+            "url": "amqp://127.0.0.1:1/%2f",
+            "exchange": "",
+            "routing_key": {"type": "value", "value": "q"},
         }),
     )
     .await;

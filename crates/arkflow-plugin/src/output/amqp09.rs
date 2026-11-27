@@ -257,12 +257,14 @@ impl Output for Amqp09Output {
                 .map(|p| p.to_vec())
                 .collect()
         };
+        // Per-row routing keys are indexed by payload, so a skipped NULL row
+        // would shift later payloads onto earlier routing keys — check alignment
+        // before returning early on empty payloads so all-NULL non-empty batches
+        // fail loudly instead of silently dropping rows.
+        crate::output::codec_helper::ensure_row_aligned(&owned_payloads, msg.num_rows(), "amqp09")?;
         if owned_payloads.is_empty() {
             return Ok(());
         }
-        // Per-row routing keys are indexed by payload, so a skipped NULL row
-        // would shift later payloads onto earlier routing keys.
-        crate::output::codec_helper::ensure_row_aligned(&owned_payloads, msg.num_rows(), "amqp09")?;
 
         let routing_keys = self.config.routing_key.evaluate_expr(&msg).await?;
         check_routing_key_alignment(&routing_keys, owned_payloads.len())?;

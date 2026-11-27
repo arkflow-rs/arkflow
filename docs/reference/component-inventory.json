@@ -68,7 +68,7 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 65535,
-            "description": "Per-channel QoS prefetch count."
+            "description": "Per-channel QoS prefetch count (defaults to 256 to bound broker backlog)."
           }
         },
         "required": [

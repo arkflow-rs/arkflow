@@ -85,7 +85,7 @@ tokio-tungstenite = { version = "0.30", optional = true, features = ["native-tls
 async-nats = { version = "0.53", optional = true }
 
 # RabbitMQ (AMQP 0.9/0.9.1)
-lapin = { version = "4.13", optional = true, default-features = false, features = ["tokio", "rustls", "rustls--ring", "rustls-native-certs"] }
+lapin = { workspace = true, optional = true }
 
 # Pulsar
 pulsar = { version = "6.6", optional = true }

@@ -24,7 +24,7 @@ AMQP 0.9 输入(Input)从 RabbitMQ 等 AMQP 0.9/0.9.1 消息代理消费消息�
 | exclusive | boolean | no | `false` | 声明的队列是否仅限当前连接独占 |
 | consumer_tag | string | no | `""` | 消费者标签(留空由代理自动分配) |
 | auto_ack | boolean | no | `false` | 收到消息后是否自动确认;为 `false` 时在下游处理完成后再发送 `basic.ack` |
-| prefetch_count | integer | no | — | 单通道 QoS 预取数量(`0`–`65535`) |
+| prefetch_count | integer | no | `256` | 单通道 QoS 预取数量(`0`–`65535`;默认 `256` 以限制代理积压并维持背压) |
 
 ## 示例
 
