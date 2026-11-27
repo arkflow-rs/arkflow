@@ -164,6 +164,7 @@ export function Configuration({
     setShowProposalDiff(true)
     setIssues([])
     setValidatedCandidate(undefined)
+    setBusy((current) => (current === t('config.busyValidating') ? '' : current))
     toast.success(t('copilot.proposalLoaded'))
     copilot.consumeConfigProposal(pendingProposal.id)
   }, [pendingProposal, systemKnown, fleetMode, nodeId, copilot, t])
