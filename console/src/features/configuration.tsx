@@ -79,6 +79,12 @@ export function Configuration({
   const proposalLoadedForNodeRef = useRef<string | null>(null)
   useEffect(() => {
     proposalLoadedForNodeRef.current = null
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- clear prior node edits and validation before new node snapshot/proposal hydrates
+    setEditable(false)
+    setShowProposalDiff(false)
+    setIssues([])
+    setValidatedCandidate(undefined)
+    setDiff(undefined)
   }, [nodeId])
   const versions = versionsQuery.data ?? []
   const candidate = { format, content }

@@ -643,3 +643,61 @@ async fn incomplete_stream_fails_and_unknown_tool_is_masked_in_audit() {
     assert!(!msg.contains("leaked_completion_tool_name"), "{msg}");
     assert!(msg.contains("<unknown_tool>"), "{msg}");
 }
+
+#[tokio::test]
+async fn finish_reason_length_fails_with_ai_output_truncated() {
+    let (api_base, _hits) = spawn_mock_openai_sse(|_turn, _body| {
+        (
+            200,
+            sse_chunks(vec![json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "delta": { "content": "cut off answer" }
+                }]
+            })]),
+        )
+    })
+    .await;
+
+    let mut cfg_hub = test_hub_config("root|admin|admin-secret");
+    cfg_hub.operator_token = Some("root|admin|admin-secret".into());
+    let hub = hub::Hub::new(cfg_hub);
+    let cfg = ServerConfig {
+        ai: AiCopilotConfig {
+            enabled: true,
+            api_base: Some(api_base),
+            model: Some("mock".into()),
+            ..AiCopilotConfig::default()
+        },
+        ..ServerConfig::default()
+    };
+    let app = hub_router(hub, &cfg);
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/ai/chat")
+                .header("authorization", "Bearer admin-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"messages": [{"role": "user", "content": "hi"}]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .into_owned();
+    let events = parse_sse_events(&raw);
+    assert!(
+        events
+            .iter()
+            .any(|(n, v)| n == "error" && v["code"] == "ai_output_truncated"),
+        "{events:?}"
+    );
+    assert!(!events.iter().any(|(n, _)| n == "done"), "{events:?}");
+}

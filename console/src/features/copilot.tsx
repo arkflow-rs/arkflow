@@ -205,12 +205,34 @@ export function CopilotProvider({
         ...(overrideContext ?? context ?? {}),
       }
 
-      const historyPayload: AiChatMessagePayload[] = [
-        ...messagesRef.current
-          .filter((m) => m.content.trim().length > 0 && !m.error)
-          .map((m) => ({ role: m.role, content: m.content })),
-        { role: 'user', content: text },
+      const encoder = new TextEncoder()
+      const utf8Bytes = (value: string) => encoder.encode(value).length
+      const contextBytes = [
+        effectiveContext.page,
+        effectiveContext.node_id,
+        effectiveContext.job_id,
+        effectiveContext.stream_id,
+        effectiveContext.draft_format,
+        effectiveContext.draft_content,
+        effectiveContext.error_summary,
       ]
+        .filter((s): s is string => typeof s === 'string')
+        .reduce((sum, s) => sum + utf8Bytes(s), 0)
+      const MAX_PAYLOAD_BYTES = 65_536
+      const MAX_HISTORY_TURNS = 40
+      const priorTurns: AiChatMessagePayload[] = messagesRef.current
+        .filter((m) => m.content.trim().length > 0 && !m.error)
+        .slice(-(MAX_HISTORY_TURNS - 1))
+        .map((m) => ({ role: m.role, content: m.content }))
+      let remainingBytes = Math.max(0, MAX_PAYLOAD_BYTES - contextBytes - utf8Bytes(text))
+      const boundedPrior: AiChatMessagePayload[] = []
+      for (let i = priorTurns.length - 1; i >= 0; i--) {
+        const turnBytes = utf8Bytes(priorTurns[i].content)
+        if (turnBytes > remainingBytes) break
+        remainingBytes -= turnBytes
+        boundedPrior.unshift(priorTurns[i])
+      }
+      const historyPayload: AiChatMessagePayload[] = [...boundedPrior, { role: 'user', content: text }]
 
       const userMsg: CopilotMessage = { id: makeId('user'), role: 'user', content: text }
       const assistantId = makeId('assistant')

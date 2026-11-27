@@ -152,8 +152,10 @@ fn mask_inline_url_credentials(text: &str) -> String {
             })
             .unwrap_or(after_scheme.len());
         let url_body = &after_scheme[..url_end];
-        if let Some(at_pos) = url_body.find('@') {
-            let userinfo = &url_body[..at_pos];
+        let authority_end = url_body.find(['/', '?', '#']).unwrap_or(url_body.len());
+        let authority = &url_body[..authority_end];
+        if let Some(at_pos) = authority.rfind('@') {
+            let userinfo = &authority[..at_pos];
             if let Some(colon_pos) = userinfo.find(':') {
                 out.push_str(&userinfo[..colon_pos + 1]);
                 out.push_str("******");
@@ -171,44 +173,82 @@ fn mask_inline_url_credentials(text: &str) -> String {
 }
 
 fn mask_secret_key_lines(text: &str) -> String {
+    let raw_lines: Vec<&str> = text.lines().collect();
     let mut lines = Vec::new();
-    for line in text.lines() {
+    let mut i = 0;
+    while i < raw_lines.len() {
+        let line = raw_lines[i];
         let trimmed_start = line.trim_start();
-        let leading = &line[..line.len() - trimmed_start.len()];
+        let leading_len = line.len() - trimmed_start.len();
+        let leading = &line[..leading_len];
         let candidate = trimmed_start.strip_prefix("- ").unwrap_or(trimmed_start);
         let prefix_dash = if trimmed_start.starts_with("- ") {
             "- "
         } else {
             ""
         };
+        let key_indent = leading_len + prefix_dash.len();
         if let Some((raw_key, raw_val)) = candidate.split_once(':') {
             let clean_key = raw_key.trim().trim_matches(|c| c == '"' || c == '\'');
             let val_trimmed = raw_val.trim();
-            if is_secret_key(clean_key) && !val_trimmed.is_empty() {
+            if is_secret_key(clean_key) {
                 let unquoted = val_trimmed
                     .trim_end_matches(',')
                     .trim()
                     .trim_matches(|c| c == '"' || c == '\'');
-                if !unquoted.starts_with("${secret:")
-                    && !unquoted.starts_with("${env:")
-                    && !unquoted.starts_with("${file:")
-                    && unquoted != "******"
+                let is_ref = unquoted.starts_with("${secret:")
+                    || unquoted.starts_with("${env:")
+                    || unquoted.starts_with("${file:")
+                    || unquoted == "******";
+                if !is_ref
+                    && (!val_trimmed.is_empty()
+                        || has_indented_continuation(&raw_lines[i + 1..], key_indent))
                 {
                     let trailing_comma = if val_trimmed.ends_with(',') { "," } else { "" };
                     lines.push(format!(
                         "{leading}{prefix_dash}{raw_key}: \"******\"{trailing_comma}"
                     ));
+                    i += 1;
+                    while i < raw_lines.len() {
+                        let next = raw_lines[i];
+                        let next_trimmed = next.trim_start();
+                        if next_trimmed.is_empty() {
+                            if has_indented_continuation(&raw_lines[i + 1..], key_indent) {
+                                i += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        let next_indent = next.len() - next_trimmed.len();
+                        if next_indent > key_indent {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
                     continue;
                 }
             }
         }
         lines.push(line.to_string());
+        i += 1;
     }
     let mut joined = lines.join("\n");
     if text.ends_with('\n') && !joined.ends_with('\n') {
         joined.push('\n');
     }
     joined
+}
+
+fn has_indented_continuation(rest: &[&str], parent_indent: usize) -> bool {
+    for line in rest {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return (line.len() - trimmed.len()) > parent_indent;
+    }
+    false
 }
 
 /// Return true if `name` is a known built-in Copilot tool name.
@@ -1570,9 +1610,21 @@ streams:
         assert!(!partial_masked.contains("raw-pw"), "{partial_masked}");
         assert!(!partial_masked.contains("s3cr3t"), "{partial_masked}");
 
-        let prose = "failed connecting to https://alice:pw123@hub.local/api with Bearer tok123";
+        let block_scalar = "password: |\n  UNIQUE_LITERAL_SECRET\n\n  SECOND_LINE\nbroken: [\n";
+        let block_masked = redact_config_or_text_for_ai(block_scalar);
+        assert!(
+            !block_masked.contains("UNIQUE_LITERAL_SECRET"),
+            "{block_masked}"
+        );
+        assert!(!block_masked.contains("SECOND_LINE"), "{block_masked}");
+        assert!(block_masked.contains("broken: ["), "{block_masked}");
+
+        let prose =
+            "failed connecting to https://alice:pw@123@hub.local/@user/api with Bearer tok123";
         let prose_masked = redact_text_for_ai(prose);
-        assert!(!prose_masked.contains("pw123"), "{prose_masked}");
+        assert!(!prose_masked.contains("pw@123"), "{prose_masked}");
+        assert!(!prose_masked.contains("@123"), "{prose_masked}");
+        assert!(prose_masked.contains("/@user/api"), "{prose_masked}");
         assert!(!prose_masked.contains("tok123"), "{prose_masked}");
     }
 

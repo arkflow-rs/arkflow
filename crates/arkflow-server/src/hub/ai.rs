@@ -754,6 +754,7 @@ async fn call_openai_stream(
     let mut byte_buf: Vec<u8> = Vec::new();
     let mut round_bytes: usize = 0;
     let mut saw_completion = false;
+    let mut finish_reason: Option<String> = None;
 
     'outer: while let Some(bytes) = response.chunk().await.map_err(|err| {
         let safe_err = err.without_url();
@@ -818,7 +819,10 @@ async fn call_openai_stream(
             let Some(choice0) = parsed.get("choices").and_then(|c| c.get(0)) else {
                 continue;
             };
-            if choice0.get("finish_reason").is_some_and(|v| !v.is_null()) {
+            if let Some(reason) = choice0.get("finish_reason").and_then(Value::as_str) {
+                saw_completion = true;
+                finish_reason = Some(reason.to_string());
+            } else if choice0.get("finish_reason").is_some_and(|v| !v.is_null()) {
                 saw_completion = true;
             }
             let Some(delta) = choice0.get("delta") else {
@@ -878,6 +882,23 @@ async fn call_openai_stream(
             "ai_provider_error".to_string(),
             "Upstream LLM stream ended before completion signal".to_string(),
         ));
+    }
+    match finish_reason.as_deref() {
+        Some("length") => {
+            return Err((
+                "ai_output_truncated".to_string(),
+                "Upstream LLM response was truncated at max_tokens limit (finish_reason=length)"
+                    .to_string(),
+            ));
+        }
+        Some("content_filter") => {
+            return Err((
+                "ai_provider_error".to_string(),
+                "Upstream LLM response stopped by content filter (finish_reason=content_filter)"
+                    .to_string(),
+            ));
+        }
+        _ => {}
     }
 
     let tool_calls = calls
