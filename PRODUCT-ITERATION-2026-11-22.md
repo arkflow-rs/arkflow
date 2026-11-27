@@ -119,7 +119,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 ### 3.2 P1（下一迭代 / 多节点生产前必须）
 
-#### PA-P1-01 构建依赖无裁剪（最大 DX 风险） · 已复核
+#### PA-P1-01 构建依赖无裁剪（最大 DX 风险） · ✅ 已实施并归档（`add-cargo-feature-gating`，PR #1402）
 
 **现象**：全 workspace 无 `[features]`；插件 crate 无条件依赖 DataFusion、`datafusion-table-providers`（duckdb/mysql/postgres/sqlite）、Ballista、`spiceai_duckdb_fork`、vendored rdkafka/SASL、PyO3、Pulsar、HDFS。`Cargo.lock` 1,021 包，debug 二进制 748 MB，target 88 GB。
 
@@ -239,7 +239,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 **建议 change**：`harden-node-identity-and-mtls`。
 
-#### PA-P1-08 审计、身份写入与会话撤销的一致性 · ✅ 已实施（`harden-identity-and-audit`，2026-11-26）
+#### PA-P1-08 审计、身份写入与会话撤销的一致性 · ✅ 已实施并归档（`harden-identity-and-audit`，PR #1404）
 
 **现象**：
 - 安全拒绝、身份变更、Job 操作审计均为 `let _ = record(...)`，存储故障静默丢失（[observability.rs:332](crates/arkflow-server/src/hub/observability.rs:332)）。
@@ -348,9 +348,9 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 | 顺序 | 事项 | 依赖 | 产出 |
 | --- | --- | --- | --- |
-| 1 | PA-P1-01 Cargo feature gating | 无 | `add-cargo-feature-gating` |
+| ~~1~~ | ~~PA-P1-01 Cargo feature gating~~ ✅ 已实施并归档（PR #1402） | 无 | `add-cargo-feature-gating` |
 | 2 | PA-P1-07 节点身份 + mTLS | 无 | `harden-node-identity-and-mtls` |
-| ~~3~~ | ~~PA-P1-08 审计/身份一致性~~ ✅ 已实施（2026-11-26） | 身份模型 | `harden-identity-and-audit` |
+| ~~3~~ | ~~PA-P1-08 审计/身份一致性~~ ✅ 已实施并归档（PR #1404） | 身份模型 | `harden-identity-and-audit` |
 | 4 | PA-P1-05 向量输出批量原子性 | 无 | `add-vector-output-batch-atomicity` |
 | 5 | PA-P1-06 S3 WAL 段回收 | 无 | `add-s3-wal-retention` |
 | 6 | PA-P1-09 local Job 隔离 | 无 | `add-local-job-isolation-policy` |
