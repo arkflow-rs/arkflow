@@ -770,6 +770,10 @@ impl Hub {
         }
         let updated = operation.clone();
         let attempt_id = operation.attempt_id.clone();
+        let newly_terminal = !already_terminal && result.state.is_terminal();
+        let node_credential_id = nodes
+            .get(&auth.node_id)
+            .and_then(|node| node.credential_id.clone());
         drop(operations);
         drop(nodes);
         if let (Some(storage), Some(attempt_id)) = (self.storage.as_ref(), attempt_id) {
@@ -786,6 +790,34 @@ impl Hub {
             persist_operation(storage, &updated)
                 .await
                 .map_err(HubError::from)?;
+        }
+        if newly_terminal {
+            let outcome = CommandMetrics::outcome_label(updated.state).unwrap_or("terminal");
+            let mut message = format!(
+                "operation={} resource={} generation={}",
+                updated.operation, updated.resource_id, updated.generation
+            );
+            if let Some(cred_id) = node_credential_id.as_deref() {
+                message.push_str(&format!(" credential={cred_id}"));
+            }
+            self.record_audit_best_effort(
+                "node",
+                crate::storage::AuditRecord {
+                    event_id: 0,
+                    actor: Some(format!("node:{}", auth.node_id)),
+                    action: "agent.command_result".into(),
+                    resource_type: "operation".into(),
+                    resource_id: Some(updated.id.clone()),
+                    node_id: Some(auth.node_id.clone()),
+                    stream_id: (!updated.operation.is_job()).then(|| updated.resource_id.clone()),
+                    correlation_id: updated.correlation_id.clone(),
+                    outcome: outcome.to_owned(),
+                    failure_code: updated.failure_class.clone(),
+                    message: Some(message),
+                    occurred_at_ms: now_ms(),
+                },
+            )
+            .await;
         }
         if updated.operation.is_job() {
             if matches!(

@@ -861,6 +861,25 @@ impl JobStartCommandPayload {
         )
         .map_err(|error| error.to_string())?;
         let (recovery_id, recovery_savepoint, recovery_required) = parse_recovery_payload(payload)?;
+        let edge_secrets = payload
+            .get("edge_secrets")
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                let mut map = BTreeMap::new();
+                for entry in entries {
+                    if let (Some(src), Some(dst), Some(secret)) = (
+                        entry.get("src").and_then(serde_json::Value::as_str),
+                        entry.get("dst").and_then(serde_json::Value::as_str),
+                        entry.get("secret").and_then(serde_json::Value::as_str),
+                    ) {
+                        if !src.is_empty() && !dst.is_empty() && !secret.is_empty() {
+                            map.insert((src.to_owned(), dst.to_owned()), secret.to_owned());
+                        }
+                    }
+                }
+                map
+            })
+            .unwrap_or_default();
         let split = SplitPlacementPayload {
             task_nodes: payload.get("task_nodes").and_then(|nodes| {
                 serde_json::from_value::<BTreeMap<String, String>>(nodes.clone()).ok()
@@ -872,6 +891,7 @@ impl JobStartCommandPayload {
                 })
                 .unwrap_or_default(),
             recovery_required,
+            edge_secrets,
         };
         Ok(Self {
             plan,

@@ -51,7 +51,30 @@ pub async fn run(
             .ok()
             .filter(|secret| !secret.is_empty());
         let data_plane_tls = data_plane_tls_from_env()?;
-        let manager = match data_secret {
+        let credentials = match data_secret {
+            Some(data_secret) => {
+                match arkflow_core::executor::remote::DataPlaneCredentials::new(
+                    config.node_id.clone(),
+                    data_secret,
+                ) {
+                    Ok(credentials) => Some(credentials),
+                    Err(error) => {
+                        warn!(node_id = %config.node_id, %error, "invalid data-plane credentials; running colocated-only");
+                        None
+                    }
+                }
+            }
+            None if data_plane_tls.is_some() => {
+                info!(
+                    node_id = %config.node_id,
+                    "data-plane mTLS active without ARKFLOW_DATA_PLANE_SECRET; using Hub-provisioned per-edge data-plane keys"
+                );
+                Some(
+                    arkflow_core::executor::remote::DataPlaneCredentials::hub_provisioned(
+                        config.node_id.clone(),
+                    ),
+                )
+            }
             None => {
                 warn!(
                     node_id = %config.node_id,
@@ -59,33 +82,22 @@ pub async fn run(
                 );
                 None
             }
-            Some(data_secret) => {
-                match arkflow_core::executor::remote::DataPlaneCredentials::new(
-                    config.node_id.clone(),
-                    data_secret,
-                ) {
+        };
+        let manager = match credentials {
+            None => None,
+            Some(credentials) => {
+                let mut manager_config = arkflow_core::executor::remote::NetworkManagerConfig {
+                    credentials: Some(credentials),
+                    channel_capacity: 1024,
+                    tls: data_plane_tls.clone(),
+                    ..arkflow_core::executor::remote::NetworkManagerConfig::default()
+                };
+                apply_data_plane_env_limits(&mut manager_config)?;
+                match arkflow_core::executor::remote::NetworkManager::with_config(manager_config) {
+                    Ok(manager) => Some(manager),
                     Err(error) => {
-                        warn!(node_id = %config.node_id, %error, "invalid data-plane credentials; running colocated-only");
+                        warn!(node_id = %config.node_id, %error, "invalid data-plane resource configuration; running colocated-only");
                         None
-                    }
-                    Ok(credentials) => {
-                        let mut manager_config =
-                            arkflow_core::executor::remote::NetworkManagerConfig {
-                                credentials: Some(credentials),
-                                channel_capacity: 1024,
-                                tls: data_plane_tls.clone(),
-                                ..arkflow_core::executor::remote::NetworkManagerConfig::default()
-                            };
-                        apply_data_plane_env_limits(&mut manager_config)?;
-                        match arkflow_core::executor::remote::NetworkManager::with_config(
-                            manager_config,
-                        ) {
-                            Ok(manager) => Some(manager),
-                            Err(error) => {
-                                warn!(node_id = %config.node_id, %error, "invalid data-plane resource configuration; running colocated-only");
-                                None
-                            }
-                        }
                     }
                 }
             }
@@ -144,7 +156,12 @@ pub async fn run(
     };
     let failover_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut active_config = config.clone();
-    let mut client = build_agent_client(&active_config.hub_url)?;
+    if let Some(path) = active_config.node_credential_file.as_deref() {
+        if let Some(stored) = load_node_credential(path)? {
+            active_config.node_token = stored;
+        }
+    }
+    let mut client = build_agent_client_with_tls(&active_config)?;
     // Reason token for the next switch's audit log, carried over from the
     // failure that triggered the rotation.
     let mut pending_reason: &'static str = "transport_error";
@@ -167,12 +184,28 @@ pub async fn run(
                 reason = pending_reason,
                 "Switching control-plane Hub candidate"
             );
-            client = build_agent_client(&next)?;
             active_config.hub_url = next;
+            client = build_agent_client_with_tls(&active_config)?;
             failover_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         match register(&client, &active_config, data_address.clone()).await {
-            Ok(session) => {
+            Ok(mut session) => {
+                if let Some(issued_credential) = session.node_credential.take() {
+                    let trimmed = issued_credential.trim().to_owned();
+                    if !trimmed.is_empty() {
+                        active_config.node_token = trimmed.clone();
+                        if let Some(path) = active_config.node_credential_file.as_deref() {
+                            if let Err(error) = persist_node_credential(path, &trimmed) {
+                                warn!(
+                                    node_id = %config.node_id,
+                                    path = %path,
+                                    %error,
+                                    "Failed to persist Hub-issued node credential"
+                                );
+                            }
+                        }
+                    }
+                }
                 info!(node_id = %config.node_id, hub = %active_config.hub_url, "Compute node registered with control-plane Hub");
                 backoff = Duration::from_millis(250);
                 failed_attempts = 0;
@@ -284,6 +317,46 @@ pub(super) fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn load_node_credential(
+    path: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let trimmed = content.trim().to_owned();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("failed to read node credential file {path}: {error}").into()),
+    }
+}
+
+fn persist_node_credential(path: &str, credential: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = std::path::Path::new(path);
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = target.with_extension(format!("tmp.{}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp_path)?;
+    file.write_all(credential.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp_path, target)?;
+    Ok(())
+}
+
 /// Build the Agent's HTTP client. Loopback hubs are never proxied: system
 /// proxy settings (macOS/Windows proxy configuration or stray env vars) that
 /// intercept 127.0.0.1 traffic silently break registration and command
@@ -304,6 +377,65 @@ pub(super) fn build_agent_client(hub_url: &str) -> Result<Client, reqwest::Error
         return builder.no_proxy().build();
     }
     builder.build()
+}
+
+pub(super) fn build_agent_client_with_tls(
+    config: &NodeAgentConfig,
+) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+    match (config.tls_cert.as_deref(), config.tls_key.as_deref()) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "Agent client mTLS requires both tls_cert and tls_key (ARKFLOW_AGENT_TLS_CERT and ARKFLOW_AGENT_TLS_KEY)"
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+    if config.tls_ca.is_none() && config.tls_cert.is_none() && config.tls_key.is_none() {
+        return Ok(build_agent_client(&config.hub_url)?);
+    }
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10));
+    let loopback = url::Url::parse(&config.hub_url)
+        .ok()
+        .and_then(|url| url.host_str().map(is_loopback_host))
+        .unwrap_or(false);
+    if loopback {
+        builder = builder.no_proxy();
+    }
+    if let Some(ca_path) = config.tls_ca.as_deref() {
+        let ca_bytes = std::fs::read(ca_path)
+            .map_err(|error| format!("failed to read ARKFLOW_AGENT_TLS_CA {ca_path}: {error}"))?;
+        let mut cursor = std::io::Cursor::new(&ca_bytes);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("invalid PEM in ARKFLOW_AGENT_TLS_CA {ca_path}: {error}"))?;
+        if certs.is_empty() {
+            return Err(format!("ARKFLOW_AGENT_TLS_CA {ca_path} contains no certificates").into());
+        }
+        for cert in certs {
+            let reqwest_cert = reqwest::Certificate::from_der(cert.as_ref()).map_err(|error| {
+                format!("invalid X.509 certificate in ARKFLOW_AGENT_TLS_CA {ca_path}: {error}")
+            })?;
+            builder = builder.add_root_certificate(reqwest_cert);
+        }
+    }
+    if let (Some(cert_path), Some(key_path)) =
+        (config.tls_cert.as_deref(), config.tls_key.as_deref())
+    {
+        let cert_pem = std::fs::read_to_string(cert_path).map_err(|error| {
+            format!("failed to read ARKFLOW_AGENT_TLS_CERT {cert_path}: {error}")
+        })?;
+        let key_pem = std::fs::read_to_string(key_path)
+            .map_err(|error| format!("failed to read ARKFLOW_AGENT_TLS_KEY {key_path}: {error}"))?;
+        let combined = format!("{cert_pem}\n{key_pem}");
+        let identity = reqwest::Identity::from_pem(combined.as_bytes()).map_err(|error| {
+            format!("invalid Agent TLS client identity ({cert_path}, {key_path}): {error}")
+        })?;
+        builder = builder.identity(identity);
+    }
+    Ok(builder.build()?)
 }
 
 /// Classified registration failure (hub-ha stage 3): the failover loop

@@ -25,6 +25,19 @@ fn row_to_credential_pg(row: &Row<'_>) -> Result<CredentialRecord, StorageError>
     })
 }
 
+fn row_to_node_credential_pg(row: &Row<'_>) -> Result<NodeCredentialRecord, StorageError> {
+    Ok(NodeCredentialRecord {
+        credential_id: row.get(0)?,
+        node_id: row.get(1)?,
+        secret_hash: row.get(2)?,
+        label: row.get(3)?,
+        created_at_ms: row.get(4)?,
+        expires_at_ms: row.get(5)?,
+        last_used_at_ms: row.get(6)?,
+        revoked_at_ms: row.get(7)?,
+    })
+}
+
 fn row_to_session_pg(row: &Row<'_>) -> Result<SessionRecord, StorageError> {
     Ok(SessionRecord {
         session_hash: row.get(0)?,
@@ -2980,6 +2993,157 @@ impl StorageBackend for PostgresBackend {
                     binds![
                         record.credential_id,
                         record.user_id,
+                        record.secret_hash,
+                        record.label,
+                        record.created_at_ms,
+                        record.expires_at_ms,
+                        record.last_used_at_ms,
+                        record.revoked_at_ms,
+                    ],
+                )
+                .await?;
+            Ok(true)
+        }.await;
+        if __ret.is_err() {
+            drop(transaction);
+            return __ret;
+        }
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn list_node_credentials(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<NodeCredentialRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        let rows = connection
+            .query_all(
+                &q("SELECT credential_id, node_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms FROM cp_node_credentials WHERE node_id = ?1 ORDER BY created_at_ms DESC, credential_id"),
+                binds![node_id],
+                row_to_node_credential_pg,
+            )
+            .await?;
+        Ok(rows)
+    }
+
+    async fn get_node_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<NodeCredentialRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        connection
+            .query_row(
+                &q("SELECT credential_id, node_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms FROM cp_node_credentials WHERE credential_id = ?1"),
+                binds![credential_id],
+                row_to_node_credential_pg,
+            )
+            .await
+            .optional()
+    }
+
+    async fn count_active_node_credentials(
+        &self,
+        node_id: &str,
+        now_ms: u64,
+    ) -> Result<usize, StorageError> {
+        let mut connection = self.lease().await?;
+        let count: i64 = connection
+            .query_row(
+                &q("SELECT COUNT(*) FROM cp_node_credentials WHERE node_id = ?1 AND revoked_at_ms IS NULL AND (expires_at_ms IS NULL OR expires_at_ms > ?2)"),
+                binds![node_id, now_ms],
+                |row| row.get::<i64>(0),
+            )
+            .await
+            .required()?;
+        Ok(count.max(0) as usize)
+    }
+
+    async fn create_node_credential(
+        &self,
+        record: NodeCredentialRecord,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            transaction
+                .execute(
+                    &q("INSERT INTO cp_node_credentials (credential_id, node_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+                    binds![
+                        record.credential_id,
+                        record.node_id,
+                        record.secret_hash,
+                        record.label,
+                        record.created_at_ms,
+                        record.expires_at_ms,
+                        record.last_used_at_ms,
+                        record.revoked_at_ms,
+                    ],
+                )
+                .await?;
+            Ok(true)
+        }.await;
+        if __ret.is_err() {
+            drop(transaction);
+            return __ret;
+        }
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn revoke_node_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<Option<(NodeCredentialRecord, bool)>, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let changed = transaction
+                .execute(
+                    &q("UPDATE cp_node_credentials SET revoked_at_ms = ?2 WHERE credential_id = ?1 AND revoked_at_ms IS NULL"),
+                    binds![credential_id, revoked_at_ms],
+                )
+                .await?;
+            let record = transaction
+                .query_row(
+                    &q("SELECT credential_id, node_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms FROM cp_node_credentials WHERE credential_id = ?1"),
+                    binds![credential_id],
+                    row_to_node_credential_pg,
+                )
+                .await
+                .optional()?;
+            Ok(record.map(|record| (record, changed > 0)))
+        }.await;
+        if __ret.is_err() {
+            drop(transaction);
+            return __ret;
+        }
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn rotate_node_credential(
+        &self,
+        record: NodeCredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            let changed = transaction
+                .execute(
+                    &q("UPDATE cp_node_credentials SET revoked_at_ms = ?2 WHERE credential_id = ?1 AND revoked_at_ms IS NULL"),
+                    binds![previous_credential_id, revoked_at_ms],
+                )
+                .await?;
+            if changed != 1 {
+                return Ok(false);
+            }
+            transaction
+                .execute(
+                    &q("INSERT INTO cp_node_credentials (credential_id, node_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+                    binds![
+                        record.credential_id,
+                        record.node_id,
                         record.secret_hash,
                         record.label,
                         record.created_at_ms,

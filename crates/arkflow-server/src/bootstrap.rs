@@ -404,5 +404,11 @@ pub async fn serve_from_config(
     if let Some(oidc) = OidcFederation::from_env().await {
         hub = hub.with_oidc(oidc);
     }
+    if config.node_bootstrap_disabled {
+        hub = hub.with_node_bootstrap_disabled(true);
+    }
+    if config.allow_shared_node_token_break_glass {
+        hub = hub.with_allow_shared_node_token_break_glass(true);
+    }
     serve_hub(hub, config, cancellation).await
 }

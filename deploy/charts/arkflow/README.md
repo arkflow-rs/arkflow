@@ -28,14 +28,15 @@ helm install my-arkflow oci://ghcr.io/arkflow-rs/charts/arkflow \
 
 ## Agent mode
 
-Node identity defaults to the pod name (`ARKFLOW_NODE_ID` via the downward API; engine-native fallback). Supply the registration token as `ARKFLOW_NODE_TOKEN` from a Secret. The data-plane port (`agent.dataPort`) is exposed through a headless Service; the engine refuses to serve the data plane without fleet credentials (see the TLS matrix docs).
+Node identity defaults to the pod name (`ARKFLOW_NODE_ID` via the downward API; engine-native fallback). Supply the registration/bootstrap token as `ARKFLOW_NODE_TOKEN` from a Secret, set `agent.tls.existingSecret` to mount CA + client/data-plane certificates for Hub mTLS and cross-node shuffle, and enable `persistence.enabled: true` so enrolled per-node `arkn_` credentials (`ARKFLOW_NODE_CREDENTIAL_FILE`) survive restarts. The data-plane port (`agent.dataPort`) is exposed through a headless Service; the engine refuses to serve the data plane without credentials (see the TLS matrix docs).
 
 ## Control-plane mode
 
 Hub + Console + optional in-chart agent:
 
 - Hub storage defaults to SQLite on the persistence PVC; set `controlPlane.hub.storage.postgresURL` to switch (also the HA prerequisite) and skip the PVC. The Hub Deployment stays single-replica `Recreate`.
-- The shared node credential (`ARKFLOW_NODE_TOKEN`) is generated into a kept Secret on first install, or point `controlPlane.nodeToken.existingSecret` at your own.
+- The bootstrap node credential (`ARKFLOW_NODE_TOKEN`) is generated into a kept Secret on first install, or point `controlPlane.nodeToken.existingSecret` at your own.
+- Mutual TLS (`controlPlane.tls.enabled: true`) is **enabled by default**: on first install the chart generates and keeps a Fleet CA, Hub server cert, and Agent client/data-plane cert (`clientAuth: agent_required` — `/api/v1/agent/*` requires client certs while `/health` and operator APIs remain reachable), and points `hub_urls` and `ARKFLOW_HUB_UPSTREAM` at `https://`. Bring your own certs with `controlPlane.tls.existingSecret` or set `controlPlane.tls.enabled=false` to opt out to plaintext HTTP.
 - The Console proxies `/api` and `/metrics` to the in-chart Hub Service (same-origin contract).
 
 See `values-controlplane.yaml` for a complete example.

@@ -326,6 +326,9 @@ pub(crate) struct TcpEdgeTransport {
     /// handshake before the edge protocol runs. Handshake failures share
     /// the same retry/backoff budget as TCP failures.
     pub tls: Option<DataPlaneTlsConfig>,
+    /// Optional peer node_id verified against `URI:urn:arkflow:node:<id>`
+    /// SANs if present in the server certificate.
+    pub peer_node: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -377,7 +380,15 @@ impl EdgeTransport for TcpEdgeTransport {
             let stream = match &self.tls {
                 Some(tls) => {
                     match tokio::time::timeout(EDGE_CONNECT_TIMEOUT, tls.connect(stream)).await {
-                        Ok(Ok(tls_stream)) => Box::new(tls_stream) as Box<dyn RemoteStream>,
+                        Ok(Ok(tls_stream)) => {
+                            if let Some(expected_node) = self.peer_node.as_deref() {
+                                let peer_node_ids = extract_peer_node_ids(
+                                    tls_stream.get_ref().1.peer_certificates(),
+                                );
+                                verify_peer_node_san(&peer_node_ids, expected_node)?;
+                            }
+                            Box::new(tls_stream) as Box<dyn RemoteStream>
+                        }
                         Ok(Err(error)) => {
                             let backoff = connect_backoff(attempt);
                             tracing::warn!(
@@ -431,8 +442,48 @@ impl TcpEdgeTransport {
             addr,
             max_attempts,
             tls: None,
+            peer_node: None,
         }
     }
+}
+
+pub(crate) fn extract_peer_node_ids(
+    certs: Option<&[rustls::pki_types::CertificateDer<'_>]>,
+) -> Vec<String> {
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let Some(leaf) = certs.and_then(|chain| chain.first()) else {
+        return Vec::new();
+    };
+    let Ok((_, cert)) = X509Certificate::from_der(leaf.as_ref()) else {
+        return Vec::new();
+    };
+    let mut node_ids = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            if let GeneralName::URI(uri) = name {
+                if let Some(node_id) = uri.strip_prefix("urn:arkflow:node:") {
+                    let trimmed = node_id.trim();
+                    if !trimmed.is_empty() && !node_ids.iter().any(|existing| existing == trimmed) {
+                        node_ids.push(trimmed.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    node_ids
+}
+
+pub(crate) fn verify_peer_node_san(
+    peer_node_ids: &[String],
+    expected_node: &str,
+) -> Result<(), Error> {
+    if !peer_node_ids.is_empty() && !peer_node_ids.iter().any(|id| id == expected_node) {
+        return Err(Error::Process(format!(
+            "data-plane TLS certificate SAN mismatch for peer '{expected_node}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Bound on one TCP connect / TLS handshake attempt. `max_attempts` counts
@@ -446,11 +497,16 @@ pub(crate) fn connect_backoff(attempt: usize) -> std::time::Duration {
     std::time::Duration::from_millis((50u64.saturating_mul(attempt as u64 + 1)).min(1_000))
 }
 
+pub(crate) struct AcceptedStream {
+    pub(crate) stream: Box<dyn RemoteStream>,
+    pub(crate) peer_node_ids: Vec<String>,
+}
+
 /// Accepted-connection queue shared between the transport listener and the
 /// serve loop.
 pub(crate) type AcceptedQueue = (
-    flume::Sender<Box<dyn RemoteStream>>,
-    flume::Receiver<Box<dyn RemoteStream>>,
+    flume::Sender<AcceptedStream>,
+    flume::Receiver<AcceptedStream>,
 );
 
 pub(crate) struct ConnectionFailure {

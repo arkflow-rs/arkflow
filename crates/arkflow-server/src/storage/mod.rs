@@ -533,6 +533,21 @@ pub struct CredentialRecord {
     pub revoked_at_ms: Option<u64>,
 }
 
+/// A durable per-node credential (`cp_node_credentials`). Only the hash is
+/// stored; the plaintext token (`arkn_<credential_id>_<secret>`) is returned
+/// once at issuance, rotation, or initial bootstrap enrollment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCredentialRecord {
+    pub credential_id: String,
+    pub node_id: String,
+    pub secret_hash: String,
+    pub label: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+    pub last_used_at_ms: Option<u64>,
+    pub revoked_at_ms: Option<u64>,
+}
+
 /// A persisted browser session (`cp_sessions`): the cookie carries the random
 /// session id, the row carries its hash plus the principal snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -709,7 +724,7 @@ pub(crate) fn session_principal_matches_subject(principal_json: &str, oidc_subje
 /// Schema version this binary's DDL understands. Each backend stamps it
 /// into the database during initialization and refuses to start when the
 /// stored stamp is newer (an older binary must not operate a newer schema).
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Outcome of `begin_write_fence`: a lock held until `end_write_fence`
 /// (`Held`) or a verified passthrough with nothing to release.
@@ -1028,6 +1043,28 @@ storage_ops! {
     },
     ("rotate_credential", RotateCredential, rotate_credential) fenced bool {
         record: CredentialRecord as v,
+        previous_credential_id: String as s,
+        revoked_at_ms: u64 as v,
+    },
+    ("list_node_credentials", ListNodeCredentials, list_node_credentials) plain Vec<NodeCredentialRecord> {
+        node_id: String as s,
+    },
+    ("get_node_credential", GetNodeCredential, get_node_credential) plain Option<NodeCredentialRecord> {
+        credential_id: String as s,
+    },
+    ("count_active_node_credentials", CountActiveNodeCredentials, count_active_node_credentials) plain usize {
+        node_id: String as s,
+        now_ms: u64 as v,
+    },
+    ("create_node_credential", CreateNodeCredential, create_node_credential) fenced bool {
+        record: NodeCredentialRecord as v,
+    },
+    ("revoke_node_credential", RevokeNodeCredential, revoke_node_credential) fenced Option<(NodeCredentialRecord, bool)> {
+        credential_id: String as s,
+        revoked_at_ms: u64 as v,
+    },
+    ("rotate_node_credential", RotateNodeCredential, rotate_node_credential) fenced bool {
+        record: NodeCredentialRecord as v,
         previous_credential_id: String as s,
         revoked_at_ms: u64 as v,
     },
@@ -1799,6 +1836,34 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn rotate_credential(
         &self,
         record: CredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError>;
+    async fn list_node_credentials(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<NodeCredentialRecord>, StorageError>;
+    async fn get_node_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<NodeCredentialRecord>, StorageError>;
+    async fn count_active_node_credentials(
+        &self,
+        node_id: &str,
+        now_ms: u64,
+    ) -> Result<usize, StorageError>;
+    async fn create_node_credential(
+        &self,
+        record: NodeCredentialRecord,
+    ) -> Result<bool, StorageError>;
+    async fn revoke_node_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<Option<(NodeCredentialRecord, bool)>, StorageError>;
+    async fn rotate_node_credential(
+        &self,
+        record: NodeCredentialRecord,
         previous_credential_id: &str,
         revoked_at_ms: u64,
     ) -> Result<bool, StorageError>;
@@ -3142,6 +3207,96 @@ impl StorageBackend for ControlPlaneStore {
             }
             Self::Postgres(backend) => {
                 StorageBackend::rotate_credential(
+                    backend,
+                    record,
+                    previous_credential_id,
+                    revoked_at_ms,
+                )
+                .await
+            }
+        }
+    }
+    async fn list_node_credentials(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<NodeCredentialRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_node_credentials(backend, node_id).await,
+            Self::Postgres(backend) => {
+                StorageBackend::list_node_credentials(backend, node_id).await
+            }
+        }
+    }
+    async fn get_node_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<NodeCredentialRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::get_node_credential(backend, credential_id).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::get_node_credential(backend, credential_id).await
+            }
+        }
+    }
+    async fn count_active_node_credentials(
+        &self,
+        node_id: &str,
+        now_ms: u64,
+    ) -> Result<usize, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::count_active_node_credentials(backend, node_id, now_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::count_active_node_credentials(backend, node_id, now_ms).await
+            }
+        }
+    }
+    async fn create_node_credential(
+        &self,
+        record: NodeCredentialRecord,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::create_node_credential(backend, record).await,
+            Self::Postgres(backend) => {
+                StorageBackend::create_node_credential(backend, record).await
+            }
+        }
+    }
+    async fn revoke_node_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<Option<(NodeCredentialRecord, bool)>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::revoke_node_credential(backend, credential_id, revoked_at_ms).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::revoke_node_credential(backend, credential_id, revoked_at_ms).await
+            }
+        }
+    }
+    async fn rotate_node_credential(
+        &self,
+        record: NodeCredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::rotate_node_credential(
+                    backend,
+                    record,
+                    previous_credential_id,
+                    revoked_at_ms,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::rotate_node_credential(
                     backend,
                     record,
                     previous_credential_id,
@@ -8090,5 +8245,78 @@ mod job_storage_tests {
         assert!(store.get_session("unbound-alice").await.unwrap().is_none());
         assert!(store.get_session("bound-alice").await.unwrap().is_none());
         assert!(store.get_session("unbound-other").await.unwrap().is_some());
+    }
+
+    #[test]
+    fn node_credentials_round_trip_and_table_copier_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.sqlite");
+        let backend = SqliteBackend::open(path.to_str().unwrap()).unwrap();
+
+        let rec1 = NodeCredentialRecord {
+            credential_id: "nc1".into(),
+            node_id: "node-1".into(),
+            secret_hash: "h1".into(),
+            label: "initial".into(),
+            created_at_ms: 100,
+            expires_at_ms: Some(1_000),
+            last_used_at_ms: None,
+            revoked_at_ms: None,
+        };
+        assert!(backend.create_node_credential(rec1.clone()).unwrap());
+        assert_eq!(
+            backend
+                .count_active_node_credentials("node-1", 500)
+                .unwrap(),
+            1
+        );
+        // Expired at t=1_000 is no longer counted active.
+        assert_eq!(
+            backend
+                .count_active_node_credentials("node-1", 1_000)
+                .unwrap(),
+            0
+        );
+
+        let rec2 = NodeCredentialRecord {
+            credential_id: "nc2".into(),
+            node_id: "node-1".into(),
+            secret_hash: "h2".into(),
+            label: "initial".into(),
+            created_at_ms: 600,
+            expires_at_ms: None,
+            last_used_at_ms: None,
+            revoked_at_ms: None,
+        };
+        assert!(backend
+            .rotate_node_credential(rec2.clone(), "nc1", 600)
+            .unwrap());
+        assert_eq!(
+            backend
+                .count_active_node_credentials("node-1", 650)
+                .unwrap(),
+            1
+        );
+        let listed = backend.list_node_credentials("node-1").unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed
+            .iter()
+            .any(|row| row.credential_id == "nc1" && row.revoked_at_ms == Some(600)));
+
+        assert!(super::table_copier::TABLE_ORDER.contains(&"cp_node_credentials"));
+        let (_cols, rows) =
+            super::table_copier::read_sqlite_table_ordered(&backend, "cp_node_credentials")
+                .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let (revoked, newly) = backend.revoke_node_credential("nc2", 700).unwrap().unwrap();
+        assert!(newly);
+        assert_eq!(revoked.revoked_at_ms, Some(700));
+        assert_eq!(
+            backend
+                .count_active_node_credentials("node-1", 750)
+                .unwrap(),
+            0
+        );
     }
 }

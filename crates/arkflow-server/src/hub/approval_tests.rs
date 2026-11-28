@@ -309,16 +309,17 @@ async fn pending_requests_survive_a_hub_restart_and_policy_toggle() {
     let store = crate::storage::ControlPlaneStore::contract("approval_restart").await;
     let storage = StorageActor::start(store, 8);
     let hub = Hub::with_storage(approval_config(), storage.clone());
-    hub.register(RegisterRequest {
-        data_address: None,
-        node_id: "node-a".into(),
-        node_token: "node-secret".into(),
-        protocol_version: "v1".into(),
-        capabilities: vec![],
-        boot_id: None,
-    })
-    .await
-    .unwrap();
+    let session = hub
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec![],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
     hub.create_rollout_with_content(
         "cfg-seed".into(),
         "{\"streams\":[]}".into(),
@@ -342,7 +343,9 @@ async fn pending_requests_survive_a_hub_restart_and_policy_toggle() {
         .register(RegisterRequest {
             data_address: None,
             node_id: "node-a".into(),
-            node_token: "node-secret".into(),
+            node_token: session
+                .node_credential
+                .unwrap_or_else(|| "node-secret".into()),
             protocol_version: "v1".into(),
             capabilities: vec![],
             boot_id: None,

@@ -7,9 +7,10 @@ use super::auth::{
 };
 use super::codec::{DataDecoder, DataEncoder};
 use super::transport::{
-    connect_backoff, read_dispatch, read_frame_with_limits, read_receipt_frame, write_frame_sealed,
-    write_frame_with_limit, write_sealed_or_plain, AcceptedQueue, ConnectionFailure,
-    DataPlaneTlsConfig, EdgeTransport, RemoteStream,
+    connect_backoff, extract_peer_node_ids, read_dispatch, read_frame_with_limits,
+    read_receipt_frame, verify_peer_node_san, write_frame_sealed, write_frame_with_limit,
+    write_sealed_or_plain, AcceptedQueue, AcceptedStream, ConnectionFailure, DataPlaneTlsConfig,
+    EdgeTransport, RemoteStream,
 };
 use super::wire::{
     FrameHeader, FrameKind, Quad, ReceiptFrame, ReceiptKind, TieredFrame, WireSignal,
@@ -492,6 +493,8 @@ pub struct NetworkManager {
     outbound: std::sync::RwLock<BTreeMap<EdgeSessionKey, Arc<PendingReceipts>>>,
     /// Job/generation/quad → expected authenticated upstream identity.
     pub(crate) inbound_auth: std::sync::RwLock<BTreeMap<EdgeSessionKey, PeerExpectation>>,
+    /// Job/generation/quad → optional Hub-provisioned per-edge HMAC secret.
+    pub(crate) inbound_edge_secrets: std::sync::RwLock<BTreeMap<EdgeSessionKey, Arc<[u8]>>>,
     /// Fatal edge errors (ack commit failures, aborted edges) for the kernel.
     failures: flume::Sender<Error>,
     pub(crate) failure_receiver: flume::Receiver<Error>,
@@ -701,6 +704,7 @@ impl NetworkManager {
             inbound: std::sync::RwLock::new(BTreeMap::new()),
             outbound: std::sync::RwLock::new(BTreeMap::new()),
             inbound_auth: std::sync::RwLock::new(BTreeMap::new()),
+            inbound_edge_secrets: std::sync::RwLock::new(BTreeMap::new()),
             failures: failure_sender,
             failure_receiver,
             failure_channels: std::sync::RwLock::new(BTreeMap::new()),
@@ -810,6 +814,10 @@ impl NetworkManager {
             .write()
             .expect("inbound auth registry lock")
             .remove(&EdgeSessionKey::legacy(quad));
+        self.inbound_edge_secrets
+            .write()
+            .expect("inbound edge secrets lock")
+            .remove(&EdgeSessionKey::legacy(quad));
     }
 
     /// Registers a downstream quad together with the identity that is allowed
@@ -821,15 +829,46 @@ impl NetworkManager {
         sender: flume::Sender<Envelope>,
         expectation: PeerExpectation,
     ) -> Result<(), Error> {
-        if self.config.credentials.is_none() {
+        self.register_inbound_for_session_with_secret(quad, sender, expectation, None)
+    }
+
+    /// Registers a downstream quad with an optional Hub-provisioned per-edge
+    /// HMAC secret. Under `DataPlaneCredentials::hub_provisioned`, a missing
+    /// or empty edge secret fails closed here.
+    pub fn register_inbound_for_session_with_secret(
+        &self,
+        quad: Quad,
+        sender: flume::Sender<Envelope>,
+        expectation: PeerExpectation,
+        edge_secret: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        let Some(credentials) = self.config.credentials.as_ref() else {
             self.claim_legacy_job_key(JobSessionKey {
                 job_id: expectation.job_id.clone(),
                 generation: expectation.generation,
             })?;
             self.register_inbound(quad, sender);
             return Ok(());
-        }
+        };
         let key = expectation.edge_key(quad);
+        let secret_arc: Option<Arc<[u8]>> = match edge_secret {
+            Some(bytes) => {
+                if bytes.is_empty() {
+                    return Err(Error::Config(format!(
+                        "per-edge data-plane secret for {}->{} on job '{}' must not be empty",
+                        expectation.source_node, credentials.local_node, expectation.job_id
+                    )));
+                }
+                Some(Arc::from(bytes.to_vec().into_boxed_slice()))
+            }
+            None if credentials.hub_provisioned => {
+                return Err(Error::Config(format!(
+                    "missing Hub-provisioned per-edge data-plane secret for {}->{} on job '{}'",
+                    expectation.source_node, credentials.local_node, expectation.job_id
+                )));
+            }
+            None => None,
+        };
         self.inbound
             .write()
             .expect("inbound registry lock")
@@ -837,7 +876,19 @@ impl NetworkManager {
         self.inbound_auth
             .write()
             .expect("inbound auth registry lock")
-            .insert(key, expectation);
+            .insert(key.clone(), expectation);
+        let mut secrets = self
+            .inbound_edge_secrets
+            .write()
+            .expect("inbound edge secrets lock");
+        match secret_arc {
+            Some(secret) => {
+                secrets.insert(key, secret);
+            }
+            None => {
+                secrets.remove(&key);
+            }
+        }
         Ok(())
     }
 
@@ -849,6 +900,10 @@ impl NetworkManager {
         self.inbound_auth
             .write()
             .expect("inbound auth registry lock")
+            .remove(key);
+        self.inbound_edge_secrets
+            .write()
+            .expect("inbound edge secrets lock")
             .remove(key);
     }
 
@@ -931,6 +986,10 @@ impl NetworkManager {
             .write()
             .expect("inbound auth registry lock")
             .retain(|key, _| key.job() != Some(&job) && !(legacy_owned && key.job().is_none()));
+        self.inbound_edge_secrets
+            .write()
+            .expect("inbound edge secrets lock")
+            .retain(|key, _| key.job() != Some(&job) && !(legacy_owned && key.job().is_none()));
         let pending = {
             let mut outbound = self.outbound.write().expect("outbound registry lock");
             outbound_keys
@@ -1003,6 +1062,14 @@ impl NetworkManager {
     /// Injects an accepted stream (server side). The TCP listener task calls
     /// this per `TcpStream`; tests inject duplex halves.
     pub fn accept_stream(&self, stream: Box<dyn RemoteStream>) {
+        self.accept_stream_with_peer_nodes(stream, Vec::new());
+    }
+
+    pub(crate) fn accept_stream_with_peer_nodes(
+        &self,
+        stream: Box<dyn RemoteStream>,
+        peer_node_ids: Vec<String>,
+    ) {
         let current = self.active_connections.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Relaxed,
@@ -1016,7 +1083,15 @@ impl NetworkManager {
             )));
             return;
         }
-        if self.accepted.0.try_send(stream).is_err() {
+        if self
+            .accepted
+            .0
+            .try_send(AcceptedStream {
+                stream,
+                peer_node_ids,
+            })
+            .is_err()
+        {
             self.active_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             self.count_rejection("accepted-connection queue full");
@@ -1037,7 +1112,7 @@ impl NetworkManager {
         let manager = self.clone();
         tokio::spawn(async move {
             loop {
-                let stream = tokio::select! {
+                let accepted = tokio::select! {
                     _ = manager.shutdown.cancelled() => break,
                     stream = manager.accepted.1.recv_async() => match stream {
                         Ok(stream) => stream,
@@ -1046,7 +1121,10 @@ impl NetworkManager {
                 };
                 let per_stream = manager.clone();
                 tokio::spawn(async move {
-                    per_stream.clone().serve_stream(stream).await;
+                    per_stream
+                        .clone()
+                        .serve_stream(accepted.stream, accepted.peer_node_ids)
+                        .await;
                     per_stream
                         .active_connections
                         .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -1121,7 +1199,13 @@ impl NetworkManager {
                                     drop(permit);
                                     match accepted {
                                         Ok(Ok(tls_stream)) => {
-                                            handshake_manager.accept_stream(Box::new(tls_stream));
+                                            let peer_node_ids = extract_peer_node_ids(
+                                                tls_stream.get_ref().1.peer_certificates(),
+                                            );
+                                            handshake_manager.accept_stream_with_peer_nodes(
+                                                Box::new(tls_stream),
+                                                peer_node_ids,
+                                            );
                                         }
                                         Ok(Err(error)) => handshake_manager.report_failure(error),
                                         Err(_) => handshake_manager.report_failure(Error::Process(
@@ -1315,6 +1399,42 @@ impl NetworkManager {
         self.open_edge_deferred_for_session(transport, quad, peer_node, job_id, generation)
     }
 
+    /// Opens a deferred, authenticated edge using an optional Hub-provisioned
+    /// per-edge secret (falling back to the shared secret only in legacy mode).
+    pub fn open_edge_deferred_for_job_with_secret(
+        self: &Arc<Self>,
+        transport: Arc<dyn EdgeTransport>,
+        quad: Quad,
+        peer_node: String,
+        job_id: String,
+        generation: u64,
+        edge_secret: Option<&[u8]>,
+    ) -> Result<RemoteEdge, Error> {
+        let auth =
+            self.session_auth_with_secret(&peer_node, &job_id, generation, quad, edge_secret)?;
+        let session_key = auth.edge_key();
+        Ok(self.open_edge_deferred_with_key(transport, quad, session_key, Some(auth)))
+    }
+
+    fn session_auth_with_secret(
+        &self,
+        peer_node: &str,
+        job_id: &str,
+        generation: u64,
+        quad: Quad,
+        edge_secret: Option<&[u8]>,
+    ) -> Result<SessionAuth, Error> {
+        self.config
+            .credentials
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Config(
+                    "authenticated remote edge requested without data-plane credentials".into(),
+                )
+            })?
+            .session_with_secret(peer_node, job_id, generation, quad, edge_secret)
+    }
+
     fn session_auth(
         &self,
         peer_node: &str,
@@ -1322,15 +1442,7 @@ impl NetworkManager {
         generation: u64,
         quad: Quad,
     ) -> Result<SessionAuth, Error> {
-        self.config
-            .credentials
-            .as_ref()
-            .map(|credentials| credentials.session(peer_node, job_id, generation, quad))
-            .ok_or_else(|| {
-                Error::Config(
-                    "authenticated remote edge requested without data-plane credentials".into(),
-                )
-            })
+        self.session_auth_with_secret(peer_node, job_id, generation, quad, None)
     }
 
     /// Records a session loss and returns the registration generation the
@@ -1544,8 +1656,12 @@ impl NetworkManager {
     /// Handles one inbound connection (downstream side): decodes data frames
     /// into the registered local channel, forwards signals, and writes the
     /// receipts produced by `RemoteAck`s on this connection back upstream.
-    async fn serve_stream(self: Arc<Self>, stream: Box<dyn RemoteStream>) {
-        let result = self.serve_stream_inner(stream).await;
+    async fn serve_stream(
+        self: Arc<Self>,
+        stream: Box<dyn RemoteStream>,
+        peer_node_ids: Vec<String>,
+    ) {
+        let result = self.serve_stream_inner(stream, peer_node_ids).await;
         if let Err(failure) = result {
             let sender = match failure.job.as_ref() {
                 Some(job) => self.failure_sender_for_registered_job(job),
@@ -1579,6 +1695,7 @@ impl NetworkManager {
     async fn serve_stream_inner(
         self: &Arc<Self>,
         stream: Box<dyn RemoteStream>,
+        peer_node_ids: Vec<String>,
     ) -> Result<(), ConnectionFailure> {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (receipt_tx, receipt_rx) =
@@ -1609,7 +1726,9 @@ impl NetworkManager {
                 Some(self.config.read_idle_timeout),
             )
             .await?;
-            let (session, request) = self.authorize_inbound(header, &payload).await?;
+            let (session, request) = self
+                .authorize_inbound_with_peer_nodes(header, &payload, &peer_node_ids)
+                .await?;
             let job = JobSessionKey {
                 job_id: request.job_id.clone(),
                 generation: request.generation,
@@ -1962,6 +2081,11 @@ impl NetworkManager {
                     .write()
                     .expect("inbound auth registry lock")
                     .remove(&key);
+                manager
+                    .inbound_edge_secrets
+                    .write()
+                    .expect("inbound edge secrets lock")
+                    .remove(&key);
                 let _ = sender.send_async(Error::Process(message)).await;
             });
         };
@@ -2044,6 +2168,10 @@ impl NetworkManager {
                     .write()
                     .expect("inbound auth registry lock")
                     .remove(&key);
+                self.inbound_edge_secrets
+                    .write()
+                    .expect("inbound edge secrets lock")
+                    .remove(&key);
             }
         }
         if receipt_writer_failed.load(std::sync::atomic::Ordering::Acquire) {
@@ -2054,10 +2182,21 @@ impl NetworkManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn authorize_inbound(
         &self,
         header: FrameHeader,
         payload: &[u8],
+    ) -> Result<(SessionAuth, HandshakePayload), Error> {
+        self.authorize_inbound_with_peer_nodes(header, payload, &[])
+            .await
+    }
+
+    pub(crate) async fn authorize_inbound_with_peer_nodes(
+        &self,
+        header: FrameHeader,
+        payload: &[u8],
+        peer_node_ids: &[String],
     ) -> Result<(SessionAuth, HandshakePayload), Error> {
         if header.kind != FrameKind::Handshake {
             return Err(Error::Process(
@@ -2080,11 +2219,32 @@ impl NetworkManager {
                 "remote edge handshake protocol or identity mismatch".into(),
             ));
         }
-        verify_handshake_mac(&credentials.shared_secret, &request, b"client")?;
-        self.claim_handshake_nonce(&request.nonce)?;
+        verify_peer_node_san(peer_node_ids, &request.source_node)?;
         let session_key =
             EdgeSessionKey::for_job(request.job_id.clone(), request.generation, request.quad);
         let deadline = tokio::time::Instant::now() + self.config.registration_grace;
+
+        // Resolve edge-specific secret if registered; for legacy shared-secret
+        // credentials we verify the handshake MAC BEFORE waiting on `inbound_auth`
+        // and BEFORE claiming the replay nonce so an unauthenticated peer
+        // never pollutes the replay cache or stalls on grace wait. For
+        // Hub-provisioned credentials there is no global fallback secret, so we
+        // first await registration of the edge's authorization + secret within
+        // `registration_grace`, then verify MAC before claiming the nonce.
+        let mut pre_verified_secret: Option<Arc<[u8]>> = None;
+        if !credentials.hub_provisioned {
+            let secret = self
+                .inbound_edge_secrets
+                .read()
+                .expect("inbound edge secrets lock")
+                .get(&session_key)
+                .cloned()
+                .unwrap_or_else(|| credentials.shared_secret.clone());
+            verify_handshake_mac(&secret, &request, b"client")?;
+            self.claim_handshake_nonce(&request.nonce)?;
+            pre_verified_secret = Some(secret);
+        }
+
         loop {
             let expected = {
                 let registry = self
@@ -2101,6 +2261,12 @@ impl NetworkManager {
                         .map(|(_, expected)| expected.clone())
                 })
             };
+            let registered_edge_secret = self
+                .inbound_edge_secrets
+                .read()
+                .expect("inbound edge secrets lock")
+                .get(&session_key)
+                .cloned();
             if let Some(expected) = expected {
                 if expected.source_node != request.source_node
                     || expected.job_id != request.job_id
@@ -2111,12 +2277,36 @@ impl NetworkManager {
                         request.quad
                     )));
                 }
+                let final_secret = match pre_verified_secret {
+                    Some(secret) => {
+                        if let Some(edge_secret) = registered_edge_secret {
+                            if edge_secret.as_ref() != secret.as_ref() {
+                                verify_handshake_mac(&edge_secret, &request, b"client")?;
+                            }
+                            edge_secret
+                        } else {
+                            secret
+                        }
+                    }
+                    None => {
+                        let edge_secret = registered_edge_secret.ok_or_else(|| {
+                            Error::Process(format!(
+                                "remote edge handshake for quad {:?} has no registered per-edge secret",
+                                request.quad
+                            ))
+                        })?;
+                        verify_handshake_mac(&edge_secret, &request, b"client")?;
+                        self.claim_handshake_nonce(&request.nonce)?;
+                        edge_secret
+                    }
+                };
                 return Ok((
-                    credentials.session(
+                    credentials.session_from_secret(
                         request.source_node.clone(),
                         request.job_id.clone(),
                         request.generation,
                         request.quad,
+                        final_secret,
                     ),
                     request,
                 ));

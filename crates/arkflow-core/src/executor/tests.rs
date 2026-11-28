@@ -1706,6 +1706,7 @@ fn build_subgraph_rejects_a_split_affinity_pair() {
             node_addrs: BTreeMap::new(),
             manager: authenticated_manager("node-a"),
             generation: 1,
+            edge_secrets: BTreeMap::new(),
         };
 
     // The pairing splits across nodes: the Agent rejects the stale task map
@@ -4742,6 +4743,7 @@ async fn remote_graph_routes_data_across_nodes() {
         )]),
         manager: manager_a.clone(),
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
     let context_b = crate::executor::graph::RemoteEdgeContext {
         tls: None,
@@ -4750,6 +4752,7 @@ async fn remote_graph_routes_data_across_nodes() {
         node_addrs: BTreeMap::new(),
         manager: manager_b.clone(),
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
 
     let graph_a = ExecutionGraphBuilder::default()
@@ -4832,6 +4835,7 @@ async fn remote_graph_fails_closed_when_downstream_unreachable() {
         node_addrs: BTreeMap::from([("node-b".to_string(), "127.0.0.1:1".parse().unwrap())]),
         manager: manager_a.clone(),
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
     let adapter_a = Adapter {
         input: Arc::new(OneBatchThenPendingInput {
@@ -4885,6 +4889,7 @@ fn remote_graph_rejects_incomplete_side_edge_assignment() {
         node_addrs: BTreeMap::new(),
         manager,
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
     let adapter = Adapter {
         input: Arc::new(VecInput::new(vec![])),
@@ -4941,6 +4946,7 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
         node_addrs: BTreeMap::new(),
         manager: manager_b.clone(),
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
     let graph_b = ExecutionGraphBuilder::default()
         .build_subgraph(
@@ -4983,6 +4989,7 @@ async fn remote_barriers_align_across_remote_inputs_and_reach_all_replicas() {
             tls: None,
             addr: format!("127.0.0.1:{port}").parse().unwrap(),
             max_attempts: 5,
+            peer_node: None,
         }) as std::sync::Arc<dyn crate::executor::remote::EdgeTransport>
     };
     // Derive quad routing ids the same way the graph builder does — the
@@ -6321,6 +6328,7 @@ fn remote_node_view_missing_a_data_edge_task_fails_closed() {
         node_addrs: BTreeMap::new(),
         manager,
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
     let error = ExecutionGraphBuilder::default()
         .build_subgraph(
@@ -6385,6 +6393,7 @@ fn partitioned_target_without_key_groups_fails_locally_and_remotely() {
         node_addrs: BTreeMap::new(),
         manager,
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
     let error = ExecutionGraphBuilder::default()
         .build_subgraph(
@@ -6848,6 +6857,7 @@ fn remote_edge_without_address_or_credentials_fails_the_build() {
         node_addrs: BTreeMap::new(),
         manager: manager.clone(),
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
     let error = ExecutionGraphBuilder::default()
         .build_subgraph(
@@ -6881,6 +6891,7 @@ fn remote_edge_without_address_or_credentials_fails_the_build() {
         )]),
         manager,
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
     let error = ExecutionGraphBuilder::default()
         .build_subgraph(
@@ -6930,6 +6941,7 @@ fn unauthenticated_transport_serves_only_one_job() {
         node_addrs: BTreeMap::new(),
         manager: manager.clone(),
         generation: 1,
+        edge_secrets: BTreeMap::new(),
     };
     let plan_a = downstream_plan("legacy-job-a");
     let task_ids: Vec<String> = ["map-0", "sink-0"]

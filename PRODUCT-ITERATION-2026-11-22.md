@@ -221,7 +221,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 
 **建议 change**：`add-s3-wal-retention`。
 
-#### PA-P1-07 Agent / 数据面身份与 mTLS · 已复核
+#### PA-P1-07 Agent / 数据面身份与 mTLS · ✅ 已实施并归档（`harden-node-identity-and-mtls`）
 
 **现象**：
 - Hub 的 Agent 注册只凭 `node_id + 全舰队共享 node_token` 自证；任意持有者可冒用其他节点 id（[nodes.rs:263-280](crates/arkflow-server/src/hub/nodes.rs:263)）。
@@ -349,7 +349,7 @@ Hub（SQLite/Postgres，lease+epoch）◄── heartbeat/report/commands ──
 | 顺序 | 事项 | 依赖 | 产出 |
 | --- | --- | --- | --- |
 | ~~1~~ | ~~PA-P1-01 Cargo feature gating~~ ✅ 已实施并归档（PR #1402） | 无 | `add-cargo-feature-gating` |
-| 2 | PA-P1-07 节点身份 + mTLS | 无 | `harden-node-identity-and-mtls` |
+| ~~2~~ | ~~PA-P1-07 节点身份 + mTLS~~ ✅ 已实施并归档 | 无 | `harden-node-identity-and-mtls` |
 | ~~3~~ | ~~PA-P1-08 审计/身份一致性~~ ✅ 已实施并归档（PR #1404） | 身份模型 | `harden-identity-and-audit` |
 | 4 | PA-P1-05 向量输出批量原子性 | 无 | `add-vector-output-batch-atomicity` |
 | 5 | PA-P1-06 S3 WAL 段回收 | 无 | `add-s3-wal-retention` |

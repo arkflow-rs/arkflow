@@ -287,9 +287,21 @@ pub struct AgentConfig {
     /// Stable identity used when this process reports to a Hub.
     #[serde(default)]
     pub node_id: Option<String>,
-    /// Shared node registration credential. Never included in reports.
+    /// Shared node registration credential or per-node credential. Never included in reports.
     #[serde(default)]
     pub node_token: Option<String>,
+    /// Optional path to persist Hub-issued per-node credentials (`arkn_...`) across restarts.
+    #[serde(default)]
+    pub node_credential_file: Option<String>,
+    /// Optional PEM CA bundle path used by the Agent to verify the Hub TLS certificate.
+    #[serde(default)]
+    pub tls_ca: Option<String>,
+    /// Optional PEM client certificate path presented by the Agent during Hub mTLS.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// Optional PEM private key path corresponding to `tls_cert`.
+    #[serde(default)]
+    pub tls_key: Option<String>,
     /// Lease duration advertised by a compute node to its Hub.
     #[serde(default = "default_agent_lease_ttl_ms")]
     pub agent_lease_ttl_ms: u64,
@@ -574,6 +586,10 @@ impl Default for AgentConfig {
             hub_urls: Vec::new(),
             node_id: None,
             node_token: None,
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
             agent_lease_ttl_ms: default_agent_lease_ttl_ms(),
             agent_session_ttl_ms: default_agent_session_ttl_ms(),
         }

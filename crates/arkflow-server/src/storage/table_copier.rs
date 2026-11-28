@@ -23,8 +23,9 @@ use sqlx::{Postgres, Row};
 /// `migrate`, `backup`, and `restore`: a table missing from this list is
 /// silently dropped by every copy command, so webhook subscriptions
 /// (`cp_webhooks`) belong here exactly like every other business table.
-pub const TABLE_ORDER: [&str; 21] = [
+pub const TABLE_ORDER: [&str; 22] = [
     "cp_nodes",
+    "cp_node_credentials",
     "cp_jobs",
     "cp_job_versions",
     "cp_job_tasks",
@@ -228,7 +229,7 @@ fn sqlite_read_table(
 /// Read one table from a SQLite source with parents-first ordering for the
 /// self-referencing tables. A missing `cp_*` table fails loudly: silently
 /// copying an absent table would drop its data from every downstream copy.
-fn read_sqlite_table_ordered(
+pub(crate) fn read_sqlite_table_ordered(
     source: &SqliteBackend,
     table: &str,
 ) -> Result<(Vec<String>, Vec<Vec<PgVal>>), StorageError> {

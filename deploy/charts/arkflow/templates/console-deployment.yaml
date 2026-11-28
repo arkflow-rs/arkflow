@@ -29,7 +29,8 @@ spec:
           env:
             # Same-origin proxy target: the in-chart Hub Service.
             - name: ARKFLOW_HUB_UPSTREAM
-              value: {{ printf "http://%s:8080" (include "arkflow.hubName" .) | quote }}
+              {{- $hubScheme := ternary "https" "http" .Values.controlPlane.tls.enabled }}
+              value: {{ printf "%s://%s:8080" $hubScheme (include "arkflow.hubName" .) | quote }}
           ports:
             - name: http
               containerPort: 80

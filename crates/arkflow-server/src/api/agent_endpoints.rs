@@ -7,19 +7,62 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+async fn enforce_agent_mtls(
+    hub: &hub::Hub,
+    node_id: &str,
+    connect_info: Option<&axum::Extension<axum::extract::ConnectInfo<super::HubTlsConnectInfo>>>,
+) -> Result<Option<hub::PeerClientCert>, Box<Response>> {
+    let peer_cert = connect_info.and_then(|info| info.0 .0.peer_cert.clone());
+    if hub.mtls_enforced() && peer_cert.is_none() {
+        hub.audit_agent_auth_rejection(
+            node_id,
+            "missing_client_certificate",
+            "mTLS client certificate required for agent endpoint",
+        )
+        .await;
+        return Err(Box::new(hub_problem(hub::HubError::Unauthorized)));
+    }
+    if let Some(cert) = peer_cert.as_ref() {
+        if !cert.node_ids.is_empty() && !cert.node_ids.iter().any(|id| id == node_id) {
+            hub.audit_agent_auth_rejection(
+                node_id,
+                "cert_node_identity_mismatch",
+                "client certificate SAN does not match node_id",
+            )
+            .await;
+            return Err(Box::new(hub_problem(hub::HubError::Unauthorized)));
+        }
+    }
+    Ok(peer_cert)
+}
+
 pub(super) async fn agent_register(
     State(hub): State<hub::Hub>,
+    connect_info: Option<axum::Extension<axum::extract::ConnectInfo<super::HubTlsConnectInfo>>>,
     Json(request): Json<hub::RegisterRequest>,
 ) -> Response {
-    match hub.register(request).await {
+    let peer_cert = match enforce_agent_mtls(&hub, &request.node_id, connect_info.as_ref()).await {
+        Ok(cert) => cert,
+        Err(response) => return *response,
+    };
+    match hub
+        .register_with_peer_cert(request, peer_cert.as_ref())
+        .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(error) => hub_problem(error),
     }
 }
 pub(super) async fn agent_heartbeat(
     State(hub): State<hub::Hub>,
+    connect_info: Option<axum::Extension<axum::extract::ConnectInfo<super::HubTlsConnectInfo>>>,
     Json(request): Json<hub::HeartbeatRequest>,
 ) -> Response {
+    if let Err(response) =
+        enforce_agent_mtls(&hub, &request.auth.node_id, connect_info.as_ref()).await
+    {
+        return *response;
+    }
     match hub.heartbeat(request).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => hub_problem(error),
@@ -27,8 +70,14 @@ pub(super) async fn agent_heartbeat(
 }
 pub(super) async fn agent_report(
     State(hub): State<hub::Hub>,
+    connect_info: Option<axum::Extension<axum::extract::ConnectInfo<super::HubTlsConnectInfo>>>,
     Json(request): Json<hub::NodeReport>,
 ) -> Response {
+    if let Err(response) =
+        enforce_agent_mtls(&hub, &request.auth.node_id, connect_info.as_ref()).await
+    {
+        return *response;
+    }
     match hub.report(request).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => hub_problem(error),
@@ -36,8 +85,14 @@ pub(super) async fn agent_report(
 }
 pub(super) async fn agent_job_observation(
     State(hub): State<hub::Hub>,
+    connect_info: Option<axum::Extension<axum::extract::ConnectInfo<super::HubTlsConnectInfo>>>,
     Json(request): Json<hub::JobObservationRequest>,
 ) -> Response {
+    if let Err(response) =
+        enforce_agent_mtls(&hub, &request.auth.node_id, connect_info.as_ref()).await
+    {
+        return *response;
+    }
     match hub.report_job_observation(request).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => hub_problem(error),
@@ -79,9 +134,13 @@ pub(super) struct AgentCommandsQuery {
 
 pub(super) async fn agent_commands(
     State(hub): State<hub::Hub>,
+    connect_info: Option<axum::Extension<axum::extract::ConnectInfo<super::HubTlsConnectInfo>>>,
     headers: HeaderMap,
     Query(query): Query<AgentCommandsQuery>,
 ) -> Response {
+    if let Err(response) = enforce_agent_mtls(&hub, &query.node_id, connect_info.as_ref()).await {
+        return *response;
+    }
     if query.session_token.is_some() {
         // The query parameter leaks the live session credential into
         // tracing/proxy logs (the trace layer records the full URI).
@@ -110,11 +169,15 @@ pub(super) async fn agent_commands(
 }
 pub(super) async fn agent_command_result(
     State(hub): State<hub::Hub>,
+    connect_info: Option<axum::Extension<axum::extract::ConnectInfo<super::HubTlsConnectInfo>>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Query(query): Query<AgentCommandsQuery>,
     Json(result): Json<hub::CommandResult>,
 ) -> Response {
+    if let Err(response) = enforce_agent_mtls(&hub, &query.node_id, connect_info.as_ref()).await {
+        return *response;
+    }
     if query.session_token.is_some() {
         tracing::warn!(
             node_id = %query.node_id,

@@ -1103,6 +1103,10 @@ async fn checkpoint_execution_failure_is_ready_for_terminal_result() {
         data_port: None,
         report_interval: Duration::from_secs(5),
         poll_interval: Duration::from_secs(5),
+        node_credential_file: None,
+        tls_ca: None,
+        tls_cert: None,
+        tls_key: None,
     };
     let error = execute_job_operation(&command, &config, &JobRuntime::default())
         .await
@@ -3508,6 +3512,7 @@ async fn split_payloads_with_peer_addresses_wire_remote_context() {
             ("bad-node".into(), "not-a-socket-address".into()),
         ]),
         recovery_required: false,
+        edge_secrets: BTreeMap::new(),
     };
     runtime
         .start(plan, assignments, 1, None, false, "node-a", &split)
@@ -3647,6 +3652,10 @@ fn test_node_config(hub_url: &str) -> NodeAgentConfig {
         poll_interval: Duration::from_secs(5),
         data_port: None,
         data_host: None,
+        node_credential_file: None,
+        tls_ca: None,
+        tls_cert: None,
+        tls_key: None,
     }
 }
 
@@ -4185,6 +4194,10 @@ async fn agent_session_reports_and_delivers_job_observations() {
             poll_interval: Duration::from_millis(20),
             data_port: None,
             data_host: None,
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         agent_cancel.clone(),
     ));
@@ -4289,6 +4302,10 @@ async fn data_plane_setup_advertises_or_degrades_gracefully() {
                 poll_interval: Duration::from_millis(50),
                 data_port,
                 data_host,
+                node_credential_file: None,
+                tls_ca: None,
+                tls_cert: None,
+                tls_key: None,
             },
             cancel.clone(),
         ));
@@ -4428,6 +4445,10 @@ async fn failed_registration_backs_off_and_exits_cleanly() {
             poll_interval: Duration::from_millis(50),
             data_port: None,
             data_host: None,
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         cancel.clone(),
     ));
@@ -5167,6 +5188,7 @@ async fn remote_context_uses_the_full_task_map_and_degrades_without_ports() {
         ])),
         node_data_ports: BTreeMap::from([("node-a".into(), "127.0.0.1:39601".into())]),
         recovery_required: false,
+        edge_secrets: BTreeMap::new(),
     };
     runtime
         .start(plan, assignments, 1, None, false, "node-a", &split)
@@ -5185,6 +5207,7 @@ async fn remote_context_uses_the_full_task_map_and_degrades_without_ports() {
         ])),
         node_data_ports: BTreeMap::new(),
         recovery_required: false,
+        edge_secrets: BTreeMap::new(),
     };
     runtime
         .start(plan, assignments, 1, None, false, "node-a", &split)
@@ -5220,6 +5243,10 @@ async fn pre_cancelled_agent_shuts_its_data_plane_down() {
             poll_interval: Duration::from_millis(50),
             data_port: Some(0),
             data_host: Some("127.0.0.1".into()),
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         cancel,
     )
@@ -5251,6 +5278,10 @@ async fn agent_session_reconnects_after_the_hub_goes_away() {
             poll_interval: Duration::from_millis(50),
             data_port: None,
             data_host: None,
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         cancel.clone(),
     ));
@@ -5354,6 +5385,10 @@ fn fast_session_config(hub_url: &str) -> NodeAgentConfig {
         poll_interval: Duration::from_millis(20),
         data_port: None,
         data_host: None,
+        node_credential_file: None,
+        tls_ca: None,
+        tls_cert: None,
+        tls_key: None,
     }
 }
 
@@ -5662,6 +5697,7 @@ fn stub_session() -> crate::hub::RegisterResponse {
         lease_ttl_ms: 0,
         poll_interval_ms: 0,
         protocol_version: "v1".into(),
+        node_credential: None,
     }
 }
 
@@ -6326,6 +6362,10 @@ async fn pre_cancelled_agent_without_a_secret_skips_the_data_plane() {
             poll_interval: Duration::from_millis(50),
             data_port: Some(0),
             data_host: Some("127.0.0.1".into()),
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         cancel,
     )
@@ -6396,4 +6436,154 @@ fn data_plane_env_limits_fail_loud_on_malformed_values() {
         .collect();
     let mut config = arkflow_core::executor::remote::NetworkManagerConfig::default();
     apply_data_plane_limits_from(&mut config, |name| env.get(name).cloned()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_retains_enrolled_node_credential_to_file_and_reloads_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let cred_path = dir.path().join("nested").join("node.cred");
+    let cred_path_str = cred_path.to_str().unwrap().to_owned();
+
+    let storage = crate::storage::StorageActor::start(
+        crate::storage::ControlPlaneStore::contract("agent_credential_retention").await,
+        8,
+    );
+    let hub = crate::hub::Hub::with_storage(
+        crate::hub::HubConfig {
+            operator_token: Some("ops|admin|op-secret".into()),
+            node_token: Some("shared-bootstrap-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 20,
+            session_ttl_ms: crate::hub::default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
+        },
+        storage,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hub_cancel = CancellationToken::new();
+    let router = crate::api::hub_router(hub.clone(), &crate::api::ServerConfig::default());
+    let hub_stop = hub_cancel.clone();
+    let hub_task = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .with_graceful_shutdown(hub_stop.cancelled_owned())
+            .await
+    });
+    let hub_url = format!("http://{addr}");
+
+    // First agent boot uses shared bootstrap token; Hub enrolls & issues arkn_...
+    let mut cfg = fast_session_config(&hub_url);
+    cfg.node_token = "shared-bootstrap-secret".into();
+    cfg.node_credential_file = Some(cred_path_str.clone());
+    let cancel1 = CancellationToken::new();
+    let mut agent1 = tokio::spawn(run(empty_control_plane(), cfg.clone(), cancel1.clone()));
+    wait_for(Duration::from_secs(10), || {
+        let cred_path = cred_path.clone();
+        async move { cred_path.exists() }
+    })
+    .await;
+    cancel1.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent1).await;
+    agent1.abort();
+
+    let saved = std::fs::read_to_string(&cred_path).unwrap();
+    assert!(
+        saved.trim().starts_with("arkn_"),
+        "expected persisted per-node credential, got {saved:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&cred_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "credential file must have 0600 permissions");
+    }
+
+    // Remove in-memory node record so we observe second boot's fresh registration;
+    // second agent boot STILL starts with config.node_token = shared-bootstrap-secret
+    // (which would be rejected by the Hub!), so it succeeds ONLY by loading cred_path.
+    let cancel2 = CancellationToken::new();
+    let mut cfg2 = fast_session_config(&hub_url);
+    cfg2.boot_id = "boot-reloaded".into();
+    cfg2.node_token = "shared-bootstrap-secret".into();
+    cfg2.node_credential_file = Some(cred_path_str);
+    let mut agent2 = tokio::spawn(run(empty_control_plane(), cfg2, cancel2.clone()));
+    wait_for(Duration::from_secs(10), || {
+        let hub = hub.clone();
+        async move {
+            hub.audit(Some("node-a"))
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|row| row.action == "agent.register" && row.outcome == "accepted")
+                .count()
+                >= 2
+        }
+    })
+    .await;
+    cancel2.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent2).await;
+    agent2.abort();
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_plane_tls_without_shared_secret_binds_hub_provisioned_data_plane() {
+    let _guard = ENV_LOCK.lock().await;
+    use rcgen::{CertificateParams, IsCa, Issuer, KeyPair};
+    let dir = tempfile::tempdir().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, &ca_key);
+    let node_params = CertificateParams::new(vec!["arkflow-data-plane".to_owned()]).unwrap();
+    let node_key = KeyPair::generate().unwrap();
+    let node_cert = node_params.signed_by(&node_key, &issuer).unwrap();
+
+    let ca_path = dir.path().join("ca.crt");
+    let cert_path = dir.path().join("node.crt");
+    let key_path = dir.path().join("node.key");
+    std::fs::write(&ca_path, ca.pem()).unwrap();
+    std::fs::write(&cert_path, node_cert.pem()).unwrap();
+    std::fs::write(&key_path, node_key.serialize_pem()).unwrap();
+
+    unsafe {
+        std::env::remove_var("ARKFLOW_DATA_PLANE_SECRET");
+        std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CA", &ca_path);
+        std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CERT", &cert_path);
+        std::env::set_var("ARKFLOW_DATA_PLANE_TLS_KEY", &key_path);
+    }
+
+    let (hub, hub_url, hub_cancel, hub_server) = spawned_hub().await;
+    let cancel = CancellationToken::new();
+    let mut cfg = fast_session_config(&hub_url);
+    cfg.node_id = "node-hub-prov".into();
+    cfg.data_port = Some(0);
+    cfg.data_host = Some("127.0.0.1".into());
+    let mut agent_task = tokio::spawn(run(empty_control_plane(), cfg, cancel.clone()));
+    wait_for(Duration::from_secs(10), || {
+        let hub = hub.clone();
+        async move {
+            hub.nodes().await.iter().any(|node| {
+                node.id == "node-hub-prov"
+                    && node.data_address.is_some()
+                    && node.capabilities.iter().any(|c| c == "network_shuffle")
+            })
+        }
+    })
+    .await;
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent_task).await;
+    agent_task.abort();
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_server).await;
+    unsafe {
+        std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CA");
+        std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CERT");
+        std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_KEY");
+    }
 }

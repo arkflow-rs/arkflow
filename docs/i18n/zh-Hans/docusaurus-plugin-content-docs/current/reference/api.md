@@ -260,6 +260,9 @@ PUT /api/v1/jobs/{job_id}/desired-state
 | `POST` | `/nodes/{node_id}/drain` | 排空节点(维护前迁走其分配)。 |
 | `POST`/`DELETE` | `/nodes/{node_id}/maintenance` | 进入/退出维护模式。 |
 | `PUT` | `/nodes/{node_id}/labels` | 整体替换该节点的标签映射(参见[节点标签](#节点标签))。 |
+| `GET`/`POST` | `/nodes/{node_id}/credentials` | 列出节点凭据元数据(绝不含明文/哈希)或签发逐节点凭据(`{label?, expires_at_ms?}` → `201 {credential, token}`);需对应 `node_id` 的 `ManageNodes` 权限,单节点最多 8 条活跃凭据。 |
+| `POST` | `/node-credentials/{credential_id}/rotate` | 原地轮换逐节点凭据(`200 {credential, token}`),同步吊销旧凭据并立即使对应活跃会话失效。 |
+| `DELETE` | `/node-credentials/{credential_id}` | 吊销逐节点凭据(`200 {"revoked": true\|false}`)并立即使使用该凭据认证的活跃会话失效。 |
 
 #### 节点标签
 
@@ -447,18 +450,23 @@ subject 的联邦令牌若 `iat` 更早(60 秒时钟偏斜容差)会被拒绝。
 
 ## Hub Agent API(`/api/v1/agent/*`)
 
-Agent 契约与操作员契约相互独立:Agent 使用节点会话凭据认证,拉取命令并推送观测。
+Agent 契约与操作员契约相互独立:Agent 使用节点会话凭据(启用 Hub mTLS 时还须出示客户端证书)认证,拉取命令并推送观测。
 
 | 方法 | 路由 | 用途 |
 |--------|-------|---------|
-| `POST` | `/agent/register` | 注册节点;建立会话。负载声明节点 `capabilities`(例如 `network_shuffle`),并在数据面(data plane)启用时声明对等端用于远程边的可路由 `data_address`。 |
+| `POST` | `/agent/register` | 注册节点;建立会话。接受严格绑定 `node_id` 的逐节点凭据(`arkn_<credential_id>_<secret>`),或在首次准入时接受共享 bootstrap `node_token` 并在 `RegisterResponse.node_credential` 中仅返回一次签发结果。声明节点 `capabilities`(如 `network_shuffle`)与 `data_address`。 |
 | `POST` | `/agent/heartbeat` | 附带租约续期的心跳;重新确认能力与数据地址。 |
 | `POST` | `/agent/report` | 观测到的流/节点状态;携带 `boot_id` 与单调递增的 `report_seq`。 |
 | `POST` | `/agent/job-observations` | 上报来自同置内核运行时的作业级观测。 |
 | `GET` | `/agent/commands` | 拉取待处理命令。 |
 | `POST` | `/agent/commands/{id}/result` | 上报命令结果。 |
 
-命令携带代数、Attempt ID、配置版本与过期时间。`split` 放置的 `job_start` 还会携带完整的 `task_nodes` 映射与 `node_data_ports`,因此每个节点无需额外查询即可推导出自己的远程边;Hub 只会把这类放置派发给声明了 `network_shuffle` 能力与数据地址的节点。命令确认只是传输层状态——收敛始终由报告推导,绝不来自确认(ack)。
+安全不变量:
+
+- 配置 `ARKFLOW_HUB_TLS_CA` 且 `ARKFLOW_HUB_TLS_CLIENT_AUTH` 为 `agent_required`(默认)或 `required` 时,每个 `/api/v1/agent/*` 请求都要求经 CA 校验的客户端证书;若对等叶证书包含 `URI:urn:arkflow:node:<node_id>`,则 `<node_id>` 必须与请求或会话节点完全匹配(否则返回 `401`)。
+- 节点注册(`agent.register`)、凭据生命周期(`node_credential.{create,enroll,rotate,revoke}`)、认证拒绝(`agent.auth_rejected`)以及终态 `agent.command_result` 均以 `"node"` 分类写入审计记录,归因到 `node:<node_id>`(或执行操作员),绝不记录明文 token 或哈希。
+
+命令携带代数、Attempt ID、配置版本与过期时间。`split` 放置的 `job_start` 还会携带完整的 `task_nodes` 映射、`node_data_ports` 与仅按 `src == node_id || dst == node_id` 过滤后的 `edge_secrets`,因此每个节点无需额外查询即可推导出自己的远程边与逐边 HMAC 密钥;Hub 只会把这类放置派发给声明了 `network_shuffle` 能力与数据地址的节点。命令确认只是传输层状态——收敛始终由报告推导,绝不来自确认(ack)。
 
 ## 相关页面
 

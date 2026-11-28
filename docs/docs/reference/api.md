@@ -348,6 +348,9 @@ records `pause_savepoint_failed` / `pause_savepoint_timeout` in the Job's
 | `POST` | `/nodes/{node_id}/drain` | Drain a node (evacuate assignments before maintenance). |
 | `POST`/`DELETE` | `/nodes/{node_id}/maintenance` | Enter/exit maintenance mode. |
 | `PUT` | `/nodes/{node_id}/labels` | Replace the node's complete label map (see [Node labels](#node-labels)). |
+| `GET`/`POST` | `/nodes/{node_id}/credentials` | List metadata (`arkn_` plaintexts/hashes omitted) or issue a new per-node credential (`{label?, expires_at_ms?}` -> `201 {credential, token}`); requires `ManageNodes` scoped to `node_id`, max 8 active per node. |
+| `POST` | `/node-credentials/{credential_id}/rotate` | Rotate a per-node credential in place (`200 {credential, token}`), revoking the predecessor and immediately invalidating its active Agent session. |
+| `DELETE` | `/node-credentials/{credential_id}` | Revoke a per-node credential (`200 {"revoked": true\|false}`) and immediately invalidate any active Agent session authenticated with it. |
 
 #### Node labels
 
@@ -590,22 +593,36 @@ error text never become labels. Counters reset on Hub restart.
 ## Hub agent API (`/api/v1/agent/*`)
 
 The Agent contract is separate from the operator contract: agents authenticate
-with node session credentials, pull commands, and push observations.
+with node session credentials (and client certificates when Hub mTLS is
+configured), pull commands, and push observations.
 
 | Method | Route | Purpose |
 |--------|-------|---------|
-| `POST` | `/agent/register` | Register a node; establishes a session. The payload declares node `capabilities` (e.g. `network_shuffle`) and, when the data plane is enabled, the routable `data_address` peers use for remote edges. |
+| `POST` | `/agent/register` | Register a node; establishes a session. Accepts a per-node `arkn_<credential_id>_<secret>` token (strictly bound to `node_id`) or, on first enrollment, the shared bootstrap `node_token` — returning `node_credential` once in `RegisterResponse`. Declares node `capabilities` (e.g. `network_shuffle`) and `data_address`. |
 | `POST` | `/agent/heartbeat` | Heartbeat with lease renewal; re-asserts capabilities and data address. |
 | `POST` | `/agent/report` | Observed stream/node state; carries `boot_id` and monotonic `report_seq`. |
 | `POST` | `/agent/job-observations` | Report job-level observations from the co-located kernel runtime. |
 | `GET` | `/agent/commands` | Pull pending commands. |
 | `POST` | `/agent/commands/{id}/result` | Report a command result. |
 
+Security invariants:
+
+- When `ARKFLOW_HUB_TLS_CA` is set with `ARKFLOW_HUB_TLS_CLIENT_AUTH=agent_required`
+  (default) or `required`, every `/api/v1/agent/*` call requires a CA-verified
+  client certificate. If the peer leaf carries `URI:urn:arkflow:node:<node_id>`,
+  calls fail closed (`401`) unless `<node_id>` matches the request/session node.
+- Node authentication, credential lifecycle (`node_credential.{create,enroll,rotate,revoke}`),
+  `agent.register`, `agent.auth_rejected`, and terminal `agent.command_result`
+  deliveries emit `"node"` audit records attributed to `node:<node_id>` (or the
+  acting operator), without ever logging tokens or hashes.
+
 Commands carry generation, Attempt ID, configuration version, and expiry. A
 `job_start` for a `split` placement additionally carries the full
-`task_nodes` map and `node_data_ports`, so every node can derive its remote
-edges without extra lookups; the Hub only dispatches such placements to nodes
-that advertised the `network_shuffle` capability and a data address.
+`task_nodes` map, `node_data_ports`, and `edge_secrets` filtered exclusively to
+edges where `src == node_id || dst == node_id`, so every node can derive its
+remote edges and per-edge HMAC keys without extra lookups; the Hub only
+dispatches such placements to nodes that advertised the `network_shuffle`
+capability and a data address.
 Command acknowledgement is transport state only — convergence is always
 derived from reports, never from acks.
 

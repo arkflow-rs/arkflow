@@ -57,6 +57,13 @@ agent:
   # serve the data plane without credentials, so also configure the fleet
   # credential material via env/config (see docs/operate/tls-matrix).
   dataPort: 9090
+  tls:
+    # Existing Secret holding CA, client/data-plane cert, and key for Hub
+    # mTLS and cross-node data-plane mTLS in `mode: agent`.
+    existingSecret: ""
+    caKey: ca.crt
+    certKey: tls.crt
+    keyKey: tls.key
 
 probes:
   liveness:
@@ -113,6 +120,24 @@ controlPlane:
   nodeToken:
     existingSecret: ""
     existingSecretKey: node_token
+
+  # Mutual TLS for Hub + in-chart Agent + cross-node data plane. Enabled by
+  # default: generates and keeps a CA + Hub cert + Agent client/data-plane cert
+  # in a Secret unless existingSecret is provided. Set `enabled: false` to
+  # opt out to plaintext HTTP.
+  tls:
+    enabled: true
+    existingSecret: ""
+    caKey: ca.crt
+    hubCertKey: hub.crt
+    hubKeyKey: hub.key
+    agentCertKey: agent.crt
+    agentKeyKey: agent.key
+    # Client verification policy on the Hub listener:
+    # agent_required (default: /api/v1/agent/* requires client cert, /health & operator APIs stay reachable)
+    # required (every endpoint requires a client cert)
+    # none
+    clientAuth: agent_required
 
   hub:
     image:

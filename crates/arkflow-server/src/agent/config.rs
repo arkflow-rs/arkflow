@@ -25,6 +25,14 @@ pub struct NodeAgentConfig {
     /// Routable host advertised to peers for the data plane. Required for
     /// split placement; without it the node stays colocated-only.
     pub data_host: Option<String>,
+    /// Optional path to persist Hub-issued per-node credentials (`arkn_...`).
+    pub node_credential_file: Option<String>,
+    /// Optional PEM CA certificate path for verifying Hub TLS certificates.
+    pub tls_ca: Option<String>,
+    /// Optional PEM client certificate path for Hub mTLS.
+    pub tls_cert: Option<String>,
+    /// Optional PEM client private key path for Hub mTLS.
+    pub tls_key: Option<String>,
 }
 
 /// Trim trailing `/` and drop duplicates, preserving first-seen order.
@@ -36,6 +44,13 @@ fn normalize_hub_urls(urls: &[String]) -> Vec<String> {
         .filter(|url| seen.insert((*url).to_owned()))
         .map(str::to_owned)
         .collect()
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 impl NodeAgentConfig {
@@ -55,6 +70,30 @@ impl NodeAgentConfig {
             .clone()
             .or_else(|| std::env::var("ARKFLOW_NODE_TOKEN").ok())
             .unwrap_or_default();
+        let node_credential_file = config
+            .node
+            .agent
+            .node_credential_file
+            .clone()
+            .or_else(|| non_empty_env("ARKFLOW_NODE_CREDENTIAL_FILE"));
+        let tls_ca = config
+            .node
+            .agent
+            .tls_ca
+            .clone()
+            .or_else(|| non_empty_env("ARKFLOW_AGENT_TLS_CA"));
+        let tls_cert = config
+            .node
+            .agent
+            .tls_cert
+            .clone()
+            .or_else(|| non_empty_env("ARKFLOW_AGENT_TLS_CERT"));
+        let tls_key = config
+            .node
+            .agent
+            .tls_key
+            .clone()
+            .or_else(|| non_empty_env("ARKFLOW_AGENT_TLS_KEY"));
         let ttl = config.node.agent.agent_lease_ttl_ms.max(3_000);
         let boot_nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -80,6 +119,10 @@ impl NodeAgentConfig {
             poll_interval: Duration::from_secs(1),
             data_port: config.node.data_plane.data_port,
             data_host: config.node.data_plane.data_host.clone(),
+            node_credential_file,
+            tls_ca,
+            tls_cert,
+            tls_key,
         })
     }
 }

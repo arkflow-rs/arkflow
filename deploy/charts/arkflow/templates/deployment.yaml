@@ -62,6 +62,27 @@ spec:
                   name: {{ include "arkflow.nodeTokenSecretName" . }}
                   key: {{ include "arkflow.nodeTokenSecretKey" . }}
             {{- end }}
+            {{- if and (ne .Values.mode "control-plane") .Values.persistence.enabled }}
+            - name: ARKFLOW_NODE_CREDENTIAL_FILE
+              value: {{ printf "%s/node_credential" (trimSuffix "/" .Values.persistence.mountPath) | quote }}
+            {{- end }}
+            {{- if include "arkflow.agentTlsEnabled" . | eq "true" }}
+            {{- $tlsCaKey := ternary (default "ca.crt" .Values.controlPlane.tls.caKey) (default "ca.crt" .Values.agent.tls.caKey) (eq .Values.mode "control-plane") }}
+            {{- $tlsCertKey := ternary (default "agent.crt" .Values.controlPlane.tls.agentCertKey) (default "tls.crt" .Values.agent.tls.certKey) (eq .Values.mode "control-plane") }}
+            {{- $tlsKeyKey := ternary (default "agent.key" .Values.controlPlane.tls.agentKeyKey) (default "tls.key" .Values.agent.tls.keyKey) (eq .Values.mode "control-plane") }}
+            - name: ARKFLOW_AGENT_TLS_CA
+              value: {{ printf "/etc/arkflow/tls/%s" $tlsCaKey | quote }}
+            - name: ARKFLOW_AGENT_TLS_CERT
+              value: {{ printf "/etc/arkflow/tls/%s" $tlsCertKey | quote }}
+            - name: ARKFLOW_AGENT_TLS_KEY
+              value: {{ printf "/etc/arkflow/tls/%s" $tlsKeyKey | quote }}
+            - name: ARKFLOW_DATA_PLANE_TLS_CA
+              value: {{ printf "/etc/arkflow/tls/%s" $tlsCaKey | quote }}
+            - name: ARKFLOW_DATA_PLANE_TLS_CERT
+              value: {{ printf "/etc/arkflow/tls/%s" $tlsCertKey | quote }}
+            - name: ARKFLOW_DATA_PLANE_TLS_KEY
+              value: {{ printf "/etc/arkflow/tls/%s" $tlsKeyKey | quote }}
+            {{- end }}
             # Engine-native fallback (see NodeAgentConfig::from_engine):
             # pod name is the node identity when config sets no node_id.
             - name: ARKFLOW_NODE_ID
@@ -96,6 +117,11 @@ spec:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
             {{- end }}
+            {{- if include "arkflow.agentTlsEnabled" . | eq "true" }}
+            - name: agent-tls
+              mountPath: /etc/arkflow/tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -104,6 +130,11 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "arkflow.fullname" . }}-data
+        {{- end }}
+        {{- if include "arkflow.agentTlsEnabled" . | eq "true" }}
+        - name: agent-tls
+          secret:
+            secretName: {{ include "arkflow.agentTlsSecretName" . }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

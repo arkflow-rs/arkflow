@@ -36,6 +36,8 @@ pub(super) struct SplitPlacementPayload {
     pub(super) node_data_ports: BTreeMap<String, String>,
     /// Hub decision: this start may not initialize an empty durable backend.
     pub(super) recovery_required: bool,
+    /// Per-edge HMAC secrets provisioned by the Hub, keyed by `(src_node, dst_node)`.
+    pub(super) edge_secrets: BTreeMap<(String, String), String>,
 }
 
 #[derive(Clone, Default)]
@@ -596,6 +598,7 @@ impl JobRuntime {
                     node_addrs,
                     manager: manager.clone(),
                     generation,
+                    edge_secrets: split.edge_secrets.clone(),
                 },
             ))
         });

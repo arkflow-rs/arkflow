@@ -263,7 +263,9 @@ async fn terminal_failure_intent_reenqueues_a_fresh_command_on_retry() {
         .register(RegisterRequest {
             data_address: None,
             node_id: "node-a".into(),
-            node_token: "node-secret".into(),
+            node_token: session
+                .node_credential
+                .unwrap_or_else(|| "node-secret".into()),
             protocol_version: "v1".into(),
             capabilities: vec!["stream_lifecycle".into()],
             boot_id: None,
@@ -378,7 +380,9 @@ async fn restart_restores_persisted_operations_and_skips_satisfied_starts() {
         .register(RegisterRequest {
             data_address: None,
             node_id: "node-a".into(),
-            node_token: "node-secret".into(),
+            node_token: session
+                .node_credential
+                .unwrap_or_else(|| "node-secret".into()),
             protocol_version: "v1".into(),
             capabilities: vec![],
             boot_id: Some("boot-a".into()),
@@ -1448,18 +1452,27 @@ fn resource_gauges_pass_the_whitelist_into_the_node_view() {
     );
 }
 
-async fn register_and_report_resources(hub: &Hub, report_seq: u64) {
+async fn register_and_report_resources(hub: &Hub, report_seq: u64) -> Option<String> {
+    register_and_report_resources_with_token(hub, report_seq, "node-secret").await
+}
+
+async fn register_and_report_resources_with_token(
+    hub: &Hub,
+    report_seq: u64,
+    node_token: &str,
+) -> Option<String> {
     let session = hub
         .register(RegisterRequest {
             data_address: None,
             node_id: "n1".into(),
-            node_token: "node-secret".into(),
+            node_token: node_token.into(),
             protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
             capabilities: vec![],
             boot_id: None,
         })
         .await
         .unwrap();
+    let credential = session.node_credential.clone();
     hub.report(NodeReport {
         auth: AgentAuth {
             node_id: "n1".into(),
@@ -1486,6 +1499,7 @@ async fn register_and_report_resources(hub: &Hub, report_seq: u64) {
     })
     .await
     .unwrap();
+    credential
 }
 
 #[tokio::test]
@@ -1510,7 +1524,9 @@ async fn resource_gauges_are_ephemeral_across_a_hub_restart() {
     .await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub1 = Hub::with_storage(config(), storage.clone());
-    register_and_report_resources(&hub1, 1).await;
+    let cred = register_and_report_resources(&hub1, 1)
+        .await
+        .unwrap_or_else(|| "node-secret".into());
     assert!(hub1
         .metrics_by_node(Some("n1"))
         .await
@@ -1528,7 +1544,7 @@ async fn resource_gauges_are_ephemeral_across_a_hub_restart() {
         .register(RegisterRequest {
             data_address: None,
             node_id: "n1".into(),
-            node_token: "node-secret".into(),
+            node_token: cred.clone(),
             protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
             capabilities: vec![],
             boot_id: None,
@@ -1542,7 +1558,7 @@ async fn resource_gauges_are_ephemeral_across_a_hub_restart() {
         .next()
         .expect("re-registered node view");
     assert!(!view.metrics.keys().any(|key| key.starts_with("node_")));
-    register_and_report_resources(&hub2, 2).await;
+    register_and_report_resources_with_token(&hub2, 2, &cred).await;
     let view = hub2
         .metrics_by_node(Some("n1"))
         .await
@@ -2550,7 +2566,9 @@ async fn dispatched_attempt_waits_for_fresh_report_after_hub_restart() {
         .register(RegisterRequest {
             data_address: None,
             node_id: "node-a".into(),
-            node_token: "node-secret".into(),
+            node_token: session1
+                .node_credential
+                .unwrap_or_else(|| "node-secret".into()),
             protocol_version: "v1".into(),
             capabilities: vec!["stream_lifecycle".into()],
             boot_id: None,
@@ -4187,16 +4205,17 @@ async fn periodic_job_reconciliation_stops_persisted_divergence_after_recovery()
         8,
     );
     let hub1 = Hub::with_storage(config(), storage.clone());
-    hub1.register(RegisterRequest {
-        data_address: None,
-        node_id: "compute-1".into(),
-        node_token: "node-secret".into(),
-        protocol_version: "v1".into(),
-        capabilities: vec!["job_runtime".into(), "state_backend".into()],
-        boot_id: None,
-    })
-    .await
-    .unwrap();
+    let session1 = hub1
+        .register(RegisterRequest {
+            data_address: None,
+            node_id: "compute-1".into(),
+            node_token: "node-secret".into(),
+            protocol_version: "v1".into(),
+            capabilities: vec!["job_runtime".into(), "state_backend".into()],
+            boot_id: None,
+        })
+        .await
+        .unwrap();
     let job = hub1
             .upsert_job(JobRecord {
                 job_id: "orders".into(),
@@ -4236,7 +4255,9 @@ async fn periodic_job_reconciliation_stops_persisted_divergence_after_recovery()
         .register(RegisterRequest {
             data_address: None,
             node_id: "compute-1".into(),
-            node_token: "node-secret".into(),
+            node_token: session1
+                .node_credential
+                .unwrap_or_else(|| "node-secret".into()),
             protocol_version: "v1".into(),
             capabilities: vec!["job_runtime".into(), "state_backend".into()],
             boot_id: None,

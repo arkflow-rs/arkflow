@@ -32,6 +32,8 @@ pub struct RemoteEdgeContext {
     pub tls: Option<super::remote::DataPlaneTlsConfig>,
     /// Job attempt generation bound into authenticated data-plane sessions.
     pub generation: u64,
+    /// Optional Hub-provisioned per-edge HMAC secrets keyed by `(src_node, dst_node)`.
+    pub edge_secrets: BTreeMap<(String, String), String>,
 }
 
 /// Deterministic routing index for quad identities: the operator's position
@@ -888,15 +890,21 @@ impl ExecutionGraphBuilder {
                             addr,
                             max_attempts: 5,
                             tls: ctx.tls.clone(),
+                            peer_node: Some(node.to_owned()),
                         });
+                        let edge_secret = ctx
+                            .edge_secrets
+                            .get(&(ctx.local_node.clone(), node.to_owned()))
+                            .map(|secret| secret.as_bytes());
                         let sender = ctx
                             .manager
-                            .open_edge_deferred_for_job(
+                            .open_edge_deferred_for_job_with_secret(
                                 transport,
                                 quad,
                                 node.to_owned(),
                                 plan.spec.id.to_string(),
                                 ctx.generation,
+                                edge_secret,
                             )?
                             .sender;
                         senders.insert((upstream_task_id.clone(), target.clone()), sender);
@@ -946,14 +954,20 @@ impl ExecutionGraphBuilder {
                             dst_subtask: task.subtask,
                         };
                         let (sender, receiver) = flume::bounded(self.channel_capacity);
-                        ctx.manager.register_inbound_for_session(
+                        let upstream_node = ctx.node_of(&upstream_task.id)?.to_owned();
+                        let edge_secret = ctx
+                            .edge_secrets
+                            .get(&(upstream_node.clone(), ctx.local_node.clone()))
+                            .map(|secret| secret.as_bytes());
+                        ctx.manager.register_inbound_for_session_with_secret(
                             quad,
                             sender,
                             super::remote::PeerExpectation {
-                                source_node: ctx.node_of(&upstream_task.id)?.to_owned(),
+                                source_node: upstream_node,
                                 job_id: plan.spec.id.to_string(),
                                 generation: ctx.generation,
                             },
+                            edge_secret,
                         )?;
                         let entry_run = *run_of_task.get(task.id.as_str()).ok_or_else(|| {
                             Error::Config(format!("task '{}' lost its run", task.id))

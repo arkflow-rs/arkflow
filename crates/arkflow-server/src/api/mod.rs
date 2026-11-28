@@ -17,6 +17,8 @@ mod diagnostics;
 mod events;
 mod jobs;
 #[cfg(test)]
+mod mtls_tests;
+#[cfg(test)]
 mod node_labels_api_tests;
 mod nodes;
 mod operations;
@@ -62,8 +64,9 @@ use jobs::{
     hub_jobs, hub_validate_job,
 };
 use nodes::{
-    hub_drain_node, hub_maintain_node, hub_nodes, hub_replace_node_labels, hub_resume_node,
-    hub_status, hub_system,
+    hub_create_node_credential, hub_drain_node, hub_maintain_node, hub_node_credentials, hub_nodes,
+    hub_replace_node_labels, hub_resume_node, hub_revoke_node_credential,
+    hub_rotate_node_credential, hub_status, hub_system,
 };
 use operations::{
     cancel_operation, hub_cancel_operation, hub_operation, hub_operations, operation, operations,
@@ -125,6 +128,18 @@ pub struct ServerConfig {
     pub tls_cert: Option<String>,
     #[serde(default)]
     pub tls_key: Option<String>,
+    /// PEM CA bundle path used by the Hub listener to verify client certificates.
+    #[serde(default)]
+    pub tls_ca: Option<String>,
+    /// Client certificate enforcement mode: `none`, `agent_required` (default when `tls_ca` is set), or `required`.
+    #[serde(default)]
+    pub tls_client_auth: Option<String>,
+    /// Reject shared `node_token` bootstrap for un-enrolled nodes (`ARKFLOW_HUB_NODE_BOOTSTRAP_DISABLED`).
+    #[serde(default)]
+    pub node_bootstrap_disabled: bool,
+    /// Break-glass override permitting shared `node_token` for already-enrolled nodes.
+    #[serde(default)]
+    pub allow_shared_node_token_break_glass: bool,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default = "default_address")]
@@ -189,6 +204,10 @@ impl ServerConfig {
             readiness_path: health.readiness_path.clone(),
             tls_cert: None,
             tls_key: None,
+            tls_ca: None,
+            tls_client_auth: None,
+            node_bootstrap_disabled: false,
+            allow_shared_node_token_break_glass: false,
             liveness_path: health.liveness_path.clone(),
             cors_origins: control_api.cors_origins.clone(),
             node_token: agent.node_token.clone(),
@@ -276,6 +295,10 @@ impl Default for ServerConfig {
             readiness_path: default_readiness_path(),
             tls_cert: None,
             tls_key: None,
+            tls_ca: None,
+            tls_client_auth: None,
+            node_bootstrap_disabled: false,
+            allow_shared_node_token_break_glass: false,
             liveness_path: default_liveness_path(),
             cors_origins: Vec::new(),
             node_token: None,
@@ -804,6 +827,18 @@ pub fn hub_router(hub: hub::Hub, config: &ServerConfig) -> Router {
             post(hub_maintain_node).delete(hub_resume_node),
         )
         .route("/nodes/{node_id}/labels", put(hub_replace_node_labels))
+        .route(
+            "/nodes/{node_id}/credentials",
+            get(hub_node_credentials).post(hub_create_node_credential),
+        )
+        .route(
+            "/node-credentials/{credential_id}/rotate",
+            post(hub_rotate_node_credential),
+        )
+        .route(
+            "/node-credentials/{credential_id}",
+            delete(hub_revoke_node_credential),
+        )
         .route("/metrics", get(hub_metrics))
         .route("/agent/register", post(agent_register))
         .route("/agent/heartbeat", post(agent_heartbeat))
@@ -1011,11 +1046,182 @@ fn sweep_logged<T>(task: &str, result: Result<T, impl std::fmt::Display>) {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct HubTlsConnectInfo {
+    pub peer_cert: Option<hub::PeerClientCert>,
+}
+
+fn parse_peer_client_cert(der: &[u8]) -> Option<hub::PeerClientCert> {
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    let subject = cert.subject().to_string();
+    let mut node_ids = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            if let GeneralName::URI(uri) = name {
+                if let Some(node_id) = uri.strip_prefix("urn:arkflow:node:") {
+                    let trimmed = node_id.trim();
+                    if !trimmed.is_empty() && !node_ids.iter().any(|existing| existing == trimmed) {
+                        node_ids.push(trimmed.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    Some(hub::PeerClientCert { subject, node_ids })
+}
+
+impl<'a> axum::extract::connect_info::Connected<axum::serve::IncomingStream<'a, HubTlsListener>>
+    for HubTlsConnectInfo
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'a, HubTlsListener>) -> Self {
+        let peer_cert = stream
+            .io()
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .and_then(|der| parse_peer_client_cert(der.as_ref()));
+        Self { peer_cert }
+    }
+}
+
+pub(crate) fn build_hub_tls_acceptor(
+    config: &ServerConfig,
+) -> Result<(Option<tokio_rustls::TlsAcceptor>, bool), Box<dyn std::error::Error + Send + Sync>> {
+    let cert_path = config
+        .tls_cert
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let key_path = config
+        .tls_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let ca_path = config
+        .tls_ca
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let client_auth = config
+        .tls_client_auth
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(mode) = client_auth {
+        if !matches!(mode, "none" | "agent_required" | "required") {
+            return Err(format!(
+                "invalid ARKFLOW_HUB_TLS_CLIENT_AUTH '{mode}'; expected none, agent_required, or required"
+            )
+            .into());
+        }
+    }
+    let effective_mode = match client_auth {
+        Some(mode) => mode,
+        None if ca_path.is_some() => "agent_required",
+        None => "none",
+    };
+    if ca_path.is_some() && (cert_path.is_none() || key_path.is_none()) {
+        return Err(
+            "ARKFLOW_HUB_TLS_CA requires both ARKFLOW_HUB_TLS_CERT and ARKFLOW_HUB_TLS_KEY".into(),
+        );
+    }
+    if matches!(effective_mode, "agent_required" | "required") && ca_path.is_none() {
+        return Err(format!(
+            "ARKFLOW_HUB_TLS_CLIENT_AUTH={effective_mode} requires ARKFLOW_HUB_TLS_CA"
+        )
+        .into());
+    }
+    match (cert_path, key_path) {
+        (None, None) => Ok((None, false)),
+        (Some(cert_path), Some(key_path)) => {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let cert_pem = std::fs::read_to_string(cert_path).map_err(|error| {
+                format!("hub TLS certificate '{cert_path}' could not be read: {error}")
+            })?;
+            let key_pem = std::fs::read_to_string(key_path)
+                .map_err(|error| format!("hub TLS key '{key_path}' could not be read: {error}"))?;
+            let mut chain = Vec::new();
+            for item in rustls_pemfile::certs(&mut cert_pem.as_bytes()) {
+                chain.push(
+                    item.map_err(|error| format!("hub TLS certificate parse failed: {error}"))?,
+                );
+            }
+            if chain.is_empty() {
+                return Err("hub TLS certificate contains no PEM certificates".into());
+            }
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                .map_err(|error| format!("hub TLS key parse failed: {error}"))?
+                .ok_or("hub TLS key contains no PEM private key")?;
+            let (server_config, mtls_enforced) = if effective_mode == "none" {
+                (
+                    rustls::ServerConfig::builder()
+                        .with_no_client_auth()
+                        .with_single_cert(chain, key)
+                        .map_err(|error| format!("hub TLS config rejected: {error}"))?,
+                    false,
+                )
+            } else {
+                let ca_path = ca_path.expect("validated above");
+                let ca_pem = std::fs::read_to_string(ca_path).map_err(|error| {
+                    format!("hub TLS CA '{ca_path}' could not be read: {error}")
+                })?;
+                let mut roots = rustls::RootCertStore::empty();
+                let mut loaded = 0usize;
+                for item in rustls_pemfile::certs(&mut ca_pem.as_bytes()) {
+                    let cert = item.map_err(|error| format!("hub TLS CA parse failed: {error}"))?;
+                    roots
+                        .add(cert)
+                        .map_err(|error| format!("hub TLS CA rejected: {error}"))?;
+                    loaded += 1;
+                }
+                if loaded == 0 {
+                    return Err("hub TLS CA contains no PEM certificates".into());
+                }
+                let verifier_builder =
+                    rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots));
+                let verifier = if effective_mode == "agent_required" {
+                    verifier_builder
+                        .allow_unauthenticated()
+                        .build()
+                        .map_err(|error| format!("hub mTLS verifier build failed: {error}"))?
+                } else {
+                    verifier_builder
+                        .build()
+                        .map_err(|error| format!("hub mTLS verifier build failed: {error}"))?
+                };
+                (
+                    rustls::ServerConfig::builder()
+                        .with_client_cert_verifier(verifier)
+                        .with_single_cert(chain, key)
+                        .map_err(|error| format!("hub mTLS config rejected: {error}"))?,
+                    true,
+                )
+            };
+            Ok((
+                Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+                    server_config,
+                ))),
+                mtls_enforced,
+            ))
+        }
+        _ => Err("hub TLS requires both ARKFLOW_HUB_TLS_CERT and ARKFLOW_HUB_TLS_KEY".into()),
+    }
+}
+
 pub async fn serve_hub(
-    hub: hub::Hub,
+    mut hub: hub::Hub,
     config: ServerConfig,
     cancellation: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if config.node_bootstrap_disabled {
+        hub = hub.with_node_bootstrap_disabled(true);
+    }
+    if config.allow_shared_node_token_break_glass {
+        hub = hub.with_allow_shared_node_token_break_glass(true);
+    }
     if !config.enabled {
         return Ok(());
     }
@@ -1066,41 +1272,10 @@ pub async fn serve_hub(
             "restored persisted operations into the in-memory registry"
         );
     }
-    // Control-plane TLS: both materials or neither — a half-configured
-    // listener must fail startup rather than silently serve plaintext.
-    let tls_acceptor = match (&config.tls_cert, &config.tls_key) {
-        (None, None) => None,
-        (Some(cert_path), Some(key_path)) => {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            let cert_pem = std::fs::read_to_string(cert_path).map_err(|error| {
-                format!("hub TLS certificate '{cert_path}' could not be read: {error}")
-            })?;
-            let key_pem = std::fs::read_to_string(key_path)
-                .map_err(|error| format!("hub TLS key '{key_path}' could not be read: {error}"))?;
-            let mut chain = Vec::new();
-            for item in rustls_pemfile::certs(&mut cert_pem.as_bytes()) {
-                chain.push(
-                    item.map_err(|error| format!("hub TLS certificate parse failed: {error}"))?,
-                );
-            }
-            if chain.is_empty() {
-                return Err("hub TLS certificate contains no PEM certificates".into());
-            }
-            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-                .map_err(|error| format!("hub TLS key parse failed: {error}"))?
-                .ok_or("hub TLS key contains no PEM private key")?;
-            let server_config = rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(chain, key)
-                .map_err(|error| format!("hub TLS config rejected: {error}"))?;
-            Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
-                server_config,
-            )))
-        }
-        _ => {
-            return Err("hub TLS requires both ARKFLOW_HUB_TLS_CERT and ARKFLOW_HUB_TLS_KEY".into())
-        }
-    };
+    // Control-plane TLS & mTLS: both materials or neither — a half-configured
+    // listener or missing CA for agent_required/required fails startup.
+    let (tls_acceptor, mtls_enforced) = build_hub_tls_acceptor(&config)?;
+    hub.set_mtls_enforced(mtls_enforced);
     let listener = TcpListener::bind(address).await?;
     // Lease election loop: leaders renew at ttl/3, standbys probe for
     // takeover. Failover is bounded by the lease TTL plus one probe.
@@ -1260,16 +1435,18 @@ pub async fn serve_hub(
         }
         shutdown_hub.release_leadership().await;
     };
-    let router = hub_router(hub.clone(), &config).into_make_service();
     let result = match tls_acceptor {
         Some(acceptor) => {
             let tls_listener = HubTlsListener::spawn(listener, acceptor)?;
-            axum::serve(tls_listener, router)
+            let mtls_router = hub_router(hub.clone(), &config)
+                .into_make_service_with_connect_info::<HubTlsConnectInfo>();
+            axum::serve(tls_listener, mtls_router)
                 .with_graceful_shutdown(shutdown)
                 .await
         }
         None => {
-            axum::serve(listener, router)
+            let plain_router = hub_router(hub.clone(), &config).into_make_service();
+            axum::serve(listener, plain_router)
                 .with_graceful_shutdown(shutdown)
                 .await
         }

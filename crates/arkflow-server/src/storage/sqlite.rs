@@ -127,6 +127,19 @@ fn row_to_credential(row: &Row<'_>) -> rusqlite::Result<CredentialRecord> {
     })
 }
 
+fn row_to_node_credential(row: &Row<'_>) -> rusqlite::Result<NodeCredentialRecord> {
+    Ok(NodeCredentialRecord {
+        credential_id: row.get(0)?,
+        node_id: row.get(1)?,
+        secret_hash: row.get(2)?,
+        label: row.get(3)?,
+        created_at_ms: row.get(4)?,
+        expires_at_ms: row.get(5)?,
+        last_used_at_ms: row.get(6)?,
+        revoked_at_ms: row.get(7)?,
+    })
+}
+
 fn row_to_session(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         session_hash: row.get(0)?,
@@ -3015,6 +3028,19 @@ impl SqliteBackend {
             CREATE INDEX IF NOT EXISTS cp_credentials_user
                 ON cp_credentials(user_id);
 
+            CREATE TABLE IF NOT EXISTS cp_node_credentials (
+                credential_id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER,
+                last_used_at_ms INTEGER,
+                revoked_at_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS cp_node_credentials_node
+                ON cp_node_credentials(node_id);
+
             CREATE TABLE IF NOT EXISTS cp_sessions (
                 session_hash TEXT PRIMARY KEY,
                 user_id TEXT,
@@ -3323,6 +3349,8 @@ impl SqliteBackend {
         "user_id, display_name, role, scopes_json, disabled, oidc_subject, tokens_valid_after_ms, created_at_ms, updated_at_ms";
     const CREDENTIAL_COLUMNS: &'static str =
         "credential_id, user_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms";
+    const NODE_CREDENTIAL_COLUMNS: &'static str =
+        "credential_id, node_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms";
     const SESSION_COLUMNS: &'static str =
         "session_hash, user_id, principal_json, created_at_ms, expires_at_ms, revoked_at_ms";
 
@@ -3594,6 +3622,132 @@ impl SqliteBackend {
                 rusqlite::params![
                     record.credential_id,
                     record.user_id,
+                    record.secret_hash,
+                    record.label,
+                    record.created_at_ms,
+                    record.expires_at_ms,
+                    record.last_used_at_ms,
+                    record.revoked_at_ms,
+                ],
+            )?;
+            Ok(true)
+        })
+    }
+
+    pub fn list_node_credentials(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<NodeCredentialRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {} FROM cp_node_credentials WHERE node_id = ?1 ORDER BY created_at_ms DESC, credential_id",
+                Self::NODE_CREDENTIAL_COLUMNS
+            ))?;
+            let rows = statement.query_map([node_id], row_to_node_credential)?;
+            rows.collect()
+        })
+    }
+
+    pub fn get_node_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<NodeCredentialRecord>, StorageError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM cp_node_credentials WHERE credential_id = ?1",
+                        Self::NODE_CREDENTIAL_COLUMNS
+                    ),
+                    [credential_id],
+                    row_to_node_credential,
+                )
+                .optional()
+        })
+    }
+
+    pub fn count_active_node_credentials(
+        &self,
+        node_id: &str,
+        now_ms: u64,
+    ) -> Result<usize, StorageError> {
+        self.with_connection(|connection| {
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM cp_node_credentials WHERE node_id = ?1 AND revoked_at_ms IS NULL AND (expires_at_ms IS NULL OR expires_at_ms > ?2)",
+                rusqlite::params![node_id, now_ms],
+                |row| row.get(0),
+            )?;
+            Ok(count.max(0) as usize)
+        })
+    }
+
+    pub fn create_node_credential(
+        &self,
+        record: NodeCredentialRecord,
+    ) -> Result<bool, StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO cp_node_credentials (credential_id, node_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    record.credential_id,
+                    record.node_id,
+                    record.secret_hash,
+                    record.label,
+                    record.created_at_ms,
+                    record.expires_at_ms,
+                    record.last_used_at_ms,
+                    record.revoked_at_ms,
+                ],
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Revoke a node credential idempotently. Returns `None` if unknown, else
+    /// `Some((updated_record, newly_revoked))`.
+    pub fn revoke_node_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<Option<(NodeCredentialRecord, bool)>, StorageError> {
+        self.immediate_transaction(|connection| {
+            let changed = connection.execute(
+                "UPDATE cp_node_credentials SET revoked_at_ms = ?2 WHERE credential_id = ?1 AND revoked_at_ms IS NULL",
+                rusqlite::params![credential_id, revoked_at_ms],
+            )?;
+            let record = connection
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM cp_node_credentials WHERE credential_id = ?1",
+                        Self::NODE_CREDENTIAL_COLUMNS
+                    ),
+                    [credential_id],
+                    row_to_node_credential,
+                )
+                .optional()?;
+            Ok(record.map(|record| (record, changed > 0)))
+        })
+    }
+
+    pub fn rotate_node_credential(
+        &self,
+        record: NodeCredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.immediate_transaction(|connection| {
+            let changed = connection.execute(
+                "UPDATE cp_node_credentials SET revoked_at_ms = ?2 WHERE credential_id = ?1 AND revoked_at_ms IS NULL",
+                rusqlite::params![previous_credential_id, revoked_at_ms],
+            )?;
+            if changed != 1 {
+                return Ok(false);
+            }
+            connection.execute(
+                "INSERT INTO cp_node_credentials (credential_id, node_id, secret_hash, label, created_at_ms, expires_at_ms, last_used_at_ms, revoked_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    record.credential_id,
+                    record.node_id,
                     record.secret_hash,
                     record.label,
                     record.created_at_ms,
@@ -4346,6 +4500,46 @@ impl StorageBackend for SqliteBackend {
         revoked_at_ms: u64,
     ) -> Result<bool, StorageError> {
         self.rotate_credential(record, previous_credential_id, revoked_at_ms)
+    }
+    async fn list_node_credentials(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<NodeCredentialRecord>, StorageError> {
+        self.list_node_credentials(node_id)
+    }
+    async fn get_node_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<NodeCredentialRecord>, StorageError> {
+        self.get_node_credential(credential_id)
+    }
+    async fn count_active_node_credentials(
+        &self,
+        node_id: &str,
+        now_ms: u64,
+    ) -> Result<usize, StorageError> {
+        self.count_active_node_credentials(node_id, now_ms)
+    }
+    async fn create_node_credential(
+        &self,
+        record: NodeCredentialRecord,
+    ) -> Result<bool, StorageError> {
+        self.create_node_credential(record)
+    }
+    async fn revoke_node_credential(
+        &self,
+        credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<Option<(NodeCredentialRecord, bool)>, StorageError> {
+        self.revoke_node_credential(credential_id, revoked_at_ms)
+    }
+    async fn rotate_node_credential(
+        &self,
+        record: NodeCredentialRecord,
+        previous_credential_id: &str,
+        revoked_at_ms: u64,
+    ) -> Result<bool, StorageError> {
+        self.rotate_node_credential(record, previous_credential_id, revoked_at_ms)
     }
     async fn get_session(&self, session_hash: &str) -> Result<Option<SessionRecord>, StorageError> {
         self.get_session(session_hash)

@@ -107,7 +107,10 @@ async fn new_session_resets_the_report_cursor() {
         .register(RegisterRequest {
             data_address: None,
             node_id: "n1".into(),
-            node_token: "node-secret".into(),
+            node_token: first
+                .node_credential
+                .clone()
+                .unwrap_or_else(|| "node-secret".into()),
             protocol_version: "v1".into(),
             capabilities: vec![],
             boot_id: None,
@@ -331,11 +334,15 @@ async fn expired_session_mid_command_still_settles_one_terminal_result() {
 
     // The Agent re-registers with its stable boot identity: leased command
     // state survives because the boot did not change.
+    let node_credential = registration
+        .node_credential
+        .clone()
+        .unwrap_or_else(|| "node-secret".into());
     let reauth = hub
         .register(RegisterRequest {
             data_address: None,
             node_id: "agent-a".into(),
-            node_token: "node-secret".into(),
+            node_token: node_credential.clone(),
             protocol_version: "v1".into(),
             capabilities: vec!["configuration".into()],
             boot_id: Some("boot-1".into()),
@@ -360,7 +367,7 @@ async fn expired_session_mid_command_still_settles_one_terminal_result() {
         .register(RegisterRequest {
             data_address: None,
             node_id: "agent-a".into(),
-            node_token: "node-secret".into(),
+            node_token: node_credential,
             protocol_version: "v1".into(),
             capabilities: vec!["configuration".into()],
             boot_id: Some("boot-1".into()),
@@ -488,7 +495,10 @@ async fn delayed_report_from_an_old_session_is_ignored() {
         .register(RegisterRequest {
             data_address: None,
             node_id: "n1".into(),
-            node_token: "node-secret".into(),
+            node_token: first
+                .node_credential
+                .clone()
+                .unwrap_or_else(|| "node-secret".into()),
             protocol_version: "v1".into(),
             capabilities: vec![],
             boot_id: None,
@@ -817,6 +827,8 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
             pressure_streak: 0,
             jobs: BTreeMap::new(),
             configuration: None,
+            credential_id: None,
+            cert_node_id: None,
         };
         if reported {
             record.metrics = resource_metrics(used_ratio, cpu);

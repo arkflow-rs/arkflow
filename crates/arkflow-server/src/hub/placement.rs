@@ -880,6 +880,13 @@ impl Hub {
         // so each node's graph build can wire its remote edges without any
         // further lookup.
         let mut split_payload = None;
+        let mut job_edge_secrets: Option<BTreeMap<(String, String), String>> = None;
+        if operation == AgentOperation::JobStop {
+            self.job_edge_secrets
+                .write()
+                .await
+                .retain(|(job_id, _), _| job_id != &job.job_id);
+        }
         if spec.placement == arkflow_core::job::PlacementStrategy::Split {
             let nodes = self.nodes.read().await;
             let mut node_data_ports = BTreeMap::new();
@@ -910,6 +917,46 @@ impl Hub {
             let mut task_nodes = BTreeMap::new();
             for assignment in &assignments {
                 task_nodes.insert(assignment.task_id.clone(), assignment.node_id.clone());
+            }
+            if operation == AgentOperation::JobStart {
+                let mut cross_edges: std::collections::BTreeSet<(String, String)> =
+                    std::collections::BTreeSet::new();
+                for edge in &plan.spec.edges {
+                    for src_task in plan
+                        .tasks
+                        .iter()
+                        .filter(|task| task.operator_id == edge.from)
+                    {
+                        let Some(src_node) = task_nodes.get(&src_task.id) else {
+                            continue;
+                        };
+                        for dst_task in plan.tasks.iter().filter(|task| task.operator_id == edge.to)
+                        {
+                            let Some(dst_node) = task_nodes.get(&dst_task.id) else {
+                                continue;
+                            };
+                            if src_node != dst_node {
+                                cross_edges.insert((src_node.clone(), dst_node.clone()));
+                            }
+                        }
+                    }
+                }
+                let mut cache = self.job_edge_secrets.write().await;
+                cache.retain(|(id, gen), _| id != &job.job_id || *gen == job.generation);
+                let secrets_for_gen = cache
+                    .entry((job.job_id.clone(), job.generation))
+                    .or_default();
+                for edge_pair in cross_edges {
+                    secrets_for_gen.entry(edge_pair).or_insert_with(|| {
+                        use rand::TryRngCore;
+                        let mut bytes = [0u8; 32];
+                        rand::rngs::OsRng
+                            .try_fill_bytes(&mut bytes)
+                            .expect("OS RNG cannot fail");
+                        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+                    });
+                }
+                job_edge_secrets = Some(secrets_for_gen.clone());
             }
             split_payload = Some(serde_json::json!({
                 "task_nodes": task_nodes,
@@ -1153,6 +1200,27 @@ impl Hub {
             ) {
                 for (key, value) in extra {
                     base.insert(key.clone(), value.clone());
+                }
+            }
+            if let (Some(base), Some(all_secrets)) =
+                (payload_value.as_object_mut(), job_edge_secrets.as_ref())
+            {
+                let node_secrets: Vec<serde_json::Value> = all_secrets
+                    .iter()
+                    .filter(|((src, dst), _)| src == &node_id || dst == &node_id)
+                    .map(|((src, dst), secret)| {
+                        serde_json::json!({
+                            "src": src,
+                            "dst": dst,
+                            "secret": secret,
+                        })
+                    })
+                    .collect();
+                if !node_secrets.is_empty() {
+                    base.insert(
+                        "edge_secrets".to_string(),
+                        serde_json::Value::Array(node_secrets),
+                    );
                 }
             }
             let payload = Some(payload_value);

@@ -82,6 +82,10 @@ async fn agent_resource_gauges_reach_the_hub_metrics_export() {
             poll_interval: Duration::from_millis(50),
             data_port: None,
             data_host: None,
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         agent_cancel.clone(),
     ));
