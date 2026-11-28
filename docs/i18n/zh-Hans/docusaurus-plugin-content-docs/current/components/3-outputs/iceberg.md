@@ -5,7 +5,7 @@ description: ArkFlow 文档页面。
 
 # Iceberg
 
-Iceberg 输出通过 REST catalog 把行追加到一张已存在的 [Apache Iceberg](https://iceberg.apache.org/) 表。一次 `write_batch` 调用就是**一次原子表追加**：输出先提交快照，源确认随后才发生，确认永远不会跑在表前面。调用之间输出不持有缓冲、不跑定时器——提交节奏与数据文件大小由管道投递的批次决定，实践中就是在本输出前面放一个 [`batch`](/components/2-processors/batch) 处理器。
+Iceberg 输出通过 REST catalog 把行追加到一张已存在的 [Apache Iceberg](https://iceberg.apache.org/) 表。一次 `write_batch` 调用就是**一次原子表追加**：输出先提交快照，源确认随后才发生，确认永远不会跑在表前面。调用之间输出不持有缓冲、不跑定时器——提交节奏与数据文件大小由管道投递的批次决定，实践中就是在本输出前面放一个 [`batch`](/zh-Hans/docs/components/processors/batch) 处理器。
 
 ## 前置条件
 

@@ -273,7 +273,7 @@ async fn init_registry() {
 /// Runs `body` unless the stack is absent and skipping is allowed.
 macro_rules! gated {
     ($body:expr) => {{
-        if !iceberg_required() && catalog_unreachable().await {
+        if !iceberg_required() && !catalog_reachable().await {
             eprintln!(
                 "skipping: catalog at {CATALOG_URI} unreachable and ARKFLOW_REQUIRE_ICEBERG \
                  is not set"
@@ -285,20 +285,34 @@ macro_rules! gated {
     }};
 }
 
-async fn catalog_unreachable() -> bool {
-    let probe = RestCatalogBuilder::default().load(
-        "arkflow-iceberg-tests-probe",
-        std::collections::HashMap::from([
-            (REST_CATALOG_PROP_URI.to_string(), CATALOG_URI.to_string()),
-            (
-                REST_CATALOG_PROP_WAREHOUSE.to_string(),
-                WAREHOUSE.to_string(),
-            ),
-        ]),
-    );
+async fn catalog_reachable() -> bool {
+    // A catalog load is lazy: it succeeds without contacting the server, so
+    // the probe must perform a real query before we trust it.
+    let probe = async {
+        let load = RestCatalogBuilder::default()
+            .load(
+                "arkflow-iceberg-tests-probe",
+                std::collections::HashMap::from([
+                    (REST_CATALOG_PROP_URI.to_string(), CATALOG_URI.to_string()),
+                    (
+                        REST_CATALOG_PROP_WAREHOUSE.to_string(),
+                        WAREHOUSE.to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .map_err(|error| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!("catalog load failed: {error}"),
+                )
+            })?;
+        load.list_namespaces(None).await?;
+        Ok::<(), iceberg::Error>(())
+    };
     matches!(
-        tokio::time::timeout(Duration::from_secs(2), probe).await,
-        Err(_) | Ok(Err(_))
+        tokio::time::timeout(Duration::from_secs(5), probe).await,
+        Ok(Ok(()))
     )
 }
 

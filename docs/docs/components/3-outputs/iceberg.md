@@ -5,7 +5,7 @@ description: ArkFlow documentation page.
 
 # Iceberg
 
-The Iceberg output appends rows to an existing [Apache Iceberg](https://iceberg.apache.org/) table through a REST catalog. One `write_batch` call is **one atomic table append**: the output commits a snapshot and only then is the source acknowledged, so the acknowledgement never outruns the table. Between calls the output holds no buffer and runs no timer — commit cadence and data-file size are decided by the batches the pipeline delivers, in practice a [`batch`](/components/2-processors/batch) processor placed in front of this output.
+The Iceberg output appends rows to an existing [Apache Iceberg](https://iceberg.apache.org/) table through a REST catalog. One `write_batch` call is **one atomic table append**: the output commits a snapshot and only then is the source acknowledged, so the acknowledgement never outruns the table. Between calls the output holds no buffer and runs no timer — commit cadence and data-file size are decided by the batches the pipeline delivers, in practice a [`batch`](/docs/components/processors/batch) processor placed in front of this output.
 
 ## Prerequisites
 
