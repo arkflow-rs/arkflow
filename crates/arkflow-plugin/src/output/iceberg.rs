@@ -58,7 +58,7 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{
     RestCatalog, RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
 };
@@ -667,6 +667,138 @@ fn transient_error(context: &str, error: impl std::fmt::Display) -> Error {
         "iceberg output: {context} — transient transport failure, retrying on a fresh          attempt may succeed"
     );
     Error::Disconnection
+}
+
+/// A one-shot commit shim. `Transaction::commit` reloads the table and
+/// silently re-applies the (already filtered) actions onto whatever base it
+/// finds; its duplicate check only compares file paths, and each attempt's
+/// files have unique names, so rows below the refreshed base's watermark
+/// could be appended twice. Committing against this shim keeps that internal
+/// rebase inert — `load_table` returns the exact base the rows were filtered
+/// against — captures the assembled `TableCommit`, and reports a
+/// non-retryable conflict. The output then submits the captured commit
+/// exactly once through the real catalog, whose server-side
+/// `AssertRefSnapshotId` requirement binds the append to the base the
+/// watermark filter used: a concurrent commit surfaces as a conflict, and
+/// the attempt loop reloads and re-filters before appending anything new.
+#[derive(Debug)]
+struct SingleShotCatalog {
+    base: Table,
+    captured: std::sync::Mutex<Option<iceberg::TableCommit>>,
+}
+
+impl SingleShotCatalog {
+    fn new(base: Table) -> Self {
+        Self {
+            base,
+            captured: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn take_captured(&self) -> Option<iceberg::TableCommit> {
+        self.captured.lock().expect("capture lock").take()
+    }
+}
+
+#[async_trait::async_trait]
+impl Catalog for SingleShotCatalog {
+    async fn list_namespaces(
+        &self,
+        _parent: Option<&NamespaceIdent>,
+    ) -> iceberg::Result<Vec<NamespaceIdent>> {
+        Err(shim_unused())
+    }
+
+    async fn create_namespace(
+        &self,
+        _namespace: &NamespaceIdent,
+        _properties: HashMap<String, String>,
+    ) -> iceberg::Result<iceberg::Namespace> {
+        Err(shim_unused())
+    }
+
+    async fn get_namespace(
+        &self,
+        _namespace: &NamespaceIdent,
+    ) -> iceberg::Result<iceberg::Namespace> {
+        Err(shim_unused())
+    }
+
+    async fn namespace_exists(&self, _namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+        Err(shim_unused())
+    }
+
+    async fn update_namespace(
+        &self,
+        _namespace: &NamespaceIdent,
+        _properties: HashMap<String, String>,
+    ) -> iceberg::Result<()> {
+        Err(shim_unused())
+    }
+
+    async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> iceberg::Result<()> {
+        Err(shim_unused())
+    }
+
+    async fn list_tables(&self, _namespace: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
+        Err(shim_unused())
+    }
+
+    async fn create_table(
+        &self,
+        _namespace: &NamespaceIdent,
+        _creation: TableCreation,
+    ) -> iceberg::Result<Table> {
+        Err(shim_unused())
+    }
+
+    async fn load_table(&self, _table: &TableIdent) -> iceberg::Result<Table> {
+        // The transaction's staleness rebase must stay inert: always hand
+        // back the base the rows were filtered against.
+        Ok(self.base.clone())
+    }
+
+    async fn drop_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+        Err(shim_unused())
+    }
+
+    async fn purge_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+        Err(shim_unused())
+    }
+
+    async fn table_exists(&self, _table: &TableIdent) -> iceberg::Result<bool> {
+        Err(shim_unused())
+    }
+
+    async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> iceberg::Result<()> {
+        Err(shim_unused())
+    }
+
+    async fn register_table(
+        &self,
+        _table: &TableIdent,
+        _metadata_location: String,
+    ) -> iceberg::Result<Table> {
+        Err(shim_unused())
+    }
+
+    async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
+        *self.captured.lock().expect("capture lock") = Some(commit);
+        // Non-retryable: the transaction must stop and hand the assembled
+        // commit back instead of re-applying it onto a refreshed base.
+        Err(iceberg::Error::new(
+            iceberg::ErrorKind::CatalogCommitConflicts,
+            "iceberg output: single-shot commit captured",
+        )
+        .with_retryable(false))
+    }
+}
+
+fn shim_unused() -> iceberg::Error {
+    iceberg::Error::new(
+        iceberg::ErrorKind::Unexpected,
+        "iceberg output: catalog method not used by the single-shot commit shim",
+    )
 }
 
 /// Config-driven static S3 credentials for the signing chain.
@@ -1431,7 +1563,20 @@ impl IcebergOutput {
                         "iceberg output: preparing the commit failed: {error}"
                     ))
                 })?;
-            match transaction.commit(state.catalog.as_ref()).await {
+
+            // Capture the assembled commit (see `SingleShotCatalog`), then
+            // submit it exactly once against the real catalog. A conflict
+            // here means the table moved past the base the rows were
+            // filtered against: the attempt loop reloads and re-filters
+            // before appending anything new.
+            let shim = Arc::new(SingleShotCatalog::new(state.table.clone()));
+            let _ = transaction.commit(shim.as_ref()).await;
+            let captured = shim.take_captured().ok_or_else(|| {
+                Error::Process(
+                    "iceberg output: the transaction assembled no commit request".to_string(),
+                )
+            })?;
+            match state.catalog.update_table(captured).await {
                 Ok(committed) => {
                     debug!(
                         snapshot = committed
@@ -1513,6 +1658,8 @@ fn commit_error(error: iceberg::Error) -> Error {
     } else if is_transient(&message)
         || message.contains("Commit Failed")
         || message.contains("Retries exceeded")
+        || message.contains("Requirement failed")
+        || message.contains("Conflict")
         // iceberg-catalog-rest maps HTTP 500/502/504 commit responses to
         // messages that explicitly say the outcome is unknown — exactly the
         // ambiguous-commit window, so reconcile against table state first.

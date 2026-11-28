@@ -95,6 +95,7 @@ recovery:     whole call redone  orphan files, not in     replayed rows are all 
 - A row's position comes from `__meta_ext.topic`, `__meta_partition`, and `__meta_offset`. Rows expanded from one Kafka record share a position and are kept or dropped together.
 - After any failed commit attempt the in-memory watermark is discarded and table metadata is reloaded before the next attempt: a commit whose outcome is unknown (timeout) may have been accepted, and the catalog is the only source of truth.
 - The upstream duplicate-data-file check stays enabled as a last line of defence against re-appending a committed file.
+- **The commit is bound to the base the rows were filtered against** (code-review round 3): `Transaction::commit` internally reloads the table and silently re-applies the already-filtered actions onto a newer base — its duplicate check only compares file paths, and each attempt's files have unique names, so a base change would append rows the (stale) watermark filter should have dropped. The output therefore commits against a shim catalog that returns the exact filtered base (keeping the internal rebase inert), captures the assembled `TableCommit`, and submits it exactly once through the real catalog. The server-side `AssertRefSnapshotId` requirement enforces the binding: a concurrent commit surfaces as a conflict (`Error::Disconnection`), and the attempt loop reloads and re-filters before appending anything new.
 
 Alternatives considered:
 
