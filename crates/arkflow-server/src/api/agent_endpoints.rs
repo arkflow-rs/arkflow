@@ -13,17 +13,27 @@ async fn enforce_agent_mtls(
     connect_info: Option<&axum::Extension<axum::extract::ConnectInfo<super::HubTlsConnectInfo>>>,
 ) -> Result<Option<hub::PeerClientCert>, Box<Response>> {
     let peer_cert = connect_info.and_then(|info| info.0 .0.peer_cert.clone());
-    if hub.mtls_enforced() && peer_cert.is_none() {
+    let expected_cert_node_id = hub.expected_cert_node_id(node_id).await;
+    if (hub.mtls_enforced() || expected_cert_node_id.is_some()) && peer_cert.is_none() {
         hub.audit_agent_auth_rejection(
             node_id,
             "missing_client_certificate",
-            "mTLS client certificate required for agent endpoint",
+            if expected_cert_node_id.is_some() {
+                "client certificate required for certificate-bound node session"
+            } else {
+                "mTLS client certificate required for agent endpoint"
+            },
         )
         .await;
         return Err(Box::new(hub_problem(hub::HubError::Unauthorized)));
     }
     if let Some(cert) = peer_cert.as_ref() {
-        if !cert.node_ids.is_empty() && !cert.node_ids.iter().any(|id| id == node_id) {
+        let bound_mismatch = expected_cert_node_id
+            .as_deref()
+            .is_some_and(|bound| !cert.node_ids.iter().any(|id| id == bound));
+        let claim_mismatch =
+            !cert.node_ids.is_empty() && !cert.node_ids.iter().any(|id| id == node_id);
+        if bound_mismatch || claim_mismatch {
             hub.audit_agent_auth_rejection(
                 node_id,
                 "cert_node_identity_mismatch",

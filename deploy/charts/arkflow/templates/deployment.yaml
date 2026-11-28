@@ -83,12 +83,17 @@ spec:
             - name: ARKFLOW_DATA_PLANE_TLS_KEY
               value: {{ printf "/etc/arkflow/tls/%s" $tlsKeyKey | quote }}
             {{- end }}
+            {{- if .Values.agent.nodeId }}
+            - name: ARKFLOW_NODE_ID
+              value: {{ .Values.agent.nodeId | quote }}
+            {{- else }}
             # Engine-native fallback (see NodeAgentConfig::from_engine):
             # pod name is the node identity when config sets no node_id.
             - name: ARKFLOW_NODE_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- end }}
             {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
@@ -132,9 +137,19 @@ spec:
             claimName: {{ include "arkflow.fullname" . }}-data
         {{- end }}
         {{- if include "arkflow.agentTlsEnabled" . | eq "true" }}
+        {{- $tlsCaKey := ternary (default "ca.crt" .Values.controlPlane.tls.caKey) (default "ca.crt" .Values.agent.tls.caKey) (eq .Values.mode "control-plane") }}
+        {{- $tlsCertKey := ternary (default "agent.crt" .Values.controlPlane.tls.agentCertKey) (default "tls.crt" .Values.agent.tls.certKey) (eq .Values.mode "control-plane") }}
+        {{- $tlsKeyKey := ternary (default "agent.key" .Values.controlPlane.tls.agentKeyKey) (default "tls.key" .Values.agent.tls.keyKey) (eq .Values.mode "control-plane") }}
         - name: agent-tls
           secret:
             secretName: {{ include "arkflow.agentTlsSecretName" . }}
+            items:
+              - key: {{ $tlsCaKey | quote }}
+                path: {{ $tlsCaKey | quote }}
+              - key: {{ $tlsCertKey | quote }}
+                path: {{ $tlsCertKey | quote }}
+              - key: {{ $tlsKeyKey | quote }}
+                path: {{ $tlsKeyKey | quote }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

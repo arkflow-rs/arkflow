@@ -671,6 +671,7 @@ async fn insert_exited_task(
             recovery_required: false,
             cancellation: CancellationToken::new(),
             assignments: Vec::new(),
+            edge_context_fingerprint: 0,
             dedicated_runtime: None,
             watermark_partitions: BTreeMap::new(),
             state,
@@ -1723,6 +1724,7 @@ async fn dropping_a_task_with_a_dedicated_runtime_never_panics() {
             recovery_required: false,
             cancellation: CancellationToken::new(),
             assignments: Vec::new(),
+            edge_context_fingerprint: 0,
             dedicated_runtime: Some(Arc::new(dedicated)),
             watermark_partitions: BTreeMap::new(),
             state: Arc::new(
@@ -2459,6 +2461,7 @@ fn dropping_a_task_outside_any_runtime_takes_the_bare_thread_path() {
                 recovery_required: false,
                 cancellation: CancellationToken::new(),
                 assignments: Vec::new(),
+                edge_context_fingerprint: 0,
                 dedicated_runtime: Some(Arc::new(dedicated)),
                 watermark_partitions: BTreeMap::new(),
                 state: Arc::new(
@@ -2494,6 +2497,7 @@ async fn metrics_count_ephemeral_and_recovery_required_jobs() {
                 recovery_required: recovery,
                 cancellation: CancellationToken::new(),
                 assignments: Vec::new(),
+                edge_context_fingerprint: 0,
                 dedicated_runtime: None,
                 watermark_partitions: BTreeMap::new(),
                 state,
@@ -6100,6 +6104,7 @@ async fn take_finished_reports_a_panicked_kernel_join() {
             recovery_required: false,
             cancellation: CancellationToken::new(),
             assignments: Vec::new(),
+            edge_context_fingerprint: 0,
             dedicated_runtime: None,
             watermark_partitions: BTreeMap::new(),
             state,
@@ -6586,4 +6591,89 @@ async fn data_plane_tls_without_shared_secret_binds_hub_provisioned_data_plane()
         std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CERT");
         std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_KEY");
     }
+}
+
+#[test]
+fn try_flush_pending_credential_retains_on_error_and_clears_on_success() {
+    let dir = tempfile::tempdir().unwrap();
+    // Pointing at an existing directory fails write cleanly without clearing pending state.
+    let mut pending = Some("arkn_testcred_secret".to_owned());
+    let dir_path = dir.path().to_string_lossy().into_owned();
+    super::session::try_flush_pending_credential("node-a", Some(&dir_path), &mut pending);
+    assert_eq!(pending.as_deref(), Some("arkn_testcred_secret"));
+
+    // Once pointed at a writable file path, flush persists the credential and clears pending.
+    let cred_file = dir.path().join("node.cred");
+    let file_path = cred_file.to_string_lossy().into_owned();
+    super::session::try_flush_pending_credential("node-a", Some(&file_path), &mut pending);
+    assert!(pending.is_none());
+    assert_eq!(
+        std::fs::read_to_string(&cred_file).unwrap(),
+        "arkn_testcred_secret\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn job_runtime_start_replaces_kernel_when_peer_edge_context_changes() {
+    let runtime = JobRuntime::default();
+    let (plan, assignments) = replacement_test_plan("orders-edge-drift").await;
+    let initial_split = SplitPlacementPayload {
+        task_nodes: Some(BTreeMap::from([
+            ("source-0".into(), "node-a".into()),
+            ("sink-0".into(), "node-a".into()),
+        ])),
+        node_data_ports: BTreeMap::from([("node-a".into(), "127.0.0.1:39601".into())]),
+        recovery_required: false,
+        edge_secrets: BTreeMap::from([(("node-a".into(), "node-b".into()), "aa".repeat(32))]),
+    };
+    runtime
+        .start(
+            plan.clone(),
+            assignments.clone(),
+            1,
+            None,
+            false,
+            "node-a",
+            &initial_split,
+        )
+        .await
+        .unwrap();
+    let initial_token = {
+        let tasks = runtime.tasks.lock().await;
+        tasks["orders-edge-drift"].cancellation.clone()
+    };
+
+    // Identical task assignment and identical edge context is a no-op.
+    runtime
+        .start(
+            plan.clone(),
+            assignments.clone(),
+            1,
+            None,
+            false,
+            "node-a",
+            &initial_split,
+        )
+        .await
+        .unwrap();
+    assert!(!initial_token.is_cancelled());
+
+    // Changed peer data port / edge secret at the SAME generation replaces the running kernel.
+    let updated_split = SplitPlacementPayload {
+        task_nodes: initial_split.task_nodes.clone(),
+        node_data_ports: BTreeMap::from([("node-a".into(), "127.0.0.1:39602".into())]),
+        recovery_required: false,
+        edge_secrets: BTreeMap::from([(("node-a".into(), "node-c".into()), "bb".repeat(32))]),
+    };
+    runtime
+        .start(plan, assignments, 1, None, false, "node-a", &updated_split)
+        .await
+        .unwrap();
+    assert!(
+        initial_token.is_cancelled(),
+        "stale kernel must be cancelled and replaced when peer edge context changes"
+    );
+
+    runtime.stop("orders-edge-drift", 1).await.unwrap();
+    let _ = runtime.take_finished().await;
 }

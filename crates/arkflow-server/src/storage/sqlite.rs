@@ -140,6 +140,16 @@ fn row_to_node_credential(row: &Row<'_>) -> rusqlite::Result<NodeCredentialRecor
     })
 }
 
+fn row_to_job_edge_secret(row: &Row<'_>) -> rusqlite::Result<JobEdgeSecretRecord> {
+    Ok(JobEdgeSecretRecord {
+        job_id: row.get(0)?,
+        generation: row.get(1)?,
+        src_node: row.get(2)?,
+        dst_node: row.get(3)?,
+        secret_hex: row.get(4)?,
+    })
+}
+
 fn row_to_session(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         session_hash: row.get(0)?,
@@ -3041,6 +3051,17 @@ impl SqliteBackend {
             CREATE INDEX IF NOT EXISTS cp_node_credentials_node
                 ON cp_node_credentials(node_id);
 
+            CREATE TABLE IF NOT EXISTS cp_job_edge_secrets (
+                job_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                src_node TEXT NOT NULL,
+                dst_node TEXT NOT NULL,
+                secret_hex TEXT NOT NULL,
+                PRIMARY KEY (job_id, generation, src_node, dst_node)
+            );
+            CREATE INDEX IF NOT EXISTS cp_job_edge_secrets_job
+                ON cp_job_edge_secrets(job_id, generation);
+
             CREATE TABLE IF NOT EXISTS cp_sessions (
                 session_hash TEXT PRIMARY KEY,
                 user_id TEXT,
@@ -3757,6 +3778,53 @@ impl SqliteBackend {
                 ],
             )?;
             Ok(true)
+        })
+    }
+
+    pub fn list_job_edge_secrets(&self) -> Result<Vec<JobEdgeSecretRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT job_id, generation, src_node, dst_node, secret_hex FROM cp_job_edge_secrets ORDER BY job_id, generation, src_node, dst_node",
+            )?;
+            let rows = statement.query_map([], row_to_job_edge_secret)?;
+            rows.collect()
+        })
+    }
+
+    pub fn upsert_job_edge_secrets(
+        &self,
+        job_id: &str,
+        generation: u64,
+        records: Vec<JobEdgeSecretRecord>,
+    ) -> Result<(), StorageError> {
+        self.immediate_transaction(|connection| {
+            connection.execute(
+                "DELETE FROM cp_job_edge_secrets WHERE job_id = ?1 AND generation != ?2",
+                rusqlite::params![job_id, generation],
+            )?;
+            for record in records {
+                connection.execute(
+                    "INSERT INTO cp_job_edge_secrets (job_id, generation, src_node, dst_node, secret_hex) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(job_id, generation, src_node, dst_node) DO NOTHING",
+                    rusqlite::params![
+                        record.job_id,
+                        record.generation,
+                        record.src_node,
+                        record.dst_node,
+                        record.secret_hex,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn delete_job_edge_secrets(&self, job_id: &str) -> Result<(), StorageError> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM cp_job_edge_secrets WHERE job_id = ?1",
+                [job_id],
+            )?;
+            Ok(())
         })
     }
 
@@ -4540,6 +4608,20 @@ impl StorageBackend for SqliteBackend {
         revoked_at_ms: u64,
     ) -> Result<bool, StorageError> {
         self.rotate_node_credential(record, previous_credential_id, revoked_at_ms)
+    }
+    async fn list_job_edge_secrets(&self) -> Result<Vec<JobEdgeSecretRecord>, StorageError> {
+        self.list_job_edge_secrets()
+    }
+    async fn upsert_job_edge_secrets(
+        &self,
+        job_id: &str,
+        generation: u64,
+        records: Vec<JobEdgeSecretRecord>,
+    ) -> Result<(), StorageError> {
+        self.upsert_job_edge_secrets(job_id, generation, records)
+    }
+    async fn delete_job_edge_secrets(&self, job_id: &str) -> Result<(), StorageError> {
+        self.delete_job_edge_secrets(job_id)
     }
     async fn get_session(&self, session_hash: &str) -> Result<Option<SessionRecord>, StorageError> {
         self.get_session(session_hash)

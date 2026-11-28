@@ -649,7 +649,7 @@ impl Hub {
         result: CommandResult,
     ) -> Result<HubOperation, HubError> {
         let mut nodes = self.nodes.write().await;
-        let node = nodes.get(&auth.node_id).ok_or(HubError::Unauthorized)?;
+        let node = nodes.get_mut(&auth.node_id).ok_or(HubError::Unauthorized)?;
         if !bool::from(
             auth.session_token
                 .as_bytes()
@@ -658,6 +658,7 @@ impl Hub {
         {
             return Err(HubError::Unauthorized);
         }
+        node.bootstrap_unconfirmed = false;
         // The command lease settles only with a terminal result: the initial
         // acknowledgement and progress reports must leave it leased so the
         // expiry sweep can still time out a command whose node acknowledged

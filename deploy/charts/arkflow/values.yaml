@@ -53,6 +53,12 @@ service:
 
 # Agent-mode settings (ignored in standalone mode).
 agent:
+  # Optional fixed node identity (sets ARKFLOW_NODE_ID). Leave empty to
+  # default to the Pod name via the downward API (metadata.name). When
+  # `persistence.enabled: true` stores an enrolled `arkn_` credential in
+  # `ARKFLOW_NODE_CREDENTIAL_FILE`, keep `agent.nodeId` stable across Pod
+  # replacements because enrolled credentials are bound to their `node_id`.
+  nodeId: ""
   # Data-plane listen port for cross-node shuffle. The engine refuses to
   # serve the data plane without credentials, so also configure the fleet
   # credential material via env/config (see docs/operate/tls-matrix).
@@ -135,8 +141,9 @@ controlPlane:
     agentKeyKey: agent.key
     # Client verification policy on the Hub listener:
     # agent_required (default: /api/v1/agent/* requires client cert, /health & operator APIs stay reachable)
-    # required (every endpoint requires a client cert)
     # none
+    # Note: `required` is rejected during chart rendering because kubelet
+    # HTTPS probes and the Console NGINX proxy do not send client certs.
     clientAuth: agent_required
 
   hub:

@@ -869,6 +869,20 @@ impl NetworkManager {
             }
             None => None,
         };
+        {
+            let mut secrets = self
+                .inbound_edge_secrets
+                .write()
+                .expect("inbound edge secrets lock");
+            match secret_arc {
+                Some(secret) => {
+                    secrets.insert(key.clone(), secret);
+                }
+                None => {
+                    secrets.remove(&key);
+                }
+            }
+        }
         self.inbound
             .write()
             .expect("inbound registry lock")
@@ -876,19 +890,7 @@ impl NetworkManager {
         self.inbound_auth
             .write()
             .expect("inbound auth registry lock")
-            .insert(key.clone(), expectation);
-        let mut secrets = self
-            .inbound_edge_secrets
-            .write()
-            .expect("inbound edge secrets lock");
-        match secret_arc {
-            Some(secret) => {
-                secrets.insert(key, secret);
-            }
-            None => {
-                secrets.remove(&key);
-            }
-        }
+            .insert(key, expectation);
         Ok(())
     }
 
@@ -2224,27 +2226,11 @@ impl NetworkManager {
             EdgeSessionKey::for_job(request.job_id.clone(), request.generation, request.quad);
         let deadline = tokio::time::Instant::now() + self.config.registration_grace;
 
-        // Resolve edge-specific secret if registered; for legacy shared-secret
-        // credentials we verify the handshake MAC BEFORE waiting on `inbound_auth`
-        // and BEFORE claiming the replay nonce so an unauthenticated peer
-        // never pollutes the replay cache or stalls on grace wait. For
-        // Hub-provisioned credentials there is no global fallback secret, so we
-        // first await registration of the edge's authorization + secret within
-        // `registration_grace`, then verify MAC before claiming the nonce.
-        let mut pre_verified_secret: Option<Arc<[u8]>> = None;
-        if !credentials.hub_provisioned {
-            let secret = self
-                .inbound_edge_secrets
-                .read()
-                .expect("inbound edge secrets lock")
-                .get(&session_key)
-                .cloned()
-                .unwrap_or_else(|| credentials.shared_secret.clone());
-            verify_handshake_mac(&secret, &request, b"client")?;
-            self.claim_handshake_nonce(&request.nonce)?;
-            pre_verified_secret = Some(secret);
-        }
-
+        // Wait for the edge's authorization (and any Hub-provisioned per-edge
+        // secret, which is always written before `inbound_auth`) within
+        // `registration_grace`, then verify the handshake MAC against the
+        // selected key BEFORE claiming the replay nonce so neither early
+        // upstream connects nor unauthenticated frames pollute the replay cache.
         loop {
             let expected = {
                 let registry = self
@@ -2261,12 +2247,6 @@ impl NetworkManager {
                         .map(|(_, expected)| expected.clone())
                 })
             };
-            let registered_edge_secret = self
-                .inbound_edge_secrets
-                .read()
-                .expect("inbound edge secrets lock")
-                .get(&session_key)
-                .cloned();
             if let Some(expected) = expected {
                 if expected.source_node != request.source_node
                     || expected.job_id != request.job_id
@@ -2277,29 +2257,24 @@ impl NetworkManager {
                         request.quad
                     )));
                 }
-                let final_secret = match pre_verified_secret {
-                    Some(secret) => {
-                        if let Some(edge_secret) = registered_edge_secret {
-                            if edge_secret.as_ref() != secret.as_ref() {
-                                verify_handshake_mac(&edge_secret, &request, b"client")?;
-                            }
-                            edge_secret
-                        } else {
-                            secret
-                        }
-                    }
+                let registered_edge_secret = self
+                    .inbound_edge_secrets
+                    .read()
+                    .expect("inbound edge secrets lock")
+                    .get(&session_key)
+                    .cloned();
+                let final_secret = match registered_edge_secret {
+                    Some(edge_secret) => edge_secret,
+                    None if !credentials.hub_provisioned => credentials.shared_secret.clone(),
                     None => {
-                        let edge_secret = registered_edge_secret.ok_or_else(|| {
-                            Error::Process(format!(
-                                "remote edge handshake for quad {:?} has no registered per-edge secret",
-                                request.quad
-                            ))
-                        })?;
-                        verify_handshake_mac(&edge_secret, &request, b"client")?;
-                        self.claim_handshake_nonce(&request.nonce)?;
-                        edge_secret
+                        return Err(Error::Process(format!(
+                            "remote edge handshake for quad {:?} has no registered per-edge secret",
+                            request.quad
+                        )));
                     }
                 };
+                verify_handshake_mac(&final_secret, &request, b"client")?;
+                self.claim_handshake_nonce(&request.nonce)?;
                 return Ok((
                     credentials.session_from_secret(
                         request.source_node.clone(),

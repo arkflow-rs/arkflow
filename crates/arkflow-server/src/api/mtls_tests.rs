@@ -410,3 +410,116 @@ async fn hub_mtls_agent_required_allows_operators_enforces_agent_cert_and_san_bi
     cancel_req.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), task_req).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_required_mtls_session_bound_to_san_rejects_uncertified_or_empty_san_requests() {
+    let fixtures = generate_tls_fixtures();
+    let addr = free_addr();
+    let cancel = CancellationToken::new();
+    let hub = Hub::with_storage(
+        HubConfig {
+            operator_token: Some("ops|admin|op-secret".into()),
+            node_token: Some("bootstrap-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 50,
+            session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: default_approval_ttl_ms(),
+        },
+        StorageActor::start(
+            ControlPlaneStore::contract("hub_mtls_bound_session").await,
+            8,
+        ),
+    );
+    let task = tokio::spawn(serve_hub(
+        hub.clone(),
+        ServerConfig {
+            address: addr.clone(),
+            tls_cert: Some(fixtures.hub_cert_path.clone()),
+            tls_key: Some(fixtures.hub_key_path.clone()),
+            tls_ca: Some(fixtures.ca_path.clone()),
+            tls_client_auth: Some("agent_required".into()),
+            ..ServerConfig::default()
+        },
+        cancel.clone(),
+    ));
+    let base_url = format!("https://{addr}");
+
+    let node_a_client = client_with_tls(
+        &fixtures.ca_path,
+        Some((
+            &fixtures.node_a_san_cert_path,
+            &fixtures.node_a_san_key_path,
+        )),
+    );
+    let no_cert_client = client_with_tls(&fixtures.ca_path, None);
+    let empty_san_client = client_with_tls(
+        &fixtures.ca_path,
+        Some((&fixtures.generic_cert_path, &fixtures.generic_key_path)),
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let reg_json: serde_json::Value = loop {
+        match node_a_client
+            .post(format!("{base_url}/api/v1/agent/register"))
+            .json(&serde_json::json!({
+                "node_id": "node-a",
+                "node_token": "bootstrap-secret",
+                "protocol_version": "v1",
+                "capabilities": []
+            }))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status() == reqwest::StatusCode::OK => {
+                break resp.json().await.unwrap();
+            }
+            _ => {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    let session_token = reg_json["session_token"].as_str().unwrap();
+
+    // Matching node-a SAN cert succeeds on post-register heartbeat.
+    let ok_resp = node_a_client
+        .post(format!("{base_url}/api/v1/agent/heartbeat"))
+        .json(&serde_json::json!({
+            "node_id": "node-a",
+            "session_token": session_token,
+            "state": "online",
+            "capabilities": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // Even under tls_client_auth=optional, a session-token holder without a cert MUST be rejected.
+    let no_cert_resp = no_cert_client
+        .post(format!("{base_url}/api/v1/agent/heartbeat"))
+        .json(&serde_json::json!({
+            "node_id": "node-a",
+            "session_token": session_token,
+            "state": "online",
+            "capabilities": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_cert_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // A generic CA-signed cert with empty node SANs MUST also be rejected for the bound session.
+    let empty_san_resp = empty_san_client
+        .get(format!("{base_url}/api/v1/agent/commands?node_id=node-a"))
+        .bearer_auth(session_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty_san_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

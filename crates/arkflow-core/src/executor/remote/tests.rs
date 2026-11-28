@@ -4853,3 +4853,134 @@ async fn data_plane_tls_san_binding_rejects_mismatched_node_uri() {
     manager_b.shutdown();
     upstream_impostor.shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn static_secret_mode_early_handshake_resolves_per_edge_secret_after_registration() {
+    let quad = quad_a_to_b();
+    let downstream = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::new("node-b", "static-shared").unwrap()),
+        registration_grace: std::time::Duration::from_millis(500),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    downstream.spawn();
+    let port = downstream
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let edge_secret = b"per-edge-secret-0123456789abcdef";
+    let upstream = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::hub_provisioned("node-a")),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    upstream.spawn();
+    let edge = upstream
+        .open_edge_deferred_for_job_with_secret(
+            Arc::new(TcpEdgeTransport::plaintext(addr, 1)),
+            quad,
+            "node-b".into(),
+            "job-early-per-edge".into(),
+            1,
+            Some(edge_secret),
+        )
+        .unwrap();
+    let branch = Arc::new(RecordingAck::default());
+    edge.sender
+        .send_async(Envelope::Data(
+            Arc::new(dictionary_batch(None)),
+            branch.clone(),
+        ))
+        .await
+        .unwrap();
+
+    // Register the edge AFTER upstream started connecting & sent its handshake.
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+    downstream
+        .register_inbound_for_session_with_secret(
+            quad,
+            input_tx,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "job-early-per-edge".into(),
+                generation: 1,
+            },
+            Some(edge_secret),
+        )
+        .unwrap();
+
+    let env = next_envelope(&input_rx).await;
+    match env {
+        Envelope::Data(_, ack) => ack.ack().await.unwrap(),
+        _ => panic!("expected Data envelope"),
+    }
+    let ack_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < ack_deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    downstream.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_secret_handshake_rejection_does_not_consume_replay_nonce() {
+    let quad = quad_a_to_b();
+    let downstream = authenticated_manager("node-b", "real-secret");
+    downstream.spawn();
+    let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+    downstream
+        .register_inbound_for_session(
+            quad,
+            input_tx,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "job-nonce-preserve".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+
+    // Prepare valid signed handshake and an invalid-MAC copy sharing its exact nonce.
+    let good_auth = DataPlaneCredentials::new("node-a", "real-secret")
+        .unwrap()
+        .session("node-b", "job-nonce-preserve", 1, quad);
+    let good_req = good_auth.client_handshake().unwrap();
+    let good_bytes = serde_json::to_vec(&good_req).unwrap();
+
+    let mut bad_json = serde_json::to_value(&good_req).unwrap();
+    bad_json["mac"] = serde_json::json!(vec![0u8; 32]);
+    let bad_bytes = serde_json::to_vec(&bad_json).unwrap();
+
+    // Attacker sends invalid MAC with `good_req`'s nonce -> rejected before claiming nonce.
+    let (mut bad_client, bad_server) = tokio::io::duplex(16 * 1024);
+    downstream.accept_stream(Box::new(bad_server));
+    write_frame(&mut bad_client, quad, FrameKind::Handshake, &bad_bytes)
+        .await
+        .unwrap();
+    assert!(read_frame(&mut bad_client).await.is_err());
+
+    // Legitimate client presents `good_req` with the exact same nonce -> succeeds.
+    let (mut good_client, good_server) = tokio::io::duplex(16 * 1024);
+    downstream.accept_stream(Box::new(good_server));
+    write_frame(&mut good_client, quad, FrameKind::Handshake, &good_bytes)
+        .await
+        .unwrap();
+    let (_ack_hdr, ack_bytes) = read_frame(&mut good_client).await.unwrap();
+    let ack: HandshakePayload = serde_json::from_slice(&ack_bytes).unwrap();
+    assert_eq!(ack.source_node, "node-b");
+
+    // Replaying `good_bytes` a second time IS rejected by the replay cache.
+    let (mut replay_client, replay_server) = tokio::io::duplex(16 * 1024);
+    downstream.accept_stream(Box::new(replay_server));
+    write_frame(&mut replay_client, quad, FrameKind::Handshake, &good_bytes)
+        .await
+        .unwrap();
+    assert!(read_frame(&mut replay_client).await.is_err());
+
+    downstream.shutdown();
+}

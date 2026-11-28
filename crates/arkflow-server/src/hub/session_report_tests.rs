@@ -829,6 +829,7 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
             configuration: None,
             credential_id: None,
             cert_node_id: None,
+            bootstrap_unconfirmed: false,
         };
         if reported {
             record.metrics = resource_metrics(used_ratio, cpu);
@@ -2088,20 +2089,45 @@ async fn partial_node_failure_moves_only_the_failed_tasks() {
         .expect("job record");
     hub.reconcile_job(&job_record).await.unwrap();
 
-    // Survivors: no new start command (their assignments are unchanged) and
-    // their successful starts stay satisfied.
-    for node_id in ["node-a", "node-b", "node-d"] {
+    // Unconnected survivor (node-d runs sink-1, fed only by surviving node-a/node-b):
+    // must NOT be re-dispatched when node-c (sink-0) moves to node-e.
+    let commands_d = hub
+        .commands(AgentAuth {
+            node_id: "node-d".into(),
+            session_token: sessions["node-d"].clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !commands_d
+            .iter()
+            .any(|command| command.operation.as_str() == "job_start"),
+        "unconnected survivor node-d must not be re-dispatched"
+    );
+    // Upstream survivors (node-a/node-b run sources feeding replaced sink-0): keep
+    // their exact original tasks and receive refreshed peer ports & edge secrets
+    // for replacement node-e.
+    for node_id in ["node-a", "node-b"] {
         let auth = AgentAuth {
             node_id: node_id.into(),
             session_token: sessions[node_id].clone(),
         };
         let commands = hub.commands(auth).await.unwrap();
-        assert!(
-            !commands
-                .iter()
-                .any(|command| command.operation.as_str() == "job_start"),
-            "survivor {node_id} must not be re-dispatched"
-        );
+        let refreshed = commands
+            .iter()
+            .rfind(|command| command.operation.as_str() == "job_start")
+            .unwrap_or_else(|| {
+                panic!("upstream survivor {node_id} must refresh edge wiring for node-e")
+            });
+        let payload = refreshed.payload.as_ref().unwrap();
+        let task_ids: Vec<String> = payload["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["task_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(task_ids, initial[node_id]);
+        assert_eq!(payload["node_data_ports"]["node-e"], "node-e:9100");
     }
     // The replacement inherits exactly the failed node's task.
     let inherited = poll_start_tasks_and_complete(&hub, "node-e", &sessions["node-e"]).await;
@@ -2754,22 +2780,30 @@ async fn split_l3_pair_stays_pinned_across_incremental_replacement() {
         .expect("job record");
     hub.reconcile_job(&job_record).await.unwrap();
 
-    // The pair moves to the replacement node together; the survivor keeps
-    // its assignment and is not re-dispatched.
+    // The pair moves to the replacement node together.
     let inherited = poll_start_tasks_and_complete(&hub, "node-e", &sessions["node-e"]).await;
     assert_eq!(
         inherited, tasks_a,
         "the replacement node takes over the whole pinned pair"
     );
+    // Connected survivor node-b keeps its exact original task assignment (m-0)
+    // and receives refreshed peer port & edge secrets for replacement node-e.
     let auth_b = AgentAuth {
         node_id: "node-b".into(),
         session_token: sessions["node-b"].clone(),
     };
     let commands = hub.commands(auth_b).await.unwrap();
-    assert!(
-        !commands
-            .iter()
-            .any(|command| command.operation.as_str() == "job_start"),
-        "survivor node-b must not be re-dispatched"
-    );
+    let refreshed = commands
+        .iter()
+        .rfind(|command| command.operation.as_str() == "job_start")
+        .expect("connected survivor node-b must refresh edge wiring for node-e");
+    let payload = refreshed.payload.as_ref().unwrap();
+    let task_ids: Vec<String> = payload["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["task_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(task_ids, tasks_b);
+    assert_eq!(payload["node_data_ports"]["node-e"], "node-e:9100");
 }

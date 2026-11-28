@@ -128,15 +128,25 @@ pub(crate) fn rank_candidates(
 }
 
 impl Hub {
-    /// Deterministic fingerprint of one node's dispatched assignment (the
-    /// sorted task-id set hashed with a fixed-key hasher). Both the
-    /// dispatch-skip gate and the drift fencing compare these; the value is
-    /// process-local and never persisted.
+    /// Deterministic fingerprint of one node's dispatched assignment and its
+    /// edge-local split-placement context (the peer tasks/nodes/data-ports
+    /// directly connected to `node_id` via `plan.spec.edges` and the node's
+    /// touching `edge_secrets`). When a peer node is replaced, connected nodes
+    /// refresh their wiring and secrets while unconnected survivors stay idle.
     fn assignment_fingerprint(
         assignments: &[arkflow_core::job::TaskAttempt],
         node_id: &str,
+        split_context: Option<SplitEdgeFingerprintContext<'_>>,
     ) -> u64 {
         use std::hash::{Hash, Hasher};
+        type LocalEdgeKey<'a> = (
+            &'a str,
+            &'a str,
+            Option<&'a str>,
+            &'a str,
+            &'a str,
+            Option<&'a str>,
+        );
         let mut ids: Vec<&str> = assignments
             .iter()
             .filter(|assignment| assignment.node_id == node_id)
@@ -145,9 +155,69 @@ impl Hub {
         ids.sort_unstable();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         ids.hash(&mut hasher);
+        if let Some(ctx) = split_context {
+            1u8.hash(&mut hasher);
+            let mut local_edges: Vec<LocalEdgeKey<'_>> = Vec::new();
+            for edge in &ctx.plan.spec.edges {
+                for src_task in ctx
+                    .plan
+                    .tasks
+                    .iter()
+                    .filter(|task| task.operator_id == edge.from)
+                {
+                    let Some(src_node) = ctx.task_nodes.get(&src_task.id) else {
+                        continue;
+                    };
+                    for dst_task in ctx
+                        .plan
+                        .tasks
+                        .iter()
+                        .filter(|task| task.operator_id == edge.to)
+                    {
+                        let Some(dst_node) = ctx.task_nodes.get(&dst_task.id) else {
+                            continue;
+                        };
+                        if src_node != dst_node && (src_node == node_id || dst_node == node_id) {
+                            local_edges.push((
+                                src_task.id.as_str(),
+                                src_node.as_str(),
+                                ctx.node_data_ports.get(src_node).map(String::as_str),
+                                dst_task.id.as_str(),
+                                dst_node.as_str(),
+                                ctx.node_data_ports.get(dst_node).map(String::as_str),
+                            ));
+                        }
+                    }
+                }
+            }
+            local_edges.sort_unstable();
+            local_edges.hash(&mut hasher);
+            if let Some(secrets) = ctx.edge_secrets {
+                let node_secrets: Vec<(&str, &str, &str)> = secrets
+                    .iter()
+                    .filter(|((src, dst), _)| src == node_id || dst == node_id)
+                    .map(|((src, dst), secret)| (src.as_str(), dst.as_str(), secret.as_str()))
+                    .collect();
+                node_secrets.hash(&mut hasher);
+            } else {
+                0usize.hash(&mut hasher);
+            }
+        } else {
+            0u8.hash(&mut hasher);
+        }
         hasher.finish()
     }
+}
 
+#[derive(Clone, Copy)]
+struct SplitEdgeFingerprintContext<'a> {
+    plan: &'a arkflow_core::job::JobPlan,
+    task_nodes: &'a BTreeMap<String, String>,
+    node_data_ports: &'a BTreeMap<String, String>,
+    edge_secrets: Option<&'a BTreeMap<(String, String), String>>,
+}
+
+impl Hub {
     /// Reconcile a bounded set of durable Jobs so Agent failures and Hub
     /// recovery converge without waiting for a new lifecycle request.
     /// The retained placement set, in the order its placement was actually
@@ -880,12 +950,20 @@ impl Hub {
         // so each node's graph build can wire its remote edges without any
         // further lookup.
         let mut split_payload = None;
+        let mut split_edge_context: Option<(BTreeMap<String, String>, BTreeMap<String, String>)> =
+            None;
         let mut job_edge_secrets: Option<BTreeMap<(String, String), String>> = None;
         if operation == AgentOperation::JobStop {
             self.job_edge_secrets
                 .write()
                 .await
                 .retain(|(job_id, _), _| job_id != &job.job_id);
+            if let Some(storage) = self.storage.as_ref() {
+                storage
+                    .delete_job_edge_secrets(&job.job_id)
+                    .await
+                    .map_err(HubError::from)?;
+            }
         }
         if spec.placement == arkflow_core::job::PlacementStrategy::Split {
             let nodes = self.nodes.read().await;
@@ -941,27 +1019,54 @@ impl Hub {
                         }
                     }
                 }
-                let mut cache = self.job_edge_secrets.write().await;
-                cache.retain(|(id, gen), _| id != &job.job_id || *gen == job.generation);
-                let secrets_for_gen = cache
-                    .entry((job.job_id.clone(), job.generation))
-                    .or_default();
-                for edge_pair in cross_edges {
-                    secrets_for_gen.entry(edge_pair).or_insert_with(|| {
-                        use rand::TryRngCore;
-                        let mut bytes = [0u8; 32];
-                        rand::rngs::OsRng
-                            .try_fill_bytes(&mut bytes)
-                            .expect("OS RNG cannot fail");
-                        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-                    });
+                let (secrets_for_gen, persisted_records) = {
+                    let mut cache = self.job_edge_secrets.write().await;
+                    cache.retain(|(id, gen), _| id != &job.job_id || *gen == job.generation);
+                    let secrets_for_gen = cache
+                        .entry((job.job_id.clone(), job.generation))
+                        .or_default();
+                    for edge_pair in &cross_edges {
+                        secrets_for_gen.entry(edge_pair.clone()).or_insert_with(|| {
+                            use rand::TryRngCore;
+                            let mut bytes = [0u8; 32];
+                            rand::rngs::OsRng
+                                .try_fill_bytes(&mut bytes)
+                                .expect("OS RNG cannot fail");
+                            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+                        });
+                    }
+                    let records = secrets_for_gen
+                        .iter()
+                        .map(|((src_node, dst_node), secret_hex)| {
+                            crate::storage::JobEdgeSecretRecord {
+                                job_id: job.job_id.clone(),
+                                generation: job.generation,
+                                src_node: src_node.clone(),
+                                dst_node: dst_node.clone(),
+                                secret_hex: secret_hex.clone(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    (secrets_for_gen.clone(), records)
+                };
+                if let Some(storage) = self.storage.as_ref() {
+                    storage
+                        .upsert_job_edge_secrets(&job.job_id, job.generation, persisted_records)
+                        .await
+                        .map_err(HubError::from)?;
                 }
-                job_edge_secrets = Some(secrets_for_gen.clone());
+                job_edge_secrets = Some(
+                    secrets_for_gen
+                        .into_iter()
+                        .filter(|(edge_pair, _)| cross_edges.contains(edge_pair))
+                        .collect(),
+                );
             }
             split_payload = Some(serde_json::json!({
-                "task_nodes": task_nodes,
-                "node_data_ports": node_data_ports,
+                "task_nodes": &task_nodes,
+                "node_data_ports": &node_data_ports,
             }));
+            split_edge_context = Some((task_nodes, node_data_ports));
         }
         // The dispatch order is only real once the target set validated: a
         // reconcile that fails validation above dispatches nothing, and
@@ -998,7 +1103,10 @@ impl Hub {
                         if operation_record.resource_id != job.job_id
                             || operation_record.operation != AgentOperation::JobStart
                             || operation_record.generation != job.generation
-                            || operation_record.state != HubOperationState::Succeeded
+                            || !matches!(
+                                operation_record.state,
+                                HubOperationState::Succeeded | HubOperationState::Queued
+                            )
                         {
                             return false;
                         }
@@ -1015,11 +1123,23 @@ impl Hub {
                         // No recorded fingerprint means the Hub cannot prove
                         // assignment continuity (restart wiped the memory):
                         // re-dispatch rather than trust a stale claim.
+                        let split_fingerprint_context =
+                            split_edge_context
+                                .as_ref()
+                                .map(
+                                    |(task_nodes, node_data_ports)| SplitEdgeFingerprintContext {
+                                        plan: &plan,
+                                        task_nodes,
+                                        node_data_ports,
+                                        edge_secrets: job_edge_secrets.as_ref(),
+                                    },
+                                );
                         recorded.is_none_or(|recorded| {
                             recorded
                                 != Self::assignment_fingerprint(
                                     &assignments,
                                     &operation_record.node_id,
+                                    split_fingerprint_context,
                                 )
                         })
                     })
@@ -1028,6 +1148,19 @@ impl Hub {
             };
             drop(recorded_fingerprints);
             if !abandoned.is_empty() {
+                // Prune any un-polled queued command whose JobStart is being
+                // superseded before locking `operations` (respecting lock
+                // order `nodes -> operations`).
+                {
+                    let mut nodes = self.nodes.write().await;
+                    for record in &abandoned {
+                        if record.state == HubOperationState::Queued {
+                            if let Some(node) = nodes.get_mut(&record.node_id) {
+                                node.commands.retain(|cmd| cmd.operation_id != record.id);
+                            }
+                        }
+                    }
+                }
                 // Apply the in-memory transition under the write lock, then
                 // persist OUTSIDE it: the storage round-trips are async and
                 // holding the operations write lock across them would block
@@ -1152,6 +1285,17 @@ impl Hub {
             // recorded assignment fingerprint to match the computed
             // assignment: a Succeeded start must not suppress a start for a
             // mapping it was never dispatched with.
+            let split_fingerprint_context =
+                split_edge_context
+                    .as_ref()
+                    .map(
+                        |(task_nodes, node_data_ports)| SplitEdgeFingerprintContext {
+                            plan: &plan,
+                            task_nodes,
+                            node_data_ports,
+                            edge_secrets: job_edge_secrets.as_ref(),
+                        },
+                    );
             let fingerprint_matches = operation != AgentOperation::JobStart
                 || self
                     .start_dispatch_fingerprints
@@ -1159,7 +1303,12 @@ impl Hub {
                     .await
                     .get(&(job.job_id.clone(), node_id.clone(), job.generation))
                     .is_some_and(|recorded| {
-                        *recorded == Self::assignment_fingerprint(&assignments, node_id.as_str())
+                        *recorded
+                            == Self::assignment_fingerprint(
+                                &assignments,
+                                node_id.as_str(),
+                                split_fingerprint_context,
+                            )
                     });
             let already_terminal = fingerprint_matches
                 && self
@@ -1227,7 +1376,11 @@ impl Hub {
             let fingerprint = if operation == AgentOperation::JobStart {
                 Some((
                     node_id.clone(),
-                    Self::assignment_fingerprint(&assignments, node_id.as_str()),
+                    Self::assignment_fingerprint(
+                        &assignments,
+                        node_id.as_str(),
+                        split_fingerprint_context,
+                    ),
                 ))
             } else {
                 None

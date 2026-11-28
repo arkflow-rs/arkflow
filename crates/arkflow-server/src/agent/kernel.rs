@@ -64,6 +64,7 @@ pub(super) struct JobTask {
     pub(super) recovery_required: bool,
     pub(super) cancellation: CancellationToken,
     pub(super) assignments: Vec<TaskAttempt>,
+    pub(super) edge_context_fingerprint: u64,
     /// Dedicated bounded runtime for Jobs declaring `resources.cpu_millicores`
     /// (worker threads = ceil(millicores/1000), min 1): one Job cannot occupy
     /// the shared runtime's workers. Shut down (detached, bounded) when the
@@ -77,6 +78,15 @@ pub(super) struct JobTask {
     pub(super) kernel:
         Option<std::sync::Arc<arkflow_core::executor::kernel_handle::KernelJobHandle>>,
     pub(super) handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
+}
+
+fn edge_context_fingerprint(split: &SplitPlacementPayload) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    split.task_nodes.hash(&mut hasher);
+    split.node_data_ports.hash(&mut hasher);
+    split.edge_secrets.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Drop for JobTask {
@@ -267,6 +277,7 @@ impl JobRuntime {
             });
         let recovery_required = split.recovery_required;
         let local_recovery_marker = durable_recovery_marker(&plan, node_id, generation);
+        let incoming_edge_context = edge_context_fingerprint(split);
         let (existing, previous_exited_on_its_own) = {
             let tasks = self.tasks.lock().await;
             if tasks
@@ -298,7 +309,8 @@ impl JobRuntime {
                     .iter()
                     .map(|assignment| assignment.task_id.clone())
                     .collect::<BTreeSet<_>>()
-                    == incoming_task_ids;
+                    == incoming_task_ids
+                    && task.edge_context_fingerprint == incoming_edge_context;
                 if alive && same_assignment {
                     return Ok(());
                 }
@@ -542,6 +554,7 @@ impl JobRuntime {
                 recovery_required,
                 cancellation: cancellation.clone(),
                 assignments: assignments.clone(),
+                edge_context_fingerprint: incoming_edge_context,
                 dedicated_runtime: None,
                 watermark_partitions: watermark_partitions.clone(),
                 state: state.clone(),
@@ -679,6 +692,7 @@ impl JobRuntime {
                         recovery_required,
                         cancellation: cancellation.clone(),
                         assignments,
+                        edge_context_fingerprint: incoming_edge_context,
                         dedicated_runtime: dedicated_runtime.clone(),
                         watermark_partitions,
                         state,

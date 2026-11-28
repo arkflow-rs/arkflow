@@ -38,6 +38,16 @@ fn row_to_node_credential_pg(row: &Row<'_>) -> Result<NodeCredentialRecord, Stor
     })
 }
 
+fn row_to_job_edge_secret_pg(row: &Row<'_>) -> Result<JobEdgeSecretRecord, StorageError> {
+    Ok(JobEdgeSecretRecord {
+        job_id: row.get(0)?,
+        generation: row.get(1)?,
+        src_node: row.get(2)?,
+        dst_node: row.get(3)?,
+        secret_hex: row.get(4)?,
+    })
+}
+
 fn row_to_session_pg(row: &Row<'_>) -> Result<SessionRecord, StorageError> {
     Ok(SessionRecord {
         session_hash: row.get(0)?,
@@ -3155,6 +3165,76 @@ impl StorageBackend for PostgresBackend {
                 .await?;
             Ok(true)
         }.await;
+        if __ret.is_err() {
+            drop(transaction);
+            return __ret;
+        }
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn list_job_edge_secrets(&self) -> Result<Vec<JobEdgeSecretRecord>, StorageError> {
+        let mut connection = self.lease().await?;
+        connection
+            .query_all(
+                &q("SELECT job_id, generation, src_node, dst_node, secret_hex FROM cp_job_edge_secrets ORDER BY job_id, generation, src_node, dst_node"),
+                &[],
+                row_to_job_edge_secret_pg,
+            )
+            .await
+    }
+
+    async fn upsert_job_edge_secrets(
+        &self,
+        job_id: &str,
+        generation: u64,
+        records: Vec<JobEdgeSecretRecord>,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            transaction
+                .execute(
+                    &q("DELETE FROM cp_job_edge_secrets WHERE job_id = ?1 AND generation != ?2"),
+                    binds![job_id, generation],
+                )
+                .await?;
+            for record in records {
+                transaction
+                    .execute(
+                        &q("INSERT INTO cp_job_edge_secrets (job_id, generation, src_node, dst_node, secret_hex) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(job_id, generation, src_node, dst_node) DO NOTHING"),
+                        binds![
+                            record.job_id,
+                            record.generation,
+                            record.src_node,
+                            record.dst_node,
+                            record.secret_hex,
+                        ],
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if __ret.is_err() {
+            drop(transaction);
+            return __ret;
+        }
+        transaction.commit().await?;
+        __ret
+    }
+
+    async fn delete_job_edge_secrets(&self, job_id: &str) -> Result<(), StorageError> {
+        let mut transaction = self.begin().await?;
+        let __ret = async {
+            transaction
+                .execute(
+                    &q("DELETE FROM cp_job_edge_secrets WHERE job_id = ?1"),
+                    binds![job_id],
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
         if __ret.is_err() {
             drop(transaction);
             return __ret;

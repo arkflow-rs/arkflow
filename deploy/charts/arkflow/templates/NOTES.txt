@@ -13,9 +13,13 @@ Control plane rendered:
            on the fleet identity).
 {{- if .Values.controlPlane.tls.enabled }}
   mTLS:    ENABLED (policy: {{ default "agent_required" .Values.controlPlane.tls.clientAuth }};
-           Secret {{ include "arkflow.cpTlsSecretName" . }}). Hub serves https:// and
-           agents mount client + data-plane certificates. Set
-           controlPlane.tls.enabled=false to fall back to plaintext HTTP.
+           Secret {{ include "arkflow.cpTlsSecretName" . }}). Hub serves https://,
+           Console verifies Hub TLS against the Fleet CA, and agents mount
+           client + data-plane certificates. Generated leaf certs expire after
+           365 days and are preserved across upgrades; use cert-manager via
+           controlPlane.tls.existingSecret or rotate the kept Secret and
+           restart pods before expiry. Set controlPlane.tls.enabled=false to
+           fall back to plaintext HTTP.
 {{- else }}
   mTLS:    DISABLED (controlPlane.tls.enabled=false — Hub serves plaintext HTTP).
 {{- end }}
@@ -39,10 +43,12 @@ Verify:
 {{- else if eq .Values.mode "agent" }}
 
 Agent node identity defaults to the pod name (ARKFLOW_NODE_ID from the
-downward API) when your config does not set health_check.node_id.
-Supply the registration credential as an env Secret (and enable persistence or
-set ARKFLOW_NODE_CREDENTIAL_FILE so enrolled per-node `arkn_` credentials
-survive pod restarts):
+downward API) when your config does not set health_check.node_id and
+`agent.nodeId` is empty. Supply the registration credential as an env Secret (and
+enable persistence or set ARKFLOW_NODE_CREDENTIAL_FILE so enrolled per-node
+`arkn_` credentials survive pod restarts — keep `agent.nodeId` stable or use a
+StatefulSet when retaining `node_credential` across Pod replacements, as `arkn_`
+credentials are bound to their original node_id):
 
     env:
       - name: ARKFLOW_NODE_TOKEN

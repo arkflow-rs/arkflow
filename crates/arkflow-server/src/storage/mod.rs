@@ -548,6 +548,17 @@ pub struct NodeCredentialRecord {
     pub revoked_at_ms: Option<u64>,
 }
 
+/// Durable per-(job, generation, src_node, dst_node) data-plane shuffle secret
+/// (`cp_job_edge_secrets`) so Hub restarts preserve active edge keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobEdgeSecretRecord {
+    pub job_id: String,
+    pub generation: u64,
+    pub src_node: String,
+    pub dst_node: String,
+    pub secret_hex: String,
+}
+
 /// A persisted browser session (`cp_sessions`): the cookie carries the random
 /// session id, the row carries its hash plus the principal snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1067,6 +1078,15 @@ storage_ops! {
         record: NodeCredentialRecord as v,
         previous_credential_id: String as s,
         revoked_at_ms: u64 as v,
+    },
+    ("list_job_edge_secrets", ListJobEdgeSecrets, list_job_edge_secrets) plain Vec<JobEdgeSecretRecord> {},
+    ("upsert_job_edge_secrets", UpsertJobEdgeSecrets, upsert_job_edge_secrets) fenced () {
+        job_id: String as s,
+        generation: u64 as v,
+        records: Vec<JobEdgeSecretRecord> as v,
+    },
+    ("delete_job_edge_secrets", DeleteJobEdgeSecrets, delete_job_edge_secrets) fenced () {
+        job_id: String as s,
     },
     ("get_session", GetSession, get_session) plain Option<SessionRecord> {
         session_hash: String as s,
@@ -1867,6 +1887,14 @@ pub trait StorageBackend: Send + Sync + 'static {
         previous_credential_id: &str,
         revoked_at_ms: u64,
     ) -> Result<bool, StorageError>;
+    async fn list_job_edge_secrets(&self) -> Result<Vec<JobEdgeSecretRecord>, StorageError>;
+    async fn upsert_job_edge_secrets(
+        &self,
+        job_id: &str,
+        generation: u64,
+        records: Vec<JobEdgeSecretRecord>,
+    ) -> Result<(), StorageError>;
+    async fn delete_job_edge_secrets(&self, job_id: &str) -> Result<(), StorageError>;
     async fn get_session(&self, session_hash: &str) -> Result<Option<SessionRecord>, StorageError>;
     async fn upsert_session(&self, record: SessionRecord) -> Result<bool, StorageError>;
     async fn delete_session(&self, session_hash: &str) -> Result<bool, StorageError>;
@@ -3303,6 +3331,35 @@ impl StorageBackend for ControlPlaneStore {
                     revoked_at_ms,
                 )
                 .await
+            }
+        }
+    }
+    async fn list_job_edge_secrets(&self) -> Result<Vec<JobEdgeSecretRecord>, StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::list_job_edge_secrets(backend).await,
+            Self::Postgres(backend) => StorageBackend::list_job_edge_secrets(backend).await,
+        }
+    }
+    async fn upsert_job_edge_secrets(
+        &self,
+        job_id: &str,
+        generation: u64,
+        records: Vec<JobEdgeSecretRecord>,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(backend) => {
+                StorageBackend::upsert_job_edge_secrets(backend, job_id, generation, records).await
+            }
+            Self::Postgres(backend) => {
+                StorageBackend::upsert_job_edge_secrets(backend, job_id, generation, records).await
+            }
+        }
+    }
+    async fn delete_job_edge_secrets(&self, job_id: &str) -> Result<(), StorageError> {
+        match self {
+            Self::Sqlite(backend) => StorageBackend::delete_job_edge_secrets(backend, job_id).await,
+            Self::Postgres(backend) => {
+                StorageBackend::delete_job_edge_secrets(backend, job_id).await
             }
         }
     }
@@ -8318,5 +8375,50 @@ mod job_storage_tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn sqlite_job_edge_secrets_roundtrip_and_table_order() {
+        let backend = SqliteBackend::in_memory().unwrap();
+        let rec1 = JobEdgeSecretRecord {
+            job_id: "job-1".into(),
+            generation: 1,
+            src_node: "node-a".into(),
+            dst_node: "node-b".into(),
+            secret_hex: "aa".repeat(32),
+        };
+        backend
+            .upsert_job_edge_secrets("job-1", 1, vec![rec1.clone()])
+            .unwrap();
+        // Re-upserting same generation preserves existing edge secret (DO NOTHING).
+        let rec1_different = JobEdgeSecretRecord {
+            secret_hex: "bb".repeat(32),
+            ..rec1.clone()
+        };
+        backend
+            .upsert_job_edge_secrets("job-1", 1, vec![rec1_different])
+            .unwrap();
+        let listed = backend.list_job_edge_secrets().unwrap();
+        assert_eq!(listed, vec![rec1.clone()]);
+
+        assert!(super::table_copier::TABLE_ORDER.contains(&"cp_job_edge_secrets"));
+        let (_cols, rows) =
+            super::table_copier::read_sqlite_table_ordered(&backend, "cp_job_edge_secrets")
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Generation advancement replaces prior generation rows.
+        let rec2 = JobEdgeSecretRecord {
+            generation: 2,
+            secret_hex: "cc".repeat(32),
+            ..rec1
+        };
+        backend
+            .upsert_job_edge_secrets("job-1", 2, vec![rec2.clone()])
+            .unwrap();
+        assert_eq!(backend.list_job_edge_secrets().unwrap(), vec![rec2]);
+
+        backend.delete_job_edge_secrets("job-1").unwrap();
+        assert!(backend.list_job_edge_secrets().unwrap().is_empty());
     }
 }

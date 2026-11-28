@@ -113,12 +113,19 @@ env:
         key: node_token
 ```
 
-- Node identity defaults to the pod name via the downward API; the engine
-  reads `ARKFLOW_NODE_ID` natively when the config sets no `node_id`.
+- Node identity defaults to the pod name via the downward API when `config`
+  sets no `node_id` and `agent.nodeId` is empty, or set `agent.nodeId` to pin a
+  fixed `ARKFLOW_NODE_ID`.
 - Supply the bootstrap credential via `ARKFLOW_NODE_TOKEN` from a Secret, and
   enable `persistence.enabled: true` so the chart wires
   `ARKFLOW_NODE_CREDENTIAL_FILE` (`/app/data/node_credential`) and retains the
-  Hub-enrolled `arkn_` credential across restarts.
+  Hub-enrolled `arkn_` credential across restarts. Because enrolled `arkn_`
+  credentials stay bound to their original `node_id`, pairing persistence with a
+  mutable Deployment Pod name across Pod replacements causes
+  `node_identity_mismatch`; use `agent.nodeId` (for a single fixed node), deploy
+  as a `StatefulSet` for stable Pod names, or delete the stale
+  `node_credential` file before starting a new `node_id` (while bootstrap is
+  enabled).
 - Set `agent.tls.existingSecret` (`ca.crt`, `tls.crt`, `tls.key`) to mount CA
   and client/data-plane certificates for Hub mTLS (`ARKFLOW_AGENT_TLS_*`) and
   cross-node shuffle (`ARKFLOW_DATA_PLANE_TLS_*`). Without TLS or a data-plane
@@ -170,13 +177,20 @@ Storage, mTLS, and availability contract:
   [control-plane deployment](./control-plane/deploy.md) page.
 - **mTLS enabled by default (`controlPlane.tls.enabled: true`)**: on first
   install the chart generates and keeps (`helm.sh/resource-policy: keep`) a
-  Fleet CA, Hub server cert, and Agent client/data-plane cert in
+  Fleet CA (10-year lifetime), Hub server cert, and Agent client/data-plane
+  cert (365-day leaf lifetime, reused while the Secret exists) in
   `<release>-tls` (or point `controlPlane.tls.existingSecret` at your own),
   configures Hub `ARKFLOW_HUB_TLS_{CA,CERT,KEY}` +
-  `ARKFLOW_HUB_TLS_CLIENT_AUTH=agent_required` with `HTTPS` probes, switches
-  `ARKFLOW_HUB_UPSTREAM` on the Console to `https://`, and wires both
-  `ARKFLOW_AGENT_TLS_*` and `ARKFLOW_DATA_PLANE_TLS_*` onto the in-chart Agent.
-  Set `controlPlane.tls.enabled=false` (and use `http://` in `hub_urls`) to opt
+  `ARKFLOW_HUB_TLS_CLIENT_AUTH=agent_required` with `HTTPS` probes (note:
+  `clientAuth=required` is rejected during chart rendering because kubelet HTTPS
+  probes and the Console proxy do not present client certificates), switches
+  `ARKFLOW_HUB_UPSTREAM` on the Console to `https://` with `proxy_ssl_verify on`
+  against the mounted Fleet CA, and mounts only CA + Agent client/data-plane
+  keys (`hub.key` excluded) onto the in-chart Agent. For long-lived clusters,
+  supply rotating certificates (e.g. `cert-manager`) via
+  `controlPlane.tls.existingSecret` or delete/rotate `<release>-tls` and
+  restart pods before the 365-day leaf expiry. Set
+  `controlPlane.tls.enabled=false` (and use `http://` in `hub_urls`) to opt
   out to plaintext HTTP.
 
 The shared bootstrap credential feeds `ARKFLOW_NODE_TOKEN` on both the Hub and
@@ -186,9 +200,9 @@ points at your own.
 
 The Console resolves its proxy target at container start from
 `ARKFLOW_HUB_UPSTREAM` — the chart sets it to `https://<release>-hub:8080`
-(or `http://` when TLS is disabled), and the image default
-(`http://arkflow-hub:8080`) preserves standalone-console behavior outside the
-chart.
+(with `ARKFLOW_HUB_PROXY_SSL` enabling CA verification) or `http://` when TLS
+is disabled, and the image defaults (`http://arkflow-hub:8080`, empty
+`ARKFLOW_HUB_PROXY_SSL`) preserve standalone-console behavior outside the chart.
 
 ## Roadmap
 

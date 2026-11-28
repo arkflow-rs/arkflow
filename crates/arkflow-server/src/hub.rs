@@ -122,6 +122,10 @@ pub(crate) struct NodeRecord {
     /// Verified client certificate node identity (`urn:arkflow:node:<id>`),
     /// if presented at registration.
     cert_node_id: Option<String>,
+    /// True after a `"bootstrap_enroll"` registration until the agent proves
+    /// receipt of its minted credential via `heartbeat`/`report`/`commands`/
+    /// `command_result`/`report_job_observation` or a subsequent `arkn_` register.
+    bootstrap_unconfirmed: bool,
     boot_id: Option<String>,
     report_seq: u64,
     commands: VecDeque<AgentCommand>,

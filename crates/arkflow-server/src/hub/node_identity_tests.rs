@@ -4,7 +4,7 @@
 
 use super::{
     default_approval_ttl_ms, default_session_ttl_ms, nodes::MAX_CREDENTIALS_PER_NODE, Hub,
-    HubConfig, HubError, RegisterRequest, SUPPORTED_PROTOCOL_VERSION,
+    HubConfig, HubError, RegisterRequest, MAX_NODES, SUPPORTED_PROTOCOL_VERSION,
 };
 use crate::api::{hub_router, ServerConfig};
 use crate::hub::{AgentAuth, CommandResult, HeartbeatRequest, HubOperationState};
@@ -628,4 +628,521 @@ async fn split_job_start_distributes_filtered_cached_edge_secrets_and_evicts_on_
         .await
         .keys()
         .any(|(job_id, _)| job_id == "edge-secret-job"));
+}
+
+#[tokio::test]
+async fn revoking_last_credential_does_not_reopen_shared_bootstrap() {
+    let hub = durable_hub("revoke_no_reenroll").await;
+    let first = hub
+        .register(RegisterRequest {
+            node_id: "node-revoked".into(),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            data_address: None,
+            boot_id: Some("boot-1".into()),
+        })
+        .await
+        .unwrap();
+    let creds = hub.list_node_credentials("node-revoked").await.unwrap();
+    assert_eq!(creds.len(), 1);
+
+    assert!(hub
+        .revoke_node_credential(&creds[0].credential_id, "admin")
+        .await
+        .unwrap());
+
+    // Even with zero active credentials remaining, shared node_token cannot re-enroll
+    // this node_id unless explicit break-glass is enabled.
+    let err = hub
+        .register(RegisterRequest {
+            node_id: "node-revoked".into(),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            data_address: None,
+            boot_id: Some("boot-2".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::Unauthorized), "{err:?}");
+
+    // The minted credential itself is also rejected.
+    let err_cred = hub
+        .register(RegisterRequest {
+            node_id: "node-revoked".into(),
+            node_token: first.node_credential.unwrap(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            data_address: None,
+            boot_id: Some("boot-2".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err_cred, HubError::Unauthorized), "{err_cred:?}");
+}
+
+#[tokio::test]
+async fn same_boot_unconfirmed_bootstrap_retry_recovers_until_authenticated_call() {
+    let hub = durable_hub("same_boot_unconfirmed_retry").await;
+    let first = hub
+        .register(RegisterRequest {
+            node_id: "node-flaky".into(),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            data_address: None,
+            boot_id: Some("boot-same".into()),
+        })
+        .await
+        .unwrap();
+    let first_cred = first.node_credential.unwrap();
+
+    // Retry with shared node_token and the SAME boot_id before making any authenticated call:
+    // recovers by rotating the single unconfirmed bootstrap credential.
+    let retried = hub
+        .register(RegisterRequest {
+            node_id: "node-flaky".into(),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            data_address: None,
+            boot_id: Some("boot-same".into()),
+        })
+        .await
+        .unwrap();
+    let second_cred = retried.node_credential.unwrap();
+    assert_ne!(second_cred, first_cred);
+
+    // Confirm receipt by sending an authenticated heartbeat.
+    hub.heartbeat(HeartbeatRequest {
+        auth: AgentAuth {
+            node_id: "node-flaky".into(),
+            session_token: retried.session_token,
+        },
+        state: "online".into(),
+        protocol_version: Some(SUPPORTED_PROTOCOL_VERSION.into()),
+        software_version: None,
+        capabilities: vec![],
+        rollout_id: None,
+    })
+    .await
+    .unwrap();
+
+    // Once confirmed, even the same boot_id can no longer re-enroll via shared node_token.
+    let err = hub
+        .register(RegisterRequest {
+            node_id: "node-flaky".into(),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            data_address: None,
+            boot_id: Some("boot-same".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::Unauthorized), "{err:?}");
+
+    // The replacement credential still authenticates cleanly.
+    hub.register(RegisterRequest {
+        node_id: "node-flaky".into(),
+        node_token: second_cred,
+        protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+        capabilities: vec![],
+        data_address: None,
+        boot_id: Some("boot-same".into()),
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn full_node_registry_rejects_before_minting_bootstrap_credential() {
+    let hub = durable_hub("capacity_before_mint").await;
+    for i in 0..MAX_NODES {
+        hub.register(RegisterRequest {
+            node_id: format!("node-cap-{i}"),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            data_address: None,
+            boot_id: Some(format!("boot-{i}")),
+        })
+        .await
+        .unwrap();
+    }
+
+    let err = hub
+        .register(RegisterRequest {
+            node_id: "node-overflow".into(),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![],
+            data_address: None,
+            boot_id: Some("boot-overflow".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::Capacity), "{err:?}");
+    assert!(
+        hub.list_node_credentials("node-overflow")
+            .await
+            .unwrap()
+            .is_empty(),
+        "capacity rejection must happen before minting a bootstrap credential"
+    );
+}
+
+#[tokio::test]
+async fn edge_secrets_persist_across_hub_restart_and_refresh_upstream_on_downstream_replacement() {
+    let store = ControlPlaneStore::contract("edge_secret_restart_and_replace").await;
+    let storage = StorageActor::start(store, 8);
+    let hub = Hub::with_storage(hub_config(), storage.clone());
+
+    let reg_a = hub
+        .register(RegisterRequest {
+            data_address: Some("127.0.0.1:19200".into()),
+            node_id: "node-a".into(),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![
+                "job_runtime".into(),
+                "state_backend".into(),
+                "network_shuffle".into(),
+            ],
+            boot_id: Some("boot-a".into()),
+        })
+        .await
+        .unwrap();
+    let reg_b = hub
+        .register(RegisterRequest {
+            data_address: Some("127.0.0.1:19201".into()),
+            node_id: "node-b".into(),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![
+                "job_runtime".into(),
+                "state_backend".into(),
+                "network_shuffle".into(),
+            ],
+            boot_id: Some("boot-b".into()),
+        })
+        .await
+        .unwrap();
+
+    let spec = serde_json::json!({
+        "id": "persist-replace-job",
+        "version": 1,
+        "placement": "split",
+        "parallelism": 1,
+        "operators": [
+            {"id": "source", "kind": "source"},
+            {"id": "sink", "kind": "sink"}
+        ],
+        "edges": [
+            {"id": "e1", "from": "source", "to": "sink"}
+        ],
+        "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+        "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+    });
+    // Pin node-a/node-b initially so post-restart single-node registration waits
+    // cleanly for both peers instead of collapsing to single-node colocated mode.
+    hub.upsert_job(crate::storage::JobRecord {
+        job_id: "persist-replace-job".into(),
+        version: 1,
+        spec_json: spec.to_string(),
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec!["node-a".into(), "node-b".into()],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
+    })
+    .await
+    .unwrap();
+
+    let cmds_a = hub
+        .commands(AgentAuth {
+            node_id: "node-a".into(),
+            session_token: reg_a.session_token.clone(),
+        })
+        .await
+        .unwrap();
+    let start_a = cmds_a
+        .iter()
+        .find(|c| c.operation.as_str() == "job_start")
+        .unwrap();
+    let secret_ab = start_a.payload.as_ref().unwrap()["edge_secrets"][0]["secret"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cmds_b = hub
+        .commands(AgentAuth {
+            node_id: "node-b".into(),
+            session_token: reg_b.session_token.clone(),
+        })
+        .await
+        .unwrap();
+    let start_b = cmds_b
+        .iter()
+        .find(|c| c.operation.as_str() == "job_start")
+        .unwrap();
+    for (auth, start) in [
+        (
+            AgentAuth {
+                node_id: "node-a".into(),
+                session_token: reg_a.session_token.clone(),
+            },
+            start_a,
+        ),
+        (
+            AgentAuth {
+                node_id: "node-b".into(),
+                session_token: reg_b.session_token.clone(),
+            },
+            start_b,
+        ),
+    ] {
+        hub.command_result(
+            auth,
+            CommandResult {
+                command_id: start.id.clone(),
+                operation_id: start.operation_id.clone(),
+                state: HubOperationState::Succeeded,
+                progress: 100,
+                error: None,
+                correlation_id: start.correlation_id.clone(),
+                generation: start.generation,
+                observed_generation: Some(1),
+                action_id: None,
+                failure_class: None,
+                config_version_id: None,
+                rollout_id: None,
+                observed_checkpoint_id: None,
+                checkpoint_manifest_uri: None,
+                result: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // Simulate Hub restart from the same storage: recovered Hub reloads cp_job_edge_secrets.
+    let restarted_hub = Hub::with_storage(hub_config(), storage);
+    restarted_hub.recover_persisted_state().await.unwrap();
+    let persisted_edge_secret = restarted_hub
+        .job_edge_secrets
+        .read()
+        .await
+        .get(&("persist-replace-job".into(), 1))
+        .and_then(|edges| {
+            edges
+                .get(&("node-a".into(), "node-b".into()))
+                .or_else(|| edges.get(&("node-b".into(), "node-a".into())))
+        })
+        .cloned();
+    assert_eq!(persisted_edge_secret.as_deref(), Some(secret_ab.as_str()));
+
+    // Register node-a and node-b on the restarted Hub: once both are online, the
+    // Hub re-serves the EXACT persisted `secret_ab` from `cp_job_edge_secrets`.
+    let reg_a2 = restarted_hub
+        .register(RegisterRequest {
+            data_address: Some("127.0.0.1:19200".into()),
+            node_id: "node-a".into(),
+            node_token: reg_a.node_credential.unwrap(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![
+                "job_runtime".into(),
+                "state_backend".into(),
+                "network_shuffle".into(),
+            ],
+            boot_id: Some("boot-a".into()),
+        })
+        .await
+        .unwrap();
+    let reg_b2 = restarted_hub
+        .register(RegisterRequest {
+            data_address: Some("127.0.0.1:19201".into()),
+            node_id: "node-b".into(),
+            node_token: reg_b.node_credential.unwrap(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![
+                "job_runtime".into(),
+                "state_backend".into(),
+                "network_shuffle".into(),
+            ],
+            boot_id: Some("boot-b".into()),
+        })
+        .await
+        .unwrap();
+    let restarted_cmds_a = restarted_hub
+        .commands(AgentAuth {
+            node_id: "node-a".into(),
+            session_token: reg_a2.session_token.clone(),
+        })
+        .await
+        .unwrap();
+    let restarted_start_a = restarted_cmds_a
+        .iter()
+        .rfind(|c| c.operation.as_str() == "job_start")
+        .unwrap();
+    assert_eq!(
+        restarted_start_a.payload.as_ref().unwrap()["edge_secrets"][0]["secret"],
+        secret_ab
+    );
+    let restarted_cmds_b = restarted_hub
+        .commands(AgentAuth {
+            node_id: "node-b".into(),
+            session_token: reg_b2.session_token.clone(),
+        })
+        .await
+        .unwrap();
+    let restarted_start_b = restarted_cmds_b
+        .iter()
+        .rfind(|c| c.operation.as_str() == "job_start")
+        .unwrap();
+    assert_eq!(
+        restarted_start_b.payload.as_ref().unwrap()["edge_secrets"][0]["secret"],
+        secret_ab
+    );
+
+    // Next, verify unpinned incremental replacement refreshes upstream node-a
+    // with replacement node-c's data port and fresh per-edge secret.
+    restarted_hub
+        .upsert_job(crate::storage::JobRecord {
+            job_id: "replace-unpinned-job".into(),
+            version: 1,
+            spec_json: serde_json::json!({
+                "id": "replace-unpinned-job",
+                "version": 1,
+                "placement": "split",
+                "parallelism": 1,
+                "operators": [
+                    {"id": "source", "kind": "source"},
+                    {"id": "sink", "kind": "sink"}
+                ],
+                "edges": [
+                    {"id": "e1", "from": "source", "to": "sink"}
+                ],
+                "sources": [{"operator_id": "source", "input_type": "memory", "time": {"mode": "processing_time"}}],
+                "sinks": [{"operator_id": "sink", "output_type": "drop"}]
+            })
+            .to_string(),
+            desired_state: "running".into(),
+            observed_state: "validated".into(),
+            convergence: "pending".into(),
+            generation: 1,
+            node_ids: Vec::new(),
+            checkpoint_id: None,
+            last_error: None,
+            updated_at_ms: 0,
+            pause_phase: None,
+            pause_artifact_id: None,
+            pause_prev_checkpoint_id: None,
+            pause_retry_count: 0,
+            paused_at_ms: None,
+            paused_by: None,
+        })
+        .await
+        .unwrap();
+    for (nid, tok) in [
+        ("node-a", &reg_a2.session_token),
+        ("node-b", &reg_b2.session_token),
+    ] {
+        let cmds = restarted_hub
+            .commands(AgentAuth {
+                node_id: nid.into(),
+                session_token: tok.clone(),
+            })
+            .await
+            .unwrap();
+        let st = cmds
+            .iter()
+            .rfind(|c| {
+                c.operation.as_str() == "job_start" && c.resource_id == "replace-unpinned-job"
+            })
+            .unwrap();
+        restarted_hub
+            .command_result(
+                AgentAuth {
+                    node_id: nid.into(),
+                    session_token: tok.clone(),
+                },
+                CommandResult {
+                    command_id: st.id.clone(),
+                    operation_id: st.operation_id.clone(),
+                    state: HubOperationState::Succeeded,
+                    progress: 100,
+                    error: None,
+                    correlation_id: st.correlation_id.clone(),
+                    generation: st.generation,
+                    observed_generation: Some(1),
+                    action_id: None,
+                    failure_class: None,
+                    config_version_id: None,
+                    rollout_id: None,
+                    observed_checkpoint_id: None,
+                    checkpoint_manifest_uri: None,
+                    result: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let _reg_c = restarted_hub
+        .register(RegisterRequest {
+            data_address: Some("127.0.0.1:19202".into()),
+            node_id: "node-c".into(),
+            node_token: "shared-bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![
+                "job_runtime".into(),
+                "state_backend".into(),
+                "network_shuffle".into(),
+            ],
+            boot_id: Some("boot-c".into()),
+        })
+        .await
+        .unwrap();
+    restarted_hub
+        .nodes
+        .write()
+        .await
+        .get_mut("node-b")
+        .unwrap()
+        .resource
+        .maintenance_state = arkflow_core::control::NodeMaintenanceState::Maintenance;
+    restarted_hub.reconcile_jobs().await.unwrap();
+
+    let refreshed_cmds_a = restarted_hub
+        .commands(AgentAuth {
+            node_id: "node-a".into(),
+            session_token: reg_a2.session_token,
+        })
+        .await
+        .unwrap();
+    let refreshed_start = refreshed_cmds_a
+        .iter()
+        .rfind(|c| c.operation.as_str() == "job_start" && c.resource_id == "replace-unpinned-job")
+        .expect(
+            "upstream node-a must be re-dispatched when downstream node-b is replaced by node-c",
+        );
+    let payload = refreshed_start.payload.as_ref().unwrap();
+    assert_eq!(payload["node_data_ports"]["node-c"], "127.0.0.1:19202");
+    let secrets = payload["edge_secrets"].as_array().unwrap();
+    assert!(
+        secrets
+            .iter()
+            .any(|s| s["dst"] == "node-c" || s["src"] == "node-c"),
+        "refreshed job_start must carry edge secret for node-c: {payload}"
+    );
 }

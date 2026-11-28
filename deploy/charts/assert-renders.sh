@@ -51,11 +51,25 @@ assert_contains "$TMP/cp.yaml" "value: \"agent_required\"" "cp: default agent_re
 assert_contains "$TMP/cp.yaml" "scheme: HTTPS" "cp: hub probes use HTTPS"
 assert_contains "$TMP/cp.yaml" "name: ARKFLOW_HUB_UPSTREAM" "cp: console upstream env"
 assert_contains "$TMP/cp.yaml" "value: \"https://arkflow-hub:8080\"" "cp: console targets https in-chart hub"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_HUB_PROXY_SSL" "cp: console proxy SSL verification env"
+assert_contains "$TMP/cp.yaml" "proxy_ssl_verify on" "cp: console enables proxy_ssl_verify"
+assert_contains "$TMP/cp.yaml" "name: hub-ca" "cp: console mounts CA-only volume"
 assert_contains "$TMP/cp.yaml" "name: arkflow-agent" "cp: in-chart agent workload"
 assert_contains "$TMP/cp.yaml" "name: ARKFLOW_NODE_TOKEN" "cp: shared credential env"
 assert_contains "$TMP/cp.yaml" "name: ARKFLOW_AGENT_TLS_CERT" "cp: agent client cert env"
 assert_contains "$TMP/cp.yaml" "name: ARKFLOW_DATA_PLANE_TLS_CERT" "cp: data-plane cert env"
 assert_contains "$TMP/cp.yaml" "clusterIP: None" "cp: agent headless service"
+python3 - "$TMP/cp.yaml" <<'EOF'
+import sys
+docs = open(sys.argv[1]).read().split("\n---")
+agent = next((d for d in docs if "app.kubernetes.io/component: engine" in d and "kind: Deployment" in d), "")
+assert agent, "cp: missing engine Deployment"
+assert 'key: "ca.crt"' in agent and 'key: "agent.crt"' in agent and 'key: "agent.key"' in agent, "cp: agent-tls items projection incomplete"
+assert "hub.key" not in agent and "hub.crt" not in agent, "cp: hub TLS key/cert must never be mounted in agent deployment"
+console = next((d for d in docs if "app.kubernetes.io/component: console" in d and "kind: Deployment" in d), "")
+assert console, "cp: missing console Deployment"
+assert 'key: "ca.crt"' in console and "hub.key" not in console, "cp: console must mount only ca.crt"
+EOF
 
 echo "== control-plane mTLS opt-out =="
 helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" \
@@ -63,13 +77,22 @@ helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" \
 assert_not_contains "$TMP/cpnotls.yaml" "name: arkflow-tls" "cp-no-tls: no generated TLS secret"
 assert_not_contains "$TMP/cpnotls.yaml" "name: ARKFLOW_HUB_TLS_CERT" "cp-no-tls: no hub TLS env"
 assert_not_contains "$TMP/cpnotls.yaml" "name: ARKFLOW_AGENT_TLS_CERT" "cp-no-tls: no agent TLS env"
+assert_not_contains "$TMP/cpnotls.yaml" "name: ARKFLOW_HUB_PROXY_SSL" "cp-no-tls: no console SSL env"
 assert_not_contains "$TMP/cpnotls.yaml" "scheme: HTTPS" "cp-no-tls: probes stay HTTP"
 assert_contains "$TMP/cpnotls.yaml" "value: \"http://arkflow-hub:8080\"" "cp-no-tls: console uses http upstream"
 
-echo "== agent existingSecret TLS and node credential persistence =="
+echo "== control-plane rejects unsupported clientAuth=required =="
+if helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" \
+  --set controlPlane.tls.clientAuth=required >"$TMP/cpreq.yaml" 2>"$TMP/cpreq.err"; then
+  fail "cp-required: expected clientAuth=required to fail chart render"
+fi
+assert_contains "$TMP/cpreq.err" "clientAuth=required" "cp-required: explicit error message"
+
+echo "== agent existingSecret TLS, fixed nodeId, and node credential persistence =="
 helm template my-agent "$CHART" -f "$CHART/values-agent.yaml" \
-  --set agent.tls.existingSecret=my-agent-tls --set persistence.enabled=true > "$TMP/agenttls.yaml"
+  --set agent.tls.existingSecret=my-agent-tls --set agent.nodeId=fixed-edge-01 --set persistence.enabled=true > "$TMP/agenttls.yaml"
 assert_contains "$TMP/agenttls.yaml" "secretName: my-agent-tls" "agent-tls: mounts existing TLS secret"
+assert_contains "$TMP/agenttls.yaml" "value: \"fixed-edge-01\"" "agent-tls: fixed nodeId override honored"
 assert_contains "$TMP/agenttls.yaml" "name: ARKFLOW_AGENT_TLS_CA" "agent-tls: agent CA env"
 assert_contains "$TMP/agenttls.yaml" "name: ARKFLOW_AGENT_TLS_CERT" "agent-tls: agent cert env"
 assert_contains "$TMP/agenttls.yaml" "name: ARKFLOW_DATA_PLANE_TLS_CERT" "agent-tls: data-plane cert env"

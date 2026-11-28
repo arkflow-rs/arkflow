@@ -27,16 +27,16 @@ On a Hub with durable storage, each compute-node credential (`cp_node_credential
 
 ### Requirement: Shared node_token SHALL be limited to bootstrap enrollment and explicit break-glass
 
-When durable storage is configured, the fleet-shared `node_token` SHALL authenticate registration for a `node_id` ONLY when that `node_id` currently has no active (unrevoked, unexpired) per-node credentials in `cp_node_credentials` (unless `allow_shared_node_token_break_glass` is explicitly enabled). On successful initial bootstrap enrollment (when `node_bootstrap_disabled` is false), the Hub SHALL mint and persist a new per-node `arkn_` credential (`label = "bootstrap"`) and return its plaintext once in `RegisterResponse.node_credential`. Once a `node_id` holds at least one active per-node credential, subsequent registrations presenting the shared `node_token` for that `node_id` MUST fail with `401 Unauthorized` (`bootstrap_blocked_enrolled_node`). Volatile Hubs without durable storage SHALL preserve pre-existing shared-token behavior.
+When durable storage is configured, the fleet-shared `node_token` SHALL authenticate registration for a `node_id` ONLY when that `node_id` has no prior per-node credentials recorded in `cp_node_credentials` (including revoked or expired historical credentials), except for a single same-boot unconfirmed bootstrap retry (`boot_id` matching an active, unrevoked, unexpired `"bootstrap"` registration that has not yet completed any post-register authenticated call or `arkn_` registration) or when `allow_shared_node_token_break_glass` is explicitly enabled. On successful initial bootstrap enrollment (when `node_bootstrap_disabled` is false), the Hub SHALL mint and persist a new per-node `arkn_` credential (`label = "bootstrap"`) and return its plaintext once in `RegisterResponse.node_credential`. Once a `node_id` has any recorded per-node credential (other than the same-boot unconfirmed retry path above), subsequent registrations presenting the shared `node_token` for that `node_id` MUST fail with `401 Unauthorized` (`bootstrap_blocked_enrolled_node`) — revoking a node's last active credential MUST NOT re-open shared `node_token` enrollment. Volatile Hubs without durable storage SHALL preserve pre-existing shared-token behavior.
 
 #### Scenario: First-time node bootstrap mints a per-node credential
 
-- **WHEN** `"node-a"` has no active per-node credentials and registers against a durable Hub with the shared bootstrap `node_token`
+- **WHEN** `"node-a"` has no recorded per-node credentials and registers against a durable Hub with the shared bootstrap `node_token`
 - **THEN** the Hub stores a hashed per-node credential for `"node-a"`, returns the plaintext once in `RegisterResponse.node_credential`, and subsequent re-registrations by `"node-a"` succeed using that `arkn_` credential
 
-#### Scenario: Shared node_token cannot hijack an already-enrolled node
+#### Scenario: Shared node_token cannot re-enroll an already-enrolled or revoked node
 
-- **WHEN** `"node-a"` already has an active per-node credential and an attacker registers with `node_id = "node-a"` using the shared `node_token` (with break-glass disabled)
+- **WHEN** `"node-a"` has any recorded per-node credential (even after its last active credential is revoked) and a caller registers with `node_id = "node-a"` using the shared `node_token` (with break-glass disabled and outside a same-boot unconfirmed bootstrap retry)
 - **THEN** the Hub rejects the request with `401 Unauthorized` and audits `bootstrap_blocked_enrolled_node`
 
 #### Scenario: Break-glass override allows shared node_token when explicitly enabled

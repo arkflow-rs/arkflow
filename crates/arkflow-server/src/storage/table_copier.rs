@@ -23,10 +23,11 @@ use sqlx::{Postgres, Row};
 /// `migrate`, `backup`, and `restore`: a table missing from this list is
 /// silently dropped by every copy command, so webhook subscriptions
 /// (`cp_webhooks`) belong here exactly like every other business table.
-pub const TABLE_ORDER: [&str; 22] = [
+pub const TABLE_ORDER: [&str; 23] = [
     "cp_nodes",
     "cp_node_credentials",
     "cp_jobs",
+    "cp_job_edge_secrets",
     "cp_job_versions",
     "cp_job_tasks",
     "cp_job_checkpoints",

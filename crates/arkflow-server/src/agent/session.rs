@@ -165,7 +165,13 @@ pub async fn run(
     // Reason token for the next switch's audit log, carried over from the
     // failure that triggered the rotation.
     let mut pending_reason: &'static str = "transport_error";
+    let mut pending_credential_persist: Option<String> = None;
     loop {
+        try_flush_pending_credential(
+            &config.node_id,
+            active_config.node_credential_file.as_deref(),
+            &mut pending_credential_persist,
+        );
         if cancellation.is_cancelled() {
             job_runtime.stop_all().await;
             if let Some(manager) = &job_runtime.data_plane {
@@ -194,22 +200,20 @@ pub async fn run(
                     let trimmed = issued_credential.trim().to_owned();
                     if !trimmed.is_empty() {
                         active_config.node_token = trimmed.clone();
-                        if let Some(path) = active_config.node_credential_file.as_deref() {
-                            if let Err(error) = persist_node_credential(path, &trimmed) {
-                                warn!(
-                                    node_id = %config.node_id,
-                                    path = %path,
-                                    %error,
-                                    "Failed to persist Hub-issued node credential"
-                                );
-                            }
+                        if active_config.node_credential_file.is_some() {
+                            pending_credential_persist = Some(trimmed);
+                            try_flush_pending_credential(
+                                &config.node_id,
+                                active_config.node_credential_file.as_deref(),
+                                &mut pending_credential_persist,
+                            );
                         }
                     }
                 }
                 info!(node_id = %config.node_id, hub = %active_config.hub_url, "Compute node registered with control-plane Hub");
                 backoff = Duration::from_millis(250);
                 failed_attempts = 0;
-                if let Err(error) = run_session(
+                if let Err(error) = run_session_with_pending_persist(
                     &client,
                     &cp,
                     &active_config,
@@ -220,6 +224,7 @@ pub async fn run(
                     network_shuffle,
                     &resource_sampler,
                     &failover_counter,
+                    Some(&mut pending_credential_persist),
                 )
                 .await
                 {
@@ -331,6 +336,25 @@ fn load_node_credential(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("failed to read node credential file {path}: {error}").into()),
+    }
+}
+
+pub(super) fn try_flush_pending_credential(
+    node_id: &str,
+    path: Option<&str>,
+    pending: &mut Option<String>,
+) {
+    let (Some(path), Some(credential)) = (path, pending.as_deref()) else {
+        return;
+    };
+    match persist_node_credential(path, credential) {
+        Ok(()) => *pending = None,
+        Err(error) => warn!(
+            node_id = %node_id,
+            path = %path,
+            %error,
+            "Failed to persist Hub-issued node credential; will retry"
+        ),
     }
 }
 
@@ -515,6 +539,7 @@ pub(super) async fn register(
         .map_err(|error| RegisterFailure::Transport(error.to_string()))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_session(
     client: &Client,
@@ -527,6 +552,36 @@ pub(super) async fn run_session(
     network_shuffle: bool,
     resource_sampler: &ResourceSampler,
     failover_counter: &std::sync::atomic::AtomicU64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_session_with_pending_persist(
+        client,
+        cp,
+        config,
+        session,
+        cancellation,
+        completed_commands,
+        job_runtime,
+        network_shuffle,
+        resource_sampler,
+        failover_counter,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session_with_pending_persist(
+    client: &Client,
+    cp: &ControlPlane,
+    config: &NodeAgentConfig,
+    session: RegisterResponse,
+    cancellation: CancellationToken,
+    completed_commands: &mut CompletedCommandCache,
+    job_runtime: JobRuntime,
+    network_shuffle: bool,
+    resource_sampler: &ResourceSampler,
+    failover_counter: &std::sync::atomic::AtomicU64,
+    mut pending_credential_persist: Option<&mut Option<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth = AgentAuth {
         node_id: config.node_id.clone(),
@@ -570,7 +625,16 @@ pub(super) async fn run_session(
                     None => {}
                 }
             },
-            _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &auth.session_token, &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await?; }
+            _ = heartbeat.tick() => {
+                if let Some(pending) = pending_credential_persist.as_deref_mut() {
+                    try_flush_pending_credential(
+                        &config.node_id,
+                        config.node_credential_file.as_deref(),
+                        pending,
+                    );
+                }
+                post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &auth.session_token, &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await?;
+            }
             _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &auth.session_token, &report(cp, &auth, &config.boot_id, report_seq, &job_runtime, network_shuffle, resource_sampler, &config.hub_url, failover_counter.load(std::sync::atomic::Ordering::Relaxed)).await).await?; }
             _ = poll.tick() => {
                 let finished = job_runtime.take_finished().await;

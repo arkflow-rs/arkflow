@@ -85,7 +85,31 @@ fn authenticated_node<'a>(
     {
         return Err(HubError::Unauthorized);
     }
+    node.bootstrap_unconfirmed = false;
     Ok(node)
+}
+
+fn find_reclaimable_node(
+    nodes: &BTreeMap<String, NodeRecord>,
+    node_id: &str,
+    now: u64,
+) -> Result<Option<String>, HubError> {
+    if nodes.len() < MAX_NODES || nodes.contains_key(node_id) {
+        return Ok(None);
+    }
+    // Retired nodes used to occupy the fixed registry forever: the expiry
+    // sweep only changes their state, never removes the map entry. Reclaim
+    // one expired/offline slot instead of rejecting a live node for the
+    // whole process lifetime.
+    nodes
+        .iter()
+        .find(|(id, record)| {
+            id.as_str() != node_id
+                && (record.resource.state != NodeConnectionState::Online
+                    || record.resource.lease_expires_at_ms <= now)
+        })
+        .map(|(id, _)| Some(id.clone()))
+        .ok_or(HubError::Capacity)
 }
 
 pub(crate) fn sanitize_metrics(metrics: BTreeMap<String, f64>) -> BTreeMap<String, f64> {
@@ -446,37 +470,54 @@ impl Hub {
         }
     }
 
+    pub async fn expected_cert_node_id(&self, node_id: &str) -> Option<String> {
+        self.nodes
+            .read()
+            .await
+            .get(node_id)
+            .and_then(|record| record.cert_node_id.clone())
+    }
+
     pub async fn revoke_node_credential(
         &self,
         credential_id: &str,
         actor: &str,
     ) -> Result<bool, HubError> {
         let storage = self.node_storage()?.clone();
-        let _guard = self.node_identity_write_lock.lock().await;
-        let Some((record, newly_revoked)) = storage
-            .revoke_node_credential(credential_id, now_ms())
-            .await
-            .map_err(HubError::from)?
-        else {
-            return Err(HubError::NotFound);
-        };
-        self.invalidate_node_session_for_credential(&record.node_id, credential_id)
-            .await;
-        if newly_revoked {
-            self.record_node_audit(
-                Some(actor.to_owned()),
-                "node_credential.revoke",
-                &record.node_id,
-                "accepted",
-                None,
-                Some(format!(
-                    "node={} credential={credential_id}",
-                    record.node_id
-                )),
-            )
-            .await;
-        }
-        Ok(newly_revoked)
+        let hub = self.clone();
+        let credential_id = credential_id.to_owned();
+        let actor = actor.to_owned();
+        tokio::spawn(async move {
+            let _guard = hub.node_identity_write_lock.lock().await;
+            let Some((record, newly_revoked)) = storage
+                .revoke_node_credential(&credential_id, now_ms())
+                .await
+                .map_err(HubError::from)?
+            else {
+                return Err(HubError::NotFound);
+            };
+            hub.invalidate_node_session_for_credential(&record.node_id, &credential_id)
+                .await;
+            if newly_revoked {
+                hub.record_node_audit(
+                    Some(actor),
+                    "node_credential.revoke",
+                    &record.node_id,
+                    "accepted",
+                    None,
+                    Some(format!(
+                        "node={} credential={credential_id}",
+                        record.node_id
+                    )),
+                )
+                .await;
+            }
+            Ok(newly_revoked)
+        })
+        .await
+        .map_err(|error| {
+            HubError::Invalid(format!("node credential revoke task failed: {error}"))
+        })?
     }
 
     pub async fn rotate_node_credential(
@@ -485,55 +526,64 @@ impl Hub {
         actor: &str,
     ) -> Result<(NodeCredentialRecord, String), HubError> {
         let storage = self.node_storage()?.clone();
-        let _guard = self.node_identity_write_lock.lock().await;
-        let current = storage
-            .get_node_credential(credential_id)
-            .await
-            .map_err(HubError::from)?
-            .ok_or(HubError::NotFound)?;
-        if current.revoked_at_ms.is_some() {
-            return Err(HubError::Invalid(
-                "cannot rotate an already revoked node credential".into(),
-            ));
-        }
-        let new_id = generate_credential_id()?;
-        let secret = generate_secret()?;
-        let now = now_ms();
-        let record = NodeCredentialRecord {
-            credential_id: new_id.clone(),
-            node_id: current.node_id.clone(),
-            secret_hash: hash_secret(&new_id, &secret),
-            label: current.label.clone(),
-            created_at_ms: now,
-            expires_at_ms: current.expires_at_ms,
-            last_used_at_ms: None,
-            revoked_at_ms: None,
-        };
-        let rotated = storage
-            .rotate_node_credential(record.clone(), credential_id, now)
-            .await
-            .map_err(HubError::from)?;
-        if !rotated {
-            return Err(HubError::Invalid(
-                "cannot rotate an already revoked node credential".into(),
-            ));
-        }
-        self.invalidate_node_session_for_credential(&current.node_id, credential_id)
+        let hub = self.clone();
+        let credential_id = credential_id.to_owned();
+        let actor = actor.to_owned();
+        tokio::spawn(async move {
+            let _guard = hub.node_identity_write_lock.lock().await;
+            let current = storage
+                .get_node_credential(&credential_id)
+                .await
+                .map_err(HubError::from)?
+                .ok_or(HubError::NotFound)?;
+            if current.revoked_at_ms.is_some() {
+                return Err(HubError::Invalid(
+                    "cannot rotate an already revoked node credential".into(),
+                ));
+            }
+            let new_id = generate_credential_id()?;
+            let secret = generate_secret()?;
+            let now = now_ms();
+            let record = NodeCredentialRecord {
+                credential_id: new_id.clone(),
+                node_id: current.node_id.clone(),
+                secret_hash: hash_secret(&new_id, &secret),
+                label: current.label.clone(),
+                created_at_ms: now,
+                expires_at_ms: current.expires_at_ms,
+                last_used_at_ms: None,
+                revoked_at_ms: None,
+            };
+            let rotated = storage
+                .rotate_node_credential(record.clone(), &credential_id, now)
+                .await
+                .map_err(HubError::from)?;
+            if !rotated {
+                return Err(HubError::Invalid(
+                    "cannot rotate an already revoked node credential".into(),
+                ));
+            }
+            hub.invalidate_node_session_for_credential(&current.node_id, &credential_id)
+                .await;
+            hub.record_node_audit(
+                Some(actor),
+                "node_credential.rotate",
+                &current.node_id,
+                "accepted",
+                None,
+                Some(format!(
+                    "node={} old_credential={credential_id} new_credential={new_id}",
+                    current.node_id
+                )),
+            )
             .await;
-        self.record_node_audit(
-            Some(actor.to_owned()),
-            "node_credential.rotate",
-            &current.node_id,
-            "accepted",
-            None,
-            Some(format!(
-                "node={} old_credential={credential_id} new_credential={new_id}",
-                current.node_id
-            )),
-        )
-        .await;
-        let token = format!("{NODE_TOKEN_PREFIX}{new_id}_{secret}");
-        Ok((record, token))
+            let token = format!("{NODE_TOKEN_PREFIX}{new_id}_{secret}");
+            Ok((record, token))
+        })
+        .await
+        .map_err(|error| {
+            HubError::Invalid(format!("node credential rotate task failed: {error}"))
+        })?
     }
 
     pub async fn register(&self, request: RegisterRequest) -> Result<RegisterResponse, HubError> {
@@ -559,6 +609,16 @@ impl Hub {
                 return Err(HubError::Unauthorized);
             }
         }
+        // Hold `node_identity_write_lock` across credential verification/minting
+        // AND `register_after_auth`'s session installation whenever durable
+        // storage is active so concurrent `revoke`/`rotate` cannot invalidate an
+        // in-memory session just before this registration installs it.
+        // Lock order stays strictly: `node_identity_write_lock -> storage -> nodes`.
+        let _identity_guard = if self.storage.is_some() {
+            Some(self.node_identity_write_lock.lock().await)
+        } else {
+            None
+        };
         let now = now_ms();
         let (auth_mode, credential_id, minted_credential) = if let Some((cred_id, secret)) =
             parse_node_managed_token(&request.node_token)
@@ -671,7 +731,9 @@ impl Hub {
                         .await;
                         return Err(HubError::Unauthorized);
                     }
-                    // Validate structural fields before minting any durable credential.
+                    // Validate structural fields and fleet capacity BEFORE
+                    // minting any durable credential so rejected registrations
+                    // never leave orphan bootstrap rows behind.
                     if request.node_id.trim().is_empty() {
                         return Err(HubError::Invalid("node_id must not be empty".into()));
                     }
@@ -686,12 +748,44 @@ impl Hub {
                         .await;
                         return Err(HubError::Invalid(message));
                     }
-                    let _guard = self.node_identity_write_lock.lock().await;
-                    let active = storage
-                        .count_active_node_credentials(&request.node_id, now)
+                    {
+                        let nodes = self.nodes.read().await;
+                        let _ = find_reclaimable_node(&nodes, &request.node_id, now)?;
+                    }
+                    let history = storage
+                        .list_node_credentials(&request.node_id)
                         .await
                         .map_err(HubError::from)?;
-                    if active > 0 {
+                    let req_boot_id = request
+                        .boot_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|boot| !boot.is_empty());
+                    // Same-boot retry recovery: if the very first bootstrap
+                    // response was lost on the wire before the Agent observed
+                    // any authenticated post-register call, let the same
+                    // unconfirmed boot_id re-roll that single unrevoked/unexpired
+                    // bootstrap credential cleanly instead of wedging the node.
+                    let same_boot_unconfirmed_cred = match req_boot_id {
+                        Some(req_boot)
+                            if history.len() == 1
+                                && history[0].label == "bootstrap"
+                                && history[0].revoked_at_ms.is_none()
+                                && history[0].expires_at_ms.is_none_or(|exp| now < exp) =>
+                        {
+                            let existing_cred_id = &history[0].credential_id;
+                            let nodes = self.nodes.read().await;
+                            nodes.get(&request.node_id).and_then(|record| {
+                                (record.bootstrap_unconfirmed
+                                    && record.boot_id.as_deref() == Some(req_boot)
+                                    && record.credential_id.as_deref()
+                                        == Some(existing_cred_id.as_str()))
+                                .then(|| existing_cred_id.clone())
+                            })
+                        }
+                        _ => None,
+                    };
+                    if !history.is_empty() && same_boot_unconfirmed_cred.is_none() {
                         if self
                             .allow_shared_node_token_break_glass
                             .load(Ordering::Acquire)
@@ -706,6 +800,40 @@ impl Hub {
                             .await;
                             return Err(HubError::Unauthorized);
                         }
+                    } else if let Some(previous_cred_id) = same_boot_unconfirmed_cred {
+                        let cred_id = generate_credential_id()?;
+                        let secret = generate_secret()?;
+                        let record = NodeCredentialRecord {
+                            credential_id: cred_id.clone(),
+                            node_id: request.node_id.clone(),
+                            secret_hash: hash_secret(&cred_id, &secret),
+                            label: "bootstrap".into(),
+                            created_at_ms: now,
+                            expires_at_ms: None,
+                            last_used_at_ms: None,
+                            revoked_at_ms: None,
+                        };
+                        if !storage
+                            .rotate_node_credential(record, &previous_cred_id, now)
+                            .await
+                            .map_err(HubError::from)?
+                        {
+                            return Err(HubError::Unauthorized);
+                        }
+                        self.record_node_audit(
+                            Some(format!("node:{}", request.node_id)),
+                            "node_credential.enroll",
+                            &request.node_id,
+                            "accepted",
+                            None,
+                            Some(format!(
+                                "node={} credential={cred_id} previous_unconfirmed={previous_cred_id}",
+                                request.node_id
+                            )),
+                        )
+                        .await;
+                        let token = format!("{NODE_TOKEN_PREFIX}{cred_id}_{secret}");
+                        ("bootstrap_enroll", Some(cred_id), Some(token))
                     } else {
                         let cred_id = generate_credential_id()?;
                         let secret = generate_secret()?;
@@ -848,25 +976,8 @@ impl Hub {
             labels,
         };
         let mut nodes = self.nodes.write().await;
-        if nodes.len() >= MAX_NODES && !nodes.contains_key(&request.node_id) {
-            // Retired nodes used to occupy the fixed registry forever: the
-            // expiry sweep only changes their state, never removes the map
-            // entry. Reclaim one expired/offline slot instead of rejecting a
-            // live node for the whole process lifetime.
-            let reclaimable = nodes
-                .iter()
-                .find(|(id, record)| {
-                    id.as_str() != request.node_id
-                        && (record.resource.state != NodeConnectionState::Online
-                            || record.resource.lease_expires_at_ms <= now)
-                })
-                .map(|(id, _)| id.clone());
-            match reclaimable {
-                Some(id) => {
-                    nodes.remove(&id);
-                }
-                None => return Err(HubError::Capacity),
-            }
+        if let Some(reclaim_id) = find_reclaimable_node(&nodes, &request.node_id, now)? {
+            nodes.remove(&reclaim_id);
         }
         let old = nodes.remove(&request.node_id);
         let boot_changed = old
@@ -900,6 +1011,7 @@ impl Hub {
                 session_expires_at_ms: now.saturating_add(self.config.session_ttl_ms),
                 credential_id: credential_id.clone(),
                 cert_node_id,
+                bootstrap_unconfirmed: auth_mode == "bootstrap_enroll",
                 boot_id: Some(registered_boot_id.clone()),
                 report_seq: 0,
                 last_report_at_ms: 0,

@@ -103,9 +103,9 @@ impl Hub {
         &self,
         request: JobObservationRequest,
     ) -> Result<Option<JobRecord>, HubError> {
-        let nodes = self.nodes.read().await;
+        let mut nodes = self.nodes.write().await;
         let node = nodes
-            .get(&request.auth.node_id)
+            .get_mut(&request.auth.node_id)
             .ok_or(HubError::Unauthorized)?;
         if !bool::from(
             request
@@ -117,6 +117,7 @@ impl Hub {
         {
             return Err(HubError::Unauthorized);
         }
+        node.bootstrap_unconfirmed = false;
         drop(nodes);
         // An authenticated session is not an assignment: a node may only
         // observe Jobs it was actually DISPATCHED at this generation. Without
@@ -320,6 +321,19 @@ impl Hub {
             let mut jobs = self.jobs.write().await;
             for job in recovered_jobs {
                 jobs.insert(job.job_id.clone(), job);
+            }
+            drop(jobs);
+            let recovered_edge_secrets = storage
+                .list_job_edge_secrets()
+                .await
+                .map_err(HubError::from)?;
+            let mut edge_secrets = self.job_edge_secrets.write().await;
+            edge_secrets.clear();
+            for row in recovered_edge_secrets {
+                edge_secrets
+                    .entry((row.job_id, row.generation))
+                    .or_default()
+                    .insert((row.src_node, row.dst_node), row.secret_hex);
             }
         }
         self.lifecycle.write().await.recovered = true;

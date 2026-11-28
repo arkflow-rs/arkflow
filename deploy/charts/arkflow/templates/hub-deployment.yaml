@@ -1,4 +1,7 @@
 {{- if eq .Values.mode "control-plane" -}}
+{{- if and .Values.controlPlane.tls.enabled (eq (default "agent_required" .Values.controlPlane.tls.clientAuth) "required") -}}
+{{- fail "controlPlane.tls.clientAuth=required is unsupported in Kubernetes deployments because kubelet HTTPS probes and the Console proxy do not present client certificates; use agent_required (default) or none" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
