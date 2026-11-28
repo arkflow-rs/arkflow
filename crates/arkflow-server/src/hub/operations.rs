@@ -248,6 +248,41 @@ impl Hub {
         attempt_id: Option<String>,
         actor: &str,
     ) -> Result<HubOperation, HubError> {
+        let (record, _) = self
+            .enqueue_with_metadata_checked_as(
+                node_id,
+                operation,
+                resource_id,
+                correlation_id,
+                payload,
+                generation,
+                action_id,
+                config_version_id,
+                operation_id_override,
+                command_id_override,
+                attempt_id,
+                actor,
+            )
+            .await?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn enqueue_with_metadata_checked_as(
+        &self,
+        node_id: String,
+        operation: AgentOperation,
+        resource_id: String,
+        correlation_id: Option<String>,
+        payload: Option<serde_json::Value>,
+        generation: u64,
+        action_id: Option<String>,
+        config_version_id: Option<String>,
+        operation_id_override: Option<String>,
+        command_id_override: Option<String>,
+        attempt_id: Option<String>,
+        actor: &str,
+    ) -> Result<(HubOperation, bool), HubError> {
         let requested_checkpoint_id = payload
             .as_ref()
             .and_then(|payload| payload.get("checkpoint_id"))
@@ -400,7 +435,7 @@ impl Hub {
                             | HubOperationState::Running
                             | HubOperationState::Succeeded
                     ) {
-                        return Ok(existing.clone());
+                        return Ok((existing.clone(), false));
                     }
                 } else {
                     return Err(HubError::IdempotencyKeyReused);
@@ -422,7 +457,7 @@ impl Hub {
                         | HubOperationState::Running
                 )
         }) {
-            return Ok(existing.clone());
+            return Ok((existing.clone(), false));
         }
         let intent_id = operation_id_override.clone();
         let id = operation_id_override
@@ -562,6 +597,11 @@ impl Hub {
                 // evicting the operation without it leaks one command id per
                 // settled command for the whole Hub process lifetime.
                 self.settled_commands.write().await.remove(&command_id);
+                self.audited_commands.write().await.remove(&command_id);
+                self.terminal_audit_credentials
+                    .write()
+                    .await
+                    .remove(&command_id);
             }
         }
         // Audit the logical mutation once: reconciler re-dispatches of the
@@ -612,7 +652,21 @@ impl Hub {
             )
             .await;
         }
-        Ok(operation_record)
+        Ok((operation_record, true))
+    }
+
+    pub(crate) async fn command_payload_matches(
+        &self,
+        node_id: &str,
+        command_id: &str,
+        expected_payload: &Option<serde_json::Value>,
+    ) -> bool {
+        self.nodes.read().await.get(node_id).is_some_and(|node| {
+            node.leased_commands
+                .get(command_id)
+                .or_else(|| node.commands.iter().find(|cmd| cmd.id == command_id))
+                .is_some_and(|cmd| &cmd.payload == expected_payload)
+        })
     }
 
     /// Account and audit an enqueue that never reached the node's command
@@ -649,15 +703,17 @@ impl Hub {
         result: CommandResult,
     ) -> Result<HubOperation, HubError> {
         let mut nodes = self.nodes.write().await;
-        let node = nodes.get(&auth.node_id).ok_or(HubError::Unauthorized)?;
+        let node = nodes.get_mut(&auth.node_id).ok_or(HubError::Unauthorized)?;
         if !bool::from(
             auth.session_token
                 .as_bytes()
                 .ct_eq(node.session_token.as_bytes()),
         ) || now_ms() > node.session_expires_at_ms
+            || node.bootstrap_rotation_pending
         {
             return Err(HubError::Unauthorized);
         }
+        node.bootstrap_unconfirmed = false;
         // The command lease settles only with a terminal result: the initial
         // acknowledgement and progress reports must leave it leased so the
         // expiry sweep can still time out a command whose node acknowledged
@@ -770,8 +826,19 @@ impl Hub {
         }
         let updated = operation.clone();
         let attempt_id = operation.attempt_id.clone();
+        let newly_terminal = !already_terminal && result.state.is_terminal();
+        let node_credential_id = nodes
+            .get(&auth.node_id)
+            .and_then(|node| node.credential_id.clone());
         drop(operations);
         drop(nodes);
+        if newly_terminal {
+            self.terminal_audit_credentials
+                .write()
+                .await
+                .entry(updated.command_id.clone())
+                .or_insert_with(|| (auth.node_id.clone(), node_credential_id.clone()));
+        }
         if let (Some(storage), Some(attempt_id)) = (self.storage.as_ref(), attempt_id) {
             let state = serde_json::to_value(result.state)
                 .ok()
@@ -786,6 +853,58 @@ impl Hub {
             persist_operation(storage, &updated)
                 .await
                 .map_err(HubError::from)?;
+        }
+        if updated.state.is_terminal()
+            && !self
+                .audited_commands
+                .read()
+                .await
+                .contains(&updated.command_id)
+        {
+            let (audit_node_id, audit_cred_id) = self
+                .terminal_audit_credentials
+                .read()
+                .await
+                .get(&updated.command_id)
+                .cloned()
+                .unwrap_or_else(|| (auth.node_id.clone(), node_credential_id.clone()));
+            let outcome = CommandMetrics::outcome_label(updated.state).unwrap_or("terminal");
+            let mut message = format!(
+                "operation={} resource={} generation={}",
+                updated.operation, updated.resource_id, updated.generation
+            );
+            if let Some(cred_id) = audit_cred_id.as_deref() {
+                message.push_str(&format!(" credential={cred_id}"));
+            }
+            let record = crate::storage::AuditRecord {
+                event_id: 0,
+                actor: Some(format!("node:{audit_node_id}")),
+                action: "agent.command_result".into(),
+                resource_type: "operation".into(),
+                resource_id: Some(updated.id.clone()),
+                node_id: Some(audit_node_id),
+                stream_id: (!updated.operation.is_job()).then(|| updated.resource_id.clone()),
+                correlation_id: updated.correlation_id.clone(),
+                outcome: outcome.to_owned(),
+                failure_code: updated.failure_class.clone(),
+                message: Some(message),
+                occurred_at_ms: now_ms(),
+            };
+            let recorded = if self.storage.is_none() {
+                true
+            } else {
+                self.record_audit_event_for("node", record).await.is_ok()
+            };
+            if recorded {
+                self.audited_commands
+                    .write()
+                    .await
+                    .insert(updated.command_id.clone());
+                self.terminal_audit_credentials
+                    .write()
+                    .await
+                    .remove(&updated.command_id);
+            }
         }
         if updated.operation.is_job() {
             if matches!(

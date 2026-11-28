@@ -17,4 +17,5 @@ COPY --from=build /app/dist /usr/share/nginx/html
 # ARKFLOW_HUB_UPSTREAM to point the same-origin proxy at the Hub.
 COPY nginx.default.conf.template /etc/nginx/templates/default.conf.template
 ENV ARKFLOW_HUB_UPSTREAM=http://arkflow-hub:8080
+ENV ARKFLOW_HUB_PROXY_SSL=""
 EXPOSE 80

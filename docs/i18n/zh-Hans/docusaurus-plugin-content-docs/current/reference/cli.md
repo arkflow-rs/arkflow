@@ -156,10 +156,16 @@ ai:
 |----------|---------|-------------|
 | `ARKFLOW_HUB_ADDRESS` | `127.0.0.1:8080` | Hub API 监听地址。 |
 | `ARKFLOW_OPERATOR_TOKEN` | — | 供人工/管理员访问 API 的 operator token。支持 `role\|token` 凭据格式;参见 [Hub 认证](../operate/control-plane/overview.md)与[用户与凭证](../operate/control-plane/users-and-credentials.md)。 |
-| `ARKFLOW_NODE_TOKEN` | — | Agent 向 Hub 认证使用的共享 token。 |
+| `ARKFLOW_NODE_TOKEN` | — | 共享 bootstrap/应急恢复 token:仅用于节点首次准入(或仅在开启 `ARKFLOW_ALLOW_SHARED_NODE_TOKEN_BREAK_GLASS=true` / 易失 Hub 时用于已接入节点)。 |
 | `ARKFLOW_HUB_INSECURE_LOCAL` | 关 | 设为 `1`/`true`/`yes` 以放宽校验,仅限本地开发。 |
-| `ARKFLOW_HUB_STORAGE` | — | 存储后端描述:SQLite 路径或 PostgreSQL URL。启用 HA 时必须设置,托管身份 API(用户/凭证/会话)也需要它。 |
+| `ARKFLOW_HUB_STORAGE` | — | 存储后端描述:SQLite 路径或 PostgreSQL URL。启用 HA 与托管身份/逐节点凭据 API 时必须设置。 |
+| `ARKFLOW_HUB_NODE_BOOTSTRAP_DISABLED` | 关 | 设为 `1`/`true`/`yes` 禁止共享 `node_token` bootstrap 准入;节点必须持预签发 `arkn_` 凭据认证。 |
+| `ARKFLOW_ALLOW_SHARED_NODE_TOKEN_BREAK_GLASS` | 关 | 设为 `1`/`true`/`yes` 允许已接入节点临时持共享 `node_token` 重新注册(应急恢复开关)。 |
 | `ARKFLOW_HUB_TLS_CERT` / `ARKFLOW_HUB_TLS_KEY` | — | Hub 监听器的 TLS 证书与私钥路径。 |
+| `ARKFLOW_HUB_TLS_CA` | — | Hub 监听器用于校验客户端证书的 PEM CA 证书包。 |
+| `ARKFLOW_HUB_TLS_CLIENT_AUTH` | 配置了 CA 时为 `agent_required` | Hub 客户端认证策略:`agent_required`(`/api/v1/agent/*` 强制客户端证书)、`required` 或 `none`。 |
+| `ARKFLOW_AGENT_TLS_CA` / `ARKFLOW_AGENT_TLS_CERT` / `ARKFLOW_AGENT_TLS_KEY` | — | Agent 访问 mTLS Hub 用的 CA 根证书及成对客户端证书/私钥(`cert` 与 `key` 必须成对配置)。 |
+| `ARKFLOW_NODE_CREDENTIAL_FILE` | — | 可选文件路径:Agent 以 `0600` 原子写入并重载 Hub 签发的 `arkn_` 逐节点凭据。 |
 | `ARKFLOW_HUB_HA_ENABLED` | 关 | 设为 `1`/`true`/`yes` 启用基于租约的 HA。要求设置 `ARKFLOW_HUB_STORAGE`;多实例 HA 使用 PostgreSQL URL(SQLite 路径仅记录一条仅供开发的警告)。 |
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | `15000` | 租约 TTL(毫秒);低于 1000 会被拒绝。 |
 | `ARKFLOW_HUB_HA_HOLDER_ID` | — | 显式租约持有者身份;缺省时由主机名、PID 与启动时间自动生成。 |

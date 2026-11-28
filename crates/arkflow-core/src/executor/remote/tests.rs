@@ -1844,6 +1844,7 @@ async fn tcp_transport_connects_and_receives() {
         tls: None,
         addr: format!("127.0.0.1:{port}").parse().expect("addr"),
         max_attempts: 3,
+        peer_node: None,
     };
     let edge = upstream
         .open_edge_for_session(&transport, quad, "node-b", "tcp-job", 1)
@@ -1976,6 +1977,7 @@ async fn tls_transport_connects_and_receives() {
         addr: format!("127.0.0.1:{port}").parse().expect("addr"),
         max_attempts: 3,
         tls: Some(DataPlaneTlsConfig::from_pem(cert_a, key_a, &ca).expect("client tls")),
+        peer_node: None,
     };
     let edge = upstream
         .open_edge_for_session(&transport, quad, "node-b", "tls-job", 1)
@@ -2046,6 +2048,7 @@ async fn plaintext_transport_against_tls_server_fails_closed() {
         addr: format!("127.0.0.1:{port}").parse().expect("addr"),
         max_attempts: 1,
         tls: None,
+        peer_node: None,
     };
     // The plaintext client may complete the TCP connect, but its bytes
     // are not a TLS record: the server handshake fails and NOTHING is
@@ -2118,6 +2121,7 @@ async fn foreign_ca_client_is_rejected_at_connect() {
             DataPlaneTlsConfig::from_pem(foreign_cert, foreign_key, &foreign_ca)
                 .expect("client tls"),
         ),
+        peer_node: None,
     };
     let result = upstream
         .open_edge_for_session(&transport, quad, "node-b", "foreign-job", 1)
@@ -4560,4 +4564,560 @@ async fn pump_data_write_failures_fail_the_edge() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("data write failed"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hub_provisioned_per_edge_keys_isolate_edges_and_reject_missing_secret() {
+    let downstream = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::hub_provisioned("node-b")),
+        registration_grace: std::time::Duration::from_millis(80),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    let upstream_a = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::hub_provisioned("node-a")),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    let upstream_c = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::hub_provisioned("node-c")),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    downstream.spawn();
+    upstream_a.spawn();
+    upstream_c.spawn();
+    let port = downstream
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let quad_ab = Quad {
+        src_op: 0,
+        src_subtask: 0,
+        dst_op: 1,
+        dst_subtask: 0,
+    };
+    let quad_cb = Quad {
+        src_op: 2,
+        src_subtask: 0,
+        dst_op: 1,
+        dst_subtask: 0,
+    };
+    let (tx_ab, rx_ab) = flume::bounded(8);
+    let (tx_cb, rx_cb) = flume::bounded(8);
+
+    // Hub-provisioned mode refuses edges missing a per-edge secret.
+    assert!(downstream
+        .register_inbound_for_session_with_secret(
+            quad_ab,
+            tx_ab.clone(),
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "job-per-edge".into(),
+                generation: 1,
+            },
+            None,
+        )
+        .is_err());
+    assert!(upstream_a
+        .open_edge_deferred_for_job_with_secret(
+            Arc::new(TcpEdgeTransport::plaintext(addr, 1)),
+            quad_ab,
+            "node-b".into(),
+            "job-per-edge".into(),
+            1,
+            None,
+        )
+        .is_err());
+
+    // Register two edges toward node-b with distinct secrets.
+    let secret_ab = b"edge-secret-a-to-b-0123456789abcdef";
+    let secret_cb = b"edge-secret-c-to-b-fedcba9876543210";
+    downstream
+        .register_inbound_for_session_with_secret(
+            quad_ab,
+            tx_ab,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "job-per-edge".into(),
+                generation: 1,
+            },
+            Some(secret_ab),
+        )
+        .unwrap();
+    downstream
+        .register_inbound_for_session_with_secret(
+            quad_cb,
+            tx_cb,
+            PeerExpectation {
+                source_node: "node-c".into(),
+                job_id: "job-per-edge".into(),
+                generation: 1,
+            },
+            Some(secret_cb),
+        )
+        .unwrap();
+
+    // Using secret_cb for node-a -> node-b must fail authentication cleanly.
+    let spoof = upstream_a
+        .open_edge_deferred_for_job_with_secret(
+            Arc::new(TcpEdgeTransport::plaintext(addr, 1)),
+            quad_ab,
+            "node-b".into(),
+            "job-per-edge".into(),
+            1,
+            Some(secret_cb),
+        )
+        .unwrap();
+    spoof
+        .sender
+        .send_async(Envelope::Data(
+            Arc::new(MessageBatch::new_arrow(large_batch(4))),
+            Arc::new(RecordingAck::default()),
+        ))
+        .await
+        .unwrap();
+    drop(spoof);
+    let err_rx = downstream.failure_receiver();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(3), err_rx.recv_async())
+        .await
+        .expect("spoofed secret must surface handshake failure")
+        .unwrap();
+    assert!(
+        err.to_string().contains("credential mismatch"),
+        "expected credential mismatch error, got {err}"
+    );
+    assert!(
+        rx_ab.try_recv().is_err(),
+        "spoofed batch must never be delivered"
+    );
+
+    // Genuine per-edge secrets transfer data end-to-end on both isolated edges.
+    let edge_ab = upstream_a
+        .open_edge_deferred_for_job_with_secret(
+            Arc::new(TcpEdgeTransport::plaintext(addr, 2)),
+            quad_ab,
+            "node-b".into(),
+            "job-per-edge".into(),
+            1,
+            Some(secret_ab),
+        )
+        .unwrap();
+    let edge_cb = upstream_c
+        .open_edge_deferred_for_job_with_secret(
+            Arc::new(TcpEdgeTransport::plaintext(addr, 2)),
+            quad_cb,
+            "node-b".into(),
+            "job-per-edge".into(),
+            1,
+            Some(secret_cb),
+        )
+        .unwrap();
+    let ack_ab = Arc::new(RecordingAck::default());
+    let ack_cb = Arc::new(RecordingAck::default());
+    edge_ab
+        .sender
+        .send_async(Envelope::Data(
+            Arc::new(MessageBatch::new_arrow(large_batch(2))),
+            ack_ab.clone(),
+        ))
+        .await
+        .unwrap();
+    edge_cb
+        .sender
+        .send_async(Envelope::Data(
+            Arc::new(MessageBatch::new_arrow(large_batch(2))),
+            ack_cb.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(rx_ab.recv_async().await.is_ok());
+    assert!(rx_cb.recv_async().await.is_ok());
+    downstream.shutdown();
+    upstream_a.shutdown();
+    upstream_c.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn data_plane_tls_san_binding_rejects_mismatched_node_uri() {
+    use rcgen::{string::Ia5String, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, &ca_key);
+
+    let make_san_node = |node_id: &str| {
+        let mut params =
+            CertificateParams::new(vec![super::DATA_PLANE_TLS_SERVER_NAME.to_owned()]).unwrap();
+        params.subject_alt_names.push(SanType::URI(
+            Ia5String::try_from(format!("urn:arkflow:node:{node_id}")).unwrap(),
+        ));
+        let key = KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        DataPlaneTlsConfig::from_pem(&cert.pem(), &key.serialize_pem(), &ca.pem()).unwrap()
+    };
+
+    let tls_a = make_san_node("node-a");
+    let tls_b = make_san_node("node-b");
+
+    let manager_b = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::new("node-b", b"san-test-secret").unwrap()),
+        tls: Some(tls_b),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    manager_b.spawn();
+    let port = manager_b
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // Outbound transport expecting "node-c" against server presenting SAN node-b must fail.
+    let mismatch_transport = TcpEdgeTransport {
+        addr,
+        max_attempts: 1,
+        tls: Some(tls_a.clone()),
+        peer_node: Some("node-c".into()),
+    };
+    let err = mismatch_transport
+        .connect(quad_a_to_b())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.to_string().contains("SAN mismatch"),
+        "expected SAN mismatch error, got {err}"
+    );
+
+    // Outbound transport expecting "node-b" succeeds TLS + SAN verification;
+    // then inbound rejects claim of source_node = "node-wrong" vs client cert SAN node-a.
+    let matching_transport = TcpEdgeTransport {
+        addr,
+        max_attempts: 1,
+        tls: Some(tls_a),
+        peer_node: Some("node-b".into()),
+    };
+    let upstream_impostor = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::new("node-wrong", b"san-test-secret").unwrap()),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    upstream_impostor.spawn();
+    let (tx, _rx) = flume::bounded(4);
+    let quad = quad_a_to_b();
+    manager_b
+        .register_inbound_for_session(
+            quad,
+            tx,
+            PeerExpectation {
+                source_node: "node-wrong".into(),
+                job_id: "san-job".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+    let err_rx = manager_b.failure_receiver();
+    let edge = upstream_impostor
+        .open_edge_deferred_for_job(
+            Arc::new(matching_transport),
+            quad,
+            "node-b".into(),
+            "san-job".into(),
+            1,
+        )
+        .unwrap();
+    edge.sender
+        .send_async(Envelope::Data(
+            Arc::new(MessageBatch::new_arrow(large_batch(1))),
+            Arc::new(RecordingAck::default()),
+        ))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "inbound SAN mismatch must surface");
+        let err = tokio::time::timeout(remaining, err_rx.recv_async())
+            .await
+            .expect("inbound SAN mismatch must report global failure")
+            .unwrap();
+        if err.to_string().contains("SAN mismatch") {
+            break;
+        }
+    }
+
+    manager_b.shutdown();
+    upstream_impostor.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn static_secret_mode_early_handshake_resolves_per_edge_secret_after_registration() {
+    let quad = quad_a_to_b();
+    let downstream = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::new("node-b", "static-shared").unwrap()),
+        registration_grace: std::time::Duration::from_millis(500),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    downstream.spawn();
+    let port = downstream
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let edge_secret = b"per-edge-secret-0123456789abcdef";
+    let wait_notify = downstream.pre_registration_wait_notify();
+    let waited = wait_notify.notified();
+    let upstream = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::hub_provisioned("node-a")),
+        reconnect_attempts: 0,
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    upstream.spawn();
+    let edge = upstream
+        .open_edge_deferred_for_job_with_secret(
+            Arc::new(TcpEdgeTransport::plaintext(addr, 1)),
+            quad,
+            "node-b".into(),
+            "job-early-per-edge".into(),
+            1,
+            Some(edge_secret),
+        )
+        .unwrap();
+    let branch = Arc::new(RecordingAck::default());
+    edge.sender
+        .send_async(Envelope::Data(
+            Arc::new(dictionary_batch(None)),
+            branch.clone(),
+        ))
+        .await
+        .unwrap();
+
+    // Register the edge only AFTER downstream's authorization loop confirmed
+    // it entered pre-registration grace on the first connection (with redials disabled).
+    tokio::time::timeout(std::time::Duration::from_secs(2), waited)
+        .await
+        .expect("downstream did not enter pre-registration wait in time");
+    let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+    downstream
+        .register_inbound_for_session_with_secret(
+            quad,
+            input_tx,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "job-early-per-edge".into(),
+                generation: 1,
+            },
+            Some(edge_secret),
+        )
+        .unwrap();
+
+    let env = next_envelope(&input_rx).await;
+    match env {
+        Envelope::Data(_, ack) => ack.ack().await.unwrap(),
+        _ => panic!("expected Data envelope"),
+    }
+    let ack_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !branch.acked.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < ack_deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    downstream.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_registration_waits_do_not_starve_registered_edges_in_static_mode() {
+    let downstream = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::new("node-b", "static-shared").unwrap()),
+        max_connections: 4,
+        registration_grace: std::time::Duration::from_secs(5),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    downstream.spawn();
+    let registered_quad = quad_a_to_b();
+    let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+    downstream
+        .register_inbound_for_session(
+            registered_quad,
+            input_tx,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "job-registered".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+    let port = downstream
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // Occupy the pre-registration wait slots (max_connections / 2 = 2) with
+    // unmatching handshakes; a third unmatching handshake must fail fast instead
+    // of exhausting max_connections, leaving room for registered connections.
+    let unknown_quad = Quad {
+        src_op: 9,
+        src_subtask: 0,
+        dst_op: 9,
+        dst_subtask: 0,
+    };
+    let bogus_creds = DataPlaneCredentials::new("node-rogue", "wrong-secret").unwrap();
+    let mut held_waiters = Vec::new();
+    for index in 0..2 {
+        let mut s = TcpEdgeTransport::plaintext(addr, 1)
+            .connect(unknown_quad)
+            .await
+            .unwrap();
+        let wait_notify = downstream.pre_registration_wait_notify();
+        let waited = wait_notify.notified();
+        let req = bogus_creds
+            .session("node-b", "unknown-job", index + 1, unknown_quad)
+            .client_handshake()
+            .unwrap();
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_frame_with_limit(
+            &mut s,
+            unknown_quad,
+            FrameKind::Handshake,
+            &payload,
+            MAX_FRAME_LEN,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waited)
+            .await
+            .unwrap();
+        held_waiters.push(s);
+    }
+
+    let mut third_rogue = TcpEdgeTransport::plaintext(addr, 1)
+        .connect(unknown_quad)
+        .await
+        .unwrap();
+    let req3 = bogus_creds
+        .session("node-b", "unknown-job", 99, unknown_quad)
+        .client_handshake()
+        .unwrap();
+    let payload3 = serde_json::to_vec(&req3).unwrap();
+    write_frame_with_limit(
+        &mut third_rogue,
+        unknown_quad,
+        FrameKind::Handshake,
+        &payload3,
+        MAX_FRAME_LEN,
+    )
+    .await
+    .unwrap();
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        read_frame_with_limits(&mut third_rogue, MAX_FRAME_LEN, None),
+    )
+    .await
+    .expect("third pre-registration waiter should be rejected immediately without stalling");
+    assert!(rejected.is_err());
+
+    let upstream = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::new("node-a", "static-shared").unwrap()),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    upstream.spawn();
+    let edge = upstream
+        .open_edge_deferred_for_job(
+            Arc::new(TcpEdgeTransport::plaintext(addr, 1)),
+            registered_quad,
+            "node-b".into(),
+            "job-registered".into(),
+            1,
+        )
+        .unwrap();
+    let ack = Arc::new(RecordingAck::default());
+    edge.sender
+        .send_async(Envelope::Data(
+            Arc::new(dictionary_batch(None)),
+            ack.clone(),
+        ))
+        .await
+        .unwrap();
+    match next_envelope(&input_rx).await {
+        Envelope::Data(_, a) => a.ack().await.unwrap(),
+        _ => panic!("expected Data envelope on registered edge"),
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !ack.acked.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    drop(held_waiters);
+    downstream.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_secret_handshake_rejection_does_not_consume_replay_nonce() {
+    let quad = quad_a_to_b();
+    let downstream = authenticated_manager("node-b", "real-secret");
+    downstream.spawn();
+    let (input_tx, _input_rx) = flume::bounded::<Envelope>(8);
+    downstream
+        .register_inbound_for_session(
+            quad,
+            input_tx,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "job-nonce-preserve".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+
+    // Prepare valid signed handshake and an invalid-MAC copy sharing its exact nonce.
+    let good_auth = DataPlaneCredentials::new("node-a", "real-secret")
+        .unwrap()
+        .session("node-b", "job-nonce-preserve", 1, quad);
+    let good_req = good_auth.client_handshake().unwrap();
+    let good_bytes = serde_json::to_vec(&good_req).unwrap();
+
+    let mut bad_json = serde_json::to_value(&good_req).unwrap();
+    bad_json["mac"] = serde_json::json!(vec![0u8; 32]);
+    let bad_bytes = serde_json::to_vec(&bad_json).unwrap();
+
+    // Attacker sends invalid MAC with `good_req`'s nonce -> rejected before claiming nonce.
+    let (mut bad_client, bad_server) = tokio::io::duplex(16 * 1024);
+    downstream.accept_stream(Box::new(bad_server));
+    write_frame(&mut bad_client, quad, FrameKind::Handshake, &bad_bytes)
+        .await
+        .unwrap();
+    assert!(read_frame(&mut bad_client).await.is_err());
+
+    // Legitimate client presents `good_req` with the exact same nonce -> succeeds.
+    let (mut good_client, good_server) = tokio::io::duplex(16 * 1024);
+    downstream.accept_stream(Box::new(good_server));
+    write_frame(&mut good_client, quad, FrameKind::Handshake, &good_bytes)
+        .await
+        .unwrap();
+    let (_ack_hdr, ack_bytes) = read_frame(&mut good_client).await.unwrap();
+    let ack: HandshakePayload = serde_json::from_slice(&ack_bytes).unwrap();
+    assert_eq!(ack.source_node, "node-b");
+
+    // Replaying `good_bytes` a second time IS rejected by the replay cache.
+    let (mut replay_client, replay_server) = tokio::io::duplex(16 * 1024);
+    downstream.accept_stream(Box::new(replay_server));
+    write_frame(&mut replay_client, quad, FrameKind::Handshake, &good_bytes)
+        .await
+        .unwrap();
+    assert!(read_frame(&mut replay_client).await.is_err());
+
+    downstream.shutdown();
 }

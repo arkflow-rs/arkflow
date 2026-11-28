@@ -29,7 +29,12 @@ spec:
           env:
             # Same-origin proxy target: the in-chart Hub Service.
             - name: ARKFLOW_HUB_UPSTREAM
-              value: {{ printf "http://%s:8080" (include "arkflow.hubName" .) | quote }}
+              {{- $hubScheme := ternary "https" "http" .Values.controlPlane.tls.enabled }}
+              value: {{ printf "%s://%s:8080" $hubScheme (include "arkflow.hubName" .) | quote }}
+            {{- if include "arkflow.cpTlsEnabled" . | eq "true" }}
+            - name: ARKFLOW_HUB_PROXY_SSL
+              value: {{ printf "proxy_ssl_verify on; proxy_ssl_trusted_certificate /etc/arkflow/tls/ca.crt; proxy_ssl_name %s; proxy_ssl_server_name on;" (include "arkflow.hubName" .) | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 80
@@ -48,4 +53,19 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.controlPlane.console.resources | nindent 12 }}
+          {{- if include "arkflow.cpTlsEnabled" . | eq "true" }}
+          volumeMounts:
+            - name: hub-ca
+              mountPath: /etc/arkflow/tls
+              readOnly: true
+          {{- end }}
+      {{- if include "arkflow.cpTlsEnabled" . | eq "true" }}
+      volumes:
+        - name: hub-ca
+          secret:
+            secretName: {{ include "arkflow.cpTlsSecretName" . }}
+            items:
+              - key: {{ default "ca.crt" .Values.controlPlane.tls.caKey | quote }}
+                path: ca.crt
+      {{- end }}
 {{- end }}

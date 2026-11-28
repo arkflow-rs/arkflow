@@ -128,15 +128,25 @@ pub(crate) fn rank_candidates(
 }
 
 impl Hub {
-    /// Deterministic fingerprint of one node's dispatched assignment (the
-    /// sorted task-id set hashed with a fixed-key hasher). Both the
-    /// dispatch-skip gate and the drift fencing compare these; the value is
-    /// process-local and never persisted.
+    /// Deterministic fingerprint of one node's dispatched assignment and its
+    /// edge-local split-placement context (the peer tasks/nodes/data-ports
+    /// directly connected to `node_id` via `plan.spec.edges` and the node's
+    /// touching `edge_secrets`). When a peer node is replaced, connected nodes
+    /// refresh their wiring and secrets while unconnected survivors stay idle.
     fn assignment_fingerprint(
         assignments: &[arkflow_core::job::TaskAttempt],
         node_id: &str,
+        split_context: Option<SplitEdgeFingerprintContext<'_>>,
     ) -> u64 {
         use std::hash::{Hash, Hasher};
+        type LocalEdgeKey<'a> = (
+            &'a str,
+            &'a str,
+            Option<&'a str>,
+            &'a str,
+            &'a str,
+            Option<&'a str>,
+        );
         let mut ids: Vec<&str> = assignments
             .iter()
             .filter(|assignment| assignment.node_id == node_id)
@@ -145,9 +155,69 @@ impl Hub {
         ids.sort_unstable();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         ids.hash(&mut hasher);
+        if let Some(ctx) = split_context {
+            1u8.hash(&mut hasher);
+            let mut local_edges: Vec<LocalEdgeKey<'_>> = Vec::new();
+            for edge in &ctx.plan.spec.edges {
+                for src_task in ctx
+                    .plan
+                    .tasks
+                    .iter()
+                    .filter(|task| task.operator_id == edge.from)
+                {
+                    let Some(src_node) = ctx.task_nodes.get(&src_task.id) else {
+                        continue;
+                    };
+                    for dst_task in ctx
+                        .plan
+                        .tasks
+                        .iter()
+                        .filter(|task| task.operator_id == edge.to)
+                    {
+                        let Some(dst_node) = ctx.task_nodes.get(&dst_task.id) else {
+                            continue;
+                        };
+                        if src_node != dst_node && (src_node == node_id || dst_node == node_id) {
+                            local_edges.push((
+                                src_task.id.as_str(),
+                                src_node.as_str(),
+                                ctx.node_data_ports.get(src_node).map(String::as_str),
+                                dst_task.id.as_str(),
+                                dst_node.as_str(),
+                                ctx.node_data_ports.get(dst_node).map(String::as_str),
+                            ));
+                        }
+                    }
+                }
+            }
+            local_edges.sort_unstable();
+            local_edges.hash(&mut hasher);
+            if let Some(secrets) = ctx.edge_secrets {
+                let node_secrets: Vec<(&str, &str, &str)> = secrets
+                    .iter()
+                    .filter(|((src, dst), _)| src == node_id || dst == node_id)
+                    .map(|((src, dst), secret)| (src.as_str(), dst.as_str(), secret.as_str()))
+                    .collect();
+                node_secrets.hash(&mut hasher);
+            } else {
+                0usize.hash(&mut hasher);
+            }
+        } else {
+            0u8.hash(&mut hasher);
+        }
         hasher.finish()
     }
+}
 
+#[derive(Clone, Copy)]
+struct SplitEdgeFingerprintContext<'a> {
+    plan: &'a arkflow_core::job::JobPlan,
+    task_nodes: &'a BTreeMap<String, String>,
+    node_data_ports: &'a BTreeMap<String, String>,
+    edge_secrets: Option<&'a BTreeMap<(String, String), String>>,
+}
+
+impl Hub {
     /// Reconcile a bounded set of durable Jobs so Agent failures and Hub
     /// recovery converge without waiting for a new lifecycle request.
     /// The retained placement set, in the order its placement was actually
@@ -880,6 +950,29 @@ impl Hub {
         // so each node's graph build can wire its remote edges without any
         // further lookup.
         let mut split_payload = None;
+        let mut split_edge_context: Option<(BTreeMap<String, String>, BTreeMap<String, String>)> =
+            None;
+        let mut job_edge_secrets: Option<BTreeMap<(String, String), String>> = None;
+        if operation == AgentOperation::JobStop {
+            let has_cached_secrets = self
+                .job_edge_secrets
+                .read()
+                .await
+                .keys()
+                .any(|(job_id, _)| job_id == &job.job_id);
+            if has_cached_secrets {
+                if let Some(storage) = self.storage.as_ref() {
+                    storage
+                        .delete_job_edge_secrets(&job.job_id)
+                        .await
+                        .map_err(HubError::from)?;
+                }
+                self.job_edge_secrets
+                    .write()
+                    .await
+                    .retain(|(job_id, _), _| job_id != &job.job_id);
+            }
+        }
         if spec.placement == arkflow_core::job::PlacementStrategy::Split {
             let nodes = self.nodes.read().await;
             let mut node_data_ports = BTreeMap::new();
@@ -911,10 +1004,112 @@ impl Hub {
             for assignment in &assignments {
                 task_nodes.insert(assignment.task_id.clone(), assignment.node_id.clone());
             }
+            if operation == AgentOperation::JobStart {
+                let mut cross_edges: std::collections::BTreeSet<(String, String)> =
+                    std::collections::BTreeSet::new();
+                for edge in &plan.spec.edges {
+                    for src_task in plan
+                        .tasks
+                        .iter()
+                        .filter(|task| task.operator_id == edge.from)
+                    {
+                        let Some(src_node) = task_nodes.get(&src_task.id) else {
+                            continue;
+                        };
+                        for dst_task in plan.tasks.iter().filter(|task| task.operator_id == edge.to)
+                        {
+                            let Some(dst_node) = task_nodes.get(&dst_task.id) else {
+                                continue;
+                            };
+                            if src_node != dst_node {
+                                cross_edges.insert((src_node.clone(), dst_node.clone()));
+                            }
+                        }
+                    }
+                }
+                let (stale_generation, needs_persist, secrets_for_gen, persisted_records) = {
+                    let cache = self.job_edge_secrets.read().await;
+                    let newer_cached = cache
+                        .keys()
+                        .any(|(id, gen)| id == &job.job_id && *gen > job.generation);
+                    if newer_cached {
+                        (true, false, BTreeMap::new(), Vec::new())
+                    } else {
+                        let has_older_gen = cache
+                            .keys()
+                            .any(|(id, gen)| id == &job.job_id && *gen < job.generation);
+                        let existing_for_gen = cache.get(&(job.job_id.clone(), job.generation));
+                        let mut desired = existing_for_gen.cloned().unwrap_or_default();
+                        for edge_pair in &cross_edges {
+                            desired.entry(edge_pair.clone()).or_insert_with(|| {
+                                use rand::TryRngCore;
+                                let mut bytes = [0u8; 32];
+                                rand::rngs::OsRng
+                                    .try_fill_bytes(&mut bytes)
+                                    .expect("OS RNG cannot fail");
+                                bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+                            });
+                        }
+                        let changed = existing_for_gen
+                            .is_none_or(|existing| existing.len() != desired.len())
+                            || has_older_gen;
+                        let records = if changed {
+                            desired
+                                .iter()
+                                .map(|((src_node, dst_node), secret_hex)| {
+                                    crate::storage::JobEdgeSecretRecord {
+                                        job_id: job.job_id.clone(),
+                                        generation: job.generation,
+                                        src_node: src_node.clone(),
+                                        dst_node: dst_node.clone(),
+                                        secret_hex: secret_hex.clone(),
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        (false, changed, desired, records)
+                    }
+                };
+                if stale_generation {
+                    return Ok(0);
+                }
+                if needs_persist {
+                    if let Some(storage) = self.storage.as_ref() {
+                        let applied = storage
+                            .upsert_job_edge_secrets(&job.job_id, job.generation, persisted_records)
+                            .await
+                            .map_err(HubError::from)?;
+                        if !applied {
+                            return Ok(0);
+                        }
+                    }
+                    let mut cache = self.job_edge_secrets.write().await;
+                    if cache
+                        .keys()
+                        .any(|(id, gen)| id == &job.job_id && *gen > job.generation)
+                    {
+                        return Ok(0);
+                    }
+                    cache.retain(|(id, gen), _| id != &job.job_id || *gen == job.generation);
+                    cache.insert(
+                        (job.job_id.clone(), job.generation),
+                        secrets_for_gen.clone(),
+                    );
+                }
+                job_edge_secrets = Some(
+                    secrets_for_gen
+                        .into_iter()
+                        .filter(|(edge_pair, _)| cross_edges.contains(edge_pair))
+                        .collect(),
+                );
+            }
             split_payload = Some(serde_json::json!({
-                "task_nodes": task_nodes,
-                "node_data_ports": node_data_ports,
+                "task_nodes": &task_nodes,
+                "node_data_ports": &node_data_ports,
             }));
+            split_edge_context = Some((task_nodes, node_data_ports));
         }
         // The dispatch order is only real once the target set validated: a
         // reconcile that fails validation above dispatches nothing, and
@@ -951,7 +1146,10 @@ impl Hub {
                         if operation_record.resource_id != job.job_id
                             || operation_record.operation != AgentOperation::JobStart
                             || operation_record.generation != job.generation
-                            || operation_record.state != HubOperationState::Succeeded
+                            || !matches!(
+                                operation_record.state,
+                                HubOperationState::Succeeded | HubOperationState::Queued
+                            )
                         {
                             return false;
                         }
@@ -968,11 +1166,23 @@ impl Hub {
                         // No recorded fingerprint means the Hub cannot prove
                         // assignment continuity (restart wiped the memory):
                         // re-dispatch rather than trust a stale claim.
+                        let split_fingerprint_context =
+                            split_edge_context
+                                .as_ref()
+                                .map(
+                                    |(task_nodes, node_data_ports)| SplitEdgeFingerprintContext {
+                                        plan: &plan,
+                                        task_nodes,
+                                        node_data_ports,
+                                        edge_secrets: job_edge_secrets.as_ref(),
+                                    },
+                                );
                         recorded.is_none_or(|recorded| {
                             recorded
                                 != Self::assignment_fingerprint(
                                     &assignments,
                                     &operation_record.node_id,
+                                    split_fingerprint_context,
                                 )
                         })
                     })
@@ -980,20 +1190,54 @@ impl Hub {
                     .collect()
             };
             drop(recorded_fingerprints);
+            let mut leased_abandoned_nodes: BTreeSet<String> = BTreeSet::new();
             if !abandoned.is_empty() {
-                // Apply the in-memory transition under the write lock, then
-                // persist OUTSIDE it: the storage round-trips are async and
-                // holding the operations write lock across them would block
-                // every agent poll, report, and command result for the
-                // duration of the I/O.
+                // Recheck abandoned starts while holding `nodes -> operations`
+                // atomically so a `commands()` poll cannot move a Queued start
+                // into `leased_commands` between queue pruning and marking it
+                // `Superseded`. Already-leased starts stay non-Superseded and
+                // are fenced via `JobStop` before any replacement is dispatched.
                 let mut superseded = Vec::with_capacity(abandoned.len());
                 {
+                    let mut nodes = self.nodes.write().await;
                     let mut operations = self.operations.write().await;
-                    for mut record in abandoned {
-                        record.state = HubOperationState::Superseded;
-                        record.superseded_generation = Some(job.generation);
-                        operations.insert(record.id.clone(), record.clone());
-                        superseded.push(record);
+                    for candidate in abandoned {
+                        let Some(record) = operations.get_mut(&candidate.id) else {
+                            continue;
+                        };
+                        match record.state {
+                            HubOperationState::Succeeded => {
+                                record.state = HubOperationState::Superseded;
+                                record.superseded_generation = Some(job.generation);
+                                superseded.push(record.clone());
+                            }
+                            HubOperationState::Queued => {
+                                let unleased_in_queue =
+                                    nodes.get(&record.node_id).is_some_and(|node| {
+                                        !node.leased_commands.contains_key(&record.command_id)
+                                            && node
+                                                .commands
+                                                .iter()
+                                                .any(|cmd| cmd.operation_id == record.id)
+                                    });
+                                if unleased_in_queue {
+                                    if let Some(node) = nodes.get_mut(&record.node_id) {
+                                        node.commands.retain(|cmd| cmd.operation_id != record.id);
+                                    }
+                                    record.state = HubOperationState::Superseded;
+                                    record.superseded_generation = Some(job.generation);
+                                    superseded.push(record.clone());
+                                } else {
+                                    leased_abandoned_nodes.insert(record.node_id.clone());
+                                }
+                            }
+                            HubOperationState::Dispatched
+                            | HubOperationState::Acknowledged
+                            | HubOperationState::Running => {
+                                leased_abandoned_nodes.insert(record.node_id.clone());
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 if let Some(storage) = self.storage.as_ref() {
@@ -1007,9 +1251,16 @@ impl Hub {
             // A target that is still valid for the new generation does not
             // need a stop/start bounce. Every historical placement outside
             // the desired set is stale and must be fenced, including starts
-            // recorded under an older generation.
-            let nodes_to_stop = historical_nodes.difference(&target_ids).collect::<Vec<_>>();
-            for node_id in nodes_to_stop {
+            // recorded under an older generation or recently leased starts.
+            let mut nodes_to_stop: BTreeSet<String> =
+                historical_nodes.difference(&target_ids).cloned().collect();
+            for node_id in &leased_abandoned_nodes {
+                if !target_ids.contains(node_id) {
+                    nodes_to_stop.insert(node_id.clone());
+                }
+            }
+            let mut pending_fenced_abandonment = false;
+            for node_id in &nodes_to_stop {
                 // The same terminal-state memory as the dispatch loop: a
                 // Succeeded stop for this (node, job, generation) already
                 // fenced the abandoned placement; re-enqueuing it every tick
@@ -1028,6 +1279,9 @@ impl Hub {
                     });
                 if stop_settled {
                     continue;
+                }
+                if leased_abandoned_nodes.contains(node_id) {
+                    pending_fenced_abandonment = true;
                 }
                 let is_online = self.nodes.read().await.get(node_id).is_some_and(|node| {
                     node.resource.state == NodeConnectionState::Online
@@ -1051,6 +1305,9 @@ impl Hub {
                     )
                     .await?;
                 }
+            }
+            if pending_fenced_abandonment {
+                return Ok(0);
             }
         }
         let explicit_recovery_id = job.checkpoint_id.clone();
@@ -1105,6 +1362,17 @@ impl Hub {
             // recorded assignment fingerprint to match the computed
             // assignment: a Succeeded start must not suppress a start for a
             // mapping it was never dispatched with.
+            let split_fingerprint_context =
+                split_edge_context
+                    .as_ref()
+                    .map(
+                        |(task_nodes, node_data_ports)| SplitEdgeFingerprintContext {
+                            plan: &plan,
+                            task_nodes,
+                            node_data_ports,
+                            edge_secrets: job_edge_secrets.as_ref(),
+                        },
+                    );
             let fingerprint_matches = operation != AgentOperation::JobStart
                 || self
                     .start_dispatch_fingerprints
@@ -1112,7 +1380,12 @@ impl Hub {
                     .await
                     .get(&(job.job_id.clone(), node_id.clone(), job.generation))
                     .is_some_and(|recorded| {
-                        *recorded == Self::assignment_fingerprint(&assignments, node_id.as_str())
+                        *recorded
+                            == Self::assignment_fingerprint(
+                                &assignments,
+                                node_id.as_str(),
+                                split_fingerprint_context,
+                            )
                     });
             let already_terminal = fingerprint_matches
                 && self
@@ -1155,35 +1428,67 @@ impl Hub {
                     base.insert(key.clone(), value.clone());
                 }
             }
+            if let (Some(base), Some(all_secrets)) =
+                (payload_value.as_object_mut(), job_edge_secrets.as_ref())
+            {
+                let node_secrets: Vec<serde_json::Value> = all_secrets
+                    .iter()
+                    .filter(|((src, dst), _)| src == &node_id || dst == &node_id)
+                    .map(|((src, dst), secret)| {
+                        serde_json::json!({
+                            "src": src,
+                            "dst": dst,
+                            "secret": secret,
+                        })
+                    })
+                    .collect();
+                if !node_secrets.is_empty() {
+                    base.insert(
+                        "edge_secrets".to_string(),
+                        serde_json::Value::Array(node_secrets),
+                    );
+                }
+            }
             let payload = Some(payload_value);
             let fingerprint = if operation == AgentOperation::JobStart {
                 Some((
                     node_id.clone(),
-                    Self::assignment_fingerprint(&assignments, node_id.as_str()),
+                    Self::assignment_fingerprint(
+                        &assignments,
+                        node_id.as_str(),
+                        split_fingerprint_context,
+                    ),
                 ))
             } else {
                 None
             };
-            self.enqueue_with_metadata_as(
-                node_id,
-                operation.clone(),
-                job.job_id.clone(),
-                None,
-                payload.clone(),
-                job.generation,
-                None,
-                None,
-                None,
-                None,
-                None,
-                actor,
-            )
-            .await?;
+            let (enqueued, created) = self
+                .enqueue_with_metadata_checked_as(
+                    node_id,
+                    operation.clone(),
+                    job.job_id.clone(),
+                    None,
+                    payload.clone(),
+                    job.generation,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    actor,
+                )
+                .await?;
             if let Some((node_id, fingerprint)) = fingerprint {
-                self.start_dispatch_fingerprints
-                    .write()
-                    .await
-                    .insert((job.job_id.clone(), node_id, job.generation), fingerprint);
+                if created
+                    || self
+                        .command_payload_matches(&enqueued.node_id, &enqueued.command_id, &payload)
+                        .await
+                {
+                    self.start_dispatch_fingerprints
+                        .write()
+                        .await
+                        .insert((job.job_id.clone(), node_id, job.generation), fingerprint);
+                }
             }
             dispatched += 1;
         }

@@ -42,6 +42,7 @@ num_cpus = "1.17.0"
 tokio-rustls = { workspace = true, features = ["ring"] }
 rustls-pemfile = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+x509-parser = { workspace = true }
 # Exactly one provider so rustls can pick a process default without ambiguity.
 
 [dev-dependencies]

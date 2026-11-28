@@ -10,6 +10,9 @@ description: 每个 ArkFlow 网络组件的加密传输启用方式。
 
 | Component | TLS 机制 |
 |-----------|--------------|
+| 控制面 Hub (`arkflow-server`) | `ARKFLOW_HUB_TLS_CERT` + `ARKFLOW_HUB_TLS_KEY`;附加 `ARKFLOW_HUB_TLS_CA` + `ARKFLOW_HUB_TLS_CLIENT_AUTH`(`agent_required` \| `required` \| `none`)启用 mTLS 及可选的 `urn:arkflow:node:<id>` SAN 绑定 |
+| 控制面 Agent (`arkflow`) | `health_check.hub_urls` 使用 `https://`,`ARKFLOW_AGENT_TLS_CA`(`tls_ca`),并成对设置 `ARKFLOW_AGENT_TLS_CERT` / `ARKFLOW_AGENT_TLS_KEY`(`tls_cert` / `tls_key`) |
+| 数据面 shuffle(Agent ↔ Agent) | `ARKFLOW_DATA_PLANE_TLS_CA` + `ARKFLOW_DATA_PLANE_TLS_CERT` + `ARKFLOW_DATA_PLANE_TLS_KEY`(`DNS:arkflow-data-plane` + 可选 `URI:urn:arkflow:node:<id>`);自动进入 `hub_provisioned` 逐边 HMAC 密钥模式,无需 `ARKFLOW_DATA_PLANE_SECRET` |
 | kafka (input/output) | rdkafka `security.protocol` + broker/CA 配置 |
 | mqtt (input/output) | `tls` 块(`enabled`、`ca`、`client_cert`、`client_key`) |
 | nats (input/output) | `tls://` URL 方案(由 async-nats 原生协商) |

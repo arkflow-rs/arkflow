@@ -843,7 +843,7 @@ fn session_hash(session_id: &str) -> String {
         .collect()
 }
 
-fn generate_credential_id() -> Result<String, HubError> {
+pub(crate) fn generate_credential_id() -> Result<String, HubError> {
     use rand::TryRngCore;
     let mut bytes = [0u8; 8];
     rand::rngs::OsRng

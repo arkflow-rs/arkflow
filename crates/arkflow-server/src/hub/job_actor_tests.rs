@@ -28,11 +28,15 @@ fn config() -> HubConfig {
     }
 }
 
-async fn register(hub: &Hub, capabilities: &[&str]) -> AgentAuth {
+async fn register_with_token(
+    hub: &Hub,
+    capabilities: &[&str],
+    node_token: &str,
+) -> (AgentAuth, Option<String>) {
     let registration = hub
         .register(RegisterRequest {
             node_id: "compute-1".into(),
-            node_token: "node-secret".into(),
+            node_token: node_token.into(),
             protocol_version: "v1".into(),
             capabilities: capabilities.iter().map(|value| (*value).into()).collect(),
             data_address: None,
@@ -40,17 +44,34 @@ async fn register(hub: &Hub, capabilities: &[&str]) -> AgentAuth {
         })
         .await
         .unwrap();
-    AgentAuth {
-        node_id: registration.node_id,
-        session_token: registration.session_token,
-    }
+    (
+        AgentAuth {
+            node_id: registration.node_id,
+            session_token: registration.session_token,
+        },
+        registration.node_credential,
+    )
+}
+
+async fn register(hub: &Hub, capabilities: &[&str]) -> AgentAuth {
+    register_with_token(hub, capabilities, "node-secret")
+        .await
+        .0
+}
+
+async fn fixture_with_cred(
+    label: &str,
+    capabilities: &[&str],
+) -> (Hub, StorageActor, Router, AgentAuth, Option<String>) {
+    let storage = StorageActor::start(ControlPlaneStore::contract(label).await, 8);
+    let hub = Hub::with_storage(config(), storage.clone());
+    let (auth, cred) = register_with_token(&hub, capabilities, "node-secret").await;
+    let app = hub_router(hub.clone(), &ServerConfig::default());
+    (hub, storage, app, auth, cred)
 }
 
 async fn fixture(label: &str, capabilities: &[&str]) -> (Hub, StorageActor, Router, AgentAuth) {
-    let storage = StorageActor::start(ControlPlaneStore::contract(label).await, 8);
-    let hub = Hub::with_storage(config(), storage.clone());
-    let auth = register(&hub, capabilities).await;
-    let app = hub_router(hub.clone(), &ServerConfig::default());
+    let (hub, storage, app, auth, _) = fixture_with_cred(label, capabilities).await;
     (hub, storage, app, auth)
 }
 
@@ -325,8 +346,8 @@ async fn background_job_dispatch_and_rejection_use_system() {
 
 #[tokio::test]
 async fn job_actor_survives_json_recovery_and_reconcile_retry() {
-    let (hub, storage, app, _) =
-        fixture("recovered_job_actor", &["job_runtime", "state_backend"]).await;
+    let (hub, storage, app, _, cred) =
+        fixture_with_cred("recovered_job_actor", &["job_runtime", "state_backend"]).await;
     hub.upsert_job_as(job("running"), "alice").await.unwrap();
     let original = hub.operations(None).await.pop().unwrap();
     let persisted = storage
@@ -345,7 +366,12 @@ async fn job_actor_survives_json_recovery_and_reconcile_retry() {
     assert_eq!(recovered.actor.as_deref(), Some("alice"));
     assert_eq!(recovered.state, HubOperationState::TimedOut);
     restored.recover_persisted_state().await.unwrap();
-    register(&restored, &["job_runtime", "state_backend"]).await;
+    register_with_token(
+        &restored,
+        &["job_runtime", "state_backend"],
+        cred.as_deref().unwrap_or("node-secret"),
+    )
+    .await;
     let first_retry = restored
         .operations(None)
         .await

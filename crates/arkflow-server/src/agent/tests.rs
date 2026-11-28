@@ -671,6 +671,7 @@ async fn insert_exited_task(
             recovery_required: false,
             cancellation: CancellationToken::new(),
             assignments: Vec::new(),
+            edge_context_fingerprint: 0,
             dedicated_runtime: None,
             watermark_partitions: BTreeMap::new(),
             state,
@@ -1103,6 +1104,10 @@ async fn checkpoint_execution_failure_is_ready_for_terminal_result() {
         data_port: None,
         report_interval: Duration::from_secs(5),
         poll_interval: Duration::from_secs(5),
+        node_credential_file: None,
+        tls_ca: None,
+        tls_cert: None,
+        tls_key: None,
     };
     let error = execute_job_operation(&command, &config, &JobRuntime::default())
         .await
@@ -1719,6 +1724,7 @@ async fn dropping_a_task_with_a_dedicated_runtime_never_panics() {
             recovery_required: false,
             cancellation: CancellationToken::new(),
             assignments: Vec::new(),
+            edge_context_fingerprint: 0,
             dedicated_runtime: Some(Arc::new(dedicated)),
             watermark_partitions: BTreeMap::new(),
             state: Arc::new(
@@ -2455,6 +2461,7 @@ fn dropping_a_task_outside_any_runtime_takes_the_bare_thread_path() {
                 recovery_required: false,
                 cancellation: CancellationToken::new(),
                 assignments: Vec::new(),
+                edge_context_fingerprint: 0,
                 dedicated_runtime: Some(Arc::new(dedicated)),
                 watermark_partitions: BTreeMap::new(),
                 state: Arc::new(
@@ -2490,6 +2497,7 @@ async fn metrics_count_ephemeral_and_recovery_required_jobs() {
                 recovery_required: recovery,
                 cancellation: CancellationToken::new(),
                 assignments: Vec::new(),
+                edge_context_fingerprint: 0,
                 dedicated_runtime: None,
                 watermark_partitions: BTreeMap::new(),
                 state,
@@ -3508,6 +3516,7 @@ async fn split_payloads_with_peer_addresses_wire_remote_context() {
             ("bad-node".into(), "not-a-socket-address".into()),
         ]),
         recovery_required: false,
+        edge_secrets: BTreeMap::new(),
     };
     runtime
         .start(plan, assignments, 1, None, false, "node-a", &split)
@@ -3647,6 +3656,10 @@ fn test_node_config(hub_url: &str) -> NodeAgentConfig {
         poll_interval: Duration::from_secs(5),
         data_port: None,
         data_host: None,
+        node_credential_file: None,
+        tls_ca: None,
+        tls_cert: None,
+        tls_key: None,
     }
 }
 
@@ -4185,6 +4198,10 @@ async fn agent_session_reports_and_delivers_job_observations() {
             poll_interval: Duration::from_millis(20),
             data_port: None,
             data_host: None,
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         agent_cancel.clone(),
     ));
@@ -4289,6 +4306,10 @@ async fn data_plane_setup_advertises_or_degrades_gracefully() {
                 poll_interval: Duration::from_millis(50),
                 data_port,
                 data_host,
+                node_credential_file: None,
+                tls_ca: None,
+                tls_cert: None,
+                tls_key: None,
             },
             cancel.clone(),
         ));
@@ -4428,6 +4449,10 @@ async fn failed_registration_backs_off_and_exits_cleanly() {
             poll_interval: Duration::from_millis(50),
             data_port: None,
             data_host: None,
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         cancel.clone(),
     ));
@@ -5167,6 +5192,7 @@ async fn remote_context_uses_the_full_task_map_and_degrades_without_ports() {
         ])),
         node_data_ports: BTreeMap::from([("node-a".into(), "127.0.0.1:39601".into())]),
         recovery_required: false,
+        edge_secrets: BTreeMap::new(),
     };
     runtime
         .start(plan, assignments, 1, None, false, "node-a", &split)
@@ -5185,6 +5211,7 @@ async fn remote_context_uses_the_full_task_map_and_degrades_without_ports() {
         ])),
         node_data_ports: BTreeMap::new(),
         recovery_required: false,
+        edge_secrets: BTreeMap::new(),
     };
     runtime
         .start(plan, assignments, 1, None, false, "node-a", &split)
@@ -5220,6 +5247,10 @@ async fn pre_cancelled_agent_shuts_its_data_plane_down() {
             poll_interval: Duration::from_millis(50),
             data_port: Some(0),
             data_host: Some("127.0.0.1".into()),
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         cancel,
     )
@@ -5251,6 +5282,10 @@ async fn agent_session_reconnects_after_the_hub_goes_away() {
             poll_interval: Duration::from_millis(50),
             data_port: None,
             data_host: None,
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         cancel.clone(),
     ));
@@ -5354,6 +5389,10 @@ fn fast_session_config(hub_url: &str) -> NodeAgentConfig {
         poll_interval: Duration::from_millis(20),
         data_port: None,
         data_host: None,
+        node_credential_file: None,
+        tls_ca: None,
+        tls_cert: None,
+        tls_key: None,
     }
 }
 
@@ -5662,6 +5701,7 @@ fn stub_session() -> crate::hub::RegisterResponse {
         lease_ttl_ms: 0,
         poll_interval_ms: 0,
         protocol_version: "v1".into(),
+        node_credential: None,
     }
 }
 
@@ -6064,6 +6104,7 @@ async fn take_finished_reports_a_panicked_kernel_join() {
             recovery_required: false,
             cancellation: CancellationToken::new(),
             assignments: Vec::new(),
+            edge_context_fingerprint: 0,
             dedicated_runtime: None,
             watermark_partitions: BTreeMap::new(),
             state,
@@ -6326,6 +6367,10 @@ async fn pre_cancelled_agent_without_a_secret_skips_the_data_plane() {
             poll_interval: Duration::from_millis(50),
             data_port: Some(0),
             data_host: Some("127.0.0.1".into()),
+            node_credential_file: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         },
         cancel,
     )
@@ -6396,4 +6441,532 @@ fn data_plane_env_limits_fail_loud_on_malformed_values() {
         .collect();
     let mut config = arkflow_core::executor::remote::NetworkManagerConfig::default();
     apply_data_plane_limits_from(&mut config, |name| env.get(name).cloned()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_retains_enrolled_node_credential_to_file_and_reloads_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let cred_path = dir.path().join("nested").join("node.cred");
+    let cred_path_str = cred_path.to_str().unwrap().to_owned();
+
+    let storage = crate::storage::StorageActor::start(
+        crate::storage::ControlPlaneStore::contract("agent_credential_retention").await,
+        8,
+    );
+    let hub = crate::hub::Hub::with_storage(
+        crate::hub::HubConfig {
+            operator_token: Some("ops|admin|op-secret".into()),
+            node_token: Some("shared-bootstrap-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 20,
+            session_ttl_ms: crate::hub::default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: crate::hub::default_approval_ttl_ms(),
+        },
+        storage,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hub_cancel = CancellationToken::new();
+    let router = crate::api::hub_router(hub.clone(), &crate::api::ServerConfig::default());
+    let hub_stop = hub_cancel.clone();
+    let hub_task = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .with_graceful_shutdown(hub_stop.cancelled_owned())
+            .await
+    });
+    let hub_url = format!("http://{addr}");
+
+    // First agent boot uses shared bootstrap token; Hub enrolls & issues arkn_...
+    let mut cfg = fast_session_config(&hub_url);
+    cfg.node_token = "shared-bootstrap-secret".into();
+    cfg.node_credential_file = Some(cred_path_str.clone());
+    let cancel1 = CancellationToken::new();
+    let mut agent1 = tokio::spawn(run(empty_control_plane(), cfg.clone(), cancel1.clone()));
+    wait_for(Duration::from_secs(10), || {
+        let cred_path = cred_path.clone();
+        async move { cred_path.exists() }
+    })
+    .await;
+    cancel1.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent1).await;
+    agent1.abort();
+
+    let saved = std::fs::read_to_string(&cred_path).unwrap();
+    assert!(
+        saved.trim().starts_with("arkn_"),
+        "expected persisted per-node credential, got {saved:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&cred_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "credential file must have 0600 permissions");
+    }
+
+    // Remove in-memory node record so we observe second boot's fresh registration;
+    // second agent boot STILL starts with config.node_token = shared-bootstrap-secret
+    // (which would be rejected by the Hub!), so it succeeds ONLY by loading cred_path.
+    let cancel2 = CancellationToken::new();
+    let mut cfg2 = fast_session_config(&hub_url);
+    cfg2.boot_id = "boot-reloaded".into();
+    cfg2.node_token = "shared-bootstrap-secret".into();
+    cfg2.node_credential_file = Some(cred_path_str);
+    let mut agent2 = tokio::spawn(run(empty_control_plane(), cfg2, cancel2.clone()));
+    wait_for(Duration::from_secs(10), || {
+        let hub = hub.clone();
+        async move {
+            hub.audit(Some("node-a"))
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|row| row.action == "agent.register" && row.outcome == "accepted")
+                .count()
+                >= 2
+        }
+    })
+    .await;
+    cancel2.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent2).await;
+    agent2.abort();
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_plane_tls_without_shared_secret_binds_hub_provisioned_data_plane() {
+    let _guard = ENV_LOCK.lock().await;
+    use rcgen::{CertificateParams, IsCa, Issuer, KeyPair};
+    let dir = tempfile::tempdir().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, &ca_key);
+    let node_params = CertificateParams::new(vec!["arkflow-data-plane".to_owned()]).unwrap();
+    let node_key = KeyPair::generate().unwrap();
+    let node_cert = node_params.signed_by(&node_key, &issuer).unwrap();
+
+    let ca_path = dir.path().join("ca.crt");
+    let cert_path = dir.path().join("node.crt");
+    let key_path = dir.path().join("node.key");
+    std::fs::write(&ca_path, ca.pem()).unwrap();
+    std::fs::write(&cert_path, node_cert.pem()).unwrap();
+    std::fs::write(&key_path, node_key.serialize_pem()).unwrap();
+
+    unsafe {
+        std::env::remove_var("ARKFLOW_DATA_PLANE_SECRET");
+        std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CA", &ca_path);
+        std::env::set_var("ARKFLOW_DATA_PLANE_TLS_CERT", &cert_path);
+        std::env::set_var("ARKFLOW_DATA_PLANE_TLS_KEY", &key_path);
+    }
+
+    let (hub, hub_url, hub_cancel, hub_server) = spawned_hub().await;
+    let cancel = CancellationToken::new();
+    let mut cfg = fast_session_config(&hub_url);
+    cfg.node_id = "node-hub-prov".into();
+    cfg.data_port = Some(0);
+    cfg.data_host = Some("127.0.0.1".into());
+    let mut agent_task = tokio::spawn(run(empty_control_plane(), cfg, cancel.clone()));
+    wait_for(Duration::from_secs(10), || {
+        let hub = hub.clone();
+        async move {
+            hub.nodes().await.iter().any(|node| {
+                node.id == "node-hub-prov"
+                    && node.data_address.is_some()
+                    && node.capabilities.iter().any(|c| c == "network_shuffle")
+            })
+        }
+    })
+    .await;
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut agent_task).await;
+    agent_task.abort();
+    hub_cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub_server).await;
+    unsafe {
+        std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CA");
+        std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_CERT");
+        std::env::remove_var("ARKFLOW_DATA_PLANE_TLS_KEY");
+    }
+}
+
+#[test]
+fn try_flush_pending_credential_retains_on_error_and_clears_on_success() {
+    let dir = tempfile::tempdir().unwrap();
+    // Pointing at an existing directory fails write cleanly without clearing pending state.
+    let mut pending = Some("arkn_testcred_secret".to_owned());
+    let dir_path = dir.path().to_string_lossy().into_owned();
+    super::session::try_flush_pending_credential("node-a", Some(&dir_path), &mut pending);
+    assert_eq!(pending.as_deref(), Some("arkn_testcred_secret"));
+
+    // Once pointed at a writable file path, flush persists the credential and clears pending.
+    let cred_file = dir.path().join("node.cred");
+    let file_path = cred_file.to_string_lossy().into_owned();
+    super::session::try_flush_pending_credential("node-a", Some(&file_path), &mut pending);
+    assert!(pending.is_none());
+    assert_eq!(
+        std::fs::read_to_string(&cred_file).unwrap(),
+        "arkn_testcred_secret\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn job_runtime_start_replaces_kernel_when_peer_edge_context_changes() {
+    let runtime = JobRuntime::default();
+    let state_dir = tempfile::tempdir().unwrap();
+    let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+        "id": "orders-edge-drift",
+        "version": 1,
+        "operators": [
+            {"id": "source", "kind": "source"},
+            {"id": "sink", "kind": "sink"}
+        ],
+        "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+        "sources": [{
+            "operator_id": "source",
+            "input_type": "generate",
+            "config": {"context": "node-a", "interval": "10ms", "batch_size": 1},
+            "time": {"mode": "processing_time"}
+        }],
+        "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+        "state": {
+            "backend": "embedded_kv",
+            "durability": "durable",
+            "root": state_dir.path().to_string_lossy().into_owned(),
+            "format_version": 1
+        }
+    }))
+    .unwrap();
+    let _ = arkflow_plugin::initialize();
+    spec.validate().unwrap();
+    let plan = JobPlan::compile(spec).unwrap();
+    let assignments = plan
+        .assignments_for_nodes(&["node-a".to_string()], 1)
+        .expect("colocated placement succeeds");
+    let initial_split = SplitPlacementPayload {
+        task_nodes: Some(BTreeMap::from([
+            ("source-0".into(), "node-a".into()),
+            ("sink-0".into(), "node-a".into()),
+        ])),
+        node_data_ports: BTreeMap::from([("node-a".into(), "127.0.0.1:39601".into())]),
+        recovery_required: false,
+        edge_secrets: BTreeMap::from([(("node-a".into(), "node-b".into()), "aa".repeat(32))]),
+    };
+    runtime
+        .start(
+            plan.clone(),
+            assignments.clone(),
+            1,
+            None,
+            false,
+            "node-a",
+            &initial_split,
+        )
+        .await
+        .unwrap();
+    let initial_token = {
+        let tasks = runtime.tasks.lock().await;
+        tasks["orders-edge-drift"].cancellation.clone()
+    };
+
+    // Identical task assignment and identical edge context is a no-op.
+    runtime
+        .start(
+            plan.clone(),
+            assignments.clone(),
+            1,
+            None,
+            false,
+            "node-a",
+            &initial_split,
+        )
+        .await
+        .unwrap();
+    assert!(!initial_token.is_cancelled());
+
+    // Changing only the peer data address replaces the running kernel.
+    let updated_addr_split = SplitPlacementPayload {
+        task_nodes: initial_split.task_nodes.clone(),
+        node_data_ports: BTreeMap::from([("node-a".into(), "127.0.0.1:39602".into())]),
+        recovery_required: false,
+        edge_secrets: initial_split.edge_secrets.clone(),
+    };
+    runtime
+        .start(
+            plan.clone(),
+            assignments.clone(),
+            1,
+            None,
+            false,
+            "node-a",
+            &updated_addr_split,
+        )
+        .await
+        .unwrap();
+    assert!(
+        initial_token.is_cancelled(),
+        "stale kernel must be cancelled when peer data address changes"
+    );
+    let second_token = {
+        let tasks = runtime.tasks.lock().await;
+        tasks["orders-edge-drift"].cancellation.clone()
+    };
+    assert!(!second_token.is_cancelled());
+
+    // Changing only the edge secret value for the same node pair also replaces the kernel.
+    let updated_secret_split = SplitPlacementPayload {
+        task_nodes: initial_split.task_nodes.clone(),
+        node_data_ports: updated_addr_split.node_data_ports.clone(),
+        recovery_required: false,
+        edge_secrets: BTreeMap::from([(("node-a".into(), "node-b".into()), "bb".repeat(32))]),
+    };
+    runtime
+        .start(
+            plan,
+            assignments,
+            1,
+            None,
+            false,
+            "node-a",
+            &updated_secret_split,
+        )
+        .await
+        .unwrap();
+    assert!(
+        second_token.is_cancelled(),
+        "stale kernel must be cancelled when per-edge secret value changes"
+    );
+
+    runtime.stop("orders-edge-drift", 1).await.unwrap();
+    let _ = runtime.take_finished().await;
+    drop(state_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn job_runtime_start_updates_live_wiring_for_durable_job_without_checkpoint() {
+    let _ = arkflow_plugin::initialize();
+    let state_dir = tempfile::tempdir().unwrap();
+    let manager_a = arkflow_core::executor::remote::NetworkManager::with_config(
+        arkflow_core::executor::remote::NetworkManagerConfig {
+            credentials: Some(
+                arkflow_core::executor::remote::DataPlaneCredentials::hub_provisioned("node-a"),
+            ),
+            ..arkflow_core::executor::remote::NetworkManagerConfig::default()
+        },
+    )
+    .unwrap();
+    manager_a.spawn();
+    let port_a = manager_a
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+
+    let manager_b = arkflow_core::executor::remote::NetworkManager::with_config(
+        arkflow_core::executor::remote::NetworkManagerConfig {
+            credentials: Some(
+                arkflow_core::executor::remote::DataPlaneCredentials::hub_provisioned("node-b"),
+            ),
+            ..arkflow_core::executor::remote::NetworkManagerConfig::default()
+        },
+    )
+    .unwrap();
+    manager_b.spawn();
+    let port_b = manager_b
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+
+    let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+        "id": "orders-live-rewire",
+        "version": 1,
+        "placement": "split",
+        "operators": [
+            {"id": "source", "kind": "source"},
+            {"id": "agg", "kind": "map", "stateful": true, "key_field": "__value__", "config": {"type": "batch", "count": 1, "timeout_ms": 10}},
+            {"id": "sink", "kind": "sink"}
+        ],
+        "edges": [
+            {"id": "source-agg", "from": "source", "to": "agg", "partitioned": true},
+            {"id": "agg-sink", "from": "agg", "to": "sink"}
+        ],
+        "sources": [{
+            "operator_id": "source",
+            "input_type": "generate",
+            "config": {"context": "node-a", "interval": "50ms", "batch_size": 1},
+            "time": {"mode": "processing_time"}
+        }],
+        "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+        "state": {
+            "backend": "embedded_kv",
+            "durability": "durable",
+            "root": state_dir.path().to_string_lossy().into_owned(),
+            "format_version": 1
+        },
+        "checkpoint": {
+            "interval_ms": 60000,
+            "object_store_uri": format!("file://{}", state_dir.path().join("checkpoints").display())
+        }
+    }))
+    .unwrap();
+    spec.validate().unwrap();
+    let plan = JobPlan::compile(spec).unwrap();
+    let sink_task_ids: std::collections::BTreeSet<String> = plan
+        .tasks
+        .iter()
+        .filter(|task| task.operator_id == "sink")
+        .map(|task| task.id.clone())
+        .collect();
+    let all_assignments = plan.assignments_for_nodes(&["node-a".into()], 1).unwrap();
+    let assignments_a: Vec<_> = all_assignments
+        .iter()
+        .filter(|a| !sink_task_ids.contains(&a.task_id))
+        .cloned()
+        .collect();
+    let assignments_b: Vec<_> = all_assignments
+        .iter()
+        .filter(|a| sink_task_ids.contains(&a.task_id))
+        .cloned()
+        .map(|mut a| {
+            a.node_id = "node-b".into();
+            a
+        })
+        .collect();
+
+    let runtime_a = JobRuntime {
+        data_plane: Some(manager_a.clone()),
+        ..Default::default()
+    };
+    let runtime_b = JobRuntime {
+        data_plane: Some(manager_b.clone()),
+        ..Default::default()
+    };
+
+    let mut task_nodes_b = BTreeMap::new();
+    for a in &assignments_a {
+        task_nodes_b.insert(a.task_id.clone(), "node-a".into());
+    }
+    for a in &assignments_b {
+        task_nodes_b.insert(a.task_id.clone(), "node-b".into());
+    }
+    let split_b = SplitPlacementPayload {
+        task_nodes: Some(task_nodes_b),
+        node_data_ports: BTreeMap::from([
+            ("node-a".into(), format!("127.0.0.1:{port_a}")),
+            ("node-b".into(), format!("127.0.0.1:{port_b}")),
+        ]),
+        recovery_required: false,
+        edge_secrets: BTreeMap::from([(("node-a".into(), "node-b".into()), "aa".repeat(32))]),
+    };
+
+    runtime_b
+        .start(
+            plan.clone(),
+            assignments_b,
+            1,
+            None,
+            false,
+            "node-b",
+            &split_b,
+        )
+        .await
+        .unwrap();
+    runtime_a
+        .start(
+            plan.clone(),
+            assignments_a.clone(),
+            1,
+            None,
+            false,
+            "node-a",
+            &split_b,
+        )
+        .await
+        .unwrap();
+    assert!(
+        durable_recovery_marker(&plan, "node-a", 1)
+            .expect("durable stateful job must define .arkflow-started path")
+            .is_file(),
+        ".arkflow-started marker must exist before live wiring update"
+    );
+    let token_a = {
+        let tasks = runtime_a.tasks.lock().await;
+        tasks["orders-live-rewire"].cancellation.clone()
+    };
+
+    // Move downstream peer from node-b -> node-c WITHOUT any checkpoint (recovery_id=None).
+    let manager_c = arkflow_core::executor::remote::NetworkManager::with_config(
+        arkflow_core::executor::remote::NetworkManagerConfig {
+            credentials: Some(
+                arkflow_core::executor::remote::DataPlaneCredentials::hub_provisioned("node-c"),
+            ),
+            ..arkflow_core::executor::remote::NetworkManagerConfig::default()
+        },
+    )
+    .unwrap();
+    manager_c.spawn();
+    let port_c = manager_c
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let runtime_c = JobRuntime {
+        data_plane: Some(manager_c.clone()),
+        ..Default::default()
+    };
+    let assignments_c: Vec<_> = all_assignments
+        .iter()
+        .filter(|a| sink_task_ids.contains(&a.task_id))
+        .cloned()
+        .map(|mut a| {
+            a.node_id = "node-c".into();
+            a
+        })
+        .collect();
+    let mut task_nodes_c = BTreeMap::new();
+    for a in &assignments_a {
+        task_nodes_c.insert(a.task_id.clone(), "node-a".into());
+    }
+    for a in &assignments_c {
+        task_nodes_c.insert(a.task_id.clone(), "node-c".into());
+    }
+    let split_c = SplitPlacementPayload {
+        task_nodes: Some(task_nodes_c),
+        node_data_ports: BTreeMap::from([
+            ("node-a".into(), format!("127.0.0.1:{port_a}")),
+            ("node-c".into(), format!("127.0.0.1:{port_c}")),
+        ]),
+        recovery_required: false,
+        edge_secrets: BTreeMap::from([(("node-a".into(), "node-c".into()), "cc".repeat(32))]),
+    };
+    runtime_c
+        .start(
+            plan.clone(),
+            assignments_c,
+            1,
+            None,
+            false,
+            "node-c",
+            &split_c,
+        )
+        .await
+        .unwrap();
+    // Updating wiring on running node-a with no checkpoint must succeed AND keep local kernel alive.
+    runtime_a
+        .start(plan, assignments_a, 1, None, false, "node-a", &split_c)
+        .await
+        .expect("live wiring update must succeed for durable job before first checkpoint");
+    assert!(
+        !token_a.is_cancelled(),
+        "live wiring update must preserve running durable kernel without triggering .arkflow-started rejection"
+    );
+
+    runtime_b.stop("orders-live-rewire", 1).await.unwrap();
+    runtime_a.stop("orders-live-rewire", 1).await.unwrap();
+    runtime_c.stop("orders-live-rewire", 1).await.unwrap();
+    manager_a.shutdown();
+    manager_b.shutdown();
+    manager_c.shutdown();
+    drop(state_dir);
 }

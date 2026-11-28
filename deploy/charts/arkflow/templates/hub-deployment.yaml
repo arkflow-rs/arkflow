@@ -1,4 +1,7 @@
 {{- if eq .Values.mode "control-plane" -}}
+{{- if and .Values.controlPlane.tls.enabled (eq (default "agent_required" .Values.controlPlane.tls.clientAuth) "required") -}}
+{{- fail "controlPlane.tls.clientAuth=required is unsupported in Kubernetes deployments because kubelet HTTPS probes and the Console proxy do not present client certificates; use agent_required (default) or none" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -61,6 +64,16 @@ spec:
             - name: ARKFLOW_HUB_HA_ENABLED
               value: "true"
             {{- end }}
+            {{- if include "arkflow.cpTlsEnabled" . | eq "true" }}
+            - name: ARKFLOW_HUB_TLS_CA
+              value: {{ printf "/etc/arkflow/tls/%s" (default "ca.crt" .Values.controlPlane.tls.caKey) | quote }}
+            - name: ARKFLOW_HUB_TLS_CERT
+              value: {{ printf "/etc/arkflow/tls/%s" (default "hub.crt" .Values.controlPlane.tls.hubCertKey) | quote }}
+            - name: ARKFLOW_HUB_TLS_KEY
+              value: {{ printf "/etc/arkflow/tls/%s" (default "hub.key" .Values.controlPlane.tls.hubKeyKey) | quote }}
+            - name: ARKFLOW_HUB_TLS_CLIENT_AUTH
+              value: {{ default "agent_required" .Values.controlPlane.tls.clientAuth | quote }}
+            {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -68,25 +81,49 @@ spec:
             httpGet:
               path: /health
               port: http
+              {{- if include "arkflow.cpTlsEnabled" . | eq "true" }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 10
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /readiness
               port: http
+              {{- if include "arkflow.cpTlsEnabled" . | eq "true" }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 5
           resources:
             {{- toYaml .Values.controlPlane.hub.resources | nindent 12 }}
-          {{- if and (not .Values.controlPlane.hub.storage.postgresURL) (include "arkflow.persistenceEnabled" . | eq "true") }}
+          {{- $hasHubData := and (not .Values.controlPlane.hub.storage.postgresURL) (include "arkflow.persistenceEnabled" . | eq "true") }}
+          {{- $hasHubTls := include "arkflow.cpTlsEnabled" . | eq "true" }}
+          {{- if or $hasHubData $hasHubTls }}
           volumeMounts:
+            {{- if $hasHubData }}
             - name: hub-data
               mountPath: /var/lib/arkflow
+            {{- end }}
+            {{- if $hasHubTls }}
+            - name: hub-tls
+              mountPath: /etc/arkflow/tls
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if and (not .Values.controlPlane.hub.storage.postgresURL) (include "arkflow.persistenceEnabled" . | eq "true") }}
+      {{- $hasHubData := and (not .Values.controlPlane.hub.storage.postgresURL) (include "arkflow.persistenceEnabled" . | eq "true") }}
+      {{- $hasHubTls := include "arkflow.cpTlsEnabled" . | eq "true" }}
+      {{- if or $hasHubData $hasHubTls }}
       volumes:
+        {{- if $hasHubData }}
         - name: hub-data
           persistentVolumeClaim:
             claimName: {{ include "arkflow.fullname" . }}-data
+        {{- end }}
+        {{- if $hasHubTls }}
+        - name: hub-tls
+          secret:
+            secretName: {{ include "arkflow.cpTlsSecretName" . }}
+        {{- end }}
       {{- end }}
 {{- end }}

@@ -179,10 +179,16 @@ Rules:
 |----------|---------|-------------|
 | `ARKFLOW_HUB_ADDRESS` | `127.0.0.1:8080` | Listen address for the Hub API. |
 | `ARKFLOW_OPERATOR_TOKEN` | — | Operator token for human/admin API access. Supports the `role\|token` credential format; see [Hub authentication](../operate/control-plane/overview.md) and [Users and credentials](../operate/control-plane/users-and-credentials.md). |
-| `ARKFLOW_NODE_TOKEN` | — | Shared token agents use to authenticate to the Hub. |
+| `ARKFLOW_NODE_TOKEN` | — | Shared bootstrap/break-glass token accepted on initial node enrollment (and already-enrolled nodes only when `ARKFLOW_ALLOW_SHARED_NODE_TOKEN_BREAK_GLASS=true` or Hub is volatile). |
 | `ARKFLOW_HUB_INSECURE_LOCAL` | off | Set to `1`/`true`/`yes` to relax checks for local development only. |
-| `ARKFLOW_HUB_STORAGE` | — | Storage backend spec: a SQLite path or a PostgreSQL URL. Required when HA is enabled and by the managed identity API (users/credentials/sessions). |
+| `ARKFLOW_HUB_STORAGE` | — | Storage backend spec: a SQLite path or a PostgreSQL URL. Required when HA is enabled and by the managed identity and per-node credential APIs. |
+| `ARKFLOW_HUB_NODE_BOOTSTRAP_DISABLED` | off | Set to `1`/`true`/`yes` to block shared `node_token` enrollment; nodes must authenticate with pre-provisioned `arkn_` credentials. |
+| `ARKFLOW_ALLOW_SHARED_NODE_TOKEN_BREAK_GLASS` | off | Set to `1`/`true`/`yes` to allow already-enrolled nodes to re-register with the shared `node_token` for emergency recovery. |
 | `ARKFLOW_HUB_TLS_CERT` / `ARKFLOW_HUB_TLS_KEY` | — | TLS certificate and key paths for the Hub listener. |
+| `ARKFLOW_HUB_TLS_CA` | — | PEM CA bundle for client certificate verification on the Hub listener. |
+| `ARKFLOW_HUB_TLS_CLIENT_AUTH` | `agent_required` (when CA is set) | Hub client-auth policy: `agent_required` (client cert mandatory on `/api/v1/agent/*`), `required`, or `none`. |
+| `ARKFLOW_AGENT_TLS_CA` / `ARKFLOW_AGENT_TLS_CERT` / `ARKFLOW_AGENT_TLS_KEY` | — | Agent HTTP client CA root and paired client cert/key (`cert` and `key` are all-or-none) for connecting to an mTLS Hub. |
+| `ARKFLOW_NODE_CREDENTIAL_FILE` | — | Optional file path where an enrolled Agent atomically persists (`0600`) and reloads its Hub-issued `arkn_` per-node credential. |
 | `ARKFLOW_HUB_HA_ENABLED` | off | Set to `1`/`true`/`yes` to enable lease-based HA. Requires `ARKFLOW_HUB_STORAGE` to be set; use a PostgreSQL URL for multi-instance HA (a SQLite path only logs a development-only warning). |
 | `ARKFLOW_HUB_HA_LEASE_TTL_MS` | `15000` | Lease TTL in milliseconds; values below 1000 are rejected. |
 | `ARKFLOW_HUB_HA_HOLDER_ID` | — | Explicit lease holder identity; by default one is generated from hostname, PID, and boot time. |

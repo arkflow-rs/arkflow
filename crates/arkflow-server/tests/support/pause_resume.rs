@@ -349,6 +349,10 @@ pub(super) fn start_agents(hub_url: &str) -> Vec<SmokeTask> {
                 poll_interval: Duration::from_millis(20),
                 data_port: None,
                 data_host: None,
+                node_credential_file: None,
+                tls_ca: None,
+                tls_cert: None,
+                tls_key: None,
             };
             SmokeTask::spawn(cancellation, async move {
                 agent::run(super::empty_control_plane(), config, agent_stop)

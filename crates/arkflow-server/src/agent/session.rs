@@ -51,7 +51,30 @@ pub async fn run(
             .ok()
             .filter(|secret| !secret.is_empty());
         let data_plane_tls = data_plane_tls_from_env()?;
-        let manager = match data_secret {
+        let credentials = match data_secret {
+            Some(data_secret) => {
+                match arkflow_core::executor::remote::DataPlaneCredentials::new(
+                    config.node_id.clone(),
+                    data_secret,
+                ) {
+                    Ok(credentials) => Some(credentials),
+                    Err(error) => {
+                        warn!(node_id = %config.node_id, %error, "invalid data-plane credentials; running colocated-only");
+                        None
+                    }
+                }
+            }
+            None if data_plane_tls.is_some() => {
+                info!(
+                    node_id = %config.node_id,
+                    "data-plane mTLS active without ARKFLOW_DATA_PLANE_SECRET; using Hub-provisioned per-edge data-plane keys"
+                );
+                Some(
+                    arkflow_core::executor::remote::DataPlaneCredentials::hub_provisioned(
+                        config.node_id.clone(),
+                    ),
+                )
+            }
             None => {
                 warn!(
                     node_id = %config.node_id,
@@ -59,33 +82,22 @@ pub async fn run(
                 );
                 None
             }
-            Some(data_secret) => {
-                match arkflow_core::executor::remote::DataPlaneCredentials::new(
-                    config.node_id.clone(),
-                    data_secret,
-                ) {
+        };
+        let manager = match credentials {
+            None => None,
+            Some(credentials) => {
+                let mut manager_config = arkflow_core::executor::remote::NetworkManagerConfig {
+                    credentials: Some(credentials),
+                    channel_capacity: 1024,
+                    tls: data_plane_tls.clone(),
+                    ..arkflow_core::executor::remote::NetworkManagerConfig::default()
+                };
+                apply_data_plane_env_limits(&mut manager_config)?;
+                match arkflow_core::executor::remote::NetworkManager::with_config(manager_config) {
+                    Ok(manager) => Some(manager),
                     Err(error) => {
-                        warn!(node_id = %config.node_id, %error, "invalid data-plane credentials; running colocated-only");
+                        warn!(node_id = %config.node_id, %error, "invalid data-plane resource configuration; running colocated-only");
                         None
-                    }
-                    Ok(credentials) => {
-                        let mut manager_config =
-                            arkflow_core::executor::remote::NetworkManagerConfig {
-                                credentials: Some(credentials),
-                                channel_capacity: 1024,
-                                tls: data_plane_tls.clone(),
-                                ..arkflow_core::executor::remote::NetworkManagerConfig::default()
-                            };
-                        apply_data_plane_env_limits(&mut manager_config)?;
-                        match arkflow_core::executor::remote::NetworkManager::with_config(
-                            manager_config,
-                        ) {
-                            Ok(manager) => Some(manager),
-                            Err(error) => {
-                                warn!(node_id = %config.node_id, %error, "invalid data-plane resource configuration; running colocated-only");
-                                None
-                            }
-                        }
                     }
                 }
             }
@@ -144,11 +156,22 @@ pub async fn run(
     };
     let failover_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut active_config = config.clone();
-    let mut client = build_agent_client(&active_config.hub_url)?;
+    if let Some(path) = active_config.node_credential_file.as_deref() {
+        if let Some(stored) = load_node_credential(path)? {
+            active_config.node_token = stored;
+        }
+    }
+    let mut client = build_agent_client_with_tls(&active_config)?;
     // Reason token for the next switch's audit log, carried over from the
     // failure that triggered the rotation.
     let mut pending_reason: &'static str = "transport_error";
+    let mut pending_credential_persist: Option<String> = None;
     loop {
+        try_flush_pending_credential(
+            &config.node_id,
+            active_config.node_credential_file.as_deref(),
+            &mut pending_credential_persist,
+        );
         if cancellation.is_cancelled() {
             job_runtime.stop_all().await;
             if let Some(manager) = &job_runtime.data_plane {
@@ -167,16 +190,71 @@ pub async fn run(
                 reason = pending_reason,
                 "Switching control-plane Hub candidate"
             );
-            client = build_agent_client(&next)?;
             active_config.hub_url = next;
+            client = build_agent_client_with_tls(&active_config)?;
             failover_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         match register(&client, &active_config, data_address.clone()).await {
-            Ok(session) => {
+            Ok(mut session) => {
+                let mut enrolled_token: Option<String> = None;
+                if let Some(issued_credential) = session.node_credential.take() {
+                    let trimmed = issued_credential.trim().to_owned();
+                    if !trimmed.is_empty() {
+                        if let Some(path) = active_config.node_credential_file.clone() {
+                            let mut pending = Some(trimmed.clone());
+                            let node_id = config.node_id.clone();
+                            let remaining = tokio::task::spawn_blocking(move || {
+                                try_flush_pending_credential(
+                                    &node_id,
+                                    Some(path.as_str()),
+                                    &mut pending,
+                                );
+                                pending
+                            })
+                            .await
+                            .unwrap_or(Some(trimmed.clone()));
+                            if remaining.is_some() {
+                                warn!(
+                                    node_id = %config.node_id,
+                                    hub = %active_config.hub_url,
+                                    "failed to persist issued node credential; retrying registration before starting session"
+                                );
+                                pending_reason = "credential_persist_failed";
+                                failed_attempts += 1;
+                                let cycle_len = candidates.len().max(1);
+                                let sleep_duration = if failed_attempts > 0
+                                    && failed_attempts.is_multiple_of(cycle_len)
+                                {
+                                    let current = backoff;
+                                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                                    jittered_backoff(current)
+                                } else {
+                                    Duration::from_millis(200)
+                                };
+                                tokio::select! {
+                                    _ = cancellation.cancelled() => {
+                                        job_runtime.stop_all().await;
+                                        if let Some(manager) = &job_runtime.data_plane {
+                                            manager.shutdown();
+                                        }
+                                        return Ok(());
+                                    }
+                                    _ = tokio::time::sleep(sleep_duration) => {}
+                                }
+                                continue;
+                            }
+                        }
+                        enrolled_token = Some(trimmed);
+                    }
+                }
+                if let Some(token) = enrolled_token {
+                    active_config.node_token = token;
+                }
+                pending_credential_persist = None;
                 info!(node_id = %config.node_id, hub = %active_config.hub_url, "Compute node registered with control-plane Hub");
                 backoff = Duration::from_millis(250);
                 failed_attempts = 0;
-                if let Err(error) = run_session(
+                if let Err(error) = run_session_with_pending_persist(
                     &client,
                     &cp,
                     &active_config,
@@ -187,6 +265,7 @@ pub async fn run(
                     network_shuffle,
                     &resource_sampler,
                     &failover_counter,
+                    Some(&mut pending_credential_persist),
                 )
                 .await
                 {
@@ -284,6 +363,65 @@ pub(super) fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn load_node_credential(
+    path: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let trimmed = content.trim().to_owned();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("failed to read node credential file {path}: {error}").into()),
+    }
+}
+
+pub(super) fn try_flush_pending_credential(
+    node_id: &str,
+    path: Option<&str>,
+    pending: &mut Option<String>,
+) {
+    let (Some(path), Some(credential)) = (path, pending.as_deref()) else {
+        return;
+    };
+    match persist_node_credential(path, credential) {
+        Ok(()) => *pending = None,
+        Err(error) => warn!(
+            node_id = %node_id,
+            path = %path,
+            %error,
+            "Failed to persist Hub-issued node credential; will retry"
+        ),
+    }
+}
+
+fn persist_node_credential(path: &str, credential: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = std::path::Path::new(path);
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = target.with_extension(format!("tmp.{}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp_path)?;
+    file.write_all(credential.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp_path, target)?;
+    Ok(())
+}
+
 /// Build the Agent's HTTP client. Loopback hubs are never proxied: system
 /// proxy settings (macOS/Windows proxy configuration or stray env vars) that
 /// intercept 127.0.0.1 traffic silently break registration and command
@@ -304,6 +442,65 @@ pub(super) fn build_agent_client(hub_url: &str) -> Result<Client, reqwest::Error
         return builder.no_proxy().build();
     }
     builder.build()
+}
+
+pub(super) fn build_agent_client_with_tls(
+    config: &NodeAgentConfig,
+) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+    match (config.tls_cert.as_deref(), config.tls_key.as_deref()) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "Agent client mTLS requires both tls_cert and tls_key (ARKFLOW_AGENT_TLS_CERT and ARKFLOW_AGENT_TLS_KEY)"
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+    if config.tls_ca.is_none() && config.tls_cert.is_none() && config.tls_key.is_none() {
+        return Ok(build_agent_client(&config.hub_url)?);
+    }
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10));
+    let loopback = url::Url::parse(&config.hub_url)
+        .ok()
+        .and_then(|url| url.host_str().map(is_loopback_host))
+        .unwrap_or(false);
+    if loopback {
+        builder = builder.no_proxy();
+    }
+    if let Some(ca_path) = config.tls_ca.as_deref() {
+        let ca_bytes = std::fs::read(ca_path)
+            .map_err(|error| format!("failed to read ARKFLOW_AGENT_TLS_CA {ca_path}: {error}"))?;
+        let mut cursor = std::io::Cursor::new(&ca_bytes);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("invalid PEM in ARKFLOW_AGENT_TLS_CA {ca_path}: {error}"))?;
+        if certs.is_empty() {
+            return Err(format!("ARKFLOW_AGENT_TLS_CA {ca_path} contains no certificates").into());
+        }
+        for cert in certs {
+            let reqwest_cert = reqwest::Certificate::from_der(cert.as_ref()).map_err(|error| {
+                format!("invalid X.509 certificate in ARKFLOW_AGENT_TLS_CA {ca_path}: {error}")
+            })?;
+            builder = builder.add_root_certificate(reqwest_cert);
+        }
+    }
+    if let (Some(cert_path), Some(key_path)) =
+        (config.tls_cert.as_deref(), config.tls_key.as_deref())
+    {
+        let cert_pem = std::fs::read_to_string(cert_path).map_err(|error| {
+            format!("failed to read ARKFLOW_AGENT_TLS_CERT {cert_path}: {error}")
+        })?;
+        let key_pem = std::fs::read_to_string(key_path)
+            .map_err(|error| format!("failed to read ARKFLOW_AGENT_TLS_KEY {key_path}: {error}"))?;
+        let combined = format!("{cert_pem}\n{key_pem}");
+        let identity = reqwest::Identity::from_pem(combined.as_bytes()).map_err(|error| {
+            format!("invalid Agent TLS client identity ({cert_path}, {key_path}): {error}")
+        })?;
+        builder = builder.identity(identity);
+    }
+    Ok(builder.build()?)
 }
 
 /// Classified registration failure (hub-ha stage 3): the failover loop
@@ -383,6 +580,7 @@ pub(super) async fn register(
         .map_err(|error| RegisterFailure::Transport(error.to_string()))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_session(
     client: &Client,
@@ -395,6 +593,36 @@ pub(super) async fn run_session(
     network_shuffle: bool,
     resource_sampler: &ResourceSampler,
     failover_counter: &std::sync::atomic::AtomicU64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_session_with_pending_persist(
+        client,
+        cp,
+        config,
+        session,
+        cancellation,
+        completed_commands,
+        job_runtime,
+        network_shuffle,
+        resource_sampler,
+        failover_counter,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session_with_pending_persist(
+    client: &Client,
+    cp: &ControlPlane,
+    config: &NodeAgentConfig,
+    session: RegisterResponse,
+    cancellation: CancellationToken,
+    completed_commands: &mut CompletedCommandCache,
+    job_runtime: JobRuntime,
+    network_shuffle: bool,
+    resource_sampler: &ResourceSampler,
+    failover_counter: &std::sync::atomic::AtomicU64,
+    mut pending_credential_persist: Option<&mut Option<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth = AgentAuth {
         node_id: config.node_id.clone(),
@@ -409,14 +637,37 @@ pub(super) async fn run_session(
     let mut command_tasks = JoinSet::new();
     let mut in_flight_commands = HashSet::new();
     let mut report_seq = 0_u64;
+    let mut pending_flush_task: Option<tokio::task::JoinHandle<Option<String>>> = None;
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => {
+                if let Some(task) = pending_flush_task.take() {
+                    task.abort();
+                }
                 command_tasks.abort_all();
                 while command_tasks.join_next().await.is_some() {}
                 job_runtime.stop_all().await;
                 let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &auth.session_token, &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await;
                 return Ok(())
+            },
+            flush_result = async {
+                match pending_flush_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if pending_flush_task.is_some() => {
+                pending_flush_task = None;
+                match flush_result {
+                    Ok(None) => {
+                        if let Some(slot) = pending_credential_persist.as_deref_mut() {
+                            *slot = None;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Err(error) => {
+                        warn!(node_id = %config.node_id, %error, "background credential persistence task failed");
+                    }
+                }
             },
             joined = command_tasks.join_next(), if !command_tasks.is_empty() => {
                 match joined {
@@ -438,7 +689,20 @@ pub(super) async fn run_session(
                     None => {}
                 }
             },
-            _ = heartbeat.tick() => { post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &auth.session_token, &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await?; }
+            _ = heartbeat.tick() => {
+                if pending_flush_task.is_none() {
+                    if let Some(Some(cred)) = pending_credential_persist.as_deref() {
+                        let node_id = config.node_id.clone();
+                        let path = config.node_credential_file.clone();
+                        let mut pending = Some(cred.clone());
+                        pending_flush_task = Some(tokio::task::spawn_blocking(move || {
+                            try_flush_pending_credential(&node_id, path.as_deref(), &mut pending);
+                            pending
+                        }));
+                    }
+                }
+                post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &auth.session_token, &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await?;
+            }
             _ = report_tick.tick() => { report_seq = report_seq.saturating_add(1); post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/report"), &auth.session_token, &report(cp, &auth, &config.boot_id, report_seq, &job_runtime, network_shuffle, resource_sampler, &config.hub_url, failover_counter.load(std::sync::atomic::Ordering::Relaxed)).await).await?; }
             _ = poll.tick() => {
                 let finished = job_runtime.take_finished().await;

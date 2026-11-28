@@ -29,6 +29,7 @@ pub(crate) const SESSION_KEY_LEN: usize = 32;
 pub struct DataPlaneCredentials {
     pub local_node: String,
     pub(crate) shared_secret: Arc<[u8]>,
+    pub(crate) hub_provisioned: bool,
 }
 
 impl std::fmt::Debug for DataPlaneCredentials {
@@ -36,6 +37,7 @@ impl std::fmt::Debug for DataPlaneCredentials {
         formatter
             .debug_struct("DataPlaneCredentials")
             .field("local_node", &self.local_node)
+            .field("hub_provisioned", &self.hub_provisioned)
             .field("shared_secret", &"<redacted>")
             .finish()
     }
@@ -55,15 +57,28 @@ impl DataPlaneCredentials {
         Ok(Self {
             local_node: local_node.into(),
             shared_secret: Arc::from(shared_secret.to_vec().into_boxed_slice()),
+            hub_provisioned: false,
         })
     }
 
-    pub(crate) fn session(
+    /// Credentials mode for nodes under data-plane mTLS where per-edge HMAC
+    /// secrets arrive exclusively from Hub `job_start` commands (no static
+    /// fleet-wide `ARKFLOW_DATA_PLANE_SECRET` configured).
+    pub fn hub_provisioned(local_node: impl Into<String>) -> Self {
+        Self {
+            local_node: local_node.into(),
+            shared_secret: Arc::from([]),
+            hub_provisioned: true,
+        }
+    }
+
+    pub(crate) fn session_from_secret(
         &self,
         peer_node: impl Into<String>,
         job_id: impl Into<String>,
         generation: u64,
         quad: Quad,
+        secret: Arc<[u8]>,
     ) -> SessionAuth {
         SessionAuth {
             source_node: self.local_node.clone(),
@@ -71,9 +86,57 @@ impl DataPlaneCredentials {
             job_id: job_id.into(),
             generation,
             quad,
-            shared_secret: self.shared_secret.clone(),
+            shared_secret: secret,
             sent_nonce: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn session_with_secret(
+        &self,
+        peer_node: impl Into<String>,
+        job_id: impl Into<String>,
+        generation: u64,
+        quad: Quad,
+        secret_override: Option<&[u8]>,
+    ) -> Result<SessionAuth, Error> {
+        let peer_node = peer_node.into();
+        let job_id = job_id.into();
+        let secret: Arc<[u8]> = match secret_override {
+            Some(bytes) => {
+                if bytes.is_empty() {
+                    return Err(Error::Config(format!(
+                        "per-edge data-plane secret for {}->{peer_node} on job '{job_id}' must not be empty",
+                        self.local_node
+                    )));
+                }
+                Arc::from(bytes.to_vec().into_boxed_slice())
+            }
+            None if self.hub_provisioned => {
+                return Err(Error::Config(format!(
+                    "missing Hub-provisioned per-edge data-plane secret for {}->{peer_node} on job '{job_id}'",
+                    self.local_node
+                )));
+            }
+            None => self.shared_secret.clone(),
+        };
+        Ok(self.session_from_secret(peer_node, job_id, generation, quad, secret))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session(
+        &self,
+        peer_node: impl Into<String>,
+        job_id: impl Into<String>,
+        generation: u64,
+        quad: Quad,
+    ) -> SessionAuth {
+        self.session_from_secret(
+            peer_node,
+            job_id,
+            generation,
+            quad,
+            self.shared_secret.clone(),
+        )
     }
 }
 

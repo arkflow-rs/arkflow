@@ -46,6 +46,8 @@ mod job_orchestration_tests;
 #[cfg(test)]
 mod job_pause_tests;
 #[cfg(test)]
+mod node_identity_tests;
+#[cfg(test)]
 mod session_report_tests;
 #[cfg(test)]
 mod tests;
@@ -113,6 +115,18 @@ pub(crate) struct NodeRecord {
     /// Wall-clock instant after which the session token stops authenticating.
     /// Credentials are never renewed; only re-registration mints a new one.
     session_expires_at_ms: u64,
+    /// Durable per-node credential id (`arkn_<credential_id>_...`) that
+    /// authenticated the current session, if any. Used to invalidate the
+    /// live session immediately upon credential revocation/rotation.
+    credential_id: Option<String>,
+    /// Verified client certificate node identity (`urn:arkflow:node:<id>`),
+    /// if presented at registration.
+    cert_node_id: Option<String>,
+    /// True after a `"bootstrap_enroll"` registration until the agent proves
+    /// receipt of its minted credential via `heartbeat`/`report`/`commands`/
+    /// `command_result`/`report_job_observation` or a subsequent `arkn_` register.
+    bootstrap_unconfirmed: bool,
+    bootstrap_rotation_pending: bool,
     boot_id: Option<String>,
     report_seq: u64,
     commands: VecDeque<AgentCommand>,
@@ -192,6 +206,15 @@ pub struct Hub {
     /// aggregation side effects. A duplicate terminal result only short-
     /// circuits when this marker is present; otherwise it retries them.
     settled_commands: Arc<RwLock<BTreeSet<String>>>,
+    /// Command ids whose terminal audit event was written (or skipped on a
+    /// volatile Hub). Tracked independently of `settled_commands` and the
+    /// in-memory terminal transition so a retry after `persist_operation`
+    /// fails still records the audit once without duplicating on replay.
+    audited_commands: Arc<RwLock<BTreeSet<String>>>,
+    /// Original `(node_id, credential_id)` session attribution captured when a
+    /// command first transitions to terminal state, preserved across retries
+    /// until the audit event is written.
+    terminal_audit_credentials: Arc<RwLock<TerminalAuditCredentialMap>>,
     /// The node order each Job's placement was actually dispatched in, so a
     /// retained placement re-dispatches with the identical task→node mapping
     /// (split round-robin and multi-component co-location are order
@@ -235,8 +258,37 @@ pub struct Hub {
     /// share the lock; HA deployments elect a single leader, which keeps
     /// identity writes single-writer in practice.
     identity_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes per-node credential enrollment/issuance/rotation so
+    /// concurrent bootstrap attempts for the same node_id mint at most one
+    /// initial credential.
+    node_identity_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// When true, shared `node_token` bootstrap enrollment is disabled; only
+    /// pre-provisioned per-node `arkn_` credentials may register.
+    node_bootstrap_disabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Explicit break-glass opt-in allowing shared `node_token` registration
+    /// even when `node_id` already has active per-node credentials.
+    allow_shared_node_token_break_glass: Arc<std::sync::atomic::AtomicBool>,
+    /// True when the Hub listener enforces mTLS (`ARKFLOW_HUB_TLS_CA` set),
+    /// requiring a verified client certificate on `/api/v1/agent/*`.
+    mtls_enforced: Arc<std::sync::atomic::AtomicBool>,
+    /// Cached per-edge data-plane secrets keyed by `(job_id, generation)` ->
+    /// `(source_node, destination_node)` -> hex-encoded 32-byte secret.
+    job_edge_secrets: Arc<RwLock<JobEdgeSecretCache>>,
     /// Process start of this Hub instance, for `/status` uptime reporting.
     started_at: std::time::Instant,
+}
+
+type EdgeSecretMap = BTreeMap<(String, String), String>;
+type JobEdgeSecretCache = BTreeMap<(String, u64), EdgeSecretMap>;
+type TerminalAuditCredentialMap = BTreeMap<String, (String, Option<String>)>;
+
+/// Verified client certificate metadata attached by `HubTlsListener` when a
+/// peer completes a TLS handshake with a CA-trusted client certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerClientCert {
+    pub subject: String,
+    /// Node identities declared as `URI:urn:arkflow:node:<id>` SAN entries.
+    pub node_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -307,11 +359,15 @@ pub(crate) fn seed_control_plane_floor(floor: u64) {
     );
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
+static MONOTONIC_WALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn now_ms() -> u64 {
+    let raw = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let prev = MONOTONIC_WALL_MS.fetch_max(raw, std::sync::atomic::Ordering::AcqRel);
+    raw.max(prev)
 }
 
 pub fn now_ms_for_metrics() -> u64 {
@@ -344,6 +400,8 @@ impl Hub {
             approval_lock: Arc::new(tokio::sync::Mutex::new(())),
             pause_dispatch_pending: Arc::new(RwLock::new(BTreeMap::new())),
             settled_commands: Arc::new(RwLock::new(BTreeSet::new())),
+            audited_commands: Arc::new(RwLock::new(BTreeSet::new())),
+            terminal_audit_credentials: Arc::new(RwLock::new(BTreeMap::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             plan_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),
@@ -353,6 +411,13 @@ impl Hub {
             leadership_transitions: Arc::new(AtomicU64::new(0)),
             oidc: None,
             identity_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            node_identity_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            node_bootstrap_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            allow_shared_node_token_break_glass: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            mtls_enforced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            job_edge_secrets: Arc::new(RwLock::new(BTreeMap::new())),
             started_at: std::time::Instant::now(),
         }
     }
@@ -361,6 +426,34 @@ impl Hub {
         let mut hub = Self::new(config);
         hub.storage = Some(storage);
         hub
+    }
+
+    pub fn with_node_bootstrap_disabled(self, disabled: bool) -> Self {
+        self.node_bootstrap_disabled
+            .store(disabled, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    pub fn with_allow_shared_node_token_break_glass(self, allow: bool) -> Self {
+        self.allow_shared_node_token_break_glass
+            .store(allow, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    pub fn with_mtls_enforced(self, enforced: bool) -> Self {
+        self.mtls_enforced
+            .store(enforced, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    pub fn set_mtls_enforced(&self, enforced: bool) {
+        self.mtls_enforced
+            .store(enforced, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn mtls_enforced(&self) -> bool {
+        self.mtls_enforced
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Park at a test gate when one is installed. Production builds omit the

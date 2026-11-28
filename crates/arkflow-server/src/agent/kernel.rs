@@ -36,6 +36,8 @@ pub(super) struct SplitPlacementPayload {
     pub(super) node_data_ports: BTreeMap<String, String>,
     /// Hub decision: this start may not initialize an empty durable backend.
     pub(super) recovery_required: bool,
+    /// Per-edge HMAC secrets provisioned by the Hub, keyed by `(src_node, dst_node)`.
+    pub(super) edge_secrets: BTreeMap<(String, String), String>,
 }
 
 #[derive(Clone, Default)]
@@ -62,6 +64,7 @@ pub(super) struct JobTask {
     pub(super) recovery_required: bool,
     pub(super) cancellation: CancellationToken,
     pub(super) assignments: Vec<TaskAttempt>,
+    pub(super) edge_context_fingerprint: u64,
     /// Dedicated bounded runtime for Jobs declaring `resources.cpu_millicores`
     /// (worker threads = ceil(millicores/1000), min 1): one Job cannot occupy
     /// the shared runtime's workers. Shut down (detached, bounded) when the
@@ -75,6 +78,15 @@ pub(super) struct JobTask {
     pub(super) kernel:
         Option<std::sync::Arc<arkflow_core::executor::kernel_handle::KernelJobHandle>>,
     pub(super) handle: tokio::task::JoinHandle<Result<(), arkflow_core::Error>>,
+}
+
+fn edge_context_fingerprint(split: &SplitPlacementPayload) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    split.task_nodes.hash(&mut hasher);
+    split.node_data_ports.hash(&mut hasher);
+    split.edge_secrets.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Drop for JobTask {
@@ -265,8 +277,9 @@ impl JobRuntime {
             });
         let recovery_required = split.recovery_required;
         let local_recovery_marker = durable_recovery_marker(&plan, node_id, generation);
+        let incoming_edge_context = edge_context_fingerprint(split);
         let (existing, previous_exited_on_its_own) = {
-            let tasks = self.tasks.lock().await;
+            let mut tasks = self.tasks.lock().await;
             if tasks
                 .get(&job_id)
                 .is_some_and(|task| task.generation > generation)
@@ -289,16 +302,73 @@ impl JobRuntime {
                 .iter()
                 .map(|assignment| assignment.task_id.clone())
                 .collect::<BTreeSet<_>>();
-            if let Some(task) = tasks.get(&job_id) {
+            if let Some(task) = tasks.get_mut(&job_id) {
                 let alive = task.generation == generation && !task.handle.is_finished();
-                let same_assignment = task
+                let same_tasks = task
                     .assignments
                     .iter()
                     .map(|assignment| assignment.task_id.clone())
                     .collect::<BTreeSet<_>>()
                     == incoming_task_ids;
-                if alive && same_assignment {
-                    return Ok(());
+                if alive && same_tasks {
+                    if task.edge_context_fingerprint == incoming_edge_context {
+                        return Ok(());
+                    }
+                    if recovery_id.is_none()
+                        && local_recovery_marker
+                            .as_ref()
+                            .is_some_and(|marker| marker.is_file())
+                    {
+                        if let Some(manager) = self.data_plane.as_ref() {
+                            if !split.node_data_ports.is_empty() {
+                                let mut node_addrs = BTreeMap::new();
+                                for (node, addr) in &split.node_data_ports {
+                                    match addr.parse::<std::net::SocketAddr>() {
+                                        Ok(parsed) => {
+                                            node_addrs.insert(node.clone(), parsed);
+                                        }
+                                        Err(error) => {
+                                            warn!(%node, %addr, %error, "ignoring malformed peer data-plane address during live rewire");
+                                        }
+                                    }
+                                }
+                                let task_nodes = split.task_nodes.clone().unwrap_or_else(|| {
+                                    assignments
+                                        .iter()
+                                        .map(|assignment| {
+                                            (assignment.task_id.clone(), assignment.node_id.clone())
+                                        })
+                                        .collect()
+                                });
+                                let remote_context =
+                                    arkflow_core::executor::graph::RemoteEdgeContext {
+                                        tls: manager.tls_config().cloned(),
+                                        local_node: node_id.to_string(),
+                                        task_nodes,
+                                        node_addrs,
+                                        manager: manager.clone(),
+                                        generation,
+                                        edge_secrets: split.edge_secrets.clone(),
+                                    };
+                                let local_task_ids: Vec<String> = assignments
+                                    .iter()
+                                    .map(|assignment| assignment.task_id.clone())
+                                    .collect();
+                                let updates =
+                                    arkflow_core::executor::graph::build_live_edge_updates(
+                                        &plan,
+                                        &local_task_ids,
+                                        &remote_context,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                manager
+                                    .update_job_edge_wiring(&job_id, generation, &updates)
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            task.edge_context_fingerprint = incoming_edge_context;
+                            return Ok(());
+                        }
+                    }
                 }
             }
             if local_recovery_marker
@@ -540,6 +610,7 @@ impl JobRuntime {
                 recovery_required,
                 cancellation: cancellation.clone(),
                 assignments: assignments.clone(),
+                edge_context_fingerprint: incoming_edge_context,
                 dedicated_runtime: None,
                 watermark_partitions: watermark_partitions.clone(),
                 state: state.clone(),
@@ -596,6 +667,7 @@ impl JobRuntime {
                     node_addrs,
                     manager: manager.clone(),
                     generation,
+                    edge_secrets: split.edge_secrets.clone(),
                 },
             ))
         });
@@ -676,6 +748,7 @@ impl JobRuntime {
                         recovery_required,
                         cancellation: cancellation.clone(),
                         assignments,
+                        edge_context_fingerprint: incoming_edge_context,
                         dedicated_runtime: dedicated_runtime.clone(),
                         watermark_partitions,
                         state,

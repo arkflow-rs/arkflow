@@ -655,6 +655,30 @@ const PG_DDL: &str = r#"
             CREATE INDEX IF NOT EXISTS cp_credentials_user
                 ON cp_credentials(user_id);
 
+            CREATE TABLE IF NOT EXISTS cp_node_credentials (
+                credential_id TEXT COLLATE "C" PRIMARY KEY,
+                node_id TEXT COLLATE "C" NOT NULL,
+                secret_hash TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                created_at_ms BIGINT NOT NULL,
+                expires_at_ms BIGINT,
+                last_used_at_ms BIGINT,
+                revoked_at_ms BIGINT
+            );
+            CREATE INDEX IF NOT EXISTS cp_node_credentials_node
+                ON cp_node_credentials(node_id);
+
+            CREATE TABLE IF NOT EXISTS cp_job_edge_secrets (
+                job_id TEXT COLLATE "C" NOT NULL,
+                generation BIGINT NOT NULL,
+                src_node TEXT COLLATE "C" NOT NULL,
+                dst_node TEXT COLLATE "C" NOT NULL,
+                secret_hex TEXT NOT NULL,
+                PRIMARY KEY (job_id, generation, src_node, dst_node)
+            );
+            CREATE INDEX IF NOT EXISTS cp_job_edge_secrets_job
+                ON cp_job_edge_secrets(job_id, generation);
+
             CREATE TABLE IF NOT EXISTS cp_sessions (
                 session_hash TEXT COLLATE "C" PRIMARY KEY,
                 user_id TEXT COLLATE "C",

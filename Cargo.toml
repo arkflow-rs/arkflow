@@ -35,6 +35,7 @@ rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
 rustls = "0.23"
+x509-parser = "0.18"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7.18"
 async-trait = "0.1"
