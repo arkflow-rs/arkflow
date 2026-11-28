@@ -1098,7 +1098,7 @@ async fn edge_secrets_persist_across_hub_restart_and_refresh_upstream_on_downstr
             .unwrap();
     }
 
-    let _reg_c = restarted_hub
+    let reg_c = restarted_hub
         .register(RegisterRequest {
             data_address: Some("127.0.0.1:19202".into()),
             node_id: "node-c".into(),
@@ -1139,10 +1139,423 @@ async fn edge_secrets_persist_across_hub_restart_and_refresh_upstream_on_downstr
     let payload = refreshed_start.payload.as_ref().unwrap();
     assert_eq!(payload["node_data_ports"]["node-c"], "127.0.0.1:19202");
     let secrets = payload["edge_secrets"].as_array().unwrap();
-    assert!(
-        secrets
-            .iter()
-            .any(|s| s["dst"] == "node-c" || s["src"] == "node-c"),
-        "refreshed job_start must carry edge secret for node-c: {payload}"
+    let key_a = secrets
+        .iter()
+        .find(|s| s["src"] == "node-a" && s["dst"] == "node-c")
+        .and_then(|s| s["secret"].as_str())
+        .expect("refreshed job_start on node-a must carry directed (node-a -> node-c) edge secret");
+    let refreshed_cmds_c = restarted_hub
+        .commands(AgentAuth {
+            node_id: "node-c".into(),
+            session_token: reg_c.session_token,
+        })
+        .await
+        .unwrap();
+    let refreshed_start_c = refreshed_cmds_c
+        .iter()
+        .rfind(|c| c.operation.as_str() == "job_start" && c.resource_id == "replace-unpinned-job")
+        .expect("replacement node-c must receive job_start");
+    let payload_c = refreshed_start_c.payload.as_ref().unwrap();
+    let key_c = payload_c["edge_secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["src"] == "node-a" && s["dst"] == "node-c")
+        .and_then(|s| s["secret"].as_str())
+        .expect("node-c must carry matching directed (node-a -> node-c) edge secret");
+    assert_eq!(
+        key_a, key_c,
+        "edge secret mismatch across node-a and node-c"
     );
+}
+
+#[tokio::test]
+async fn dispatched_job_start_with_old_payload_does_not_suppress_updated_payload_after_success() {
+    let storage = StorageActor::start(
+        crate::storage::ControlPlaneStore::contract("hub_dispatched_drift").await,
+        8,
+    );
+    let hub = Hub::with_storage(
+        HubConfig {
+            operator_token: Some("ops|admin|op-secret".into()),
+            node_token: Some("node-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 50,
+            session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: default_approval_ttl_ms(),
+        },
+        storage.clone(),
+    );
+    let reg_a = hub
+        .register(RegisterRequest {
+            node_id: "node-a".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![
+                "job_runtime".into(),
+                "state_backend".into(),
+                "network_shuffle".into(),
+            ],
+            boot_id: Some("boot-a".into()),
+            data_address: Some("127.0.0.1:19301".into()),
+        })
+        .await
+        .unwrap();
+    let reg_b = hub
+        .register(RegisterRequest {
+            node_id: "node-b".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![
+                "job_runtime".into(),
+                "state_backend".into(),
+                "network_shuffle".into(),
+            ],
+            boot_id: Some("boot-b".into()),
+            data_address: Some("127.0.0.1:19302".into()),
+        })
+        .await
+        .unwrap();
+
+    let spec_json = serde_json::json!({
+        "id": "dispatched-drift-job",
+        "version": 1,
+        "placement": "split",
+        "parallelism": 1,
+        "operators": [
+            {"id": "src", "kind": "source"},
+            {"id": "snk", "kind": "sink"}
+        ],
+        "edges": [{"id": "e1", "from": "src", "to": "snk"}],
+        "sources": [{
+            "operator_id": "src",
+            "input_type": "memory",
+            "time": {"mode": "processing_time"}
+        }],
+        "sinks": [{"operator_id": "snk", "output_type": "drop"}]
+    })
+    .to_string();
+    hub.upsert_job(crate::storage::JobRecord {
+        job_id: "dispatched-drift-job".into(),
+        version: 1,
+        spec_json,
+        desired_state: "running".into(),
+        observed_state: "validated".into(),
+        convergence: "pending".into(),
+        generation: 1,
+        node_ids: vec!["node-a".into(), "node-b".into()],
+        checkpoint_id: None,
+        last_error: None,
+        updated_at_ms: 0,
+        pause_phase: None,
+        pause_artifact_id: None,
+        pause_prev_checkpoint_id: None,
+        pause_retry_count: 0,
+        paused_at_ms: None,
+        paused_by: None,
+    })
+    .await
+    .unwrap();
+    hub.reconcile_jobs().await.unwrap();
+
+    // Poll commands on node-a so its initial JobStart moves to Dispatched.
+    let cmds_a = hub
+        .commands(AgentAuth {
+            node_id: "node-a".into(),
+            session_token: reg_a.session_token.clone(),
+        })
+        .await
+        .unwrap();
+    let initial_start = cmds_a
+        .iter()
+        .find(|c| c.operation.as_str() == "job_start" && c.resource_id == "dispatched-drift-job")
+        .expect("node-a initial job_start");
+
+    // Re-register node-b with a new data_address while node-a's initial JobStart is still Dispatched.
+    let _ = hub
+        .register(RegisterRequest {
+            node_id: "node-b".into(),
+            node_token: reg_b
+                .node_credential
+                .clone()
+                .unwrap_or_else(|| "node-secret".into()),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: vec![
+                "job_runtime".into(),
+                "state_backend".into(),
+                "network_shuffle".into(),
+            ],
+            boot_id: Some("boot-b".into()),
+            data_address: Some("127.0.0.1:19399".into()),
+        })
+        .await
+        .unwrap();
+    hub.reconcile_jobs().await.unwrap();
+
+    // Now the old Dispatched JobStart (carrying 19302) succeeds.
+    hub.command_result(
+        AgentAuth {
+            node_id: "node-a".into(),
+            session_token: reg_a.session_token.clone(),
+        },
+        CommandResult {
+            command_id: initial_start.id.clone(),
+            operation_id: initial_start.operation_id.clone(),
+            state: HubOperationState::Succeeded,
+            progress: 100,
+            error: None,
+            correlation_id: initial_start.correlation_id.clone(),
+            generation: initial_start.generation,
+            observed_generation: Some(1),
+            action_id: None,
+            failure_class: None,
+            config_version_id: None,
+            rollout_id: None,
+            observed_checkpoint_id: None,
+            checkpoint_manifest_uri: None,
+            result: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Reconcile must NOT suppress the updated payload containing 19399.
+    hub.reconcile_jobs().await.unwrap();
+    let refreshed_cmds = hub
+        .commands(AgentAuth {
+            node_id: "node-a".into(),
+            session_token: reg_a.session_token,
+        })
+        .await
+        .unwrap();
+    let refreshed = refreshed_cmds
+        .iter()
+        .find(|c| {
+            c.operation.as_str() == "job_start"
+                && c.resource_id == "dispatched-drift-job"
+                && c.id != initial_start.id
+        })
+        .expect("reconcile must enqueue a new job_start with the updated peer address");
+    assert_eq!(
+        refreshed.payload.as_ref().unwrap()["node_data_ports"]["node-b"],
+        "127.0.0.1:19399"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_rotation_blocks_confirmation_and_invalidates_old_session() {
+    let storage = StorageActor::start(
+        crate::storage::ControlPlaneStore::contract("hub_bootstrap_rotation_fence").await,
+        8,
+    );
+    let hub = Hub::with_storage(
+        HubConfig {
+            operator_token: Some("ops|admin|op-secret".into()),
+            node_token: Some("bootstrap-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 50,
+            session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: default_approval_ttl_ms(),
+        },
+        storage,
+    );
+    let first = hub
+        .register(RegisterRequest {
+            node_id: "node-rot".into(),
+            node_token: "bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: Vec::new(),
+            boot_id: Some("boot-1".into()),
+            data_address: None,
+        })
+        .await
+        .unwrap();
+    let first_cred = first.node_credential.clone().unwrap();
+
+    // Same-boot retry rolls a second credential and immediately replaces/invalidates the first session.
+    let retry = hub
+        .register(RegisterRequest {
+            node_id: "node-rot".into(),
+            node_token: "bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: Vec::new(),
+            boot_id: Some("  boot-1 ".into()),
+            data_address: None,
+        })
+        .await
+        .unwrap();
+    let retry_cred = retry.node_credential.clone().unwrap();
+    assert_ne!(first_cred, retry_cred);
+
+    // Old session token must not authenticate or clear confirmation.
+    let err = hub
+        .commands(AgentAuth {
+            node_id: "node-rot".into(),
+            session_token: first.session_token,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::Unauthorized));
+
+    // A second retry before any confirmation recovers cleanly under the same boot_id
+    // even though two historical rows exist (one revoked, one unconfirmed active).
+    let retry2 = hub
+        .register(RegisterRequest {
+            node_id: "node-rot".into(),
+            node_token: "bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: Vec::new(),
+            boot_id: Some("boot-1".into()),
+            data_address: None,
+        })
+        .await
+        .unwrap();
+    assert_ne!(retry2.node_credential.as_ref().unwrap(), &retry_cred);
+
+    // Confirm with retry2 session; thereafter shared bootstrap is blocked.
+    hub.commands(AgentAuth {
+        node_id: "node-rot".into(),
+        session_token: retry2.session_token,
+    })
+    .await
+    .unwrap();
+    let blocked = hub
+        .register(RegisterRequest {
+            node_id: "node-rot".into(),
+            node_token: "bootstrap-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: Vec::new(),
+            boot_id: Some("boot-1".into()),
+            data_address: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(blocked, HubError::Unauthorized));
+}
+
+#[tokio::test]
+async fn terminal_command_audit_persists_once_on_unsettled_retry_and_dedups_replay() {
+    let storage = StorageActor::start(
+        crate::storage::ControlPlaneStore::contract("hub_terminal_audit_retry").await,
+        8,
+    );
+    let hub = Hub::with_storage(
+        HubConfig {
+            operator_token: Some("ops|admin|op-secret".into()),
+            node_token: Some("node-secret".into()),
+            insecure_local: false,
+            lease_ttl_ms: 10_000,
+            poll_interval_ms: 50,
+            session_ttl_ms: default_session_ttl_ms(),
+            approval_required: false,
+            approval_ttl_ms: default_approval_ttl_ms(),
+        },
+        storage.clone(),
+    );
+    let reg = hub
+        .register(RegisterRequest {
+            node_id: "node-audit".into(),
+            node_token: "node-secret".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            capabilities: Vec::new(),
+            boot_id: Some("boot-audit".into()),
+            data_address: None,
+        })
+        .await
+        .unwrap();
+    let op = hub
+        .enqueue_with_metadata_as(
+            "node-audit".into(),
+            crate::hub::AgentOperation::ValidateConfiguration,
+            "cfg-1".into(),
+            None,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "admin",
+        )
+        .await
+        .unwrap();
+    let cmds = hub
+        .commands(AgentAuth {
+            node_id: "node-audit".into(),
+            session_token: reg.session_token.clone(),
+        })
+        .await
+        .unwrap();
+    let polled = cmds.iter().find(|c| c.operation_id == op.id).unwrap();
+
+    // Simulate a failed first persist where in-memory state already flipped to
+    // Succeeded and original attribution was recorded, without settled/audited markers.
+    {
+        let mut ops = hub.operations.write().await;
+        let rec = ops.get_mut(&op.id).unwrap();
+        rec.state = HubOperationState::Succeeded;
+        rec.finished_at_ms = Some(1_000);
+    }
+    hub.terminal_audit_credentials.write().await.insert(
+        op.command_id.clone(),
+        ("node-audit".into(), Some("orig-cred-id".into())),
+    );
+
+    let result = CommandResult {
+        command_id: polled.id.clone(),
+        operation_id: op.id.clone(),
+        state: HubOperationState::Succeeded,
+        progress: 100,
+        error: None,
+        correlation_id: polled.correlation_id.clone(),
+        generation: polled.generation,
+        observed_generation: None,
+        action_id: None,
+        failure_class: None,
+        config_version_id: None,
+        rollout_id: None,
+        observed_checkpoint_id: None,
+        checkpoint_manifest_uri: None,
+        result: None,
+    };
+    hub.command_result(
+        AgentAuth {
+            node_id: "node-audit".into(),
+            session_token: reg.session_token.clone(),
+        },
+        result.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Replay the identical terminal result: must NOT emit a second audit row.
+    hub.command_result(
+        AgentAuth {
+            node_id: "node-audit".into(),
+            session_token: reg.session_token,
+        },
+        result,
+    )
+    .await
+    .unwrap();
+
+    let audits = storage.list_audit(Some(&op.id)).await.unwrap();
+    let cmd_audits: Vec<_> = audits
+        .iter()
+        .filter(|a| a.action == "agent.command_result")
+        .collect();
+    assert_eq!(
+        cmd_audits.len(),
+        1,
+        "terminal retry after persistence failure must write audit once and dedup replay"
+    );
+    assert!(cmd_audits[0]
+        .message
+        .as_deref()
+        .is_some_and(|m| m.contains("credential=orig-cred-id")));
 }

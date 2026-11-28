@@ -188,8 +188,10 @@ Storage, mTLS, and availability contract:
   against the mounted Fleet CA, and mounts only CA + Agent client/data-plane
   keys (`hub.key` excluded) onto the in-chart Agent. For long-lived clusters,
   supply rotating certificates (e.g. `cert-manager`) via
-  `controlPlane.tls.existingSecret` or delete/rotate `<release>-tls` and
-  restart pods before the 365-day leaf expiry. Set
+  `controlPlane.tls.existingSecret` or, before the 365-day leaf expiry,
+  delete `<release>-tls`, run `helm upgrade` to regenerate the Secret
+  (certificates are generated during Helm rendering, not at pod startup),
+  and then restart the Hub, Console, and Agent pods. Set
   `controlPlane.tls.enabled=false` (and use `http://` in `hub_urls`) to opt
   out to plaintext HTTP.
 

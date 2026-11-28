@@ -954,15 +954,23 @@ impl Hub {
             None;
         let mut job_edge_secrets: Option<BTreeMap<(String, String), String>> = None;
         if operation == AgentOperation::JobStop {
-            self.job_edge_secrets
-                .write()
+            let has_cached_secrets = self
+                .job_edge_secrets
+                .read()
                 .await
-                .retain(|(job_id, _), _| job_id != &job.job_id);
-            if let Some(storage) = self.storage.as_ref() {
-                storage
-                    .delete_job_edge_secrets(&job.job_id)
+                .keys()
+                .any(|(job_id, _)| job_id == &job.job_id);
+            if has_cached_secrets {
+                if let Some(storage) = self.storage.as_ref() {
+                    storage
+                        .delete_job_edge_secrets(&job.job_id)
+                        .await
+                        .map_err(HubError::from)?;
+                }
+                self.job_edge_secrets
+                    .write()
                     .await
-                    .map_err(HubError::from)?;
+                    .retain(|(job_id, _), _| job_id != &job.job_id);
             }
         }
         if spec.placement == arkflow_core::job::PlacementStrategy::Split {
@@ -1019,41 +1027,76 @@ impl Hub {
                         }
                     }
                 }
-                let (secrets_for_gen, persisted_records) = {
-                    let mut cache = self.job_edge_secrets.write().await;
-                    cache.retain(|(id, gen), _| id != &job.job_id || *gen == job.generation);
-                    let secrets_for_gen = cache
-                        .entry((job.job_id.clone(), job.generation))
-                        .or_default();
-                    for edge_pair in &cross_edges {
-                        secrets_for_gen.entry(edge_pair.clone()).or_insert_with(|| {
-                            use rand::TryRngCore;
-                            let mut bytes = [0u8; 32];
-                            rand::rngs::OsRng
-                                .try_fill_bytes(&mut bytes)
-                                .expect("OS RNG cannot fail");
-                            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-                        });
+                let (stale_generation, needs_persist, secrets_for_gen, persisted_records) = {
+                    let cache = self.job_edge_secrets.read().await;
+                    let newer_cached = cache
+                        .keys()
+                        .any(|(id, gen)| id == &job.job_id && *gen > job.generation);
+                    if newer_cached {
+                        (true, false, BTreeMap::new(), Vec::new())
+                    } else {
+                        let has_older_gen = cache
+                            .keys()
+                            .any(|(id, gen)| id == &job.job_id && *gen < job.generation);
+                        let existing_for_gen = cache.get(&(job.job_id.clone(), job.generation));
+                        let mut desired = existing_for_gen.cloned().unwrap_or_default();
+                        for edge_pair in &cross_edges {
+                            desired.entry(edge_pair.clone()).or_insert_with(|| {
+                                use rand::TryRngCore;
+                                let mut bytes = [0u8; 32];
+                                rand::rngs::OsRng
+                                    .try_fill_bytes(&mut bytes)
+                                    .expect("OS RNG cannot fail");
+                                bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+                            });
+                        }
+                        let changed = existing_for_gen
+                            .is_none_or(|existing| existing.len() != desired.len())
+                            || has_older_gen;
+                        let records = if changed {
+                            desired
+                                .iter()
+                                .map(|((src_node, dst_node), secret_hex)| {
+                                    crate::storage::JobEdgeSecretRecord {
+                                        job_id: job.job_id.clone(),
+                                        generation: job.generation,
+                                        src_node: src_node.clone(),
+                                        dst_node: dst_node.clone(),
+                                        secret_hex: secret_hex.clone(),
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        (false, changed, desired, records)
                     }
-                    let records = secrets_for_gen
-                        .iter()
-                        .map(|((src_node, dst_node), secret_hex)| {
-                            crate::storage::JobEdgeSecretRecord {
-                                job_id: job.job_id.clone(),
-                                generation: job.generation,
-                                src_node: src_node.clone(),
-                                dst_node: dst_node.clone(),
-                                secret_hex: secret_hex.clone(),
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    (secrets_for_gen.clone(), records)
                 };
-                if let Some(storage) = self.storage.as_ref() {
-                    storage
-                        .upsert_job_edge_secrets(&job.job_id, job.generation, persisted_records)
-                        .await
-                        .map_err(HubError::from)?;
+                if stale_generation {
+                    return Ok(0);
+                }
+                if needs_persist {
+                    if let Some(storage) = self.storage.as_ref() {
+                        let applied = storage
+                            .upsert_job_edge_secrets(&job.job_id, job.generation, persisted_records)
+                            .await
+                            .map_err(HubError::from)?;
+                        if !applied {
+                            return Ok(0);
+                        }
+                    }
+                    let mut cache = self.job_edge_secrets.write().await;
+                    if cache
+                        .keys()
+                        .any(|(id, gen)| id == &job.job_id && *gen > job.generation)
+                    {
+                        return Ok(0);
+                    }
+                    cache.retain(|(id, gen), _| id != &job.job_id || *gen == job.generation);
+                    cache.insert(
+                        (job.job_id.clone(), job.generation),
+                        secrets_for_gen.clone(),
+                    );
                 }
                 job_edge_secrets = Some(
                     secrets_for_gen
@@ -1147,33 +1190,54 @@ impl Hub {
                     .collect()
             };
             drop(recorded_fingerprints);
+            let mut leased_abandoned_nodes: BTreeSet<String> = BTreeSet::new();
             if !abandoned.is_empty() {
-                // Prune any un-polled queued command whose JobStart is being
-                // superseded before locking `operations` (respecting lock
-                // order `nodes -> operations`).
-                {
-                    let mut nodes = self.nodes.write().await;
-                    for record in &abandoned {
-                        if record.state == HubOperationState::Queued {
-                            if let Some(node) = nodes.get_mut(&record.node_id) {
-                                node.commands.retain(|cmd| cmd.operation_id != record.id);
-                            }
-                        }
-                    }
-                }
-                // Apply the in-memory transition under the write lock, then
-                // persist OUTSIDE it: the storage round-trips are async and
-                // holding the operations write lock across them would block
-                // every agent poll, report, and command result for the
-                // duration of the I/O.
+                // Recheck abandoned starts while holding `nodes -> operations`
+                // atomically so a `commands()` poll cannot move a Queued start
+                // into `leased_commands` between queue pruning and marking it
+                // `Superseded`. Already-leased starts stay non-Superseded and
+                // are fenced via `JobStop` before any replacement is dispatched.
                 let mut superseded = Vec::with_capacity(abandoned.len());
                 {
+                    let mut nodes = self.nodes.write().await;
                     let mut operations = self.operations.write().await;
-                    for mut record in abandoned {
-                        record.state = HubOperationState::Superseded;
-                        record.superseded_generation = Some(job.generation);
-                        operations.insert(record.id.clone(), record.clone());
-                        superseded.push(record);
+                    for candidate in abandoned {
+                        let Some(record) = operations.get_mut(&candidate.id) else {
+                            continue;
+                        };
+                        match record.state {
+                            HubOperationState::Succeeded => {
+                                record.state = HubOperationState::Superseded;
+                                record.superseded_generation = Some(job.generation);
+                                superseded.push(record.clone());
+                            }
+                            HubOperationState::Queued => {
+                                let unleased_in_queue =
+                                    nodes.get(&record.node_id).is_some_and(|node| {
+                                        !node.leased_commands.contains_key(&record.command_id)
+                                            && node
+                                                .commands
+                                                .iter()
+                                                .any(|cmd| cmd.operation_id == record.id)
+                                    });
+                                if unleased_in_queue {
+                                    if let Some(node) = nodes.get_mut(&record.node_id) {
+                                        node.commands.retain(|cmd| cmd.operation_id != record.id);
+                                    }
+                                    record.state = HubOperationState::Superseded;
+                                    record.superseded_generation = Some(job.generation);
+                                    superseded.push(record.clone());
+                                } else {
+                                    leased_abandoned_nodes.insert(record.node_id.clone());
+                                }
+                            }
+                            HubOperationState::Dispatched
+                            | HubOperationState::Acknowledged
+                            | HubOperationState::Running => {
+                                leased_abandoned_nodes.insert(record.node_id.clone());
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 if let Some(storage) = self.storage.as_ref() {
@@ -1187,9 +1251,16 @@ impl Hub {
             // A target that is still valid for the new generation does not
             // need a stop/start bounce. Every historical placement outside
             // the desired set is stale and must be fenced, including starts
-            // recorded under an older generation.
-            let nodes_to_stop = historical_nodes.difference(&target_ids).collect::<Vec<_>>();
-            for node_id in nodes_to_stop {
+            // recorded under an older generation or recently leased starts.
+            let mut nodes_to_stop: BTreeSet<String> =
+                historical_nodes.difference(&target_ids).cloned().collect();
+            for node_id in &leased_abandoned_nodes {
+                if !target_ids.contains(node_id) {
+                    nodes_to_stop.insert(node_id.clone());
+                }
+            }
+            let mut pending_fenced_abandonment = false;
+            for node_id in &nodes_to_stop {
                 // The same terminal-state memory as the dispatch loop: a
                 // Succeeded stop for this (node, job, generation) already
                 // fenced the abandoned placement; re-enqueuing it every tick
@@ -1208,6 +1279,9 @@ impl Hub {
                     });
                 if stop_settled {
                     continue;
+                }
+                if leased_abandoned_nodes.contains(node_id) {
+                    pending_fenced_abandonment = true;
                 }
                 let is_online = self.nodes.read().await.get(node_id).is_some_and(|node| {
                     node.resource.state == NodeConnectionState::Online
@@ -1231,6 +1305,9 @@ impl Hub {
                     )
                     .await?;
                 }
+            }
+            if pending_fenced_abandonment {
+                return Ok(0);
             }
         }
         let explicit_recovery_id = job.checkpoint_id.clone();
@@ -1385,26 +1462,33 @@ impl Hub {
             } else {
                 None
             };
-            self.enqueue_with_metadata_as(
-                node_id,
-                operation.clone(),
-                job.job_id.clone(),
-                None,
-                payload.clone(),
-                job.generation,
-                None,
-                None,
-                None,
-                None,
-                None,
-                actor,
-            )
-            .await?;
+            let (enqueued, created) = self
+                .enqueue_with_metadata_checked_as(
+                    node_id,
+                    operation.clone(),
+                    job.job_id.clone(),
+                    None,
+                    payload.clone(),
+                    job.generation,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    actor,
+                )
+                .await?;
             if let Some((node_id, fingerprint)) = fingerprint {
-                self.start_dispatch_fingerprints
-                    .write()
-                    .await
-                    .insert((job.job_id.clone(), node_id, job.generation), fingerprint);
+                if created
+                    || self
+                        .command_payload_matches(&enqueued.node_id, &enqueued.command_id, &payload)
+                        .await
+                {
+                    self.start_dispatch_fingerprints
+                        .write()
+                        .await
+                        .insert((job.job_id.clone(), node_id, job.generation), fingerprint);
+                }
             }
             dispatched += 1;
         }

@@ -199,6 +199,17 @@ controlPlane:
     # run independently on every replica — keep local streams out of the
     # config (or pin replicas: 1) unless they are partition-assigned.
     replicas: 1
+    # Storage for `ARKFLOW_NODE_CREDENTIAL_FILE` when `agent.nodeId` is
+    # pinned in control-plane mode (replicas must stay 1). Pod-name
+    # identities automatically use Pod-scoped emptyDir storage instead.
+    persistence:
+      enabled: false
+      existingClaim: ""
+      storageClass: ""
+      accessModes:
+        - ReadWriteOnce
+      size: 1Gi
+      mountPath: /app/data
 
 serviceAccount:
   create: true

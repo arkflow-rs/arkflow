@@ -4871,8 +4871,11 @@ async fn static_secret_mode_early_handshake_resolves_per_edge_secret_after_regis
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     let edge_secret = b"per-edge-secret-0123456789abcdef";
+    let wait_notify = downstream.pre_registration_wait_notify();
+    let waited = wait_notify.notified();
     let upstream = NetworkManager::with_config(NetworkManagerConfig {
         credentials: Some(DataPlaneCredentials::hub_provisioned("node-a")),
+        reconnect_attempts: 0,
         ..NetworkManagerConfig::default()
     })
     .unwrap();
@@ -4896,8 +4899,11 @@ async fn static_secret_mode_early_handshake_resolves_per_edge_secret_after_regis
         .await
         .unwrap();
 
-    // Register the edge AFTER upstream started connecting & sent its handshake.
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    // Register the edge only AFTER downstream's authorization loop confirmed
+    // it entered pre-registration grace on the first connection (with redials disabled).
+    tokio::time::timeout(std::time::Duration::from_secs(2), waited)
+        .await
+        .expect("downstream did not enter pre-registration wait in time");
     let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
     downstream
         .register_inbound_for_session_with_secret(
@@ -4923,6 +4929,137 @@ async fn static_secret_mode_early_handshake_resolves_per_edge_secret_after_regis
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
+    downstream.shutdown();
+    upstream.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_registration_waits_do_not_starve_registered_edges_in_static_mode() {
+    let downstream = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::new("node-b", "static-shared").unwrap()),
+        max_connections: 4,
+        registration_grace: std::time::Duration::from_secs(5),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    downstream.spawn();
+    let registered_quad = quad_a_to_b();
+    let (input_tx, input_rx) = flume::bounded::<Envelope>(8);
+    downstream
+        .register_inbound_for_session(
+            registered_quad,
+            input_tx,
+            PeerExpectation {
+                source_node: "node-a".into(),
+                job_id: "job-registered".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+    let port = downstream
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // Occupy the pre-registration wait slots (max_connections / 2 = 2) with
+    // unmatching handshakes; a third unmatching handshake must fail fast instead
+    // of exhausting max_connections, leaving room for registered connections.
+    let unknown_quad = Quad {
+        src_op: 9,
+        src_subtask: 0,
+        dst_op: 9,
+        dst_subtask: 0,
+    };
+    let bogus_creds = DataPlaneCredentials::new("node-rogue", "wrong-secret").unwrap();
+    let mut held_waiters = Vec::new();
+    for index in 0..2 {
+        let mut s = TcpEdgeTransport::plaintext(addr, 1)
+            .connect(unknown_quad)
+            .await
+            .unwrap();
+        let wait_notify = downstream.pre_registration_wait_notify();
+        let waited = wait_notify.notified();
+        let req = bogus_creds
+            .session("node-b", "unknown-job", index + 1, unknown_quad)
+            .client_handshake()
+            .unwrap();
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_frame_with_limit(
+            &mut s,
+            unknown_quad,
+            FrameKind::Handshake,
+            &payload,
+            MAX_FRAME_LEN,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waited)
+            .await
+            .unwrap();
+        held_waiters.push(s);
+    }
+
+    let mut third_rogue = TcpEdgeTransport::plaintext(addr, 1)
+        .connect(unknown_quad)
+        .await
+        .unwrap();
+    let req3 = bogus_creds
+        .session("node-b", "unknown-job", 99, unknown_quad)
+        .client_handshake()
+        .unwrap();
+    let payload3 = serde_json::to_vec(&req3).unwrap();
+    write_frame_with_limit(
+        &mut third_rogue,
+        unknown_quad,
+        FrameKind::Handshake,
+        &payload3,
+        MAX_FRAME_LEN,
+    )
+    .await
+    .unwrap();
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        read_frame_with_limits(&mut third_rogue, MAX_FRAME_LEN, None),
+    )
+    .await
+    .expect("third pre-registration waiter should be rejected immediately without stalling");
+    assert!(rejected.is_err());
+
+    let upstream = NetworkManager::with_config(NetworkManagerConfig {
+        credentials: Some(DataPlaneCredentials::new("node-a", "static-shared").unwrap()),
+        ..NetworkManagerConfig::default()
+    })
+    .unwrap();
+    upstream.spawn();
+    let edge = upstream
+        .open_edge_deferred_for_job(
+            Arc::new(TcpEdgeTransport::plaintext(addr, 1)),
+            registered_quad,
+            "node-b".into(),
+            "job-registered".into(),
+            1,
+        )
+        .unwrap();
+    let ack = Arc::new(RecordingAck::default());
+    edge.sender
+        .send_async(Envelope::Data(
+            Arc::new(dictionary_batch(None)),
+            ack.clone(),
+        ))
+        .await
+        .unwrap();
+    match next_envelope(&input_rx).await {
+        Envelope::Data(_, a) => a.ack().await.unwrap(),
+        _ => panic!("expected Data envelope on registered edge"),
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !ack.acked.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    drop(held_waiters);
     downstream.shutdown();
     upstream.shutdown();
 }

@@ -1232,8 +1232,22 @@ pub(crate) fn build_hub_tls_acceptor(
 }
 
 pub async fn serve_hub(
+    hub: hub::Hub,
+    config: ServerConfig,
+    cancellation: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let address = config.validate_hub_startup(&hub)?;
+    let listener = TcpListener::bind(address).await?;
+    serve_hub_with_listener(hub, config, listener, cancellation).await
+}
+
+pub async fn serve_hub_with_listener(
     mut hub: hub::Hub,
     config: ServerConfig,
+    listener: TcpListener,
     cancellation: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if config.node_bootstrap_disabled {
@@ -1245,7 +1259,7 @@ pub async fn serve_hub(
     if !config.enabled {
         return Ok(());
     }
-    let address = config.validate_hub_startup(&hub)?;
+    let _address = config.validate_hub_startup(&hub)?;
     // HA election (hub-ha stage 2): an HA-enabled Hub starts as standby and
     // earns leadership through the durable lease. Enabling HA without
     // durable storage is rejected before anything binds: a standby has no
@@ -1278,13 +1292,13 @@ pub async fn serve_hub(
              Hub beyond localhost."
         );
     }
-    // Restore persisted operations before binding the listener (and before
-    // readiness): the terminal-state dispatch-skip memory and the operations
-    // read API must reflect durable history before any reconcile tick or
-    // operator request runs. Manual `hub_router` test setups do not restart
-    // the Hub and skip this path by construction. A standby defers this: it
-    // must not write terminal settlements while another Hub is leader —
-    // promotion re-runs the restore after winning the lease.
+    // Restore persisted operations before serving ready: the terminal-state
+    // dispatch-skip memory and the operations read API must reflect durable
+    // history before any reconcile tick or operator request runs. Manual
+    // `hub_router` test setups do not restart the Hub and skip this path by
+    // construction. A standby defers this: it must not write terminal
+    // settlements while another Hub is leader — promotion re-runs the restore
+    // after winning the lease.
     if hub.has_storage() && hub.is_leader().await {
         let restored = hub.restore_persisted_operations().await?;
         tracing::info!(
@@ -1296,7 +1310,6 @@ pub async fn serve_hub(
     // listener or missing CA for agent_required/required fails startup.
     let (tls_acceptor, mtls_enforced) = build_hub_tls_acceptor(&config)?;
     hub.set_mtls_enforced(mtls_enforced);
-    let listener = TcpListener::bind(address).await?;
     // Lease election loop: leaders renew at ttl/3, standbys probe for
     // takeover. Failover is bounded by the lease TTL plus one probe.
     let election_task = if hub.ha_config().enabled {

@@ -78,6 +78,7 @@ fn authenticated_node<'a>(
             .as_bytes()
             .ct_eq(node.session_token.as_bytes()),
     ) || now_ms() > node.session_expires_at_ms
+        || node.bootstrap_rotation_pending
         || node
             .cert_node_id
             .as_deref()
@@ -761,27 +762,41 @@ impl Hub {
                         .as_deref()
                         .map(str::trim)
                         .filter(|boot| !boot.is_empty());
-                    // Same-boot retry recovery: if the very first bootstrap
-                    // response was lost on the wire before the Agent observed
-                    // any authenticated post-register call, let the same
-                    // unconfirmed boot_id re-roll that single unrevoked/unexpired
+                    // Same-boot retry recovery: if the bootstrap response (or a
+                    // previous rotation commit before register_after_auth) was lost
+                    // before the Agent confirmed the session, let the same
+                    // unconfirmed boot_id re-roll the single active/unexpired
                     // bootstrap credential cleanly instead of wedging the node.
+                    let all_bootstrap = history.iter().all(|c| c.label == "bootstrap");
+                    let active_bootstrap = history
+                        .iter()
+                        .filter(|c| c.revoked_at_ms.is_none())
+                        .collect::<Vec<_>>();
                     let same_boot_unconfirmed_cred = match req_boot_id {
                         Some(req_boot)
-                            if history.len() == 1
-                                && history[0].label == "bootstrap"
-                                && history[0].revoked_at_ms.is_none()
-                                && history[0].expires_at_ms.is_none_or(|exp| now < exp) =>
+                            if all_bootstrap
+                                && active_bootstrap.len() == 1
+                                && active_bootstrap[0]
+                                    .expires_at_ms
+                                    .is_none_or(|exp| now < exp) =>
                         {
-                            let existing_cred_id = &history[0].credential_id;
-                            let nodes = self.nodes.read().await;
-                            nodes.get(&request.node_id).and_then(|record| {
-                                (record.bootstrap_unconfirmed
+                            let existing_cred_id = active_bootstrap[0].credential_id.clone();
+                            let mut nodes = self.nodes.write().await;
+                            let eligible = nodes.get(&request.node_id).is_some_and(|record| {
+                                record.bootstrap_unconfirmed
+                                    && !record.bootstrap_rotation_pending
                                     && record.boot_id.as_deref() == Some(req_boot)
                                     && record.credential_id.as_deref()
-                                        == Some(existing_cred_id.as_str()))
-                                .then(|| existing_cred_id.clone())
-                            })
+                                        == Some(existing_cred_id.as_str())
+                            });
+                            if eligible {
+                                if let Some(record) = nodes.get_mut(&request.node_id) {
+                                    record.bootstrap_rotation_pending = true;
+                                }
+                                Some(existing_cred_id)
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
@@ -813,12 +828,48 @@ impl Hub {
                             last_used_at_ms: None,
                             revoked_at_ms: None,
                         };
-                        if !storage
+                        let rotated = match storage
                             .rotate_node_credential(record, &previous_cred_id, now)
                             .await
-                            .map_err(HubError::from)?
                         {
+                            Ok(rotated) => rotated,
+                            Err(error) => {
+                                let mut nodes = self.nodes.write().await;
+                                if let Some(existing) = nodes.get_mut(&request.node_id) {
+                                    if existing.credential_id.as_deref()
+                                        == Some(previous_cred_id.as_str())
+                                    {
+                                        existing.bootstrap_rotation_pending = false;
+                                    }
+                                }
+                                return Err(HubError::from(error));
+                            }
+                        };
+                        if !rotated {
+                            let mut nodes = self.nodes.write().await;
+                            if let Some(existing) = nodes.get_mut(&request.node_id) {
+                                if existing.credential_id.as_deref()
+                                    == Some(previous_cred_id.as_str())
+                                {
+                                    existing.bootstrap_rotation_pending = false;
+                                }
+                            }
                             return Err(HubError::Unauthorized);
+                        }
+                        // Rotation committed in durable storage: immediately
+                        // invalidate the prior session BEFORE any fallible
+                        // register_after_auth work so the revoked credential's
+                        // session cannot remain active if registration errors,
+                        // while preserving recoverability on the next retry.
+                        {
+                            let mut nodes = self.nodes.write().await;
+                            if let Some(existing) = nodes.get_mut(&request.node_id) {
+                                existing.session_token = String::new();
+                                existing.session_expires_at_ms = 0;
+                                existing.credential_id = Some(cred_id.clone());
+                                existing.bootstrap_unconfirmed = true;
+                                existing.bootstrap_rotation_pending = false;
+                            }
                         }
                         self.record_node_audit(
                             Some(format!("node:{}", request.node_id)),
@@ -941,8 +992,10 @@ impl Hub {
         // built-in Agent sends its stable `NodeAgentConfig::boot_id`.
         let registered_boot_id = request
             .boot_id
-            .clone()
-            .filter(|boot_id| !boot_id.trim().is_empty())
+            .as_deref()
+            .map(str::trim)
+            .filter(|boot_id| !boot_id.is_empty())
+            .map(str::to_owned)
             .unwrap_or_else(|| session_token.clone());
         // Labels are durable operator state: re-hydrate them from storage so
         // they survive Hub restarts (the in-memory registry is rebuilt from
@@ -1012,6 +1065,7 @@ impl Hub {
                 credential_id: credential_id.clone(),
                 cert_node_id,
                 bootstrap_unconfirmed: auth_mode == "bootstrap_enroll",
+                bootstrap_rotation_pending: false,
                 boot_id: Some(registered_boot_id.clone()),
                 report_seq: 0,
                 last_report_at_ms: 0,

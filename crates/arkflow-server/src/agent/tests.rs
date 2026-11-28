@@ -6616,7 +6616,36 @@ fn try_flush_pending_credential_retains_on_error_and_clears_on_success() {
 #[tokio::test(flavor = "multi_thread")]
 async fn job_runtime_start_replaces_kernel_when_peer_edge_context_changes() {
     let runtime = JobRuntime::default();
-    let (plan, assignments) = replacement_test_plan("orders-edge-drift").await;
+    let state_dir = tempfile::tempdir().unwrap();
+    let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+        "id": "orders-edge-drift",
+        "version": 1,
+        "operators": [
+            {"id": "source", "kind": "source"},
+            {"id": "sink", "kind": "sink"}
+        ],
+        "edges": [{"id": "source-sink", "from": "source", "to": "sink"}],
+        "sources": [{
+            "operator_id": "source",
+            "input_type": "generate",
+            "config": {"context": "node-a", "interval": "10ms", "batch_size": 1},
+            "time": {"mode": "processing_time"}
+        }],
+        "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+        "state": {
+            "backend": "embedded_kv",
+            "durability": "durable",
+            "root": state_dir.path().to_string_lossy().into_owned(),
+            "format_version": 1
+        }
+    }))
+    .unwrap();
+    let _ = arkflow_plugin::initialize();
+    spec.validate().unwrap();
+    let plan = JobPlan::compile(spec).unwrap();
+    let assignments = plan
+        .assignments_for_nodes(&["node-a".to_string()], 1)
+        .expect("colocated placement succeeds");
     let initial_split = SplitPlacementPayload {
         task_nodes: Some(BTreeMap::from([
             ("source-0".into(), "node-a".into()),
@@ -6658,22 +6687,286 @@ async fn job_runtime_start_replaces_kernel_when_peer_edge_context_changes() {
         .unwrap();
     assert!(!initial_token.is_cancelled());
 
-    // Changed peer data port / edge secret at the SAME generation replaces the running kernel.
-    let updated_split = SplitPlacementPayload {
+    // Changing only the peer data address replaces the running kernel.
+    let updated_addr_split = SplitPlacementPayload {
         task_nodes: initial_split.task_nodes.clone(),
         node_data_ports: BTreeMap::from([("node-a".into(), "127.0.0.1:39602".into())]),
         recovery_required: false,
-        edge_secrets: BTreeMap::from([(("node-a".into(), "node-c".into()), "bb".repeat(32))]),
+        edge_secrets: initial_split.edge_secrets.clone(),
     };
     runtime
-        .start(plan, assignments, 1, None, false, "node-a", &updated_split)
+        .start(
+            plan.clone(),
+            assignments.clone(),
+            1,
+            None,
+            false,
+            "node-a",
+            &updated_addr_split,
+        )
         .await
         .unwrap();
     assert!(
         initial_token.is_cancelled(),
-        "stale kernel must be cancelled and replaced when peer edge context changes"
+        "stale kernel must be cancelled when peer data address changes"
+    );
+    let second_token = {
+        let tasks = runtime.tasks.lock().await;
+        tasks["orders-edge-drift"].cancellation.clone()
+    };
+    assert!(!second_token.is_cancelled());
+
+    // Changing only the edge secret value for the same node pair also replaces the kernel.
+    let updated_secret_split = SplitPlacementPayload {
+        task_nodes: initial_split.task_nodes.clone(),
+        node_data_ports: updated_addr_split.node_data_ports.clone(),
+        recovery_required: false,
+        edge_secrets: BTreeMap::from([(("node-a".into(), "node-b".into()), "bb".repeat(32))]),
+    };
+    runtime
+        .start(
+            plan,
+            assignments,
+            1,
+            None,
+            false,
+            "node-a",
+            &updated_secret_split,
+        )
+        .await
+        .unwrap();
+    assert!(
+        second_token.is_cancelled(),
+        "stale kernel must be cancelled when per-edge secret value changes"
     );
 
     runtime.stop("orders-edge-drift", 1).await.unwrap();
     let _ = runtime.take_finished().await;
+    drop(state_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn job_runtime_start_updates_live_wiring_for_durable_job_without_checkpoint() {
+    let _ = arkflow_plugin::initialize();
+    let state_dir = tempfile::tempdir().unwrap();
+    let manager_a = arkflow_core::executor::remote::NetworkManager::with_config(
+        arkflow_core::executor::remote::NetworkManagerConfig {
+            credentials: Some(
+                arkflow_core::executor::remote::DataPlaneCredentials::hub_provisioned("node-a"),
+            ),
+            ..arkflow_core::executor::remote::NetworkManagerConfig::default()
+        },
+    )
+    .unwrap();
+    manager_a.spawn();
+    let port_a = manager_a
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+
+    let manager_b = arkflow_core::executor::remote::NetworkManager::with_config(
+        arkflow_core::executor::remote::NetworkManagerConfig {
+            credentials: Some(
+                arkflow_core::executor::remote::DataPlaneCredentials::hub_provisioned("node-b"),
+            ),
+            ..arkflow_core::executor::remote::NetworkManagerConfig::default()
+        },
+    )
+    .unwrap();
+    manager_b.spawn();
+    let port_b = manager_b
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+
+    let spec: arkflow_core::job::JobSpec = serde_json::from_value(serde_json::json!({
+        "id": "orders-live-rewire",
+        "version": 1,
+        "placement": "split",
+        "operators": [
+            {"id": "source", "kind": "source"},
+            {"id": "agg", "kind": "map", "stateful": true, "key_field": "__value__", "config": {"type": "batch", "count": 1, "timeout_ms": 10}},
+            {"id": "sink", "kind": "sink"}
+        ],
+        "edges": [
+            {"id": "source-agg", "from": "source", "to": "agg", "partitioned": true},
+            {"id": "agg-sink", "from": "agg", "to": "sink"}
+        ],
+        "sources": [{
+            "operator_id": "source",
+            "input_type": "generate",
+            "config": {"context": "node-a", "interval": "50ms", "batch_size": 1},
+            "time": {"mode": "processing_time"}
+        }],
+        "sinks": [{"operator_id": "sink", "output_type": "drop"}],
+        "state": {
+            "backend": "embedded_kv",
+            "durability": "durable",
+            "root": state_dir.path().to_string_lossy().into_owned(),
+            "format_version": 1
+        },
+        "checkpoint": {
+            "interval_ms": 60000,
+            "object_store_uri": format!("file://{}", state_dir.path().join("checkpoints").display())
+        }
+    }))
+    .unwrap();
+    spec.validate().unwrap();
+    let plan = JobPlan::compile(spec).unwrap();
+    let sink_task_ids: std::collections::BTreeSet<String> = plan
+        .tasks
+        .iter()
+        .filter(|task| task.operator_id == "sink")
+        .map(|task| task.id.clone())
+        .collect();
+    let all_assignments = plan.assignments_for_nodes(&["node-a".into()], 1).unwrap();
+    let assignments_a: Vec<_> = all_assignments
+        .iter()
+        .filter(|a| !sink_task_ids.contains(&a.task_id))
+        .cloned()
+        .collect();
+    let assignments_b: Vec<_> = all_assignments
+        .iter()
+        .filter(|a| sink_task_ids.contains(&a.task_id))
+        .cloned()
+        .map(|mut a| {
+            a.node_id = "node-b".into();
+            a
+        })
+        .collect();
+
+    let runtime_a = JobRuntime {
+        data_plane: Some(manager_a.clone()),
+        ..Default::default()
+    };
+    let runtime_b = JobRuntime {
+        data_plane: Some(manager_b.clone()),
+        ..Default::default()
+    };
+
+    let mut task_nodes_b = BTreeMap::new();
+    for a in &assignments_a {
+        task_nodes_b.insert(a.task_id.clone(), "node-a".into());
+    }
+    for a in &assignments_b {
+        task_nodes_b.insert(a.task_id.clone(), "node-b".into());
+    }
+    let split_b = SplitPlacementPayload {
+        task_nodes: Some(task_nodes_b),
+        node_data_ports: BTreeMap::from([
+            ("node-a".into(), format!("127.0.0.1:{port_a}")),
+            ("node-b".into(), format!("127.0.0.1:{port_b}")),
+        ]),
+        recovery_required: false,
+        edge_secrets: BTreeMap::from([(("node-a".into(), "node-b".into()), "aa".repeat(32))]),
+    };
+
+    runtime_b
+        .start(
+            plan.clone(),
+            assignments_b,
+            1,
+            None,
+            false,
+            "node-b",
+            &split_b,
+        )
+        .await
+        .unwrap();
+    runtime_a
+        .start(
+            plan.clone(),
+            assignments_a.clone(),
+            1,
+            None,
+            false,
+            "node-a",
+            &split_b,
+        )
+        .await
+        .unwrap();
+    assert!(
+        durable_recovery_marker(&plan, "node-a", 1)
+            .expect("durable stateful job must define .arkflow-started path")
+            .is_file(),
+        ".arkflow-started marker must exist before live wiring update"
+    );
+    let token_a = {
+        let tasks = runtime_a.tasks.lock().await;
+        tasks["orders-live-rewire"].cancellation.clone()
+    };
+
+    // Move downstream peer from node-b -> node-c WITHOUT any checkpoint (recovery_id=None).
+    let manager_c = arkflow_core::executor::remote::NetworkManager::with_config(
+        arkflow_core::executor::remote::NetworkManagerConfig {
+            credentials: Some(
+                arkflow_core::executor::remote::DataPlaneCredentials::hub_provisioned("node-c"),
+            ),
+            ..arkflow_core::executor::remote::NetworkManagerConfig::default()
+        },
+    )
+    .unwrap();
+    manager_c.spawn();
+    let port_c = manager_c
+        .bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let runtime_c = JobRuntime {
+        data_plane: Some(manager_c.clone()),
+        ..Default::default()
+    };
+    let assignments_c: Vec<_> = all_assignments
+        .iter()
+        .filter(|a| sink_task_ids.contains(&a.task_id))
+        .cloned()
+        .map(|mut a| {
+            a.node_id = "node-c".into();
+            a
+        })
+        .collect();
+    let mut task_nodes_c = BTreeMap::new();
+    for a in &assignments_a {
+        task_nodes_c.insert(a.task_id.clone(), "node-a".into());
+    }
+    for a in &assignments_c {
+        task_nodes_c.insert(a.task_id.clone(), "node-c".into());
+    }
+    let split_c = SplitPlacementPayload {
+        task_nodes: Some(task_nodes_c),
+        node_data_ports: BTreeMap::from([
+            ("node-a".into(), format!("127.0.0.1:{port_a}")),
+            ("node-c".into(), format!("127.0.0.1:{port_c}")),
+        ]),
+        recovery_required: false,
+        edge_secrets: BTreeMap::from([(("node-a".into(), "node-c".into()), "cc".repeat(32))]),
+    };
+    runtime_c
+        .start(
+            plan.clone(),
+            assignments_c,
+            1,
+            None,
+            false,
+            "node-c",
+            &split_c,
+        )
+        .await
+        .unwrap();
+    // Updating wiring on running node-a with no checkpoint must succeed AND keep local kernel alive.
+    runtime_a
+        .start(plan, assignments_a, 1, None, false, "node-a", &split_c)
+        .await
+        .expect("live wiring update must succeed for durable job before first checkpoint");
+    assert!(
+        !token_a.is_cancelled(),
+        "live wiring update must preserve running durable kernel without triggering .arkflow-started rejection"
+    );
+
+    runtime_b.stop("orders-live-rewire", 1).await.unwrap();
+    runtime_a.stop("orders-live-rewire", 1).await.unwrap();
+    runtime_c.stop("orders-live-rewire", 1).await.unwrap();
+    manager_a.shutdown();
+    manager_b.shutdown();
+    manager_c.shutdown();
+    drop(state_dir);
 }

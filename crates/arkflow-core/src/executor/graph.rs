@@ -82,6 +82,130 @@ impl RemoteEdgeContext {
     }
 }
 
+/// Computes live endpoint and per-edge secret updates for every remote edge
+/// touching `local_task_ids`, preserving existing in-process channels and state.
+pub fn build_live_edge_updates(
+    plan: &JobPlan,
+    local_task_ids: &[String],
+    remote: &RemoteEdgeContext,
+) -> Result<Vec<super::remote::LiveEdgeUpdate>, Error> {
+    plan.validate_side_edge_nodes(&remote.task_nodes)?;
+    plan.validate_affinity_nodes(&remote.task_nodes)?;
+    let index = PlanIndex::new(plan);
+    let local_set: BTreeSet<&str> = local_task_ids.iter().map(String::as_str).collect();
+    let operator_index = operator_routing_index(plan);
+    let mut updates = Vec::new();
+    let mut seen_outbound = BTreeSet::new();
+    let mut seen_inbound = BTreeSet::new();
+
+    for task in &plan.tasks {
+        if !local_set.contains(task.id.as_str()) {
+            continue;
+        }
+        if let Some(downstream_ops) = index.downstream.get(task.operator_id.as_str()) {
+            for downstream_operator in downstream_ops {
+                for target_task in plan
+                    .tasks
+                    .iter()
+                    .filter(|candidate| candidate.operator_id == *downstream_operator)
+                {
+                    if local_set.contains(target_task.id.as_str())
+                        || remote.node_of(&target_task.id)? == remote.local_node
+                    {
+                        continue;
+                    }
+                    if !seen_outbound.insert((task.id.as_str(), target_task.id.as_str())) {
+                        continue;
+                    }
+                    let quad = super::remote::Quad {
+                        src_op: *operator_index.get(&task.operator_id).ok_or_else(|| {
+                            Error::Config(format!(
+                                "operator '{}' has no routing index",
+                                task.operator_id
+                            ))
+                        })?,
+                        src_subtask: task.subtask,
+                        dst_op: *operator_index
+                            .get(&target_task.operator_id)
+                            .ok_or_else(|| {
+                                Error::Config(format!(
+                                    "operator '{}' has no routing index",
+                                    target_task.operator_id
+                                ))
+                            })?,
+                        dst_subtask: target_task.subtask,
+                    };
+                    let peer_node = remote.node_of(&target_task.id)?.to_owned();
+                    let addr = *remote.node_addrs.get(&peer_node).ok_or_else(|| {
+                        Error::Config(format!(
+                            "no data-plane address for remote node '{peer_node}'"
+                        ))
+                    })?;
+                    let secret = remote
+                        .edge_secrets
+                        .get(&(remote.local_node.clone(), peer_node.clone()))
+                        .map(|secret| secret.as_bytes().to_vec());
+                    updates.push(super::remote::LiveEdgeUpdate {
+                        quad,
+                        is_outbound: true,
+                        peer_node,
+                        peer_addr: Some(addr),
+                        edge_secret: secret,
+                    });
+                }
+            }
+        }
+
+        if let Some(upstream_ops) = index.upstream.get(task.operator_id.as_str()) {
+            for upstream_operator in upstream_ops {
+                for upstream_task in plan
+                    .tasks
+                    .iter()
+                    .filter(|candidate| candidate.operator_id == *upstream_operator)
+                {
+                    if local_set.contains(upstream_task.id.as_str())
+                        || remote.node_of(&upstream_task.id)? == remote.local_node
+                    {
+                        continue;
+                    }
+                    if !seen_inbound.insert((upstream_task.id.as_str(), task.id.as_str())) {
+                        continue;
+                    }
+                    let quad = super::remote::Quad {
+                        src_op: *operator_index.get(*upstream_operator).ok_or_else(|| {
+                            Error::Config(format!(
+                                "operator '{upstream_operator}' has no routing index"
+                            ))
+                        })?,
+                        src_subtask: upstream_task.subtask,
+                        dst_op: *operator_index.get(&task.operator_id).ok_or_else(|| {
+                            Error::Config(format!(
+                                "operator '{}' has no routing index",
+                                task.operator_id
+                            ))
+                        })?,
+                        dst_subtask: task.subtask,
+                    };
+                    let peer_node = remote.node_of(&upstream_task.id)?.to_owned();
+                    let secret = remote
+                        .edge_secrets
+                        .get(&(peer_node.clone(), remote.local_node.clone()))
+                        .map(|secret| secret.as_bytes().to_vec());
+                    updates.push(super::remote::LiveEdgeUpdate {
+                        quad,
+                        is_outbound: false,
+                        peer_node,
+                        peer_addr: None,
+                        edge_secret: secret,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(updates)
+}
+
 /// An outbound edge endpoint from a task inside a chain.
 #[derive(Clone)]
 pub enum EdgeTarget {

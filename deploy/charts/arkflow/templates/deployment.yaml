@@ -61,10 +61,30 @@ spec:
                 secretKeyRef:
                   name: {{ include "arkflow.nodeTokenSecretName" . }}
                   key: {{ include "arkflow.nodeTokenSecretKey" . }}
+            {{- if .Values.agent.nodeId }}
+            {{- if not (or .Values.controlPlane.agent.persistence.enabled .Values.controlPlane.agent.persistence.existingClaim) }}
+            {{- fail "pinned agent.nodeId in control-plane mode requires controlPlane.agent.persistence.enabled=true or existingClaim so enrolled arkn_ credentials survive Pod replacement" }}
             {{- end }}
-            {{- if and (ne .Values.mode "control-plane") .Values.persistence.enabled }}
+            {{- if ne (int .Values.controlPlane.agent.replicas) 1 }}
+            {{- fail "pinned agent.nodeId requires controlPlane.agent.replicas=1 so two pods do not contend for one node_id or PVC" }}
+            {{- end }}
+            - name: ARKFLOW_NODE_CREDENTIAL_FILE
+              value: {{ printf "%s/node_credential" (trimSuffix "/" .Values.controlPlane.agent.persistence.mountPath) | quote }}
+            {{- else }}
+            - name: ARKFLOW_NODE_CREDENTIAL_FILE
+              value: "/var/lib/arkflow-agent/node_credential"
+            {{- end }}
+            {{- else }}
+            {{- if .Values.persistence.enabled }}
             - name: ARKFLOW_NODE_CREDENTIAL_FILE
               value: {{ printf "%s/node_credential" (trimSuffix "/" .Values.persistence.mountPath) | quote }}
+            {{- else }}
+            {{- if .Values.agent.nodeId }}
+            {{- fail "pinned agent.nodeId requires persistence.enabled=true so enrolled arkn_ credentials survive Pod replacement" }}
+            {{- end }}
+            - name: ARKFLOW_NODE_CREDENTIAL_FILE
+              value: "/var/lib/arkflow-agent/node_credential"
+            {{- end }}
             {{- end }}
             {{- if include "arkflow.agentTlsEnabled" . | eq "true" }}
             {{- $tlsCaKey := ternary (default "ca.crt" .Values.controlPlane.tls.caKey) (default "ca.crt" .Values.agent.tls.caKey) (eq .Values.mode "control-plane") }}
@@ -121,6 +141,12 @@ spec:
             {{- if and (ne .Values.mode "control-plane") .Values.persistence.enabled }}
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
+            {{- else if and (eq .Values.mode "control-plane") .Values.agent.nodeId (or .Values.controlPlane.agent.persistence.enabled .Values.controlPlane.agent.persistence.existingClaim) }}
+            - name: agent-data
+              mountPath: {{ .Values.controlPlane.agent.persistence.mountPath }}
+            {{- else if include "arkflow.agentEnabled" . | eq "true" }}
+            - name: agent-credential
+              mountPath: /var/lib/arkflow-agent
             {{- end }}
             {{- if include "arkflow.agentTlsEnabled" . | eq "true" }}
             - name: agent-tls
@@ -135,6 +161,13 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "arkflow.fullname" . }}-data
+        {{- else if and (eq .Values.mode "control-plane") .Values.agent.nodeId (or .Values.controlPlane.agent.persistence.enabled .Values.controlPlane.agent.persistence.existingClaim) }}
+        - name: agent-data
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-agent-data" (include "arkflow.fullname" .)) .Values.controlPlane.agent.persistence.existingClaim }}
+        {{- else if include "arkflow.agentEnabled" . | eq "true" }}
+        - name: agent-credential
+          emptyDir: {}
         {{- end }}
         {{- if include "arkflow.agentTlsEnabled" . | eq "true" }}
         {{- $tlsCaKey := ternary (default "ca.crt" .Values.controlPlane.tls.caKey) (default "ca.crt" .Values.agent.tls.caKey) (eq .Values.mode "control-plane") }}

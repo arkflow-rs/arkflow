@@ -1,7 +1,7 @@
 //! Hub mTLS listener, Agent client TLS/mTLS, SAN identity binding, and startup
 //! configuration override tests (PA-P1-07 Phase 3).
 
-use super::{build_hub_tls_acceptor, serve_hub, ServerConfig};
+use super::{build_hub_tls_acceptor, serve_hub, serve_hub_with_listener, ServerConfig};
 use crate::agent::{self, NodeAgentConfig};
 use crate::hub::{default_approval_ttl_ms, default_session_ttl_ms, Hub, HubConfig};
 use crate::startup_config::{apply_env_overrides, HubStartupConfig};
@@ -414,7 +414,8 @@ async fn hub_mtls_agent_required_allows_operators_enforces_agent_cert_and_san_bi
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_required_mtls_session_bound_to_san_rejects_uncertified_or_empty_san_requests() {
     let fixtures = generate_tls_fixtures();
-    let addr = free_addr();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
     let cancel = CancellationToken::new();
     let hub = Hub::with_storage(
         HubConfig {
@@ -432,7 +433,7 @@ async fn agent_required_mtls_session_bound_to_san_rejects_uncertified_or_empty_s
             8,
         ),
     );
-    let task = tokio::spawn(serve_hub(
+    let task = tokio::spawn(serve_hub_with_listener(
         hub.clone(),
         ServerConfig {
             address: addr.clone(),
@@ -442,6 +443,7 @@ async fn agent_required_mtls_session_bound_to_san_rejects_uncertified_or_empty_s
             tls_client_auth: Some("agent_required".into()),
             ..ServerConfig::default()
         },
+        listener,
         cancel.clone(),
     ));
     let base_url = format!("https://{addr}");

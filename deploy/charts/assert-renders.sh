@@ -56,6 +56,9 @@ assert_contains "$TMP/cp.yaml" "proxy_ssl_verify on" "cp: console enables proxy_
 assert_contains "$TMP/cp.yaml" "name: hub-ca" "cp: console mounts CA-only volume"
 assert_contains "$TMP/cp.yaml" "name: arkflow-agent" "cp: in-chart agent workload"
 assert_contains "$TMP/cp.yaml" "name: ARKFLOW_NODE_TOKEN" "cp: shared credential env"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_NODE_CREDENTIAL_FILE" "cp: in-chart agent credential file env"
+assert_contains "$TMP/cp.yaml" "value: \"/var/lib/arkflow-agent/node_credential\"" "cp: in-chart agent uses Pod-scoped emptyDir path"
+assert_contains "$TMP/cp.yaml" "emptyDir: {}" "cp: in-chart agent uses Pod-scoped emptyDir volume"
 assert_contains "$TMP/cp.yaml" "name: ARKFLOW_AGENT_TLS_CERT" "cp: agent client cert env"
 assert_contains "$TMP/cp.yaml" "name: ARKFLOW_DATA_PLANE_TLS_CERT" "cp: data-plane cert env"
 assert_contains "$TMP/cp.yaml" "clusterIP: None" "cp: agent headless service"
@@ -70,6 +73,12 @@ console = next((d for d in docs if "app.kubernetes.io/component: console" in d a
 assert console, "cp: missing console Deployment"
 assert 'key: "ca.crt"' in console and "hub.key" not in console, "cp: console must mount only ca.crt"
 EOF
+
+echo "== pinned agent.nodeId requires persistent storage =="
+if helm template my-agent "$CHART" -f "$CHART/values-agent.yaml" --set agent.nodeId=fixed-edge-01 >"$TMP/pinfail.yaml" 2>"$TMP/pinfail.err"; then
+  fail "pinned-agent: expected render failure when persistence.enabled=false"
+fi
+assert_contains "$TMP/pinfail.err" "persistence.enabled=true" "pinned-agent: explicit persistence requirement"
 
 echo "== control-plane mTLS opt-out =="
 helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" \

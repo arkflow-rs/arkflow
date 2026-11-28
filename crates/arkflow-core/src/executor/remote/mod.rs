@@ -51,7 +51,7 @@ mod wire;
 mod tests;
 
 pub use auth::{DataPlaneCredentials, PeerExpectation};
-pub use manager::{NetworkManager, NetworkManagerConfig, RemoteEdge};
+pub use manager::{LiveEdgeUpdate, NetworkManager, NetworkManagerConfig, RemoteEdge};
 pub use transport::{DataPlaneTlsConfig, EdgeTransport, RemoteStream};
 pub use wire::Quad;
 

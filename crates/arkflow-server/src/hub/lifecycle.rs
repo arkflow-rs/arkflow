@@ -114,6 +114,7 @@ impl Hub {
                 .as_bytes()
                 .ct_eq(node.session_token.as_bytes()),
         ) || now_ms() > node.session_expires_at_ms
+            || node.bootstrap_rotation_pending
         {
             return Err(HubError::Unauthorized);
         }

@@ -830,6 +830,7 @@ fn rank_candidates_is_deterministic_and_prefers_headroom() {
             credential_id: None,
             cert_node_id: None,
             bootstrap_unconfirmed: false,
+            bootstrap_rotation_pending: false,
         };
         if reported {
             record.metrics = resource_metrics(used_ratio, cpu);

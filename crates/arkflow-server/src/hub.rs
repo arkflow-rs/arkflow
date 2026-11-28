@@ -126,6 +126,7 @@ pub(crate) struct NodeRecord {
     /// receipt of its minted credential via `heartbeat`/`report`/`commands`/
     /// `command_result`/`report_job_observation` or a subsequent `arkn_` register.
     bootstrap_unconfirmed: bool,
+    bootstrap_rotation_pending: bool,
     boot_id: Option<String>,
     report_seq: u64,
     commands: VecDeque<AgentCommand>,
@@ -205,6 +206,15 @@ pub struct Hub {
     /// aggregation side effects. A duplicate terminal result only short-
     /// circuits when this marker is present; otherwise it retries them.
     settled_commands: Arc<RwLock<BTreeSet<String>>>,
+    /// Command ids whose terminal audit event was written (or skipped on a
+    /// volatile Hub). Tracked independently of `settled_commands` and the
+    /// in-memory terminal transition so a retry after `persist_operation`
+    /// fails still records the audit once without duplicating on replay.
+    audited_commands: Arc<RwLock<BTreeSet<String>>>,
+    /// Original `(node_id, credential_id)` session attribution captured when a
+    /// command first transitions to terminal state, preserved across retries
+    /// until the audit event is written.
+    terminal_audit_credentials: Arc<RwLock<TerminalAuditCredentialMap>>,
     /// The node order each Job's placement was actually dispatched in, so a
     /// retained placement re-dispatches with the identical task→node mapping
     /// (split round-robin and multi-component co-location are order
@@ -270,6 +280,7 @@ pub struct Hub {
 
 type EdgeSecretMap = BTreeMap<(String, String), String>;
 type JobEdgeSecretCache = BTreeMap<(String, u64), EdgeSecretMap>;
+type TerminalAuditCredentialMap = BTreeMap<String, (String, Option<String>)>;
 
 /// Verified client certificate metadata attached by `HubTlsListener` when a
 /// peer completes a TLS handshake with a CA-trusted client certificate.
@@ -348,11 +359,15 @@ pub(crate) fn seed_control_plane_floor(floor: u64) {
     );
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
+static MONOTONIC_WALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn now_ms() -> u64 {
+    let raw = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let prev = MONOTONIC_WALL_MS.fetch_max(raw, std::sync::atomic::Ordering::AcqRel);
+    raw.max(prev)
 }
 
 pub fn now_ms_for_metrics() -> u64 {
@@ -385,6 +400,8 @@ impl Hub {
             approval_lock: Arc::new(tokio::sync::Mutex::new(())),
             pause_dispatch_pending: Arc::new(RwLock::new(BTreeMap::new())),
             settled_commands: Arc::new(RwLock::new(BTreeSet::new())),
+            audited_commands: Arc::new(RwLock::new(BTreeSet::new())),
+            terminal_audit_credentials: Arc::new(RwLock::new(BTreeMap::new())),
             placement_order: Arc::new(RwLock::new(BTreeMap::new())),
             plan_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             start_dispatch_fingerprints: Arc::new(RwLock::new(BTreeMap::new())),

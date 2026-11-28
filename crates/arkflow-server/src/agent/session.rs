@@ -196,20 +196,61 @@ pub async fn run(
         }
         match register(&client, &active_config, data_address.clone()).await {
             Ok(mut session) => {
+                let mut enrolled_token: Option<String> = None;
                 if let Some(issued_credential) = session.node_credential.take() {
                     let trimmed = issued_credential.trim().to_owned();
                     if !trimmed.is_empty() {
-                        active_config.node_token = trimmed.clone();
-                        if active_config.node_credential_file.is_some() {
-                            pending_credential_persist = Some(trimmed);
-                            try_flush_pending_credential(
-                                &config.node_id,
-                                active_config.node_credential_file.as_deref(),
-                                &mut pending_credential_persist,
-                            );
+                        if let Some(path) = active_config.node_credential_file.clone() {
+                            let mut pending = Some(trimmed.clone());
+                            let node_id = config.node_id.clone();
+                            let remaining = tokio::task::spawn_blocking(move || {
+                                try_flush_pending_credential(
+                                    &node_id,
+                                    Some(path.as_str()),
+                                    &mut pending,
+                                );
+                                pending
+                            })
+                            .await
+                            .unwrap_or(Some(trimmed.clone()));
+                            if remaining.is_some() {
+                                warn!(
+                                    node_id = %config.node_id,
+                                    hub = %active_config.hub_url,
+                                    "failed to persist issued node credential; retrying registration before starting session"
+                                );
+                                pending_reason = "credential_persist_failed";
+                                failed_attempts += 1;
+                                let cycle_len = candidates.len().max(1);
+                                let sleep_duration = if failed_attempts > 0
+                                    && failed_attempts.is_multiple_of(cycle_len)
+                                {
+                                    let current = backoff;
+                                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                                    jittered_backoff(current)
+                                } else {
+                                    Duration::from_millis(200)
+                                };
+                                tokio::select! {
+                                    _ = cancellation.cancelled() => {
+                                        job_runtime.stop_all().await;
+                                        if let Some(manager) = &job_runtime.data_plane {
+                                            manager.shutdown();
+                                        }
+                                        return Ok(());
+                                    }
+                                    _ = tokio::time::sleep(sleep_duration) => {}
+                                }
+                                continue;
+                            }
                         }
+                        enrolled_token = Some(trimmed);
                     }
                 }
+                if let Some(token) = enrolled_token {
+                    active_config.node_token = token;
+                }
+                pending_credential_persist = None;
                 info!(node_id = %config.node_id, hub = %active_config.hub_url, "Compute node registered with control-plane Hub");
                 backoff = Duration::from_millis(250);
                 failed_attempts = 0;
@@ -596,14 +637,37 @@ async fn run_session_with_pending_persist(
     let mut command_tasks = JoinSet::new();
     let mut in_flight_commands = HashSet::new();
     let mut report_seq = 0_u64;
+    let mut pending_flush_task: Option<tokio::task::JoinHandle<Option<String>>> = None;
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => {
+                if let Some(task) = pending_flush_task.take() {
+                    task.abort();
+                }
                 command_tasks.abort_all();
                 while command_tasks.join_next().await.is_some() {}
                 job_runtime.stop_all().await;
                 let _ = post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &auth.session_token, &HeartbeatRequest { auth: auth.clone(), state: "draining".into(), protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await;
                 return Ok(())
+            },
+            flush_result = async {
+                match pending_flush_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if pending_flush_task.is_some() => {
+                pending_flush_task = None;
+                match flush_result {
+                    Ok(None) => {
+                        if let Some(slot) = pending_credential_persist.as_deref_mut() {
+                            *slot = None;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Err(error) => {
+                        warn!(node_id = %config.node_id, %error, "background credential persistence task failed");
+                    }
+                }
             },
             joined = command_tasks.join_next(), if !command_tasks.is_empty() => {
                 match joined {
@@ -626,12 +690,16 @@ async fn run_session_with_pending_persist(
                 }
             },
             _ = heartbeat.tick() => {
-                if let Some(pending) = pending_credential_persist.as_deref_mut() {
-                    try_flush_pending_credential(
-                        &config.node_id,
-                        config.node_credential_file.as_deref(),
-                        pending,
-                    );
+                if pending_flush_task.is_none() {
+                    if let Some(Some(cred)) = pending_credential_persist.as_deref() {
+                        let node_id = config.node_id.clone();
+                        let path = config.node_credential_file.clone();
+                        let mut pending = Some(cred.clone());
+                        pending_flush_task = Some(tokio::task::spawn_blocking(move || {
+                            try_flush_pending_credential(&node_id, path.as_deref(), &mut pending);
+                            pending
+                        }));
+                    }
                 }
                 post_json(client, format!("{}{}{}", config.hub_url, config.api_prefix, "/agent/heartbeat"), &auth.session_token, &HeartbeatRequest { auth: auth.clone(), state: if cp.health().is_running() { "online".into() } else { "starting".into() }, protocol_version: Some("v1".into()), software_version: Some(env!("CARGO_PKG_VERSION").into()), capabilities: agent_capabilities(network_shuffle), rollout_id: None }).await?;
             }

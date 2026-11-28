@@ -169,7 +169,9 @@ config: |
   `<release>-tls` 中生成并保留(`helm.sh/resource-policy: keep`)Fleet CA(10 年)、
   Hub 服务端证书及 Agent 客户端/数据面证书(叶证书有效期 365 天,只要 Secret 存在
   就会在升级时复用;生产环境建议通过 `controlPlane.tls.existingSecret` 接入
-  `cert-manager` 等自动轮换证书,或在 365 天到期前轮换 Secret 并重启 Pod),为 Hub
+  `cert-manager` 等自动轮换证书,或在 365 天到期前先删除 `<release>-tls` Secret、执行
+  `helm upgrade` 重新渲染生成 Secret(证书在 Helm 渲染阶段生成而非 Pod 启动时生成),
+  再重启 Hub、Console 与 Agent Pod),为 Hub
   配置 `ARKFLOW_HUB_TLS_{CA,CERT,KEY}`、`ARKFLOW_HUB_TLS_CLIENT_AUTH=agent_required`
   与 `HTTPS` 探针(注意:Chart 会在渲染期拒绝 `clientAuth=required`,因为 kubelet
   探针与 Console 反代不携带客户端证书),将 Console 的 `ARKFLOW_HUB_UPSTREAM` 设为

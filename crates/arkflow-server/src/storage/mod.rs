@@ -1080,7 +1080,7 @@ storage_ops! {
         revoked_at_ms: u64 as v,
     },
     ("list_job_edge_secrets", ListJobEdgeSecrets, list_job_edge_secrets) plain Vec<JobEdgeSecretRecord> {},
-    ("upsert_job_edge_secrets", UpsertJobEdgeSecrets, upsert_job_edge_secrets) fenced () {
+    ("upsert_job_edge_secrets", UpsertJobEdgeSecrets, upsert_job_edge_secrets) fenced bool {
         job_id: String as s,
         generation: u64 as v,
         records: Vec<JobEdgeSecretRecord> as v,
@@ -1893,7 +1893,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         job_id: &str,
         generation: u64,
         records: Vec<JobEdgeSecretRecord>,
-    ) -> Result<(), StorageError>;
+    ) -> Result<bool, StorageError>;
     async fn delete_job_edge_secrets(&self, job_id: &str) -> Result<(), StorageError>;
     async fn get_session(&self, session_hash: &str) -> Result<Option<SessionRecord>, StorageError>;
     async fn upsert_session(&self, record: SessionRecord) -> Result<bool, StorageError>;
@@ -3345,7 +3345,7 @@ impl StorageBackend for ControlPlaneStore {
         job_id: &str,
         generation: u64,
         records: Vec<JobEdgeSecretRecord>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         match self {
             Self::Sqlite(backend) => {
                 StorageBackend::upsert_job_edge_secrets(backend, job_id, generation, records).await
@@ -3533,10 +3533,7 @@ pub(crate) fn seed_intent_counter(floor: u64) {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
+    crate::hub::now_ms()
 }
 
 #[cfg(test)]
@@ -8387,17 +8384,17 @@ mod job_storage_tests {
             dst_node: "node-b".into(),
             secret_hex: "aa".repeat(32),
         };
-        backend
+        assert!(backend
             .upsert_job_edge_secrets("job-1", 1, vec![rec1.clone()])
-            .unwrap();
+            .unwrap());
         // Re-upserting same generation preserves existing edge secret (DO NOTHING).
         let rec1_different = JobEdgeSecretRecord {
             secret_hex: "bb".repeat(32),
             ..rec1.clone()
         };
-        backend
+        assert!(backend
             .upsert_job_edge_secrets("job-1", 1, vec![rec1_different])
-            .unwrap();
+            .unwrap());
         let listed = backend.list_job_edge_secrets().unwrap();
         assert_eq!(listed, vec![rec1.clone()]);
 
@@ -8411,11 +8408,17 @@ mod job_storage_tests {
         let rec2 = JobEdgeSecretRecord {
             generation: 2,
             secret_hex: "cc".repeat(32),
-            ..rec1
+            ..rec1.clone()
         };
-        backend
+        assert!(backend
             .upsert_job_edge_secrets("job-1", 2, vec![rec2.clone()])
-            .unwrap();
+            .unwrap());
+        assert_eq!(backend.list_job_edge_secrets().unwrap(), vec![rec2.clone()]);
+
+        // Older generation write is atomically rejected and leaves generation 2 intact.
+        assert!(!backend
+            .upsert_job_edge_secrets("job-1", 1, vec![rec1])
+            .unwrap());
         assert_eq!(backend.list_job_edge_secrets().unwrap(), vec![rec2]);
 
         backend.delete_job_edge_secrets("job-1").unwrap();

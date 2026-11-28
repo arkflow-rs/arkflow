@@ -3189,9 +3189,26 @@ impl StorageBackend for PostgresBackend {
         job_id: &str,
         generation: u64,
         records: Vec<JobEdgeSecretRecord>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         let mut transaction = self.begin().await?;
         let __ret = async {
+            let max_secret_gen: Option<i64> = sqlx::query_scalar(
+                "SELECT MAX(generation) FROM cp_job_edge_secrets WHERE job_id = $1",
+            )
+            .bind(job_id)
+            .fetch_one(&mut *transaction.transaction)
+            .await?;
+            let max_job_gen: Option<i64> =
+                sqlx::query_scalar("SELECT generation FROM cp_jobs WHERE job_id = $1")
+                    .bind(job_id)
+                    .fetch_optional(&mut *transaction.transaction)
+                    .await?;
+            let target_gen = i64::try_from(generation).unwrap_or(i64::MAX);
+            if max_secret_gen.is_some_and(|persisted| persisted > target_gen)
+                || max_job_gen.is_some_and(|persisted| persisted > target_gen)
+            {
+                return Ok(false);
+            }
             transaction
                 .execute(
                     &q("DELETE FROM cp_job_edge_secrets WHERE job_id = ?1 AND generation != ?2"),
@@ -3212,7 +3229,7 @@ impl StorageBackend for PostgresBackend {
                     )
                     .await?;
             }
-            Ok(())
+            Ok(true)
         }
         .await;
         if __ret.is_err() {

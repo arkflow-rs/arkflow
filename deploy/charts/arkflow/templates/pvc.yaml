@@ -15,3 +15,21 @@ spec:
     requests:
       storage: {{ .Values.persistence.size }}
 {{- end }}
+{{- if and (eq .Values.mode "control-plane") .Values.controlPlane.agent.enabled .Values.controlPlane.agent.persistence.enabled (not .Values.controlPlane.agent.persistence.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "arkflow.fullname" . }}-agent-data
+  labels:
+    {{- include "arkflow.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.controlPlane.agent.persistence.accessModes | nindent 4 }}
+  {{- with .Values.controlPlane.agent.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.controlPlane.agent.persistence.size }}
+{{- end }}

@@ -3796,8 +3796,25 @@ impl SqliteBackend {
         job_id: &str,
         generation: u64,
         records: Vec<JobEdgeSecretRecord>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         self.immediate_transaction(|connection| {
+            let max_secret_gen: Option<u64> = connection.query_row(
+                "SELECT MAX(generation) FROM cp_job_edge_secrets WHERE job_id = ?1",
+                rusqlite::params![job_id],
+                |row| row.get(0),
+            )?;
+            let max_job_gen: Option<u64> = rusqlite::OptionalExtension::optional(
+                connection.query_row(
+                    "SELECT generation FROM cp_jobs WHERE job_id = ?1",
+                    rusqlite::params![job_id],
+                    |row| row.get(0),
+                ),
+            )?;
+            if max_secret_gen.is_some_and(|persisted| persisted > generation)
+                || max_job_gen.is_some_and(|persisted| persisted > generation)
+            {
+                return Ok(false);
+            }
             connection.execute(
                 "DELETE FROM cp_job_edge_secrets WHERE job_id = ?1 AND generation != ?2",
                 rusqlite::params![job_id, generation],
@@ -3814,7 +3831,7 @@ impl SqliteBackend {
                     ],
                 )?;
             }
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -4617,7 +4634,7 @@ impl StorageBackend for SqliteBackend {
         job_id: &str,
         generation: u64,
         records: Vec<JobEdgeSecretRecord>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         self.upsert_job_edge_secrets(job_id, generation, records)
     }
     async fn delete_job_edge_secrets(&self, job_id: &str) -> Result<(), StorageError> {
