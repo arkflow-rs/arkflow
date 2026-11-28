@@ -3,6 +3,7 @@ import { api, formatTime } from '../api'
 import type { ControlEvent, Operation } from '../api'
 import { currentLocale, intlLocale, useT } from '../i18n'
 import { useMutationFailure } from '../queries'
+import { useCopilot } from './copilot'
 
 export const number = (value: number | undefined) =>
   value === undefined ? '—' : new Intl.NumberFormat(intlLocale(currentLocale())).format(value)
@@ -64,6 +65,8 @@ export function OperationRow({
 }
 export function EventRow({ event }: { event: ControlEvent }) {
   const t = useT()
+  const copilot = useCopilot()
+  const diagnosable = event.outcome !== 'succeeded' || Boolean(event.message)
   return (
     <div className="event-row">
       <strong>{event.event_type}</strong>
@@ -75,6 +78,26 @@ export function EventRow({ event }: { event: ControlEvent }) {
         {event.operation_id ? ` · ${event.operation_id}` : ''}
       </small>
       {event.message && <p>{event.message}</p>}
+      {copilot.enabled && diagnosable && (
+        <div className="actions">
+          <button
+            type="button"
+            onClick={() =>
+              copilot.openWithContext(
+                {
+                  page: '/events',
+                  node_id: event.node_id,
+                  stream_id: event.stream_id,
+                  error_summary: event.message ?? event.event_type,
+                },
+                t('copilot.promptDiagnoseEvent', { type: event.event_type }),
+              )
+            }
+          >
+            {t('copilot.aiDiagnose')}
+          </button>
+        </div>
+      )}
     </div>
   )
 }

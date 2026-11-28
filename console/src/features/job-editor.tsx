@@ -28,6 +28,7 @@ import { useConfirm } from './confirm'
 import { ComponentBrowserControls, ComponentKind, filterComponents } from './component-browser'
 import { useT, type TKey } from '../i18n'
 import { useMutationFailure } from '../queries'
+import { useCopilot } from './copilot'
 
 const copy = <T,>(v: T): T => structuredClone(v)
 function JobNode({ data }: { data: DagNodeData }) {
@@ -235,6 +236,8 @@ type Props = {
   nodes: ControlNode[]
   busy: boolean
   canMutate?: boolean
+  proposalSpec?: { id: number; spec: JobSpec }
+  onProposalConsumed?: (id: number) => void
   onClose: () => void
   onError: (message: string) => void
   onSaved: () => void
@@ -248,6 +251,8 @@ export function JobEditor({
   nodes,
   busy,
   canMutate = true,
+  proposalSpec,
+  onProposalConsumed,
   onClose,
   onError,
   onSaved,
@@ -257,7 +262,9 @@ export function JobEditor({
   const confirm = useConfirm()
   const t = useT()
   const reportMutationFailure = useMutationFailure()
+  const copilot = useCopilot()
   const initial = useMemo<JobSpec>(() => {
+    if (proposalSpec) return proposalSpec.spec
     if ((mode === 'upgrade' || mode === 'atomic') && job) {
       if (job.spec_json)
         try {
@@ -267,7 +274,7 @@ export function JobEditor({
         }
     }
     return defaultJobSpec()
-  }, [job, mode])
+  }, [job, mode, proposalSpec])
   const graph = useMemo(() => jobSpecToDag(initial), [initial])
   const [dagNodes, setDagNodes, onNodesChange] = useNodesState<DagNode>(graph.nodes)
   const [edges, setEdges, onEdgesChange] = useEdgesState(graph.edges)
@@ -283,7 +290,7 @@ export function JobEditor({
   // editor reports that state and offers the start action instead of closing
   // as if the Job were running.
   const [upgraded, setUpgraded] = useState<string>()
-  const editorTarget = `${mode}:${job?.job_id ?? ''}:${savepoint?.checkpoint_id ?? ''}`
+  const editorTarget = `${mode}:${job?.job_id ?? ''}:${savepoint?.checkpoint_id ?? ''}:${proposalSpec?.id ?? ''}`
   const [issues, setIssues] = useState<string[]>([])
   const loadComponents = () => {
     setComponentLoad('loading')
@@ -323,6 +330,12 @@ export function JobEditor({
     setUpgraded(undefined)
     setNodeIds(job?.node_ids ?? [])
   }, [editorTarget])
+
+  useEffect(() => {
+    if (proposalSpec) {
+      onProposalConsumed?.(proposalSpec.id)
+    }
+  }, [proposalSpec, onProposalConsumed])
   const selected = dagNodes.find((node) => node.id === selectedId)
   const updateSpec = (nextNodes = dagNodes, nextEdges = edges, nextBase = spec) => {
     const derived = dagToJobSpec(nextNodes, nextEdges, nextBase)
@@ -516,6 +529,24 @@ export function JobEditor({
           </small>
         </div>
         <div className="actions">
+          {copilot.enabled && (
+            <button
+              type="button"
+              disabled={busy || !canMutate}
+              title={!canMutate ? t('copilot.requiresConfigure') : undefined}
+              onClick={() =>
+                copilot.openWithContext({
+                  page: '/jobs',
+                  job_id: job?.job_id ?? spec.id,
+                  draft_format: 'json',
+                  draft_content: JSON.stringify(dagToJobSpec(dagNodes, edges, spec), null, 2),
+                  error_summary: issues.length ? issues.join('\n') : undefined,
+                })
+              }
+            >
+              {t('copilot.aiAssist')}
+            </button>
+          )}
           <button onClick={onClose}>{t('editor.cancel')}</button>
           <button
             disabled={busy || !canMutate}
