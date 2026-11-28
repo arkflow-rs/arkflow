@@ -150,7 +150,7 @@ jobs:
       # the allowed set only when the kafka family itself is enabled.
       - name: Minimal tree excludes gated dependency families
         run: |
-          FORBIDDEN='pyo3 v|spiceai_duckdb_fork|ballista|mongodb v|pulsar v|rumqttc|async-nats|lapin v|tokio-tungstenite|tokio-modbus|prost-reflect|protox|hdfs-native-object-store|vrl v'
+          FORBIDDEN='pyo3 v|spiceai_duckdb_fork|ballista|mongodb v|pulsar v|rumqttc|async-nats|lapin v|tokio-tungstenite|tokio-modbus|prost-reflect|protox|hdfs-native-object-store|vrl v|iceberg v|opendal v|reqsign'
           if [ "${{ matrix.features }}" = "engine-minimal" ]; then
             FORBIDDEN="$FORBIDDEN|rdkafka"
           fi

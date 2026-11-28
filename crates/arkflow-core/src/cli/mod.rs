@@ -735,6 +735,7 @@ mod tests {
                 config_optional: true,
                 config_schema: serde_json::json!({"type": "object"}),
                 config_example: Some(serde_json::json!({"answer": 42})),
+                codec_supported: true,
             };
             // Ignore the "already registered" error on re-runs in the same
             // process: the important part is that listing finds it.
@@ -761,6 +762,7 @@ mod tests {
                 config_optional: false,
                 config_schema: serde_json::json!({"type": "object"}),
                 config_example: None,
+                codec_supported: true,
             };
             let _ = crate::component::register_component_metadata(ComponentKind::Buffer, metadata);
             let mut cli = Cli::default();
@@ -904,6 +906,7 @@ mod tests {
                         config_optional: false,
                         config_schema: serde_json::json!({"type": "object"}),
                         config_example: None,
+                        codec_supported: true,
                     },
                 );
             }
@@ -927,6 +930,7 @@ mod tests {
                     config_optional: false,
                     config_schema: serde_json::json!({"type": "object"}),
                     config_example: None,
+                    codec_supported: true,
                 },
             );
             let err =

@@ -1,0 +1,108 @@
+# Iceberg Output — Kafka → Iceberg lakehouse ingest
+#
+# This example shows the recommended shape for streaming into Apache Iceberg:
+#
+#   Kafka → SQL projection (keeps the __meta_* source columns)
+#         → batch (commit cadence: 50k rows or 60s, whichever first)
+#         → iceberg (one atomic table append per batch)
+#
+# ── Why the `batch` processor is load-bearing ────────────────────────────
+#
+#   The iceberg output performs one catalog commit per write_batch call and
+#   holds nothing between calls — the kernel acknowledges the source only
+#   after the commit. The `batch` processor therefore decides both the commit
+#   cadence and the data-file size, the same role a checkpoint interval plays
+#   in other stream processors. Without it the Kafka input forwards one small
+#   batch per read and the table drowns in tiny snapshots and files.
+#
+# ── Exactly-once ─────────────────────────────────────────────────────────
+#
+#   `exactly_once: true` commits a per-(topic, partition) Kafka offset
+#   watermark atomically with every append (snapshot summary property
+#   `arkflow.writer.<writer_id>.offsets`) and drops replayed rows below it,
+#   so a crash between the table commit and the acknowledgement produces no
+#   duplicates. It requires the `__meta_partition` / `__meta_offset` /
+#   `__meta_ext` columns to survive the pipeline (keep them in the SQL
+#   projection — a projection that drops them fails the write explicitly)
+#   and `writer_id` to identify exactly one consumer group.
+#
+# ── Prerequisites ────────────────────────────────────────────────────────
+#
+#   - A REST catalog (Lakekeeper in this example) reachable from this host.
+#   - The table `analytics.user_events` already exists; the output never
+#     creates tables or evolves schemas.
+#   - An S3 endpoint reachable from this host (MinIO here); data files are
+#     uploaded by this process, not by the catalog.
+#
+# ── See also ─────────────────────────────────────────────────────────────
+#
+#   docs/docs/components/3-outputs/iceberg.md
+
+logging:
+  level: info
+
+streams:
+  - input:
+      type: "kafka"
+      brokers: ["redpanda:9092"]
+      topics: ["events"]
+      consumer_group: "arkflow-iceberg-ingest"
+
+    durability:
+      enabled: true
+      sync: "group_commit"
+      backend:
+        type: "object_store"
+        node_id: "${ARKFLOW_NODE_ID}"
+        stream_id: "events-to-iceberg"
+        prefix: "arkflow/wal"
+        s3:
+          bucket: "arkflow-wal"
+          region: "us-east-1"
+          endpoint: "http://localhost:9000"
+          # Bare ${VAR} placeholders keep this example offline-validatable
+          # (${env:...} references would demand the variable at parse time).
+          # Substitute real credentials — or ${env:...} references — when
+          # running.
+          access_key_id: "${AWS_ACCESS_KEY_ID}"
+          secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+          allow_http: true
+        compression:
+          type: zstd
+          level: 3
+        segment_tuning:
+          strategy: balanced
+
+    pipeline:
+      processors:
+        - type: "sql"
+          # Keep the __meta_* source columns: exactly-once delivery reads the
+          # Kafka position from them. A projection that drops them makes the
+          # write fail explicitly rather than silently degrading.
+          query: >-
+            SELECT id, user_id, event_type, ts,
+                   __meta_partition, __meta_offset, __meta_ext
+            FROM flow
+            WHERE event_type IS NOT NULL
+        - type: "batch"
+          count: 50000
+          timeout_ms: 60000
+
+    output:
+      type: "iceberg"
+      catalog:
+        uri: "http://lakekeeper:8181/catalog"
+        warehouse: "demo"
+      namespace: "analytics"
+      table: "user_events"
+      exactly_once: true
+      writer_id: "arkflow-iceberg-ingest"
+      write:
+        target_file_size_bytes: 33554432
+        compression: "zstd"
+      s3:
+        endpoint: "http://localhost:9000"
+        region: "local-01"
+        access_key_id: "${AWS_ACCESS_KEY_ID}"
+        secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+        path_style_access: true

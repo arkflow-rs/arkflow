@@ -252,20 +252,20 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null
+            "amqp09",
+            "file",
+            "generate",
+            "http",
+            "kafka",
+            "memory",
+            "modbus",
+            "mqtt",
+            "multiple_inputs",
+            "nats",
+            "pulsar",
+            "redis",
+            "sql",
+            "websocket"
           ],
           "description": "input component type."
         },
@@ -3398,21 +3398,22 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null
+            "amqp09",
+            "drop",
+            "http",
+            "iceberg",
+            "influxdb",
+            "kafka",
+            "milvus",
+            "mongodb",
+            "mqtt",
+            "nats",
+            "pgvector",
+            "pulsar",
+            "qdrant",
+            "redis",
+            "sql",
+            "stdout"
           ],
           "description": "output component type."
         },
@@ -4079,6 +4080,137 @@
               "method": "POST",
               "timeout_ms": 5000,
               "retry_count": 3
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "title": "iceberg",
+          "description": "Appends rows to an existing Apache Iceberg table through a REST catalog. One write_batch call is one atomic table append; a batch processor in front of this output controls commit cadence and file size.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "iceberg",
+              "description": "Appends rows to an existing Apache Iceberg table through a REST catalog. One write_batch call is one atomic table append; a batch processor in front of this output controls commit cadence and file size."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional logical name for this instance."
+            },
+            "catalog": {
+              "type": "object",
+              "description": "REST catalog connection.",
+              "properties": {
+                "uri": {
+                  "type": "string",
+                  "description": "REST catalog endpoint, e.g. http://lakekeeper:8181/catalog."
+                },
+                "warehouse": {
+                  "type": "string",
+                  "description": "Warehouse (catalog) name."
+                },
+                "token": {
+                  "type": "string",
+                  "description": "Static bearer token; may reference ${env:VAR} / ${file:/path} / ${secret:...}."
+                }
+              },
+              "required": [
+                "uri",
+                "warehouse"
+              ],
+              "additionalProperties": false
+            },
+            "namespace": {
+              "type": "string",
+              "description": "Namespace containing the table; split on '.' for multi-level namespaces."
+            },
+            "table": {
+              "type": "string",
+              "description": "Table name. The table must already exist; the output never creates tables or evolves schemas."
+            },
+            "exactly_once": {
+              "type": "boolean",
+              "description": "Drop replayed rows below the committed Kafka offset watermark. Requires a replayable source position on every row and an ordered single chain from the Kafka input.",
+              "default": false
+            },
+            "writer_id": {
+              "type": "string",
+              "description": "Watermark writer identity; required exactly when exactly_once is true. Use the Kafka consumer group id."
+            },
+            "write": {
+              "type": "object",
+              "description": "Write tuning; unset values follow the table's own write.* properties.",
+              "properties": {
+                "target_file_size_bytes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Roll the data file after this many bytes. Only splits files inside one commit; does not drive commit cadence. Default: the table's write.target-file-size-bytes (512 MiB)."
+                },
+                "compression": {
+                  "enum": [
+                    "snappy",
+                    "gzip",
+                    "zstd",
+                    "lz4"
+                  ],
+                  "description": "Parquet codec. Default: the table's write.parquet.compression-codec (snappy)."
+                }
+              },
+              "additionalProperties": false
+            },
+            "s3": {
+              "type": "object",
+              "description": "S3 storage overrides. When absent, storage config comes from the catalog server and credentials fall back to the environment.",
+              "properties": {
+                "endpoint": {
+                  "type": "string",
+                  "description": "S3 endpoint reachable from the host running ArkFlow; sent as a client property overriding the server default."
+                },
+                "region": {
+                  "type": "string"
+                },
+                "access_key_id": {
+                  "type": "string",
+                  "description": "Static access key; set together with secret_access_key to avoid environment credential lookup."
+                },
+                "secret_access_key": {
+                  "type": "string",
+                  "description": "Static secret key; may reference ${env:VAR} / ${file:/path} / ${secret:...}."
+                },
+                "path_style_access": {
+                  "type": "boolean",
+                  "description": "Path-style addressing (required by MinIO).",
+                  "default": true
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "type",
+            "catalog",
+            "namespace",
+            "table"
+          ],
+          "examples": [
+            {
+              "catalog": {
+                "uri": "http://lakekeeper:8181/catalog",
+                "warehouse": "demo"
+              },
+              "namespace": "analytics",
+              "table": "user_events",
+              "exactly_once": true,
+              "writer_id": "arkflow-iceberg-ingest",
+              "write": {
+                "target_file_size_bytes": 33554432,
+                "compression": "zstd"
+              },
+              "s3": {
+                "endpoint": "http://minio:9000",
+                "region": "local-01",
+                "path_style_access": true
+              }
             }
           ]
         },
@@ -6847,152 +6979,6 @@
               "type": "string",
               "description": "Optional logical name for this instance."
             },
-            "codec": {
-              "oneOf": [
-                {
-                  "type": "object",
-                  "title": "debezium_json",
-                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "debezium_json"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "title": "json",
-                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "json"
-                    },
-                    "on_error": {
-                      "type": "string",
-                      "enum": [
-                        "fail",
-                        "skip"
-                      ],
-                      "default": "fail",
-                      "description": "Decode-error policy: `fail` fails the batch (default), `skip` isolates bad messages with a warning and decodes the rest."
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "title": "protobuf",
-                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "protobuf"
-                    },
-                    "message_type": {
-                      "type": "string",
-                      "description": "Fully-qualified Protobuf message type name."
-                    },
-                    "proto_inputs": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      },
-                      "description": "Paths to .proto files."
-                    },
-                    "proto_includes": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      },
-                      "description": "Include paths for proto resolution."
-                    },
-                    "on_error": {
-                      "type": "string",
-                      "enum": [
-                        "fail",
-                        "skip"
-                      ],
-                      "default": "fail",
-                      "description": "Decode-error policy: `fail` fails the batch (default), `skip` isolates bad messages with a warning and decodes the rest."
-                    }
-                  },
-                  "required": [
-                    "type",
-                    "message_type",
-                    "proto_inputs"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "schema_registry"
-                    },
-                    "registry_url": {
-                      "type": "string",
-                      "description": "Confluent Schema Registry base URL."
-                    },
-                    "message_type": {
-                      "type": "string",
-                      "description": "Fully-qualified Protobuf message type. Required for Protobuf schemas; omit for Avro."
-                    },
-                    "subject": {
-                      "type": "string",
-                      "description": "Registry subject for the compatibility gate."
-                    },
-                    "min_compatibility": {
-                      "type": "string",
-                      "enum": [
-                        "none",
-                        "backward",
-                        "forward",
-                        "full"
-                      ],
-                      "description": "Minimum subject compatibility level enforced on the first decoded message. Requires `subject`."
-                    },
-                    "auth": {
-                      "type": "object",
-                      "description": "Optional registry authentication.",
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "enum": [
-                            "basic",
-                            "bearer"
-                          ]
-                        },
-                        "username": {
-                          "type": "string"
-                        },
-                        "password": {
-                          "type": "string"
-                        },
-                        "token": {
-                          "type": "string"
-                        }
-                      },
-                      "required": [
-                        "type"
-                      ]
-                    }
-                  },
-                  "required": [
-                    "type",
-                    "registry_url"
-                  ]
-                }
-              ]
-            },
             "output_type": {
               "type": "object",
               "description": "Database connection settings, tagged by `type` (`mysql` or `postgres`), each with `uri` and optional `ssl`.",
@@ -7240,20 +7226,20 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null
+            "arrow_to_json",
+            "arrow_to_protobuf",
+            "batch",
+            "embedding",
+            "json_to_arrow",
+            "llm",
+            "lookup",
+            "milvus_search",
+            "pgvector_search",
+            "protobuf_to_arrow",
+            "python",
+            "sql",
+            "vector_search",
+            "vrl"
           ],
           "description": "processor component type."
         },
@@ -10267,10 +10253,10 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null
+            "memory",
+            "session_window",
+            "sliding_window",
+            "tumbling_window"
           ],
           "description": "buffer component type."
         },
@@ -11059,10 +11045,10 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null
+            "debezium_json",
+            "json",
+            "protobuf",
+            "schema_registry"
           ],
           "description": "codec component type."
         },
@@ -11830,7 +11816,7 @@
         "type": {
           "type": "string",
           "enum": [
-            null
+            "redis"
           ],
           "description": "temporary component type."
         },

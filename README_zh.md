@@ -200,6 +200,7 @@ ArkFlow支持多种输出目标：
 - **Kafka** (`kafka`)：将数据写入Kafka主题
 - **MQTT** (`mqtt`)：将消息发布到MQTT主题
 - **HTTP** (`http`)：通过HTTP发送数据
+- **Iceberg** (`iceberg`)：通过 REST catalog 向已有的 Apache Iceberg 表追加行，支持来自 Kafka 源的可选 exactly-once 投递
 - **InfluxDB** (`influxdb`)：将时序数据写入 InfluxDB 2.x
 - **MongoDB** (`mongodb`)：将文档写入 MongoDB 集合
 - **NATS** (`nats`)：将消息发布到 NATS 主题

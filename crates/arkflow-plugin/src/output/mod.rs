@@ -23,6 +23,8 @@ pub mod amqp09;
 pub mod codec_helper;
 pub mod drop;
 pub mod http;
+#[cfg(feature = "connectors-iceberg")]
+pub mod iceberg;
 pub mod influxdb;
 #[cfg(feature = "connectors-kafka")]
 pub mod kafka;
@@ -57,6 +59,8 @@ fn register_components() -> Result<(), Error> {
     steps.push(amqp09::init);
     #[cfg(feature = "connectors-kafka")]
     steps.push(kafka::init);
+    #[cfg(feature = "connectors-iceberg")]
+    steps.push(iceberg::init);
     #[cfg(feature = "ai-vector")]
     steps.push(milvus::init);
     #[cfg(feature = "connectors-mqtt")]
