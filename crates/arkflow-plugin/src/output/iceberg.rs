@@ -635,11 +635,16 @@ fn ensure_table_shape_supported(
     // An all-void spec reports is_unpartitioned() == true but keeps its own
     // spec id — writing it with a null partition key produces a spec-id
     // mismatch the catalog rejects, so refuse it up front.
-    if spec.is_unpartitioned() && spec.spec_id() != 0 {
+    // Any all-void spec that still carries fields (whatever its id) keeps a
+    // partition type with the Void column, so writing with no partition key
+    // produces an empty tuple the catalog rejects. Only the fieldless
+    // default spec is the unpartitioned path.
+    if spec.is_unpartitioned() && !spec.fields().is_empty() {
         return Err(Error::Process(format!(
-            "iceberg output: table {table} uses an all-void partition spec (id {}) — drop \
-             the spec or repartition with a supported transform",
-            spec.spec_id()
+            "iceberg output: table {table} uses an all-void partition spec (id {}, {} \
+             field(s)) — drop the spec or repartition with a supported transform",
+            spec.spec_id(),
+            spec.fields().len()
         )));
     }
     if !spec.is_unpartitioned() {
@@ -754,6 +759,18 @@ fn extract_positions(batch: &RecordBatch) -> Result<PositionColumns, Error> {
         })?;
     for row in 0..rows {
         let mut topic = None;
+        // `MapArray::value(row)` ignores the parent validity bit: a null
+        // map can still be backed by entries carrying a "topic" value, and
+        // accepting it would silently treat a row without a source position
+        // as positioned.
+        if ext.is_null(row) {
+            return Err(Error::Process(format!(
+                "iceberg output: row {} carries a null {} — exactly-once delivery requires \
+                 a source position on every row",
+                row,
+                arkflow_core::meta_columns::EXT
+            )));
+        }
         let entries = ext.value(row);
         if let Some(structs) = entries.as_any().downcast_ref::<arrow_array::StructArray>() {
             if let (Some(keys), Some(values)) = (
@@ -1790,6 +1807,15 @@ mod tests {
             .expect("bound spec");
         let error = ensure_table_shape_supported("t", &schema, &spec).unwrap_err();
         assert!(error.to_string().contains("all-void"), "{error}");
+        // An all-void spec wearing the default spec id is equally rejected.
+        let id0_void = iceberg::spec::PartitionSpecBuilder::new(Arc::new(schema.clone()))
+            .add_partition_field("id", "id_void", iceberg::spec::Transform::Void)
+            .expect("add field")
+            .build()
+            .expect("bound spec");
+        let error = ensure_table_shape_supported("t", &schema, &id0_void).unwrap_err();
+        assert!(error.to_string().contains("all-void"), "{error}");
+        // The fieldless default spec stays the unpartitioned path.
         let default_spec = iceberg::spec::PartitionSpecBuilder::new(Arc::new(schema.clone()))
             .build()
             .expect("default spec");

@@ -68,12 +68,14 @@ With `exactly_once: true` every commit stores a per-`(topic, partition)` offset 
 The guarantee holds only when all of the following are true; otherwise delivery is at-least-once:
 
 - every row reaches the output with `__meta_partition`, `__meta_offset`, and `__meta_ext.topic` — keep them in any SQL projection, a projection that drops them fails the write explicitly;
-- the path from the Kafka input to this output is an ordered single chain per partition, and every row a Kafka record expands into reaches the same `write_batch` call (a processor that holds some expanded rows and emits them in a later call would have the later rows dropped as already committed);
-- `writer_id` identifies exactly one consumer group.
+- the path from the Kafka input to this output is an ordered single chain per partition, and every row a Kafka record expands into reaches the same `write_batch` call — a processor that holds some expanded rows and emits them in a later call has those later rows **dropped** (the watermark has already passed them), so that topology has *no* delivery guarantee rather than at-least-once;
+- `writer_id` identifies exactly one consumer group. Sharing a `writer_id` across instances makes every commit overwrite the whole watermark map with only that instance's partitions, so the other partitions lose their watermark and replayed rows there are written again.
+
+With `exactly_once: false` the output delivers at-least-once without any of these requirements.
 
 Multiple writers may commit to the same table concurrently (Iceberg's optimistic concurrency handles it); each writer tracks its own watermark.
 
-One exception can admit duplicates: if the writer's watermark snapshot is unreachable at startup — expired by snapshot retention, or beyond the 1000-snapshot lookback — the output starts with an empty watermark and logs a warning, and rows replayed after that point are written again. Keep your snapshot-expiry window longer than the effective replay window of the pipeline (at minimum the `batch.timeout_ms` plus worst-case restart time).
+One exception can admit duplicates: if the writer's watermark snapshot is unreachable at startup — expired by snapshot retention, or beyond the 1000-snapshot lookback — the output starts with an empty watermark and logs a warning, and rows replayed after that point are written again. Keep your snapshot-expiry window longer than the effective replay window of the pipeline (at minimum the `batch.timeout_ms` plus worst-case restart time), **and** keep the snapshot count committed after the watermark snapshot below 1000 — a busy table (other writers, a long outage) can age out the lookback even when retention is generous.
 
 ## Schema and partitions
 
