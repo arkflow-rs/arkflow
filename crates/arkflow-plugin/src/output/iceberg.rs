@@ -635,14 +635,15 @@ fn ensure_table_shape_supported(
     // An all-void spec reports is_unpartitioned() == true but keeps its own
     // spec id — writing it with a null partition key produces a spec-id
     // mismatch the catalog rejects, so refuse it up front.
-    // Any all-void spec that still carries fields (whatever its id) keeps a
-    // partition type with the Void column, so writing with no partition key
-    // produces an empty tuple the catalog rejects. Only the fieldless
-    // default spec is the unpartitioned path.
-    if spec.is_unpartitioned() && !spec.fields().is_empty() {
+    // Only the fieldless default spec (id 0) is the unpartitioned path:
+    // - an all-void spec keeps a partition type with the Void column, so a
+    //   null partition key produces an empty tuple the catalog rejects;
+    // - a fieldless spec with a non-zero id would make every data file carry
+    //   spec id 0 while the table's default spec is that id.
+    if spec.is_unpartitioned() && (spec.spec_id() != 0 || !spec.fields().is_empty()) {
         return Err(Error::Process(format!(
-            "iceberg output: table {table} uses an all-void partition spec (id {}, {} \
-             field(s)) — drop the spec or repartition with a supported transform",
+            "iceberg output: table {table} uses an unpartitioned-equivalent partition spec \
+             (id {}, {} field(s)) — drop the spec or repartition with a supported transform",
             spec.spec_id(),
             spec.fields().len()
         )));
@@ -1953,7 +1954,10 @@ mod tests {
             .build()
             .expect("bound spec");
         let error = ensure_table_shape_supported("t", &schema, &spec).unwrap_err();
-        assert!(error.to_string().contains("all-void"), "{error}");
+        assert!(
+            error.to_string().contains("unpartitioned-equivalent"),
+            "{error}"
+        );
         // An all-void spec wearing the default spec id is equally rejected.
         let id0_void = iceberg::spec::PartitionSpecBuilder::new(Arc::new(schema.clone()))
             .add_partition_field("id", "id_void", iceberg::spec::Transform::Void)
@@ -1961,12 +1965,26 @@ mod tests {
             .build()
             .expect("bound spec");
         let error = ensure_table_shape_supported("t", &schema, &id0_void).unwrap_err();
-        assert!(error.to_string().contains("all-void"), "{error}");
+        assert!(
+            error.to_string().contains("unpartitioned-equivalent"),
+            "{error}"
+        );
         // The fieldless default spec stays the unpartitioned path.
         let default_spec = iceberg::spec::PartitionSpecBuilder::new(Arc::new(schema.clone()))
             .build()
             .expect("default spec");
         assert!(ensure_table_shape_supported("t", &schema, &default_spec).is_ok());
+        // A fieldless spec wearing a non-zero id is also rejected: data files
+        // would carry spec id 0 while the table's default spec is that id.
+        let fieldless7 = iceberg::spec::PartitionSpecBuilder::new(Arc::new(schema.clone()))
+            .with_spec_id(7)
+            .build()
+            .expect("fieldless spec");
+        let error = ensure_table_shape_supported("t", &schema, &fieldless7).unwrap_err();
+        assert!(
+            error.to_string().contains("unpartitioned-equivalent"),
+            "{error}"
+        );
     }
 
     #[test]
